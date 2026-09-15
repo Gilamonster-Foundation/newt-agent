@@ -29,9 +29,10 @@ async fn dispatch_responses_json_retries_transient_transport_failures() {
     let validated = responses_wire_validation::ValidatedResponsesRequest::from_body_for_test(
         serde_json::json!({"model": "m", "input": []}),
     );
-    let err = super::dispatch_responses_json(&client, &url, None, &validated, &retry, false, None)
-        .await
-        .expect_err("a persistent 503 exhausts retries");
+    let err =
+        super::dispatch_responses_json(&client, &url, None, &validated, &retry, false, None, None)
+            .await
+            .expect_err("a persistent 503 exhausts retries");
     assert_eq!(
         err.to_string(),
         "inference endpoint 503 Service Unavailable: "

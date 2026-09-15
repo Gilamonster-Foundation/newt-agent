@@ -4,18 +4,25 @@ another model or was never graded stays visible in the summary.
 Run: PYTHONPATH=scripts/eval/harbor python -m unittest discover scripts/eval/harbor/tests
 """
 
+import contextlib
+import io
 import json
+import subprocess
+import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import tb_campaign
 from pi_log import pi_inference_failure, pi_session_claim
 
 from tb_campaign import (
-    PINNED, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
-    harness_evidence, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
-    newt_claim, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
-    render_profile, summarize, treatment_env, trial_plan, wilson, window_at,
+    PINNED, TREATMENT_ENV, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
+    harness_evidence, ingest, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
+    newt_claim, newt_end_reason, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
+    redact, render_profile, scrub, summarize, table, treatment_env, trial_plan, wilson, window_at,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -46,6 +53,17 @@ class Claims(unittest.TestCase):
         incomplete = jl({"kind": "solve_result", "status": "incomplete"}, {"outcome": "completed"})
         self.assertEqual(newt_claim(incomplete)[0], False)
         done = jl({"kind": "solve_result", "status": "completed"}, {"outcome": "completed"})
+        self.assertEqual(newt_claim(done)[0], True)
+
+    def test_a_verification_end_reason_is_never_a_claim_with_or_without_a_status(self):
+        # #2374: RepairExhausted / VerificationIncomplete map to outcome completed.
+        for reason in ("RepairExhausted", "VerificationIncomplete"):
+            for status in ({"status": "incomplete"}, {}):
+                lines = jl({"kind": "solve_result", "end_reason": f"Some({reason})", **status}, {"outcome": "completed"})
+                self.assertEqual(newt_claim(lines)[0], False, (reason, status))
+                self.assertEqual(newt_end_reason(lines), reason)
+        self.assertIsNone(newt_end_reason(jl({"kind": "solve_result", "end_reason": "None"})))
+        done = jl({"kind": "solve_result", "end_reason": "Some(Completed)"}, {"outcome": "completed"})
         self.assertEqual(newt_claim(done)[0], True)
 
     def test_pi_claims_only_on_a_final_stop(self):
@@ -119,6 +137,9 @@ class Summary(unittest.TestCase):
         self.assertEqual(summarize({"expected": 1, "model": "m"}, [row(harness_outcome="completed", harness_status="incomplete",
                                                                        claimed_done=False)])["terminal_not_done"], 1)
         self.assertEqual((s["rate_excl"], s["rate_agent_fail"], s["causes"]), ((2, 5), (2, 6), (2, 1, 0)))
+        ended = [row(harness_end_reason="RepairExhausted"), row(harness_end_reason="VerificationIncomplete"),
+                 row(harness_end_reason="RepairExhausted"), row(harness_end_reason="Completed")]
+        self.assertEqual(summarize({"expected": 4, "model": "m"}, ended)["verification_ended"], (2, 1))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 
     def test_two_resolve_rates(self):
@@ -139,7 +160,8 @@ class Summary(unittest.TestCase):
 class Treatments(unittest.TestCase):
     def test_none_is_the_baseline(self):
         t = load_treatment("none")
-        self.assertEqual((t["name"], t["sha256"], t["env"], t["expect"]), ("none", None, {}, {}))
+        self.assertEqual((t["name"], t["sha256"], t["env"], t["expect"]),
+                         ("none", None, {}, {"receipt.verification.mode": "attempted"}))
         self.assertEqual(render_profile(t, "m", BASE), BASE.replace('model = "old"', 'model = "m"'))
 
     def test_committed_treatments_render_to_valid_profiles_without_placeholders(self):
@@ -164,6 +186,64 @@ class Treatments(unittest.TestCase):
         self.assertEqual(treatment_env(load_treatment("none")), {})
         with self.assertRaises(ValueError):  # names are the receipt keys: scratchpad, code_search, crew
             load_treatment(HARBOR / "tests/fixtures/treatment-requires-unknown.toml")
+
+    def test_the_verify_outcomes_treatment_reaches_the_adapter_and_is_observable(self):
+        # #2315: the result-aware switch is the treatment's only knob (the
+        # self-verify gate it refines is on by default), and the arm is confirmed
+        # from the receipt, not assumed from the declared env.
+        t = load_treatment(HARBOR / "treatments/verify-outcomes.toml")
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_VERIFY_OUTCOMES": "1"})
+        treated = {"receipt": {"verification": {"mode": "result_aware", "repair_allowance": 3}}}
+        self.assertIs(observed(t["expect"], treated), True)
+        self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
+
+    def test_self_verify_off_is_an_ablation_confirmed_from_the_receipt(self):
+        t = load_treatment(HARBOR / "treatments/self-verify-off.toml")
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_SELF_VERIFY": "0"})
+        self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "off"}}}), True)
+        self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "attempted"}}}), False)
+
+    def test_the_baseline_expects_newts_shipped_attempted_gate(self):
+        # none is newt's shipped defaults: the self-verify gate is on (#1961), so a
+        # baseline cell whose receipt says otherwise did not run the baseline.
+        none = load_treatment("none")
+        self.assertIs(observed(none["expect"], {"receipt": {"verification": {"mode": "attempted"}}}), True)
+        self.assertIs(observed(none["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
+        self.assertIsNone(observed(none["expect"], None))  # pi and codex have no contract to read
+
+    def test_the_table_shows_the_baseline_receipt_check_and_verification_ends_for_newt_only(self):
+        cells = [{"campaign": "c", "model": "m", "harness": h, "job": f"m__{h}", "expected": 2, "treatment": "none",
+                  "treatment_expect": {"receipt.verification.mode": "attempted"}} for h in ("newt", "pi")]
+        rows = [{**row(treatment_observed=o, harness_end_reason=e, trial=f"t{i}__x"), "campaign": "c", "model": "m",
+                 "harness": h, "job": f"m__{h}"}
+                for h, pairs in (("newt", ((False, "RepairExhausted"), (True, "Completed"))), ("pi", ((None, None),) * 2))
+                for i, (o, e) in enumerate(pairs)]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cells.jsonl").write_text("".join(json.dumps(c) + "\n" for c in cells))
+            (Path(tmp) / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                table(Path(tmp))
+        header, _, *body = printed.getvalue().splitlines()
+        names = [c.strip() for c in header.split("|")]
+        col = {n: i for i, n in enumerate(names)}
+        by_harness = {r.split("|")[2].split()[0]: [c.strip() for c in r.split("|")] for r in body}
+        seen, ended = col["treatment declared but not observed"], col["newt verification ended: repair exhausted / incomplete"]
+        self.assertEqual((by_harness["newt"][seen], by_harness["newt"][ended]), ("1", "1/0"))
+        self.assertEqual(by_harness["pi"][seen], "n/a")
+
+    def test_the_campaign_unsets_every_arm_changing_knob_it_does_not_set(self):
+        # An operator's exported treatment knob must not silently change every
+        # baseline cell: each TREATMENT_ENV key the runner does not export
+        # itself is unset. Derived from TREATMENT_ENV, so a new knob fails here
+        # until the script handles it.
+        lines = (HARBOR / "tb-campaign.sh").read_text().splitlines()
+        def words(prefix):
+            return {w.split("=")[0] for line in lines if line.startswith(prefix) for w in line.split()[1:]}
+        exported, unset = words("export "), words("unset ")
+        missing = sorted(TREATMENT_ENV - exported - unset)
+        self.assertEqual(missing, [], "treatment knobs the campaign neither sets nor unsets")
+        self.assertTrue({"NEWT_BENCH_OCAP", "NEWT_BENCH_CONTEXT_WINDOW"} <= exported, exported)
 
     def test_a_refused_requirement_is_read_from_the_exit_message(self):
         message = ("Command failed (exit 1): newt solve ...\nstdout: None\n"
@@ -418,6 +498,111 @@ class PiSessionLog(unittest.TestCase):
         self.assertEqual(awaiting("codex", jl({"type": "turn.started"}, {"type": "item.started"}), []), "tool")
         self.assertEqual(awaiting("codex", jl({"type": "item.completed", "item": {"type": "command_execution"}}), []), "model")
         self.assertIsNone(awaiting("newt", jl({"kind": "chat_completion_finish"}), []))
+
+
+class Redaction(unittest.TestCase):
+    """trials.jsonl, cells.jsonl and the table reach commits, report tables and cards.
+    chess-best-move is a real unreachable-endpoint newt trial (address swapped for a
+    documentation one): its error names the request URL. build-cython-ext and the pi
+    trial are synthetic: the operator's endpoint host unbracketed, portless, quoted
+    and %-encoded, a bracketed IPv6 literal, an account, a home dir, a multi-line
+    provider body, and a smart_harness endpoint in effective_config, under an
+    address-shaped model id and version that must survive, because tables join and
+    pins install on them. build-cython-ext sorts first, so the cell takes its version."""
+
+    FIXTURES = HARBOR / "tests/fixtures"
+    LITERALS = ({"gpu-box.invalid", "fd00::1"}, {"fixture-user"}, "/home/fixture-user")
+    FORBIDDEN = ("203.0.113", "198.51.100", "gpu-box", "fd00::1", "fixture-user", "/home/", "req_fixture")
+    CELL = {"campaign": "c", "model": "coder-1.2.3.4", "harness": "newt", "job": "coder-1.2.3.4__newt", "expected": 2}
+
+    def assert_clean(self, text):
+        for literal in self.FORBIDDEN:
+            self.assertNotIn(literal, text)
+
+    def ingest_job(self, job, cell):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(tb_campaign, "local_literals",
+                                                                     return_value=self.LITERALS):
+            out = Path(tmp)
+            (out / "cell.json").write_text(json.dumps(cell))
+            ingest(self.FIXTURES / job, out / "cell.json", out)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                table(out)
+            trials, cells = (out / "trials.jsonl").read_text(), (out / "cells.jsonl").read_text()
+        for text in (trials, cells, printed.getvalue()):
+            self.assert_clean(text)
+        return {r["trial"]: r for r in map(json.loads, trials.splitlines())}, json.loads(cells), printed.getvalue()
+
+    def test_a_full_newt_ingest_writes_no_address_and_keeps_identity_fields(self):
+        rows, cell, printed = self.ingest_job("job-redaction", self.CELL)
+        self.assertEqual(rows["chess-best-move__fixture"]["error_cause"], "infra")  # classified before redaction
+        self.assertIn("error sending request", rows["chess-best-move__fixture"]["harness_error"])
+        synthetic = rows["build-cython-ext__fixture"]
+        self.assertEqual((synthetic["model"], synthetic["harness_version"], synthetic["model_effective"]),
+                         ("coder-1.2.3.4", "1.2.3.4", "coder-1.2.3.4"))
+        for kept in ("status:429", "src/main.rs:42:5", "error[E0308]", "account <redacted>"):  # evidence survives
+            self.assertIn(kept, synthetic["harness_error"])
+        self.assertNotIn("quota", synthetic["harness_error"])  # first line only: the provider body is dropped
+        self.assertEqual(synthetic["harness_config"]["smart_harness"]["backend"]["endpoint"], "<redacted>")
+        self.assertEqual(cell["harness_version"], "1.2.3.4")  # what the pin installs
+        self.assertIn("| coder-1.2.3.4 | newt 1.2.3.4 [none] | 2 / 2 /", printed)  # rows still join
+
+    def test_a_pi_inference_failure_naming_the_host_is_scrubbed(self):
+        pi = {**self.CELL, "harness": "pi", "job": "coder-1.2.3.4__pi", "expected": 1}
+        rows, _, _ = self.ingest_job("job-redaction-pi", pi)
+        row = rows["pypi-server__fixture"]
+        self.assertEqual((row["state"], row["error_cause"]), ("error", "infra"))
+        self.assertEqual(row["inference_failure"], "auto_retry_end success=false: connect ECONNREFUSED <redacted> (<redacted>)")
+
+    def test_every_free_text_field_is_scrubbed_and_no_identity_field_is(self):
+        free = ("harness_error", "harness_config", "inference_failure", "refusal", "claim_source", "skipped")
+        identity = ("campaign", "model", "harness", "job", "task", "harness_version")
+        record = {**{k: "at gpu-box.invalid:8000" for k in free}, **{k: "coder-1.2.3.4" for k in identity}}
+        out = redact(record, self.LITERALS)
+        self.assertEqual(out, {**{k: "at <redacted>:8000" for k in free}, **{k: "coder-1.2.3.4" for k in identity}})
+
+    def test_redaction_happens_before_the_cap(self):
+        for address, literals in (("gpu-box.invalid", self.LITERALS), ("198.51.100.4", (set(), set(), None))):
+            # the address starts 10 chars before the cap: cutting first would leave "gpu-box.in" / "198.51.100"
+            text = scrub("x" * (tb_campaign.FREE_TEXT_MAX - 11) + " " + address + " tail", literals)
+            self.assertLessEqual(len(text), tb_campaign.FREE_TEXT_MAX)
+            self.assert_clean(text)
+
+    def test_generic_shapes_do_not_eat_evidence(self):
+        kept = "status:429 exit code:137 error[E0308] PID:4242 /dev/null newt solve"
+        self.assertEqual(scrub(kept, (set(), set(), None)), kept)
+        self.assertEqual(scrub("at src/main.rs:42", (set(), set(), None)), "at src/main.rs:42")  # the lookbehind
+        self.assertEqual(scrub("at main.rs:42:5", (set(), set(), None)), "at main.rs:42:5")  # the port lookahead
+        self.assertEqual(scrub("at localhost:8080 and [fd00::2]:80", (set(), set(), None)), "at <redacted> and <redacted>")
+
+    def test_short_or_root_local_names_are_not_literals_and_the_hostname_is_a_whole_word(self):
+        with mock.patch.dict("os.environ", {"TB_LOCAL_BASE_URL": "http://203.0.113.7:8080/v1"}), \
+                mock.patch.object(tb_campaign.getpass, "getuser", return_value="newt"), \
+                mock.patch.object(tb_campaign.socket, "gethostname", return_value="gpubox1"), \
+                mock.patch.object(tb_campaign.Path, "home", return_value=Path("/")):
+            literals = tb_campaign.local_literals()
+        self.assertEqual(literals, ({"203.0.113.7"}, {"gpubox1"}, None))
+        self.assertEqual(scrub("newt solve on gpubox1, not gpubox10 or my-gpubox1, cwd /", literals),
+                         "newt solve on <redacted>, not gpubox10 or my-gpubox1, cwd /")
+
+    def test_an_unencodable_endpoint_host_is_kept_as_a_literal(self):
+        tb_campaign._addresses.cache_clear()
+        try:
+            with mock.patch.object(tb_campaign.socket, "getaddrinfo", side_effect=UnicodeError("label too long")):
+                self.assertEqual(tb_campaign._addresses("x" * 64 + ".invalid"), {"x" * 64 + ".invalid"})
+        finally:
+            tb_campaign._addresses.cache_clear()
+
+    def test_the_cell_line_command_writes_a_skipped_cell_through_the_same_redaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cell.json").write_text(json.dumps({**self.CELL, "skipped": "router at 203.0.113.7 said no"}))
+            env = {"PATH": "/usr/bin:/bin", "TB_LOCAL_BASE_URL": "http://203.0.113.7:8080/v1"}
+            subprocess.run([sys.executable, str(HARBOR / "tb_campaign.py"), "cell-line", str(Path(tmp) / "cell.json"), tmp],
+                           check=True, env=env, cwd=HARBOR)
+            cell = json.loads((Path(tmp) / "cells.jsonl").read_text())
+        self.assert_clean(json.dumps(cell))
+        self.assertEqual((cell["model"], cell["job"], cell["skipped"], cell["observed"]),
+                         ("coder-1.2.3.4", "coder-1.2.3.4__newt", "router at <redacted> said no", 0))
 
 
 if __name__ == "__main__":

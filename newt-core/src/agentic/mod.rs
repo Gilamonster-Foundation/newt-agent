@@ -34,6 +34,7 @@ mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
+pub use generation_policy::validate_output_allowance;
 mod git_tool;
 pub mod openai_sse;
 pub(crate) mod self_verify;
@@ -245,6 +246,10 @@ pub use scheduled::{
 };
 pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
+};
+pub use self_verify::{
+    enabled as self_verify_enabled, outcomes_enabled as verify_outcomes_requested,
+    verification_gate_present, verification_receipt,
 };
 pub use semantic::{
     chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,
@@ -1160,6 +1165,11 @@ pub struct ChatCtx<'a> {
     /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. All smart
     /// providers report terminal control outcomes, including Responses.
     pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
+    /// Out-param: set when the turn ended at its tool-round cap, whatever end
+    /// reason that exit reports. #2374: a result-aware cap exit reports
+    /// `RepairExhausted`, and the TUI still pauses the objective there. `None`
+    /// ⇒ not reported.
+    pub round_cap_hit: Option<&'a mut bool>,
     /// Out-param: per-turn observability for the solve contract (W0 #1511) —
     /// the backend-reported served `model` plus per-round tool-call parse
     /// signals ([`observability::ParseSignal`]). Lent fresh per turn like
@@ -1252,6 +1262,11 @@ pub struct ChatCtx<'a> {
     /// the Lean TUI and headless callers pass `None` and retain the static
     /// completion-only output from `display::spill_view_lines`.
     pub completed_spill_renderer: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
+    /// #2315: the operator asked for result-aware verification
+    /// (`NEWT_VERIFY_OUTCOMES`). The host reads it once when it builds the
+    /// context; the loop never reads the process env for it. The gate also
+    /// needs `NEWT_SELF_VERIFY` on.
+    pub verify_outcomes: bool,
     /// The injected embedded-git capability (PR4, #461). `Some` ⇒ the `git`
     /// tool is advertised and dispatches through it (`LocalGitTool` in
     /// `newt-git`, injected by the binary). `None` (every headless / eval
@@ -1816,6 +1831,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    // #2312: the one dispatch entry refuses an unusable explicit allowance
+    // before any wire is chosen, for every host.
+    validate_output_allowance(ctx.output_allowance, ctx.num_ctx)?;
     // Anthropic speaks its own wire (/v1/messages) — request, tool_use, and
     // usage shapes all differ — so it gets its own loop (the fourth parallel
     // loop beside Ollama / Chat Completions / Responses).
@@ -1858,6 +1876,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .await;
     }
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -1917,6 +1936,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -2043,7 +2063,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -2066,7 +2090,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #2312: no cognition table on this wire — only an explicit allowance reserves.
     let mut effective_input_ceiling =
         num_ctx_input_ceiling(num_ctx, input_ceiling_pct, output_allowance);
-    observability::observe_output_allowance(&mut solve_obs, output_allowance, false);
+    // An explicit allowance rides every request as `num_predict`.
+    let ollama_options = ollama_options(num_ctx, output_allowance);
+    observability::observe_output_allowance(
+        &mut solve_obs,
+        output_allowance,
+        output_allowance.is_some(),
+    );
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
@@ -2546,22 +2576,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if let Some(harness) = smart_harness {
                 harness.record_messages(&messages)?;
             }
-            let mut body_no_stream = if let Some(ctx_size) = num_ctx {
-                serde_json::json!({
-                    "model": model,
-                    "messages": messages,
-                    "stream": false,
-                    "tools": tools.clone(),
-                    "options": { "num_ctx": ctx_size },
-                })
-            } else {
-                serde_json::json!({
-                    "model": model,
-                    "messages": messages,
-                    "stream": false,
-                    "tools": tools.clone(),
-                })
-            };
+            let mut body_no_stream = serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "stream": false,
+                "tools": tools.clone(),
+            });
+            if let Some(options) = &ollama_options {
+                body_no_stream["options"] = options.clone();
+            }
             // Drop tools entirely for a model that rejects them (set below on a
             // "does not support tools" 400) — an empty array still trips strict
             // models, so remove the key.
@@ -2602,8 +2625,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 "request failed",
                             )
                             .await?;
-                            let json =
-                                smart_harness::response(resp, smart_harness, "Ollama").await?;
+                            let json = smart_harness::response(resp, smart_harness, "Ollama")
+                                .await
+                                .inspect_err(|error| {
+                                    attempt_capture::failed(attempts, attempt.as_ref(), error);
+                                })?;
                             attempt_capture::complete(
                                 attempts,
                                 attempt.as_ref(),
@@ -3032,13 +3058,22 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&probe_content, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    &messages,
-                    workspace,
-                    task,
-                    more && smart_verify,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &messages,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &probe_content,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         messages
@@ -3154,6 +3189,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 )
                             }));
                             unverified_exec_blocker_nudges += 1;
+                            // #2313: the rejected reply was still generated.
+                            accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
                         }
                         if action_nudges && round + 1 < current_tool_round_limit {
@@ -3893,6 +3930,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -3948,6 +3988,18 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage the plan/state ledger + the failed-call count so the
     // summary reflects progress and the fallback advice is honest.
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            smart_harness.is_some() && smart_verify,
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -3963,9 +4015,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -3983,7 +4035,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         ),
         calibration: cal,
         estimation,
-        ollama_num_ctx: num_ctx,
+        ollama_options,
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
@@ -4003,7 +4055,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, streamed, usage, hallucination_count))
 }
@@ -4056,12 +4108,23 @@ struct RepeatCallGuard {
     repeat_memos: std::collections::HashMap<String, RepeatMemo>,
     /// `name` → how many times it has failed this run (any args).
     fails_by_tool: std::collections::HashMap<String, usize>,
+    /// #2374: result-aware verification is on, so a failure memo describes the
+    /// tree it ran against and a workspace change releases it. Off (the
+    /// default path) keeps every failure memo for the turn.
+    clears_failures_on_change: bool,
 }
 
 impl RepeatCallGuard {
     /// How many consecutive failures of one tool before the steer escalates to
     /// "stop using it".
     const ESCALATE_AFTER: usize = 2;
+
+    fn for_verification(result_aware: bool) -> Self {
+        Self {
+            clears_failures_on_change: result_aware,
+            ..Self::default()
+        }
+    }
 
     fn key(name: &str, args: &serde_json::Value) -> String {
         // The model emits byte-identical args when it loops (confirmed by the
@@ -4202,6 +4265,13 @@ impl RepeatCallGuard {
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+        // #2374: in result-aware mode a failure memo describes the tree it ran
+        // against. After a real workspace change the identical call is the
+        // re-check a repair nudge asks for, so the memo is released.
+        if self.clears_failures_on_change && ok && may_change_workspace(name, args) {
+            self.repeat_memos
+                .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
+        }
         if name == "update_plan" && ok {
             self.repeat_memos.retain(|key, _| {
                 !key.starts_with("plan_get\u{1}") && !key.starts_with("update_plan\u{1}")
@@ -4704,6 +4774,119 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
 /// counted there.
 pub fn is_workspace_write_call(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
+}
+
+/// #2374: built-in tools that never touch workspace files: harness state,
+/// plans, retrieval, operator prompts, mode switches.
+fn is_workspace_inert_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "code_search"
+            | "where_is"
+            | "tool_search"
+            | "memory_fetch"
+            | "re_read"
+            | "resume_context"
+            | "experience_recall"
+            | "experience_record"
+            | "state_get"
+            | "state_set"
+            | "state_clear"
+            | "plan_get"
+            | "update_plan"
+            | "render_report"
+            | "request_permissions"
+            | "request_user_input"
+            | "select_operating_mode"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+    ) || tools::is_context_remaining_call(name)
+}
+
+/// #2374: simple shell commands that only read. Used only by result-aware
+/// verification, so the default path's probe steering is unchanged. It differs
+/// from [`is_read_only_shell_probe`]'s list on purpose: `sed` is left out,
+/// because `-ri`, `-Ei`, `--in-place` and its `w` command all write.
+const VERIFICATION_READ_PROGRAMS: &[&str] = &[
+    "grep",
+    "rg",
+    "head",
+    "tail",
+    "wc",
+    "pwd",
+    "cat",
+    "ls",
+    "find",
+    "stat",
+    "file",
+    "tree",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+];
+
+/// #2374: the tool a call reaches: a rewrite alias's canonical name, the name
+/// itself otherwise, and `None` for a corrective alias, which only returns
+/// coaching text.
+pub(crate) fn dispatched_tool_name(name: &str) -> Option<&str> {
+    match tools::resolve_tool_alias(name) {
+        Some(tools::AliasOutcome::Correct(_)) => None,
+        Some(tools::AliasOutcome::Rewrite(canonical)) => Some(canonical),
+        None => Some(name),
+    }
+}
+
+/// #2374: whether a call may have changed the workspace: anything that is
+/// neither read-only nor a workspace-inert built-in, judged as the tool it
+/// reaches. Unknown and MCP tools fail closed (they may).
+pub(crate) fn may_change_workspace(name: &str, args: &serde_json::Value) -> bool {
+    let Some(name) = dispatched_tool_name(name) else {
+        return false;
+    };
+    if name == "run_command" {
+        return args["command"]
+            .as_str()
+            .is_none_or(|command| !is_verification_read_command(command));
+    }
+    !is_read_only_call(name, args) && !is_workspace_inert_tool(name)
+}
+
+/// A single simple command that only reads: one of
+/// [`VERIFICATION_READ_PROGRAMS`], with no shell metacharacters and no action
+/// that writes or runs (`find -delete` / `-exec` / `-fprint`, `--output=`,
+/// `tree -o`), however quotes or backslashes spell the token.
+pub(crate) fn is_verification_read_command(command: &str) -> bool {
+    let command = command.trim();
+    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
+    if command.is_empty() || command.contains(SHELL_META) {
+        return false;
+    }
+    let tokens: Vec<String> = command
+        .split_whitespace()
+        .map(|t| t.replace(['"', '\'', '\\'], ""))
+        .collect();
+    let acts = tokens.iter().any(|t| {
+        t.starts_with("--output")
+            || matches!(
+                t.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+    }) || (tokens[0] == "tree" && tokens.iter().any(|t| t == "-o"));
+    if acts {
+        return false;
+    }
+    VERIFICATION_READ_PROGRAMS
+        .iter()
+        .any(|p| command == *p || command.starts_with(&format!("{p} ")))
 }
 
 /// Redact a model-/user-facing string through the session disclosure filter,
@@ -5737,9 +5920,9 @@ struct CapExit {
     request_budget: Option<usize>,
     calibration: f32,
     estimation: crate::tokens::TokenEstimation,
-    /// Ollama must repeat the configured context window on every request,
-    /// including the tools-disabled cap exit. Ignored by OpenAI chat.
-    ollama_num_ctx: Option<u32>,
+    /// Ollama's request `options` (see [`ollama_options`]), repeated on every
+    /// request including the tools-disabled cap exit. Ignored by OpenAI chat.
+    ollama_options: Option<serde_json::Value>,
     /// Learning evidence from fresh counts of this immutable summary request.
     /// Admission still probes anew on every attempt; this is never a count cache.
     prompt_measurement: std::sync::Mutex<Option<context_recovery::PromptMeasurement>>,
@@ -5926,6 +6109,20 @@ impl CapExit {
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
 /// `cap.accumulated` carries usage from the preceding tool-call rounds so it
 /// survives even when this summary request fails.
+/// Ollama's request `options` (#2312): the declared window as `num_ctx` and an
+/// explicit output allowance as `num_predict`, its supported cap field. `None`
+/// when neither applies, so such a body gains no `options` key at all.
+fn ollama_options(num_ctx: Option<u32>, num_predict: Option<u32>) -> Option<serde_json::Value> {
+    let mut options = serde_json::Map::new();
+    if let Some(num_ctx) = num_ctx {
+        options.insert("num_ctx".into(), num_ctx.into());
+    }
+    if let Some(num_predict) = num_predict {
+        options.insert("num_predict".into(), num_predict.into());
+    }
+    (!options.is_empty()).then_some(serde_json::Value::Object(options))
+}
+
 async fn final_summary_ollama(
     client: &reqwest::Client,
     chat_url: &str,
@@ -5944,8 +6141,8 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
-    if let Some(num_ctx) = cap.ollama_num_ctx {
-        body["options"] = serde_json::json!({ "num_ctx": num_ctx });
+    if let Some(options) = &cap.ollama_options {
+        body["options"] = options.clone();
     }
     cap.finish(
         chat_url,
@@ -6082,6 +6279,7 @@ fn enforce_counted_budget(
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
 /// `accumulated` carries usage from the preceding tool-call rounds.
+#[allow(clippy::too_many_arguments)]
 async fn final_summary_openai(
     clients: (&reqwest::Client, &reqwest::Client),
     chat_url: &str,
@@ -6090,6 +6288,7 @@ async fn final_summary_openai(
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
@@ -6107,7 +6306,7 @@ async fn final_summary_openai(
     generation_policy.apply_to_chat_completions_body(&mut body);
     cap.finish_with_decoder(
         chat_url,
-        None,
+        attempts,
         || async {
             let count =
                 count_openai_request(count_client, chat_url, api_key, &body, cap.request_budget)
@@ -6184,6 +6383,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -6214,7 +6414,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // into a local generation policy.
         cognition,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -6245,6 +6445,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -6370,6 +6571,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
@@ -6386,7 +6597,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -6488,6 +6703,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // verification the workspace ships before letting it conclude. Capped so a
     // model that refuses to verify still ends the turn.
     let mut self_verify_nudges: usize = 0;
+    let mut verification_nudges: usize = 0;
     const SELF_VERIFY_CAP: usize = 2;
     // Pending-plan final-answer gate counter (mirror of the Ollama path).
     let mut pending_plan_nudges: usize = 0;
@@ -6907,19 +7123,25 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         // W0 (#1511): classify while the error is TYPED — the
                         // DispatchError keeps the historical message text and carries
                         // the structural class to the driver boundary.
-                        let resp = req.send().await.map_err(|e| {
-                            anyhow::Error::new(observability::DispatchError::from_reqwest(
-                                "request failed",
-                                e,
-                            ))
-                        })?;
-                        smart_harness::response_with_decoder(
+                        let (resp, attempt) =
+                            attempt_capture::send(attempts, "primary", req, "request failed")
+                                .await?;
+                        let json = smart_harness::response_with_decoder(
                             resp,
                             smart_harness,
                             "inference endpoint",
                             smart_harness::decode_openai_response,
                         )
                         .await
+                        .inspect_err(|error| {
+                            attempt_capture::failed(attempts, attempt.as_ref(), error);
+                        })?;
+                        attempt_capture::complete(
+                            attempts,
+                            attempt.as_ref(),
+                            openai_usage(&json["usage"]),
+                        );
+                        Ok(json)
                     }
                 },
                 |attempt, delay, error| {
@@ -7443,13 +7665,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&oa_content, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    &messages,
-                    workspace,
-                    task,
-                    more && smart_verify,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &messages,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &oa_content,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         messages
@@ -7685,7 +7916,39 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // mirrors the narration/stale-file nudges: on the FINAL round a
             // verify nudge would burn the pending answer into a cap-exit with
             // zero rounds left to actually run anything — step aside and accept.
-            if self_verify::enabled()
+            // #2315: in the opt-in result-aware mode the same position decides
+            // from observed outcomes instead (A12: one decision, three callers).
+            let mut verification_stop = None;
+            if verification.result_aware() && action_nudges && !content.is_empty() {
+                match self_verify::conclude_turn(
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task: active_task,
+                        rounds_left: round + 1 < current_tool_round_limit,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    verification_nudges,
+                )
+                .await
+                {
+                    self_verify::Decision::Nudge(nudge) => {
+                        strip_trailing_nudge_exchange(&mut messages);
+                        messages
+                            .push(serde_json::json!({ "role": "assistant", "content": content }));
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
+                        }));
+                        verification_nudges += 1;
+                        continue 'round_loop;
+                    }
+                    self_verify::Decision::Stop(reason) => verification_stop = Some(reason),
+                    self_verify::Decision::Accept => {}
+                }
+            } else if self_verify::enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
@@ -7741,6 +8004,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             } else {
                 crate::TurnEndReason::Completed
             };
+            let accepted_reason = verification_stop.unwrap_or(accepted_reason);
             if debug && accepted_reason != crate::TurnEndReason::Completed {
                 print_debug(
                     &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
@@ -7828,7 +8092,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }
                 // A missing/blank/duplicate `tool_call_id`: a tool result cannot
                 // be correlated. Abort the turn — do not fabricate an id.
-                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+                return Err(tools::uncorrelatable_tool_calls(&reason));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
                 if let Some(harness) = smart_harness {
@@ -8101,6 +8365,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -8148,6 +8415,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            if smart_harness.is_some() {
+                smart_verify
+            } else {
+                action_nudges
+            },
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -8163,9 +8446,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -8183,7 +8466,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         ),
         calibration: cal,
         estimation,
-        ollama_num_ctx: None,
+        ollama_options: None,
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
@@ -8195,6 +8478,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         trimmed,
         generation_policy,
         &cap,
+        attempts,
     );
     let Some(result) = cancellable(cancel, summary).await else {
         cap.learn_measurement(compress_state)?;
@@ -8220,7 +8504,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, streamed, usage, hallucination_count))
 }
@@ -8293,6 +8577,7 @@ async fn anthropic_dispatch_round(
     messages: &[serde_json::Value],
     stream: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<Option<(anthropic_wire::AnthropicRound, bool)>> {
     if !stream {
         let result = cancellable(
@@ -8309,13 +8594,11 @@ async fn anthropic_dispatch_round(
                     };
                     // W0 (#1511): classify while the error is TYPED — mirrors
                     // the OpenAI path's dispatch site.
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "request failed",
-                            e,
-                        ))
-                    })?;
-                    smart_harness::response(resp, d.smart_harness, "inference endpoint").await
+                    let (resp, attempt) =
+                        attempt_capture::send(attempts, "primary", req, "request failed").await?;
+                    let json = smart_harness::response(resp, d.smart_harness, "inference endpoint")
+                        .await?;
+                    Ok((json, attempt))
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -8325,7 +8608,11 @@ async fn anthropic_dispatch_round(
         .await;
         return match result {
             None => Ok(None),
-            Some(Ok(json)) => Ok(Some((anthropic_wire::parse_messages_reply(&json), false))),
+            Some(Ok((json, attempt))) => {
+                let round = anthropic_wire::parse_messages_reply(&json);
+                attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
+                Ok(Some((round, false)))
+            }
             Some(Err(e)) => Err(e),
         };
     }
@@ -8342,12 +8629,9 @@ async fn anthropic_dispatch_round(
                 || async {
                     let req = anthropic_headers(d.stream_client.post(d.messages_url), d.api_key)
                         .json(body);
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "stream request failed",
-                            e,
-                        ))
-                    })?;
+                    let (resp, attempt) =
+                        attempt_capture::send(attempts, "primary", req, "stream request failed")
+                            .await?;
                     if !resp.status().is_success() {
                         let status = resp.status();
                         let (bytes, read_error) = crate::retry::read_response_bytes(resp).await;
@@ -8360,7 +8644,7 @@ async fn anthropic_dispatch_round(
                         ))
                         .into());
                     }
-                    Ok(resp)
+                    Ok((resp, attempt))
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -8372,6 +8656,7 @@ async fn anthropic_dispatch_round(
             None => return Ok(None),
             Some(r) => r?,
         };
+        let (resp, attempt) = resp;
 
         // The ONE spinner (`newt_core::tty`), gated on a colour terminal with
         // thinking shown; the accumulated round text stays RAW (it is
@@ -8399,16 +8684,22 @@ async fn anthropic_dispatch_round(
         let mut anth_reason = ReasoningTrickle::default();
         let mut started = false;
         let mut transport_break: Option<String> = None;
+        let mut interrupted = false;
+        // The bytes of a character that has only half arrived. See `decode_chunk`.
+        let mut carry: Vec<u8> = Vec::new();
         let mut resp = resp;
         while !acc.is_done() {
             match cancellable(cancel, resp.chunk()).await {
                 // Interrupted: stop reading and keep what already streamed.
-                None => break,
+                None => {
+                    interrupted = true;
+                    break;
+                }
                 Some(Ok(Some(chunk))) => {
-                    // Lossy UTF-8 into the accumulator's ROLLING line buffer —
-                    // an SSE `data:` line routinely splits across chunks, so a
-                    // per-chunk `lines()` split would drop events.
-                    for action in acc.feed(&String::from_utf8_lossy(&chunk)) {
+                    // Two rolling buffers: `decode_chunk` carries half a
+                    // CHARACTER to the next chunk, and the accumulator carries
+                    // half a `data:` LINE, since both straddle chunk boundaries.
+                    for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
                                 if !started {
@@ -8465,6 +8756,7 @@ async fn anthropic_dispatch_round(
         if started && md.is_none() {
             println!();
         }
+        let done = acc.is_done();
         let round = acc.finish();
 
         // #640 mid-stream-break policy (mirrors the Ollama path): a stream
@@ -8472,6 +8764,19 @@ async fn anthropic_dispatch_round(
         // partial text with a notice; before any visible output it converts
         // to the retryable error shape and this round is re-issued.
         let break_error = round.error.clone().or(transport_break);
+        // #2313: ok only for a stream that reached `message_stop` with no error
+        // and no interrupt; a cut stream, an error event, or an interrupt is
+        // failed. Reported usage attaches either way.
+        attempt_capture::finish(
+            attempts,
+            attempt.as_ref(),
+            if done && break_error.is_none() && !interrupted {
+                crate::attempts::AttemptState::Ok
+            } else {
+                crate::attempts::AttemptState::Failed
+            },
+            round.usage,
+        );
         if let Some(err) = break_error {
             let shaped: anyhow::Error = observability::DispatchError::http_status(format!(
                 "inference endpoint 529: mid-stream error: {err}"
@@ -8508,6 +8813,7 @@ async fn anthropic_dispatch_round(
 /// `accumulated` carries usage from the preceding tool-call rounds. Mirrors
 /// [`final_summary_openai`]: cap-exit nudge appended, same preflight, and
 /// `stream:false` with NO tools advertised so the model cannot emit tool_use.
+#[allow(clippy::too_many_arguments)]
 async fn final_summary_anthropic(
     client: &reqwest::Client,
     messages_url: &str,
@@ -8516,6 +8822,7 @@ async fn final_summary_anthropic(
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
@@ -8536,7 +8843,7 @@ async fn final_summary_anthropic(
     );
     cap.finish(
         messages_url,
-        None,
+        attempts,
         || async { Ok(anthropic_headers(client.post(messages_url), api_key).json(&body)) },
         "inference endpoint",
         estimate_value_tokens(&body, cap.estimation),
@@ -8558,6 +8865,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -8588,7 +8896,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // the output cap projects onto this wire today (see below).
         cognition,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -8619,6 +8927,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -8771,6 +9080,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
     if note_sink.is_some() {
@@ -8787,7 +9106,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -8872,6 +9195,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut readonly_completion_retried = false;
     // Self-verify gate (#23) — mirrors the OpenAI path.
     let mut self_verify_nudges: usize = 0;
+    let mut verification_nudges: usize = 0;
     const SELF_VERIFY_CAP: usize = 2;
     // Pending-plan final-answer gate counter (mirrors the OpenAI path).
     let mut pending_plan_nudges: usize = 0;
@@ -9182,9 +9506,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 use_tools.then_some(tools_anthropic.as_slice()),
                 streaming_enabled,
             );
-            let dispatch =
-                anthropic_dispatch_round(&dispatcher, &body, &messages, streaming_enabled, cancel)
-                    .await;
+            let dispatch = anthropic_dispatch_round(
+                &dispatcher,
+                &body,
+                &messages,
+                streaming_enabled,
+                cancel,
+                attempts,
+            )
+            .await;
             match dispatch {
                 // Interrupted mid-dispatch: same contract as the round-
                 // boundary checkpoint (mirrors the Ollama raced probe).
@@ -9202,6 +9532,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     // pauses cannot spin the loop.
                     if reply.stop_reason.as_deref() == Some("pause_turn") && !pause_turn_retried {
                         pause_turn_retried = true;
+                        // #2313: the paused reply generated tokens the turn pays for.
+                        accumulated_usage = merge_round_usage(accumulated_usage, reply.usage);
                         if debug {
                             print_debug("pause_turn — re-dispatching the same history once", color);
                         }
@@ -9676,13 +10008,22 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&oa_content, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    &messages,
-                    workspace,
-                    task,
-                    more && smart_verify,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &messages,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &oa_content,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         messages
@@ -9904,7 +10245,39 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 continue 'round_loop;
             }
             // Self-verify gate (#23) — mirrors the OpenAI path.
-            if self_verify::enabled()
+            // #2315: in the opt-in result-aware mode the same position decides
+            // from observed outcomes instead (A12: one decision, three callers).
+            let mut verification_stop = None;
+            if verification.result_aware() && action_nudges && !content.is_empty() {
+                match self_verify::conclude_turn(
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task: active_task,
+                        rounds_left: round + 1 < current_tool_round_limit,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    verification_nudges,
+                )
+                .await
+                {
+                    self_verify::Decision::Nudge(nudge) => {
+                        strip_trailing_nudge_exchange(&mut messages);
+                        messages
+                            .push(serde_json::json!({ "role": "assistant", "content": content }));
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
+                        }));
+                        verification_nudges += 1;
+                        continue 'round_loop;
+                    }
+                    self_verify::Decision::Stop(reason) => verification_stop = Some(reason),
+                    self_verify::Decision::Accept => {}
+                }
+            } else if self_verify::enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
@@ -9956,6 +10329,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             } else {
                 crate::TurnEndReason::Completed
             };
+            let accepted_reason = verification_stop.unwrap_or(accepted_reason);
             if debug && accepted_reason != crate::TurnEndReason::Completed {
                 print_debug(
                     &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
@@ -10025,7 +10399,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 }
                 // A missing/blank/duplicate id: a tool result cannot be
                 // correlated. Abort the turn — do not fabricate an id.
-                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+                return Err(tools::uncorrelatable_tool_calls(&reason));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
                 if let Some(harness) = smart_harness {
@@ -10285,6 +10659,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -10335,6 +10712,22 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            if smart_harness.is_some() {
+                smart_verify
+            } else {
+                action_nudges
+            },
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -10350,9 +10743,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -10370,7 +10763,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         ),
         calibration: cal,
         estimation,
-        ollama_num_ctx: None,
+        ollama_options: None,
         prompt_measurement: Default::default(),
         fell_back: Default::default(),
     };
@@ -10382,6 +10775,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         trimmed,
         generation_policy,
         &cap,
+        attempts,
     )
     .await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -10399,7 +10793,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, streamed, usage, hallucination_count))
 }
@@ -10550,6 +10944,7 @@ pub async fn openai_responses_complete_with_prompt(
 /// #1528 B5: this takes a [`ValidatedResponsesRequest`] — a newtype with no public
 /// constructor other than a successful [`validate_responses_request`] — so an
 /// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_responses_json(
     client: &reqwest::Client,
     url: &str,
@@ -10558,13 +10953,15 @@ async fn dispatch_responses_json(
     retry: &RetryPolicy,
     color: bool,
     smart_harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<serde_json::Value> {
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
+) -> anyhow::Result<(serde_json::Value, Option<crate::attempts::AttemptKey>)> {
     let body = validated.body();
     let body_bytes = smart_harness
         .map(|h| h.request(body, "responses"))
         .transpose()?;
-    let result = dispatch_json(
+    dispatch_with_decoder(
         retry,
+        attempts,
         || async {
             let mut req = match &body_bytes {
                 Some(bytes) => client
@@ -10578,39 +10975,15 @@ async fn dispatch_responses_json(
             }
             Ok(req)
         },
+        // Keep the status prefix exact: retry classification reads the message.
         "inference endpoint",
         |attempt, delay, error| {
             print_retry_indicator(attempt, retry.max_retries, delay, error, color);
         },
         smart_harness,
-    )
-    .await?;
-    Ok(result)
-}
-
-/// Shared transport from the Responses dispatcher; build a fresh request per attempt.
-/// Keep the status prefix exact: retry classification reads the resulting message.
-async fn dispatch_json<Fut>(
-    retry: &RetryPolicy,
-    request: impl Fn() -> Fut,
-    http_error_prefix: &str,
-    on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
-    smart_harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<serde_json::Value>
-where
-    Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
-{
-    dispatch_with_decoder(
-        retry,
-        None,
-        request,
-        http_error_prefix,
-        on_retry,
-        smart_harness,
         |bytes| Ok(serde_json::from_slice(bytes)?),
     )
     .await
-    .map(|(json, _)| json)
 }
 
 /// Send with retries and decode. With an attempt scope, every try is one
@@ -10641,12 +11014,52 @@ where
                 http_error_prefix,
                 decode,
             )
-            .await?;
+            .await
+            .inspect_err(|error| attempt_capture::failed(attempts, attempt.as_ref(), error))?;
             Ok((json, attempt))
         },
         on_retry,
     )
     .await
+}
+
+/// Record a decoded 2xx Responses reply's attempt by the #2313 state rule: a
+/// complete terminal response is ok whatever its content shape — an answer, a
+/// refusal, a truncation (`incomplete`), or content the loop rejects: a mixed
+/// refusal and tool calls (whatever the status, since it is real output), or
+/// malformed content under status `completed`. A failed, provider-error or
+/// non-terminal body is failed, and so is a body with neither a status nor any
+/// output: that is not a Responses reply at all. How the loop handles the content is
+/// separate from the attempt state. The usage the body reported attaches either
+/// way.
+fn complete_responses_attempt(
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
+    attempt: Option<&crate::attempts::AttemptKey>,
+    json: &serde_json::Value,
+    decoded: &Result<
+        crate::responses_wire::DecodedResponse,
+        crate::responses_wire::ResponseDecodeError,
+    >,
+) {
+    use crate::attempts::AttemptState;
+    use crate::responses_wire::ResponseDecodeError as E;
+    // Every variant is named, so a new one cannot default to ok.
+    let state = match decoded {
+        Ok(_)
+        | Err(E::Refused { .. } | E::Incomplete { .. } | E::MixedRefusalAndToolCalls { .. }) => {
+            AttemptState::Ok
+        }
+        Err(E::Malformed(_)) if json["status"].as_str() == Some("completed") => AttemptState::Ok,
+        Err(E::Malformed(_) | E::ProviderError(_) | E::Failed(_) | E::NonTerminal(_)) => {
+            AttemptState::Failed
+        }
+    };
+    attempt_capture::finish(
+        attempts,
+        attempt,
+        state,
+        crate::responses_wire::decode_usage(&json["usage"]),
+    );
 }
 
 async fn openai_responses_complete_with_prompt_and_artifacts(
@@ -10658,6 +11071,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -10685,7 +11099,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         cognition,
         chat_completions_capability: _,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
@@ -10721,6 +11135,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -10810,6 +11225,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
@@ -10915,7 +11340,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -11005,7 +11434,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // out and lets `round` advance, so recovery never consumes a tool-capable
         // round (critical at max_tool_rounds == 1 or near the cap): the recovered
         // request is re-sent WITH tools, never demoted to the tools-disabled summary.
-        let json = loop {
+        let (json, attempt) = loop {
             // #1528 B3: PROACTIVE pre-dispatch compaction — when the request is
             // LOCALLY known to exceed the budget, compact BEFORE dispatch instead of
             // paying a round-trip to learn it from a cw-400. Reuses the ONE
@@ -11100,6 +11529,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &retry,
                 color,
                 smart_harness,
+                attempts,
             )
             .await;
 
@@ -11291,7 +11721,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // model's final answer for this turn; every other error (provider error,
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
-        let decoded = match crate::responses_wire::decode_response(&json) {
+        let decoded = crate::responses_wire::decode_response(&json);
+        complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
+        let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
                 if smart_harness.is_some() =>
@@ -11358,13 +11790,22 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&text, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    &input,
-                    workspace,
-                    task,
-                    more && smart_verify,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &input,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &text,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         input.extend(echo.clone());
@@ -11480,7 +11921,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 // cannot be correlated. Abort the turn — fabricating an id only
                 // produces a provider 400 or a silent mispairing. Nothing was
                 // echoed, so no malformed follow-up is dispatched.
-                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+                return Err(tools::uncorrelatable_tool_calls(&reason));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
                 if let Some(harness) = smart_harness {
@@ -11741,6 +12182,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -11781,6 +12225,18 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // count does not include this extra tools-disabled completion.
     let cap_accumulated = accumulated_usage;
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            smart_harness.is_some() && smart_verify,
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_responses_messages(instructions.as_deref(), &input)?;
         let text = cap_exit_fallback(
@@ -11796,9 +12252,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -11899,7 +12355,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -11910,7 +12366,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // were spent.
     let summary_estimate =
         estimate_responses_request_tokens(instructions.as_deref(), &input, None, estimation);
-    let json = match dispatch_responses_json(
+    let (json, attempt) = match dispatch_responses_json(
         &client,
         &responses_url,
         api_key,
@@ -11918,10 +12374,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &retry,
         color,
         smart_harness,
+        attempts,
     )
     .await
     {
-        Ok(json) => json,
+        Ok(dispatched) => dispatched,
         Err(error) => {
             if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded {
                 context_recovery::terminal_optional(
@@ -11950,7 +12407,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -11959,7 +12416,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // answer. At this already-reached cap, however, the deterministic progress
     // handoff is still a successful paused turn so the interactive caller can
     // persist it and retain the continuation link.
-    let decoded = match crate::responses_wire::decode_response(&json) {
+    let decoded = crate::responses_wire::decode_response(&json);
+    complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
+    let decoded = match decoded {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
             accumulated_usage = merge_round_usage(accumulated_usage, usage);
@@ -11978,7 +12437,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -12000,7 +12459,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -12020,7 +12479,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, false, accumulated_usage, hallucination_count))
 }
@@ -12193,6 +12652,53 @@ impl ReasoningTrickle {
             println!("{line}");
         }
         io::stdout().flush().ok();
+    }
+}
+
+/// Decode one wire chunk, holding an INCOMPLETE trailing character back for
+/// the next one.
+///
+/// It replaces a per-chunk `String::from_utf8_lossy`, which was wrong for
+/// exactly the reason a per-chunk `lines()` split is wrong: `reqwest` splits
+/// where the socket did, not where the protocol did. A multi-byte character
+/// therefore straddles a chunk boundary whenever the boundary happens to fall
+/// inside it — and lossy decoding replaces the half that arrived with U+FFFD.
+/// That corruption is silent and permanent: the mangled text is what gets
+/// printed, returned, persisted, and re-sent to the model. Where the boundary
+/// falls is a function of machine load, so the same reply is clean on an idle
+/// box and mangled on a busy one; `café` arrives as `caf\u{FFFD}\u{FFFD}`.
+///
+/// Only a TRUNCATED tail is carried (`Utf8Error::error_len() == None`).
+/// Genuinely invalid bytes are consumed lossily and the loop continues, so a
+/// server emitting garbage cannot grow `carry` without bound or stall the
+/// stream waiting for a continuation that will never come.
+fn decode_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    carry.extend_from_slice(chunk);
+    let mut out = String::new();
+    loop {
+        let err = match std::str::from_utf8(carry) {
+            Ok(s) => {
+                out.push_str(s);
+                carry.clear();
+                return out;
+            }
+            Err(e) => e,
+        };
+        let good = err.valid_up_to();
+        // Valid by construction, so this is a decode and never a replacement.
+        out.push_str(&String::from_utf8_lossy(&carry[..good]));
+        match err.error_len() {
+            // Cut at the boundary: the rest is in the next chunk.
+            None => {
+                carry.drain(..good);
+                return out;
+            }
+            // Not a cut — actually invalid. Spend it and keep going.
+            Some(n) => {
+                carry.drain(..good + n);
+                out.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
     }
 }
 

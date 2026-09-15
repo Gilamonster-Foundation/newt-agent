@@ -185,12 +185,24 @@ fn round_cap_pause_footer() -> &'static str {
     "⏸ If work remains, reply `continue` to resume this objective, or use `/rounds <n>` first to change the per-turn limit."
 }
 
+/// Whether a turn paused its objective at the round cap: a `RoundCap` exit, or
+/// (#2374) a result-aware cap exit that reports `RepairExhausted` because a
+/// check still failed when the rounds ran out.
+fn paused_at_round_cap(end_reason: Option<newt_core::TurnEndReason>, at_cap: bool) -> bool {
+    end_reason == Some(newt_core::TurnEndReason::RoundCap)
+        || (at_cap && end_reason == Some(newt_core::TurnEndReason::RepairExhausted))
+}
+
 /// The core handoff is shared by TUI, solve, and web callers, so the interactive
 /// continuation affordance belongs here. Returning the decorated value (rather
 /// than printing a second-only notice) ensures conversation persistence and
 /// memory see exactly what the operator saw.
-fn decorate_round_cap_reply(reply: &str, end_reason: Option<newt_core::TurnEndReason>) -> String {
-    if end_reason != Some(newt_core::TurnEndReason::RoundCap) {
+fn decorate_round_cap_reply(
+    reply: &str,
+    end_reason: Option<newt_core::TurnEndReason>,
+    at_cap: bool,
+) -> String {
+    if !paused_at_round_cap(end_reason, at_cap) {
         return reply.to_string();
     }
     let footer = round_cap_pause_footer();
@@ -725,6 +737,7 @@ fn persist_incomplete_turn(
     turn_tool_events: &[newt_core::ToolEvent],
     turn_phantom_reaches: &[newt_core::PhantomReach],
     usage: Option<newt_core::TokenUsage>,
+    attempts: newt_core::attempts::UsageTotals,
     hallucinations: u32,
     end_reason: newt_core::TurnEndReason,
     elapsed: std::time::Duration,
@@ -750,13 +763,14 @@ fn persist_incomplete_turn(
     let metrics = newt_core::TurnMetrics {
         elapsed_ms: elapsed.as_millis() as u64,
         usage,
-        cost_usd: pricing.estimate_cost(
+        attempts: Some(attempts),
+        cost_usd: pricing.estimate_attempts_cost(
             inf_model,
             newt_core::owned_hosts::inference_is_local(
                 inf_kind == newt_core::BackendKind::Embedded,
                 Some(inf_url),
             ),
-            usage.as_ref(),
+            &attempts,
         ),
         model_id: inf_model.to_string(),
         endpoint: inf_url.to_string(),
@@ -7247,6 +7261,7 @@ fn session_body(
                     // turn's `phantom_reaches` column.
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
                     let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
+                    let mut turn_round_cap_hit = false;
                     // FR-1 part 2 (#997): the active persona's tool allow-list
                     // (its `tools:` front-matter). Threaded into `ChatCtx` so the
                     // loop advertises ONLY these tools and the executor refuses
@@ -7564,6 +7579,9 @@ fn session_body(
                     } else {
                         None
                     };
+                    // #2313: one attempt ledger per turn; its totals price the turn.
+                    let turn_attempts =
+                        std::sync::Mutex::new(newt_core::attempts::AttemptLedger::default());
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -7573,6 +7591,8 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        verify_outcomes: newt_core::agentic::verify_outcomes_requested(),
+                                        round_cap_hit: Some(&mut turn_round_cap_hit),
                                         smart_harness: turn_smart_harness.as_deref(),
                                         rewrites_history: turn_rewrites_history,
                                         url: &inf_url,
@@ -7652,7 +7672,7 @@ fn session_body(
                                             .capability_decision().chat_completions(),
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
-                                        attempt_ledger: None,
+                                        attempt_ledger: Some(&turn_attempts),
                                         reasoning_replay_scope: choice
                                             .capability_decision()
                                             .reasoning_replay_scope(),
@@ -7813,6 +7833,10 @@ fn session_body(
                     surface.turn_ended();
 
                     let elapsed = t0.elapsed();
+                    let turn_attempt_totals = turn_attempts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .totals();
                     erase_line();
                     // Snapshot again regardless of the response shape. A tool
                     // may have committed before cancellation or a later model
@@ -7913,6 +7937,7 @@ fn session_body(
                             &turn_tool_events,
                             &turn_phantom_reaches,
                             cancel_usage,
+                            turn_attempt_totals,
                             cancel_hallucinations,
                             newt_core::TurnEndReason::Cancelled,
                             elapsed,
@@ -7943,10 +7968,14 @@ fn session_body(
                                 // interactive TUI affordance before any display,
                                 // memory sync, artifact, or conversation save so
                                 // the visible and persisted replies are identical.
-                                let reply = decorate_round_cap_reply(&reply, turn_end_reason);
-                                if was_streamed
-                                    && turn_end_reason == Some(newt_core::TurnEndReason::RoundCap)
-                                {
+                                let paused =
+                                    paused_at_round_cap(turn_end_reason, turn_round_cap_hit);
+                                let reply = decorate_round_cap_reply(
+                                    &reply,
+                                    turn_end_reason,
+                                    turn_round_cap_hit,
+                                );
+                                if was_streamed && paused {
                                     // The model text was emitted incrementally;
                                     // only the deterministic footer remains to be
                                     // rendered. Non-streamed replies render the
@@ -8078,13 +8107,14 @@ fn session_body(
                                 let metrics = newt_core::TurnMetrics {
                                     elapsed_ms: elapsed.as_millis() as u64,
                                     usage,
-                                    cost_usd: pricing.estimate_cost(
+                                    attempts: Some(turn_attempt_totals),
+                                    cost_usd: pricing.estimate_attempts_cost(
                                         &inf_model,
                                         newt_core::owned_hosts::inference_is_local(
                                             inf_kind == newt_core::BackendKind::Embedded,
                                             Some(&inf_url),
                                         ),
-                                        usage.as_ref(),
+                                        &turn_attempt_totals,
                                     ),
                                     model_id: inf_model.clone(),
                                     endpoint: inf_url.clone(),
@@ -8093,10 +8123,8 @@ fn session_body(
                                 };
                                 // Iteration #2: keep a RoundCap-interrupted
                                 // objective linkable for the next bare nudge.
-                                interrupted_objective = (turn_end_reason
-                                    == Some(newt_core::TurnEndReason::RoundCap))
-                                .then(|| active_prompt_context.clone())
-                                .flatten();
+                                interrupted_objective =
+                                    paused.then(|| active_prompt_context.clone()).flatten();
                                 let memory_task =
                                     active_operator_task(active_prompt_context.as_ref(), &task);
                                 tokio::task::block_in_place(|| {
@@ -8369,6 +8397,7 @@ fn session_body(
                                     &turn_tool_events,
                                     &turn_phantom_reaches,
                                     None,
+                                    turn_attempt_totals,
                                     0,
                                     newt_core::TurnEndReason::Failed,
                                     elapsed,

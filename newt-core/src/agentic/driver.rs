@@ -312,6 +312,10 @@ pub struct TurnOutcome {
     pub harness_reply: bool,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
+    /// What this turn sent and generated, summed per inference attempt, with
+    /// how many attempts reported no usage (#2313). `usage` above stays the
+    /// context merge (largest prompt, generated tokens).
+    pub attempts: Option<crate::attempts::UsageTotals>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -626,7 +630,11 @@ async fn run_one_turn(
                 turn.into()
             }
         };
+    // #2313: one attempt ledger per turn; its totals ride the outcome.
+    let attempt_ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let ctx = ChatCtx {
+        verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
+        round_cap_hit: None,
         smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
         url: &config.url,
@@ -685,7 +693,7 @@ async fn run_one_turn(
         cognition: runtime.cognition,
         chat_completions_capability: config.chat_completions_capability,
         output_allowance: config.output_allowance,
-        attempt_ledger: None,
+        attempt_ledger: Some(&attempt_ledger),
         reasoning_replay_scope: config.reasoning_replay_scope,
         emits_leading_reasoning: config.emits_leading_reasoning,
         max_tool_rounds: config.max_tool_rounds,
@@ -755,6 +763,12 @@ async fn run_one_turn(
     // responses check — which is exactly why a responses-only model like
     // gpt-5.6-sol was mis-routed to /v1/chat/completions.)
     let dispatch = chat_complete(ctx, &mut mcp).await;
+    let attempts = Some(
+        attempt_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .totals(),
+    );
     // Both arms move `tool_events`/`end_reason` out (only one arm runs). On a
     // failed turn we still return `Ok` carrying the PARTIAL trajectory + the
     // error, rather than `Err` that discards what the agent already did — an
@@ -776,6 +790,7 @@ async fn run_one_turn(
             features,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
+            attempts,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -798,6 +813,7 @@ async fn run_one_turn(
             features,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
+            attempts,
         }),
     }
 }
@@ -974,8 +990,7 @@ mod tests {
         assert_eq!(t[1].role, Role::Assistant);
         assert_eq!(t[1].content, "the driver answered");
 
-        // The backend served exactly the streaming re-issue + probe (the
-        // tools-present probe then the stream); at least one request landed.
+        // The backend served the turn's generation; at least one request landed.
         assert!(served.load(Ordering::SeqCst) >= 1);
         // Drained — back to idle.
         assert!(matches!(driver.poll(), TurnStatus::Idle));
@@ -1043,6 +1058,65 @@ mod tests {
         }
     }
 
+    /// #2313 (b2): a headless turn owns a per-turn attempt ledger and returns
+    /// its totals — what was sent, summed per attempt — beside the context
+    /// merge in `usage`. Attempts equal the wire requests: the accepted answer
+    /// is one generation (#2372).
+    #[tokio::test]
+    async fn a_headless_turn_reports_its_per_attempt_totals() {
+        let body = [
+            r#"{"choices":[{"delta":{"content":"the answer is 4"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":40}}"#,
+            "[DONE]",
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let config = TurnDriverConfig::new(
+            server.uri(),
+            "test-model",
+            BackendKind::Openai,
+            "newt-core-test-workspace-that-does-not-exist",
+        );
+        let mut driver = TurnDriver::new(config);
+        driver.submit("what is two plus two").expect("submit");
+        let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+            panic!("the headless turn did not complete");
+        };
+        let received = server.received_requests().await.expect("journal");
+        assert!(received
+            .iter()
+            .all(|r| r.url.path() == "/v1/chat/completions"));
+        assert_eq!(
+            outcome.usage,
+            Some(TokenUsage {
+                input_tokens: 900,
+                output_tokens: 40
+            }),
+            "usage stays the context merge"
+        );
+        assert_eq!(
+            outcome.attempts,
+            Some(crate::attempts::UsageTotals {
+                attempts: u32::try_from(received.len()).unwrap(),
+                usage_missing: 0,
+                in_tokens: 900,
+                out_tokens: 40,
+                usage_complete: true,
+            })
+        );
+        assert_eq!(received.len(), 1, "one generation for the accepted answer");
+    }
+
     async fn drive_once_capturing(mut driver: TurnDriver) -> (Vec<serde_json::Value>, TurnOutcome) {
         let server = MockServer::start().await;
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1101,9 +1175,10 @@ mod tests {
     }
 
     /// #2312: the driver threads its configured allowance into the turn, and the
-    /// Ollama wire — which sends no cap — reports it as a local reserve.
+    /// Ollama wire sends an explicit one as `options.num_predict`, so the server
+    /// enforces it. With none configured the body gains no `options` at all.
     #[tokio::test]
-    async fn a_configured_output_allowance_is_reserved_locally_on_ollama() {
+    async fn a_configured_output_allowance_is_sent_as_num_predict_on_ollama() {
         let (bare, outcome) =
             drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
         assert_eq!(
@@ -1118,11 +1193,31 @@ mod tests {
             outcome.output_allowance,
             Some(crate::agentic::OutputAllowance {
                 tokens: 3_000,
-                enforced: crate::agentic::Enforcement::Local,
+                enforced: crate::agentic::Enforcement::Server,
             })
         );
+        for body in &bare {
+            assert!(body.get("options").is_none(), "{body}");
+        }
+        for body in &capped {
+            assert_eq!(
+                body["options"],
+                serde_json::json!({"num_predict": 3_000}),
+                "{body}"
+            );
+        }
+        let mut config = cfg("http://placeholder");
+        config.num_ctx = Some(8_192);
+        config.output_allowance = Some(3_000);
+        let (windowed, _) = drive_once_capturing(TurnDriver::new(config)).await;
+        for body in &windowed {
+            assert_eq!(
+                body["options"],
+                serde_json::json!({"num_ctx": 8_192, "num_predict": 3_000}),
+                "{body}"
+            );
+        }
         for body in bare.iter().chain(&capped) {
-            assert!(body["options"].get("num_predict").is_none(), "{body}");
             assert!(body.get("max_tokens").is_none(), "{body}");
         }
     }
@@ -1659,6 +1754,63 @@ mod tests {
             .expect("the failed dispatch is carried on the outcome");
         assert!(err.contains("Ollama 404"), "historical wording kept: {err}");
         assert_eq!(o.error_class, Some(ErrorClass::Model));
+    }
+
+    /// #2318: a 2xx OpenAI reply whose tool call has no id was answered by the
+    /// model, so the turn ends `model_error` on either route the defect takes:
+    /// strict decoding of a stream (a `DispatchError` attached as context, which
+    /// the outcome used to miss and file as `harness_error`), or the batch
+    /// validator's `CorrelationImpossible` arm for a complete JSON reply (the
+    /// arm Anthropic and Responses share). Nothing runs, and nothing is retried.
+    #[tokio::test]
+    async fn a_tool_call_without_an_id_classifies_as_model_error() {
+        use crate::agentic::observability::ErrorClass;
+        let stream = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>();
+        let json = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null,
+            "tool_calls": [{"type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]});
+        for (name, reply, message) in [
+            (
+                "strict stream",
+                ResponseTemplate::new(200).set_body_raw(stream.into_bytes(), "text/event-stream"),
+                "has no ID",
+            ),
+            (
+                "complete JSON",
+                ResponseTemplate::new(200).set_body_json(json),
+                "malformed provider output",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(reply)
+                .mount(&server)
+                .await;
+
+            let mut config = cfg(&server.uri());
+            config.kind = BackendKind::Openai;
+            let mut driver = TurnDriver::new(config);
+            driver.submit("do a thing").expect("submit");
+            let status = pump_to_done(&mut driver).await;
+            let TurnStatus::Completed(o) = status else {
+                panic!("{name}: expected Completed-with-error, got {status:?}");
+            };
+            let err = o.error.expect("the rejection is carried on the outcome");
+            assert!(err.contains(message), "{name}: {err}");
+            assert_eq!(o.error_class, Some(ErrorClass::Model), "{name}");
+            assert_eq!(o.end_reason, None, "{name}");
+            assert!(o.tool_events.is_empty(), "{name}: nothing ran");
+            let posts = server.received_requests().await.expect("journal");
+            assert_eq!(posts.len(), 1, "{name}: exactly one POST, no retry");
+        }
     }
 
     /// Cancel aborts the in-flight turn and returns the driver to idle.

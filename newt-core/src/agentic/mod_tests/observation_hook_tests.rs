@@ -8,6 +8,8 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         url: server_uri,
         model: "test-model",
@@ -782,8 +784,7 @@ async fn validated_tool_calls_emit_one_accepted_and_survive_execution_failure() 
 /// the `RawContentId` of one received body. Nothing else may be hit, so the
 /// filter cannot hide an extra inference call.
 ///
-/// Scope of the count: the Ollama primary loop's probe, stream reissue and
-/// cap-exit summary. Summarizer, auxiliary and other wires are not yet wired.
+/// Scope of the count: the Ollama primary loop's probe and cap-exit summary. Summarizer, auxiliary and other wires are not yet wired.
 #[tokio::test]
 async fn every_ollama_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
     let server = MockServer::start().await;
@@ -922,6 +923,65 @@ async fn an_ollama_cap_exit_summary_is_one_ledger_attempt() {
     assert!(ledger
         .records()
         .all(|r| r.state == crate::attempts::AttemptState::Ok && r.usage.is_some()));
+}
+
+/// Claims run_command cannot run until the loop's grounding nudge arrives,
+/// then answers. Each round's probe reports its own usage.
+struct OllamaBlockerThenAnswer;
+impl Respond for OllamaBlockerThenAnswer {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body = body_json(req);
+        let nudged = body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(crate::agentic::compress::LOOP_GUIDANCE_PREFIX))
+            })
+        });
+        let (content, input) = if nudged {
+            ("all done", 350)
+        } else {
+            ("run_command cannot run in this sandbox", 300)
+        };
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": content},
+            "prompt_eval_count": input, "eval_count": 5,
+        }))
+    }
+}
+
+/// #2313 (b2): when the grounding nudge rejects a blocker claim, the answer it
+/// rejected was still generated, so its usage joins the turn.
+#[tokio::test]
+async fn a_grounding_nudge_keeps_the_rejected_answers_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(OllamaBlockerThenAnswer)
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("run the test suite"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let (reply, _, usage, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the nudged turn completes");
+    assert_eq!(reply, "all done");
+    let received = server.received_requests().await.expect("journal");
+    assert_eq!(received.len(), 2, "one generation per round (#2372)");
+    let totals = ledger.lock().unwrap().totals();
+    assert_eq!((totals.attempts, totals.out_tokens), (2, 5 + 5));
+    assert_eq!(
+        usage.map(|u| u.output_tokens),
+        Some(5 + 5),
+        "the rejected answer's 5 generated tokens join the turn"
+    );
 }
 
 /// B4 rule: a CONTENT-INVALID tool batch (RR1) — here a call with no name —

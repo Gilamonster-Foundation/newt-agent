@@ -99,6 +99,8 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         rewrites_history: true,
         url: server_uri,
@@ -859,7 +861,7 @@ async fn final_summary_provider_contracts() {
                 request_budget: None,
                 calibration: 1.0,
                 estimation: crate::tokens::TokenEstimation::default(),
-                ollama_num_ctx: None,
+                ollama_options: None,
                 prompt_measurement: Default::default(),
                 fell_back: Default::default(),
             };
@@ -879,12 +881,22 @@ async fn final_summary_provider_contracts() {
                         Vec::new(),
                         policy,
                         &cap,
+                        None,
                     )
                     .await
                 }
                 _ => {
-                    final_summary_anthropic(&client, &url, "test", None, Vec::new(), policy, &cap)
-                        .await
+                    final_summary_anthropic(
+                        &client,
+                        &url,
+                        "test",
+                        None,
+                        Vec::new(),
+                        policy,
+                        &cap,
+                        None,
+                    )
+                    .await
                 }
             };
             let (reply, streamed, usage) = result.expect("summary failures become fallbacks");
@@ -1256,6 +1268,555 @@ async fn usage_across_rounds_takes_max_input_and_sums_output() {
     // double-count), output = the SUM (each completion is new generation).
     assert_eq!(u.input_tokens, 120, "max(100, 120), not the sum");
     assert_eq!(u.output_tokens, 15, "10 + 5");
+}
+
+// -----------------------------------------------------------------------
+// #2313 (b1c): every Anthropic primary request is one ledger attempt
+// -----------------------------------------------------------------------
+
+/// Assert the #2313 invariant for one Anthropic turn: every received request is
+/// on the generation path (`/v1/messages`, so nothing else was hit and the
+/// filter hides nothing), and the ledger's attempts are exactly those requests,
+/// keyed by their bodies. Returns the records, ordered by ordinal.
+///
+/// Scope of the count: the Anthropic primary loop's round dispatch (stream and
+/// non-stream, including a no-output stream re-issue) and cap-exit summary.
+async fn assert_anthropic_attempts_equal_wire_requests(
+    server: &MockServer,
+    ledger: &std::sync::Mutex<crate::attempts::AttemptLedger>,
+) -> Vec<crate::attempts::AttemptRecord> {
+    let received = server.received_requests().await.expect("journal");
+    assert!(
+        received
+            .iter()
+            .all(|request| request.url.path() == "/v1/messages"),
+        "only /v1/messages may be hit: {:?}",
+        received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    let ledger = ledger.lock().unwrap();
+    let mut wire: Vec<_> = received
+        .iter()
+        .map(|request| content_addressable::RawContentId::from_content(&request.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger.records().map(|record| record.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire,
+        "attempts == wire requests, keyed by their bodies"
+    );
+    let mut records: Vec<_> = ledger.records().cloned().collect();
+    records.sort_by_key(|record| record.key.ordinal);
+    for record in &records {
+        assert!(
+            record.key.turn.starts_with("prompt:"),
+            "{}",
+            record.key.turn
+        );
+        assert_eq!(record.key.role, "primary");
+    }
+    records
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn every_non_streaming_anthropic_round_is_one_ledger_attempt() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(UsageAcrossRounds {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "ok",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    chat_complete(c, &mut mcp).await.expect("dispatch");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 2, "tool round, final answer");
+    assert!(records
+        .iter()
+        .all(|r| r.state == crate::attempts::AttemptState::Ok));
+    let totals = ledger.lock().unwrap().totals();
+    assert_eq!((totals.in_tokens, totals.out_tokens), (100 + 120, 10 + 5));
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_streamed_anthropic_round_is_one_ledger_attempt() {
+    let _env = test_env(true);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_text_reply(&["Hello ", "world"], 7, 3))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    chat_complete(c, &mut NoMcp)
+        .await
+        .expect("streamed dispatch");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Ok);
+    assert_eq!(
+        records[0].usage,
+        Some(crate::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3
+        })
+    );
+}
+
+/// Precision (3) on a real loop: a 529 then a success is two requests and two
+/// attempts with identical bytes — ordinal 0 `failed` with no usage, ordinal 1
+/// `ok`.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_retried_anthropic_round_is_one_ledger_attempt_per_try() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(OverloadedOnce {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    chat_complete(c, &mut NoMcp).await.expect("529 is retried");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].key.request, records[1].key.request);
+    assert_eq!(
+        (records[0].state, records[0].usage),
+        (crate::attempts::AttemptState::Failed, None)
+    );
+    assert_eq!(records[1].state, crate::attempts::AttemptState::Ok);
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ToolsUntilCap {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.max_tool_rounds = 2;
+    c.attempt_ledger = Some(&ledger);
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "ok",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (reply, _, _, _) = chat_complete(c, &mut mcp).await.expect("cap exit");
+    assert!(reply.starts_with("capped summary"), "{reply}");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(
+        records.len(),
+        3,
+        "two tool rounds + one tools-disabled summary"
+    );
+    assert!(records
+        .iter()
+        .all(|r| r.state == crate::attempts::AttemptState::Ok));
+}
+
+/// A `pause_turn` reply (with usage), then the final answer.
+struct PauseThenAnswer {
+    calls: Arc<AtomicUsize>,
+}
+impl Respond for PauseThenAnswer {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            json_reply(
+                "pause_turn",
+                serde_json::json!([{"type": "text", "text": "thinking so far"}]),
+                100,
+                8,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "resumed answer"}]),
+                110,
+                6,
+            )
+        }
+    }
+}
+
+/// #2313 (b2): a `pause_turn` reply generated tokens the operator pays for,
+/// so its usage joins the turn instead of being dropped by the re-dispatch.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_paused_turn_keeps_the_paused_replys_usage() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(PauseThenAnswer {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let (reply, _, usage, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(reply, "resumed answer");
+    assert_eq!(
+        usage,
+        Some(crate::TokenUsage {
+            input_tokens: 110,
+            output_tokens: 14
+        }),
+        "the paused reply's 8 generated tokens join the turn"
+    );
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 2);
+    let totals = ledger.lock().unwrap().totals();
+    assert_eq!((totals.in_tokens, totals.out_tokens), (210, 14));
+}
+
+// -----------------------------------------------------------------------
+// #2313 review: streamed Anthropic attempts follow the state rule — a stream
+// that reached `message_stop` is ok; a cut stream, an error event, or an
+// interrupt is failed; reported usage attaches either way.
+// -----------------------------------------------------------------------
+
+fn anthropic_stream_head(input: u64) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "message_start",
+            "message": {"model": "claude-test", "usage": {"input_tokens": input}}}),
+        serde_json::json!({"type": "content_block_start",
+            "index": 0, "content_block": {"type": "text"}}),
+    ]
+}
+
+async fn streamed_anthropic_turn(
+    responder: impl Respond + 'static,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<crate::attempts::AttemptRecord> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(responder)
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    c.cancel = cancel;
+    let _ = chat_complete(c, &mut NoMcp).await;
+    assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await
+}
+
+/// Review finding 3: a clean EOF before `message_stop` is a CUT stream, not a
+/// completed one.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_cut_anthropic_stream_is_a_failed_attempt() {
+    let _env = test_env(true);
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "half an answ"}}),
+    );
+    let records = streamed_anthropic_turn(sse(&frames), None).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+}
+
+/// An error event, then a clean stream.
+struct StreamErrorThenAnswer {
+    calls: Arc<AtomicUsize>,
+}
+impl Respond for StreamErrorThenAnswer {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut frames = anthropic_stream_head(6);
+            frames.push(serde_json::json!({"type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+            sse(&frames)
+        } else {
+            sse_text_reply(&["recovered"], 7, 2)
+        }
+    }
+}
+
+/// Review finding 5: an error event before any visible text re-issues the same
+/// bytes — ordinal 0 failed, ordinal 1 ok.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_error_event_before_text_is_a_failed_attempt_then_a_retry() {
+    let _env = test_env(true);
+    let records = streamed_anthropic_turn(
+        StreamErrorThenAnswer {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].key.request, records[1].key.request);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(records[1].state, crate::attempts::AttemptState::Ok);
+}
+
+/// Review finding 5: an error event after partial text keeps the partial
+/// answer, and the attempt is failed.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_error_event_after_partial_text_is_a_failed_attempt() {
+    let _env = test_env(true);
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "partial answer before the break"}}),
+    );
+    frames.push(serde_json::json!({"type": "error",
+        "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+    let records = streamed_anthropic_turn(sse(&frames), None).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+}
+
+/// Review round 2, item 4: a failure after `message_delta` has complete usage,
+/// and the failed attempt keeps it.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_error_event_after_message_delta_keeps_the_complete_usage() {
+    let _env = test_env(true);
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "a whole answer"}}),
+    );
+    frames.push(serde_json::json!({"type": "message_delta",
+        "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}));
+    frames.push(serde_json::json!({"type": "error",
+        "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+    let records = streamed_anthropic_turn(sse(&frames), None).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(
+        records[0].usage,
+        Some(crate::TokenUsage {
+            input_tokens: 6,
+            output_tokens: 3
+        })
+    );
+}
+
+/// Dispatch one streamed Anthropic round against `serve_stream_parts`, bounded
+/// so a broken read loop fails instead of hanging. Returns the round, whether
+/// text was shown, and the attempts recorded.
+async fn raw_anthropic_round(
+    parts: &[&[u8]],
+    interrupt: bool,
+) -> (
+    anthropic_wire::AnthropicRound,
+    bool,
+    Vec<crate::attempts::AttemptRecord>,
+) {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (url, server) =
+        super::http_loop_tests::serve_stream_parts(parts, interrupt.then(|| flag.clone())).await;
+    let messages_url = format!("{url}/v1/messages");
+    let client = reqwest::Client::new();
+    let retry = RetryPolicy {
+        max_retries: 0,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        jitter: false,
+    };
+    let dispatch = AnthropicDispatch {
+        smart_harness: None,
+        client: &client,
+        stream_client: &client,
+        messages_url: &messages_url,
+        api_key: None,
+        retry: &retry,
+        color: false,
+        markdown: false,
+        retain: None,
+    };
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "claude-test",
+        backend: "test-backend",
+    };
+    let (round, started) = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        anthropic_dispatch_round(
+            &dispatch,
+            &serde_json::json!({"stream": true}),
+            &[],
+            true,
+            Some(flag.as_ref()),
+            Some(scope),
+        ),
+    )
+    .await
+    .expect("the read ends: at message_stop, at EOF, or at the interrupt")
+    .expect("the round is not an error")
+    .expect("the stream was read, so this is not the send-time cancel");
+    server.abort();
+    let records = ledger.lock().unwrap().records().cloned().collect();
+    (round, started, records)
+}
+
+fn anthropic_sse_body(frames: &[serde_json::Value]) -> String {
+    frames.iter().map(|f| format!("data: {f}\n\n")).collect()
+}
+
+/// Review round 2, item 4: an Esc inside the stream's read loop, after the first
+/// text delta, is a failed attempt. Deterministic: the flag is tripped only
+/// after the reader has drained megabytes of the body, so the send-time cancel
+/// cannot be what fires. Only `message_start` usage arrived, which is no usage
+/// (a known limit: `TokenUsage` cannot say "output unknown").
+#[tokio::test]
+async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt() {
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "the beginning"}}),
+    );
+    let head = anthropic_sse_body(&frames);
+    let (round, started, records) = raw_anthropic_round(&[head.as_bytes()], true).await;
+    assert!(started, "the first delta was shown");
+    assert_eq!(round.text, "the beginning");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(records[0].usage, None);
+}
+
+const SPLIT_TEXT: &str = "newt 🦎 蠑螈";
+
+fn anthropic_split_text_body() -> String {
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": SPLIT_TEXT}}),
+    );
+    frames.push(serde_json::json!({"type": "content_block_stop", "index": 0}));
+    frames.push(serde_json::json!({"type": "message_delta",
+        "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}));
+    frames.push(serde_json::json!({"type": "message_stop"}));
+    anthropic_sse_body(&frames)
+}
+
+/// Review round 4, item b: a character split across two reads is still that
+/// character in the Anthropic stream's text. Decoding each chunk on its own
+/// turns both halves into U+FFFD.
+#[tokio::test]
+async fn an_anthropic_character_split_across_reads_is_not_corrupted() {
+    let body = anthropic_split_text_body();
+    let bytes = body.as_bytes();
+    let cut = bytes
+        .iter()
+        .position(|&b| b == 0xF0)
+        .expect("the emoji's lead byte")
+        + 2;
+    let (round, _, records) = raw_anthropic_round(&[&bytes[..cut], &bytes[cut..]], false).await;
+    assert_eq!(round.text, SPLIT_TEXT);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Ok);
+}
+
+/// The same property without a socket, which can coalesce the two writes and
+/// make the test above vacuous: at every byte offset, `decode_chunk` feeding the
+/// Anthropic accumulator yields the text intact.
+#[test]
+fn an_anthropic_text_delta_split_at_every_byte_offset_is_not_corrupted() {
+    let body = anthropic_split_text_body();
+    let bytes = body.as_bytes();
+    for cut in 0..=bytes.len() {
+        let mut carry = Vec::new();
+        let mut acc = anthropic_wire::SseAccumulator::new();
+        let mut text = String::new();
+        for part in [&bytes[..cut], &bytes[cut..]] {
+            for action in acc.feed(&decode_chunk(&mut carry, part)) {
+                if let anthropic_wire::StreamAction::TextDelta(t) = action {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, SPLIT_TEXT, "split at byte {cut}");
+        assert!(acc.is_done(), "split at byte {cut}");
+    }
+}
+
+/// Trips the interrupt flag as the response is served.
+struct CancelWhileServing {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Respond for CancelWhileServing {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        self.flag.store(true, Ordering::SeqCst);
+        sse_text_reply(&["never shown"], 7, 2)
+    }
+}
+
+/// Review finding 5: a cancel while the request is in flight is never an ok
+/// attempt. The flag is set before the headers return, so this covers the
+/// send-time cancel; the stream's own interrupt arm is pinned by
+/// `an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt`.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_stream_cancelled_mid_flight_is_never_ok() {
+    let _env = test_env(true);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let records = streamed_anthropic_turn(
+        CancelWhileServing { flag: flag.clone() },
+        Some(flag.as_ref()),
+    )
+    .await;
+    assert!(!records.is_empty(), "the request was sent");
+    assert!(records
+        .iter()
+        .all(|r| r.state != crate::attempts::AttemptState::Ok));
 }
 
 // -----------------------------------------------------------------------

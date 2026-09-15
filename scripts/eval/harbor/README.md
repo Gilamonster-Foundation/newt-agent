@@ -150,9 +150,17 @@ supply refuses before any inference. A cell whose trials all refuse is recorded
 as skipped with newt's refusal text. It is never graded, and no claim is counted
 for it. The baseline requires nothing.
 
-*Declared but not observed.* This column counts trials whose contract lacks a
-declared path. It reads `n/a` when a treatment declares nothing observable;
-today only `smart_harness` appears in the contract.
+*Declared but not observed.* This column counts newt trials whose contract lacks a
+declared path, and reads `n/a` for pi and Codex. The baseline is newt's shipped
+defaults, which arm the self-verify gate (#1961), so `none` itself expects
+`receipt.verification.mode = attempted`. `verify-outcomes` expects
+`result_aware`, and the `self-verify-off` ablation (`NEWT_BENCH_SELF_VERIFY=0`)
+expects `off`; `NEWT_BENCH_SELF_VERIFY=1` changes nothing.
+
+*Verification ends.* `RepairExhausted` and `VerificationIncomplete` still deliver
+an answer, so newt's contract says `outcome: completed` while `solve_result`
+says `incomplete`. Neither counts as a done-claim, and the table counts each in
+its own column.
 
 *Pinning.* The first cell writes `campaign.pin.json`, which pins:
 - the task-set digest;

@@ -112,16 +112,36 @@ fn accepted_web_objective_consumes_the_old_round_cap_link() {
     assert!(interrupted.is_none());
 }
 
+/// #2374 round three, item 7: a result-aware cap exit reports
+/// `repair_exhausted` and still pauses the objective with the same footer; a
+/// `repair_exhausted` before the cap (the allowance ran out) does not.
+#[test]
+fn a_repair_exhausted_at_the_round_cap_keeps_the_pause_affordance() {
+    use newt_core::TurnEndReason::RepairExhausted;
+    let reply = "The check still fails.";
+    assert!(paused_at_round_cap(Some(RepairExhausted), true));
+    assert!(decorate_round_cap_reply(reply, Some(RepairExhausted), true).contains("`continue`"));
+    assert!(!paused_at_round_cap(Some(RepairExhausted), false));
+    assert_eq!(
+        decorate_round_cap_reply(reply, Some(RepairExhausted), false),
+        reply
+    );
+    assert!(!paused_at_round_cap(
+        Some(newt_core::TurnEndReason::Completed),
+        true
+    ));
+}
+
 #[test]
 fn round_cap_footer_is_deterministic_and_only_decorates_capped_replies() {
     let reply = "Completed the parser; tests remain.";
-    let capped = decorate_round_cap_reply(reply, Some(newt_core::TurnEndReason::RoundCap));
+    let capped = decorate_round_cap_reply(reply, Some(newt_core::TurnEndReason::RoundCap), false);
     assert!(capped.starts_with(reply), "{capped}");
     assert!(capped.contains("If work remains"), "{capped}");
     assert!(capped.contains("`continue`"), "{capped}");
     assert!(capped.contains("`/rounds <n>`"), "{capped}");
     assert_eq!(
-        decorate_round_cap_reply(reply, None),
+        decorate_round_cap_reply(reply, None, false),
         reply,
         "ordinary replies must remain byte-for-byte unchanged"
     );
@@ -130,8 +150,11 @@ fn round_cap_footer_is_deterministic_and_only_decorates_capped_replies() {
 #[test]
 fn terminal_notices_preserve_questions_and_incomplete_observations() {
     let question = "Which project should I update?";
-    let awaiting =
-        decorate_round_cap_reply(question, Some(newt_core::TurnEndReason::AwaitingOperator));
+    let awaiting = decorate_round_cap_reply(
+        question,
+        Some(newt_core::TurnEndReason::AwaitingOperator),
+        false,
+    );
     assert_eq!(
         awaiting, question,
         "host notices must not become model material"
@@ -146,7 +169,7 @@ fn terminal_notices_preserve_questions_and_incomplete_observations() {
         newt_core::TurnEndReason::NarrationFinalRound,
     ] {
         let reply = "I will inspect the test failure.";
-        let incomplete = decorate_round_cap_reply(reply, Some(reason));
+        let incomplete = decorate_round_cap_reply(reply, Some(reason), false);
         assert_eq!(incomplete, reply);
         metrics.end_reason = Some(reason);
         assert!(metrics.display_line().contains("incomplete"));
@@ -154,7 +177,8 @@ fn terminal_notices_preserve_questions_and_incomplete_observations() {
     assert_eq!(
         decorate_round_cap_reply(
             "The answer is 3.",
-            Some(newt_core::TurnEndReason::Completed)
+            Some(newt_core::TurnEndReason::Completed),
+            false
         ),
         "The answer is 3."
     );
@@ -164,8 +188,11 @@ fn terminal_notices_preserve_questions_and_incomplete_observations() {
 fn capped_progress_is_persistable_without_duplicate_notices_and_resumes_its_objective() {
     let parent = ctx();
     let core_handoff = "Progress captured.\n\nPaused at the tool-round limit (40 rounds).";
-    let persisted =
-        decorate_round_cap_reply(core_handoff, Some(newt_core::TurnEndReason::RoundCap));
+    let persisted = decorate_round_cap_reply(
+        core_handoff,
+        Some(newt_core::TurnEndReason::RoundCap),
+        false,
+    );
     assert_eq!(
         persisted.matches("tool-round limit").count(),
         1,

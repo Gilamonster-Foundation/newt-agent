@@ -295,6 +295,8 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let (reply, streamed, _usage, _hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -419,7 +421,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             request_budget: None,
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: Some(4_096),
+            ollama_options: ollama_options(Some(4_096), None),
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
@@ -453,7 +455,8 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
         .await
         .expect("wiremock request journal");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["options"]["num_ctx"], 4_096);
+    // Exactly the window: no allowance adds no `num_predict` (#2312).
+    assert_eq!(body["options"], serde_json::json!({"num_ctx": 4_096}));
 }
 
 #[tokio::test]
@@ -492,10 +495,11 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             request_budget: None,
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: None,
+            ollama_options: None,
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
+        None,
     )
     .await
     .expect("OpenAI cap summary should become a paused handoff");
@@ -568,7 +572,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             request_budget: Some(2_000),
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: Some(2_500),
+            ollama_options: ollama_options(Some(2_500), None),
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
@@ -629,10 +633,11 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             request_budget: Some(2_000),
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: None,
+            ollama_options: None,
             prompt_measurement: Default::default(),
             fell_back: Default::default(),
         },
+        None,
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
@@ -696,6 +701,8 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
     let cap = 3;
     let (reply, _streamed, _usage, hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -848,6 +855,8 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let (reply, streamed, _usage, _hallu) = openai_chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -977,6 +986,8 @@ async fn cap_exit_fallback_when_final_summary_errors() {
     let caveats = Caveats::top();
     let (reply, _streamed, _usage, _hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -1108,6 +1119,8 @@ async fn accumulated_usage_survives_summary_failure() {
     let cap = 2;
     let (reply, _streamed, usage, hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",

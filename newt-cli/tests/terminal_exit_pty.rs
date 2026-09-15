@@ -30,10 +30,14 @@ const MODEL: &str = "terminal-exit-fixture";
 const PROMPT: &str = "What is two plus two? Give a short answer.";
 const ANSWER: &str = "The answer is four. TERM_EXIT_ANSWER.";
 const LEAN_READY: &str = "TERM_EXIT_READY> ";
-// TurnMetrics::display_line renders this suffix for the unpriced fixture model
-// with reported usage: no rate is known, so the cost is unknown, not free
-// (#2313). It does not depend on elapsed time or probe/replay totals.
-const TURN_METRICS: &str = " out · cost unknown";
+// TurnMetrics::display_line for the provider turn, priced by the fixture's
+// `[pricing.overrides]` rate ($1 per 1k tokens each way). The turn sends one
+// generation request (the accepted answer is not reissued for display, #2372)
+// reporting 32 in / 12 out, so the per-attempt totals are 32 in / 12 out and the
+// price is $0.044 (#2313). The line only reads this way when the TUI passes its
+// per-turn attempt ledger AND prices those totals: without the ledger it reads
+// "cost unknown". Independent of elapsed time.
+const TURN_METRICS: &str = " 32 in / 12 out · ~$0.0440";
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
@@ -240,6 +244,10 @@ endpoint = "{}"
 model = "{MODEL}"
 kind = "openai"
 
+[pricing.overrides.{MODEL}]
+input_usd_per_1k = 1.0
+output_usd_per_1k = 1.0
+
 [tui.permissions]
 preset = "read_only"
 prompt = false
@@ -404,7 +412,7 @@ net = []
 
     let requests = server.received_requests().await.expect("captured requests");
     let expected_prompt = resized.expect("resize result checked after reaping the CLI");
-    let saw_prompt = requests.iter().any(|request| {
+    let carries_prompt = |request: &&wiremock::Request| {
         serde_json::from_slice::<serde_json::Value>(&request.body)
             .ok()
             .and_then(|body| body["messages"].as_array().cloned())
@@ -416,7 +424,21 @@ net = []
                             .is_some_and(|text| text == expected_prompt)
                 })
             })
-    });
+    };
+    let saw_prompt = requests.iter().any(|request| carries_prompt(&request));
+    // #2313: the metrics line above is priced on the turn's per-attempt
+    // totals, and those attempts are exactly the turn's generation requests
+    // (one: the answer). The startup capability `ping` is not part of the turn.
+    let turn_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .filter(carries_prompt)
+        .count();
+    assert_eq!(
+        turn_requests,
+        if provider_turn { 1 } else { 0 },
+        "{case}: attempts == the turn's generation requests"
+    );
     assert_eq!(
         saw_prompt, provider_turn,
         "{case}: backend must receive the exact submitted draft"

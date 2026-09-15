@@ -2,7 +2,7 @@
 //! at the send, from the exact bytes on the wire.
 //!
 //! Recording where round usage is merged cannot count attempts honestly: one
-//! merged round can be a probe plus a stream reissue, and every send sits inside
+//! merged round can span several sends, and every send sits inside
 //! a retry loop that resends identical bytes. Keying the attempt from the built
 //! request's body is the only point that sees exactly one attempt per HTTP
 //! request, and it sees smart-harness projected bytes as they are sent.
@@ -78,8 +78,34 @@ pub(crate) fn complete(
     key: Option<&AttemptKey>,
     usage: Option<TokenUsage>,
 ) {
+    finish(scope, key, AttemptState::Ok, usage);
+}
+
+/// Record how a sent attempt ended, attaching whatever usage the server
+/// reported whatever the state (#2313). `ok` is a complete terminal response —
+/// truncation included; `failed` is a transport error, non-2xx, cut stream,
+/// error event, or failed body, and (until cancellation is modelled) an
+/// interrupt.
+pub(crate) fn finish(
+    scope: Option<AttemptScope<'_>>,
+    key: Option<&AttemptKey>,
+    state: AttemptState,
+    usage: Option<TokenUsage>,
+) {
     if let (Some(scope), Some(key)) = (scope, key) {
-        scope.observe(key, usage, AttemptState::Ok);
+        scope.observe(key, usage, state);
+    }
+}
+
+/// Keep the usage a failed response still reported. The send already recorded
+/// the attempt failed, so without reported usage there is nothing to add.
+pub(crate) fn failed(
+    scope: Option<AttemptScope<'_>>,
+    key: Option<&AttemptKey>,
+    error: &anyhow::Error,
+) {
+    if let Some(usage) = super::observability::reported_usage(error) {
+        finish(scope, key, AttemptState::Failed, Some(usage));
     }
 }
 

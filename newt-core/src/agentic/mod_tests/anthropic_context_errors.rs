@@ -24,6 +24,7 @@ async fn dispatch(url: &str) -> anyhow::Result<Option<(anthropic_wire::Anthropic
         &[],
         true,
         None,
+        None,
     )
     .await
 }

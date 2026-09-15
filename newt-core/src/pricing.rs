@@ -85,6 +85,31 @@ impl PricingConfig {
         builtin_rate(model_id, local)
     }
 
+    /// Estimate a turn's cost from its per-attempt totals — every token it
+    /// sent and generated, summed per inference attempt (#2313). `None` unless
+    /// every attempt reported usage and the model has a known rate: a partial
+    /// or unpriced turn is unknown, never a confirmed zero.
+    ///
+    /// **Cache tokens are not tracked.** Usage carries no cache-read or
+    /// cache-creation split anywhere, so on a cached Anthropic prompt the summed
+    /// input over-states cost, just as the context merge's largest-prompt input
+    /// under-states it for every multi-round turn.
+    pub fn estimate_attempts_cost(
+        &self,
+        model_id: &str,
+        local: bool,
+        totals: &crate::attempts::UsageTotals,
+    ) -> Option<f64> {
+        if !totals.usage_complete {
+            return None;
+        }
+        let rate = self.rate_for(model_id, local)?;
+        Some(
+            (totals.in_tokens as f64 / 1000.0) * rate.input_usd_per_1k
+                + (totals.out_tokens as f64 / 1000.0) * rate.output_usd_per_1k,
+        )
+    }
+
     /// Estimate cost for `usage` with `model_id`, served locally or not.
     /// Returns `None` when the price is unknown (not overridden, not in the
     /// table, and not a local family served locally).
@@ -316,6 +341,50 @@ mod tests {
             .unwrap();
         // 0.5 * 2 + 1.0 * 1 = 2.0, not the local family's zero.
         assert!((gateway - 2.0).abs() < 0.0001, "got {gateway}");
+    }
+
+    /// #2313 (b2): a turn's cost is priced on the per-attempt SUM of input —
+    /// what was sent — not the context merge's largest prompt; and it is
+    /// unknown, never zero, when any attempt lacks usage. The Anthropic b1c
+    /// fixture's rounds 100/10 and 120/5 merge to 120/15 but sent 220/15.
+    #[test]
+    fn attempts_cost_is_the_per_attempt_sum_and_unknown_when_incomplete() {
+        let cfg = PricingConfig::default();
+        let totals = |in_tokens, out_tokens, usage_complete: bool| crate::attempts::UsageTotals {
+            attempts: 2,
+            usage_missing: u32::from(!usage_complete),
+            in_tokens,
+            out_tokens,
+            usage_complete,
+        };
+        let sonnet = "claude-3-5-sonnet-20241022";
+        let billed = cfg
+            .estimate_attempts_cost(sonnet, false, &totals(220, 15, true))
+            .unwrap();
+        assert!(
+            (billed - (0.003 * 0.220 + 0.015 * 0.015)).abs() < 1e-12,
+            "{billed}"
+        );
+        let merged = cfg
+            .estimate_cost(sonnet, false, Some(&usage(120, 15)))
+            .unwrap();
+        assert!(
+            billed > merged,
+            "the merged turn under-prices: {billed} vs {merged}"
+        );
+        assert_eq!(
+            cfg.estimate_attempts_cost(sonnet, false, &totals(100, 10, false)),
+            None
+        );
+        // Local: complete is free; incomplete is unknown, never $0.
+        assert_eq!(
+            cfg.estimate_attempts_cost("qwen3:8b", true, &totals(100, 10, true)),
+            Some(0.0)
+        );
+        assert_eq!(
+            cfg.estimate_attempts_cost("qwen3:8b", true, &totals(100, 10, false)),
+            None
+        );
     }
 
     #[test]

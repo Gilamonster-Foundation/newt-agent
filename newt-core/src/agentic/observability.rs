@@ -102,6 +102,17 @@ pub fn reasoning_overflow_signature(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BehaviorSignal {
+    /// #2315: one result-aware verification decision at a concluding answer:
+    /// `accept`, `nudge`, the stop reason, `no_checks` (nothing to verify) or
+    /// `check_scan_failed`; the per-check status; and which state evidence
+    /// (`tree` or `mutation_chain`) decided freshness.
+    Verification {
+        round: usize,
+        decision: String,
+        repairs_used: usize,
+        allowance: usize,
+        report: super::self_verify::VerificationReport,
+    },
     /// A rejected request and the strictly smaller projection selected next.
     /// `None` means recovery stopped; attempts count within the user turn.
     ContextExceeded {
@@ -262,16 +273,28 @@ pub struct DispatchError {
     /// The structural class, decided from the typed source.
     pub class: ErrorClass,
     msg: String,
+    /// Usage the rejected response reported: it was generated and billed.
+    usage: Option<crate::TokenUsage>,
 }
 
 impl DispatchError {
+    /// A failure whose class the caller decided from typed evidence.
+    pub fn new(class: ErrorClass, msg: impl Into<String>) -> Self {
+        Self {
+            class,
+            msg: msg.into(),
+            usage: None,
+        }
+    }
+
     /// Wrap a reqwest send/decode failure, classifying it while it is still
-    /// typed. `prefix` preserves the historical site wording (`"request
-    /// failed"` on the probe, `"stream request failed"` on the re-issue).
+    /// typed. `prefix` preserves the historical site wording (e.g. `"request
+    /// failed"`).
     pub fn from_reqwest(prefix: &str, e: reqwest::Error) -> Self {
         Self {
             class: classify_reqwest(&e),
             msg: format!("{prefix}: {e}"),
+            usage: None,
         }
     }
 
@@ -286,6 +309,7 @@ impl DispatchError {
                 ErrorClass::Transport
             },
             msg: format!("{prefix}: {e}"),
+            usage: None,
         }
     }
 
@@ -294,6 +318,7 @@ impl DispatchError {
         Self {
             class: ErrorClass::ContextExceeded,
             msg: message.into(),
+            usage: None,
         }
     }
 
@@ -309,8 +334,21 @@ impl DispatchError {
                 ErrorClass::Model
             },
             msg,
+            usage: None,
         }
     }
+
+    /// Attach the usage a rejected response reported.
+    pub(crate) fn with_usage(mut self, usage: Option<crate::TokenUsage>) -> Self {
+        self.usage = usage;
+        self
+    }
+}
+
+/// The usage a failed dispatch's response reported, if its chain carries any.
+pub(crate) fn reported_usage(e: &anyhow::Error) -> Option<crate::TokenUsage> {
+    // `downcast_ref` also reaches a DispatchError attached as context.
+    e.downcast_ref::<DispatchError>()?.usage
 }
 
 impl std::fmt::Display for DispatchError {
@@ -328,11 +366,16 @@ impl std::error::Error for DispatchError {}
 /// happened outside a dispatch (the caller files it as `harness_error`,
 /// fail-closed: an unattributed error must never masquerade as a model one).
 pub fn error_class(e: &anyhow::Error) -> Option<ErrorClass> {
-    e.chain().find_map(|c| {
-        c.downcast_ref::<DispatchError>()
-            .map(|d| d.class)
-            .or_else(|| c.downcast_ref::<reqwest::Error>().map(classify_reqwest))
-    })
+    // `anyhow::Error::downcast_ref` reaches a DispatchError at the root or
+    // attached with `.context()` (as `decode_openai_response` attaches one); a
+    // chain walk sees a context layer only as its wrapper. Nothing places a
+    // DispatchError behind a foreign `source()`, so only reqwest is walked for.
+    e.downcast_ref::<DispatchError>()
+        .map(|d| d.class)
+        .or_else(|| {
+            e.chain()
+                .find_map(|c| c.downcast_ref::<reqwest::Error>().map(classify_reqwest))
+        })
 }
 
 #[cfg(test)]
@@ -389,6 +432,29 @@ mod tests {
         // Display is the historical wording, verbatim — the retry layer and
         // the recovery heuristics match on it.
         assert_eq!(e.to_string(), "Ollama 500 Internal Server Error: boom");
+    }
+
+    /// #2318: `decode_openai_response` attaches its `DispatchError` with
+    /// `.context()`, and later layers add more context. A chain walk cannot
+    /// downcast a context layer to its context type, so every strict-decode
+    /// rejection of a 2xx reply lost its class and was filed as a harness error.
+    #[test]
+    fn a_dispatch_error_attached_as_context_keeps_its_class() {
+        let rejected = |message: &str| {
+            anyhow::anyhow!("streamed tool call has no ID")
+                .context(DispatchError::http_status(message.to_string()))
+                .context("round 3")
+        };
+        assert_eq!(
+            error_class(&rejected("streamed tool call has no ID")),
+            Some(ErrorClass::Model)
+        );
+        assert_eq!(
+            error_class(&rejected(
+                r#"OpenAI stream error: {"message":"Context size has been exceeded."}"#
+            )),
+            Some(ErrorClass::ContextExceeded)
+        );
     }
 
     /// `harness_error` (builder side): a request WE built wrong is our

@@ -28,14 +28,14 @@ Run it:
     NEWT_BENCH_PROFILE=/path/to/bench.toml \\
     NEWT_BENCH_TENACITY=insistent \\
     NEWT_BENCH_OCAP=on \\        # omit / off for the --unsafe-host-exec lane
-    NEWT_BENCH_SELF_VERIFY=1 \\  # run the workspace's own checks before RTB (#1 lever)
+    NEWT_BENCH_SELF_VERIFY=0 \\  # ablation: the self-verify gate is on by default
     PYTHONPATH=scripts/eval/harbor \\
     harbor run -a newt_agent:NewtAgent -m newt/qwen3-coder_30b <task-or-dataset...>
 
 Robustness/capability knobs injected INTO the container (the harbor process's env
 does not cross the container boundary): NEWT_BENCH_HTTP_RETRIES (default 10 — a
 more patient retry window so a transient router drop doesn't zero a task on a
-pure infra fault) and NEWT_BENCH_SELF_VERIFY (opt-in self-verify gate).
+pure infra fault) and NEWT_BENCH_SELF_VERIFY (0 turns the default-on self-verify gate off).
 
 The backend (endpoint + model) is pinned by NEWT_BENCH_PROFILE (host-secret,
 local); ``-m`` is required by Harbor but the profile is authoritative here.
@@ -94,9 +94,15 @@ def _lane_flag(ocap: str) -> str:
 # reads these; overridable, empty keeps newt's own default.
 _HTTP_RETRIES = os.environ.get("NEWT_BENCH_HTTP_RETRIES", "10")
 # Self-verify gate (the measured #1 capability lever): make the agent RUN the
-# workspace's own checks before declaring done. Opt-in per run — set
-# NEWT_BENCH_SELF_VERIFY=1 to inject NEWT_SELF_VERIFY=1 into the container.
+# workspace's own checks before declaring done. newt arms it by default (#1961),
+# so the baseline already runs it and =1 changes nothing. NEWT_BENCH_SELF_VERIFY=0
+# (off/false) injects NEWT_SELF_VERIFY=0: the ablation.
 _SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
+# Result-aware verification (#2315): set NEWT_BENCH_VERIFY_OUTCOMES=1 to inject
+# NEWT_VERIFY_OUTCOMES=1, so the gate repairs a check that ran and FAILED instead
+# of accepting any attempt. It is a mode of the default-on self-verify gate; newt reports the
+# mode it ran in the contract record's receipt.verification.
+_VERIFY_OUTCOMES = os.environ.get("NEWT_BENCH_VERIFY_OUTCOMES", "")
 # Smart-harness arm (#2260/#2263): set NEWT_BENCH_SMART=1 to run `newt solve
 # --smart-harness`. The frame lives under /logs/agent so it is outside every
 # workspace tool grant AND survives the container for the cross-tab. The
@@ -125,6 +131,10 @@ def _container_env_prefix() -> str:
         parts.append("NEWT_HTTP_BACKOFF_MAX_MS=30000")
     if _SELF_VERIFY.strip().lower() in ("1", "true", "on", "yes"):
         parts.append("NEWT_SELF_VERIFY=1")
+    elif _SELF_VERIFY.strip().lower() in ("0", "false", "off", "no"):
+        parts.append("NEWT_SELF_VERIFY=0")
+    if _VERIFY_OUTCOMES.strip().lower() in ("1", "true", "on", "yes"):
+        parts.append("NEWT_VERIFY_OUTCOMES=1")
     if _MODEL_DIGEST.strip():
         parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
     return (" ".join(parts) + " ") if parts else ""

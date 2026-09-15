@@ -57,16 +57,29 @@ pub fn changed_identity(error: &anyhow::Error) -> Option<&'static str> {
 /// Complete JSON from a server ignoring `stream: true` is decoded once as-is.
 /// The caller must record the original bytes before interpreting this value.
 pub fn decode_response(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    decode_response_reporting_usage(bytes, &mut None)
+}
+
+/// [`decode_response`], also leaving in `usage` what the stream reported. A
+/// response strict validation rejects was still generated and billed (#2313).
+pub(crate) fn decode_response_reporting_usage(
+    bytes: &[u8],
+    usage: &mut Option<crate::TokenUsage>,
+) -> anyhow::Result<serde_json::Value> {
+    // `Some(true)`: the bytes end inside a character, as a cut body can.
     let (body, invalid_utf8) = match std::str::from_utf8(bytes) {
-        Ok(body) => (body, false),
-        Err(error) => (std::str::from_utf8(&bytes[..error.valid_up_to()])?, true),
+        Ok(body) => (body, None),
+        Err(error) => (
+            std::str::from_utf8(&bytes[..error.valid_up_to()])?,
+            Some(error.error_len().is_none()),
+        ),
     };
     if body.trim_start().starts_with(['{', '[']) {
         let json: serde_json::Value = serde_json::from_str(body)?;
         return if response::is_error(&json) {
             Err(response::provider_error(&json))
         } else {
-            anyhow::ensure!(!invalid_utf8, "OpenAI response has invalid UTF-8");
+            anyhow::ensure!(invalid_utf8.is_none(), "OpenAI response has invalid UTF-8");
             Ok(json)
         };
     }
@@ -74,20 +87,44 @@ pub fn decode_response(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
         strict: Some(StrictResponse::default()),
         ..Default::default()
     };
-    if invalid_utf8 {
-        accumulator
-            .strict
-            .as_mut()
-            .expect("decode_response enables strict validation")
-            .problem("OpenAI stream has invalid UTF-8");
-    }
     let _ = accumulator.feed(body);
+    let complete_lines_sound = !accumulator
+        .strict
+        .as_ref()
+        .expect("decode_response enables strict validation")
+        .has_problem();
     accumulator.flush_line();
-    accumulator
+    *usage = accumulator.round.usage;
+    let mut strict = accumulator
         .strict
         .take()
-        .expect("decode_response enables strict validation")
-        .finish(accumulator.round)
+        .expect("decode_response enables strict validation");
+    if invalid_utf8.is_some() {
+        strict.problem("OpenAI stream has invalid UTF-8");
+    }
+    // Ended before `[DONE]` with nothing wrong but a torn last line or
+    // character: the body was cut, not malformed (#2318).
+    let cut = !accumulator.round.done && complete_lines_sound && invalid_utf8 != Some(false);
+    strict.finish(accumulator.round, cut)
+}
+
+/// The outcome class of a strict-decode rejection, by its cause (#2318). `None`
+/// for a provider's own error, whose class follows its text as an HTTP error
+/// body's does. A cut body, and a response whose identity changed (#2334), are
+/// transport failures; a shape this decoder does not support is ours; every
+/// other rejection is a defect in the model's output.
+pub(crate) fn rejection_class(error: &anyhow::Error) -> Option<super::observability::ErrorClass> {
+    use super::observability::ErrorClass;
+    let caused_by = |is: fn(&(dyn std::error::Error + 'static)) -> bool| error.chain().any(is);
+    if is_provider_error(error) {
+        None
+    } else if caused_by(|c| c.is::<response::StreamCut>() || c.is::<response::IdentityChanged>()) {
+        Some(ErrorClass::Transport)
+    } else if caused_by(|c| c.is::<response::Unsupported>()) {
+        Some(ErrorClass::Harness)
+    } else {
+        Some(ErrorClass::Model)
+    }
 }
 
 /// One display-affecting thing a chunk produced.

@@ -2,6 +2,7 @@
 """tb_campaign.py — trial records and the report table for tb-campaign.sh (#2318).
 
     tb_campaign.py ingest <job_dir> <cell.json> <out_dir>   # append trials.jsonl + cells.jsonl
+    tb_campaign.py cell-line <cell.json> <out_dir>          # append a skipped cell to cells.jsonl
     tb_campaign.py table <out_dir> [--pair]                # markdown matrix [+ treatment vs none]
     tb_campaign.py cell <cell.json> <treatment|none> key value ...   # write a cell binding
     tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
@@ -28,16 +29,22 @@ attempt counts once; tasks carry equal attempts by design.
 
 from __future__ import annotations
 
+import functools
+import getpass
 import hashlib
+import ipaddress
 import json
 import math
+import os
 import random
 import re
+import socket
 import statistics
 import sys
 import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pi_log import pi_awaiting, pi_inference_failure, pi_session_claim, session_messages
 from pi_log import records as _records
@@ -92,6 +99,82 @@ def error_cause(exception, exit_code, harness_error, pi_failure, responses, wait
     if exception in AGENT_EXCEPTIONS or responses:
         return "agent"
     return "unknown"
+
+
+# Rows and cells reach commits, report tables and cards. Free text copied from a
+# harness or provider is scrubbed as it is written, after classification: newt's
+# failed request names the request URL, and a provider's error body can name an
+# account. Identity and join fields (campaign, model, harness, job, task,
+# harness_version) are never touched, so tables still join and pins still install.
+FREE_TEXT = ("harness_error", "harness_config", "inference_failure", "refusal", "claim_source", "skipped")
+FREE_TEXT_MAX = 300
+# Generic shapes, for addresses this machine does not know about. The operator's
+# own names are matched as literals (local_literals), which also catches them
+# unbracketed, portless, escaped or %-encoded.
+ADDRESS = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+"  # URL
+    r"|\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?::\d+)?"  # bracketed IPv6 literal (not error[E0308])
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"  # IPv4
+    # host:port with a dotted host or localhost (not status:429 or src/main.rs:42:5)
+    r"|(?<![\w./-])(?:localhost|[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+):\d{2,5}(?![\d:])"
+    r"|/(?:home|Users)/[^/\s\"']+"  # home dir
+)
+ACCOUNT_MIN = 5  # ponytail: a shorter account (dev, app, newt) is only caught inside its home dir
+
+
+@functools.lru_cache(maxsize=None)
+def _addresses(host):
+    try:
+        ipaddress.ip_address(host)
+        return {host}
+    except ValueError:
+        pass
+    try:
+        return {host} | {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except (OSError, UnicodeError):  # an empty or overlong label cannot be encoded
+        return {host}
+
+
+def local_literals(base_url=None):
+    """(tokens, words, home): the endpoint host tb-campaign.sh exports in
+    TB_LOCAL_BASE_URL with its addresses (plain substrings, so escaped and
+    %-encoded forms are caught), this machine's hostname and the account (whole
+    words only), and the home dir. Names too short to be distinctive are left out."""
+    host = urlparse(base_url or os.environ.get("TB_LOCAL_BASE_URL", "")).hostname
+    tokens = {t for t in (_addresses(host) if host else set()) if len(t) >= 3}
+    hostname, account, home = socket.gethostname(), getpass.getuser(), str(Path.home())
+    words = {w for w in (hostname,) if len(w) >= 3} | ({account} if len(account) >= ACCOUNT_MIN else set())
+    return tokens, words, (home if len(home) >= ACCOUNT_MIN and home not in ("/", "~") else None)
+
+
+def scrub(value, literals=None):
+    """First line, with no address, local name or home dir, then bounded."""
+    literals = literals or local_literals()
+    if isinstance(value, dict):
+        return {k: scrub(v, literals) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub(v, literals) for v in value]
+    if not isinstance(value, str):
+        return value
+    tokens, words, home = literals
+    text = (value.strip().splitlines() or [""])[0]
+    text = text.replace(home, "<redacted>") if home else text
+    for token in sorted(tokens, key=len, reverse=True):
+        text = text.replace(token, "<redacted>")
+    for word in sorted(words, key=len, reverse=True):
+        text = re.sub(rf"(?<![\w-]){re.escape(word)}(?![\w-])", "<redacted>", text)
+    return ADDRESS.sub("<redacted>", text)[:FREE_TEXT_MAX]
+
+
+def redact(record, literals=None):
+    literals = literals or local_literals()
+    return {k: scrub(v, literals) if k in FREE_TEXT else v for k, v in record.items()}
+
+
+def write_cell(out: Path, cell, observed):
+    """The one writer of cells.jsonl lines, for ingested and skipped cells alike."""
+    with open(out / "cells.jsonl", "a") as f:
+        f.write(json.dumps(redact({**cell, "observed": observed})) + "\n")
 
 
 def pi_session_lines(agent_dir: Path):
@@ -157,6 +240,19 @@ def newt_status(lines):
     return status
 
 
+NOT_DONE_END = ("RepairExhausted", "VerificationIncomplete")
+
+
+def newt_end_reason(lines):
+    """newt's `solve_result.end_reason`, recorded as Rust Debug text: Some(X) is X."""
+    end = None
+    for o in _records(lines):
+        if o.get("kind") == "solve_result":
+            end = o.get("end_reason")
+    found = re.fullmatch(r"Some\((\w+)\)", end or "")
+    return found.group(1) if found else None
+
+
 def newt_claim(lines):
     """The contract's `outcome` says a terminal state was reached, not that the
     work is done: a run newt marks `status: incomplete` (#2315's RepairExhausted,
@@ -169,7 +265,7 @@ def newt_claim(lines):
     if outcome is None:
         return None
     status = newt_status(lines)
-    claimed = outcome == "completed" and status in ("completed", None)
+    claimed = outcome == "completed" and status in ("completed", None) and newt_end_reason(lines) not in NOT_DONE_END
     return claimed, f"contract outcome={outcome}, solve_result status={status}"
 
 
@@ -267,13 +363,17 @@ REFUSAL = re.compile(r"required feature `[a-z_]+` is [a-z_]+: [^\n]*")
 TREATMENT_ENV = {
     "NEWT_BENCH_SMART", "NEWT_BENCH_SELF_VERIFY", "NEWT_BENCH_MAX_ROUNDS",
     "NEWT_BENCH_TENACITY", "NEWT_BENCH_CONTEXT_WINDOW", "NEWT_BENCH_OCAP",
+    "NEWT_BENCH_VERIFY_OUTCOMES",
 }
-NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {}, "requires": []}
+# none is newt's shipped defaults, whose self-verify gate is on (#1961): a newt
+# baseline receipt that says otherwise did not run the baseline.
+NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {"receipt.verification.mode": "attempted"},
+        "requires": []}
 
 
 def load_treatment(path):
     if str(path) in ("", "none"):
-        return dict(NONE)
+        return {**NONE, "expect": dict(NONE["expect"])}
     raw = Path(path).read_bytes()
     t = tomllib.loads(raw.decode())
     if set(t) - TREATMENT_KEYS or not t.get("description"):
@@ -445,7 +545,7 @@ def trial_row(harness, trial: Path, expect=None):
             harness_config = o.get("effective_config") or harness_config
             contract = o if "outcome" in o else contract
         tokens_out = timing.get("gen_tokens")
-    return {
+    return redact({
         "trial": rec["trial"],
         "task": rec["task"],
         "task_checksum": r.get("task_checksum"),
@@ -456,6 +556,7 @@ def trial_row(harness, trial: Path, expect=None):
         "treatment_observed": observed(expect, contract),
         "harness_status": newt_status(lines) if harness == "newt" else None,
         "harness_outcome": (contract or {}).get("outcome"),
+        "harness_end_reason": newt_end_reason(lines) if harness == "newt" else None,
         "result": bool(r),
         "exception": exc,
         "reward": reward,
@@ -475,7 +576,7 @@ def trial_row(harness, trial: Path, expect=None):
         "tokens_source": source,
         "max_request_output_tokens": max_request_output(harness, trial / "agent"),
         "agent_s": _seconds(r.get("agent_execution")),
-    }
+    })
 
 
 # ── one Harbor job per trial ─────────────────────────────────────────────────
@@ -623,8 +724,7 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
             pin_path.write_text(json.dumps(pin_extend(pin, cell), indent=1, sort_keys=True))
     with open(out / "trials.jsonl", "a") as f:
         f.writelines(json.dumps(row) + "\n" for row in rows)
-    with open(out / "cells.jsonl", "a") as f:
-        f.write(json.dumps({**cell, "observed": len(rows)}) + "\n")
+    write_cell(out, cell, len(rows))
 
 
 def wilson(k, n, z=1.96):
@@ -681,6 +781,7 @@ def summarize(cell, rows):
         ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "not_observed": sum(r.get("treatment_observed") is False for r in rows),
+        "verification_ended": tuple(sum(r.get("harness_end_reason") == e for r in rows) for e in NOT_DONE_END),
         "terminal_not_done": sum(r.get("harness_outcome") == "completed"
                                  and r.get("harness_status") not in (None, "completed") for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
@@ -797,8 +898,8 @@ def table(out: Path, paired_report=False):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | interrupted (archived, re-run) | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | interrupted (archived, re-run) | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | newt verification ended: repair exhausted / incomplete | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -820,11 +921,11 @@ def table(out: Path, paired_report=False):
         fc = f"{s['false_completions']}/{s['claimed']}" if s["claimed"] else "0/0"
         big = f"{s['max_request_output']:,}" if s["max_request_output"] is not None else "not logged"
         treat = cell.get("treatment") or "none"
-        seen = "n/a" if treat == "none" or not cell.get("treatment_expect") else s["not_observed"]
+        seen = "n/a" if cell["harness"] != "newt" or not cell.get("treatment_expect") else s["not_observed"]
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {'/'.join(map(str, s['verification_ended']))} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
@@ -837,6 +938,8 @@ if __name__ == "__main__":
     cmd, *args = sys.argv[1:]
     if cmd == "ingest":
         ingest(Path(args[0]), Path(args[1]), Path(args[2]))
+    elif cmd == "cell-line":  # a skipped cell, through the same redaction as an ingested one
+        write_cell(Path(args[1]), json.loads(Path(args[0]).read_text()), 0)
     elif cmd == "table":
         table(Path(args[0]), "--pair" in args[1:])
     elif cmd == "cell":
