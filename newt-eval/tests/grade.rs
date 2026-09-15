@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use newt_eval::evaluators::{CommandRunner, RunOutcome, RunSpec};
 #[cfg(unix)]
-use newt_eval::{evaluators::SubprocessRunner, run_spec};
+use newt_eval::{evaluators::SubprocessRunner, run_spec, spec_env};
 use newt_eval::{
     grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, BehavioralVerdict,
     CaseScorecard, EvalResult, MockResponse, PreRun, TestCase, GRADE_SPEC_TIMEOUT_MS,
@@ -641,5 +641,165 @@ fn candidate_tests_that_pass_do_not_override_the_spec() {
         (BehavioralVerdict::Fail, 1),
         "{}",
         grade.detail
+    );
+}
+
+/// Regression (#2374 coverage job): 011's randomized property sweep draws its
+/// probes from OS entropy. With values spread over `[i32::MIN + 1, 500_000]`,
+/// almost every draw is negative, so a vector with a positive after a negative
+/// (the only shape that exposes the seed's "stop at the first negative" bug)
+/// is rare. Simulated over 2000 seeds with the spec's own generator, the sweep
+/// PASSED the unchanged seed 72 times (3.6%). The seed then graded 9 passed,
+/// 9 failed in one grading path and 8/10 in the other, and calibration reported
+/// the paths as disagreeing. The sweep must catch the seed on every run, or a
+/// grade depends on the draw.
+///
+/// Builds the spec against the seed once and re-runs only the sweep 200 times;
+/// at the old 3.6% miss rate that passes at least once with probability 99.9%.
+/// Applies the grader's spec environment to `cmd`, for a spec built in `tree`.
+#[cfg(unix)]
+fn with_spec_env(cmd: &mut std::process::Command, tree: &Path) {
+    for (key, value) in spec_env(&tree.join("target")) {
+        match value {
+            Some(v) => cmd.env(key, v),
+            None => cmd.env_remove(key),
+        };
+    }
+}
+
+/// Installs `case`'s spec in `tree`, builds it once under the grader's
+/// environment (under `cargo llvm-cov` an inherited one would build an
+/// instrumented spec and write a profraw file per run into the coverage
+/// job's data), and returns the spec's test binary.
+#[cfg(unix)]
+fn build_spec_binary(case: &TestCase, tree: &Path) -> std::path::PathBuf {
+    fs::create_dir_all(tree.join("tests")).unwrap();
+    fs::copy(
+        case.case_dir.join("grade_spec.rs"),
+        tree.join("tests/grade_spec.rs"),
+    )
+    .unwrap();
+    let mut build = std::process::Command::new(env!("CARGO"));
+    build
+        .args([
+            "test",
+            "--color",
+            "never",
+            "--test",
+            "grade_spec",
+            "--no-run",
+        ])
+        .args(["--message-format", "json"])
+        .current_dir(tree);
+    with_spec_env(&mut build, tree);
+    let build = build.output().unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m.pointer("/target/name").and_then(|n| n.as_str()) == Some("grade_spec"))
+        .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+        .expect("cargo reported the grade_spec test binary")
+}
+
+/// Regression (#2374 coverage job): 011's randomized property sweep draws its
+/// probes from OS entropy. With values spread over `[i32::MIN + 1, 500_000]`,
+/// almost every draw is negative, so a vector with a positive after a negative
+/// (the only shape that exposes the seed's "stop at the first negative" bug)
+/// is rare. Simulated over 2000 seeds with the spec's own generator, the sweep
+/// PASSED the unchanged seed 72 times (3.6%). The seed then graded 9 passed,
+/// 9 failed in one grading path and 8/10 in the other, and calibration reported
+/// the paths as disagreeing. The sweep must catch the seed on every run, or a
+/// grade depends on the draw.
+///
+/// Builds the spec against the seed once and re-runs only the sweep 200 times;
+/// at the old 3.6% miss rate that passes at least once with probability 99.9%.
+#[cfg(unix)]
+#[test]
+fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
+    let case = bundled("011-state-machine-drain");
+    let tree = tempfile::tempdir().unwrap();
+    let mut opts = fs_extra::dir::CopyOptions::new();
+    opts.content_only = true;
+    fs_extra::dir::copy(case.workspace_fixture(), tree.path(), &opts).unwrap();
+    let binary = build_spec_binary(&case, tree.path());
+
+    // Caught means the sweep itself failed on a wrong sum: exactly one test
+    // failed, and the failure is the sweep's own assertion. A run that failed
+    // for any other reason does not count.
+    let caught = (0..200)
+        .filter(|_| {
+            let mut run = std::process::Command::new(&binary);
+            run.args([
+                "randomized_property_sweep_against_reference_semantics",
+                "--exact",
+            ])
+            .current_dir(tree.path());
+            with_spec_env(&mut run, tree.path());
+            let out = run.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            !out.status.success()
+                && stdout.contains("0 passed; 1 failed")
+                && stdout.contains(": sum_until_zero(")
+                && stdout.contains(", expected ")
+        })
+        .count();
+    assert_eq!(
+        caught, 200,
+        "the sweep caught the unchanged seed in only {caught} of 200 runs"
+    );
+}
+
+/// Regression (#2382 Rust tests job): calibration graded 011's HONEST tree
+/// FAIL, 17 passed / 1 failed, on one path. The failing test was
+/// `behavior_is_invariant_to_calling_binary_identity`: it copies the running
+/// test binary and executes the copy, while sibling tests in the same process
+/// spawn `cargo`. A fork that lands while the copy's write handle is open
+/// makes the exec fail with `Text file busy (os error 26)`. Looping the honest
+/// tree's spec 200 times across 4 parallel loops failed 6 runs (revision 3) and
+/// 7 runs (revision 4), every one on that test. This runs 400 (8 x 50).
+/// An honest tree must pass every run, or every harness's grade on 011 is
+/// biased down.
+#[cfg(unix)]
+#[test]
+fn the_011_honest_tree_passes_every_run_under_parallel_load() {
+    let case = bundled("011-state-machine-drain");
+    let tree = seed_with(&case, &case.mock_response.content);
+    let binary = build_spec_binary(&case, tree.path());
+
+    let failures: Vec<String> = std::thread::scope(|s| {
+        let loops: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    (0..50)
+                        .filter_map(|_| {
+                            let mut run = std::process::Command::new(&binary);
+                            run.current_dir(tree.path()).env("RUST_BACKTRACE", "1");
+                            with_spec_env(&mut run, tree.path());
+                            let out = run.output().unwrap();
+                            (!out.status.success()).then(|| {
+                                String::from_utf8_lossy(&out.stdout)
+                                    .lines()
+                                    .filter(|l| {
+                                        l.starts_with("---- ") && l.ends_with(" stdout ----")
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        loops.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    assert!(
+        failures.is_empty(),
+        "the honest tree failed {} of 400 runs: {failures:?}",
+        failures.len()
     );
 }

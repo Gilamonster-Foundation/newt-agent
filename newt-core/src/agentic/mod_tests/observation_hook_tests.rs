@@ -8,6 +8,8 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         url: server_uri,
         model: "test-model",

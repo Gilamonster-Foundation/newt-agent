@@ -99,6 +99,8 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         rewrites_history: true,
         url: server_uri,
@@ -859,7 +861,7 @@ async fn final_summary_provider_contracts() {
                 request_budget: None,
                 calibration: 1.0,
                 estimation: crate::tokens::TokenEstimation::default(),
-                ollama_num_ctx: None,
+                ollama_options: None,
                 prompt_measurement: Default::default(),
             };
             let client = reqwest::Client::new();

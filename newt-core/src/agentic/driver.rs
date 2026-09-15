@@ -622,6 +622,8 @@ async fn run_one_turn(
             }
         };
     let ctx = ChatCtx {
+        verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
+        round_cap_hit: None,
         smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
         url: &config.url,
@@ -1092,9 +1094,10 @@ mod tests {
     }
 
     /// #2312: the driver threads its configured allowance into the turn, and the
-    /// Ollama wire — which sends no cap — reports it as a local reserve.
+    /// Ollama wire sends an explicit one as `options.num_predict`, so the server
+    /// enforces it. With none configured the body gains no `options` at all.
     #[tokio::test]
-    async fn a_configured_output_allowance_is_reserved_locally_on_ollama() {
+    async fn a_configured_output_allowance_is_sent_as_num_predict_on_ollama() {
         let (bare, outcome) =
             drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
         assert_eq!(
@@ -1109,11 +1112,31 @@ mod tests {
             outcome.output_allowance,
             Some(crate::agentic::OutputAllowance {
                 tokens: 3_000,
-                enforced: crate::agentic::Enforcement::Local,
+                enforced: crate::agentic::Enforcement::Server,
             })
         );
+        for body in &bare {
+            assert!(body.get("options").is_none(), "{body}");
+        }
+        for body in &capped {
+            assert_eq!(
+                body["options"],
+                serde_json::json!({"num_predict": 3_000}),
+                "{body}"
+            );
+        }
+        let mut config = cfg("http://placeholder");
+        config.num_ctx = Some(8_192);
+        config.output_allowance = Some(3_000);
+        let (windowed, _) = drive_once_capturing(TurnDriver::new(config)).await;
+        for body in &windowed {
+            assert_eq!(
+                body["options"],
+                serde_json::json!({"num_ctx": 8_192, "num_predict": 3_000}),
+                "{body}"
+            );
+        }
         for body in bare.iter().chain(&capped) {
-            assert!(body["options"].get("num_predict").is_none(), "{body}");
             assert!(body.get("max_tokens").is_none(), "{body}");
         }
     }
