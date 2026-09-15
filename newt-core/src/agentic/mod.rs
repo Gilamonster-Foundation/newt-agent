@@ -3058,21 +3058,22 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&probe_content, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    self_verify::Concluding {
-                        messages: &messages,
-                        workspace,
-                        task,
-                        rounds_left: more,
-                        round,
-                        ledger: &verification,
-                        tree_now: verification.tree_now(workspace).await,
-                        solve_obs: solve_obs.as_deref_mut(),
-                    },
-                    smart_verify,
-                    &probe_content,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &messages,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &probe_content,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         messages
@@ -5040,11 +5041,17 @@ fn is_workspace_inert_tool(name: &str) -> bool {
     ) || tools::is_context_remaining_call(name)
 }
 
-/// #2374: simple shell commands that only read, beyond
-/// [`is_read_only_shell_probe`]'s list. Used only by result-aware verification,
-/// so the default path's probe steering is unchanged; a candidate to merge into
-/// the shared list once that behaviour change is decided on its own.
+/// #2374: simple shell commands that only read. Used only by result-aware
+/// verification, so the default path's probe steering is unchanged. It differs
+/// from [`is_read_only_shell_probe`]'s list on purpose: `sed` is left out,
+/// because `-ri`, `-Ei`, `--in-place` and its `w` command all write.
 const VERIFICATION_READ_PROGRAMS: &[&str] = &[
+    "grep",
+    "rg",
+    "head",
+    "tail",
+    "wc",
+    "pwd",
     "cat",
     "ls",
     "find",
@@ -5057,10 +5064,24 @@ const VERIFICATION_READ_PROGRAMS: &[&str] = &[
     "git show",
 ];
 
+/// #2374: the tool a call reaches: a rewrite alias's canonical name, the name
+/// itself otherwise, and `None` for a corrective alias, which only returns
+/// coaching text.
+pub(crate) fn dispatched_tool_name(name: &str) -> Option<&str> {
+    match tools::resolve_tool_alias(name) {
+        Some(tools::AliasOutcome::Correct(_)) => None,
+        Some(tools::AliasOutcome::Rewrite(canonical)) => Some(canonical),
+        None => Some(name),
+    }
+}
+
 /// #2374: whether a call may have changed the workspace: anything that is
-/// neither read-only nor a workspace-inert built-in. Unknown and MCP tools
-/// fail closed (they may).
+/// neither read-only nor a workspace-inert built-in, judged as the tool it
+/// reaches. Unknown and MCP tools fail closed (they may).
 pub(crate) fn may_change_workspace(name: &str, args: &serde_json::Value) -> bool {
+    let Some(name) = dispatched_tool_name(name) else {
+        return false;
+    };
     if name == "run_command" {
         return args["command"]
             .as_str()
@@ -5069,22 +5090,36 @@ pub(crate) fn may_change_workspace(name: &str, args: &serde_json::Value) -> bool
     !is_read_only_call(name, args) && !is_workspace_inert_tool(name)
 }
 
-/// A single simple command that only reads: the shared probe list or
-/// [`VERIFICATION_READ_PROGRAMS`], with no shell metacharacters and no
-/// `find -delete` / `-exec`.
+/// A single simple command that only reads: one of
+/// [`VERIFICATION_READ_PROGRAMS`], with no shell metacharacters and no action
+/// that writes or runs (`find -delete` / `-exec` / `-fprint`, `--output=`,
+/// `tree -o`), however quotes or backslashes spell the token.
 pub(crate) fn is_verification_read_command(command: &str) -> bool {
     let command = command.trim();
-    if is_read_only_shell_probe(command) {
-        return true;
-    }
     const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
     if command.is_empty() || command.contains(SHELL_META) {
         return false;
     }
-    if command
+    let tokens: Vec<String> = command
         .split_whitespace()
-        .any(|t| matches!(t, "-delete" | "-exec" | "-execdir" | "-ok"))
-    {
+        .map(|t| t.replace(['"', '\'', '\\'], ""))
+        .collect();
+    let acts = tokens.iter().any(|t| {
+        t.starts_with("--output")
+            || matches!(
+                t.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+    }) || (tokens[0] == "tree" && tokens.iter().any(|t| t == "-o"));
+    if acts {
         return false;
     }
     VERIFICATION_READ_PROGRAMS
@@ -7834,21 +7869,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&oa_content, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    self_verify::Concluding {
-                        messages: &messages,
-                        workspace,
-                        task,
-                        rounds_left: more,
-                        round,
-                        ledger: &verification,
-                        tree_now: verification.tree_now(workspace).await,
-                        solve_obs: solve_obs.as_deref_mut(),
-                    },
-                    smart_verify,
-                    &oa_content,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &messages,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &oa_content,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         messages
@@ -8096,11 +8132,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         rounds_left: round + 1 < current_tool_round_limit,
                         round,
                         ledger: &verification,
-                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     verification_nudges,
-                ) {
+                )
+                .await
+                {
                     self_verify::Decision::Nudge(nudge) => {
                         strip_trailing_nudge_exchange(&mut messages);
                         messages
@@ -10256,21 +10293,22 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&oa_content, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    self_verify::Concluding {
-                        messages: &messages,
-                        workspace,
-                        task,
-                        rounds_left: more,
-                        round,
-                        ledger: &verification,
-                        tree_now: verification.tree_now(workspace).await,
-                        solve_obs: solve_obs.as_deref_mut(),
-                    },
-                    smart_verify,
-                    &oa_content,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &messages,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &oa_content,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         messages
@@ -10504,11 +10542,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         rounds_left: round + 1 < current_tool_round_limit,
                         round,
                         ledger: &verification,
-                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     verification_nudges,
-                ) {
+                )
+                .await
+                {
                     self_verify::Decision::Nudge(nudge) => {
                         strip_trailing_nudge_exchange(&mut messages);
                         messages
@@ -11997,21 +12036,22 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 let control = harness
                     .classify(&text, narration_nudge_cap, more, cancel)
                     .await?;
-                let control = harness.verify_answer(
-                    control,
-                    self_verify::Concluding {
-                        messages: &input,
-                        workspace,
-                        task,
-                        rounds_left: more,
-                        round,
-                        ledger: &verification,
-                        tree_now: verification.tree_now(workspace).await,
-                        solve_obs: solve_obs.as_deref_mut(),
-                    },
-                    smart_verify,
-                    &text,
-                )?;
+                let control = harness
+                    .verify_answer(
+                        control,
+                        self_verify::Concluding {
+                            messages: &input,
+                            workspace,
+                            task,
+                            rounds_left: more,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        smart_verify,
+                        &text,
+                    )
+                    .await?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
                         input.extend(echo.clone());

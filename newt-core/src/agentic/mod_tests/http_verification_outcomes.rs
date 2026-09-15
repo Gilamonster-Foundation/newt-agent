@@ -436,3 +436,48 @@ async fn a_failure_at_the_round_limit_ends_repair_exhausted_not_round_cap() {
         );
     }
 }
+
+/// Round three, item 2: a check created after the turn's first scan is still
+/// seen. The model runs a command (the first scan finds nothing to verify),
+/// writes a `Cargo.toml`, and runs `cargo test`, which fails on the broken
+/// manifest at the round limit. The cap exit must see that check and end
+/// `repair_exhausted`, not `round_cap`. The task names no check, so only the
+/// workspace scan can find it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn a_check_created_after_the_first_scan_decides_the_cap_exit() {
+    let script = [
+        Step::Run(PASSING_CHECK),
+        Step::Run("sh -c 'echo broken > Cargo.toml'"),
+        Step::Run("cargo test"),
+    ];
+    for (wire, smart) in [("openai", false), ("anthropic", true)] {
+        let run = run_script(wire, smart, true, "", &script, None, 3).await;
+        assert_eq!(run.reason, "repair_exhausted", "{wire} smart={smart}");
+        // The cap exit's trace names the check the scan found after the write,
+        // and the failed run it decided on.
+        let checks: Vec<_> = run
+            .signals
+            .iter()
+            .filter_map(|signal| match signal {
+                observability::BehaviorSignal::Verification { report, .. } => Some(
+                    report
+                        .checks
+                        .iter()
+                        .map(|check| (check.label.clone(), check.status))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            checks,
+            [vec![(
+                "`cargo test`".to_string(),
+                crate::agentic::self_verify::CheckStatus::Failed
+            )]],
+            "{wire} smart={smart}"
+        );
+    }
+}

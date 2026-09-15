@@ -42,8 +42,8 @@ pub struct VerifyCheck {
     /// and runs nothing).
     pub runners: Vec<String>,
     /// Forms that run no check: a flag anywhere in the runner's arguments
-    /// (`--no-run`, `--collect-only`), or a runner-relative prefix
-    /// (`cargo nextest list`).
+    /// (`--no-run`, `--collect-only`, also as `--flag=value`), compared
+    /// case-sensitively, or a runner-relative prefix (`cargo nextest list`).
     pub non_runs: Vec<String>,
     /// The check the task names in backticks matches only that command plus
     /// flags: backticked `make` is not `make install`.
@@ -108,7 +108,10 @@ impl VerifyCheck {
         let text = words.join(" ").to_ascii_lowercase();
         let non_run = self.non_runs.iter().any(|form| {
             if form.starts_with('-') {
-                args.iter().any(|a| a.eq_ignore_ascii_case(form))
+                args.iter().any(|a| {
+                    a.strip_prefix(form.as_str())
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+                })
             } else {
                 text == *form || text.starts_with(&format!("{form} "))
             }
@@ -152,8 +155,8 @@ struct Invocation {
 }
 
 /// `command` split into `(segment, separator after it)` at `&&`, `||`, `|`,
-/// `;`, `&` and newlines, outside quotes. `2>&1`, `>&2` and `&>` are
-/// redirections, not separators.
+/// `;`, `&` and newlines, outside quotes (a `\"` inside double quotes does not
+/// end them). `2>&1`, `>&2` and `&>` are redirections, not separators.
 fn split_command(command: &str) -> Vec<(String, &'static str)> {
     let chars: Vec<char> = command.trim().chars().collect();
     let (mut out, mut cur, mut quote, mut i) = (Vec::new(), String::new(), None::<char>, 0);
@@ -161,6 +164,13 @@ fn split_command(command: &str) -> Vec<(String, &'static str)> {
         let (c, next) = (chars[i], chars.get(i + 1).copied());
         if let Some(q) = quote {
             cur.push(c);
+            if q == '"' && c == '\\' {
+                if let Some(n) = next {
+                    cur.push(n);
+                    i += 2;
+                    continue;
+                }
+            }
             if c == q {
                 quote = None;
             }
@@ -224,6 +234,42 @@ fn strip_transparent_prefix(segment: &str) -> Vec<String> {
     }
 }
 
+/// #2374: forms of each runner that run no test. Flags match anywhere among the
+/// runner's arguments; the rest are command prefixes.
+const PYTEST_NON_RUNS: &[&str] = &[
+    "--collect-only",
+    "--co",
+    "--collectonly",
+    "--fixtures",
+    "--markers",
+    "--setup-plan",
+    "--version",
+    "--help",
+    "-h",
+];
+const CARGO_NON_RUNS: &[&str] = &[
+    "--no-run",
+    "--list",
+    "--help",
+    "-h",
+    "cargo nextest list",
+    "cargo nextest archive",
+    "cargo nextest show-config",
+];
+const GO_NON_RUNS: &[&str] = &["-c", "-list", "--list", "-n"];
+const MAKE_NON_RUNS: &[&str] = &["-n", "--dry-run", "--just-print", "--recon"];
+
+/// The non-run forms of the runner a command starts with.
+fn non_runs_for(runner: &str) -> &'static [&'static str] {
+    match runner.split_whitespace().next() {
+        Some("pytest" | "py.test" | "python" | "python3") => PYTEST_NON_RUNS,
+        Some("cargo") => CARGO_NON_RUNS,
+        Some("go") => GO_NON_RUNS,
+        Some("make") => MAKE_NON_RUNS,
+        _ => &[],
+    }
+}
+
 /// Detect the verifications afforded by a workspace's top-level `entries`
 /// (file/dir names, not full paths) plus the task `instruction`. Pure.
 ///
@@ -268,14 +314,17 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                     "python test_",
                     "python3 test_",
                 ])
-                .except(&["--collect-only", "--co", "--version", "--help"]),
+                .except(PYTEST_NON_RUNS),
             );
         }
         match el.as_str() {
-            "makefile" => checks.push(VerifyCheck::new(
-                "`make test` (the Makefile)",
-                &["make test", "make check", "make ci"],
-            )),
+            "makefile" => checks.push(
+                VerifyCheck::new(
+                    "`make test` (the Makefile)",
+                    &["make test", "make check", "make ci"],
+                )
+                .except(MAKE_NON_RUNS),
+            ),
             "justfile" => checks.push(VerifyCheck::new(
                 "`just test` (the justfile)",
                 &["just test", "just check"],
@@ -306,25 +355,35 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                 // tests: a turn that ran it has verified exactly as much, and
                 // omitting it would nudge a workspace that had.
                 checks.push(
-                    VerifyCheck::new("`cargo test`", &["cargo test", "cargo nextest"]).except(&[
-                        "--no-run",
-                        "--list",
-                        "cargo nextest list",
-                    ]),
+                    VerifyCheck::new("`cargo test`", &["cargo test", "cargo nextest"])
+                        .except(CARGO_NON_RUNS),
                 );
             }
-            "go.mod" => checks
-                .push(VerifyCheck::new("`go test ./...`", &["go test"]).except(&["-c", "-list"])),
+            "go.mod" => {
+                checks.push(VerifyCheck::new("`go test ./...`", &["go test"]).except(GO_NON_RUNS));
+            }
             _ => {}
         }
     }
 
     if let Some(cmd) = instruction_verify_command(instruction) {
         let marker = cmd.to_ascii_lowercase();
+        // #2374: the command runs as its last segment after the prefixes that
+        // run it unchanged, so `cd app && pytest` and `time make test` match
+        // their own runs; it takes that runner's non-run forms.
+        let runner = split_command(&cmd)
+            .iter()
+            .rev()
+            .find(|(segment, _)| !segment.is_empty())
+            .map(|(segment, _)| strip_transparent_prefix(segment).join(" "))
+            .filter(|runner| !runner.is_empty())
+            .unwrap_or_else(|| marker.clone());
         let mut named = VerifyCheck::new(
             format!("the command the task says to run: `{cmd}`"),
             &[marker.as_str()],
-        );
+        )
+        .runs_as(&[runner.as_str()])
+        .except(non_runs_for(&runner.to_ascii_lowercase()));
         named.flags_only = true;
         checks.push(named);
     }
@@ -672,8 +731,8 @@ pub struct VerificationLedger {
     ///
     /// [`ChatCtx::verify_outcomes`]: super::ChatCtx::verify_outcomes
     result_aware: bool,
-    /// The workspace's detected checks, scanned once per turn (off the async
-    /// worker) the first time a pass needs them.
+    /// The workspace's detected checks, scanned (off the async worker) when a
+    /// pass needs them and dropped whenever a call may have created a check.
     checks: Option<Vec<VerifyCheck>>,
 }
 
@@ -689,17 +748,11 @@ impl VerificationLedger {
         }
     }
 
-    /// This turn's detected checks: one bounded directory scan per turn, run on
-    /// the blocking pool.
+    /// This turn's detected checks, rescanned after any call that may have
+    /// created one. A failed scan is not cached.
     async fn checks(&mut self, workspace: &str) -> &[VerifyCheck] {
         if self.checks.is_none() {
-            let (root, task) = (std::path::PathBuf::from(workspace), self.task.clone());
-            let scanned = tokio::task::spawn_blocking(move || {
-                detect_checks(&workspace_entries(&root), &task)
-            })
-            .await
-            .unwrap_or_default();
-            self.checks = Some(scanned);
+            self.checks = detect_off_worker(workspace, &self.task).await;
         }
         self.checks.as_deref().unwrap_or_default()
     }
@@ -718,8 +771,10 @@ impl VerificationLedger {
         });
     }
 
-    /// Record a call that may have changed the workspace.
+    /// Record a call that may have changed the workspace (and so created a
+    /// check).
     pub fn record_write(&mut self) {
+        self.checks = None;
         self.entries.push(Observed::Write);
     }
 
@@ -740,9 +795,21 @@ impl VerificationLedger {
         match execution {
             Some(outcome) => {
                 let command = match args["command"].as_str() {
-                    Some(command) if name == "run_command" => command.to_string(),
+                    Some(command) if super::dispatched_tool_name(name) == Some("run_command") => {
+                        command.to_string()
+                    }
                     _ => format!("{name} {args}"),
                 };
+                // A command other than a read or a plain run of a known check
+                // may have created a check (`cargo new`, a new test file).
+                let plain = self.checks.as_ref().is_some_and(|checks| {
+                    checks
+                        .iter()
+                        .any(|check| check.invocation(&command).is_some_and(|i| i.plain))
+                });
+                if !plain && !super::is_verification_read_command(&command) {
+                    self.checks = None;
+                }
                 // Hash only pass evidence for a detected check; any other
                 // command's tree is never read.
                 let evidence = outcome == ExecOutcome::Passed
@@ -771,7 +838,7 @@ impl VerificationLedger {
     /// `RepairExhausted` and the reclassification is traced. Otherwise, and on
     /// any loop without a gate, it stays `RoundCap`.
     pub(crate) async fn cap_exit_reason(
-        &mut self,
+        &self,
         workspace: &str,
         gate_on: bool,
         round: usize,
@@ -780,30 +847,36 @@ impl VerificationLedger {
         if !(self.result_aware && gate_on) {
             return crate::TurnEndReason::RoundCap;
         }
-        let tree_now = self.tree_now(workspace).await;
-        let checks = self.checks(workspace).await.to_vec();
+        let scanned = detect_off_worker(workspace, &self.task).await;
         let (decision, report) = conclude(&Conclusion {
-            checks: &checks,
+            checks: scanned.as_deref().unwrap_or_default(),
             requested: &[],
             ledger: self,
-            tree_now,
+            tree_now: self.tree_now(workspace).await,
             repairs_used: VERIFY_REPAIR_ALLOWANCE,
             rounds_left: false,
         });
-        if decision != Decision::Stop(crate::TurnEndReason::RepairExhausted) {
-            return crate::TurnEndReason::RoundCap;
-        }
-        if let Some(obs) = solve_obs {
+        let exhausted = decision == Decision::Stop(crate::TurnEndReason::RepairExhausted);
+        if let Some(obs) = solve_obs.filter(|_| exhausted || scanned.is_none()) {
             obs.behavior_signals
                 .push(super::observability::BehaviorSignal::Verification {
                     round,
-                    decision: "repair_exhausted".to_string(),
+                    decision: if exhausted {
+                        "repair_exhausted"
+                    } else {
+                        SCAN_FAILED
+                    }
+                    .to_string(),
                     repairs_used: VERIFY_REPAIR_ALLOWANCE,
                     allowance: VERIFY_REPAIR_ALLOWANCE,
                     report,
                 });
         }
-        crate::TurnEndReason::RepairExhausted
+        if exhausted {
+            crate::TurnEndReason::RepairExhausted
+        } else {
+            crate::TurnEndReason::RoundCap
+        }
     }
 
     /// The current tree state, computed (off the async worker) only when some
@@ -819,6 +892,19 @@ impl VerificationLedger {
             None
         }
     }
+}
+
+/// The trace decision for a conclusion whose check scan failed: it decided
+/// with no checks.
+const SCAN_FAILED: &str = "check_scan_failed";
+
+/// [`detect_checks`] over a fresh [`workspace_entries`] scan, on the blocking
+/// pool. `None` when the scan task failed.
+async fn detect_off_worker(workspace: &str, task: &str) -> Option<Vec<VerifyCheck>> {
+    let (root, task) = (std::path::PathBuf::from(workspace), task.to_string());
+    tokio::task::spawn_blocking(move || detect_checks(&workspace_entries(&root), &task))
+        .await
+        .ok()
 }
 
 /// [`workspace_tree_state`] on the blocking pool: it reads and hashes up to
@@ -841,31 +927,35 @@ pub(crate) struct Concluding<'a> {
     pub rounds_left: bool,
     pub round: usize,
     pub ledger: &'a VerificationLedger,
-    /// The tree state now, computed by the caller off the async worker.
-    pub tree_now: Option<ContentId>,
     pub solve_obs: Option<&'a mut super::observability::SolveObservation>,
 }
 
 /// The one result-aware decision every caller uses (the two ordinary gates and
 /// SmartHarness), with its evidence recorded as a solve trace signal whenever
-/// the workspace affords a check.
-pub(crate) fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> Decision {
-    let entries = workspace_entries(std::path::Path::new(turn.workspace));
-    let checks = detect_checks(&entries, turn.task);
+/// the workspace affords a check or the scan failed. The scan and the tree
+/// state run here, off the async worker, so only a real conclusion pays for
+/// them.
+pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> Decision {
+    let scanned = detect_off_worker(turn.workspace, turn.task).await;
+    let checks = scanned.as_deref().unwrap_or_default();
     let requested = commands_from_messages(turn.messages);
     let (decision, report) = conclude(&Conclusion {
-        checks: &checks,
+        checks,
         requested: &requested,
         ledger: turn.ledger,
-        tree_now: turn.tree_now,
+        tree_now: turn.ledger.tree_now(turn.workspace).await,
         repairs_used,
         rounds_left: turn.rounds_left,
     });
-    if let Some(obs) = turn.solve_obs.filter(|_| !checks.is_empty()) {
+    if let Some(obs) = turn
+        .solve_obs
+        .filter(|_| !checks.is_empty() || scanned.is_none())
+    {
         obs.behavior_signals
             .push(super::observability::BehaviorSignal::Verification {
                 round: turn.round,
                 decision: match &decision {
+                    _ if scanned.is_none() => SCAN_FAILED.to_string(),
                     Decision::Accept => "accept".to_string(),
                     Decision::Nudge(_) => "nudge".to_string(),
                     Decision::Stop(reason) => serde_json::to_value(reason)
@@ -998,8 +1088,8 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
 
     // Each check's standing from its runs in order, by one rule: only pass
     // evidence moves it to Pass; a failure is cleared only by the same
-    // normalized command; a denial or a non-evidence run never erases a Pass or
-    // a Fail.
+    // normalized command; a denied or unavailable run, and a non-evidence run,
+    // never erases a Pass or a Fail.
     enum Standing<'a> {
         None,
         Pass(usize, &'a Option<ContentId>),
@@ -1033,7 +1123,7 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
                 (true, kind @ (ExecOutcome::Failed | ExecOutcome::TimedOut), _) => {
                     Standing::Fail(kind, run.normalized)
                 }
-                (true, _, kept @ Standing::Fail(..)) => kept,
+                (true, _, kept @ (Standing::Pass(..) | Standing::Fail(..))) => kept,
                 (true, kind, _) => Standing::Blocked(kind, i),
             };
         }

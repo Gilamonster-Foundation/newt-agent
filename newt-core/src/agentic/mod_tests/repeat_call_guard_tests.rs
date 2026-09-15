@@ -952,7 +952,7 @@ fn default_mode_keeps_steering_a_repeated_failure_across_successful_calls() {
 #[test]
 fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     let check = serde_json::json!({"command": "cargo test"});
-    for (name, args, clears) in [
+    let wrong = [
         ("run_command", serde_json::json!({"command": "ls"}), false),
         ("state_get", serde_json::json!({"key": "k"}), false),
         ("plan_get", serde_json::json!({}), false),
@@ -964,14 +964,38 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
         ),
         ("write_file", serde_json::json!({"path": "a.txt"}), true),
         ("delete_file", serde_json::json!({"path": "a.txt"}), true),
-    ] {
+        // Round three, item 4: an alias is classified as the tool it reaches.
+        // Rewrites to inert tools and shell aliases running a read keep the
+        // memo; corrective aliases only return coaching text.
+        ("get_plan", serde_json::json!({}), false),
+        ("show_plan", serde_json::json!({}), false),
+        ("read_plan", serde_json::json!({}), false),
+        ("find_tool", serde_json::json!({"query": "x"}), false),
+        ("list_tools", serde_json::json!({}), false),
+        ("resume", serde_json::json!({}), false),
+        ("recap", serde_json::json!({}), false),
+        ("ask_user", serde_json::json!({"question": "?"}), false),
+        ("bash", serde_json::json!({"command": "ls"}), false),
+        ("sh", serde_json::json!({"command": "cat a.txt"}), false),
+        ("exec", serde_json::json!({"command": "git status"}), false),
+        ("str_replace", serde_json::json!({"path": "a.txt"}), false),
+        ("apply_patch", serde_json::json!({"path": "a.txt"}), false),
+        ("edit", serde_json::json!({"path": "a.txt"}), false),
+        ("create_file", serde_json::json!({"path": "a.txt"}), false),
+        ("cat", serde_json::json!({"path": "a.txt"}), false),
+        ("open_file", serde_json::json!({"path": "a.txt"}), false),
+        ("delete", serde_json::json!({"path": "a.txt"}), false),
+        ("mkdir", serde_json::json!({"path": "d"}), false),
+        ("bash", serde_json::json!({"command": "touch fixed"}), true),
+    ]
+    .into_iter()
+    .filter_map(|(name, args, clears)| {
         let mut guard = RepeatCallGuard::for_verification(true);
         guard.record("run_command", &check, false, "error: command exited 101");
         guard.record(name, &args, true, "ok");
-        assert_eq!(
-            guard.repeat_steer("run_command", &check).is_none(),
-            clears,
-            "{name} {args}"
-        );
-    }
+        (guard.repeat_steer("run_command", &check).is_none() != clears)
+            .then(|| format!("{name} {args}: clears={}", !clears))
+    })
+    .collect::<Vec<_>>();
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

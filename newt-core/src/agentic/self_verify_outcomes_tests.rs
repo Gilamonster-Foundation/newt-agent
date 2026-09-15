@@ -507,3 +507,263 @@ fn the_receipt_says_off_where_the_loop_has_no_gate() {
     );
     assert_eq!(mode(Openai, Responses, true), "result_aware");
 }
+
+// ---------------------------------------------------------------------------
+// #2374 review round two, C and E: one pass-evidence rule. Restored in round
+// three (3d8aa43e dropped them) and extended by its shapes.
+// ---------------------------------------------------------------------------
+
+fn standing(
+    checks: &[VerifyCheck],
+    runs: &[(&str, crate::ExecOutcome)],
+    tree_now: Option<ContentId>,
+) -> CheckStatus {
+    let mut ledger = VerificationLedger::default();
+    for (command, outcome) in runs {
+        let tree = (*outcome == Passed)
+            .then(|| id("tree-t"))
+            .filter(|_| tree_now.is_some());
+        ledger.record_exec(command, *outcome, tree);
+    }
+    let (_, report) = conclude(&Conclusion {
+        checks,
+        requested: &[],
+        ledger: &ledger,
+        tree_now,
+        repairs_used: 0,
+        rounds_left: true,
+    });
+    report.checks[0].status
+}
+
+/// Checks, their runs in order, and the standing the rule must give.
+type Case<'a> = (
+    &'a [VerifyCheck],
+    &'a [(&'a str, crate::ExecOutcome)],
+    CheckStatus,
+);
+
+fn named(command: &str) -> Vec<VerifyCheck> {
+    detect_checks(&[], &format!("You can run `{command}` to verify."))
+}
+
+/// C: a run is pass evidence only when its runner segment is the last one, it
+/// is not backgrounded, no earlier `||` can skip it, and it is not a non-run
+/// form. A failure is cleared only by the same normalized full command, a
+/// denial never erases a pass or a failure, and an unverified re-run keeps a
+/// genuine pass.
+#[test]
+fn one_rule_decides_pass_evidence_for_every_command_shape() {
+    use CheckStatus::{Failed as F, NeverRun, Passed as P, Unverified as U};
+    let t = || Some(id("tree-t"));
+    let cargo = cargo_checks();
+    let python = python_checks();
+    let go = detect_checks(&["go.mod".to_string()], "");
+    let make = detect_checks(&["Makefile".to_string()], "");
+    let named_make = named("make");
+    let named_pytest = named("pytest");
+    let cases: &[Case] = &[
+        (&cargo, &[("cargo test", Passed)], P),
+        (&cargo, &[("cd backend && cargo test", Passed)], P),
+        (&cargo, &[("cargo test 2>&1", Passed)], P),
+        (&cargo, &[("RUST_BACKTRACE=1 cargo test", Passed)], P),
+        (
+            &cargo,
+            &[("cargo test && sed -i s/a/b/ src/lib.rs", Passed)],
+            U,
+        ),
+        (&cargo, &[("cargo test && rm src/lib.rs", Passed)], U),
+        (&cargo, &[("cargo test 2>&1 | tail -30", Passed)], U),
+        (&cargo, &[("cargo test; echo done", Passed)], U),
+        (&cargo, &[("cargo test &", Passed)], U),
+        (&cargo, &[("true || cargo test", Passed)], U),
+        (&cargo, &[("cargo test --no-run", Passed)], U),
+        (&cargo, &[("cargo test -- --list", Passed)], U),
+        (&cargo, &[("cargo nextest list", Passed)], U),
+        (&python, &[("pytest --collect-only", Passed)], U),
+        (&python, &[("pytest --co -q", Passed)], U),
+        (&python, &[("pytest --version", Passed)], U),
+        (&go, &[("go test -c ./...", Passed)], U),
+        (&go, &[("go test -list .", Passed)], U),
+        (
+            &python,
+            &[("pytest", Failed), ("pytest test_a.py", Passed)],
+            F,
+        ),
+        (
+            &python,
+            &[("pytest test_a.py", Failed), ("pytest", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cargo test --workspace", Failed), ("cargo test", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cd x && cargo test", Failed), ("cargo test", Passed)],
+            F,
+        ),
+        (
+            &python,
+            &[("PYTEST_ADDOPTS=-x pytest", Failed), ("pytest", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cargo test", Failed), ("cargo  test", Passed)],
+            P,
+        ),
+        (&cargo, &[("cargo test", Failed), ("cargo test", Denied)], F),
+        (
+            &cargo,
+            &[("cargo test", Failed), ("cargo test | tail", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cargo test", Passed), ("cargo test | tail", Passed)],
+            P,
+        ),
+        (&named_make, &[("make install", Passed)], NeverRun),
+        (&named_make, &[("make -j4", Passed)], P),
+        // Round three, item 5: a denied or unavailable re-run erases no pass.
+        (&cargo, &[("cargo test", Passed), ("cargo test", Denied)], P),
+        (
+            &cargo,
+            &[("cargo test", Passed), ("cargo test", Unavailable)],
+            P,
+        ),
+        // Item 6: `-C dir` is a real `go test` run; `-c` builds without running.
+        (&go, &[("go test -C sub ./...", Passed)], P),
+        // Item 6: a named check with a separator or a prefix matches its own
+        // command.
+        (
+            &named("cd app && pytest"),
+            &[("cd app && pytest", Passed)],
+            P,
+        ),
+        (
+            &named("make build; make test"),
+            &[("make build; make test", Passed)],
+            P,
+        ),
+        (&named("time make test"), &[("time make test", Passed)], P),
+        // Item 11: an escaped quote inside double quotes does not end them.
+        (
+            &python,
+            &[(r#"pytest -k "not \"slow\"" | tail -5"#, Passed)],
+            U,
+        ),
+        // Item 12: more forms that run no test.
+        (&python, &[("pytest -h", Passed)], U),
+        (&python, &[("pytest --collectonly", Passed)], U),
+        (&python, &[("pytest --fixtures", Passed)], U),
+        (&python, &[("pytest --markers", Passed)], U),
+        (&python, &[("pytest --setup-plan", Passed)], U),
+        (&cargo, &[("cargo test -h", Passed)], U),
+        (&cargo, &[("cargo test --help", Passed)], U),
+        (&cargo, &[("cargo nextest archive", Passed)], U),
+        (&cargo, &[("cargo nextest show-config", Passed)], U),
+        (&go, &[("go test -list=. ./...", Passed)], U),
+        (&go, &[("go test --list .", Passed)], U),
+        (&go, &[("go test -n ./...", Passed)], U),
+        (&make, &[("make test -n", Passed)], U),
+        (&named_make, &[("make -n", Passed)], U),
+        (&named_pytest, &[("pytest --collect-only", Passed)], U),
+        (&named_pytest, &[("pytest -x", Passed)], P),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(checks, runs, expected)| {
+            let got = standing(checks, runs, t());
+            (got != *expected).then(|| format!("{runs:?}: {got:?}, expected {expected:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// E: on the mutation-chain basis, a read-only probe after a pass is not a
+/// mutation, so it does not cost a repair nudge. A failed mutating call still
+/// counts. Round three, item 10: `sed` is never a read here (`-ri`, `-Ei`,
+/// `--in-place` and the `w` command all write), nor are `find`'s file-writing
+/// actions, `git --output=` or `tree -o`, however the token is quoted.
+#[test]
+fn a_read_only_probe_after_a_pass_does_not_stale_it_on_the_chain() {
+    let cargo = cargo_checks();
+    let after_pass =
+        |command: &str| standing(&cargo, &[("cargo test", Passed), (command, Passed)], None);
+    let mut wrong: Vec<String> = [
+        "cat src/lib.rs",
+        "ls",
+        "git status",
+        "grep -o fn src/lib.rs",
+        "find . -name a -o -name b",
+    ]
+    .into_iter()
+    .filter(|probe| after_pass(probe) != CheckStatus::Passed)
+    .map(|probe| format!("{probe}: a read staled the pass"))
+    .collect();
+    assert_eq!(
+        standing(
+            &cargo,
+            &[("cargo test", Passed), ("rm src/lib.rs", Failed)],
+            None
+        ),
+        CheckStatus::Stale,
+        "a failed mutating call still counts"
+    );
+    for writer in [
+        "sed -n 1p src/lib.rs",
+        "sed -ri s/a/b/ src/lib.rs",
+        "sed -Ei s/a/b/ src/lib.rs",
+        "sed --in-place s/a/b/ src/lib.rs",
+        "find . -fprint out.txt",
+        "find . -fprint0 out.txt",
+        "find . -fprintf out.txt %p",
+        "find . -fls out.txt",
+        "find . -okdir rm {} +",
+        "find . -name x \"-delete\"",
+        "find . -name x -exe\\c rm {} +",
+        "git diff --output=patch.txt",
+        "tree -o out.txt",
+    ] {
+        if after_pass(writer) != CheckStatus::Stale {
+            wrong.push(format!("{writer}: counted as a read"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Round three, item 4: an alias is classified as the tool it reaches. A shell
+/// alias runs its `command`, so `bash` running `cargo test` is the check's run
+/// and `sh` running `ls` is a read; a corrective alias (`str_replace`) and a
+/// rewrite to an inert tool (`get_plan`) change nothing.
+#[tokio::test]
+async fn an_alias_is_classified_as_the_tool_it_reaches() {
+    let ws = "newt-core-test-workspace-that-does-not-exist";
+    let mut ledger = VerificationLedger::for_turn("", true);
+    let command = |c: &str| serde_json::json!({ "command": c });
+    ledger
+        .observe("bash", &command("cargo test"), true, Some(Passed), ws)
+        .await;
+    ledger
+        .observe("sh", &command("ls"), true, Some(Passed), ws)
+        .await;
+    for name in ["str_replace", "get_plan"] {
+        ledger
+            .observe(
+                name,
+                &serde_json::json!({"path": "src/lib.rs"}),
+                true,
+                None,
+                ws,
+            )
+            .await;
+    }
+    assert_eq!(
+        decide_with(&cargo_checks(), &ledger, None),
+        Decision::Accept
+    );
+}

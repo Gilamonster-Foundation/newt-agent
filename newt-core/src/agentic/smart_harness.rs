@@ -810,7 +810,7 @@ impl SmartHarness {
     /// `gate_on` is the turn's action-nudge and disposition switch; the
     /// attempted-check path also needs a round left, the result-aware path
     /// (#2315) decides what to do without one.
-    pub(crate) fn verify_answer(
+    pub(crate) async fn verify_answer(
         &self,
         control: Control,
         turn: super::self_verify::Concluding<'_>,
@@ -822,7 +822,7 @@ impl SmartHarness {
         }
         if turn.ledger.result_aware() {
             let used = self.state()?.verify_repairs;
-            return Ok(match super::self_verify::conclude_turn(turn, used) {
+            return Ok(match super::self_verify::conclude_turn(turn, used).await {
                 super::self_verify::Decision::Accept => control,
                 super::self_verify::Decision::Nudge(text) => {
                     let text = format!("{} {text}", super::compress::LOOP_GUIDANCE_PREFIX);
