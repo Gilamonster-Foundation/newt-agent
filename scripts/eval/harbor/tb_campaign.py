@@ -29,17 +29,22 @@ attempt counts once; tasks carry equal attempts by design.
 
 from __future__ import annotations
 
+import functools
 import getpass
 import hashlib
+import ipaddress
 import json
 import math
+import os
 import random
 import re
+import socket
 import statistics
 import sys
 import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pi_log import pi_awaiting, pi_inference_failure, pi_session_claim, session_messages
 from pi_log import records as _records
@@ -103,33 +108,62 @@ def error_cause(exception, exit_code, harness_error, pi_failure, responses, wait
 # harness_version) are never touched, so tables still join and pins still install.
 FREE_TEXT = ("harness_error", "harness_config", "inference_failure", "refusal", "claim_source", "skipped")
 FREE_TEXT_MAX = 300
+# Generic shapes, for addresses this machine does not know about. The operator's
+# own names are matched as literals (local_literals), which also catches them
+# unbracketed, portless, escaped or %-encoded.
 ADDRESS = re.compile(
     r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+"  # URL
-    r"|\[[0-9A-Fa-f:.]+\](?::\d+)?"  # bracketed IPv6 literal
+    r"|\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?::\d+)?"  # bracketed IPv6 literal (not error[E0308])
     r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"  # IPv4
-    r"|(?<![\w.-])[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*:\d{2,5}\b"  # host:port
+    # host:port with a dotted host or localhost (not status:429 or src/main.rs:42:5)
+    r"|(?<![\w./-])(?:localhost|[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+):\d{2,5}(?![\d:])"
     r"|/(?:home|Users)/[^/\s\"']+"  # home dir
 )
-LOCAL_NAMES = {getpass.getuser(), str(Path.home())}
+ACCOUNT_MIN = 5  # ponytail: a shorter account (dev, app, newt) is only caught inside its home dir
 
 
-def scrub(value):
-    """First line, bounded, with no address, local account or home dir."""
+@functools.lru_cache(maxsize=None)
+def _addresses(host):
+    try:
+        ipaddress.ip_address(host)
+        return {host}
+    except ValueError:
+        pass
+    try:
+        return {host} | {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except OSError:
+        return {host}
+
+
+def local_literals(base_url=None):
+    """(tokens, account, home): the endpoint host tb-campaign.sh exports in
+    TB_LOCAL_BASE_URL with its addresses, this machine's hostname, the account."""
+    host = urlparse(base_url or os.environ.get("TB_LOCAL_BASE_URL", "")).hostname
+    tokens = (_addresses(host) if host else set()) | {socket.gethostname()}
+    return {t for t in tokens if t}, getpass.getuser(), str(Path.home())
+
+
+def scrub(value, literals=None):
+    """First line, with no address, account or home dir, then bounded."""
+    literals = literals or local_literals()
     if isinstance(value, dict):
-        return {k: scrub(v) for k, v in value.items()}
+        return {k: scrub(v, literals) for k, v in value.items()}
     if isinstance(value, list):
-        return [scrub(v) for v in value]
+        return [scrub(v, literals) for v in value]
     if not isinstance(value, str):
         return value
-    text = (value.strip().splitlines() or [""])[0][:FREE_TEXT_MAX]
-    for name in sorted(LOCAL_NAMES, key=len, reverse=True):
-        if len(name) >= 3:
-            text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", "<redacted>", text)
-    return ADDRESS.sub("<redacted>", text)
+    tokens, account, home = literals
+    text = (value.strip().splitlines() or [""])[0].replace(home, "<redacted>")
+    for token in sorted(tokens, key=len, reverse=True):  # plain substrings: inside %-encoded or escaped URLs too
+        text = text.replace(token, "<redacted>") if len(token) >= 3 else text
+    if len(account) >= ACCOUNT_MIN:
+        text = re.sub(rf"(?<![\w-]){re.escape(account)}(?![\w-])", "<redacted>", text)
+    return ADDRESS.sub("<redacted>", text)[:FREE_TEXT_MAX]
 
 
-def redact(record):
-    return {k: scrub(v) if k in FREE_TEXT else v for k, v in record.items()}
+def redact(record, literals=None):
+    literals = literals or local_literals()
+    return {k: scrub(v, literals) if k in FREE_TEXT else v for k, v in record.items()}
 
 
 def write_cell(out: Path, cell, observed):
