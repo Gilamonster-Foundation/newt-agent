@@ -1652,6 +1652,43 @@ mod tests {
         assert_eq!(o.error_class, Some(ErrorClass::Model));
     }
 
+    /// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool
+    /// call without an id) was answered by the model, so the turn ends
+    /// `model_error`. Its class rides a `DispatchError` attached as context,
+    /// which the outcome used to miss and file as `harness_error`.
+    #[tokio::test]
+    async fn a_strictly_rejected_openai_stream_classifies_as_model_error() {
+        use crate::agentic::observability::ErrorClass;
+        let server = MockServer::start().await;
+        let body = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = cfg(&server.uri());
+        config.kind = BackendKind::Openai;
+        let mut driver = TurnDriver::new(config);
+        driver.submit("do a thing").expect("submit");
+        let status = pump_to_done(&mut driver).await;
+        let TurnStatus::Completed(o) = status else {
+            panic!("expected Completed-with-error, got {status:?}");
+        };
+        let err = o.error.expect("the rejection is carried on the outcome");
+        assert!(err.contains("has no ID"), "{err}");
+        assert_eq!(o.error_class, Some(ErrorClass::Model));
+    }
+
     /// Cancel aborts the in-flight turn and returns the driver to idle.
     #[tokio::test]
     async fn cancel_aborts_the_in_flight_turn() {
