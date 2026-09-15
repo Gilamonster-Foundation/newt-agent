@@ -265,6 +265,14 @@ pub struct DispatchError {
 }
 
 impl DispatchError {
+    /// A failure whose class the caller decided from typed evidence.
+    pub fn new(class: ErrorClass, msg: impl Into<String>) -> Self {
+        Self {
+            class,
+            msg: msg.into(),
+        }
+    }
+
     /// Wrap a reqwest send/decode failure, classifying it while it is still
     /// typed. `prefix` preserves the historical site wording (`"request
     /// failed"` on the probe, `"stream request failed"` on the re-issue).
@@ -328,11 +336,16 @@ impl std::error::Error for DispatchError {}
 /// happened outside a dispatch (the caller files it as `harness_error`,
 /// fail-closed: an unattributed error must never masquerade as a model one).
 pub fn error_class(e: &anyhow::Error) -> Option<ErrorClass> {
-    e.chain().find_map(|c| {
-        c.downcast_ref::<DispatchError>()
-            .map(|d| d.class)
-            .or_else(|| c.downcast_ref::<reqwest::Error>().map(classify_reqwest))
-    })
+    // `anyhow::Error::downcast_ref` reaches a DispatchError at the root or
+    // attached with `.context()` (as `decode_openai_response` attaches one); a
+    // chain walk sees a context layer only as its wrapper. Nothing places a
+    // DispatchError behind a foreign `source()`, so only reqwest is walked for.
+    e.downcast_ref::<DispatchError>()
+        .map(|d| d.class)
+        .or_else(|| {
+            e.chain()
+                .find_map(|c| c.downcast_ref::<reqwest::Error>().map(classify_reqwest))
+        })
 }
 
 #[cfg(test)]
@@ -389,6 +402,29 @@ mod tests {
         // Display is the historical wording, verbatim — the retry layer and
         // the recovery heuristics match on it.
         assert_eq!(e.to_string(), "Ollama 500 Internal Server Error: boom");
+    }
+
+    /// #2318: `decode_openai_response` attaches its `DispatchError` with
+    /// `.context()`, and later layers add more context. A chain walk cannot
+    /// downcast a context layer to its context type, so every strict-decode
+    /// rejection of a 2xx reply lost its class and was filed as a harness error.
+    #[test]
+    fn a_dispatch_error_attached_as_context_keeps_its_class() {
+        let rejected = |message: &str| {
+            anyhow::anyhow!("streamed tool call has no ID")
+                .context(DispatchError::http_status(message.to_string()))
+                .context("round 3")
+        };
+        assert_eq!(
+            error_class(&rejected("streamed tool call has no ID")),
+            Some(ErrorClass::Model)
+        );
+        assert_eq!(
+            error_class(&rejected(
+                r#"OpenAI stream error: {"message":"Context size has been exceeded."}"#
+            )),
+            Some(ErrorClass::ContextExceeded)
+        );
     }
 
     /// `harness_error` (builder side): a request WE built wrong is our

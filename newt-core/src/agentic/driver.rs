@@ -1675,6 +1675,63 @@ mod tests {
         assert_eq!(o.error_class, Some(ErrorClass::Model));
     }
 
+    /// #2318: a 2xx OpenAI reply whose tool call has no id was answered by the
+    /// model, so the turn ends `model_error` on either route the defect takes:
+    /// strict decoding of a stream (a `DispatchError` attached as context, which
+    /// the outcome used to miss and file as `harness_error`), or the batch
+    /// validator's `CorrelationImpossible` arm for a complete JSON reply (the
+    /// arm Anthropic and Responses share). Nothing runs, and nothing is retried.
+    #[tokio::test]
+    async fn a_tool_call_without_an_id_classifies_as_model_error() {
+        use crate::agentic::observability::ErrorClass;
+        let stream = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>();
+        let json = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null,
+            "tool_calls": [{"type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]});
+        for (name, reply, message) in [
+            (
+                "strict stream",
+                ResponseTemplate::new(200).set_body_raw(stream.into_bytes(), "text/event-stream"),
+                "has no ID",
+            ),
+            (
+                "complete JSON",
+                ResponseTemplate::new(200).set_body_json(json),
+                "malformed provider output",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(reply)
+                .mount(&server)
+                .await;
+
+            let mut config = cfg(&server.uri());
+            config.kind = BackendKind::Openai;
+            let mut driver = TurnDriver::new(config);
+            driver.submit("do a thing").expect("submit");
+            let status = pump_to_done(&mut driver).await;
+            let TurnStatus::Completed(o) = status else {
+                panic!("{name}: expected Completed-with-error, got {status:?}");
+            };
+            let err = o.error.expect("the rejection is carried on the outcome");
+            assert!(err.contains(message), "{name}: {err}");
+            assert_eq!(o.error_class, Some(ErrorClass::Model), "{name}");
+            assert_eq!(o.end_reason, None, "{name}");
+            assert!(o.tool_events.is_empty(), "{name}: nothing ran");
+            let posts = server.received_requests().await.expect("journal");
+            assert_eq!(posts.len(), 1, "{name}: exactly one POST, no retry");
+        }
+    }
+
     /// Cancel aborts the in-flight turn and returns the driver to idle.
     #[tokio::test]
     async fn cancel_aborts_the_in_flight_turn() {
