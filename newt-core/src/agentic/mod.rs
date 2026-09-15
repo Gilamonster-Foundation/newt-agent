@@ -11073,22 +11073,30 @@ where
     .await
 }
 
-/// A Responses reply completed its attempt when it decoded to an answer or a
-/// refusal (the model's final word); failed, incomplete and malformed replies
-/// leave the attempt recorded failed.
+/// Record a decoded 2xx Responses reply's attempt by the #2313 state rule: a
+/// complete terminal response — an answer, a refusal, or a truncation
+/// (`incomplete`) — is ok; a failed, provider-error, mixed, non-terminal or
+/// malformed body is failed. The usage the body reported attaches either way.
 fn complete_responses_attempt(
     attempts: Option<attempt_capture::AttemptScope<'_>>,
     attempt: Option<&crate::attempts::AttemptKey>,
+    json: &serde_json::Value,
     decoded: &Result<
         crate::responses_wire::DecodedResponse,
         crate::responses_wire::ResponseDecodeError,
     >,
 ) {
-    if let Ok(crate::responses_wire::DecodedResponse { usage, .. })
-    | Err(crate::responses_wire::ResponseDecodeError::Refused { usage, .. }) = decoded
-    {
-        attempt_capture::complete(attempts, attempt, *usage);
-    }
+    use crate::responses_wire::ResponseDecodeError::{Incomplete, Refused};
+    let state = match decoded {
+        Ok(_) | Err(Refused { .. } | Incomplete { .. }) => crate::attempts::AttemptState::Ok,
+        Err(_) => crate::attempts::AttemptState::Failed,
+    };
+    attempt_capture::finish(
+        attempts,
+        attempt,
+        state,
+        crate::responses_wire::decode_usage(&json["usage"]),
+    );
 }
 
 async fn openai_responses_complete_with_prompt_and_artifacts(
@@ -11745,7 +11753,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
-        complete_responses_attempt(attempts, attempt.as_ref(), &decoded);
+        complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
         let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
@@ -12416,7 +12424,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // handoff is still a successful paused turn so the interactive caller can
     // persist it and retain the continuation link.
     let decoded = crate::responses_wire::decode_response(&json);
-    complete_responses_attempt(attempts, attempt.as_ref(), &decoded);
+    complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
     let decoded = match decoded {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
