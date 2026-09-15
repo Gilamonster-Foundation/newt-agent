@@ -1,0 +1,2 @@
+description = "a requirement newt has no receipt key for"
+requires = ["verification"]

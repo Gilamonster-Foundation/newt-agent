@@ -1,0 +1,2 @@
+description = "a treatment that requires the scratchpad receipt feature"
+requires = ["scratchpad"]
