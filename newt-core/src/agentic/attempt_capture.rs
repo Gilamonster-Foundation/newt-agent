@@ -97,6 +97,18 @@ pub(crate) fn finish(
     }
 }
 
+/// Keep the usage a failed response still reported. The send already recorded
+/// the attempt failed, so without reported usage there is nothing to add.
+pub(crate) fn failed(
+    scope: Option<AttemptScope<'_>>,
+    key: Option<&AttemptKey>,
+    error: &anyhow::Error,
+) {
+    if let Some(usage) = super::observability::reported_usage(error) {
+        finish(scope, key, AttemptState::Failed, Some(usage));
+    }
+}
+
 #[cfg(test)]
 #[path = "attempt_capture_tests.rs"]
 mod tests;
