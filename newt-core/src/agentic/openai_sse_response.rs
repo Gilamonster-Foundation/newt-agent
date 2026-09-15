@@ -141,8 +141,10 @@ impl StrictResponse {
         let finish = self
             .finish_reason
             .context("OpenAI stream has no finish reason")?;
+        // A batch cut at the output limit (`length`) is the model's to retry,
+        // as it is on the non-streamed wire: the loop judges its calls (#2385).
         anyhow::ensure!(
-            self.calls.is_empty() || finish == "tool_calls",
+            self.calls.is_empty() || matches!(finish.as_str(), "tool_calls" | "length"),
             "streamed tool batch did not finish with tool_calls"
         );
         anyhow::ensure!(
@@ -158,12 +160,18 @@ impl StrictResponse {
             );
             let id = call.id.context("streamed tool call has no ID")?;
             anyhow::ensure!(ids.insert(id.clone()), "streamed tool calls reuse an ID");
+            // Only what cannot be correlated fails the response. A call's name
+            // and arguments are the loop's to judge (`validate_tool_call_batch`),
+            // as on every other wire: an invalid call becomes a keyed rejection
+            // the model can retry, so it passes through raw (#2385). A valid call
+            // is normalized exactly as the loop would.
             let raw_arguments = Value::String(call.arguments);
-            let (name, arguments) =
-                crate::agentic::tools::validate_tool_call(Some(&call.name), &raw_arguments)
-                    .map_err(anyhow::Error::msg)?;
-            calls.push(json!({"id":id, "type":"function", "function":{
-                "name":name,"arguments":arguments.to_string()}}));
+            let function =
+                match crate::agentic::tools::validate_tool_call(Some(&call.name), &raw_arguments) {
+                    Ok((name, arguments)) => json!({"name":name,"arguments":arguments.to_string()}),
+                    Err(_) => json!({"name":call.name,"arguments":raw_arguments}),
+                };
+            calls.push(json!({"id":id, "type":"function", "function":function}));
         }
         let mut message = json!({"role":"assistant", "content":round.text});
         if !round.reasoning.is_empty() {
