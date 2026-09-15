@@ -162,14 +162,11 @@ async fn primary_stream_assembles_a_tool_batch_once_and_preserves_call_ids() {
         .expect("a complete streamed tool batch must reach execution");
     assert_eq!(tools.0, ["a", "b"]);
     assert_eq!(text, "Fixture response.");
-    assert!(
-        streamed,
-        "the accepted final answer retains its display reissue"
-    );
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(hallucinations, 0);
-    assert_eq!(usage.unwrap().output_tokens, 8);
+    assert_eq!(usage.unwrap().output_tokens, 6, "tool batch 4 + answer 2");
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 3, "tool batch, final answer, display reissue");
+    assert_eq!(seen.len(), 2, "tool batch, final answer");
     for request in seen.iter() {
         assert_eq!(request["stream"], true);
         assert_eq!(request["stream_options"]["include_usage"], true);
@@ -401,28 +398,6 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
             written_tx.send(()).unwrap();
         }
         socket.shutdown().await.unwrap();
-
-        if !cap_summary {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let (path, display) = read_request(&mut socket).await;
-            assert_eq!(path, "/v1/chat/completions");
-            assert_eq!(display["stream"], true);
-            let body = concat!(
-                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"display answer\"},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n",
-            );
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            socket.shutdown().await.unwrap();
-        }
         request
     });
 
@@ -467,13 +442,10 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         .expect("the progressing generation must finish")
         .expect("progress must reset the idle timeout");
     server.await.unwrap();
-    if cap_summary {
-        assert_eq!(text, "progressing answer");
-        assert!(!streamed);
-    } else {
-        assert_eq!(text, "display answer");
-        assert!(streamed);
-    }
+    // #2372: both the primary answer and the cap summary are returned as
+    // generated; nothing is sent again for display.
+    assert_eq!(text, "progressing answer");
+    assert!(!streamed);
 }
 
 #[tokio::test]
@@ -1085,11 +1057,7 @@ async fn a_mixed_response_after_a_dispatched_tool_retries_the_round_without_repl
     assert_eq!(text, "Fixture response.");
     assert_eq!(tools.0, ["a"], "a dispatched tool is never replayed");
     let seen = seen.lock().unwrap();
-    assert_eq!(
-        seen.len(),
-        4,
-        "tool round, mixed answer, one retry, display reissue"
-    );
+    assert_eq!(seen.len(), 3, "tool round, mixed answer, one retry");
 }
 
 /// #2334: when the one fresh attempt is also mixed, the turn fails explicitly

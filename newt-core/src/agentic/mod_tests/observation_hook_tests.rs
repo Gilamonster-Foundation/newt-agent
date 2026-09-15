@@ -819,11 +819,7 @@ async fn every_ollama_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
         "only the generation path may be hit: {:?}",
         received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
     );
-    assert_eq!(
-        generation.len(),
-        3,
-        "tool probe, answer probe, stream reissue"
-    );
+    assert_eq!(generation.len(), 2, "tool probe, answer probe (#2372)");
 
     let ledger = ledger.lock().unwrap();
     let records: Vec<_> = ledger.records().collect();
@@ -846,7 +842,7 @@ async fn every_ollama_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
     let totals = ledger.totals();
     assert_eq!(
         (totals.in_tokens, totals.out_tokens, totals.usage_complete),
-        (6_000 + 5_200 + 5_200, 5 + 3 + 3, true)
+        (6_000 + 5_200, 5 + 3, true)
     );
 }
 

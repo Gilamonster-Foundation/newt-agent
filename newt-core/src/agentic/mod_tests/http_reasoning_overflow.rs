@@ -66,8 +66,8 @@ async fn openai_reasoning_overflow_continues_once_with_the_current_plan() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(responder)
-        // Two model rounds + the #123 streaming re-issue of the second one.
-        .expect(3)
+        // Two model rounds; no display reissue (#2372).
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -182,8 +182,8 @@ async fn openai_inline_reasoning_overflow_uses_the_same_bounded_continuation() {
             inline_reasoning: true,
             replay: Default::default(),
         })
-        // Two model rounds + the #123 streaming re-issue of the second one.
-        .expect(3)
+        // Two model rounds; no display reissue (#2372).
+        .expect(2)
         .mount(&server)
         .await;
 

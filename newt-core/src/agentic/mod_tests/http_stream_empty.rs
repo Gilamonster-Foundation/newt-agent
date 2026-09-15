@@ -296,7 +296,7 @@ async fn suspicious_empty_generated_output_retries_with_nudge() {
             .expect("chat_complete should succeed");
 
     assert_eq!(reply, "recovered after empty retry");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 2);
     assert!(saw_nudge.load(Ordering::SeqCst));
     assert!(
@@ -383,7 +383,7 @@ async fn repeated_thinking_only_gets_stronger_second_nudge() {
             .expect("second hidden-only nudge should recover the turn");
 
     assert_eq!(reply, "recovered after strong hidden-only nudge");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 3);
     assert!(saw_strong_nudge.load(Ordering::SeqCst));
 }

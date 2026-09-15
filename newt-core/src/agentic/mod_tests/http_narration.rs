@@ -543,7 +543,8 @@ async fn readonly_completion_ollama_and_responses_recover_with_the_same_readonly
         .unwrap();
         assert_eq!(reply, "There are three local branches.");
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), if responses { 2 } else { 3 });
+        // #2372: no display reissue on either wire.
+        assert_eq!(requests.len(), 2);
         if responses {
             let second = body_json(&requests[1]);
             assert!(

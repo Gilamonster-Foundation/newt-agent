@@ -337,15 +337,17 @@ async fn scripted_openai_identical_next_turn_consumes_the_next_answer() {
             .await
             .expect("scripted streamed primary must produce a complete answer");
         assert_eq!(reply, expected);
-        assert!(streamed, "the display reissue must carry real SSE text");
+        assert!(!streamed, "the host renders the accepted answer (#2372)");
     }
     assert_eq!(round.load(Ordering::SeqCst), 2, "two logical rounds");
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 4, "primary and display for each turn");
+    assert_eq!(
+        requests.len(),
+        2,
+        "one generation per turn, no display reissue"
+    );
     assert!(requests.iter().all(is_stream), "all generations stream");
-    assert_eq!(requests[0].body, requests[1].body, "first display replay");
-    assert_eq!(requests[2].body, requests[3].body, "second display replay");
-    assert_eq!(requests[0].body, requests[2].body, "identical next turn");
+    assert_eq!(requests[0].body, requests[1].body, "identical next turn");
 }
 
 #[cfg(test)]
