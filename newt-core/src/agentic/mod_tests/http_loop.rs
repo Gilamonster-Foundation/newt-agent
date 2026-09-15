@@ -132,6 +132,60 @@ fn sse_replay(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
 }
 
+/// A raw HTTP/1.1 stream for what wiremock cannot drive: chunk boundaries, and
+/// an interrupt that lands inside a stream's read loop rather than its send.
+///
+/// Each part is written and drained before the next, so it arrives as its own
+/// `chunk()`. With `interrupt`, the server then writes padding far past the
+/// socket buffers (`:` comment lines, which neither the SSE nor the NDJSON
+/// reader parses), so the reader is provably inside its chunk loop; only then
+/// does it trip the flag, and it holds the connection open with no EOF.
+/// Without `interrupt`, the body ends after the last part.
+pub(super) async fn serve_stream_parts(
+    parts: &[&str],
+    interrupt: Option<Arc<AtomicBool>>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let parts: Vec<String> = parts.iter().map(|part| part.to_string()).collect();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        sock.set_nodelay(true).unwrap();
+        let mut scratch = [0u8; 8192];
+        assert!(
+            sock.read(&mut scratch).await.unwrap() > 0,
+            "the client asked"
+        );
+        // No Content-Length and no chunked framing: the body runs to close.
+        let head =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+        sock.write_all(head.as_bytes()).await.unwrap();
+        for part in parts {
+            sock.write_all(part.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let Some(flag) = interrupt else {
+            let _ = sock.shutdown().await;
+            return;
+        };
+        let pad = format!(":{}\n", "x".repeat(64 * 1024 - 2));
+        for _ in 0..256 {
+            // A reader that already returned stops draining; that is its answer.
+            if sock.write_all(pad.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+        flag.store(true, Ordering::Relaxed);
+        std::future::pending::<()>().await;
+    });
+    (url, server)
+}
+
 /// One terminal response authorizes one matching display reissue. A changed
 /// request invalidates the pending replay; every later logical turn advances.
 #[derive(Default)]

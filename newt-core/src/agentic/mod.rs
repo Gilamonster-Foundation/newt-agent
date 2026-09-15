@@ -13106,17 +13106,28 @@ async fn stream_response(
     let mut resp = resp;
     let mut done = false;
     let mut interrupted = false;
+    // The tail of an NDJSON line that arrived without its newline: a line
+    // straddles chunk boundaries, and the `done` line decides the attempt state.
+    let mut pending = String::new();
     // Race each chunk read against the interrupt flag so Esc stops the token
     // stream promptly; on interrupt, stop reading and return what we have.
-    while let Some(chunk) = match cancellable(cancel, resp.chunk()).await {
-        Some(c) => c?,
-        None => {
-            interrupted = true;
-            None
+    'read: loop {
+        let chunk = match cancellable(cancel, resp.chunk()).await {
+            Some(c) => c?,
+            None => {
+                interrupted = true;
+                break;
+            }
+        };
+        let eof = chunk.is_none();
+        match chunk {
+            Some(chunk) => pending.push_str(&String::from_utf8_lossy(&chunk)),
+            // EOF terminates an unterminated final line.
+            None => pending.push('\n'),
         }
-    } {
-        let text = String::from_utf8_lossy(&chunk);
-        for line in text.lines() {
+        while let Some(end) = pending.find('\n') {
+            let line: String = pending.drain(..=end).collect();
+            let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
                 continue;
             }
@@ -13186,8 +13197,12 @@ async fn stream_response(
                     input_tokens: i,
                     output_tokens: o,
                 });
-                break;
+                // Finished: never poll the socket (or the interrupt) again.
+                break 'read;
             }
+        }
+        if eof {
+            break;
         }
     }
     // #385: flush any clean tail the filter held back (a trailing run that turned out
