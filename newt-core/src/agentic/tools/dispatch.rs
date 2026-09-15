@@ -60,10 +60,17 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     pub(crate) plan_mode_control: Option<&'a dyn agentic::PlanModeControl>,
     pub(crate) spill_store: Option<&'a dyn SpillStore>,
     pub(crate) persona_tools: Option<&'a [String]>,
+    /// #2331: the turn's authorized tools whose schemas are off the wire.
+    /// `None` when nothing was hidden to track (the `full` profile, or a bare
+    /// dispatch).
+    pub(crate) hidden_tools: Option<&'a super::HiddenTools>,
     pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
     pub(crate) completed_spill_renderer:
         Option<std::sync::Arc<dyn crate::agentic::CompletedSpillRenderer>>,
+    /// #2315: where a shell call records its execution class for the loop's
+    /// tool-event funnel. `None` when no funnel is listening.
+    pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
 }
 
 #[allow(clippy::too_many_arguments)]
