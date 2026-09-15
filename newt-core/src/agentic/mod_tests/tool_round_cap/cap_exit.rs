@@ -418,7 +418,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             request_budget: None,
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: Some(4_096),
+            ollama_options: ollama_options(Some(4_096), None),
             prompt_measurement: Default::default(),
         },
     )
@@ -450,7 +450,8 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
         .await
         .expect("wiremock request journal");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["options"]["num_ctx"], 4_096);
+    // Exactly the window: no allowance adds no `num_predict` (#2312).
+    assert_eq!(body["options"], serde_json::json!({"num_ctx": 4_096}));
 }
 
 #[tokio::test]
@@ -489,7 +490,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             request_budget: None,
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: None,
+            ollama_options: None,
             prompt_measurement: Default::default(),
         },
     )
@@ -564,7 +565,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             request_budget: Some(2_000),
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: Some(2_500),
+            ollama_options: ollama_options(Some(2_500), None),
             prompt_measurement: Default::default(),
         },
     )
@@ -623,7 +624,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             request_budget: Some(2_000),
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
-            ollama_num_ctx: None,
+            ollama_options: None,
             prompt_measurement: Default::default(),
         },
     )

@@ -518,6 +518,55 @@ bounded_reasoning_continuation = true
     }
 }
 
+/// #2312: `newt solve` refuses an invalid output allowance at admission, like a
+/// required feature it cannot supply: no model request, no events file.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_refuses_an_invalid_output_allowance_before_inference() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    let events_path = fixture.path().join("events.jsonl");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    for (extra, expected) in [
+        (vec!["--output-allowance", "0"], "output_allowance 0 permits no output"),
+        (
+            vec!["--output-allowance", "40000", "--context-window", "32768"],
+            "output_allowance 40000 leaves no input room in the declared 32768-token context window",
+        ),
+    ] {
+        Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", NEMOTRON_MODEL])
+            .args(["--backend-kind", "openai"])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(extra)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(expected));
+    }
+    assert!(
+        requests.lock().expect("request capture lock").is_empty(),
+        "a refused allowance must not reach the model"
+    );
+    assert!(!events_path.exists(), "a refused run records no trace");
+}
+
 /// #2312: a headless run can set its output allowance, and the contract says
 /// whether the server was told (`max_tokens` on the wire) or newt only reserved
 /// it locally. Every contract read is paired with the captured bodies, so an
