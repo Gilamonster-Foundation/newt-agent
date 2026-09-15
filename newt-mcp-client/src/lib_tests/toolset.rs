@@ -251,7 +251,11 @@ async fn headless_toolset_reconnects_and_replays_once_after_session_404() {
     let mut toolset = McpToolset {
         servers: vec![ToolsetServer {
             live: connected,
-            http: Some(ToolsetHttpReconnectState { entry, caveats }),
+            http: Some(ToolsetHttpReconnectState {
+                entry,
+                caveats,
+                explicit_net_hosts: Vec::new(),
+            }),
         }],
         sanitize_server_names: true,
     };
@@ -291,7 +295,11 @@ async fn headless_recovers_404_then_replay_401_with_configured_authorization() {
     let mut toolset = McpToolset {
         servers: vec![ToolsetServer {
             live: connected,
-            http: Some(ToolsetHttpReconnectState { entry, caveats }),
+            http: Some(ToolsetHttpReconnectState {
+                entry,
+                caveats,
+                explicit_net_hosts: Vec::new(),
+            }),
         }],
         sanitize_server_names: true,
     };
@@ -347,7 +355,11 @@ async fn headless_toolset_reresolves_file_authorization_after_401() {
     let mut toolset = McpToolset {
         servers: vec![ToolsetServer {
             live: connected,
-            http: Some(ToolsetHttpReconnectState { entry, caveats }),
+            http: Some(ToolsetHttpReconnectState {
+                entry,
+                caveats,
+                explicit_net_hosts: Vec::new(),
+            }),
         }],
         sanitize_server_names: true,
     };

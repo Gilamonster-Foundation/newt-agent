@@ -423,33 +423,9 @@ struct CallbackParams {
     duplicate_issuer: bool,
 }
 
-/// The complete session network capability carried through every OAuth hop.
-/// `Scope::All` permits public egress but deliberately does not count as an
-/// exact approval for SSRF-sensitive private address resolution.
-#[derive(Clone, Debug)]
-pub struct OAuthHopPolicy {
-    net: newt_core::Scope<String>,
-}
-
-impl OAuthHopPolicy {
-    #[must_use]
-    pub fn new(net: &newt_core::Scope<String>) -> Self {
-        Self { net: net.clone() }
-    }
-
-    fn permits_host(&self, host: &str) -> bool {
-        newt_mcp_client::net_scope_permits_http_host(&self.net, host)
-    }
-
-    fn explicitly_grants_host(&self, host: &str) -> bool {
-        match &self.net {
-            newt_core::Scope::Only(hosts) => hosts
-                .iter()
-                .any(|granted| newt_mcp_client::http_host_grant_matches(granted, host)),
-            newt_core::Scope::All => false,
-        }
-    }
-}
+/// The shared MCP network capability and exact-host approvals, carried through
+/// every OAuth hop. Broad egress alone does not approve private resolution.
+pub type OAuthHopPolicy = newt_mcp_client::HttpNetworkPolicy;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -1822,3 +1798,5 @@ fn test_oauth_policy() -> OAuthHopPolicy {
 #[cfg(test)]
 #[path = "mcp_token_tests/tests.rs"]
 mod tests;
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:24 EDT | Date: 2026-09-15

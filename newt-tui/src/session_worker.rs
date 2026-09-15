@@ -212,6 +212,14 @@ impl PanelWindow {
             ratatui::layout::Rect::new(0, self.top, self.cols, self.rows),
         )
     }
+
+    /// Acquire input only after the presenter has lent the dialog its rows.
+    pub(crate) fn prompt_window(&self) -> std::io::Result<newt_core::tty::PromptWindow> {
+        Ok(newt_core::tty::Terminal::suspend_for_prompt_to(
+            self.out.try_clone()?,
+            newt_core::tty::TerminalTaker::PermissionAuthorization,
+        ))
+    }
 }
 
 impl SurfaceRequest {
@@ -1360,3 +1368,5 @@ mod tests {
         );
     }
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:29 EDT | Date: 2026-09-15

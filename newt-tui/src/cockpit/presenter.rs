@@ -125,45 +125,20 @@ struct ModalReservation {
     chat_visible: bool,
 }
 
-fn plan_modal_reservation(block_top: u16, screen_rows: u16, requested: u16) -> ModalReservation {
-    if requested <= block_top {
-        ModalReservation {
-            start: block_top - requested,
-            rows: requested,
-            chat_visible: true,
-        }
-    } else {
-        // The dialog and chat block cannot both fit. Give the blocking surface
-        // the whole screen; hiding the inactive chat box is preferable to
-        // letting the dialog scroll through a still-live ratatui viewport.
-        ModalReservation {
-            start: 0,
-            rows: screen_rows,
-            chat_visible: false,
-        }
+fn plan_modal_reservation(_block_top: u16, screen_rows: u16, requested: u16) -> ModalReservation {
+    let rows = requested.min(screen_rows);
+    ModalReservation {
+        start: screen_rows.saturating_sub(rows),
+        rows,
+        chat_visible: false,
     }
 }
 
-/// Physical terminal rows occupied by the canonical plain modal body.
-///
-/// The cockpit normally disables terminal autowrap because all of its own
-/// rows are pre-wrapped. The width-aware core terminal adapter applies this
-/// same shared wrapper to the canonical plain body while leaving the editable
-/// answer row in no-wrap mode.
-fn modal_physical_rows(body: &str, cols: u16) -> usize {
-    newt_core::tty::wrap_line(body, usize::from(cols.max(1))).len()
-}
-
-fn modal_requested_rows(body: &str, cols: u16) -> u16 {
-    u16::try_from(modal_physical_rows(body, cols).saturating_add(1)).unwrap_or(u16::MAX)
-}
-
-/// Bytes needed only when a constrained terminal gave the modal the whole
-/// visible screen. Ratatui's fixed-viewport `clear()` deliberately touches
-/// only the chat block, so it cannot remove modal rows outside that viewport.
-fn full_screen_modal_cleanup() -> io::Result<Vec<u8>> {
+/// Clear the window's whole reservation, including rows above the editor's
+/// fixed viewport, while retaining the transcript above it.
+fn modal_cleanup_bytes(start: u16) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    queue!(buf, MoveTo(0, 0), Clear(ClearType::All))?;
+    queue!(buf, MoveTo(0, start), Clear(ClearType::FromCursorDown))?;
     Ok(buf)
 }
 
@@ -188,37 +163,23 @@ impl Screen {
         self.term.clear()
     }
 
-    /// Open clean rows immediately above the persistent cockpit block.
-    ///
-    /// Scrolling first preserves the transcript in the terminal's history;
-    /// clearing only the shifted copy of the ephemeral block then leaves the
-    /// requested modal rows blank. The chat block is repainted in place below
-    /// them, so the operator can see its dimmed prompt and the modal's active
-    /// prompt at the same time.
+    /// Give the blocking window the composer's rows. Erase the editor first,
+    /// then preserve any covered transcript in scrollback. The draft stays in
+    /// memory and is painted again only after this window releases input.
     fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
         let plan = plan_modal_reservation(self.top, self.rows, requested);
-        if !plan.chat_visible {
-            let mut buf = Vec::new();
-            // Remove the ephemeral block before preserving the visible
-            // transcript in scrollback. That keeps a duplicate editor out of
-            // history while opening a full-screen fallback for the modal.
-            queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
-            if self.top > 0 {
-                queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
-                buf.extend(std::iter::repeat_n(b'\n', self.top as usize));
-            }
-            queue!(buf, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
-            self.tty.write_all(&buf)?;
-            self.tty.flush()?;
-            self.term.clear()?;
-            return Ok(plan);
-        }
-        if plan.rows == 0 {
-            return Ok(plan);
-        }
         let mut buf = Vec::new();
-        queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
-        buf.extend(std::iter::repeat_n(b'\n', plan.rows as usize));
+        queue!(
+            buf,
+            crossterm::cursor::Hide,
+            MoveTo(0, self.top),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        let covered_transcript = self.top.saturating_sub(plan.start);
+        if covered_transcript > 0 {
+            queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
+            buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
+        }
         queue!(buf, MoveTo(0, plan.start), Clear(ClearType::FromCursorDown))?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -235,7 +196,8 @@ impl Screen {
         if reservation.chat_visible {
             return Ok(());
         }
-        self.tty.write_all(&full_screen_modal_cleanup()?)?;
+        self.tty
+            .write_all(&modal_cleanup_bytes(reservation.start)?)?;
         self.tty.flush()
     }
 
@@ -569,8 +531,8 @@ pub(crate) struct Presenter {
     arbiter: newt_core::tty::EphemeralRegistration,
     _arbiter_target: Arc<dyn newt_core::tty::Ephemeral>,
     was_suspended: bool,
-    /// True only while a blocking interaction owns the keyboard. The editor
-    /// remains visible, but its prompt marker recedes behind the modal.
+    /// True only while a blocking window owns the keyboard. The editor draft
+    /// stays mounted in memory and is hidden until the window closes.
     chat_inactive: bool,
     dirty: bool,
     last_draw: Instant,
@@ -868,14 +830,10 @@ impl Presenter {
                 if self.dirty {
                     self.draw()?;
                 }
-                let plain_body = newt_core::markup::plain::render(&interaction.definition);
-                let requested_rows = modal_requested_rows(&plain_body, self.screen.cols);
+                let requested_rows =
+                    crate::interaction_view::requested_rows(&interaction, self.screen.cols);
                 let reservation = self.screen.reserve_modal_rows(requested_rows)?;
-                // Transfer visible focus before the blocking read: the modal's
-                // chevron becomes active and the persistent chat chevron
-                // recedes without discarding its draft. When a very short
-                // terminal cannot fit both surfaces, the chat box is hidden
-                // until the modal closes instead of being overwritten.
+                // The modal is the only visible input surface until it exits.
                 self.chat_inactive = true;
                 if reservation.chat_visible {
                     if let Err(error) = self.draw() {
@@ -885,7 +843,7 @@ impl Presenter {
                 }
                 if let Err(error) = self.screen.place_cursor(reservation.start) {
                     self.chat_inactive = false;
-                    let _ = self.screen.cleanup_modal(&reservation);
+                    let _ = self.finish_modal(&reservation);
                     let _ = self.draw();
                     return Err(error);
                 }
@@ -898,13 +856,23 @@ impl Presenter {
                     prompt_output,
                     newt_core::tty::TerminalTaker::CockpitModal,
                 );
-                let (outcome, prompt_notice) = crate::permissions::present_on_terminal_with_width(
-                    &window,
-                    &interaction,
-                    usize::from(self.screen.cols),
-                );
+                let rich = self.screen.tty.try_clone().and_then(|out| {
+                    let terminal = crate::inline_viewport::cockpit_panel_terminal(
+                        out,
+                        Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
+                    )?;
+                    crate::interaction_view::present_in(terminal, &interaction)
+                });
+                let (outcome, prompt_notice) = match rich {
+                    Ok((outcome, _)) => crate::permissions::apply_chat_prompt_policy(outcome),
+                    Err(_) => crate::permissions::present_on_terminal_with_width(
+                        &window,
+                        &interaction,
+                        usize::from(self.screen.cols),
+                    ),
+                };
                 drop(window);
-                let modal_cleanup = self.screen.cleanup_modal(&reservation);
+                let modal_cleanup = self.finish_modal(&reservation);
                 self.chat_inactive = false;
                 // The modal wrote outside ratatui's diff. Repaint the inline
                 // region from a clean buffer so focus returns to chat without
@@ -972,7 +940,7 @@ impl Presenter {
                     // The session vanished between asking and receiving. Undo
                     // the reservation rather than parking forever.
                     self.chat_inactive = false;
-                    let cleanup = self.screen.cleanup_modal(&reservation);
+                    let cleanup = self.finish_modal(&reservation);
                     let _ = self.screen.term.clear();
                     let _ = self.draw();
                     return cleanup;
@@ -981,7 +949,7 @@ impl Presenter {
                 // send — the same "the panel is done" signal, reached by a
                 // path that could not send. Either way: clean up.
                 let _ = released.recv();
-                let modal_cleanup = self.screen.cleanup_modal(&reservation);
+                let modal_cleanup = self.finish_modal(&reservation);
                 self.chat_inactive = false;
                 // The panel wrote outside ratatui's diff, so the mounted block
                 // is repainted from a clean buffer — the same restore the
@@ -1102,6 +1070,30 @@ impl Presenter {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// A blocking dialog may have consumed every resize event while this
+    /// presenter was parked. Read the real tty before restoring its draft.
+    fn finish_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: the saved real tty is open for the presenter's lifetime,
+        // and ioctl writes only to this correctly sized winsize value. fd 1
+        // is the capture PTY and still carries the old dimensions here.
+        if unsafe { libc::ioctl(self.screen.tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (cols, rows) = (size.ws_col.max(1), size.ws_row.max(1));
+        if (cols, rows) != (self.screen.cols, self.screen.rows) {
+            // A narrower dialog may have expanded above its original top.
+            // Clear the visible screen before rebuilding the editor at the
+            // actual dimensions; terminal scrollback is retained.
+            self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+            self.screen.tty.flush()?;
+            self.on_event(Event::Resize(cols, rows))
+        } else {
+            self.screen.cleanup_modal(reservation)
         }
     }
 
@@ -1386,13 +1378,13 @@ mod tests {
     }
 
     #[test]
-    fn modal_reservation_sits_immediately_above_the_chat_block() {
+    fn modal_reservation_occludes_the_chat_block() {
         assert_eq!(
             plan_modal_reservation(20, 24, 5),
             ModalReservation {
-                start: 15,
+                start: 19,
                 rows: 5,
-                chat_visible: true,
+                chat_visible: false,
             }
         );
         assert_eq!(
@@ -1407,44 +1399,19 @@ mod tests {
         assert_eq!(
             plan_modal_reservation(0, 4, 2),
             ModalReservation {
-                start: 0,
-                rows: 4,
+                start: 2,
+                rows: 2,
                 chat_visible: false,
             }
         );
     }
 
     #[test]
-    fn modal_reservation_counts_wrapped_display_rows() {
-        assert_eq!(modal_physical_rows("short", 10), 1);
-        assert_eq!(modal_physical_rows("123456", 5), 2);
-        assert_eq!(
-            modal_physical_rows("ab界\n\nlast", 3),
-            5,
-            "wide cells, hard newlines, and blank lines all occupy rows"
-        );
-        assert_eq!(
-            modal_requested_rows("123456", 5),
-            3,
-            "two wrapped body rows plus the answer row"
-        );
-        assert_eq!(
-            modal_requested_rows("x", 1),
-            2,
-            "the editable answer stays on one clipped, no-wrap row"
-        );
-    }
-
-    #[test]
-    fn full_screen_modal_cleanup_clears_outside_the_fixed_chat_viewport() {
-        let cleanup = full_screen_modal_cleanup().expect("cleanup bytes");
+    fn modal_cleanup_clears_outside_the_fixed_chat_viewport() {
+        let cleanup = modal_cleanup_bytes(6).expect("cleanup bytes");
         let mut expected = Vec::new();
-        queue!(expected, MoveTo(0, 0), Clear(ClearType::All)).expect("expected bytes");
+        queue!(expected, MoveTo(0, 6), Clear(ClearType::FromCursorDown)).expect("expected bytes");
         assert_eq!(cleanup, expected);
-        assert!(
-            cleanup.windows(4).any(|window| window == b"\x1b[2J"),
-            "cleanup must clear the whole screen, not only ratatui's fixed viewport"
-        );
     }
 
     fn crlf_count(buf: &[u8]) -> usize {
@@ -1557,3 +1524,6 @@ mod tests {
 #[cfg(test)]
 #[path = "presenter_terminal_acceptance.rs"]
 mod terminal_acceptance;
+
+#[cfg(test)]
+pub(crate) use terminal_acceptance::{cockpit_acceptance_case, panel_resize_case};

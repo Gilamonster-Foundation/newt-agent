@@ -205,9 +205,10 @@ fn every_terminal_taker_is_declared_at_an_acquisition_and_every_acquisition_decl
     );
 }
 
-/// The cockpit modal is the ONE production acquisition through the `File`
-/// door, and it is the taker that legitimately takes rows it did not reserve
-/// from the arbiter's point of view.
+/// The cockpit owns its semantic modal. Authorization has two mutually
+/// exclusive routes: the permission gate owns a standalone terminal, or the
+/// session worker acquires the saved terminal only after a `PanelWindow` loan
+/// has parked the cockpit. Pin both routes to their exact acquisition sites.
 ///
 /// Pinned separately because the two-way check above is set-shaped: it would
 /// still pass if `CockpitModal` were declared from some other file. Where a
@@ -231,7 +232,12 @@ fn the_two_deliberate_row_takers_are_where_they_say_they_are() {
     );
     assert_eq!(
         site_of("PermissionAuthorization"),
-        vec!["newt-tui/src/permissions.rs".to_string()],
-        "the authorization prompt is the permission gate's, and only its"
+        vec![
+            "newt-tui/src/permissions.rs".to_string(),
+            "newt-tui/src/session_worker.rs".to_string(),
+        ],
+        "authorization acquires either the gate's standalone terminal or a cockpit loan"
     );
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 15:32 EDT | Date: 2026-09-15

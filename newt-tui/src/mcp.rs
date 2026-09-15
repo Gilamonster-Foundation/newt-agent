@@ -111,12 +111,13 @@ impl Confinement {
 struct HttpReconnectState {
     entry: McpServerEntry,
     caveats: newt_core::caveats::Caveats,
+    explicit_net_hosts: Vec<String>,
     bearer: Option<String>,
     insecure_authorization_allowed: bool,
 }
 
-struct ReconnectableServer {
-    live: ClientConnectedServer,
+struct ReconnectableServer<Live = ClientConnectedServer> {
+    live: Live,
     http: Option<HttpReconnectState>,
 }
 
@@ -231,8 +232,198 @@ async fn reconnect_http(
         &state.caveats,
         bearer,
         state.insecure_authorization_allowed,
+        &state.explicit_net_hosts,
     )
     .await
+}
+
+/// The permission gate returns fresh caveats, the named net approvals that
+/// survive a full-access scope, and whether the current grant may be reused.
+pub(crate) type McpNetGrantPrompt<'a> = dyn FnMut(&newt_core::PermissionRequest) -> Option<(newt_core::Caveats, Vec<String>, bool)>
+    + 'a;
+
+fn request_http_net_grant(
+    error: &anyhow::Error,
+    server_name: &str,
+    prompt: &mut Option<&mut McpNetGrantPrompt<'_>>,
+) -> Option<(newt_core::Caveats, Vec<String>, bool)> {
+    let required = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()?;
+    let reason = if required.private {
+        "the private destination requires an exact host approval"
+    } else {
+        "the host is outside the session network capability"
+    };
+    let request = newt_core::PermissionRequest {
+        tool: "mcp connect".into(),
+        kind: newt_core::DenialKind::Net,
+        target: required.host.clone(),
+        reason: format!(
+            "MCP server `{server_name}`: {reason}. Allow once opens this server connection; \
+             session/permanent also allows reconnecting and other configured servers on this host."
+        ),
+    };
+    let (caveats, mut hosts, remembered) = prompt.as_mut()?(&request)?;
+    if !hosts.contains(&required.host) {
+        hosts.push(required.host.clone());
+    }
+    // A returned grant remains subject to the gate's posture/delegation clamp.
+    newt_mcp_client::net_scope_permits_http_host(&caveats.net, &required.host)
+        .then_some((caveats, hosts, remembered))
+}
+
+async fn connect_http_entry(
+    admitted: &newt_core::mcp::AdmittedServer<'_>,
+    caveats: &newt_core::Caveats,
+    explicit_net_hosts: &[String],
+    allow_insecure_hosts: &[String],
+) -> anyhow::Result<ReconnectableServer> {
+    let entry = admitted.entry();
+    let oauth_policy =
+        crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(&caveats.net, explicit_net_hosts);
+    let token = if has_configured_authorization_header(entry) {
+        None
+    } else {
+        match entry.url.as_deref() {
+            Some(url) => crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy).await,
+            None => None,
+        }
+    };
+    let (token, insecure_authorization_allowed) =
+        apply_transport_security(entry, token, allow_insecure_hosts);
+    let rejected_bearer = token.clone();
+    let initial = connect_http_with_runtime_bearer(
+        admitted,
+        caveats,
+        token.as_deref(),
+        insecure_authorization_allowed,
+        explicit_net_hosts,
+    )
+    .await;
+    retry_http_unauthorized_once(
+        initial,
+        token,
+        || async {
+            crate::mcp_token::refresh_bearer_token(
+                &entry.name,
+                entry.url.as_deref()?,
+                rejected_bearer.as_deref()?,
+                &oauth_policy,
+            )
+            .await
+        },
+        |refreshed| async move {
+            let (retry_token, retry_insecure_allowed) =
+                apply_transport_security(entry, Some(refreshed), allow_insecure_hosts);
+            connect_http_with_runtime_bearer(
+                admitted,
+                caveats,
+                retry_token.as_deref(),
+                retry_insecure_allowed,
+                explicit_net_hosts,
+            )
+            .await
+        },
+    )
+    .await
+    .map(|outcome| ReconnectableServer {
+        live: outcome.value,
+        http: Some(HttpReconnectState {
+            entry: entry.clone(),
+            caveats: caveats.clone(),
+            explicit_net_hosts: explicit_net_hosts.to_vec(),
+            bearer: outcome.bearer,
+            insecure_authorization_allowed,
+        }),
+    })
+}
+
+async fn connect_http_with_net_prompt(
+    admitted: &newt_core::mcp::AdmittedServer<'_>,
+    startup: &mut (newt_core::Caveats, Vec<String>),
+    allow_insecure_hosts: &[String],
+    prompt: &mut Option<&mut McpNetGrantPrompt<'_>>,
+) -> anyhow::Result<ReconnectableServer> {
+    let entry = admitted.entry();
+    let (_, host) = parse_scheme_host(entry.url.as_deref());
+    // Refuse out-of-scope hosts before token loading can trigger a refresh.
+    let initial = if !http_egress_permitted(&startup.0.net, &host) {
+        Err(newt_mcp_client::HttpNetGrantRequired {
+            host,
+            private: false,
+        }
+        .into())
+    } else {
+        connect_http_entry(admitted, &startup.0, &startup.1, allow_insecure_hosts).await
+    };
+    retry_http_net_grant_once(
+        initial,
+        &entry.name,
+        startup,
+        prompt,
+        |granted, approved_hosts| async move {
+            connect_http_entry(admitted, &granted, &approved_hosts, allow_insecure_hosts).await
+        },
+    )
+    .await
+}
+
+async fn retry_http_net_grant_once<Live, Connect, ConnectFuture>(
+    initial: anyhow::Result<ReconnectableServer<Live>>,
+    server_name: &str,
+    startup: &mut (newt_core::Caveats, Vec<String>),
+    prompt: &mut Option<&mut McpNetGrantPrompt<'_>>,
+    connect: Connect,
+) -> anyhow::Result<ReconnectableServer<Live>>
+where
+    Connect: FnOnce(newt_core::Caveats, Vec<String>) -> ConnectFuture,
+    ConnectFuture: std::future::Future<Output = anyhow::Result<ReconnectableServer<Live>>>,
+{
+    match initial {
+        Ok(connected) => Ok(connected),
+        Err(error) => {
+            let Some((granted, hosts, remembered)) =
+                request_http_net_grant(&error, server_name, prompt)
+            else {
+                return Err(error);
+            };
+            let mut approved_hosts = startup.1.clone();
+            approved_hosts.extend(hosts);
+            approved_hosts.sort();
+            approved_hosts.dedup();
+            if remembered {
+                // Preserve the decision before dialing: a later 401 does not
+                // revoke a session grant needed by another server's OAuth hop.
+                startup.0.net = granted.net.clone();
+                startup.1 = approved_hosts.clone();
+            }
+            let mut connected = connect(granted, approved_hosts).await?;
+            if !remembered {
+                // Allow-once covers this connection, never a later reconnect.
+                connected.http = None;
+            }
+            Ok(connected)
+        }
+    }
+}
+
+fn startup_mcp_entries<'a>(
+    entries: &'a [McpServerEntry],
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
+) -> impl Iterator<Item = &'a McpServerEntry> {
+    entries.iter().take_while(move |_| {
+        !cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+fn synchronize_http_reconnect_policy<Live>(
+    servers: &mut [ReconnectableServer<Live>],
+    startup: &(newt_core::Caveats, Vec<String>),
+) {
+    // Earlier connections may refresh against a host granted later in startup.
+    for state in servers.iter_mut().filter_map(|server| server.http.as_mut()) {
+        state.caveats.net = startup.0.net.clone();
+        state.explicit_net_hosts = startup.1.clone();
+    }
 }
 
 struct HttpConnectOutcome<T> {
@@ -358,9 +549,11 @@ impl Mcp {
                     }
                 }
                 McpStatus::Skipped(r) => {
-                    // A 401 is the one skip an operator can act on, so it says
-                    // how — the rest report what happened and stop.
-                    let hint = if r.contains("401") || r.to_lowercase().contains("auth") {
+                    // Network denials already name their config remediation;
+                    // an auth-related hostname must not turn one into a login hint.
+                    let hint = if r.contains("[tui.permissions] net") {
+                        String::new()
+                    } else if r.contains("401") || r.to_lowercase().contains("auth") {
                         format!(" — `newt auth {n}` to re-authenticate")
                     } else {
                         String::new()
@@ -467,7 +660,13 @@ impl Mcp {
         // confined session can't reach an un-granted host via a rogue MCP config.
         // #1243 Leg 3: a spawned stdio server is confined to this whole leash.
         caveats: &newt_core::caveats::Caveats,
+        explicit_net_hosts: &[String],
+        grant_net: Option<(&mut McpNetGrantPrompt<'_>, &std::sync::atomic::AtomicBool)>,
     ) -> Self {
+        let (mut grant_net, startup_cancel) = match grant_net {
+            Some((prompt, cancel)) => (Some(prompt), Some(cancel)),
+            None => (None, None),
+        };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
         let entries = newt_core::mcp::discover_with_namespace_mode(
@@ -480,7 +679,8 @@ impl Mcp {
         let mut servers = Vec::new();
         let mut connected_prefixes = std::collections::BTreeSet::new();
         let mut statuses: Vec<(String, McpStatus)> = Vec::new();
-        for entry in &entries {
+        let mut http_startup = (caveats.clone(), explicit_net_hosts.to_vec());
+        for entry in startup_mcp_entries(&entries, startup_cancel) {
             if !entry.enabled {
                 statuses.push((entry.name.clone(), McpStatus::Disabled));
                 continue;
@@ -517,105 +717,19 @@ impl Mcp {
                             continue;
                         }
                     };
-                    // #1156: net-gate egress. A loopback host is the dev
-                    // exception (never leaves the box); any other host must be
-                    // permitted by the session net scope or the server is
-                    // skipped (shown in /mcp), never silently dialed.
-                    let (_scheme, host) = parse_scheme_host(entry.url.as_deref());
-                    if !http_egress_permitted(&caveats.net, &host) {
-                        tracing::warn!(
-                            "MCP server `{}`: egress to {host} is outside the session net \
-                             allow-list — skipped (grant it in [tui.permissions] net)",
-                            entry.name
-                        );
-                        statuses.push((
-                            entry.name.clone(),
-                            McpStatus::Skipped(format!("net not granted: {host}")),
-                        ));
-                        continue;
-                    }
                     if has_plaintext_authorization_header(entry) {
                         let reason = "plaintext Authorization credential in MCP config; replace it with an environment/file reference";
                         tracing::warn!("MCP server `{}`: {reason} — skipped", entry.name);
                         statuses.push((entry.name.clone(), McpStatus::Skipped(reason.to_string())));
                         continue;
                     }
-                    // Load the stored hermes OAuth token only when the operator
-                    // hasn't already configured an explicit Authorization header.
-                    let already_authed = has_configured_authorization_header(entry);
-                    let oauth_policy = crate::mcp_token::OAuthHopPolicy::new(&caveats.net);
-                    let token = if already_authed {
-                        None
-                    } else {
-                        match entry.url.as_deref() {
-                            Some(url) => {
-                                crate::mcp_token::load_bearer_token(&entry.name, url, &oauth_policy)
-                                    .await
-                            }
-                            None => None,
-                        }
-                    };
-                    // Secure-by-default transport policy: WARN on any non-loopback
-                    // unencrypted connection, and only inject the OAuth Bearer over
-                    // https / loopback / an explicitly allow-listed host
-                    // (docs/decisions/mcp_transport_security.md).
-                    let (token, insecure_authorization_allowed) =
-                        apply_transport_security(entry, token, allow_insecure_hosts);
-                    let rejected_bearer = token.clone();
-                    let reconnect_entry = entry.clone();
-                    let reconnect_caveats = caveats.clone();
-                    // #1243 Leg 4: route the HTTP client through the session's
-                    // egress proxy so per-call traffic + redirects are net-gated,
-                    // not just the connect-time host (#1156).
-                    let initial = connect_http_with_runtime_bearer(
+                    connect_http_with_net_prompt(
                         &admitted,
-                        caveats,
-                        token.as_deref(),
-                        insecure_authorization_allowed,
-                    )
-                    .await;
-                    // A token can be revoked or expire earlier than its local
-                    // timestamp. Refresh under the credential transaction and
-                    // retry the MCP handshake exactly once on a typed 401.
-                    retry_http_unauthorized_once(
-                        initial,
-                        token,
-                        || async {
-                            let url = entry.url.as_deref()?;
-                            let rejected = rejected_bearer.as_deref()?;
-                            crate::mcp_token::refresh_bearer_token(
-                                &entry.name,
-                                url,
-                                rejected,
-                                &oauth_policy,
-                            )
-                            .await
-                        },
-                        |refreshed| async move {
-                            let (retry_token, retry_insecure_allowed) = apply_transport_security(
-                                entry,
-                                Some(refreshed),
-                                allow_insecure_hosts,
-                            );
-                            connect_http_with_runtime_bearer(
-                                &admitted,
-                                caveats,
-                                retry_token.as_deref(),
-                                retry_insecure_allowed,
-                            )
-                            .await
-                        },
+                        &mut http_startup,
+                        allow_insecure_hosts,
+                        &mut grant_net,
                     )
                     .await
-                    .map(|outcome| ReconnectableServer {
-                        live: outcome.value,
-                        http: Some(HttpReconnectState {
-                            entry: reconnect_entry,
-                            caveats: reconnect_caveats,
-                            bearer: outcome.bearer,
-                            insecure_authorization_allowed,
-                        }),
-                    })
                 }
                 TransportKind::Sse => {
                     tracing::warn!(
@@ -655,6 +769,7 @@ impl Mcp {
                 }
             }
         }
+        synchronize_http_reconnect_policy(&mut servers, &http_startup);
         Self {
             statuses,
             servers,
@@ -764,8 +879,10 @@ impl Mcp {
                         let refresh_state = refresh_state.clone();
                         async move {
                             let url = refresh_state.entry.url.as_deref()?;
-                            let policy =
-                                crate::mcp_token::OAuthHopPolicy::new(&refresh_state.caveats.net);
+                            let policy = crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(
+                                &refresh_state.caveats.net,
+                                &refresh_state.explicit_net_hosts,
+                            );
                             crate::mcp_token::refresh_bearer_token(
                                 &refresh_state.entry.name,
                                 url,
@@ -867,6 +984,231 @@ fn format_result(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_net_retry_prompts_only_for_typed_network_denials() {
+        let mut calls = 0;
+        let mut approve = |request: &newt_core::PermissionRequest| {
+            calls += 1;
+            assert_eq!(request.kind, newt_core::DenialKind::Net);
+            assert_eq!(request.target, "mcp.example.test");
+            Some((newt_core::Caveats::top(), Vec::new(), true))
+        };
+        let mut prompt: Option<&mut McpNetGrantPrompt<'_>> = Some(&mut approve);
+        assert!(request_http_net_grant(
+            &anyhow::anyhow!("TLS handshake failed"),
+            "review",
+            &mut prompt,
+        )
+        .is_none());
+        for private in [false, true] {
+            let error = anyhow::Error::new(newt_mcp_client::HttpNetGrantRequired {
+                host: "mcp.example.test".into(),
+                private,
+            });
+            let (_, hosts, remembered) =
+                request_http_net_grant(&error, "review", &mut prompt).unwrap();
+            assert_eq!(hosts, ["mcp.example.test"]);
+            assert!(remembered);
+        }
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn mcp_net_retry_headless_denied_or_attenuated_stays_closed() {
+        let error = anyhow::Error::new(newt_mcp_client::HttpNetGrantRequired {
+            host: "mcp.example.test".into(),
+            private: true,
+        });
+        assert!(request_http_net_grant(&error, "review", &mut None).is_none());
+        let mut deny = |_request: &newt_core::PermissionRequest| None;
+        assert!(request_http_net_grant(&error, "review", &mut Some(&mut deny)).is_none());
+        let mut clamped = |_request: &newt_core::PermissionRequest| {
+            Some((
+                newt_core::Caveats {
+                    net: newt_core::Scope::none(),
+                    ..newt_core::Caveats::top()
+                },
+                Vec::new(),
+                true,
+            ))
+        };
+        assert!(request_http_net_grant(&error, "review", &mut Some(&mut clamped)).is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_net_retry_preserves_named_grants_and_only_retains_session_recovery() {
+        for remembered in [false, true] {
+            let initial = Err(newt_mcp_client::HttpNetGrantRequired {
+                host: "mcp.example.test".into(),
+                private: true,
+            }
+            .into());
+            let mut approve = |_request: &newt_core::PermissionRequest| {
+                Some((newt_core::Caveats::top(), Vec::new(), remembered))
+            };
+            let mut startup = (
+                newt_core::Caveats::top(),
+                vec!["auth.example.test".to_string()],
+            );
+            let connected = retry_http_net_grant_once(
+                initial,
+                "review",
+                &mut startup,
+                &mut Some(&mut approve),
+                |caveats, explicit_net_hosts| async move {
+                    let policy = newt_mcp_client::HttpNetworkPolicy::with_explicit_hosts(
+                        &caveats.net,
+                        &explicit_net_hosts,
+                    );
+                    assert!(policy.explicitly_grants_host("mcp.example.test"));
+                    assert!(policy.explicitly_grants_host("auth.example.test"));
+                    assert!(!policy.explicitly_grants_host("unapproved.example.test"));
+                    Ok(ReconnectableServer {
+                        live: (),
+                        http: Some(HttpReconnectState {
+                            entry: http_entry("https://mcp.example.test/mcp"),
+                            caveats,
+                            explicit_net_hosts,
+                            bearer: None,
+                            insecure_authorization_allowed: false,
+                        }),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(connected.http.is_some(), remembered);
+        }
+    }
+
+    #[tokio::test]
+    async fn remembered_mcp_grant_reaches_later_initial_oauth_even_after_connect_failure() {
+        for base_net in [
+            newt_core::Scope::All,
+            newt_core::Scope::only(["mcp.example.test".into()]),
+        ] {
+            for remembered in [false, true] {
+                let mut startup = (
+                    newt_core::Caveats {
+                        net: base_net.clone(),
+                        ..newt_core::Caveats::top()
+                    },
+                    vec!["mcp.example.test".into()],
+                );
+                let granted = newt_core::widen_caveats(
+                    &startup.0,
+                    &[(newt_core::DenialKind::Net, "auth.example.test".into())],
+                );
+                let mut approve = |_request: &newt_core::PermissionRequest| {
+                    Some((
+                        granted.clone(),
+                        vec!["auth.example.test".into()],
+                        remembered,
+                    ))
+                };
+                let initial = Err(newt_mcp_client::HttpNetGrantRequired {
+                    host: "auth.example.test".into(),
+                    private: true,
+                }
+                .into());
+                let failure = retry_http_net_grant_once::<(), _, _>(
+                    initial,
+                    "auth",
+                    &mut startup,
+                    &mut Some(&mut approve),
+                    |_caveats, _hosts| async { Err(anyhow::anyhow!("HTTP 401")) },
+                )
+                .await;
+                assert!(failure.is_err());
+                let next_initial_oauth = crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(
+                    &startup.0.net,
+                    &startup.1,
+                );
+                assert!(next_initial_oauth.permits_host("mcp.example.test"));
+                assert_eq!(
+                    next_initial_oauth.explicitly_grants_host("auth.example.test"),
+                    remembered
+                );
+                assert!(!next_initial_oauth.explicitly_grants_host("unapproved.example.test"));
+            }
+        }
+    }
+
+    #[test]
+    fn exiting_mcp_startup_never_attempts_the_next_connector() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = AtomicBool::new(false);
+        let mut second = http_entry("https://already-granted.example.test/mcp");
+        second.transport = TransportKind::Stdio;
+        let entries = [http_entry("https://needs-grant.example.test/mcp"), second];
+        let mut later_connector_calls = 0;
+        let mut attempts = 0;
+        for (index, _) in startup_mcp_entries(&entries, Some(&cancel)).enumerate() {
+            attempts += 1;
+            if index == 0 {
+                // The permission gate's Exit control sets this same cancellation flag.
+                cancel.store(true, Ordering::Relaxed);
+            } else {
+                later_connector_calls += 1;
+            }
+        }
+        assert_eq!(attempts, 1);
+        assert_eq!(later_connector_calls, 0);
+        assert_eq!(startup_mcp_entries(&entries, None).count(), 2);
+    }
+
+    #[test]
+    fn earlier_http_recovery_receives_later_remembered_oauth_host_grants() {
+        for final_net in [
+            newt_core::Scope::All,
+            newt_core::Scope::only(["mcp.example.test".into(), "auth.example.test".into()]),
+        ] {
+            let mut servers = [
+                ReconnectableServer {
+                    live: "early",
+                    http: Some(HttpReconnectState {
+                        entry: http_entry("https://mcp.example.test/mcp"),
+                        caveats: newt_core::Caveats {
+                            net: newt_core::Scope::only(["mcp.example.test".into()]),
+                            fs_write: newt_core::Scope::none(),
+                            ..newt_core::Caveats::top()
+                        },
+                        explicit_net_hosts: vec!["mcp.example.test".into()],
+                        bearer: Some("fixture-bearer".into()),
+                        insecure_authorization_allowed: false,
+                    }),
+                },
+                ReconnectableServer {
+                    live: "once",
+                    http: None,
+                },
+            ];
+            let final_startup = (
+                newt_core::Caveats {
+                    net: final_net.clone(),
+                    ..newt_core::Caveats::top()
+                },
+                vec!["mcp.example.test".into(), "auth.example.test".into()],
+            );
+            synchronize_http_reconnect_policy(&mut servers, &final_startup);
+            let recovery = servers[0].http.as_ref().unwrap();
+            let oauth = crate::mcp_token::OAuthHopPolicy::with_explicit_hosts(
+                &recovery.caveats.net,
+                &recovery.explicit_net_hosts,
+            );
+            assert!(oauth.explicitly_grants_host("mcp.example.test"));
+            assert!(oauth.explicitly_grants_host("auth.example.test"));
+            assert!(!oauth.explicitly_grants_host("unapproved.example.test"));
+            assert_eq!(recovery.caveats.net, final_net);
+            assert_eq!(recovery.caveats.fs_write, newt_core::Scope::none());
+            assert_eq!(recovery.bearer.as_deref(), Some("fixture-bearer"));
+            assert!(
+                servers[1].http.is_none(),
+                "a once grant cannot acquire recovery state"
+            );
+        }
+    }
     use serde_json::json;
 
     #[test]
@@ -1486,6 +1828,24 @@ mod tests {
         assert!(lines[4].contains("disabled in config"), "{:?}", lines[4]);
     }
 
+    #[test]
+    fn network_status_names_durable_remediation_without_an_authentication_hint() {
+        let mut mcp = Mcp::empty();
+        let denial = newt_mcp_client::HttpNetGrantRequired {
+            host: "authorization.example.test".into(),
+            private: true,
+        };
+        mcp.statuses = vec![("review".into(), McpStatus::Skipped(denial.to_string()))];
+        let line = &mcp.status_lines()[1];
+        assert!(line.contains("authorization.example.test"));
+        assert!(line.contains("[tui.permissions] net"));
+        assert!(line.contains("restart"));
+        assert!(
+            !line.contains("newt auth"),
+            "network denial is not authentication: {line}"
+        );
+    }
+
     /// A muted server reads as muted AND as still connected — the distinction
     /// `/mcp off` exists for, and the one a status line most easily loses.
     #[test]
@@ -1528,3 +1888,5 @@ mod tests {
         assert!(lines[0].contains("[[mcp_servers]]"), "{:?}", lines[0]);
     }
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:27 EDT | Date: 2026-09-15

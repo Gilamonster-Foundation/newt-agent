@@ -82,6 +82,8 @@ fn web_decisions_publish_and_consume_a_web_verdict_without_the_tty() {
         exit: None,
         // Proof the TTY is bypassed when web decisions are on.
         ask_surface: None,
+        #[cfg(feature = "rich-tui")]
+        open_panel: None,
         ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
             panic!("the TTY must not be read when web decisions are enabled")
         },
@@ -122,6 +124,8 @@ fn web_decision_timeout_resolves_and_denies_without_hanging() {
         cancel: None,
         exit: None,
         ask_surface: None,
+        #[cfg(feature = "rich-tui")]
+        open_panel: None,
         ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
             panic!("the TTY must not be read when web decisions are enabled")
         },
@@ -162,6 +166,8 @@ fn web_publish_failure_records_web_unavailable_scope() {
         cancel: None,
         exit: None,
         ask_surface: None,
+        #[cfg(feature = "rich-tui")]
+        open_panel: None,
         ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
             panic!("the TTY must not be read when web decisions are enabled");
         },
@@ -279,6 +285,8 @@ macro_rules! web_gate {
             cancel: $cancel,
             exit: $exit,
             ask_surface: None,
+            #[cfg(feature = "rich-tui")]
+            open_panel: None,
             ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("run_web_wait must not read the TTY answer path")
             },
@@ -831,6 +839,8 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
             cancel: None,
             exit: None,
             ask_surface: None,
+            #[cfg(feature = "rich-tui")]
+            open_panel: None,
             ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                 PromptChoice::AllowPermanent
             },
@@ -875,11 +885,394 @@ pub(super) fn scripted_gate<'a>(
         cancel: None,
         exit: None,
         ask_surface: None,
+        #[cfg(feature = "rich-tui")]
+        open_panel: None,
         ask_human: move |_w: &PromptWindow, _definition: &InteractionDefinition| {
             prompts.set(prompts.get() + 1);
             script.next().expect("script exhausted — unexpected prompt")
         },
     }
+}
+
+#[test]
+fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
+    for (outcome, allowed, remembered, cancelled, exited) in [
+        (
+            HumanQuestionOutcome::Answer("a".into()),
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::Answer("s".into()),
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::Answer("A".into()),
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::Answer("d".into()),
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::Answer(String::new()),
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::Answer("unknown".into()),
+            false,
+            false,
+            false,
+            false,
+        ),
+        (HumanQuestionOutcome::Cancelled, false, false, true, false),
+        (
+            HumanQuestionOutcome::ExitRequested,
+            false,
+            false,
+            true,
+            true,
+        ),
+        (
+            HumanQuestionOutcome::InputClosed,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::InputFailed,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            HumanQuestionOutcome::Unavailable,
+            false,
+            false,
+            false,
+            false,
+        ),
+    ] {
+        for base in [base_caveats("/ws"), Caveats::top()] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let config = directory.path().join("config.toml");
+            let mut state = PermissionPromptState::default();
+            let direct_prompts = Rc::new(Cell::new(0));
+            let surface_prompts = Cell::new(0);
+            let blocked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = blocked.clone();
+            let me = std::thread::current().id();
+            let _events = newt_core::lifecycle::subscribe(move |event| {
+                if std::thread::current().id() == me
+                    && matches!(event.event, newt_core::lifecycle::LifecycleEvent::Blocked)
+                {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let cancel = AtomicBool::new(false);
+            let exit = AtomicBool::new(false);
+            let request = PermissionRequest {
+                tool: "mcp connect".into(),
+                kind: DenialKind::Net,
+                target: "mcp.example.test".into(),
+                reason: "connect the configured MCP server".into(),
+            };
+            let ask = |interaction: &SurfaceInteraction| {
+                surface_prompts.set(surface_prompts.get() + 1);
+                assert!(interaction.is_blocking());
+                assert!(interaction.wants_attention());
+                assert_eq!(
+                    interaction.definition,
+                    permission_definition(
+                        &request,
+                        &danger::DangerTable::builtin(),
+                        Audience::Terminal
+                    ),
+                    "the terminal receives the exact definition used to authorize the answer"
+                );
+                outcome.clone()
+            };
+            let mut gate = scripted_gate(
+                &mut state,
+                base,
+                None,
+                None,
+                vec![PromptChoice::Deny],
+                direct_prompts.clone(),
+            );
+            gate.ask_surface = Some(&ask);
+            gate.config_path = Some(config.clone());
+            gate.cancel = Some(&cancel);
+            gate.exit = Some(&exit);
+            let grant = gate.ask_mcp_net_grant(&request);
+            assert_eq!(
+                blocked.load(Ordering::Relaxed),
+                0,
+                "the session must not acquire a PromptWindow before asking its terminal owner"
+            );
+            assert_eq!(direct_prompts.get(), 0);
+            assert_eq!(surface_prompts.get(), 1);
+            assert_eq!(grant.is_some(), allowed, "{outcome:?}");
+            if let Some((caveats, hosts, retained)) = grant {
+                assert!(caveats.permits_net(&request.target));
+                assert!(hosts.contains(&request.target));
+                assert_eq!(retained, remembered);
+            }
+            assert_eq!(cancel.load(Ordering::Relaxed), cancelled);
+            assert_eq!(exit.load(Ordering::Relaxed), exited);
+            if outcome == HumanQuestionOutcome::Answer("A".into()) {
+                let permissions = newt_core::Config::load(&config)
+                    .unwrap()
+                    .tui
+                    .unwrap()
+                    .permissions;
+                assert_eq!(permissions.net, vec![request.target]);
+            } else {
+                assert!(!config.exists(), "only a permanent answer writes config");
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "rich-tui")]
+#[serial_test::serial(prompt_stdin)]
+fn web_permission_asks_terminal_owner_before_claiming_input() {
+    let (_root, _workspace, store, conversation_id) = store_and_conv();
+    let mut state = PermissionPromptState {
+        web_store: Some(store.clone()),
+        ..Default::default()
+    };
+    let prompts = Cell::new(0);
+    let blocked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = blocked.clone();
+    let me = std::thread::current().id();
+    let _events = newt_core::lifecycle::subscribe(move |event| {
+        if std::thread::current().id() == me
+            && matches!(event.event, newt_core::lifecycle::LifecycleEvent::Blocked)
+        {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let open_panel = |rows| {
+        assert!(
+            rows > 2,
+            "the web offer needs a bounded modal body and border"
+        );
+        assert_eq!(blocked.load(Ordering::Relaxed), 0);
+        prompts.set(prompts.get() + 1);
+        let pending = store
+            .pending_interaction_offer(&conversation_id)
+            .unwrap()
+            .unwrap();
+        store
+            .answer_interaction_offer(
+                &conversation_id,
+                &pending.instance_id,
+                PromptChoice::AllowOnce,
+                Audience::Web,
+            )
+            .unwrap();
+        // A surface may refuse the loan. Closing the offer must still
+        // consume the existing web CAS winner, never invent a verdict.
+        None
+    };
+    let mut gate = scripted_gate(
+        &mut state,
+        Caveats::top(),
+        None,
+        None,
+        vec![],
+        Rc::new(Cell::new(0)),
+    );
+    gate.conversation_id = conversation_id.clone();
+    gate.web_decision_timeout = Duration::ZERO;
+    gate.open_panel = Some(&open_panel);
+    assert!(matches!(
+        gate.ask(&[exec_request("git")]),
+        newt_core::PermissionDecision::Allow(_)
+    ));
+    assert_eq!(prompts.get(), 1);
+    assert_eq!(blocked.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[cfg(feature = "rich-tui")]
+#[serial_test::serial(prompt_stdin)]
+fn web_permission_refused_modal_loan_does_not_take_input_or_leave_an_offer() {
+    let (_root, _workspace, store, conversation_id) = store_and_conv();
+    let mut state = PermissionPromptState {
+        web_store: Some(store.clone()),
+        ..Default::default()
+    };
+    let blocked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = blocked.clone();
+    let me = std::thread::current().id();
+    let _events = newt_core::lifecycle::subscribe(move |event| {
+        if std::thread::current().id() == me
+            && matches!(event.event, newt_core::lifecycle::LifecycleEvent::Blocked)
+        {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let open_panel = |_rows| None;
+    let mut gate = scripted_gate(
+        &mut state,
+        Caveats::top(),
+        None,
+        None,
+        vec![],
+        Rc::new(Cell::new(0)),
+    );
+    gate.conversation_id = conversation_id.clone();
+    gate.web_decision_timeout = Duration::ZERO;
+    gate.open_panel = Some(&open_panel);
+    assert!(matches!(
+        gate.ask(&[exec_request("git")]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert!(store
+        .pending_interaction_offer(&conversation_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        blocked.load(Ordering::Relaxed),
+        0,
+        "a declined loan never hands stdin to the worker"
+    );
+}
+
+#[test]
+fn mcp_net_prompt_distinguishes_once_from_shared_session_grants() {
+    for (choice, remembered, expected_prompts) in [
+        (PromptChoice::AllowOnce, false, 2),
+        (PromptChoice::AllowSession, true, 1),
+        (PromptChoice::AllowPermanent, true, 1),
+    ] {
+        for base in [base_caveats("/ws"), Caveats::top()] {
+            let mut state = PermissionPromptState::default();
+            let prompts = Rc::new(Cell::new(0));
+            let mut gate = scripted_gate(
+                &mut state,
+                base,
+                None,
+                None,
+                vec![choice, choice],
+                prompts.clone(),
+            );
+            let request = PermissionRequest {
+                tool: "mcp connect".into(),
+                kind: DenialKind::Net,
+                target: "mcp.example.test".into(),
+                reason: "connect the configured MCP server".into(),
+            };
+            for _ in 0..2 {
+                let (granted, names, retain) = gate.ask_mcp_net_grant(&request).unwrap();
+                assert!(granted.permits_net(&request.target));
+                assert!(names.contains(&request.target));
+                assert_eq!(retain, remembered);
+            }
+            assert_eq!(prompts.get(), expected_prompts);
+        }
+    }
+}
+
+#[test]
+fn mcp_net_prompt_disabled_or_denied_never_grants() {
+    for enabled in [false, true] {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![PromptChoice::Deny],
+            prompts.clone(),
+        );
+        gate.authorization_prompts_enabled = enabled;
+        let request = PermissionRequest {
+            tool: "mcp connect".into(),
+            kind: DenialKind::Net,
+            target: "mcp.example.test".into(),
+            reason: "private MCP origin needs an exact approval".into(),
+        };
+        assert!(gate.ask_mcp_net_grant(&request).is_none());
+        assert_eq!(prompts.get(), usize::from(enabled));
+    }
+}
+
+#[test]
+fn mcp_net_grant_retains_prior_session_names_under_full_access() {
+    for first in [
+        PromptChoice::AllowOnce,
+        PromptChoice::AllowSession,
+        PromptChoice::AllowPermanent,
+    ] {
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![first, PromptChoice::AllowSession],
+            Rc::new(Cell::new(0)),
+        );
+        for target in ["auth.example.test", "mcp.example.test"] {
+            let request = PermissionRequest {
+                tool: "mcp connect".into(),
+                kind: DenialKind::Net,
+                target: target.into(),
+                reason: "private MCP origin needs exact approval".into(),
+            };
+            let (caveats, names, _) = gate.ask_mcp_net_grant(&request).unwrap();
+            let policy =
+                newt_mcp_client::HttpNetworkPolicy::with_explicit_hosts(&caveats.net, &names);
+            assert!(policy.explicitly_grants_host(target));
+            if target == "mcp.example.test" {
+                assert_eq!(
+                    policy.explicitly_grants_host("auth.example.test"),
+                    first != PromptChoice::AllowOnce
+                );
+                assert!(!policy.explicitly_grants_host("unapproved.example.test"));
+            }
+        }
+    }
+}
+
+#[test]
+fn permanent_net_target_follows_config_precedence_without_writing_ambient_config() {
+    let pinned = std::path::PathBuf::from("explicit.toml");
+    let user = std::path::PathBuf::from("user/config.toml");
+    assert_eq!(
+        durable_permission_config_target(Some(pinned.clone()), true, Some(user.clone())),
+        Some(pinned),
+    );
+    assert_eq!(
+        durable_permission_config_target(None, false, Some(user.clone())),
+        Some(user.clone()),
+    );
+    assert_eq!(
+        durable_permission_config_target(None, true, Some(user)),
+        None
+    );
+    assert_eq!(durable_permission_config_target(None, false, None), None);
 }
 
 #[test]
@@ -1295,6 +1688,8 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             cancel: None,
             exit: None,
             ask_surface: None,
+            #[cfg(feature = "rich-tui")]
+            open_panel: None,
             ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                 script.next().expect("script exhausted")
             },
@@ -1333,6 +1728,8 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             cancel: None,
             exit: None,
             ask_surface: None,
+            #[cfg(feature = "rich-tui")]
+            open_panel: None,
             ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("must NOT prompt: target was permanently denied")
             },
@@ -1376,71 +1773,103 @@ fn permanent_allow_offered_for_net_only() {
 
 #[test]
 fn allow_permanently_grants_now_and_persists_host_to_config() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config = dir.path().join("config.toml");
-    std::fs::write(&config, "# my config\n[tui.permissions]\nnet = []\n").unwrap();
-    let base = base_caveats("/ws");
-    let net_req = newt_core::PermissionRequest {
-        tool: "web_fetch".to_string(),
-        kind: DenialKind::Net,
-        target: "github.com".to_string(),
-        reason: "net does not permit 'github.com'".to_string(),
-    };
-
-    let mut state = PermissionPromptState::default();
-    {
-        let mut script = vec![PromptChoice::AllowPermanent].into_iter();
-        let mut gate = PromptPermissionGate {
-            state: &mut state,
-            base,
-            key_path: None,
-            conversation_id: "conv-904a".to_string(),
-            log_path: None,
-            denials_path: None,
-            config_path: Some(config.clone()),
-            preset_clamp: None,
-            delegation: None,
-            danger: danger::DangerTable::builtin(),
-            color: false,
-            verbose: false,
-            authorization_prompts_enabled: true,
-            web_decision_timeout: Duration::from_secs(2),
-            cancel: None,
-            exit: None,
-            ask_surface: None,
-            ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
-                script.next().expect("script exhausted")
-            },
+    for (preset, wildcard, force_full_access) in [
+        ("workspace_dev", false, false),
+        ("workspace_dev", true, false),
+        ("workspace_dev", false, true),
+        ("full_access", false, false),
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let net = if wildcard { r#"["*"]"# } else { "[]" };
+        std::fs::write(
+            &config,
+            format!("# my config\n[tui.permissions]\npreset = \"{preset}\"\nnet = {net}\n"),
+        )
+        .unwrap();
+        let base = if force_full_access {
+            Caveats::top()
+        } else {
+            newt_core::Config::load(&config)
+                .unwrap()
+                .tui
+                .unwrap()
+                .permissions
+                .to_caveats("/ws")
         };
-        match gate.ask(std::slice::from_ref(&net_req)) {
-            newt_core::PermissionDecision::Allow(c) => {
-                assert!(c.permits_net("github.com"), "granted this session");
-            }
-            newt_core::PermissionDecision::Deny => {
-                panic!("permanent-allow of a net host must be granted")
+        let net_req = newt_core::PermissionRequest {
+            tool: "mcp connect".to_string(),
+            kind: DenialKind::Net,
+            target: "github.com".to_string(),
+            reason: "net does not permit 'github.com'".to_string(),
+        };
+
+        let mut state = PermissionPromptState::default();
+        {
+            let mut script = vec![PromptChoice::AllowPermanent].into_iter();
+            let mut gate = PromptPermissionGate {
+                state: &mut state,
+                base,
+                key_path: None,
+                conversation_id: "conv-904a".to_string(),
+                log_path: None,
+                denials_path: None,
+                config_path: Some(config.clone()),
+                preset_clamp: None,
+                delegation: None,
+                danger: danger::DangerTable::builtin(),
+                color: false,
+                verbose: false,
+                authorization_prompts_enabled: true,
+                web_decision_timeout: Duration::from_secs(2),
+                cancel: None,
+                exit: None,
+                ask_surface: None,
+                #[cfg(feature = "rich-tui")]
+                open_panel: None,
+                ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
+                    script.next().expect("script exhausted")
+                },
+            };
+            match gate.ask(std::slice::from_ref(&net_req)) {
+                newt_core::PermissionDecision::Allow(c) => {
+                    assert!(c.permits_net("github.com"), "granted this session");
+                }
+                newt_core::PermissionDecision::Deny => {
+                    panic!("permanent-allow of a net host must be granted")
+                }
             }
         }
-    }
-    assert!(state
-        .session_grants
-        .contains(&(DenialKind::Net, "github.com".to_string())));
-    assert_eq!(state.decisions[0].scope, "permanent");
-    let written = std::fs::read_to_string(&config).unwrap();
-    assert!(written.contains("# my config"), "comment lost: {written}");
-    assert!(
-        written.contains("github.com"),
-        "host not persisted: {written}"
-    );
-    let reloaded = newt_core::Config::load(&config).unwrap();
-    assert!(
-        reloaded
+        assert!(state
+            .session_grants
+            .contains(&(DenialKind::Net, "github.com".to_string())));
+        assert_eq!(state.decisions[0].scope, "permanent");
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("# my config"), "comment lost: {written}");
+        assert!(
+            written.contains("github.com"),
+            "host not persisted: {written}"
+        );
+        let permissions = newt_core::Config::load(&config)
+            .unwrap()
             .tui
             .unwrap()
-            .permissions
-            .net
-            .contains(&"github.com".to_string()),
-        "a fresh session reads the durable net grant"
-    );
+            .permissions;
+        assert!(permissions.net.contains(&"github.com".to_string()));
+        let reloaded = if force_full_access {
+            Caveats::top()
+        } else {
+            permissions.to_caveats("/ws")
+        };
+        let policy = newt_mcp_client::HttpNetworkPolicy::with_explicit_hosts(
+            &reloaded.net,
+            &permissions.net,
+        );
+        assert!(
+            policy.explicitly_grants_host("github.com"),
+            "a fresh session honors permanent MCP grants in every mode"
+        );
+    }
 }
 
 #[test]
@@ -1951,6 +2380,9 @@ fn delegated_grants_cannot_cross_the_parent_ceiling_or_persist_approval() {
             );
             gate.delegation = Some(&delegation);
             gate.config_path = Some(config_path.clone());
+            if req.kind == DenialKind::Net {
+                assert!(gate.ask_mcp_net_grant(req).is_none());
+            }
             assert!(
                 matches!(
                     gate.ask(std::slice::from_ref(req)),
@@ -2705,3 +3137,5 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
         "an operator who WON was told they lost: {told:?}"
     );
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:35 EDT | Date: 2026-09-15

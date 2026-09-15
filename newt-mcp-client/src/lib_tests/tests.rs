@@ -289,6 +289,40 @@ fn private_http_entry(url: String) -> McpServerEntry {
 }
 
 #[test]
+fn durable_net_grants_survive_permission_modes() {
+    let host = "review.internal.example";
+    let entry = private_http_entry(format!("https://{host}/mcp"));
+    let admitted = newt_core::mcp::admit(&entry).unwrap();
+    let resolver =
+        |_host: &str, port: u16| Ok(vec![std::net::SocketAddr::from(([10, 0, 0, 42], port))]);
+    for (preset, hosts) in [
+        ("workspace_dev", vec![host]),
+        ("full_access", vec![host]),
+        ("workspace_dev", vec!["*", host]),
+    ] {
+        let permissions: newt_core::ToolPermissions = serde_json::from_value(json!({
+            "preset": preset,
+            "net": hosts,
+        }))
+        .unwrap();
+        let caveats = permissions.to_caveats("/workspace");
+        let result = HttpTransport::connect_with_runtime_bearer_and_resolver(
+            &admitted,
+            &caveats,
+            None,
+            false,
+            &resolver,
+            &permissions.net,
+        );
+        assert!(
+            result.is_ok(),
+            "{preset} {hosts:?}: {}",
+            result.err().unwrap()
+        );
+    }
+}
+
+#[test]
 fn ungranted_private_dns_answer_fails_before_dial() {
     let entry = private_http_entry("http://review.internal.example:8443/mcp".to_string());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted entry admits");
@@ -300,6 +334,7 @@ fn ungranted_private_dns_answer_fails_before_dial() {
         None,
         false,
         &resolver,
+        &[],
     ) {
         Ok(_) => panic!("private DNS without an exact host grant must fail"),
         Err(error) => error,
@@ -307,6 +342,66 @@ fn ungranted_private_dns_answer_fails_before_dial() {
     assert!(
         error.to_string().contains("without an exact net grant"),
         "{error:#}"
+    );
+}
+
+#[test]
+fn forbidden_dns_answers_do_not_offer_a_private_host_grant() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let entry = private_http_entry("https://review.internal.example/mcp".into());
+    let admitted = newt_core::mcp::admit(&entry).unwrap();
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        "ff02::1".parse().unwrap(),
+    ] {
+        let resolver = |_host: &str, port: u16| Ok(vec![std::net::SocketAddr::new(ip, port)]);
+        let error = HttpTransport::connect_with_runtime_bearer_and_resolver(
+            &admitted,
+            &Caveats::top(),
+            None,
+            false,
+            &resolver,
+            &[],
+        )
+        .err()
+        .expect("special address must stay forbidden");
+        assert!(
+            error.downcast_ref::<HttpNetGrantRequired>().is_none(),
+            "{ip}: {error}"
+        );
+    }
+}
+
+#[test]
+fn retained_private_names_cannot_widen_an_attenuated_scope() {
+    let host = "review.internal.example";
+    let entry = private_http_entry(format!("https://{host}/mcp"));
+    let admitted = newt_core::mcp::admit(&entry).unwrap();
+    let resolver = |_host: &str, _port: u16| -> std::io::Result<Vec<std::net::SocketAddr>> {
+        panic!("an attenuated host must be denied before DNS")
+    };
+    let caveats = Caveats {
+        net: newt_core::Scope::none(),
+        ..Caveats::top()
+    };
+    let error = HttpTransport::connect_with_runtime_bearer_and_resolver(
+        &admitted,
+        &caveats,
+        None,
+        false,
+        &resolver,
+        &[host.to_string()],
+    )
+    .err()
+    .expect("retained approval cannot restore authority");
+    assert!(
+        !error
+            .downcast_ref::<HttpNetGrantRequired>()
+            .unwrap()
+            .private
     );
 }
 
@@ -324,7 +419,12 @@ fn public_host_outside_scope_fails_before_dns() {
         ..Caveats::top()
     };
     let error = match HttpTransport::connect_with_runtime_bearer_and_resolver(
-        &admitted, &deny, None, false, &resolver,
+        &admitted,
+        &deny,
+        None,
+        false,
+        &resolver,
+        &[],
     ) {
         Ok(_) => panic!("public DNS outside the net scope must fail"),
         Err(error) => error,
@@ -352,7 +452,12 @@ fn localhost_must_resolve_only_to_loopback_even_when_explicitly_granted() {
         ] {
             let resolver = |_host: &str, _port: u16| Ok(vec![address]);
             let error = match HttpTransport::connect_with_runtime_bearer_and_resolver(
-                &admitted, &caveats, None, false, &resolver,
+                &admitted,
+                &caveats,
+                None,
+                false,
+                &resolver,
+                &[],
             ) {
                 Ok(_) => panic!("localhost mapped outside loopback must fail"),
                 Err(error) => error,
@@ -375,7 +480,12 @@ fn resolver_cannot_pivot_the_pinned_origin_to_another_port() {
     let resolver =
         |_host: &str, _port: u16| Ok(vec![std::net::SocketAddr::from(([10, 0, 0, 42], 9443))]);
     let error = match HttpTransport::connect_with_runtime_bearer_and_resolver(
-        &admitted, &caveats, None, false, &resolver,
+        &admitted,
+        &caveats,
+        None,
+        false,
+        &resolver,
+        &[],
     ) {
         Ok(_) => panic!("a resolver-provided port pivot must fail"),
         Err(error) => error,
@@ -403,6 +513,7 @@ fn unsafe_http_url_shapes_fail_before_dns() {
                 None,
                 false,
                 &resolver,
+                &[],
             )
             .is_err(),
             "{url} must fail"
@@ -410,6 +521,7 @@ fn unsafe_http_url_shapes_fail_before_dns() {
     }
 }
 
+/// Grounds the mocked durable-grant policy with real MCP initialize/list/call in both modes.
 #[tokio::test]
 #[ignore = "real loopback private-host MCP lifecycle"]
 async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
@@ -431,7 +543,7 @@ async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
                     r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"{PROTOCOL_VERSION}","capabilities":{{}},"serverInfo":{{"name":"review","version":"1"}}}}}}"#,
                 )),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -442,7 +554,7 @@ async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
         .and(header("mcp-session-id", "private-session"))
         .and(header("mcp-protocol-version", PROTOCOL_VERSION))
         .respond_with(ResponseTemplate::new(202))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -457,7 +569,7 @@ async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
                     r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"review","description":"review a change","inputSchema":{"type":"object"}}]}}"#,
                 ),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -472,7 +584,7 @@ async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
                     r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"review loaded"}]}}"#,
                 ),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -481,45 +593,53 @@ async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
     let server_port = server_url.port().expect("wiremock has an explicit port");
     let entry = private_http_entry(format!("http://{private_host}:{server_port}/mcp"));
     let admitted = newt_core::mcp::admit(&entry).expect("trusted entry admits");
-    let caveats = Caveats {
-        net: Scope::only([private_host.to_string()]),
-        ..Caveats::top()
-    };
-    let resolution_count = Arc::new(AtomicUsize::new(0));
-    let resolver_count = Arc::clone(&resolution_count);
-    let resolver = move |host: &str, port: u16| {
-        assert_eq!(host, private_host);
-        assert_eq!(port, server_port);
-        resolver_count.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
-    };
-    let transport = HttpTransport::connect_with_runtime_bearer_and_resolver(
-        &admitted, &caveats, None, false, &resolver,
-    )
-    .expect("an exact private-host grant builds a pinned transport");
-    assert!(transport.private_origin_pinned());
-    assert!(!transport.egress_proxied());
-    let net = net_posture(
-        &caveats,
-        transport.egress_proxied(),
-        transport.private_origin_pinned(),
-    );
-    let mut connected = finish_connect(&entry, AnyTransport::Http(Box::new(transport)), None, net)
-        .await
-        .expect("initialize and tools/list succeed through the pinned host");
-    assert_eq!(connected.tools.len(), 1);
-    assert_eq!(connected.tools[0].name, "review");
-    let result = connected
-        .conn
-        .call_tool("review", json!({"review": 4242}))
-        .await
-        .expect("tool call succeeds through the same pinned host");
-    assert_eq!(result["content"][0]["text"].as_str(), Some("review loaded"));
-    assert_eq!(
-        resolution_count.load(Ordering::SeqCst),
-        1,
-        "initialize, initialized, list, and call must reuse one DNS answer"
-    );
+    for net in [Scope::only([private_host.to_string()]), Scope::All] {
+        let caveats = Caveats {
+            net,
+            ..Caveats::top()
+        };
+        let resolution_count = Arc::new(AtomicUsize::new(0));
+        let resolver_count = Arc::clone(&resolution_count);
+        let resolver = move |host: &str, port: u16| {
+            assert_eq!(host, private_host);
+            assert_eq!(port, server_port);
+            resolver_count.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+        };
+        let transport = HttpTransport::connect_with_runtime_bearer_and_resolver(
+            &admitted,
+            &caveats,
+            None,
+            false,
+            &resolver,
+            &[private_host.to_string()],
+        )
+        .expect("an exact private-host grant builds a pinned transport");
+        assert!(transport.private_origin_pinned());
+        assert!(!transport.egress_proxied());
+        let net = net_posture(
+            &caveats,
+            transport.egress_proxied(),
+            transport.private_origin_pinned(),
+        );
+        let mut connected =
+            finish_connect(&entry, AnyTransport::Http(Box::new(transport)), None, net)
+                .await
+                .expect("initialize and tools/list succeed through the pinned host");
+        assert_eq!(connected.tools.len(), 1);
+        assert_eq!(connected.tools[0].name, "review");
+        let result = connected
+            .conn
+            .call_tool("review", json!({"review": 4242}))
+            .await
+            .expect("tool call succeeds through the same pinned host");
+        assert_eq!(result["content"][0]["text"].as_str(), Some("review loaded"));
+        assert_eq!(
+            resolution_count.load(Ordering::SeqCst),
+            1,
+            "initialize, initialized, list, and call must reuse one DNS answer"
+        );
+    }
     server.verify().await;
 }
 
@@ -1093,3 +1213,5 @@ async fn request_gives_up_after_the_configured_timeout() {
         "{err}"
     );
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:24 EDT | Date: 2026-09-15

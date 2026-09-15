@@ -148,6 +148,12 @@ fn interaction_view_child() {
             drop(spinner);
             println!("OUTCOME:{outcome:?}");
         }
+        "cockpit_resize" => {
+            crate::cockpit::presenter::panel_resize_case();
+        }
+        "cockpit_acceptance" => {
+            crate::cockpit::presenter::cockpit_acceptance_case();
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -303,6 +309,28 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn the pty child")
+}
+
+/// Ground the modal reservation's resize contract in a disposable process.
+/// Reusing this child launcher keeps the extra tty and Crossterm's global
+/// event source out of sibling keyboard tests, without dropping assertions.
+pub(crate) fn drive_cockpit_resize() {
+    drive_cockpit_case("cockpit_resize");
+}
+
+pub(crate) fn drive_cockpit_acceptance() {
+    drive_cockpit_case("cockpit_acceptance");
+}
+
+fn drive_cockpit_case(mode: &str) {
+    let pty = Pty::open();
+    let mut child = spawn_child(&pty, mode);
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    let screen = pty.screen_to_eof();
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{mode} child failed: {status:?}; {screen:?}"
+    );
 }
 
 /// Everything the parent needs to judge one lifecycle.
@@ -639,7 +667,7 @@ fn overflowing(segment: &str, width: usize) -> Vec<String> {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_resize_reflows_the_frame_and_still_restores_the_terminal() {
     const NARROW: usize = 46;
-    let f = drive_present(24, 100, Some((12, NARROW as u16)), "d");
+    let f = drive_present(24, 100, Some((12, NARROW as u16)), "d\r");
     assert!(
         f.raw_during,
         "the pty was never raw — nothing was exercised"
@@ -673,7 +701,7 @@ fn a_resize_reflows_the_frame_and_still_restores_the_terminal() {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_narrow_terminal_wraps_rather_than_overflowing() {
     const COLS: usize = 28;
-    let f = drive_present(20, COLS as u16, None, "d");
+    let f = drive_present(20, COLS as u16, None, "d\r");
     assert!(
         f.raw_during,
         "the pty was never raw — nothing was exercised"
@@ -793,7 +821,7 @@ fn drive_active_turn(key: &str) -> (String, usize, String, bool, bool) {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_frame_opened_mid_turn_is_not_painted_over_by_the_spinner() {
-    let (all, frame_start, tail, raw_during, raw_after) = drive_active_turn("d");
+    let (all, frame_start, tail, raw_during, raw_after) = drive_active_turn("d\r");
 
     assert!(raw_during, "the frame never took raw mode");
     assert!(!raw_after, "the terminal was left RAW");

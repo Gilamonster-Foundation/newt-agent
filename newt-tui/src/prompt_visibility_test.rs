@@ -139,6 +139,8 @@ fn prompt_scenario_child() {
                 cancel: Some(cancel.as_ref()),
                 exit: Some(exit.as_ref()),
                 ask_surface: None,
+                #[cfg(feature = "rich-tui")]
+                open_panel: None,
                 ask_human: prompt_permission_choice,
             };
             let _decision = gate.ask(std::slice::from_ref(&request));
@@ -177,6 +179,8 @@ fn prompt_scenario_child() {
             cancel: None,
             exit: None,
             ask_surface: None,
+            #[cfg(feature = "rich-tui")]
+            open_panel: None,
             ask_human: prompt_permission_choice,
         };
         let _decision = gate.ask(std::slice::from_ref(&request));

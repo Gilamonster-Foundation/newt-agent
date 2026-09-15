@@ -30,7 +30,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 #[cfg(test)]
@@ -56,6 +56,9 @@ pub(crate) struct Chrome<'a> {
 /// The caller renders whatever it likes into the returned [`Rect`]; this owns
 /// only the parts that should look the same everywhere.
 pub(crate) fn frame(f: &mut Frame, area: Rect, chrome: &Chrome<'_>) -> Rect {
+    // A modal owns these cells as well as the keyboard. Empty body cells
+    // must occlude the editor or transcript painted underneath the window.
+    f.render_widget(Clear, area);
     // The title carries the subtitle so both ride the border rather than
     // spending a body row — the pagers used to spend one, which is why a
     // 3-row terminal showed them one line of content.
@@ -138,6 +141,43 @@ mod tests {
             corner.fg,
             ratatui::style::Color::Reset,
             "an unstyled border is the defect, not the fix"
+        );
+    }
+
+    #[test]
+    fn a_modal_occludes_the_underlying_composer() {
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        term.draw(|f| {
+            f.render_widget(
+                Paragraph::new("normal prompt\nsecret draft\nvi INSERT"),
+                f.area(),
+            );
+            let body = frame(
+                f,
+                f.area(),
+                &Chrome {
+                    title: "decision required",
+                    ..Chrome::default()
+                },
+            );
+            f.render_widget(Paragraph::new("Allow this connection?"), body);
+        })
+        .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Allow this connection?"));
+        assert!(
+            !text.contains("secret draft"),
+            "the dialog must paint an opaque body: {text}"
+        );
+        assert!(
+            !text.contains("vi INSERT"),
+            "the normal composer must be hidden: {text}"
         );
     }
 

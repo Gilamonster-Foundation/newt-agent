@@ -2,6 +2,8 @@
 //! terminal and web rendering, parsing, and the set of actions that may pass.
 
 use std::io;
+#[cfg(feature = "rich-tui")]
+use std::io::IsTerminal as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -43,6 +45,16 @@ pub(crate) fn permission_prompting_configured(
     tui: Option<&newt_core::TuiConfig>,
 ) -> bool {
     env_flag || tui.is_some_and(|t| t.permissions.prompt)
+}
+
+/// Match the trusted prefix of Config's base precedence. An ambient newt.toml
+/// shadows user config while its own permissions are stripped as untrusted.
+pub(crate) fn durable_permission_config_target(
+    pinned: Option<std::path::PathBuf>,
+    ambient_base_exists: bool,
+    user: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    pinned.or(if ambient_base_exists { None } else { user })
 }
 
 const INTERACTIVE_PROMPT_DEFAULT: bool = true;
@@ -181,6 +193,9 @@ pub(crate) fn permission_definition(
         DenialKind::Exec => ("run", "outside the granted exec allowlist"),
         DenialKind::FsRead => ("read", "outside the granted fs_read scope"),
         DenialKind::FsWrite => ("write", "outside the granted fs_write scope"),
+        DenialKind::Net if req.tool == "mcp connect" => {
+            ("reach", "MCP connection requires a named host grant")
+        }
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
         DenialKind::RemoteTool => ("call", "not in the active persona's tool allow-list"),
         DenialKind::GitWrite => (
@@ -542,7 +557,7 @@ pub(crate) fn present_on_terminal_with_width(
 pub(crate) const SLASH_COMMAND_PROMPT_NOTICE: &str =
     "(slash commands aren't answers; press Esc, then use the command at the chat prompt)";
 
-fn apply_chat_prompt_policy(
+pub(crate) fn apply_chat_prompt_policy(
     outcome: HumanQuestionOutcome,
 ) -> (HumanQuestionOutcome, Option<&'static str>) {
     // The answer is inspected VERBATIM — leading/trailing whitespace can be
@@ -729,9 +744,50 @@ pub(crate) struct PromptPermissionGate<
     /// `&dyn Fn` rather than a second generic parameter, so adding the seam
     /// does not propagate a type parameter through every construction site.
     pub(crate) ask_surface: Option<&'a dyn Fn(&SurfaceInteraction) -> HumanQuestionOutcome>,
+    /// A web-shared decision keeps its CAS wait on the session while its
+    /// terminal owner lends the modal rows and parks until this loan closes.
+    #[cfg(feature = "rich-tui")]
+    pub(crate) open_panel: Option<&'a dyn Fn(u16) -> Option<crate::session_worker::PanelWindow>>,
+}
+
+/// Only the direct, terminal-owning route uses stdout. A mounted cockpit
+/// instead lends its rows before `PanelWindow::prompt_window` acquires input.
+fn direct_authorization_window() -> PromptWindow {
+    Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization)
 }
 
 impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPermissionGate<'_, F> {
+    /// Reuse the permission gate for MCP startup, preserving the lifetime of
+    /// the operator's grant without changing the session capability.
+    pub(crate) fn ask_mcp_net_grant(
+        &mut self,
+        request: &newt_core::PermissionRequest,
+    ) -> Option<(newt_core::Caveats, Vec<String>, bool)> {
+        if request.kind != newt_core::DenialKind::Net {
+            return None;
+        }
+        match newt_core::PermissionGate::ask(self, std::slice::from_ref(request)) {
+            newt_core::PermissionDecision::Allow(caveats) => {
+                let mut hosts: Vec<_> = self
+                    .state
+                    .session_grants
+                    .iter()
+                    .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
+                    .map(|(_, host)| host.clone())
+                    .collect();
+                if !hosts.contains(&request.target) {
+                    hosts.push(request.target.clone());
+                }
+                Some((
+                    caveats,
+                    hosts,
+                    session_grant_covers(&self.state.session_grants, request),
+                ))
+            }
+            newt_core::PermissionDecision::Deny => None,
+        }
+    }
+
     /// Record one decision: into the session list (for `/permissions`) and
     /// appended to the durable log. A log-write failure is reported but
     /// never blocks the decision — the record is a review artifact, not a
@@ -801,7 +857,6 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
     fn await_web_decision(
         &self,
         store: &newt_core::ConversationStore,
-        w: &newt_core::tty::PromptWindow,
         req: &newt_core::PermissionRequest,
     ) -> (PromptChoice, &'static str) {
         // B0b-2 (#1846): publish the OFFER — the definition AND the instance
@@ -853,6 +908,94 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
             Ok(id) => id,
             Err(_) => return (PromptChoice::Deny, "web-unavailable"),
         };
+        #[cfg(feature = "rich-tui")]
+        let interaction = {
+            let mut displayed = definition.clone();
+            let context = "You or the web may answer; whoever answers first decides.";
+            displayed.note = Some(match displayed.note.take() {
+                Some(note) => format!("{context}\n{note}"),
+                None => context.into(),
+            });
+            SurfaceInteraction::blocking(displayed)
+        };
+        #[cfg(feature = "rich-tui")]
+        let panel = self.open_panel.and_then(|open| {
+            let cols = crossterm::terminal::size().map_or(80, |(cols, _)| cols);
+            open(crate::interaction_view::requested_rows(&interaction, cols))
+        });
+        #[cfg(feature = "rich-tui")]
+        if self.open_panel.is_some() && panel.is_none() {
+            // A cockpit that could not lend its rows still owns stdin. Close
+            // our offer through the same CAS, preserving any web winner.
+            return self
+                .web_abort_choice(
+                    store,
+                    &self.conversation_id,
+                    &request_id,
+                    PromptChoice::Deny,
+                )
+                .unwrap_or((PromptChoice::Deny, "web-unavailable"));
+        }
+        // Acquire stdin only after the terminal owner has parked and lent its
+        // rows. The window drops before the panel loan releases that owner.
+        #[cfg(feature = "rich-tui")]
+        let window = match panel.as_ref() {
+            Some(panel) => match panel.prompt_window() {
+                Ok(window) => window,
+                Err(_) => {
+                    return self
+                        .web_abort_choice(
+                            store,
+                            &self.conversation_id,
+                            &request_id,
+                            PromptChoice::Deny,
+                        )
+                        .unwrap_or((PromptChoice::Deny, "web-unavailable"));
+                }
+            },
+            None => direct_authorization_window(),
+        };
+        #[cfg(not(feature = "rich-tui"))]
+        let window = direct_authorization_window();
+        let w = &window;
+        #[cfg(feature = "rich-tui")]
+        if panel.is_some() || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
+            let mut notices = Vec::new();
+            let result = self.run_web_wait(
+                store,
+                &request_id,
+                &definition,
+                w,
+                &mut WebWaitIo {
+                    reacquire: &mut || {
+                        match panel.as_ref() {
+                            Some(panel) => panel.terminal().and_then(|terminal| {
+                                crate::interaction_view::reader_for_shared_decision(
+                                    terminal,
+                                    &interaction,
+                                )
+                            }),
+                            None => {
+                                crate::interaction_view::reader_for_shared_decision_on_terminal(
+                                    &interaction,
+                                )
+                            }
+                        }
+                        .map(|reader| Box::new(reader) as Box<dyn ControlReader>)
+                    },
+                    now: &Instant::now,
+                    sleep: &mut std::thread::sleep,
+                    notify: &mut |message| notices.push(message.to_string()),
+                },
+            );
+            // The reader has now erased its standalone viewport. A loaned
+            // viewport is still mounted, so its owner captures these rows and
+            // commits them after removing the modal and restoring the composer.
+            for message in notices {
+                self.notice(panel.is_none().then_some(w), &message);
+            }
+            return result;
+        }
         let note = definition
             .note
             .as_deref()
@@ -1144,7 +1287,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
     /// a generic deny is a worse refusal.
     fn note_refusal(
         &mut self,
-        w: &PromptWindow,
+        w: Option<&PromptWindow>,
         req: &newt_core::PermissionRequest,
         decoded: PromptChoice,
         refusal: &newt_interaction::Refusal,
@@ -1172,8 +1315,21 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
         let _ = refusal;
         self.record(req, "deny", scope);
         if let Some(message) = message {
-            w.notice(&newt_line(&message, self.color, self.verbose))
-                .ok();
+            self.notice(w, &message);
+        }
+    }
+
+    /// Direct prompts keep the arbiter until their notices are written. A
+    /// surface-owned prompt has already closed; stdout is captured by that
+    /// owner and committed to the transcript after its modal is removed.
+    fn notice(&self, window: Option<&PromptWindow>, message: &str) {
+        match window {
+            Some(window) => {
+                window
+                    .notice(&newt_line(message, self.color, self.verbose))
+                    .ok();
+            }
+            None => print_newt(message, self.color, self.verbose),
         }
     }
 
@@ -1340,12 +1496,12 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                     continue;
                 }
             }
-            // The sole prompt seam suspends every competing terminal writer.
-            let w = Terminal::suspend_for_prompt(
-                newt_core::tty::TerminalTaker::PermissionAuthorization,
-            );
+            // The session hands semantic authorization to its terminal owner,
+            // just as `ask_question` does. Taking stdin on this worker would
+            // race the cockpit and leave its composer over the permission menu.
+            let mut window = None;
             let (choice, scope) = match &web {
-                Some(store) => self.await_web_decision(store, &w, req),
+                Some(store) => self.await_web_decision(store, req),
                 None => {
                     // ONE definition: rendered to the operator, and the
                     // authority the answer is checked against. No store is
@@ -1357,12 +1513,31 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                     // which meant the value displayed and the value
                     // authorized against were two objects that happened to
                     // agree; now they are one.
-                    let definition = permission_definition(req, &self.danger, Audience::Terminal);
-                    let decoded = (self.ask_human)(&w, &definition);
-                    match self.authorize(&definition, Audience::Terminal, decoded) {
+                    let interaction = SurfaceInteraction::blocking(permission_definition(
+                        req,
+                        &self.danger,
+                        Audience::Terminal,
+                    ));
+                    let decoded = match self.ask_surface {
+                        Some(ask) => match ask(&interaction) {
+                            HumanQuestionOutcome::Answer(answer) => {
+                                decode_answer(&interaction.definition, &answer)
+                            }
+                            HumanQuestionOutcome::Cancelled => PromptChoice::Back,
+                            HumanQuestionOutcome::ExitRequested => PromptChoice::Exit,
+                            HumanQuestionOutcome::InputClosed
+                            | HumanQuestionOutcome::InputFailed
+                            | HumanQuestionOutcome::Unavailable => PromptChoice::Deny,
+                        },
+                        None => (self.ask_human)(
+                            window.insert(direct_authorization_window()),
+                            &interaction.definition,
+                        ),
+                    };
+                    match self.authorize(&interaction.definition, Audience::Terminal, decoded) {
                         Ok(choice) => (choice, decision_scope(choice)),
                         Err(refusal) => {
-                            self.note_refusal(&w, req, decoded, &refusal);
+                            self.note_refusal(window.as_ref(), req, decoded, &refusal);
                             return Deny;
                         }
                     }
@@ -1386,16 +1561,14 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                     // The form omits this action for high danger; enforce it too.
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
                         self.record(req, "deny", "session-allow-refused-high-danger");
-                        w.notice(&newt_line(
+                        self.notice(
+                            window.as_ref(),
                             &format!(
                                 "session allow refused for high-danger `{}` — \
                                  allow once per op or deny (step-up is the future path)",
                                 req.target
                             ),
-                            self.color,
-                            self.verbose,
-                        ))
-                        .ok();
+                        );
                         return Deny;
                     }
                     self.record(req, "allow", scope);
@@ -1414,12 +1587,10 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                     }
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
                         self.record(req, "deny", "permanent-allow-refused-high-danger");
-                        w.notice(&newt_line(
+                        self.notice(
+                            window.as_ref(),
                             &format!("permanent allow refused for high-danger `{}`", req.target),
-                            self.color,
-                            self.verbose,
-                        ))
-                        .ok();
+                        );
                         return Deny;
                     }
                     let persistent_scope = match self.config_path.as_deref() {
@@ -1427,41 +1598,36 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                             match newt_core::Config::append_permission_net_host(path, &req.target) {
                                 Ok(()) => "permanent",
                                 Err(e) => {
-                                    w.notice(&newt_line(
+                                    self.notice(
+                                        window.as_ref(),
                                         &format!(
                                             "warning: could not persist net grant to config: {e} \
                                              (granted for this session only)"
                                         ),
-                                        self.color,
-                                        self.verbose,
-                                    ))
-                                    .ok();
+                                    );
                                     "permanent-persist-failed"
                                 }
                             }
                         }
                         None => {
-                            w.notice(&newt_line(
-                                "no config path this session — net grant is session-only",
-                                self.color,
-                                self.verbose,
-                            ))
-                            .ok();
+                            self.notice(
+                                window.as_ref(),
+                                "no effective writable config target — net grant is session-only; \
+                                 select a trusted config with --config to save permanent grants",
+                            );
                             "session"
                         }
                     };
                     self.record(req, "allow", persistent_scope);
                     if persistent_scope == "permanent" {
-                        w.notice(&newt_line(
+                        self.notice(
+                            window.as_ref(),
                             &format!(
                                 "added `{}` to [tui.permissions] net — future sessions \
                                  will not prompt for it",
                                 req.target
                             ),
-                            self.color,
-                            self.verbose,
-                        ))
-                        .ok();
+                        );
                     }
                     self.state
                         .session_grants
@@ -1606,3 +1772,5 @@ mod b0a;
 #[cfg(test)]
 #[path = "permissions_tests/b0b.rs"]
 mod b0b;
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 15:32 EDT | Date: 2026-09-15

@@ -1887,7 +1887,8 @@ fn full_access_banner() -> String {
      for this run — the Object-Capability attenuations (fs fence, net leash, exec \
      allowlist) are lifted and run_command uses the `host` shell engine (a real \
      /bin/sh inside the platform kernel jail). Writes are still prompted. Drop the \
-     flag to restore Object-Capability authority restrictions."
+     flag to restore Object-Capability authority restrictions. Private HTTP destinations \
+     still require exact MCP net grants in [tui.permissions] net."
         .to_string()
 }
 
@@ -9326,3 +9327,5 @@ mod env_resolution_tests;
 mod http_loop_tests;
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15

@@ -128,6 +128,7 @@ fn full_access_banner_names_the_flag_and_the_consequence() {
     let banner = full_access_banner();
     assert!(banner.contains("⚠ FULL ACCESS"), "got: {banner}");
     assert!(banner.contains("--full-access"), "got: {banner}");
+    assert!(banner.contains("exact MCP net grants"), "got: {banner}");
     // #926: the prose frames it as ambient authority + OCAP attenuation.
     assert!(banner.contains("full AMBIENT authority"), "got: {banner}");
     assert!(
@@ -306,6 +307,8 @@ async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
     // the gate was never reached.
     let mut gate = PromptPermissionGate {
         ask_surface: None,
+        #[cfg(feature = "rich-tui")]
+        open_panel: None,
         state: &mut state,
         base: caveats.clone(),
         key_path: None,
@@ -362,6 +365,8 @@ async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
     // and the allow-once answer turns the denial into the real contents.
     let mut gate = PromptPermissionGate {
         ask_surface: None,
+        #[cfg(feature = "rich-tui")]
+        open_panel: None,
         state: &mut state,
         base: caveats.clone(),
         key_path: None,
@@ -467,3 +472,5 @@ async fn floor_wins_over_disable_ocap_at_the_tui_seam() {
         "fell to the confined dispatch and was denied: {out}"
     );
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15

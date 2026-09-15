@@ -5,9 +5,60 @@ use crate::cockpit::test_tty::{
 
 const CTRL_C: &[u8] = &[0x03];
 
+/// Grounds the mocked modal reservation geometry: a real panel may consume
+/// resize events while the presenter is parked, so release must read the tty
+/// dimensions before restoring the preserved draft.
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+fn panel_release_resynchronizes_terminal_size_before_restoring_draft() {
+    crate::interaction_view_pty_test::drive_cockpit_resize();
+}
+
+// Crossterm retains a process-global event source. Run the extra owned tty
+// in the existing child harness so it cannot bind the next cockpit test's
+// keyboard to a tty that this case has already closed.
+pub(crate) fn panel_resize_case() {
+    let _tty = TestTty::install();
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit
+        .editor
+        .on_event(
+            Event::Paste("draft survives resize".into()),
+            &mut cockpit.screen,
+        )
+        .unwrap();
+    let draft = cockpit.editor.draft();
+    let (reply, received) =
+        std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+    let panel = std::thread::spawn(move || {
+        let window = received.recv().unwrap().expect("reserved panel");
+        let size = libc::winsize {
+            ws_row: 12,
+            ws_col: 46,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TestTty installed this test's owned slave on fd 0; no live
+        // developer terminal is touched. The parent waits before dropping it.
+        assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
+        drop(window);
+    });
+    cockpit
+        .handle_request(SurfaceRequest::Panel { rows: 8, reply })
+        .unwrap();
+    panel.join().unwrap();
+    assert_eq!((cockpit.screen.cols, cockpit.screen.rows), (46, 12));
+    assert_eq!(cockpit.editor.draft(), draft);
+    assert!(!cockpit.chat_inactive);
+    assert!(cockpit.screen.viewport_rect().bottom() <= 12);
+}
+
 /// The three properties #1744 turns on, proven on one real terminal with
-/// one cockpit: Ctrl-C's two tiers, a modal opening underneath it, and the
+/// one cockpit: Ctrl-C's two tiers, a modal occluding the composer, and the
 /// terminal handed back exactly as it was found.
+/// Grounds the modal reservation and interaction-renderer buffer tests in
+/// real terminal output, including the frame visible before an answer.
 ///
 /// #1959: also serialized on `prompt_stdin` — this test constructs a real
 /// `PromptWindow` via `Terminal::suspend_for_prompt`, which bumps the same
@@ -17,6 +68,13 @@ const CTRL_C: &[u8] = &[0x03];
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 #[test]
 fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
+    crate::interaction_view_pty_test::drive_cockpit_acceptance();
+}
+
+// The capture temporarily redirects process-wide stdout. Isolate its lifetime
+// from libtest's parallel result writer: a blocked write to the undrained
+// capture can otherwise keep dup2 from restoring fd 1 during teardown.
+pub(crate) fn cockpit_acceptance_case() {
     let tty = TestTty::install();
     newt_core::tty::set_interrupt_pending(false);
 
@@ -132,14 +190,15 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
                  stale={stale_top}, expected={expected_top}"
         );
         let definition = crate::permissions::free_text_form("Cockpit modal visible?");
-        let plain_body = newt_core::markup::plain::render(&definition);
-        let requested_rows = modal_requested_rows(&plain_body, cockpit.screen.cols);
+        let interaction = newt_core::interaction_surface::SurfaceInteraction::blocking(definition);
+        let requested_rows =
+            crate::interaction_view::requested_rows(&interaction, cockpit.screen.cols);
         let expected_reservation =
             plan_modal_reservation(expected_top, cockpit.screen.rows, requested_rows);
         assert!(
-                expected_reservation.chat_visible,
-                "acceptance must exercise reserved rows with the inactive chat still visible: {expected_reservation:?}"
-            );
+            !expected_reservation.chat_visible,
+            "the modal must occlude the composer: {expected_reservation:?}"
+        );
         // Where THIS round's bytes begin. The assertions below ask what
         // the modal wrote, and the buffer also holds what everything
         // before it wrote — including, when the harness orders the two
@@ -149,20 +208,66 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         // scan for `EnableLineWrap` was reading another test's teardown as
         // this modal's behavior.
         let before_modal_round = tty.painted().len();
-        let typer = tty.type_when_painted("Prompt — Cockpit modal visible?", b"yes\r");
         let (reply, answer) = std::sync::mpsc::sync_channel(1);
-        cockpit
-            .handle_request(SurfaceRequest::Interact {
-                interaction: Box::new(
-                    newt_core::interaction_surface::SurfaceInteraction::blocking(definition),
-                ),
-                reply,
-            })
-            .expect("present the interaction");
+        let (saw_box, while_modal) = std::thread::scope(|scope| {
+            let typer = scope.spawn(|| {
+                // The bottom-right corner is the final cell of the box.
+                // Capture the entire initial frame BEFORE delivering input,
+                // so the restored editor cannot satisfy this evidence.
+                let saw_prompt = tty.wait_for_painted_after(
+                    before_modal_round,
+                    "visible?",
+                    std::time::Duration::from_secs(2),
+                );
+                let prompt_end = tty.painted()[before_modal_round..]
+                    .find("visible?")
+                    .map_or(before_modal_round, |at| {
+                        before_modal_round + at + "visible?".len()
+                    });
+                let saw_box = saw_prompt
+                    && tty.wait_for_painted_after(
+                        prompt_end,
+                        "╯",
+                        std::time::Duration::from_secs(2),
+                    );
+                let painted = tty.painted();
+                tty.type_bytes(b"yes\r");
+                (saw_box, painted)
+            });
+            cockpit
+                .handle_request(SurfaceRequest::Interact {
+                    interaction: Box::new(interaction),
+                    reply,
+                })
+                .expect("present the interaction");
+            typer.join().expect("prompt watcher")
+        });
         assert!(
-            typer.join().expect("prompt watcher"),
-            "the modal must reach the real terminal before input is sent; painted: {:?}",
-            tty.painted()
+            saw_box,
+            "the modal must reach the real terminal before input is sent; painted: {while_modal:?}"
+        );
+        let modal_delta = &while_modal[before_modal_round..];
+        // The pure cleanup test pins this sequence; here the real terminal
+        // must receive it before the dialog is painted.
+        let erase = modal_cleanup_bytes(expected_reservation.start).expect("modal erase bytes");
+        let erase = String::from_utf8(erase).expect("erase bytes are UTF-8");
+        let erased_at = modal_delta.find(&erase).unwrap_or_else(|| {
+            panic!("the modal must erase the covered composer before painting its box: {modal_delta:?}")
+        });
+        // screen_grid intentionally handles cursor positioning, not erase.
+        // Start at the verified erase so a pending pre-modal chat repaint
+        // cannot be mistaken for text still visible inside the window.
+        let modal_grid = tests_pty::screen_grid(&modal_delta[erased_at..]);
+        let modal_visible = modal_grid.join("\n");
+        for text in ["╭", "╮", "╰", "╯", "Cockpit modal visible?"] {
+            assert!(
+                modal_visible.contains(text),
+                "the blocking question must be enclosed and readable before input; missing {text:?}: {modal_visible}"
+            );
+        }
+        assert!(
+            !modal_visible.contains("draft survives"),
+            "the normal composer must not be drawn into the blocking window: {modal_visible}"
         );
         assert_eq!(
             answer.recv().expect("interaction answer"),
@@ -176,14 +281,14 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         );
         let provisional = tty.painted();
         let prompt_at = provisional
-            .find("Prompt — Cockpit modal visible?")
+            .find("visible?")
             .expect("modal body reached the terminal");
         let mut show = Vec::new();
         queue!(show, crossterm::cursor::Show).expect("show-cursor bytes");
         let show = String::from_utf8(show).expect("show bytes are UTF-8");
         // #1959 (post-rebase flake): the modal's OPENING is already
-        // synchronized (`type_when_painted` above waits for its prompt
-        // text before this point), but the repaint that restores the
+        // synchronized (the observer above waits for the completed box
+        // before typing), but the repaint that restores the
         // chat cursor when it CLOSES is the last thing this round
         // writes, with no synchronization point before the snapshot
         // below — unlike input, `painted()` has no way to know the
@@ -206,7 +311,7 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         let expected_move = String::from_utf8(expected_move).expect("cursor bytes are UTF-8");
         assert!(
                 painted[..prompt_at].contains(&expected_move),
-                "the modal was not placed in its reserved rows above chat; expected {expected_move:?}, painted: {painted:?}"
+                "the modal was not placed over the composer; expected {expected_move:?}, painted: {painted:?}"
             );
         let mut hide = Vec::new();
         queue!(hide, crossterm::cursor::Hide).expect("hide-cursor bytes");
@@ -239,8 +344,7 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         let slash_rows = cockpit.screen.rows;
         let slash_cols = cockpit.screen.cols;
         let before_slash = tty.painted().len();
-        let slash_typer =
-            tty.type_when_painted("Prompt — Slash commands stay in chat?", b"/help\r");
+        let slash_typer = tty.type_when_painted("chat?", b"/help\r");
         let (slash_reply, slash_answer) = std::sync::mpsc::sync_channel(1);
         cockpit
             .handle_request(SurfaceRequest::Interact {
@@ -361,9 +465,8 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         });
         let panel_plan = plan_modal_reservation(cockpit.screen.top, cockpit.screen.rows, 6);
         assert!(
-            panel_plan.chat_visible,
-            "acceptance must exercise a panel with the inactive chat still \
-                 visible: {panel_plan:?}"
+            !panel_plan.chat_visible,
+            "a blocking panel must occlude the normal composer: {panel_plan:?}"
         );
         let before_panel = tty.painted().len();
         cockpit
@@ -403,7 +506,7 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         let panel_move = String::from_utf8(panel_move).expect("panel cursor bytes are UTF-8");
         assert!(
             panel_delta.contains(&panel_move),
-            "the panel must be placed in its reserved rows above chat; \
+            "the panel must be placed in its reserved rows over chat; \
                  expected {panel_move:?}, painted: {panel_delta:?}"
         );
         for word in ["PANEL", "BODY", "REAL", "TERMINAL"] {
