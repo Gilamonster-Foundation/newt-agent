@@ -1,7 +1,8 @@
 use super::*;
 
-/// Probe (stream:false) answers with plain content; the streaming re-issue
-/// (stream:true) returns NDJSON tokens with usage on the `done` chunk.
+/// #2372: the probe's plain answer is ACCEPTED and returned. Any second
+/// (`stream: true`) request would stream DIFFERENT text, so a display reissue
+/// shows up as an extra request and as `Hello world` in the reply.
 struct StreamHappyResponder;
 impl Respond for StreamHappyResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
@@ -23,7 +24,7 @@ impl Respond for StreamHappyResponder {
 }
 
 #[tokio::test]
-async fn ollama_streams_final_answer_and_merges_usage() {
+async fn ollama_returns_the_accepted_probe_answer_without_a_reissue() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -38,19 +39,49 @@ async fn ollama_streams_final_answer_and_merges_usage() {
             .await
             .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "Hello world", "tokens accumulated across chunks");
-    assert!(streamed, "the streaming path printed the tokens");
-    let u = usage.expect("probe + stream usage merged");
-    // SEMANTICS CHANGED in Step 18.1: both requests carried the same
-    // conversation, so input is max(5, 7) = 7 — the old sum (12) counted
-    // the shared history twice. Output is still 2 + 3 (new generation).
-    assert_eq!(u.input_tokens, 7, "max(5 probe, 7 stream), not the sum");
-    assert_eq!(u.output_tokens, 5, "2 (probe) + 3 (stream)");
+    assert_eq!(
+        reply, "probe answer",
+        "the gated answer, never a second generation"
+    );
+    assert!(!streamed, "nothing was streamed to a display");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "one generation request"
+    );
+    let u = usage.expect("the probe's usage");
+    assert_eq!((u.input_tokens, u.output_tokens), (5, 2));
     assert_eq!(hallu, 0);
 }
 
-/// The streaming re-issue produces no tokens — the loop must fall back to
-/// the probe round's content rather than returning silence.
+/// #2372: reasoning never reaches the accepted Ollama answer. The deleted
+/// display stream's filter used to strip it; the probe path must now, for an
+/// inline `<think>` block and #528's lone leading closer alike.
+#[tokio::test]
+async fn reasoning_does_not_leak_into_the_accepted_ollama_answer() {
+    for content in ["<think>x</think>Done.", "x</think>Done."] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": content},
+                "prompt_eval_count": 5, "eval_count": 2,
+            })))
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, _streamed, _usage, _hallu) =
+            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
+                .await
+                .expect("dispatch");
+
+        assert_eq!(reply, "Done.", "{content:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
 struct EmptyStreamResponder;
 impl Respond for EmptyStreamResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {

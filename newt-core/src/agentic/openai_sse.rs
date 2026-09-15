@@ -142,22 +142,6 @@ impl SseAccumulator {
         Self::default()
     }
 
-    /// Track actual provider error envelopes during optional display streaming.
-    /// Display retains its existing tolerant completion behavior; callers can
-    /// still distinguish an observed rejection from ordinary assistant text.
-    pub(crate) fn new_with_provider_errors() -> Self {
-        Self {
-            strict: Some(StrictResponse::default()),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn has_provider_error(&self) -> bool {
-        self.strict
-            .as_ref()
-            .is_some_and(|strict| strict.provider_error.is_some())
-    }
-
     /// True once `data: [DONE]` has been seen.
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -183,13 +167,6 @@ impl SseAccumulator {
     pub fn finish(mut self) -> OpenAiStreamRound {
         self.flush_line();
         self.round
-    }
-
-    /// Flush the final frame and retain any observed provider rejection.
-    pub(crate) fn finish_with_error(mut self) -> (OpenAiStreamRound, Option<anyhow::Error>) {
-        self.flush_line();
-        let error = self.strict.and_then(|strict| strict.provider_error);
-        (self.round, error)
     }
 
     fn flush_line(&mut self) {

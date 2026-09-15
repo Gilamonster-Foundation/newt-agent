@@ -78,6 +78,54 @@ fn complete_single_tool_prefix() -> String {
     format!("data: {}\n\n", complete_single_tool_frame())
 }
 
+/// #2372: an accepted final answer is generated ONCE and returned exactly as
+/// the gates accepted it. The mock would answer any second request with
+/// DIFFERENT text, so a display reissue shows up twice: as an extra request,
+/// and as `REISSUED` in the returned reply.
+#[tokio::test]
+async fn an_accepted_final_answer_is_generated_once_and_returned_as_accepted() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_request: &Request| {
+            let text = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                "ACCEPTED answer."
+            } else {
+                "REISSUED answer."
+            };
+            wire(
+                &[
+                    json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":3}}),
+                ],
+                true,
+            )
+        })
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = false;
+    let (text, streamed, usage, _) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("a plain answer completes the turn");
+    assert_eq!(
+        text, "ACCEPTED answer.",
+        "the gated answer, never a second generation"
+    );
+    assert!(!streamed, "nothing was streamed to a display");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "one generation request"
+    );
+    assert_eq!(usage.unwrap().output_tokens, 3, "one generation's tokens");
+}
+
 #[tokio::test]
 async fn primary_stream_assembles_a_tool_batch_once_and_preserves_call_ids() {
     let server = MockServer::start().await;
