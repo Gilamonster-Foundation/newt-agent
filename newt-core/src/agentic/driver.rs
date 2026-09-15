@@ -173,6 +173,9 @@ pub struct TurnDriverConfig {
     /// `code_search` tool is advertised and executable against the supplied
     /// index; `None` (the default) ⇒ absent, preserving today's behavior.
     pub code_search: Option<HeadlessCodeSearch>,
+    /// #2312: explicit output-token allowance for driven turns. `None` keeps
+    /// the cognition table and wire defaults.
+    pub output_allowance: Option<u32>,
 }
 
 impl TurnDriverConfig {
@@ -216,6 +219,7 @@ impl TurnDriverConfig {
             summary_input_cap_floor_chars: 8_192,
             context_manager: crate::ContextManager::default(),
             code_search: None,
+            output_allowance: None,
         }
     }
 
@@ -301,6 +305,8 @@ pub struct TurnOutcome {
     pub behavior_signals: Vec<crate::agentic::observability::BehaviorSignal>,
     /// The optional collaborators this turn's context actually carried.
     pub features: InstantiatedFeatures,
+    /// The output cap the turn's wire applied, and who enforced it (#2312).
+    pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -673,7 +679,7 @@ async fn run_one_turn(
         persona_tools: None,
         cognition: runtime.cognition,
         chat_completions_capability: config.chat_completions_capability,
-        output_allowance: None, // TODO(#2312): thread from TurnDriverConfig after #2314.
+        output_allowance: config.output_allowance,
         reasoning_replay_scope: config.reasoning_replay_scope,
         emits_leading_reasoning: config.emits_leading_reasoning,
         max_tool_rounds: config.max_tool_rounds,
@@ -761,6 +767,7 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             features,
+            output_allowance: solve_obs.output_allowance,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -780,6 +787,7 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             features,
+            output_allowance: solve_obs.output_allowance,
         }),
     }
 }
@@ -1080,6 +1088,33 @@ mod tests {
             "code_search advertised once the driver carries retrieval"
         );
         assert!(outcome.features.code_search && !outcome.features.crew);
+    }
+
+    /// #2312: the driver threads its configured allowance into the turn, and the
+    /// Ollama wire — which sends no cap — reports it as a local reserve.
+    #[tokio::test]
+    async fn a_configured_output_allowance_is_reserved_locally_on_ollama() {
+        let (bare, outcome) =
+            drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
+        assert_eq!(
+            outcome.output_allowance, None,
+            "nothing configured, nothing reserved"
+        );
+
+        let mut config = cfg("http://placeholder");
+        config.output_allowance = Some(3_000);
+        let (capped, outcome) = drive_once_capturing(TurnDriver::new(config)).await;
+        assert_eq!(
+            outcome.output_allowance,
+            Some(crate::agentic::OutputAllowance {
+                tokens: 3_000,
+                enforced: crate::agentic::Enforcement::Local,
+            })
+        );
+        for body in bare.iter().chain(&capped) {
+            assert!(body["options"].get("num_predict").is_none(), "{body}");
+            assert!(body.get("max_tokens").is_none(), "{body}");
+        }
     }
 
     /// Grounds the owned thread-crossing seam itself: a configured runner is

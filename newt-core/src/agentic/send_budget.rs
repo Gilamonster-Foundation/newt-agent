@@ -621,6 +621,11 @@ impl ResponsesBudgetState {
         self.tool_schema_tokens = tokens;
     }
 
+    /// The resolved output allowance this wire reserves (it sends no cap).
+    pub(super) fn output_reserve(&self) -> Option<u32> {
+        self.output_reserve
+    }
+
     /// The configured window, echoed by `get_context_remaining`.
     pub(super) fn num_ctx(&self) -> Option<u32> {
         self.num_ctx

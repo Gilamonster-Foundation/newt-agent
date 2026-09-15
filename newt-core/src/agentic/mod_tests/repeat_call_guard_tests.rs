@@ -876,7 +876,7 @@ fn the_carried_userland_refusal_is_a_blocker_no_edit_can_clear() {
         "stdout": "",
         "stderr": "error: command not found: cargo\n",
     });
-    let rendered = tools::absent_binary_refusal("cargo", &envelope, &crate::caveats::Scope::none())
+    let rendered = tools::absent_binary_refusal(&envelope, &crate::caveats::Scope::none())
         .expect("a 127 with no denials renders the refusal");
     assert!(rendered.contains(tools::ABSENT_BINARY_MARKER), "{rendered}");
     assert!(!tools::tool_result_ok(&rendered));

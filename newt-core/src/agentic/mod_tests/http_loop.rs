@@ -373,5 +373,9 @@ mod verification;
 mod spill_retrieval;
 
 #[cfg(test)]
+#[path = "http_exposure_promotion.rs"]
+mod exposure_promotion;
+
+#[cfg(test)]
 #[path = "http_smart_harness.rs"]
 mod smart_harness;
