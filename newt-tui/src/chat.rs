@@ -729,6 +729,7 @@ fn persist_incomplete_turn(
     end_reason: newt_core::TurnEndReason,
     elapsed: std::time::Duration,
     inf_model: &str,
+    inf_kind: newt_core::BackendKind,
     inf_url: &str,
     pricing: &newt_core::PricingConfig,
     memory: &mut newt_core::MemoryManager,
@@ -749,7 +750,14 @@ fn persist_incomplete_turn(
     let metrics = newt_core::TurnMetrics {
         elapsed_ms: elapsed.as_millis() as u64,
         usage,
-        cost_usd: pricing.estimate_cost(inf_model, usage.as_ref()),
+        cost_usd: pricing.estimate_cost(
+            inf_model,
+            newt_core::owned_hosts::inference_is_local(
+                inf_kind == newt_core::BackendKind::Embedded,
+                Some(inf_url),
+            ),
+            usage.as_ref(),
+        ),
         model_id: inf_model.to_string(),
         endpoint: inf_url.to_string(),
         hallucinations,
@@ -1748,7 +1756,7 @@ fn session_body(
     // #1021: seed the shipped gila-personal-assistant skill (best-effort — a
     // seeding failure shouldn't block the session; the persona's declared
     // `skills:` binding would just warn as unresolved instead).
-    if let Err(e) = ensure_default_skills() {
+    if let Err(e) = ensure_default_skills(&cfg) {
         print_newt(
             &format!("warning: could not seed default skills: {e}"),
             color,
@@ -7912,6 +7920,7 @@ fn session_body(
                             newt_core::TurnEndReason::Cancelled,
                             elapsed,
                             &inf_model,
+                            inf_kind,
                             &inf_url,
                             &pricing,
                             &mut memory,
@@ -8072,7 +8081,14 @@ fn session_body(
                                 let metrics = newt_core::TurnMetrics {
                                     elapsed_ms: elapsed.as_millis() as u64,
                                     usage,
-                                    cost_usd: pricing.estimate_cost(&inf_model, usage.as_ref()),
+                                    cost_usd: pricing.estimate_cost(
+                                        &inf_model,
+                                        newt_core::owned_hosts::inference_is_local(
+                                            inf_kind == newt_core::BackendKind::Embedded,
+                                            Some(&inf_url),
+                                        ),
+                                        usage.as_ref(),
+                                    ),
                                     model_id: inf_model.clone(),
                                     endpoint: inf_url.clone(),
                                     hallucinations,
@@ -8360,6 +8376,7 @@ fn session_body(
                                     newt_core::TurnEndReason::Failed,
                                     elapsed,
                                     &inf_model,
+                                    inf_kind,
                                     &inf_url,
                                     &pricing,
                                     &mut memory,

@@ -10,7 +10,7 @@ use super::*;
 #[test]
 fn skill_search_dirs_defaults_to_single_newt_dir() {
     let cfg = Config::default();
-    let dirs = cfg.skill_search_dirs();
+    let dirs = cfg.skill_search_dirs_with(None, |_| false);
     assert_eq!(dirs.len(), 1);
     assert!(dirs[0].ends_with("skills"));
     // The parent component is `.newt`.
@@ -44,7 +44,7 @@ fn skill_search_dirs_preserves_configured_order() {
         ..Config::default()
     };
     assert_eq!(
-        cfg.skill_search_dirs(),
+        cfg.skill_search_dirs_with(None, |_| false),
         vec![PathBuf::from("/abs/one"), PathBuf::from("/abs/two")]
     );
 }
@@ -58,7 +58,7 @@ fn skill_search_dirs_expands_tilde() {
         }),
         ..Config::default()
     };
-    let dirs = cfg.skill_search_dirs();
+    let dirs = cfg.skill_search_dirs_with(None, |_| false);
     // The final component survives expansion regardless of whether $HOME
     // was set; when set, the leading `~` must be gone.
     assert!(dirs[0].ends_with("skills-x"));
@@ -78,7 +78,7 @@ fn skill_search_dirs_appends_bundled_dir_last() {
         ..Config::default()
     };
     assert_eq!(
-        cfg.skill_search_dirs(),
+        cfg.skill_search_dirs_with(None, |_| false),
         vec![PathBuf::from("/abs/user"), PathBuf::from("/abs/bundled")],
         "user search dirs must precede the bundled dir so users can override"
     );
@@ -95,7 +95,7 @@ fn skill_search_dirs_bundled_after_default_when_search_empty() {
         }),
         ..Config::default()
     };
-    let dirs = with_bundled.skill_search_dirs();
+    let dirs = with_bundled.skill_search_dirs_with(None, |_| false);
     assert_eq!(dirs.len(), 2, "default host dir + bundled: {dirs:?}");
     assert!(
         dirs[0].ends_with("skills"),
@@ -115,29 +115,91 @@ fn skill_search_dirs_bundled_after_default_when_search_empty() {
         ..Config::default()
     };
     assert_eq!(
-        no_bundled.skill_search_dirs().len(),
+        no_bundled.skill_search_dirs_with(None, |_| false).len(),
         1,
         "empty bundled_dir contributes no directory"
     );
 }
 
+/// #2331: with no `bundled_dir` configured, a newt checkout's
+/// `.newt/bundled-skills` above the cwd is the bundled default, appended last.
+/// This is the list the index AND the `use_skill` loader both read now.
 #[test]
-fn with_bundled_default_leaves_a_configured_value_untouched() {
-    // A user who set `bundled_dir` must win — the checkout default only
-    // fills the gap, it never overrides an explicit choice.
+fn skill_search_dirs_append_the_checkout_bundled_default_when_unset() {
+    let checkout = PathBuf::from("/home/u/repo/.newt/bundled-skills");
+    let cfg = Config {
+        skills: Some(SkillsConfig {
+            search: vec!["/abs/user".into()],
+            bundled_dir: String::new(),
+        }),
+        ..Config::default()
+    };
+    assert_eq!(
+        cfg.skill_search_dirs_with(Some(Path::new("/home/u/repo/newt-core")), |p| p == checkout),
+        vec![PathBuf::from("/abs/user"), checkout.clone()],
+        "the checkout default is the LOWEST priority entry"
+    );
+    // Twin: outside a checkout there is no bundled default to append.
+    assert_eq!(
+        cfg.skill_search_dirs_with(Some(Path::new("/elsewhere")), |p| p == checkout),
+        vec![PathBuf::from("/abs/user")]
+    );
+}
+
+/// A user who set `bundled_dir` wins — the checkout default only fills the
+/// gap, it never overrides an explicit choice.
+#[test]
+fn a_configured_bundled_dir_beats_the_checkout_default() {
     let cfg = Config {
         skills: Some(SkillsConfig {
             search: vec![],
             bundled_dir: "/explicit/bundled".into(),
         }),
         ..Config::default()
-    }
-    .with_bundled_default();
+    };
+    let dirs = cfg.skill_search_dirs_with(Some(Path::new("/home/u/repo")), |_| true);
+    assert_eq!(dirs.last(), Some(&PathBuf::from("/explicit/bundled")));
     assert_eq!(
-        cfg.skills.unwrap().bundled_dir,
-        "/explicit/bundled",
-        "an explicitly configured bundled_dir is never overridden"
+        dirs.len(),
+        2,
+        "host default + the explicit bundled dir: {dirs:?}"
     );
+}
+
+/// #2331: installs and seeding land in the first configured root, never in
+/// the bundled directory, whatever the probe finds.
+#[test]
+fn skill_install_dir_is_the_first_configured_root() {
+    let cfg = Config {
+        skills: Some(SkillsConfig {
+            search: vec!["/abs/first".into(), "/abs/second".into()],
+            bundled_dir: "/abs/bundled".into(),
+        }),
+        ..Config::default()
+    };
+    assert_eq!(cfg.skill_install_dir(), Some(PathBuf::from("/abs/first")));
+    assert_eq!(
+        cfg.skill_search_dirs_with(None, |_| false).first(),
+        cfg.skill_install_dir().as_ref(),
+        "the install dir is the search path's highest-priority entry"
+    );
+}
+
+/// The config-root leak regression (field-caught, moved here from
+/// `newt_skills::default_skills_dir` with #2331): a redirected
+/// `$NEWT_CONFIG_DIR` owns the default install dir — seeding once wrote
+/// `~/.newt/skills` on the real home even with the root redirected.
+#[serial_test::serial(real_fs)]
+#[test]
+fn skill_install_dir_honors_newt_config_dir() {
+    let saved = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+    std::env::set_var(NEWT_CONFIG_DIR_ENV, "/tmp/redirected-root");
+    let dir = Config::default().skill_install_dir();
+    match saved {
+        Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+        None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+    }
+    assert_eq!(dir, Some(PathBuf::from("/tmp/redirected-root/skills")));
 }
 
 #[test]

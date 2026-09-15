@@ -440,32 +440,6 @@ fn line_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
 }
 
 // ---------------------------------------------------------------------------
-// Default location
-// ---------------------------------------------------------------------------
-
-/// Resolve the host-scoped skills directory: `$HOME/.newt/skills`.
-///
-/// Skills are intentionally host-scoped (not per-workspace) — installed skills
-/// are the operator's trusted procedural knowledge, available to every session.
-#[must_use]
-pub fn default_skills_dir() -> Option<PathBuf> {
-    // Honor $NEWT_CONFIG_DIR (the same root newt-core's Config::user_config_dir
-    // resolves; duplicated here because newt-skills sits BELOW newt-core in the
-    // dependency graph). Without this, a session run with a redirected config
-    // root still seeded ~/.newt/skills on the real home — the config-root
-    // leak caught in field testing.
-    if let Some(dir) = std::env::var_os("NEWT_CONFIG_DIR").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(dir).join("skills"));
-    }
-    home_dir().map(|h| h.join(".newt").join("skills"))
-}
-
-/// Resolve the real `$HOME` (env first; no extra deps).
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-// ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
 

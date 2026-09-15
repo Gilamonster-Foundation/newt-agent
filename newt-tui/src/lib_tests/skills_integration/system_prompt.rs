@@ -134,3 +134,109 @@ async fn registered_agents_provider_block_reaches_prompt() {
     assert!(prompt.contains("# Project instructions"));
     assert!(prompt.contains("Run just check before PRs."));
 }
+
+/// Pins the process-wide inputs skill resolution reads — `NEWT_CONFIG`,
+/// `NEWT_CONFIG_DIR`, `HOME` and the cwd — restoring them on drop, so a
+/// failing assertion cannot leak a redirected root into the next test.
+struct SkillRootSandbox {
+    vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    cwd: std::path::PathBuf,
+}
+
+impl SkillRootSandbox {
+    fn enter(config_dir: &std::path::Path, cwd: &std::path::Path) -> Self {
+        let keys = [
+            "NEWT_CONFIG",
+            newt_core::config::NEWT_CONFIG_DIR_ENV,
+            "HOME",
+        ];
+        let sandbox = Self {
+            vars: keys.iter().map(|k| (*k, std::env::var_os(k))).collect(),
+            cwd: std::env::current_dir().unwrap(),
+        };
+        // SAFETY: the caller is in the `serial(real_fs)` lane.
+        unsafe {
+            std::env::remove_var("NEWT_CONFIG");
+            std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, config_dir);
+            std::env::set_var("HOME", config_dir);
+        }
+        std::env::set_current_dir(cwd).unwrap();
+        sandbox
+    }
+}
+
+impl Drop for SkillRootSandbox {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.cwd);
+        for (key, value) in &self.vars {
+            // SAFETY: still inside the `serial(real_fs)` lane.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+/// #2331 real-resource grounding for the mocked resolver and same-copy tests
+/// (`skill_search_dirs_append_the_checkout_bundled_default_when_unset` in
+/// newt-core, `index_and_loader_resolve_the_same_copy_over_user_then_bundled`
+/// in newt-skills): on a real filesystem, a skill that exists ONLY in a
+/// checkout's `.newt/bundled-skills` is listed by the real system prompt AND
+/// loaded by the real `use_skill` dispatch. Before #2331 the prompt listed it
+/// and `use_skill` answered `unknown skill`. Asserting the index alone would
+/// pass on that bug, so both halves are required.
+#[ignore = "real-resource: weekly/release tier; pins cwd, HOME and NEWT_CONFIG_DIR"]
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn a_bundled_only_skill_is_indexed_and_loaded_by_use_skill() {
+    let root = tempfile::TempDir::new().unwrap();
+    let checkout = root.path().join("checkout");
+    write_skill(
+        &checkout.join(".newt").join("bundled-skills"),
+        "grounding-skill",
+        "Only in the bundled dir",
+    );
+    let nested = checkout.join("crate");
+    let config_dir = root.path().join("config");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&config_dir).unwrap();
+    let _sandbox = SkillRootSandbox::enter(&config_dir, &nested);
+    let ws = nested.to_str().unwrap();
+
+    let prompt = build_system_prompt_with_soul(ws, None, "plan.md");
+    assert!(
+        prompt.contains("grounding-skill: Only in the bundled dir"),
+        "the prompt index must list the bundled-only skill"
+    );
+
+    let body = newt_core::execute_tool(
+        "use_skill",
+        &serde_json::json!({ "name": "grounding-skill" }),
+        ws,
+        false,
+        200,
+        &newt_core::Caveats::top(),
+        &mut newt_core::NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        body.contains("Full body of grounding-skill."),
+        "use_skill must load the copy the index listed, got: {body}"
+    );
+}

@@ -344,18 +344,8 @@ use trim::{
 /// loads or sheds pressure. Hosted requests get one retry: each failed attempt
 /// may already have consumed the full configured inference bound and may be billable.
 /// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
-fn inference_endpoint_is_owned(endpoint: &str) -> bool {
-    let Some(host) = reqwest::Url::parse(endpoint)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-    else {
-        return false;
-    };
-    crate::owned_hosts::is_owned_host(&host)
-}
-
 fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
-    if inference_endpoint_is_owned(endpoint) {
+    if crate::owned_hosts::inference_is_local(false, Some(endpoint)) {
         RetryPolicy::for_local_inference()
     } else {
         RetryPolicy::for_hosted_inference()
@@ -2114,14 +2104,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // identity, so this is bit-for-bit unchanged unless `[tool_exposure]` opts
     // in. Applied before the token estimate so what we count equals what we
     // send. Dispatch still authorizes on the full set — exposure ≠ authority.
-    let tools = crate::agentic::tools::select_exposed(
+    let (mut tools, hidden_tools) = crate::agentic::tools::select_exposed(
         tools,
         &exposure,
         exposure_budget_tokens(send_budget, safe_context),
         &std::collections::BTreeSet::new(),
         estimation,
     );
-    let tool_tokens = estimate_value_tokens(&tools, estimation);
+    let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Price the stable tool catalog in real-token space. Reprice it whenever
     // usage or an overflow updates the session's calibration.
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
@@ -2212,6 +2202,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        // #2331: a call to an authorized tool whose schema was off the wire
+        // promoted it; its schema rides every request from here on.
+        if hidden_tools.append_promoted(&mut tools) {
+            tool_tokens = estimate_value_tokens(&tools, estimation);
+            tool_tokens_real = calibrate_up(tool_tokens, cal);
+        }
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -4067,6 +4063,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         plan_mode_control,
                         spill_store,
                         persona_tools,
+                        hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                     },
@@ -6652,7 +6649,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // #TEC Pass 1: exposure stage — clip the authorized catalog to the live
     // usable budget (identity under `ExposureProfile::Full`). See the Ollama
     // path for the full rationale.
-    let tools = crate::agentic::tools::select_exposed(
+    let (tools, hidden_tools) = crate::agentic::tools::select_exposed(
         tools,
         &exposure,
         exposure_budget_tokens(send_budget, safe_context),
@@ -6664,8 +6661,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // envelope after authorization + exposure, keeping Kernel tools ahead of
     // optional MCP schemas. Omitted tools remain dispatch-authorized and
     // listable through tool_search; dynamic schema activation is separate.
-    let tools = crate::agentic::tools::select_openai_compatible_tools(tools);
-    let tool_tokens = estimate_value_tokens(&tools, estimation);
+    let mut tools = crate::agentic::tools::select_openai_compatible_tools(tools);
+    hidden_tools.limit_to(
+        crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS,
+        tools.as_array().map_or(0, Vec::len),
+    );
+    let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
@@ -6728,6 +6729,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        // #2331: a call to an authorized tool whose schema was off the wire
+        // promoted it; its schema rides every request from here on.
+        if hidden_tools.append_promoted(&mut tools) {
+            tool_tokens = estimate_value_tokens(&tools, estimation);
+            tool_tokens_real = calibrate_up(tool_tokens, cal);
+        }
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -8360,6 +8367,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         plan_mode_control,
                         spill_store,
                         persona_tools,
+                        hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                     },
@@ -9151,17 +9159,18 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         prompt_disposition,
     );
     // #TEC Pass 1: exposure stage — mirrors the OpenAI path.
-    let tools = crate::agentic::tools::select_exposed(
+    let (mut tools, hidden_tools) = crate::agentic::tools::select_exposed(
         tools,
         &exposure,
         exposure_budget_tokens(send_budget, safe_context),
         &std::collections::BTreeSet::new(),
         estimation,
     );
-    // The Anthropic tool catalog, converted ONCE from the exposed catalog
-    // (`input_schema` copied wholesale, no `function` nesting).
-    let tools_anthropic = anthropic_wire::tools_to_anthropic(&tools);
-    let tool_tokens = estimate_value_tokens(&tools, estimation);
+    // The Anthropic tool catalog, converted from the exposed catalog
+    // (`input_schema` copied wholesale, no `function` nesting), and again only
+    // when a hidden tool is promoted.
+    let mut tools_anthropic = anthropic_wire::tools_to_anthropic(&tools);
+    let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the OpenAI path).
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
@@ -9221,6 +9230,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        // #2331: a call to an authorized tool whose schema was off the wire
+        // promoted it; its schema rides every request from here on.
+        if hidden_tools.append_promoted(&mut tools) {
+            tools_anthropic = anthropic_wire::tools_to_anthropic(&tools);
+            tool_tokens = estimate_value_tokens(&tools, estimation);
+            tool_tokens_real = calibrate_up(tool_tokens, cal);
+        }
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -10531,6 +10547,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         plan_mode_control,
                         spill_store,
                         persona_tools,
+                        hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                     },
@@ -11162,16 +11179,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         output_allowance,
     );
     observability::observe_output_allowance(&mut solve_obs, budget_state.output_reserve(), false);
-    let tools_chat = crate::agentic::tools::select_exposed(
+    let (tools_chat, hidden_tools) = crate::agentic::tools::select_exposed(
         tools_chat,
         &exposure,
         budget_state.exposure_budget(),
         &std::collections::BTreeSet::new(),
         estimation,
     );
-    let tools_chat = crate::agentic::tools::select_openai_compatible_tools(tools_chat);
-    let tools = tools_to_responses(&tools_chat);
-    let tools_for_estimate = serde_json::Value::Array(tools.clone());
+    let mut tools_chat = crate::agentic::tools::select_openai_compatible_tools(tools_chat);
+    hidden_tools.limit_to(
+        crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS,
+        tools_chat.as_array().map_or(0, Vec::len),
+    );
+    let mut tools = tools_to_responses(&tools_chat);
+    let mut tools_for_estimate = serde_json::Value::Array(tools.clone());
     let mut cal = compress_state.calibration.ratio(estimate_ratio);
     // #1528: real-token schema overhead of the EXPOSED tool set — subtracted from
     // a recovered input cap before the compaction budget is converted back to
@@ -11215,7 +11236,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let turn_start_head = claim_check::git_head(workspace, &caveats.fs_read);
 
     let reasoning = responses_reasoning_field(cognition);
-    let build_body = |input: &[serde_json::Value], with_tools: bool| {
+    // Tools are passed per call (#2331): a promotion can append to them.
+    let build_body = |input: &[serde_json::Value], tools: &[serde_json::Value]| {
         // `store` is set EXPLICITLY (#1526, invariant #5): the Responses API
         // defaults it to `true` (server-side retention). Newt is stateless — it
         // replays the full history here and never uses `previous_response_id` —
@@ -11235,7 +11257,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if let Some(reasoning) = &reasoning {
             body["reasoning"] = reasoning.clone();
         }
-        if with_tools && !tools.is_empty() {
+        if !tools.is_empty() {
             body["tools"] = serde_json::json!(tools);
             body["tool_choice"] = serde_json::json!("auto");
         }
@@ -11248,6 +11270,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     for round in 0..max_tool_rounds {
+        // #2331: a call to an authorized tool whose schema was off the wire
+        // promoted it; its schema rides every request from here on.
+        if hidden_tools.append_promoted(&mut tools_chat) {
+            tools = tools_to_responses(&tools_chat);
+            tools_for_estimate = serde_json::Value::Array(tools.clone());
+            budget_state.set_tool_schema_tokens(calibrate_up(
+                estimate_value_tokens(&tools_for_estimate, estimation),
+                cal,
+            ));
+        }
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -11348,7 +11380,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if let Some(harness) = smart_harness {
                 harness.record_responses_messages(instructions.as_deref(), &input)?;
             }
-            let body = build_body(&input, tools_supported);
+            let body = build_body(&input, if tools_supported { &tools } else { &[] });
             let policy = responses_wire_validation::ResponsesWirePolicy {
                 store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
                 tools_permitted: true,
@@ -11959,6 +11991,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         plan_mode_control,
                         spill_store,
                         persona_tools,
+                        hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                     },
@@ -12126,7 +12159,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // typed strict-wire gate the rounds use, with `tools_permitted = false` so the
     // final summary can carry NO tools; a proactive-compaction reason (if any) rides
     // its error chain. Only a `ValidatedResponsesRequest` reaches the dispatcher.
-    let body = build_body(&input, false);
+    let body = build_body(&input, &[]);
     let policy = responses_wire_validation::ResponsesWirePolicy {
         store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
         tools_permitted: false,

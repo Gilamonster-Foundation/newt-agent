@@ -91,7 +91,7 @@ use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
 pub use exposure::ExposureSettings;
-pub(crate) use exposure::{select_exposed, select_openai_compatible_tools};
+pub(crate) use exposure::{select_exposed, select_openai_compatible_tools, HiddenTools};
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -2458,6 +2458,7 @@ async fn execute_authorized_tool(
         plan_mode_control,
         spill_store,
         persona_tools,
+        hidden_tools,
         live_tool_output,
         completed_spill_renderer: _,
     } = collab;
@@ -2566,6 +2567,13 @@ async fn execute_authorized_tool(
         if !persona_tool_allowed(canonical, allow) && !mcp.handles(name) {
             return host_return(persona_tool_denied_message(canonical));
         }
+    }
+
+    // #2331: an authorized tool whose schema the model was never sent. Every
+    // authority check above has already passed, so a refused tool never gets
+    // here; this call does not run, and the loop sends the schema next request.
+    if let Some(message) = hidden_tools.and_then(|hidden| hidden.promote(name).message(name)) {
+        return host_return(message);
     }
 
     // Remote MCP tools (namespaced `server__tool`) route to their server before
@@ -2964,7 +2972,12 @@ async fn execute_authorized_tool(
             );
             // #2332: disposition narrowing happens inside the search, which
             // names what it hides instead of dropping it.
-            super::tool_search::execute_tool_search_for_disposition(query, &catalog, disposition)
+            super::tool_search::execute_tool_search_for_disposition(
+                query,
+                &catalog,
+                disposition,
+                hidden_tools,
+            )
         }
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool

@@ -451,7 +451,11 @@ impl AcpServer {
         let metrics = newt_core::TurnMetrics {
             elapsed_ms,
             usage: reply.usage,
-            cost_usd: pricing.estimate_cost(&reply.model_id, reply.usage.as_ref()),
+            cost_usd: pricing.estimate_cost(
+                &reply.model_id,
+                self.backend.is_local(),
+                reply.usage.as_ref(),
+            ),
             model_id: reply.model_id.clone(),
             endpoint: self.backend.endpoint().unwrap_or("unknown").to_string(),
             ..Default::default()

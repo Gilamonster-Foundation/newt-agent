@@ -2,7 +2,7 @@
 """tb_campaign.py — trial records and the report table for tb-campaign.sh (#2318).
 
     tb_campaign.py ingest <job_dir> <cell.json> <out_dir>   # append trials.jsonl + cells.jsonl
-    tb_campaign.py table <out_dir>                         # markdown matrix
+    tb_campaign.py table <out_dir> [--pair]                # markdown matrix [+ treatment vs none]
     tb_campaign.py cell <cell.json> <treatment|none> key value ...   # write a cell binding
     tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
     tb_campaign.py pin-check <out_dir> <cell.json>         # exit 3 naming the fields that differ
@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 import statistics
 import sys
@@ -106,13 +107,29 @@ def harness_evidence(harness, lines):
     return replies, "; ".join(e for e in errors if e) or None
 
 
+def newt_status(lines):
+    """newt's own `solve_result.status` (completed / incomplete / awaiting_operator / failed)."""
+    status = None
+    for o in _records(lines):
+        if o.get("kind") == "solve_result":
+            status = o.get("status")
+    return status
+
+
 def newt_claim(lines):
-    """newt's contract record carries `outcome`; `completed` is its claim."""
+    """The contract's `outcome` says a terminal state was reached, not that the
+    work is done: a run newt marks `status: incomplete` (#2315's RepairExhausted,
+    VerificationIncomplete; RoundCap) can still carry `outcome: completed`. So the
+    claim needs both. A record without a status falls back to the outcome alone."""
     outcome = None
     for o in _records(lines):
         if "outcome" in o:
             outcome = o["outcome"]
-    return None if outcome is None else (outcome == "completed", f"contract outcome={outcome}")
+    if outcome is None:
+        return None
+    status = newt_status(lines)
+    claimed = outcome == "completed" and status in ("completed", None)
+    return claimed, f"contract outcome={outcome}, solve_result status={status}"
 
 
 def pi_claim(lines):
@@ -343,6 +360,8 @@ def trial_row(harness, trial: Path, expect=None):
         "model_effective": effective,
         "harness_config": harness_config,
         "treatment_observed": observed(expect, contract),
+        "harness_status": newt_status(lines) if harness == "newt" else None,
+        "harness_outcome": (contract or {}).get("outcome"),
         "result": bool(r),
         "exception": exc,
         "reward": reward,
@@ -352,7 +371,7 @@ def trial_row(harness, trial: Path, expect=None):
         "error_cause": cause,
         "model_replies": replies,
         "harness_error": harness_error,
-        "resolved": verdict(reward, SUITE) == "resolved",
+        "resolved": verdict(reward, rec["source"] or SUITE) == "resolved",
         "claimed_done": claimed,
         "claim_source": claim_source,
         "tokens_in": tokens_in,
@@ -392,13 +411,27 @@ def wilson(k, n, z=1.96):
     return max(0.0, c - h), min(1.0, c + h)
 
 
-def summarize(cell, rows):
-    # graded is trial_record's: a finite reward and no exception. A reward that
-    # arrived alongside an exception still says what the workspace held, so the
-    # agent-failure rate and the claim analysis use it unless the cause is infra.
+RATES = {
+    "excl": "trials with any exception excluded",
+    "agent_fail": "agent-caused exceptions counted as failures (infra, unknown excluded)",
+}
+
+
+def eligible(rows, rate):
+    """The trials a resolve rate counts. graded is trial_record's: a finite reward
+    and no exception. A reward that arrived alongside an agent-caused exception
+    still says what the workspace held, so the agent-failure rate keeps it."""
     graded = [r for r in rows if r["state"] == "graded"]
+    if rate == "excl":
+        return graded
+    return graded + [r for r in rows if r["state"] == "error" and r.get("error_cause") == "agent"
+                     and r["reward"] is not None]
+
+
+def summarize(cell, rows):
+    graded = eligible(rows, "excl")
     scored = [r for r in rows if r["reward"] is not None and r.get("error_cause") != "infra"]
-    with_agent = graded + [r for r in scored if r["state"] == "error" and r.get("error_cause") == "agent"]
+    with_agent = eligible(rows, "agent_fail")
     claimed = [r for r in scored if r["claimed_done"] is True]
     known_in = [r["tokens_in"] for r in rows if r["tokens_in"] is not None]
     known_out = [r["tokens_out"] for r in rows if r["tokens_out"] is not None]
@@ -424,6 +457,8 @@ def summarize(cell, rows):
         ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "not_observed": sum(r.get("treatment_observed") is False for r in rows),
+        "terminal_not_done": sum(r.get("harness_outcome") == "completed"
+                                 and r.get("harness_status") not in (None, "completed") for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
         "tokens_out": (sum(known_out), len(known_out)),
         "agent_s_median": statistics.median(secs) if secs else None,
@@ -434,12 +469,112 @@ def summarize(cell, rows):
     }
 
 
-def table(out: Path):
+# ── paired ablation ─────────────────────────────────────────────────────────
+BOOT_SEED, BOOT_N = 2318, 2000
+# Below this many paired tasks a task-resampling interval has too few clusters to
+# mean anything (one task resamples to itself: a zero-width, falsely certain band).
+BOOT_MIN_TASKS = 5
+
+
+def newcombe(k_t, n_t, k_b, n_b):
+    """Hybrid-score 95% interval for p_t - p_b (Newcombe 1998, method 10). It
+    treats trials as independent, which they are not within a task: SECONDARY."""
+    if not (n_t and n_b):
+        return None
+    pt, pb = k_t / n_t, k_b / n_b
+    (lt, ut), (lb, ub) = wilson(k_t, n_t), wilson(k_b, n_b)
+    d = pt - pb
+    return d - math.hypot(pt - lt, ub - pb), d + math.hypot(ut - pt, pb - lb)
+
+
+def pair(base_rows, treat_rows, rate, seed=BOOT_SEED, n_boot=BOOT_N):
+    """Treatment vs baseline on the tasks both arms graded under `rate`.
+
+    The primary interval is a task-clustered paired bootstrap: resample TASKS with
+    replacement, keep each task's trials together in both arms, recompute the
+    pooled difference; fixed seed, percentile 95%. Trials within a task are
+    correlated (a task that runs away does so on every attempt), so resampling
+    trials independently would understate the uncertainty."""
+    def by_task(rows):
+        out = {}
+        for r in eligible(rows, rate):
+            k, n = out.get(r["task"], (0, 0))
+            out[r["task"]] = (k + bool(r["resolved"]), n + 1)
+        return out
+
+    b, t = by_task(base_rows), by_task(treat_rows)
+    tasks = sorted(set(b) & set(t))
+    per_task = [(task, b[task], t[task]) for task in tasks]
+
+    def diff(sample):
+        kb, nb = sum(x[1][0] for x in sample), sum(x[1][1] for x in sample)
+        kt, nt = sum(x[2][0] for x in sample), sum(x[2][1] for x in sample)
+        return kt / nt - kb / nb
+
+    result = {"tasks": per_task, "unpaired": sorted(set(b) ^ set(t)), "diff": None, "bootstrap": None, "newcombe": None}
+    if not per_task:
+        return result
+    boots = None
+    if len(per_task) >= BOOT_MIN_TASKS:
+        rng = random.Random(seed)
+        boots = sorted(diff([rng.choice(per_task) for _ in per_task]) for _ in range(n_boot))
+    kb, nb = sum(x[1][0] for x in per_task), sum(x[1][1] for x in per_task)
+    kt, nt = sum(x[2][0] for x in per_task), sum(x[2][1] for x in per_task)
+    better = sum(x[2][0] / x[2][1] > x[1][0] / x[1][1] for x in per_task)
+    worse = sum(x[2][0] / x[2][1] < x[1][0] / x[1][1] for x in per_task)
+    result.update(diff=kt / nt - kb / nb, base=(kb, nb), treat=(kt, nt), better=better, worse=worse,
+                  tied=len(per_task) - better - worse, floor=kb == 0 and kt == 0, ceiling=kb == nb and kt == nt,
+                  bootstrap=boots and (boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot) - 1]),
+                  newcombe=newcombe(kt, nt, kb, nb))
+    return result
+
+
+def pair_report(cells, rows):
+    """Markdown for every treatment cell against its model and harness's `none` cell."""
+    def usable(c):
+        return c and not c.get("skipped") and not c.get("pin_mismatch")
+
+    lines = []
+    for cell in cells.values():
+        treat = cell.get("treatment") or "none"
+        if treat == "none":
+            continue
+        base = next((c for c in cells.values() if (c["model"], c["harness"], c.get("treatment") or "none")
+                     == (cell["model"], cell["harness"], "none")), None)
+        lines.append(f"\n### {cell['model']} / {cell['harness']}: {treat} vs none\n")
+        if not (usable(cell) and usable(base)):
+            lines.append("Not paired: the treatment or its baseline cell is missing, skipped, or off-pin.")
+            continue
+        mine = {c["job"]: [r for r in rows if r.get("job") == c["job"]] for c in (base, cell)}
+        for rate, label in RATES.items():
+            p = pair(mine[base["job"]], mine[cell["job"]], rate)
+            lines.append(f"**Resolve rate, {label}**\n")
+            if p["diff"] is None:
+                lines.append("No task graded in both arms.\n")
+                continue
+            lines.append("| task | none k/n | " + treat + " k/n |\n|---|---|---|")
+            lines += [f"| {task} | {kb}/{nb} | {kt}/{nt} |" for task, (kb, nb), (kt, nt) in p["tasks"]]
+            nc = p["newcombe"]
+            boot = (f"[{p['bootstrap'][0]:+.2f}, {p['bootstrap'][1]:+.2f}] ({len(p['tasks'])} tasks, {BOOT_N} resamples, seed {BOOT_SEED})"
+                    if p["bootstrap"] else f"not reported ({len(p['tasks'])} paired tasks; needs {BOOT_MIN_TASKS})")
+            lines.append(
+                f"\nΔ = {p['treat'][0]}/{p['treat'][1]} − {p['base'][0]}/{p['base'][1]} = {p['diff']:+.2f}; "
+                f"primary: task-clustered paired bootstrap 95% {boot}; "
+                f"secondary: Newcombe hybrid score, trials assumed independent, [{nc[0]:+.2f}, {nc[1]:+.2f}]. "
+                f"Tasks better / worse / tied: {p['better']} / {p['worse']} / {p['tied']}."
+                + (" **Floor: both arms resolved nothing, so this pair cannot show an effect.**" if p["floor"] else "")
+                + (" **Ceiling: both arms resolved everything, so this pair cannot show an effect.**" if p["ceiling"] else "")
+                + (f" Unpaired tasks: {', '.join(p['unpaired'])}." if p["unpaired"] else "") + "\n"
+            )
+    return "\n".join(lines)
+
+
+def table(out: Path, paired_report=False):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -465,11 +600,13 @@ def table(out: Path):
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
     print("\n".join(lines))
+    if paired_report:
+        print(pair_report(cells, rows))
 
 
 if __name__ == "__main__":
@@ -477,7 +614,7 @@ if __name__ == "__main__":
     if cmd == "ingest":
         ingest(Path(args[0]), Path(args[1]), Path(args[2]))
     elif cmd == "table":
-        table(Path(args[0]))
+        table(Path(args[0]), "--pair" in args[1:])
     elif cmd == "cell":
         Path(args[0]).write_text(json.dumps(build_cell(load_treatment(args[1]), args[2:])))
     elif cmd == "profile":  # writes the profile; prints the treatment's adapter env as KEY=VALUE lines

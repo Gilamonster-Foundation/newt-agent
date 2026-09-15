@@ -105,6 +105,20 @@ pub trait InferenceBackend: Send + Sync {
     fn endpoint(&self) -> Option<&str> {
         None
     }
+
+    /// Whether inference runs inside this process (the embedded engine). The
+    /// default is `false`: having no endpoint is not the same as being local —
+    /// a cloud provider plugin has no endpoint either.
+    fn in_process(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend's calls are served by the operator's own machinery,
+    /// by the one locality rule ([`newt_core::owned_hosts::inference_is_local`]).
+    /// Pricing reads it to decide whether a local model family is free (#2313).
+    fn is_local(&self) -> bool {
+        newt_core::owned_hosts::inference_is_local(self.in_process(), self.endpoint())
+    }
 }
 
 #[cfg(test)]
