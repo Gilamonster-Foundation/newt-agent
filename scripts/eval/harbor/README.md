@@ -84,7 +84,17 @@ one Harbor job per cell, plus these records:
   served, the engine build, the harness version, the newt binary digest, the
   task-set digest and the expected trial count.
 
-Rerunning the command skips recorded cells.
+Each cell runs **one Harbor job per trial** (`<cell>/<task>__a<attempt>`). Harbor
+0.20 has no way to stop after the current trial: resuming a job deletes trial
+dirs that have no `result.json`, and SIGTERM cancels the trial in flight. Rerunning
+the command therefore does three things:
+- skips recorded cells;
+- inside an unrecorded cell, skips every trial job that already has a
+  non-cancelled result, so a graded trial never runs twice;
+- moves a partial or cancelled trial job to `<cell>/interrupted/` before that
+  attempt runs again.
+
+A cell is recorded only when every planned trial has a result.
 
 **Treatments and pinning (#2318).**
 

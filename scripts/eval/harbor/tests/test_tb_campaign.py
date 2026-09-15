@@ -10,9 +10,9 @@ import unittest
 from pathlib import Path
 
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, error_cause, fingerprint, harness_evidence, load_treatment, newcombe, newt_claim,
-    observed, pair, pair_report, pi_claim, pin_extend, pin_mismatch, refusal, render_profile, summarize,
-    treatment_env, wilson,
+    PINNED, build_cell, codex_claim, error_cause, fingerprint, harness_evidence, is_trial_config, job_state,
+    load_treatment, newcombe, newt_claim, observed, pair, pair_report, pi_claim, pin_extend, pin_mismatch,
+    refusal, render_profile, summarize, treatment_env, trial_plan, wilson,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -292,6 +292,28 @@ class Pairing(unittest.TestCase):
         report = pair_report(cells, rows)
         self.assertIn("Δ = 3/3 − 0/3 = +1.00", report)
         self.assertIn("task-clustered paired bootstrap 95% not reported (1 paired tasks; needs 5)", report)
+
+
+class PerTrialJobs(unittest.TestCase):
+    """One Harbor job per trial: Harbor has no stop-after-this-trial, deletes a
+    result-less trial dir on resume, and SIGTERM cancels the in-flight trial,
+    so the process boundary is the only clean trial boundary."""
+
+    def test_a_trial_job_is_done_only_with_a_non_cancelled_result(self):
+        self.assertEqual(job_state([]), "absent")
+        self.assertEqual(job_state([None]), "partial")  # a trial dir without result.json
+        self.assertEqual(job_state([{"exception_info": {"exception_type": "CancelledError"}}]), "partial")
+        # An errored trial is a recorded attempt: never re-run it.
+        self.assertEqual(job_state([{"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}}]), "done")
+        self.assertEqual(job_state([{"exception_info": None, "verifier_result": {"rewards": {"reward": 0.0}}}]), "done")
+
+    def test_every_task_gets_its_first_attempt_before_any_second(self):
+        # Cutting third trials first (the design card's cut order) needs this order.
+        self.assertEqual(trial_plan(["a", "b"], 2), [("a", 1), ("b", 1), ("a", 2), ("b", 2)])
+
+    def test_trial_configs_are_told_from_job_configs(self):
+        self.assertTrue(is_trial_config({"task": {"path": "x"}, "trial_name": "t__1"}))
+        self.assertFalse(is_trial_config({"jobs_dir": "/x", "datasets": []}))
 
 
 if __name__ == "__main__":

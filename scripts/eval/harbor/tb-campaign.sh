@@ -30,11 +30,15 @@
 #   (default: this checkout's HEAD; set it when running a frozen copy),
 #   NEWT_BENCH_MAX_ROUNDS (the adapter's 40).
 #
-# Output: $TB_JOBS_ROOT/<campaign>/ holds one Harbor job per cell
-# (<model>__<harness>), trials.jsonl (every trial dir Harbor created),
-# cells.jsonl (bindings + coverage), campaign.log. Re-running the same command
-# skips cells already recorded (a skipped cell is retried). A partial job dir is moved aside, not
-# deleted. Report: python3 tb_campaign.py table <out>.
+# Output: $TB_JOBS_ROOT/<campaign>/<cell>/ holds ONE Harbor job per trial,
+# <task>__a<attempt> (Harbor has no stop-after-this-trial, and resuming a job
+# deletes result-less trial dirs, so the process boundary is the trial
+# boundary); trials.jsonl, cells.jsonl and campaign.log sit beside the cells.
+# Re-running the same command skips recorded cells and, inside an unrecorded
+# cell, every trial job that already has a non-cancelled result.json: a graded
+# trial is never re-run. A partial or cancelled trial job is moved to
+# <cell>/interrupted/ (never deleted) before its attempt runs again.
+# Report: python3 tb_campaign.py table <out>.
 set -euo pipefail
 ROSTER="${1:?roster file}"; TASKS="${2:?task-set json}"; CAMPAIGN="${3:?campaign name}"
 : "${NEWT_BENCH_BIN:?bookworm-built newt binary}"
@@ -119,7 +123,6 @@ for MLINE in "${MODELS[@]}"; do
     if [ -f "$OUT/cells.jsonl" ] && py 'import json,sys; sys.exit(not any(c["job"]==sys.argv[2] and not c.get("skipped") for c in map(json.loads,open(sys.argv[1]))))' "$OUT/cells.jsonl" "$NAME"; then
       log "$NAME recorded; skipping"; continue
     fi
-    [ -d "$JOB" ] && { mv "$JOB" "$JOB.partial.$(date +%s)"; log "$NAME: moved an unrecorded partial job aside"; }
     case "$H" in
       newt) AGENT=newt_agent:NewtAgent; LABEL="newt/$MODEL"; HV="$("$NEWT_BENCH_BIN" --version | sed "s/^newt //")" ;;
       pi) AGENT=pi_local:PiLocal; LABEL="local/$MODEL"; HV="" ;;
@@ -143,19 +146,43 @@ for MLINE in "${MODELS[@]}"; do
     [ -n "$skip" ] || { bad=$(tbc pin-check "$OUT" "$CELL") || skip="pin mismatch: $bad"; }
     if [ -n "$skip" ]; then log "$NAME skipped: $skip"; record "$CELL"; continue; fi
     # pi and codex install exactly the version the pin recorded (their first run records it).
-    py 'import json,sys; j=json.load(open(sys.argv[1])); a={"import_path":sys.argv[4],"model_name":sys.argv[5]}
-if sys.argv[6]: a["kwargs"]={"version":sys.argv[6]}
-json.dump({"jobs_dir":sys.argv[3],"datasets":j["datasets"],"agents":[a]},open(sys.argv[2],"w"),indent=1)' \
-      "$TASKS" "$OUT/$NAME.job.json" "$OUT" "$AGENT" "$LABEL" "$([ "$H" = newt ] || tbc pinned-version "$OUT" "$H")"
+    # pi and codex install exactly the version the pin recorded (their first run records it).
+    PV="$([ "$H" = newt ] || tbc pinned-version "$OUT" "$H")"
     log "$NAME start treatment=${T:-none} env=${TENV[*]:-}"
-    rc=0
-    env "${TENV[@]}" NEWT_BENCH_PROFILE="$PROFILE" NEWT_BENCH_MODEL_DIGEST="${DIGEST:-}" harbor run --config "$OUT/$NAME.job.json" --job-name "$NAME" \
-      --n-attempts "$TRIALS" --n-concurrent 1 --max-retries 0 --agent-timeout-multiplier "$MULT" \
-      --no-delete -y > "$OUT/$NAME.harbor.log" 2>&1 || rc=$?
-    py 'import json,sys; c=json.load(open(sys.argv[1])); c.update(harbor_exit=int(sys.argv[2]), finished_at=sys.argv[3], loaded_at_end=sys.argv[4]); json.dump(c,open(sys.argv[1],"w"))' \
-      "$CELL" "$rc" "$(date -Is)" "$(loaded)"
+    mkdir -p "$JOB"; failed=0
+    mapfile -t PLAN < <(tbc plan "$TASKS" "$TRIALS")
+    for STEP in "${PLAN[@]}"; do
+      read -r TASK K DPATH <<< "$STEP"
+      TJ="$JOB/${TASK}__a$K"
+      case "$(tbc job-state "$TJ")" in
+        done) continue ;;
+        partial) mkdir -p "$JOB/interrupted"; mv "$TJ" "$JOB/interrupted/$(basename "$TJ").$(date +%s)"
+                 log "$NAME: archived an interrupted trial job ${TASK}__a$K" ;;
+      esac
+      wait_idle "$MODEL" || log "$NAME: slot still busy after 30 min"
+      py 'import json,sys; a={"import_path":sys.argv[3],"model_name":sys.argv[4]}
+if sys.argv[5]: a["kwargs"]={"version":sys.argv[5]}
+json.dump({"jobs_dir":sys.argv[2],"datasets":[{"path":sys.argv[6],"task_names":[sys.argv[7]]}],"agents":[a]},open(sys.argv[1],"w"),indent=1)' \
+        "$TJ.job.json" "$JOB" "$AGENT" "$LABEL" "$PV" "$DPATH" "$TASK"
+      rc=0
+      env "${TENV[@]}" NEWT_BENCH_PROFILE="$PROFILE" NEWT_BENCH_MODEL_DIGEST="${DIGEST:-}" harbor run --config "$TJ.job.json" \
+        --job-name "${TASK}__a$K" --n-attempts 1 --n-concurrent 1 --max-retries 0 --agent-timeout-multiplier "$MULT" \
+        --no-delete -y > "$TJ.harbor.log" 2>&1 || rc=$?
+      [ "$rc" = 0 ] || { failed=$((failed + 1)); log "$NAME ${TASK}__a$K harbor_exit=$rc"; }
+    done
+    missing=0
+    for STEP in "${PLAN[@]}"; do
+      read -r TASK K _ <<< "$STEP"
+      state="$(tbc job-state "$JOB/${TASK}__a$K")"
+      [ "$state" = "done" ] || missing=$((missing + 1))
+    done
+    if [ "$missing" -gt 0 ]; then  # not recorded: the next run resumes at the missing attempts
+      log "$NAME incomplete: $missing trial(s) without a result; re-run to resume"; continue
+    fi
+    py 'import json,sys; c=json.load(open(sys.argv[1])); c.update(harbor_nonzero_exits=int(sys.argv[2]), finished_at=sys.argv[3], loaded_at_end=sys.argv[4]); json.dump(c,open(sys.argv[1],"w"))' \
+      "$CELL" "$failed" "$(date -Is)" "$(loaded)"
     record "$CELL" "$JOB"
-    log "$NAME done harbor_exit=$rc"
+    log "$NAME done harbor_nonzero_exits=$failed"
   done
 done
 python3 "$HERE/tb_campaign.py" table "$OUT" | tee -a "$LOG"

@@ -7,6 +7,8 @@
     tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
     tb_campaign.py pin-check <out_dir> <cell.json>         # exit 3 naming the fields that differ
     tb_campaign.py pinned-version <out_dir> <harness>      # the version pi/codex must install
+    tb_campaign.py plan <task-set.json> <trials>           # "<task> <attempt>" lines, in run order
+    tb_campaign.py job-state <trial_job_dir>               # absent / partial / done
 
 Every trial directory Harbor created becomes one row, graded or not. A cell's
 expected count comes from the task set, so a trial Harbor never produced is
@@ -426,13 +428,61 @@ def trial_row(harness, trial: Path, expect=None):
     }
 
 
+# ── one Harbor job per trial ─────────────────────────────────────────────────
+# Harbor 0.20 has no stop-after-this-trial: resuming a job deletes any trial dir
+# without result.json (job.py), and SIGTERM cancels the in-flight trial
+# (cli/jobs.py). So each trial is its own Harbor job, <cell>/<task>__a<attempt>,
+# and the process boundary is the trial boundary.
+INTERRUPTED = "interrupted"
+
+
+def trial_plan(tasks, trials):
+    """Run order: every task's first attempt before any task's second."""
+    return [(task, k) for k in range(1, trials + 1) for task in tasks]
+
+
+def job_state(results):
+    """A trial job from its trial dirs' parsed result.json (None when absent):
+    `done` once a non-cancelled result exists (an errored trial is a recorded
+    attempt, never re-run), `partial` when a dir holds no usable result, else `absent`."""
+    if any(r is not None and ((r.get("exception_info") or {}).get("exception_type") != "CancelledError")
+           for r in results):
+        return "done"
+    return "partial" if results else "absent"
+
+
+def _json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def is_trial_config(config):
+    return isinstance(config, dict) and "task" in config
+
+
+def trial_dirs(root: Path):
+    """Every Harbor trial dir under a cell: directly inside it (one job per cell)
+    or one level down (one job per trial). Archived interruptions are not rows."""
+    found = []
+    for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name != INTERRUPTED):
+        if is_trial_config(_json(d / "config.json")) or not (d / "config.json").exists() and (d / "agent").is_dir():
+            found.append(d)
+        else:
+            found += [t for t in sorted(p for p in d.iterdir() if p.is_dir())]
+    return found
+
+
 def ingest(job_dir: Path, cell_json: Path, out: Path):
     cell = json.loads(cell_json.read_text())
     rows = [
         {**{k: cell.get(k) for k in ("campaign", "model", "harness", "job")},
          **trial_row(cell["harness"], t, cell.get("treatment_expect"))}
-        for t in sorted(p for p in job_dir.iterdir() if p.is_dir())
+        for t in trial_dirs(job_dir)
     ]
+    archived = job_dir / INTERRUPTED
+    cell["interrupted"] = len([p for p in archived.iterdir() if p.is_dir()]) if archived.is_dir() else 0
     if not cell.get("harness_version") and rows:
         cell["harness_version"] = rows[0]["harness_version"]
     if rows and all(r["state"] == "refused" for r in rows):  # admission is per run, so it refuses every trial
@@ -619,8 +669,8 @@ def table(out: Path, paired_report=False):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | interrupted (archived, re-run) | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -646,7 +696,7 @@ def table(out: Path, paired_report=False):
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
@@ -669,6 +719,13 @@ if __name__ == "__main__":
         print("\n".join(f"{k}={v}" for k, v in sorted(treatment_env(t).items())))
     elif cmd == "pin-check":
         sys.exit(pin_check(Path(args[0]), Path(args[1])))
+    elif cmd == "plan":  # "<task> <attempt> <dataset path>"
+        paths = {t: d["path"] for d in json.loads(Path(args[0]).read_text())["datasets"] for t in d["task_names"]}
+        print("\n".join(f"{task} {k} {paths[task]}" for task, k in trial_plan(list(paths), int(args[1]))))
+    elif cmd == "job-state":
+        job = Path(args[0])
+        dirs = [d for d in job.iterdir() if d.is_dir()] if job.is_dir() else []
+        print(job_state([_json(d / "result.json") for d in dirs]))
     elif cmd == "pinned-version":
         path = Path(args[0]) / "campaign.pin.json"
         print(((json.loads(path.read_text()) if path.exists() else {}).get("harness_versions") or {}).get(args[1], ""))
