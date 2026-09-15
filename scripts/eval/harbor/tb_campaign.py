@@ -113,6 +113,10 @@ def awaiting(harness, lines, session_lines):
             return "tool"
         if last["type"] == "turn.started" or (last.get("item") or {}).get("type") != "agent_message":
             return "model"
+    # newt writes its whole events file only after the turn ends (solve.rs, the
+    # `--events` append after the contract record), so a newt run killed by the
+    # agent timeout leaves no log: there is nothing to read, and with no replies
+    # on record its timeout is unknown, the same as any harness with no log.
     return None
 
 

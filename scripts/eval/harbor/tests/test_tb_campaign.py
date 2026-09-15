@@ -385,6 +385,16 @@ class PiSessionLog(unittest.TestCase):
         self.assertIsNone(pi_inference_failure(self.txt, self.session))
         self.assertEqual(pi_session_claim(self.session), (False, "session last assistant stopReason=toolUse"))
 
+    def test_a_timeout_with_no_readable_log_is_unknown_for_every_harness(self):
+        # newt writes newt-events.jsonl only after the turn ends, so a killed newt has no
+        # log at all; pi and codex with no log are in the same position. Same evidence
+        # standard for all three: no log, no attribution.
+        for harness in ("newt", "pi", "codex"):
+            waiting_on = awaiting(harness, [], [])
+            replies, _ = harness_evidence(harness, [], [])
+            self.assertIsNone(waiting_on, harness)
+            self.assertEqual(error_cause("AgentTimeoutError", None, None, None, replies, waiting_on), "unknown", harness)
+
     def test_codex_last_event_says_what_it_waits_on(self):
         self.assertEqual(awaiting("codex", jl({"type": "turn.started"}, {"type": "item.started"}), []), "tool")
         self.assertEqual(awaiting("codex", jl({"type": "item.completed", "item": {"type": "command_execution"}}), []), "model")
