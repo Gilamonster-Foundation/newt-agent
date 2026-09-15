@@ -928,6 +928,68 @@ async fn an_ollama_cap_exit_summary_is_one_ledger_attempt() {
         .all(|r| r.state == crate::attempts::AttemptState::Ok && r.usage.is_some()));
 }
 
+/// A plain answer on the probe; a stream reissue cut before `done: true`.
+struct OllamaAnswerThenCutStream;
+impl Respond for OllamaAnswerThenCutStream {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        if is_stream(req) {
+            return ndjson(&[serde_json::json!({"message": {"content": "half an"}})]);
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": "the whole answer"},
+            "prompt_eval_count": 40, "eval_count": 6,
+        }))
+    }
+}
+
+/// #2313 review (rule on the Ollama wire): a stream reissue that ends before
+/// `done: true` is a cut stream — a failed attempt, never ok.
+#[tokio::test]
+async fn a_cut_ollama_stream_reissue_is_a_failed_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(OllamaAnswerThenCutStream)
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("answer me"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let _ = chat_complete(c, &mut NoMcp).await;
+    let received = server.received_requests().await.expect("journal");
+    assert_eq!(received.len(), 2, "probe, stream reissue");
+    let ledger = ledger.lock().unwrap();
+    let mut records: Vec<_> = ledger.records().cloned().collect();
+    records.sort_by_key(|r| {
+        serde_json::from_slice::<serde_json::Value>(
+            &received
+                .iter()
+                .find(|q| content_addressable::RawContentId::from_content(&q.body) == r.key.request)
+                .expect("keyed by a received body")
+                .body,
+        )
+        .unwrap()["stream"]
+            .as_bool()
+    });
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0].state,
+        crate::attempts::AttemptState::Ok,
+        "the probe"
+    );
+    assert_eq!(
+        records[1].state,
+        crate::attempts::AttemptState::Failed,
+        "the cut stream"
+    );
+}
+
 /// B4 rule: a CONTENT-INVALID tool batch (RR1) — here a call with no name —
 /// is NOT usable output, so NO `Accepted` is emitted for that round; the
 /// loop echoes the rejection and re-dispatches, and only the following valid

@@ -1450,6 +1450,140 @@ async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
 }
 
 // -----------------------------------------------------------------------
+// #2313 review: streamed Anthropic attempts follow the state rule — a stream
+// that reached `message_stop` is ok; a cut stream, an error event, or an
+// interrupt is failed; reported usage attaches either way.
+// -----------------------------------------------------------------------
+
+fn anthropic_stream_head(input: u64) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type": "message_start",
+            "message": {"model": "claude-test", "usage": {"input_tokens": input}}}),
+        serde_json::json!({"type": "content_block_start",
+            "index": 0, "content_block": {"type": "text"}}),
+    ]
+}
+
+async fn streamed_anthropic_turn(
+    responder: impl Respond + 'static,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<crate::attempts::AttemptRecord> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(responder)
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    c.cancel = cancel;
+    let _ = chat_complete(c, &mut NoMcp).await;
+    assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await
+}
+
+/// Review finding 3: a clean EOF before `message_stop` is a CUT stream, not a
+/// completed one.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_cut_anthropic_stream_is_a_failed_attempt() {
+    let _env = test_env(true);
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "half an answ"}}),
+    );
+    let records = streamed_anthropic_turn(sse(&frames), None).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+}
+
+/// An error event, then a clean stream.
+struct StreamErrorThenAnswer {
+    calls: Arc<AtomicUsize>,
+}
+impl Respond for StreamErrorThenAnswer {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut frames = anthropic_stream_head(6);
+            frames.push(serde_json::json!({"type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+            sse(&frames)
+        } else {
+            sse_text_reply(&["recovered"], 7, 2)
+        }
+    }
+}
+
+/// Review finding 5: an error event before any visible text re-issues the same
+/// bytes — ordinal 0 failed, ordinal 1 ok.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_error_event_before_text_is_a_failed_attempt_then_a_retry() {
+    let _env = test_env(true);
+    let records = streamed_anthropic_turn(
+        StreamErrorThenAnswer {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].key.request, records[1].key.request);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(records[1].state, crate::attempts::AttemptState::Ok);
+}
+
+/// Review finding 5: an error event after partial text keeps the partial
+/// answer, and the attempt is failed.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_error_event_after_partial_text_is_a_failed_attempt() {
+    let _env = test_env(true);
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "partial answer before the break"}}),
+    );
+    frames.push(serde_json::json!({"type": "error",
+        "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+    let records = streamed_anthropic_turn(sse(&frames), None).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+}
+
+/// Trips the interrupt flag as the response is served.
+struct CancelWhileServing {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Respond for CancelWhileServing {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        self.flag.store(true, Ordering::SeqCst);
+        sse_text_reply(&["never shown"], 7, 2)
+    }
+}
+
+/// Review finding 5: a cancel mid-stream is never an ok attempt.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_stream_cancelled_mid_flight_is_never_ok() {
+    let _env = test_env(true);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let records = streamed_anthropic_turn(
+        CancelWhileServing { flag: flag.clone() },
+        Some(flag.as_ref()),
+    )
+    .await;
+    assert!(!records.is_empty(), "the request was sent");
+    assert!(records
+        .iter()
+        .all(|r| r.state != crate::attempts::AttemptState::Ok));
+}
+
+// -----------------------------------------------------------------------
 // 15: mid-stream error event after partial text → partial survives (#640)
 // -----------------------------------------------------------------------
 
