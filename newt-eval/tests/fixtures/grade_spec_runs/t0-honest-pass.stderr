@@ -1,0 +1,3 @@
+   Compiling t0-fix-add v0.0.0 (<tree>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests/grade_spec.rs (target/debug/deps/grade_spec-11a47e959a175762)

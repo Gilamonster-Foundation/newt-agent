@@ -1,0 +1,7 @@
+description = "Self-verify ablation: turn off the self-verify gate newt arms by default (#1961), which the none baseline already runs"
+
+[env]
+NEWT_BENCH_SELF_VERIFY = "0"
+
+[expect]
+"receipt.verification.mode" = "off"

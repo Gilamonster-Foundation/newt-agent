@@ -57,6 +57,8 @@ fn hard_budget_ctx<'a>(
     kind: BackendKind,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         url,
         model: "tiny-context-model",

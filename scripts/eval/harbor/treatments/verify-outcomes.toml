@@ -1,0 +1,8 @@
+description = "Result-aware verification (#2315): the self-verify gate repairs a check that ran and failed, up to a declared allowance, instead of accepting any attempt"
+
+# The self-verify gate this refines is on by default, so only its mode is set.
+[env]
+NEWT_BENCH_VERIFY_OUTCOMES = "1"
+
+[expect]
+"receipt.verification.mode" = "result_aware"
