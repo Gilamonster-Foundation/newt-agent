@@ -132,24 +132,29 @@ fn sse_replay(text: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
 }
 
+/// How long a raw-stream test may take. A reader whose interrupt arm is
+/// broken never sees EOF from `serve_stream_parts`, so without a bound the test
+/// would hang instead of failing.
+pub(super) const RAW_STREAM_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A raw HTTP/1.1 stream for what wiremock cannot drive: chunk boundaries, and
 /// an interrupt that lands inside a stream's read loop rather than its send.
 ///
 /// Each part is written and drained before the next, so it arrives as its own
-/// `chunk()`. With `interrupt`, the server then writes padding far past the
+/// `chunk()`; parts are bytes, so a boundary can fall inside a character. With `interrupt`, the server then writes padding far past the
 /// socket buffers (`:` comment lines, which neither the SSE nor the NDJSON
 /// reader parses), so the reader is provably inside its chunk loop; only then
 /// does it trip the flag, and it holds the connection open with no EOF.
 /// Without `interrupt`, the body ends after the last part.
 pub(super) async fn serve_stream_parts(
-    parts: &[&str],
+    parts: &[&[u8]],
     interrupt: Option<Arc<AtomicBool>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let parts: Vec<String> = parts.iter().map(|part| part.to_string()).collect();
+    let parts: Vec<Vec<u8>> = parts.iter().map(|part| part.to_vec()).collect();
     let server = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         sock.set_nodelay(true).unwrap();
@@ -163,7 +168,7 @@ pub(super) async fn serve_stream_parts(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
         sock.write_all(head.as_bytes()).await.unwrap();
         for part in parts {
-            sock.write_all(part.as_bytes()).await.unwrap();
+            sock.write_all(&part).await.unwrap();
             sock.flush().await.unwrap();
             for _ in 0..200 {
                 tokio::task::yield_now().await;

@@ -13131,7 +13131,8 @@ async fn stream_response(
     let mut interrupted = false;
     // The tail of an NDJSON line that arrived without its newline: a line
     // straddles chunk boundaries, and the `done` line decides the attempt state.
-    let mut pending = String::new();
+    // Bytes, not text: a chunk boundary can also fall inside a character.
+    let mut pending: Vec<u8> = Vec::new();
     // Race each chunk read against the interrupt flag so Esc stops the token
     // stream promptly; on interrupt, stop reading and return what we have.
     'read: loop {
@@ -13144,12 +13145,13 @@ async fn stream_response(
         };
         let eof = chunk.is_none();
         match chunk {
-            Some(chunk) => pending.push_str(&String::from_utf8_lossy(&chunk)),
+            Some(chunk) => pending.extend_from_slice(&chunk),
             // EOF terminates an unterminated final line.
-            None => pending.push('\n'),
+            None => pending.push(b'\n'),
         }
-        while let Some(end) = pending.find('\n') {
-            let line: String = pending.drain(..=end).collect();
+        while let Some(end) = pending.iter().position(|&byte| byte == b'\n') {
+            let bytes: Vec<u8> = pending.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&bytes);
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
                 continue;
