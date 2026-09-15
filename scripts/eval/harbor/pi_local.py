@@ -27,7 +27,7 @@ from harbor.agents.installed.node_install import nvm_node_install_snippet
 from harbor.agents.installed.pi import Pi
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
-from pi_log import inference_failure
+from pi_log import pi_inference_failure
 
 PROVIDER = "local"
 # Harbor 0.20 installs @mariozechner/pi-coding-agent, deprecated upstream in
@@ -60,9 +60,14 @@ def models_json(base_url: str, model: str, context_window: str) -> str:
 
 def raise_on_inference_failure(log: Path) -> None:
     """pi exits 0 when every model call failed; turn that into an agent error
-    so Harbor does not grade an untouched workspace as the model's work."""
+    so Harbor does not grade an untouched workspace as the model's work.
+
+    Runs after pi exited normally, when pi.txt is whole (grep flushes at EOF), and
+    reads pi's session file beside it too, through the same reader as the ingest."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-    if failure := inference_failure(lines):
+    sessions = sorted((log.parent / "pi" / "sessions").rglob("*.jsonl")) if (log.parent / "pi").is_dir() else []
+    session = sessions[-1].read_text(errors="replace").splitlines() if sessions else []
+    if failure := pi_inference_failure(lines, session):
         raise NonZeroAgentExitCodeError(f"pi exited 0 without a usable model reply ({failure})")
 
 
