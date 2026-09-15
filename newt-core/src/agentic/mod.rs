@@ -1337,15 +1337,21 @@ fn record_completed_tool_event(
     name: &str,
     args: &serde_json::Value,
     ok: bool,
+    // #2315: required, so no funnel can record a shell call without deciding
+    // what its execution slot holds.
+    execution: Option<crate::ExecOutcome>,
     tool_t0: std::time::Instant,
 ) {
     if let Some(rec) = tool_events.as_deref_mut() {
-        rec.push(crate::ToolEvent::from_call(
-            name,
-            args,
-            ok,
-            u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-        ));
+        rec.push(crate::ToolEvent {
+            execution,
+            ..crate::ToolEvent::from_call(
+                name,
+                args,
+                ok,
+                u64::try_from(tool_t0.elapsed().as_millis()).ok(),
+            )
+        });
     }
 }
 
@@ -3976,6 +3982,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
+            let execution = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read here. Its answer is
             // dynamic per-turn loop state — the num_ctx input ceiling and the
             // conversation's token estimate — which are in scope in the loop, not
@@ -4065,6 +4072,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
+                        execution: Some(&execution),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -4109,7 +4117,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
-            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_completed_tool_event(
+                &mut tool_events,
+                name,
+                &args,
+                ok,
+                execution.get().copied(),
+                tool_t0,
+            );
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -8285,6 +8300,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
+            let execution = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
             // endpoint's operator-declared window still provides the displayed
@@ -8362,6 +8378,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
+                        execution: Some(&execution),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -8414,7 +8431,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
-            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_completed_tool_event(
+                &mut tool_events,
+                name,
+                &args,
+                ok,
+                execution.get().copied(),
+                tool_t0,
+            );
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -10470,6 +10494,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // write tool runs (mirrors the OpenAI path).
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
+            let execution = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read (mirrors the
             // OpenAI path — `num_ctx` never rides this wire either).
             let result = if tools::is_context_remaining_call(name) {
@@ -10541,6 +10566,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
+                        execution: Some(&execution),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -10590,7 +10616,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
-            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_completed_tool_event(
+                &mut tool_events,
+                name,
+                &args,
+                ok,
+                execution.get().copied(),
+                tool_t0,
+            );
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -11893,6 +11926,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
+            let execution = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
             // estimate of the ACTUAL Responses request; num_ctx is normally unset
@@ -11984,6 +12018,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         hidden_tools: Some(&hidden_tools),
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
+                        execution: Some(&execution),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -12025,7 +12060,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_completed_tool_event(
+                &mut tool_events,
+                name,
+                &args,
+                ok,
+                execution.get().copied(),
+                tool_t0,
+            );
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
