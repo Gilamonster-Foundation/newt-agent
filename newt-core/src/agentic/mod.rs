@@ -11079,10 +11079,12 @@ where
 
 /// Record a decoded 2xx Responses reply's attempt by the #2313 state rule: a
 /// complete terminal response is ok whatever its content shape — an answer, a
-/// refusal, a truncation (`incomplete`), or content the loop rejects (malformed,
-/// mixed); a failed, provider-error or non-terminal body is failed. How the loop
-/// handles the content is separate from the attempt state. The usage the body
-/// reported attaches either way.
+/// refusal, a truncation (`incomplete`), or, under status `completed`, content
+/// the loop rejects (malformed, mixed). A failed, provider-error or non-terminal
+/// body is failed, and so is a body with neither a status nor any output: that
+/// is not a Responses reply at all. How the loop handles the content is
+/// separate from the attempt state. The usage the body reported attaches either
+/// way.
 fn complete_responses_attempt(
     attempts: Option<attempt_capture::AttemptScope<'_>>,
     attempt: Option<&crate::attempts::AttemptKey>,
@@ -11092,10 +11094,18 @@ fn complete_responses_attempt(
         crate::responses_wire::ResponseDecodeError,
     >,
 ) {
-    use crate::responses_wire::ResponseDecodeError::{Failed, NonTerminal, ProviderError};
+    use crate::attempts::AttemptState;
+    use crate::responses_wire::ResponseDecodeError as E;
+    // Every variant is named, so a new one cannot default to ok.
     let state = match decoded {
-        Err(ProviderError(_) | Failed(_) | NonTerminal(_)) => crate::attempts::AttemptState::Failed,
-        _ => crate::attempts::AttemptState::Ok,
+        Ok(_)
+        | Err(E::Refused { .. } | E::Incomplete { .. } | E::MixedRefusalAndToolCalls { .. }) => {
+            AttemptState::Ok
+        }
+        Err(E::Malformed(_)) if json["status"].as_str() == Some("completed") => AttemptState::Ok,
+        Err(E::Malformed(_) | E::ProviderError(_) | E::Failed(_) | E::NonTerminal(_)) => {
+            AttemptState::Failed
+        }
     };
     attempt_capture::finish(
         attempts,
