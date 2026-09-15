@@ -88,12 +88,9 @@ fn empty_exec() -> crate::caveats::Scope<String> {
 #[test]
 fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
     let present = present_host_binary();
-    let msg = super::super::shell::absent_binary_refusal(
-        &present,
-        &not_found_envelope(&present),
-        &empty_exec(),
-    )
-    .expect("a 127 with no denials must produce a named refusal");
+    let msg =
+        super::super::shell::absent_binary_refusal(&not_found_envelope(&present), &empty_exec())
+            .expect("a 127 with no denials must produce a named refusal");
 
     assert!(
         msg.contains("carried userland"),
@@ -118,12 +115,9 @@ fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
 /// to detect.)
 #[test]
 fn absent_from_host_says_so_and_does_not_coach_a_useless_grant() {
-    let msg = super::super::shell::absent_binary_refusal(
-        ABSENT,
-        &not_found_envelope(ABSENT),
-        &empty_exec(),
-    )
-    .expect("a 127 with no denials must produce a named refusal");
+    let msg =
+        super::super::shell::absent_binary_refusal(&not_found_envelope(ABSENT), &empty_exec())
+            .expect("a 127 with no denials must produce a named refusal");
 
     assert!(
         msg.contains("not installed on this host"),
@@ -142,7 +136,6 @@ fn absent_from_host_says_so_and_does_not_coach_a_useless_grant() {
 fn denied_by_grant_is_not_an_absence() {
     assert!(
         super::super::shell::absent_binary_refusal(
-            &present_host_binary(),
             &denied_envelope(&present_host_binary()),
             &empty_exec(),
         )
@@ -157,19 +150,13 @@ fn denied_by_grant_is_not_an_absence() {
 #[test]
 fn all_three_states_produce_different_messages() {
     let present = present_host_binary();
-    let not_carried = super::super::shell::absent_binary_refusal(
-        &present,
-        &not_found_envelope(&present),
-        &empty_exec(),
-    )
-    .expect("not-carried must be named");
+    let not_carried =
+        super::super::shell::absent_binary_refusal(&not_found_envelope(&present), &empty_exec())
+            .expect("not-carried must be named");
 
-    let absent = super::super::shell::absent_binary_refusal(
-        ABSENT,
-        &not_found_envelope(ABSENT),
-        &empty_exec(),
-    )
-    .expect("absent-from-host must be named");
+    let absent =
+        super::super::shell::absent_binary_refusal(&not_found_envelope(ABSENT), &empty_exec())
+            .expect("absent-from-host must be named");
 
     let denied = super::super::shell::denied_run_command_result(&denied_envelope(&present), false);
 
@@ -193,7 +180,7 @@ fn all_three_states_produce_different_messages() {
 fn a_successful_command_is_not_an_absence() {
     let ok = serde_json::json!({"exit_code": 0, "stdout": "hi\n", "stderr": ""});
     assert!(
-        super::super::shell::absent_binary_refusal("echo hi", &ok, &empty_exec()).is_none(),
+        super::super::shell::absent_binary_refusal(&ok, &empty_exec()).is_none(),
         "exit 0 must never be rewritten as a refusal"
     );
 }
@@ -204,7 +191,7 @@ fn a_successful_command_is_not_an_absence() {
 fn an_ordinary_failure_is_not_an_absence() {
     let failed = serde_json::json!({"exit_code": 1, "stdout": "", "stderr": "boom\n"});
     assert!(
-        super::super::shell::absent_binary_refusal("false", &failed, &empty_exec()).is_none(),
+        super::super::shell::absent_binary_refusal(&failed, &empty_exec()).is_none(),
         "a plain non-zero exit must not be relabelled as an absence"
     );
 }
@@ -305,11 +292,34 @@ fn a_compound_127_names_the_last_program_not_found() {
         "stdout": "",
         "stderr": format!("error: command not found: nope\nerror: command not found: {ABSENT}\n"),
     });
-    let msg = super::super::shell::absent_binary_refusal(
-        &format!("nope; {ABSENT}"),
-        &envelope,
+    let msg = super::super::shell::absent_binary_refusal(&envelope, &empty_exec())
+        .expect("a 127 with no denials must produce a named refusal");
+    assert!(msg.starts_with(&format!("error: {ABSENT}:")), "{msg}");
+}
+
+/// #2315: a 127 that brush did NOT attribute to a missing program is a check
+/// failing on its own terms (a test harness, a `make` recipe), not an absence.
+/// Before this fix the leading token stood in for the unnamed program, so the
+/// run rendered as `<leading>: not in this profile's carried userland`, the
+/// repair router read a blocker no edit can clear, and a real failing check
+/// never reached repair. The refusal no longer reads the command at all, so
+/// nothing but brush's own naming can mint it.
+#[test]
+fn a_127_brush_did_not_attribute_to_a_missing_program_is_not_an_absence() {
+    let present = present_host_binary();
+    let recipe_failed = serde_json::json!({
+        "exit_code": 127,
+        "stdout": "",
+        "stderr": "make: *** [test] Error 127\n",
+    });
+    assert!(
+        super::super::shell::absent_binary_refusal(&recipe_failed, &empty_exec()).is_none(),
+        "only brush naming the missing program makes a 127 an absence"
+    );
+    // Twin: the same command, with brush naming the program, still refuses.
+    assert!(super::super::shell::absent_binary_refusal(
+        &not_found_envelope(&present),
         &empty_exec(),
     )
-    .expect("a 127 with no denials must produce a named refusal");
-    assert!(msg.starts_with(&format!("error: {ABSENT}:")), "{msg}");
+    .is_some());
 }

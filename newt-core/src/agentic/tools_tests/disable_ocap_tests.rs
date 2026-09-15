@@ -29,7 +29,7 @@ impl EnvVar {
         Self { key, saved }
     }
 
-    fn unset(key: &'static str) -> Self {
+    pub(crate) fn unset(key: &'static str) -> Self {
         let saved = std::env::var(key).ok();
         std::env::remove_var(key);
         Self { key, saved }
@@ -533,6 +533,30 @@ async fn no_floor_keeps_disable_ocap_bit_for_bit() {
     )
     .await;
     assert_eq!(out, "no-floor-ok\n", "no floor ⇒ bypass unchanged");
+}
+
+/// #2315: grounds the host 127 rule's mocked tests in the real host shell
+/// (bash, else sh). A program the shell names as not found and that does not
+/// resolve is `unavailable`; a bare `exit 127` names nothing and failed.
+#[cfg(unix)]
+#[tokio::test]
+async fn host_shell_127_wording_grounds_the_named_missing_rule() {
+    use crate::ExecOutcome;
+    let ws = tempfile::TempDir::new().unwrap();
+    for (cmd, expected) in [
+        (
+            "newt-absent-binary-xyzzy-2315 --version",
+            ExecOutcome::Unavailable,
+        ),
+        ("exit 127", ExecOutcome::Failed),
+    ] {
+        let envelope = super::shell::host_shell_dispatch(cmd, &ws.path().to_string_lossy(), None)
+            .await
+            .expect("host shell runs");
+        assert_eq!(envelope["exit_code"], 127, "{envelope}");
+        let (_, class) = super::shell::host_result(&envelope, |_| String::new());
+        assert_eq!(class, expected, "{cmd}: {envelope}");
+    }
 }
 
 /// Envelope parity (#297): the host-shell envelope is structurally

@@ -336,7 +336,8 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
         Some(sink.clone()),
         &mut display,
     )
-    .await;
+    .await
+    .0;
 
     assert!(out.contains("retry-visible"), "retry result: {out}");
     assert_eq!(gate.asks.len(), 1, "permission prompt count");
