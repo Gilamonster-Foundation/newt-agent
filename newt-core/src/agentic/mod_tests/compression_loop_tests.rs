@@ -23,6 +23,7 @@ fn ctx<'a>(
 ) -> ChatCtx<'a> {
     ChatCtx {
         verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         url: server_uri,
         model: "test-model",

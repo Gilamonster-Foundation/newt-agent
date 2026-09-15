@@ -41,6 +41,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     chat_complete(
         ChatCtx {
             verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -194,6 +195,7 @@ async fn openai_loop_records_tool_events_with_digested_args() {
     openai_chat_complete(
         ChatCtx {
             verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -313,6 +315,7 @@ fn outcome_ctx<'a>(
 ) -> ChatCtx<'a> {
     ChatCtx {
         verify_outcomes: false,
+        round_cap_hit: None,
         model: "test-model",
         workspace,
         safe_context: None,

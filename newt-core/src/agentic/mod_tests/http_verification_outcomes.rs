@@ -67,6 +67,8 @@ struct Run {
     bodies: Vec<String>,
     /// The behavior signals the turn recorded for the solve trace.
     signals: Vec<observability::BehaviorSignal>,
+    /// The loop reported that the turn ended at its round cap.
+    at_cap: bool,
 }
 
 /// The model runs `check` once, then answers `done` every time it is asked.
@@ -126,6 +128,8 @@ async fn run_script(
     context.cancel = cancel;
     let mut reason = None;
     context.end_reason = Some(&mut reason);
+    let mut at_cap = false;
+    context.round_cap_hit = Some(&mut at_cap);
     if wire == "responses" {
         openai_responses_complete(context, &mut NoMcp).await
     } else {
@@ -143,6 +147,7 @@ async fn run_script(
         reason: serde_json::to_value(reason).unwrap(),
         bodies,
         signals: obs.behavior_signals,
+        at_cap,
     }
 }
 
@@ -257,6 +262,7 @@ async fn a_fresh_passing_check_completes_without_a_nudge() {
     for (wire, smart) in [("openai", false), ("anthropic", false), ("responses", true)] {
         let run = run(wire, smart, true, PASSING_CHECK).await;
         assert_eq!(run.reason, "completed", "{wire} smart={smart}");
+        assert!(!run.at_cap, "{wire} smart={smart}");
         assert!(
             !run.bodies
                 .iter()
@@ -421,6 +427,9 @@ async fn a_failure_at_the_round_limit_ends_repair_exhausted_not_round_cap() {
     ] {
         let run = run_script(wire, smart, true, FAILING_CHECK, script, None, 3).await;
         assert_eq!(run.reason, expected, "{wire} smart={smart}");
+        // Round three, item 7: every cap exit says so, whatever it reports, so
+        // the TUI keeps the pause affordance for a repair_exhausted at the cap.
+        assert!(run.at_cap, "{wire} smart={smart}");
         let stops = run
             .signals
             .iter()

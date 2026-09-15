@@ -1164,6 +1164,11 @@ pub struct ChatCtx<'a> {
     /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. All smart
     /// providers report terminal control outcomes, including Responses.
     pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
+    /// Out-param: set when the turn ended at its tool-round cap, whatever end
+    /// reason that exit reports. #2374: a result-aware cap exit reports
+    /// `RepairExhausted`, and the TUI still pauses the objective there. `None`
+    /// ⇒ not reported.
+    pub round_cap_hit: Option<&'a mut bool>,
     /// Out-param: per-turn observability for the solve contract (W0 #1511) —
     /// the backend-reported served `model` plus per-round tool-call parse
     /// signals ([`observability::ParseSignal`]). Lent fresh per turn like
@@ -1930,6 +1935,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -4239,6 +4245,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -6661,6 +6670,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -8757,6 +8767,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -9232,6 +9245,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -11009,6 +11023,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -11395,6 +11412,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
+        mut round_cap_hit,
         mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
@@ -12480,6 +12498,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if let Some(hit) = &mut round_cap_hit {
+        **hit = true;
+    }
     if let Some(harness) = smart_harness {
         harness.record_responses_messages(instructions.as_deref(), &input)?;
         let text = cap_exit_fallback(

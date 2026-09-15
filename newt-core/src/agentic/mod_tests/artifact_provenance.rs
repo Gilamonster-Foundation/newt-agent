@@ -24,6 +24,7 @@ fn ctx<'a>(
 ) -> ChatCtx<'a> {
     ChatCtx {
         verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         rewrites_history: true,
         url: server_uri,
