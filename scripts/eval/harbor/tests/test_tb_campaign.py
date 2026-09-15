@@ -4,19 +4,23 @@ another model or was never graded stays visible in the summary.
 Run: PYTHONPATH=scripts/eval/harbor python -m unittest discover scripts/eval/harbor/tests
 """
 
+import contextlib
+import io
 import json
-import re
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import tb_campaign
 from pi_log import pi_inference_failure, pi_session_claim
 
 from tb_campaign import (
     PINNED, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
-    harness_evidence, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
+    harness_evidence, ingest, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
     newt_claim, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
-    render_profile, summarize, treatment_env, trial_plan, trial_row, wilson, window_at,
+    render_profile, summarize, table, treatment_env, trial_plan, wilson, window_at, write_cell,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -422,16 +426,49 @@ class PiSessionLog(unittest.TestCase):
 
 
 class Redaction(unittest.TestCase):
-    """Rows reach commits, report tables and cards. newt's solve_result records its
-    endpoint, and a failed request's error text names the request URL (a real
-    unreachable-endpoint trial, address swapped for a documentation one)."""
+    """trials.jsonl, cells.jsonl and the table reach commits, report tables and cards.
+    chess-best-move is a real unreachable-endpoint newt trial (address swapped for a
+    documentation one): its error names the request URL. build-cython-ext is
+    synthetic: a scheme-less host:port, a bracketed IPv6 literal, a local account and
+    home dir, and a multi-line provider body, under an address-shaped model id and
+    version that must survive, because tables join and pins install on them. It
+    sorts first, so the cell takes its version."""
 
-    def test_an_ingested_row_carries_no_url_or_ip(self):
-        r = trial_row("newt", HARBOR / "tests/fixtures/trial-newt-unreachable")
-        leak = re.compile(r"://|\b\d{1,3}(?:\.\d{1,3}){3}\b|/home/|/Users/")
-        self.assertIsNone(leak.search(json.dumps(r)), json.dumps(r))
-        self.assertEqual(r["error_cause"], "infra")  # classified from the raw text, before redaction
-        self.assertIn("error sending request", r["harness_error"])
+    JOB = HARBOR / "tests/fixtures/job-redaction"
+    FORBIDDEN = ("203.0.113.7", "gpu-box.local", ":8000", "fd00::1", "fixture-user", "/home/", "req_fixture")
+    CELL = {"campaign": "c", "model": "coder-1.2.3.4", "harness": "newt", "job": "coder-1.2.3.4__newt", "expected": 2}
+
+    def assert_clean(self, text):
+        for literal in self.FORBIDDEN:
+            self.assertNotIn(literal, text)
+
+    def test_a_full_ingest_writes_no_address_and_keeps_identity_fields(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(tb_campaign, "LOCAL_NAMES", {"fixture-user"}):
+            out = Path(tmp)
+            (out / "cell.json").write_text(json.dumps(self.CELL))
+            ingest(self.JOB, out / "cell.json", out)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                table(out)
+            trials, cells = (out / "trials.jsonl").read_text(), (out / "cells.jsonl").read_text()
+        for text in (trials, cells, printed.getvalue()):
+            self.assert_clean(text)
+        rows = {r["trial"]: r for r in map(json.loads, trials.splitlines())}
+        self.assertEqual(rows["chess-best-move__fixture"]["error_cause"], "infra")  # classified before redaction
+        self.assertIn("error sending request", rows["chess-best-move__fixture"]["harness_error"])
+        synthetic = rows["build-cython-ext__fixture"]
+        self.assertEqual((synthetic["model"], synthetic["harness_version"], synthetic["model_effective"]),
+                         ("coder-1.2.3.4", "1.2.3.4", "coder-1.2.3.4"))
+        self.assertNotIn("\n", synthetic["harness_error"])  # first line only: the provider body is dropped
+        self.assertEqual(json.loads(cells)["harness_version"], "1.2.3.4")  # what the pin installs
+        self.assertIn("| coder-1.2.3.4 | newt 1.2.3.4 [none] | 2 / 2 /", printed.getvalue())  # rows still join
+
+    def test_a_skipped_cell_is_written_through_the_same_redaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_cell(Path(tmp), {**self.CELL, "skipped": "model not loaded at gpu-box.local:8000"}, 0)
+            cell = json.loads((Path(tmp) / "cells.jsonl").read_text())
+        self.assert_clean(json.dumps(cell))
+        self.assertEqual((cell["model"], cell["job"], cell["observed"]), ("coder-1.2.3.4", "coder-1.2.3.4__newt", 0))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 """tb_campaign.py — trial records and the report table for tb-campaign.sh (#2318).
 
     tb_campaign.py ingest <job_dir> <cell.json> <out_dir>   # append trials.jsonl + cells.jsonl
+    tb_campaign.py cell-line <cell.json> <out_dir>          # append a skipped cell to cells.jsonl
     tb_campaign.py table <out_dir> [--pair]                # markdown matrix [+ treatment vs none]
     tb_campaign.py cell <cell.json> <treatment|none> key value ...   # write a cell binding
     tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
@@ -28,6 +29,7 @@ attempt counts once; tasks carry equal attempts by design.
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import math
@@ -94,20 +96,46 @@ def error_cause(exception, exit_code, harness_error, pi_failure, responses, wait
     return "unknown"
 
 
-# Rows and cells reach commits, report tables and cards, so the ingest writes no
-# address: newt's solve_result records its endpoint, and a failed request's error
-# text names the request URL. Applied to what is written, after classification.
-ADDRESS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+|\b\d{1,3}(?:\.\d{1,3}){3}\b|/(?:home|Users)/[^/\s\"']+")
+# Rows and cells reach commits, report tables and cards. Free text copied from a
+# harness or provider is scrubbed as it is written, after classification: newt's
+# failed request names the request URL, and a provider's error body can name an
+# account. Identity and join fields (campaign, model, harness, job, task,
+# harness_version) are never touched, so tables still join and pins still install.
+FREE_TEXT = ("harness_error", "harness_config", "inference_failure", "refusal", "claim_source", "skipped")
+FREE_TEXT_MAX = 300
+ADDRESS = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+"  # URL
+    r"|\[[0-9A-Fa-f:.]+\](?::\d+)?"  # bracketed IPv6 literal
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"  # IPv4
+    r"|(?<![\w.-])[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*:\d{2,5}\b"  # host:port
+    r"|/(?:home|Users)/[^/\s\"']+"  # home dir
+)
+LOCAL_NAMES = {getpass.getuser(), str(Path.home())}
 
 
-def redact(value):
-    if isinstance(value, str):
-        return ADDRESS.sub("<redacted>", value)
+def scrub(value):
+    """First line, bounded, with no address, local account or home dir."""
     if isinstance(value, dict):
-        return {k: redact(v) for k, v in value.items()}
+        return {k: scrub(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(v) for v in value]
-    return value
+        return [scrub(v) for v in value]
+    if not isinstance(value, str):
+        return value
+    text = (value.strip().splitlines() or [""])[0][:FREE_TEXT_MAX]
+    for name in sorted(LOCAL_NAMES, key=len, reverse=True):
+        if len(name) >= 3:
+            text = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", "<redacted>", text)
+    return ADDRESS.sub("<redacted>", text)
+
+
+def redact(record):
+    return {k: scrub(v) if k in FREE_TEXT else v for k, v in record.items()}
+
+
+def write_cell(out: Path, cell, observed):
+    """The one writer of cells.jsonl lines, for ingested and skipped cells alike."""
+    with open(out / "cells.jsonl", "a") as f:
+        f.write(json.dumps(redact({**cell, "observed": observed})) + "\n")
 
 
 def pi_session_lines(agent_dir: Path):
@@ -639,8 +667,7 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
             pin_path.write_text(json.dumps(pin_extend(pin, cell), indent=1, sort_keys=True))
     with open(out / "trials.jsonl", "a") as f:
         f.writelines(json.dumps(row) + "\n" for row in rows)
-    with open(out / "cells.jsonl", "a") as f:
-        f.write(json.dumps(redact({**cell, "observed": len(rows)})) + "\n")
+    write_cell(out, cell, len(rows))
 
 
 def wilson(k, n, z=1.96):
@@ -853,6 +880,8 @@ if __name__ == "__main__":
     cmd, *args = sys.argv[1:]
     if cmd == "ingest":
         ingest(Path(args[0]), Path(args[1]), Path(args[2]))
+    elif cmd == "cell-line":  # a skipped cell, through the same redaction as an ingested one
+        write_cell(Path(args[1]), json.loads(Path(args[0]).read_text()), 0)
     elif cmd == "table":
         table(Path(args[0]), "--pair" in args[1:])
     elif cmd == "cell":
