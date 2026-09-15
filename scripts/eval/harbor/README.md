@@ -96,6 +96,28 @@ the command therefore does three things:
 
 A cell is recorded only when every planned trial has a result.
 
+**Windows (#2318).** The inference box belongs to the maintainer outside the
+declared windows. Set `TB_SCHEDULE` to a schedule file, whose shape is shown in
+[`systemd/tb-windows.example`](systemd/tb-windows.example). It is the only
+source of windows.
+
+Before each trial the runner checks four things, in order:
+- **Stop file.** If `<campaign>/campaign.stop` exists, the runner exits at this
+  trial boundary.
+- **Window.** Outside a window it exits.
+- **Router.** If a model outside the roster is loaded, it waits
+  `TB_ROUTER_WAIT_MIN`. If the model is still loaded after that, it skips the
+  rest of the window. It never unloads anything.
+- **Deadline.** It sets a hard deadline at window end plus
+  `TB_DEADLINE_GRACE_MIN`, a maintainer setting. A trial still running at the
+  deadline is cancelled and archived to `interrupted/`, then re-runs in the next
+  window. A second deadline cancel of the same attempt is final: the attempt is
+  recorded as `DeadlineExhausted`, cause agent, and never re-run.
+
+[`systemd/`](systemd) holds a `systemd --user` service and timer template. The
+timer only wakes the runner every 15 minutes; the schedule decides whether
+trials run.
+
 **Treatments and pinning (#2318).**
 
 *Arms.* `TB_MATRIX` names a file of `<harness> <treatment>` lines, which

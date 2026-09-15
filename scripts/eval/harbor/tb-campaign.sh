@@ -25,6 +25,14 @@
 #   TB_CTX_SIZE                  the ctx-size the server must be serving; every
 #                                harness is pinned to it and a cell is skipped if
 #                                the served value differs
+# Windows (#2318): with TB_SCHEDULE set (see systemd/tb-windows.example) the
+# runner starts a trial only inside a declared window, only while no model
+# outside the roster is loaded (it waits TB_ROUTER_WAIT_MIN, default 30, then
+# skips the window; it never unloads anything), and cancels a trial still
+# running at window end + TB_DEADLINE_GRACE_MIN (a maintainer setting, default
+# 120). A cancelled attempt is archived as interrupted and re-run next window;
+# a second cancel of the same attempt is final (DeadlineExhausted, cause agent).
+# $OUT/campaign.stop (any content) stops the runner at the next trial boundary.
 # Optional: TB_TRIALS (3), TB_HARNESSES ("newt pi codex"), TB_MATRIX, TB_TIMEOUT_MULT (3),
 #   TB_JOBS_ROOT (/var/tmp/tbench-harbor), TB_MIN_FREE_GB (30), TB_INSTRUMENT_COMMIT
 #   (default: this checkout's HEAD; set it when running a frozen copy),
@@ -97,6 +105,28 @@ wait_idle() {
     sleep 10
   done; return 1
 }
+STOP="$OUT/campaign.stop"; DEADLINE=""
+# Exit cleanly at a trial boundary when asked to, or when the window has closed.
+boundary() {
+  if [ -f "$STOP" ]; then log "stop requested ($(head -c 200 "$STOP")); exiting at a trial boundary"; exit 0; fi
+  [ -n "${TB_SCHEDULE:-}" ] || return 0
+  read -r WINDOW WEND < <(tbc window "$TB_SCHEDULE") || { log "outside the declared windows; exiting"; exit 0; }
+  [ ! -f "$OUT/skipped-window.$WINDOW" ] || exit 0
+  DEADLINE=$(( WEND + ${TB_DEADLINE_GRACE_MIN:-120} * 60 ))
+}
+# No slot sharing with interactive use: wait while a model outside the roster is
+# loaded, then skip this window. The runner never unloads the maintainer's models.
+router_clear() {
+  [ -n "${TB_SCHEDULE:-}" ] || return 0
+  local others waited=0
+  while :; do
+    others=$(loaded | tr ',' '\n' | { grep -vxF -f <(printf '%s\n' "${MODELS[@]%% *}") || true; } | paste -sd, -)
+    [ -z "$others" ] && return 0
+    [ "$waited" -lt $(( ${TB_ROUTER_WAIT_MIN:-30} * 60 )) ] || break
+    sleep 30; waited=$((waited + 30))
+  done
+  log "window $WINDOW skipped: $others loaded"; : > "$OUT/skipped-window.$WINDOW"; exit 0
+}
 record() { # record <cell.json> [job dir]: bind the cell and ingest its trials
   if [ -n "${2:-}" ]; then python3 "$HERE/tb_campaign.py" ingest "$2" "$1" "$OUT"
   else py 'import json,sys; c=json.load(open(sys.argv[1])); open(sys.argv[2],"a").write(json.dumps({**c,"observed":0})+"\n")' "$1" "$OUT/cells.jsonl"; fi
@@ -107,6 +137,7 @@ else ARMS=(); for H in ${TB_HARNESSES:-newt pi codex}; do ARMS+=("$H none"); don
 mapfile -t MODELS < <(grep -vE '^\s*(#|$)' "$ROSTER")
 
 log "campaign=$CAMPAIGN tasks=$N_TASKS x trials=$TRIALS engine=$ENGINE instrument=$INSTRUMENT newt=$("$NEWT_BENCH_BIN" --version) arms=${#ARMS[@]}"
+boundary; router_clear
 for MLINE in "${MODELS[@]}"; do
   read -r MODEL DIGEST <<< "$MLINE"
   read -r status ctx _ < <(served "$MODEL") || true
@@ -159,16 +190,32 @@ for MLINE in "${MODELS[@]}"; do
         partial) mkdir -p "$JOB/interrupted"; mv "$TJ" "$JOB/interrupted/$(basename "$TJ").$(date +%s)"
                  log "$NAME: archived an interrupted trial job ${TASK}__a$K" ;;
       esac
+      boundary; router_clear
       wait_idle "$MODEL" || log "$NAME: slot still busy after 30 min"
       py 'import json,sys; a={"import_path":sys.argv[3],"model_name":sys.argv[4]}
 if sys.argv[5]: a["kwargs"]={"version":sys.argv[5]}
 json.dump({"jobs_dir":sys.argv[2],"datasets":[{"path":sys.argv[6],"task_names":[sys.argv[7]]}],"agents":[a]},open(sys.argv[1],"w"),indent=1)' \
         "$TJ.job.json" "$JOB" "$AGENT" "$LABEL" "$PV" "$DPATH" "$TASK"
-      rc=0
+      rc=0; cancelled=""
       env "${TENV[@]}" NEWT_BENCH_PROFILE="$PROFILE" NEWT_BENCH_MODEL_DIGEST="${DIGEST:-}" harbor run --config "$TJ.job.json" \
         --job-name "${TASK}__a$K" --n-attempts 1 --n-concurrent 1 --max-retries 0 --agent-timeout-multiplier "$MULT" \
-        --no-delete -y > "$TJ.harbor.log" 2>&1 || rc=$?
+        --no-delete -y > "$TJ.harbor.log" 2>&1 &
+      hp=$!
+      while kill -0 "$hp" 2>/dev/null; do
+        if [ -n "$DEADLINE" ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then kill -TERM "$hp"; cancelled=1; break; fi
+        sleep 10
+      done
+      wait "$hp" || rc=$?
       [ "$rc" = 0 ] || { failed=$((failed + 1)); log "$NAME ${TASK}__a$K harbor_exit=$rc"; }
+      if [ -n "$cancelled" ] && [ "$(tbc job-state "$TJ")" != "done" ]; then
+        if [ "$(tbc deadline-cancels "$JOB" "${TASK}__a$K")" -ge 1 ]; then
+          : > "$TJ.deadline-exhausted"; log "$NAME ${TASK}__a$K cancelled at the hard deadline again: deadline exhausted (final)"
+        else
+          mkdir -p "$JOB/interrupted"; mv "$TJ" "$JOB/interrupted/$(basename "$TJ").$(date +%s).deadline"
+          log "$NAME ${TASK}__a$K cancelled at the hard deadline; archived, re-runs next window"
+        fi
+        exit 0
+      fi
     done
     missing=0
     for STEP in "${PLAN[@]}"; do

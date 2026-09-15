@@ -10,9 +10,10 @@ import unittest
 from pathlib import Path
 
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, error_cause, fingerprint, harness_evidence, is_trial_config, job_state,
-    load_treatment, newcombe, newt_claim, observed, pair, pair_report, pi_claim, pin_extend, pin_mismatch,
-    refusal, render_profile, summarize, treatment_env, trial_plan, wilson,
+    PINNED, build_cell, codex_claim, deadline_cancels, error_cause, fingerprint, harness_evidence,
+    is_trial_config, job_state, load_treatment, newcombe, newt_claim, observed, pair, pair_report,
+    parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal, render_profile, summarize, treatment_env,
+    trial_plan, wilson, window_at,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -314,6 +315,35 @@ class PerTrialJobs(unittest.TestCase):
     def test_trial_configs_are_told_from_job_configs(self):
         self.assertTrue(is_trial_config({"task": {"path": "x"}, "trial_name": "t__1"}))
         self.assertFalse(is_trial_config({"jobs_dir": "/x", "datasets": []}))
+
+
+class Windows(unittest.TestCase):
+    """The campaign runs only inside declared windows; the inference box is the maintainer's
+    outside them. One schedule file is the only source of the windows."""
+
+    SCHEDULE = "# nights on weekdays, whole weekend\nmon,tue,wed,thu,fri 20:00 08:00\nsat,sun 00:00 24:00\n"
+
+    def test_overnight_and_weekend_windows(self):
+        from datetime import datetime
+        sched = parse_schedule(self.SCHEDULE)
+        wed_night = window_at(sched, datetime(2026, 9, 16, 23, 30))   # a Wednesday
+        self.assertEqual(wed_night[1], datetime(2026, 9, 17, 8, 0))   # ends Thursday 08:00
+        thu_early = window_at(sched, datetime(2026, 9, 17, 7, 59))    # still Wednesday's window
+        self.assertEqual(thu_early, wed_night)
+        self.assertIsNone(window_at(sched, datetime(2026, 9, 17, 12, 0)))  # Thursday midday: his
+        sat = window_at(sched, datetime(2026, 9, 19, 15, 0))
+        self.assertEqual(sat[1], datetime(2026, 9, 20, 0, 0))
+
+    def test_a_malformed_schedule_line_refuses(self):
+        with self.assertRaises(ValueError):
+            parse_schedule("someday 20:00 08:00")
+
+    def test_a_second_deadline_cancel_exhausts_the_attempt(self):
+        # A runaway can hit the deadline every window; the second cancel is final.
+        archived = ["task-a__a1.1789430000.deadline", "task-a__a2.1789430001", "task-b__a1.1789430002.deadline"]
+        self.assertEqual(deadline_cancels(archived, "task-a__a1"), 1)
+        self.assertEqual(deadline_cancels(archived, "task-a__a2"), 0)  # a crash archive is not a deadline cancel
+        self.assertEqual(job_state([], exhausted=True), "done")
 
 
 if __name__ == "__main__":

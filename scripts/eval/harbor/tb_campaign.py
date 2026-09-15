@@ -9,6 +9,8 @@
     tb_campaign.py pinned-version <out_dir> <harness>      # the version pi/codex must install
     tb_campaign.py plan <task-set.json> <trials>           # "<task> <attempt>" lines, in run order
     tb_campaign.py job-state <trial_job_dir>               # absent / partial / done
+    tb_campaign.py window <schedule> [epoch]               # "<window id> <end epoch>", exit 1 outside
+    tb_campaign.py deadline-cancels <cell_dir> <trial_job> # prior deadline cancels of one attempt
 
 Every trial directory Harbor created becomes one row, graded or not. A cell's
 expected count comes from the task set, so a trial Harbor never produced is
@@ -32,7 +34,7 @@ import re
 import statistics
 import sys
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pi_log import inference_failure
@@ -441,14 +443,61 @@ def trial_plan(tasks, trials):
     return [(task, k) for k in range(1, trials + 1) for task in tasks]
 
 
-def job_state(results):
+def job_state(results, exhausted=False):
     """A trial job from its trial dirs' parsed result.json (None when absent):
     `done` once a non-cancelled result exists (an errored trial is a recorded
-    attempt, never re-run), `partial` when a dir holds no usable result, else `absent`."""
-    if any(r is not None and ((r.get("exception_info") or {}).get("exception_type") != "CancelledError")
+    attempt, never re-run) or its attempt is deadline-exhausted, `partial` when a
+    dir holds no usable result, else `absent`."""
+    if exhausted or any(r is not None and ((r.get("exception_info") or {}).get("exception_type") != "CancelledError")
            for r in results):
         return "done"
     return "partial" if results else "absent"
+
+
+# ── windows and the hard deadline ────────────────────────────────────────────
+# The inference box is the maintainer's outside declared windows. ONE schedule file is the
+# only source: "<days> <HH:MM start> <HH:MM end>" per line, days from
+# mon..sun, an end at or before the start running past midnight. A timer only
+# wakes the runner; the runner decides.
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+EXHAUSTED = ".deadline-exhausted"
+
+
+def parse_schedule(text):
+    windows = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            days, start, end = line.split()
+            day_ids = {DAYS.index(d) for d in days.split(",")}
+            start_m, end_m = (int(h) * 60 + int(m) for h, m in (t.split(":") for t in (start, end)))
+            if not (0 <= start_m < 1440 and 0 < end_m <= 1440):
+                raise ValueError("time out of range")
+        except ValueError as e:
+            raise ValueError(f"schedule line {n}: {raw!r}") from e
+        windows.append((day_ids, start_m, end_m))
+    return windows
+
+
+def window_at(schedule, now):
+    """(window id, window end) for the window containing `now`, else None."""
+    for day_ids, start_m, end_m in schedule:
+        for back in (0, 1):  # a window that opened yesterday may still be open
+            day = datetime.combine(now.date() - timedelta(days=back), datetime.min.time())
+            if day.weekday() not in day_ids:
+                continue
+            start = day + timedelta(minutes=start_m)
+            end = day + timedelta(minutes=end_m if end_m > start_m else end_m + 1440)
+            if start <= now < end:
+                return f"{start:%Y-%m-%dT%H:%M}", end
+    return None
+
+
+def deadline_cancels(archived_names, trial_job):
+    """How many times this attempt was already cancelled at a hard deadline."""
+    return sum(n.startswith(trial_job + ".") and n.endswith(".deadline") for n in archived_names)
 
 
 def _json(path: Path):
@@ -481,6 +530,11 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
          **trial_row(cell["harness"], t, cell.get("treatment_expect"))}
         for t in trial_dirs(job_dir)
     ]
+    for row, t in zip(rows, trial_dirs(job_dir)):
+        # The attempt was cancelled at a hard deadline twice: final, and the
+        # agent's (a runaway), never a silent infra retry.
+        if Path(str(t.parent) + EXHAUSTED).exists():
+            row.update(state="error", error_cause="agent", exception="DeadlineExhausted", resolved=False)
     archived = job_dir / INTERRUPTED
     cell["interrupted"] = len([p for p in archived.iterdir() if p.is_dir()]) if archived.is_dir() else 0
     if not cell.get("harness_version") and rows:
@@ -725,7 +779,16 @@ if __name__ == "__main__":
     elif cmd == "job-state":
         job = Path(args[0])
         dirs = [d for d in job.iterdir() if d.is_dir()] if job.is_dir() else []
-        print(job_state([_json(d / "result.json") for d in dirs]))
+        print(job_state([_json(d / "result.json") for d in dirs], exhausted=Path(str(job) + EXHAUSTED).exists()))
+    elif cmd == "window":
+        now = datetime.fromtimestamp(float(args[1])) if len(args) > 1 else datetime.now()
+        found = window_at(parse_schedule(Path(args[0]).read_text()), now)
+        if not found:
+            sys.exit(1)
+        print(found[0], int(found[1].timestamp()))
+    elif cmd == "deadline-cancels":
+        archived = Path(args[0]) / INTERRUPTED
+        print(deadline_cancels([p.name for p in archived.iterdir()] if archived.is_dir() else [], args[1]))
     elif cmd == "pinned-version":
         path = Path(args[0]) / "campaign.pin.json"
         print(((json.loads(path.read_text()) if path.exists() else {}).get("harness_versions") or {}).get(args[1], ""))
