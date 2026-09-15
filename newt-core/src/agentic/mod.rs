@@ -12910,6 +12910,19 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     drop(spinner.take());
     let mut out = sink.end(started);
     let (round, provider_error) = acc.finish_with_error();
+    // #2313: one decision for the attempt, whatever the caller does with the
+    // text. Ok only for a stream that reached `[DONE]` with no error event and
+    // no interrupt; failed otherwise. Reported usage attaches either way.
+    attempt_capture::finish(
+        attempts,
+        attempt.as_ref(),
+        if round.done && provider_error.is_none() && !interrupted {
+            crate::attempts::AttemptState::Ok
+        } else {
+            crate::attempts::AttemptState::Failed
+        },
+        round.usage,
+    );
     if !interrupted {
         if let Some(error) = provider_error {
             if started {
@@ -12946,7 +12959,6 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // ended before [DONE]" blames the wire for the operator's own decision.
     if interrupted {
         display::write_harness_notice(&mut out, "interrupted — keeping the partial answer", color);
-        attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
         return StreamOutcome::Printed(text, round.usage);
     }
     // A stream that never reached `[DONE]` was CUT: the fragment on screen
@@ -12983,7 +12995,6 @@ async fn openai_stream_final_answer<W: std::io::Write>(
         );
         return StreamOutcome::UseProbe(round.usage);
     }
-    attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
     StreamOutcome::Printed(text, round.usage)
 }
 
