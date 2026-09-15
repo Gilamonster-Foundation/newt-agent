@@ -8658,6 +8658,7 @@ async fn anthropic_dispatch_round(
     messages: &[serde_json::Value],
     stream: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<Option<(anthropic_wire::AnthropicRound, bool)>> {
     if !stream {
         let result = cancellable(
@@ -8674,13 +8675,11 @@ async fn anthropic_dispatch_round(
                     };
                     // W0 (#1511): classify while the error is TYPED — mirrors
                     // the OpenAI path's dispatch site.
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "request failed",
-                            e,
-                        ))
-                    })?;
-                    smart_harness::response(resp, d.smart_harness, "inference endpoint").await
+                    let (resp, attempt) =
+                        attempt_capture::send(attempts, "primary", req, "request failed").await?;
+                    let json = smart_harness::response(resp, d.smart_harness, "inference endpoint")
+                        .await?;
+                    Ok((json, attempt))
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -8690,7 +8689,11 @@ async fn anthropic_dispatch_round(
         .await;
         return match result {
             None => Ok(None),
-            Some(Ok(json)) => Ok(Some((anthropic_wire::parse_messages_reply(&json), false))),
+            Some(Ok((json, attempt))) => {
+                let round = anthropic_wire::parse_messages_reply(&json);
+                attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
+                Ok(Some((round, false)))
+            }
             Some(Err(e)) => Err(e),
         };
     }
@@ -8707,12 +8710,9 @@ async fn anthropic_dispatch_round(
                 || async {
                     let req = anthropic_headers(d.stream_client.post(d.messages_url), d.api_key)
                         .json(body);
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "stream request failed",
-                            e,
-                        ))
-                    })?;
+                    let (resp, attempt) =
+                        attempt_capture::send(attempts, "primary", req, "stream request failed")
+                            .await?;
                     if !resp.status().is_success() {
                         let status = resp.status();
                         let (bytes, read_error) = crate::retry::read_response_bytes(resp).await;
@@ -8725,7 +8725,7 @@ async fn anthropic_dispatch_round(
                         ))
                         .into());
                     }
-                    Ok(resp)
+                    Ok((resp, attempt))
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -8737,6 +8737,7 @@ async fn anthropic_dispatch_round(
             None => return Ok(None),
             Some(r) => r?,
         };
+        let (resp, attempt) = resp;
 
         // The ONE spinner (`newt_core::tty`), gated exactly like
         // `stream_response`; the accumulated round text stays RAW (it is
@@ -8865,6 +8866,10 @@ async fn anthropic_dispatch_round(
             );
             return Ok(Some((round, true)));
         }
+        // A broken stream above stays recorded failed; so does an interrupt.
+        if !is_cancelled(cancel) {
+            attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
+        }
         return Ok(Some((round, started)));
     }
 }
@@ -8875,6 +8880,7 @@ async fn anthropic_dispatch_round(
 /// `accumulated` carries usage from the preceding tool-call rounds. Mirrors
 /// [`final_summary_openai`]: cap-exit nudge appended, same preflight, and
 /// `stream:false` with NO tools advertised so the model cannot emit tool_use.
+#[allow(clippy::too_many_arguments)]
 async fn final_summary_anthropic(
     client: &reqwest::Client,
     messages_url: &str,
@@ -8883,6 +8889,7 @@ async fn final_summary_anthropic(
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
@@ -8903,7 +8910,7 @@ async fn final_summary_anthropic(
     );
     cap.finish(
         messages_url,
-        None,
+        attempts,
         || async { Ok(anthropic_headers(client.post(messages_url), api_key).json(&body)) },
         "inference endpoint",
         estimate_value_tokens(&body, cap.estimation),
@@ -8955,7 +8962,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // the output cap projects onto this wire today (see below).
         cognition,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -9137,6 +9144,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
     if note_sink.is_some() {
@@ -9551,9 +9568,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 use_tools.then_some(tools_anthropic.as_slice()),
                 streaming_enabled,
             );
-            let dispatch =
-                anthropic_dispatch_round(&dispatcher, &body, &messages, streaming_enabled, cancel)
-                    .await;
+            let dispatch = anthropic_dispatch_round(
+                &dispatcher,
+                &body,
+                &messages,
+                streaming_enabled,
+                cancel,
+                attempts,
+            )
+            .await;
             match dispatch {
                 // Interrupted mid-dispatch: same contract as the round-
                 // boundary checkpoint (mirrors the Ollama raced probe).
@@ -10739,6 +10762,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         trimmed,
         generation_policy,
         &cap,
+        attempts,
     )
     .await;
     let (text, streamed, usage) = cap.recover_rejection(

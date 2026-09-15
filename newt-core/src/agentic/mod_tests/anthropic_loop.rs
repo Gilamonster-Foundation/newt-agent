@@ -872,8 +872,17 @@ async fn final_summary_provider_contracts() {
                     .await
                 }
                 _ => {
-                    final_summary_anthropic(&client, &url, "test", None, Vec::new(), policy, &cap)
-                        .await
+                    final_summary_anthropic(
+                        &client,
+                        &url,
+                        "test",
+                        None,
+                        Vec::new(),
+                        policy,
+                        &cap,
+                        None,
+                    )
+                    .await
                 }
             };
             let (reply, streamed, usage) = result.expect("summary failures become fallbacks");
@@ -1242,6 +1251,191 @@ async fn usage_across_rounds_takes_max_input_and_sums_output() {
     // double-count), output = the SUM (each completion is new generation).
     assert_eq!(u.input_tokens, 120, "max(100, 120), not the sum");
     assert_eq!(u.output_tokens, 15, "10 + 5");
+}
+
+// -----------------------------------------------------------------------
+// #2313 (b1c): every Anthropic primary request is one ledger attempt
+// -----------------------------------------------------------------------
+
+/// Assert the #2313 invariant for one Anthropic turn: every received request is
+/// on the generation path (`/v1/messages`, so nothing else was hit and the
+/// filter hides nothing), and the ledger's attempts are exactly those requests,
+/// keyed by their bodies. Returns the records, ordered by ordinal.
+///
+/// Scope of the count: the Anthropic primary loop's round dispatch (stream and
+/// non-stream, including a no-output stream re-issue) and cap-exit summary.
+async fn assert_anthropic_attempts_equal_wire_requests(
+    server: &MockServer,
+    ledger: &std::sync::Mutex<crate::attempts::AttemptLedger>,
+) -> Vec<crate::attempts::AttemptRecord> {
+    let received = server.received_requests().await.expect("journal");
+    assert!(
+        received
+            .iter()
+            .all(|request| request.url.path() == "/v1/messages"),
+        "only /v1/messages may be hit: {:?}",
+        received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    let ledger = ledger.lock().unwrap();
+    let mut wire: Vec<_> = received
+        .iter()
+        .map(|request| content_addressable::RawContentId::from_content(&request.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger.records().map(|record| record.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire,
+        "attempts == wire requests, keyed by their bodies"
+    );
+    let mut records: Vec<_> = ledger.records().cloned().collect();
+    records.sort_by_key(|record| record.key.ordinal);
+    for record in &records {
+        assert!(
+            record.key.turn.starts_with("prompt:"),
+            "{}",
+            record.key.turn
+        );
+        assert_eq!(record.key.role, "primary");
+    }
+    records
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn every_non_streaming_anthropic_round_is_one_ledger_attempt() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(UsageAcrossRounds {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "ok",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    chat_complete(c, &mut mcp).await.expect("dispatch");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 2, "tool round, final answer");
+    assert!(records
+        .iter()
+        .all(|r| r.state == crate::attempts::AttemptState::Ok));
+    let totals = ledger.lock().unwrap().totals();
+    assert_eq!((totals.in_tokens, totals.out_tokens), (100 + 120, 10 + 5));
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_streamed_anthropic_round_is_one_ledger_attempt() {
+    let _env = test_env(true);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_text_reply(&["Hello ", "world"], 7, 3))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    chat_complete(c, &mut NoMcp)
+        .await
+        .expect("streamed dispatch");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Ok);
+    assert_eq!(
+        records[0].usage,
+        Some(crate::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3
+        })
+    );
+}
+
+/// Precision (3) on a real loop: a 529 then a success is two requests and two
+/// attempts with identical bytes — ordinal 0 `failed` with no usage, ordinal 1
+/// `ok`.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_retried_anthropic_round_is_one_ledger_attempt_per_try() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(OverloadedOnce {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    chat_complete(c, &mut NoMcp).await.expect("529 is retried");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].key.request, records[1].key.request);
+    assert_eq!(
+        (records[0].state, records[0].usage),
+        (crate::attempts::AttemptState::Failed, None)
+    );
+    assert_eq!(records[1].state, crate::attempts::AttemptState::Ok);
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ToolsUntilCap {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.max_tool_rounds = 2;
+    c.attempt_ledger = Some(&ledger);
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "ok",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (reply, _, _, _) = chat_complete(c, &mut mcp).await.expect("cap exit");
+    assert!(reply.starts_with("capped summary"), "{reply}");
+
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(
+        records.len(),
+        3,
+        "two tool rounds + one tools-disabled summary"
+    );
+    assert!(records
+        .iter()
+        .all(|r| r.state == crate::attempts::AttemptState::Ok));
 }
 
 // -----------------------------------------------------------------------
