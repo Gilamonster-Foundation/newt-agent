@@ -313,7 +313,7 @@ async fn exact_count_absent_endpoint_falls_back_to_anchored_admission() {
 }
 
 #[tokio::test]
-async fn exact_count_rechecks_identical_turns_and_final_display_reissues() {
+async fn exact_count_rechecks_identical_turns() {
     let server = MockServer::start().await;
     let trace = Trace::default();
     mount_counter(&server, &trace, Some(|_| 43_210)).await;
@@ -332,8 +332,8 @@ async fn exact_count_rechecks_identical_turns_and_final_display_reissues() {
     let trace = trace.lock().unwrap();
     assert_eq!(
         trace.generations.len(),
-        4,
-        "two primary rounds and their display reissues"
+        2,
+        "two primary rounds; no display reissue (#2372)"
     );
     assert_eq!(
         trace.probes.len(),
@@ -537,7 +537,9 @@ fn request_prior(body: &serde_json::Value) -> usize {
     )
 }
 
-async fn check_optional_measurement(cap_summary: bool, rejected: bool) {
+/// The optional request is the tools-disabled cap-exit summary; since #2372
+/// there is no display reissue to measure.
+async fn check_optional_measurement(rejected: bool) {
     let server = MockServer::start().await;
     let trace = Trace::default();
     let counted = trace.clone();
@@ -557,7 +559,7 @@ async fn check_optional_measurement(cap_summary: bool, rejected: bool) {
         })
         .mount(&server)
         .await;
-    mount_generation(&server, &trace, true, cap_summary).await;
+    mount_generation(&server, &trace, true, true).await;
     let messages = msgs();
     let caveats = Caveats::top();
     let uri = server.uri();
@@ -565,7 +567,7 @@ async fn check_optional_measurement(cap_summary: bool, rejected: bool) {
     let mut observation = observability::SolveObservation::default();
     let mut reason = None;
     let mut context = count_ctx(&uri, &messages, &caveats);
-    context.max_tool_rounds = if cap_summary { 1 } else { 8 };
+    context.max_tool_rounds = 1;
     context.compress_state = Some(&mut state);
     context.solve_obs = Some(&mut observation);
     context.end_reason = Some(&mut reason);
@@ -599,45 +601,24 @@ async fn check_optional_measurement(cap_summary: bool, rejected: bool) {
         })
         .count();
     assert_eq!(rejections, usize::from(rejected));
-    assert_eq!(
-        reason,
-        Some(if cap_summary {
-            crate::TurnEndReason::RoundCap
-        } else {
-            crate::TurnEndReason::Completed
-        })
-    );
-    if cap_summary {
-        assert!(body["tools"].is_null());
-        assert!(body["messages"].as_array().unwrap().iter().any(|message| {
-            message["role"] == "tool" && message["tool_call_id"] == "measured_call"
-        }));
-        if rejected {
-            assert!(reply.contains("tool-round limit (1"), "{reply}");
-        }
-    } else {
-        assert_eq!(reply, "measured answer");
+    assert_eq!(reason, Some(crate::TurnEndReason::RoundCap));
+    assert!(body["tools"].is_null());
+    assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "measured_call"
+    }));
+    if rejected {
+        assert!(reply.contains("tool-round limit (1"), "{reply}");
     }
 }
 
 #[tokio::test]
-async fn exact_count_optional_display_refusal_learns_its_own_measurement() {
-    check_optional_measurement(false, true).await;
-}
-
-#[tokio::test]
 async fn exact_count_optional_cap_refusal_learns_its_own_measurement() {
-    check_optional_measurement(true, true).await;
-}
-
-#[tokio::test]
-async fn exact_count_optional_display_success_learns_its_own_measurement() {
-    check_optional_measurement(false, false).await;
+    check_optional_measurement(true).await;
 }
 
 #[tokio::test]
 async fn exact_count_optional_cap_success_learns_its_own_measurement() {
-    check_optional_measurement(true, false).await;
+    check_optional_measurement(false).await;
 }
 
 #[tokio::test]
@@ -671,13 +652,13 @@ async fn exact_count_transport_retry_keeps_the_strongest_observed_count() {
     assert_eq!(reply, "measured answer");
     assert_eq!(
         trace.probes.len(),
-        3,
+        2,
         "a fresh count precedes each generation"
     );
     assert_eq!(
         trace.generations.len(),
-        3,
-        "one transient retry and the display reissue"
+        2,
+        "one transient retry; no display reissue (#2372)"
     );
     assert_eq!(
         trace.generations[0], trace.generations[1],

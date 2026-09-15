@@ -305,6 +305,11 @@ pub struct TurnOutcome {
     pub behavior_signals: Vec<crate::agentic::observability::BehaviorSignal>,
     /// The optional collaborators this turn's context actually carried.
     pub features: InstantiatedFeatures,
+    /// Whether the loop already printed `reply` as it arrived. A host that
+    /// shows answers must print an unstreamed reply itself (#2372).
+    pub was_streamed: bool,
+    /// `reply` is harness-written text, not the model's claim (#2372).
+    pub harness_reply: bool,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
     /// What this turn sent and generated, summed per inference attempt, with
@@ -770,8 +775,9 @@ async fn run_one_turn(
     // infrastructure failure (e.g. a context-window 500) must not misreport the
     // agent as having done nothing.
     match dispatch {
-        Ok((reply, _, usage, hallucinations)) => Ok(TurnOutcome {
+        Ok((reply, was_streamed, usage, hallucinations)) => Ok(TurnOutcome {
             reply,
+            was_streamed,
             usage,
             hallucinations,
             tool_events,
@@ -783,10 +789,12 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             features,
             output_allowance: solve_obs.output_allowance,
+            harness_reply: solve_obs.harness_reply,
             attempts,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
+            was_streamed: false,
             usage: None,
             hallucinations: 0,
             tool_events,
@@ -804,6 +812,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             features,
             output_allowance: solve_obs.output_allowance,
+            harness_reply: solve_obs.harness_reply,
             attempts,
         }),
     }
@@ -981,8 +990,7 @@ mod tests {
         assert_eq!(t[1].role, Role::Assistant);
         assert_eq!(t[1].content, "the driver answered");
 
-        // The backend served exactly the streaming re-issue + probe (the
-        // tools-present probe then the stream); at least one request landed.
+        // The backend served the turn's generation; at least one request landed.
         assert!(served.load(Ordering::SeqCst) >= 1);
         // Drained — back to idle.
         assert!(matches!(driver.poll(), TurnStatus::Idle));
@@ -1053,7 +1061,7 @@ mod tests {
     /// #2313 (b2): a headless turn owns a per-turn attempt ledger and returns
     /// its totals — what was sent, summed per attempt — beside the context
     /// merge in `usage`. Attempts equal the wire requests: the accepted answer
-    /// and its display reissue are two generations.
+    /// is one generation (#2372).
     #[tokio::test]
     async fn a_headless_turn_reports_its_per_attempt_totals() {
         let body = [
@@ -1092,7 +1100,7 @@ mod tests {
             outcome.usage,
             Some(TokenUsage {
                 input_tokens: 900,
-                output_tokens: 80
+                output_tokens: 40
             }),
             "usage stays the context merge"
         );
@@ -1101,12 +1109,12 @@ mod tests {
             Some(crate::attempts::UsageTotals {
                 attempts: u32::try_from(received.len()).unwrap(),
                 usage_missing: 0,
-                in_tokens: 1_800,
-                out_tokens: 80,
+                in_tokens: 900,
+                out_tokens: 40,
                 usage_complete: true,
             })
         );
-        assert_eq!(received.len(), 2, "accepted answer + display reissue");
+        assert_eq!(received.len(), 1, "one generation for the accepted answer");
     }
 
     async fn drive_once_capturing(mut driver: TurnDriver) -> (Vec<serde_json::Value>, TurnOutcome) {

@@ -168,6 +168,16 @@ pub struct SolveObservation {
     pub behavior_signals: Vec<BehaviorSignal>,
     /// The output cap the turn's wire applied (#2312), when it applied one.
     pub output_allowance: Option<OutputAllowance>,
+    /// The reply is harness-written text (an empty-response note, a refusal
+    /// placeholder, a cap-exit fallback), not a model claim (#2372).
+    pub harness_reply: bool,
+}
+
+/// Mark the turn's reply as harness-written rather than model-authored.
+pub(crate) fn observe_harness_reply(obs: &mut Option<&mut SolveObservation>) {
+    if let Some(obs) = obs.as_deref_mut() {
+        obs.harness_reply = true;
+    }
 }
 
 /// An output cap as a turn applied it (#2312): the tokens, and whether the
@@ -278,8 +288,8 @@ impl DispatchError {
     }
 
     /// Wrap a reqwest send/decode failure, classifying it while it is still
-    /// typed. `prefix` preserves the historical site wording (`"request
-    /// failed"` on the probe, `"stream request failed"` on the re-issue).
+    /// typed. `prefix` preserves the historical site wording (e.g. `"request
+    /// failed"`).
     pub fn from_reqwest(prefix: &str, e: reqwest::Error) -> Self {
         Self {
             class: classify_reqwest(&e),

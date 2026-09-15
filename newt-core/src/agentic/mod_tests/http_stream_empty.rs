@@ -1,7 +1,8 @@
 use super::*;
 
-/// Probe (stream:false) answers with plain content; the streaming re-issue
-/// (stream:true) returns NDJSON tokens with usage on the `done` chunk.
+/// #2372: the probe's plain answer is ACCEPTED and returned. Any second
+/// (`stream: true`) request would stream DIFFERENT text, so a display reissue
+/// shows up as an extra request and as `Hello world` in the reply.
 struct StreamHappyResponder;
 impl Respond for StreamHappyResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
@@ -23,7 +24,7 @@ impl Respond for StreamHappyResponder {
 }
 
 #[tokio::test]
-async fn ollama_streams_final_answer_and_merges_usage() {
+async fn ollama_returns_the_accepted_probe_answer_without_a_reissue() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -38,19 +39,168 @@ async fn ollama_streams_final_answer_and_merges_usage() {
             .await
             .expect("chat_complete should succeed");
 
-    assert_eq!(reply, "Hello world", "tokens accumulated across chunks");
-    assert!(streamed, "the streaming path printed the tokens");
-    let u = usage.expect("probe + stream usage merged");
-    // SEMANTICS CHANGED in Step 18.1: both requests carried the same
-    // conversation, so input is max(5, 7) = 7 — the old sum (12) counted
-    // the shared history twice. Output is still 2 + 3 (new generation).
-    assert_eq!(u.input_tokens, 7, "max(5 probe, 7 stream), not the sum");
-    assert_eq!(u.output_tokens, 5, "2 (probe) + 3 (stream)");
+    assert_eq!(
+        reply, "probe answer",
+        "the gated answer, never a second generation"
+    );
+    assert!(!streamed, "nothing was streamed to a display");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "one generation request"
+    );
+    let u = usage.expect("the probe's usage");
+    assert_eq!((u.input_tokens, u.output_tokens), (5, 2));
     assert_eq!(hallu, 0);
 }
 
-/// The streaming re-issue produces no tokens — the loop must fall back to
-/// the probe round's content rather than returning silence.
+/// One Ollama answer with `content` (and optionally native `thinking`),
+/// returned through a real turn. Returns the reply and every reasoning body
+/// the fold retained. Callers hold `GlobalSettingsGuard` with
+/// `NEWT_THINKING=fold`, so a missing fold cannot pass by being switched off.
+async fn ollama_answer(
+    content: &str,
+    thinking: Option<&str>,
+    leading_reasoning: bool,
+    color: bool,
+) -> (String, Vec<String>) {
+    let server = MockServer::start().await;
+    let mut message = serde_json::json!({"content": content});
+    if let Some(thinking) = thinking {
+        message["thinking"] = serde_json::json!(thinking);
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": message, "prompt_eval_count": 5, "eval_count": 2,
+        })))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let recorder = Arc::new(FoldRecorder::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.emits_leading_reasoning = leading_reasoning;
+    c.color = color;
+    c.completed_spill_renderer = Some(recorder.clone() as Arc<dyn CompletedSpillRenderer>);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let folded = recorder.0.lock().unwrap().clone();
+    (reply, folded)
+}
+
+fn thinking_folded() -> crate::test_guard::GlobalSettingsGuard {
+    let guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::process_env::set_var("NEWT_THINKING", "fold");
+    guard
+}
+
+/// #2372: the accepted Ollama answer follows the display stream's reasoning
+/// policy, and what it strips is what it folds. An undeclared backend keeps a
+/// lone `</think>` as answer text; only a backend declaring the leading shape
+/// (#384, #528) has it stripped; an inline `<think>` block never reaches the
+/// answer either way.
+#[tokio::test]
+async fn the_ollama_answer_follows_the_declared_reasoning_policy() {
+    let _settings = thinking_folded();
+    let undeclared = "End the block with `</think>` and then answer.";
+    assert_eq!(
+        ollama_answer(undeclared, None, false, true).await,
+        (undeclared.to_string(), vec![])
+    );
+    let (reply, folded) = ollama_answer("plan</think>Done.", None, true, true).await;
+    assert_eq!(reply, "Done.");
+    assert!(
+        folded.iter().any(|body| body.contains("plan")),
+        "{folded:?}"
+    );
+    let (reply, folded) = ollama_answer("plan</think>Use the <think> tag", None, true, true).await;
+    assert!(
+        !reply.contains("plan") && !reply.contains("</think>"),
+        "{reply:?}"
+    );
+    assert!(
+        folded.iter().any(|body| body.contains("plan")),
+        "{folded:?}"
+    );
+    for leading in [false, true] {
+        let (reply, folded) = ollama_answer("<think>x</think>Done.", None, leading, true).await;
+        assert_eq!(reply, "Done.");
+        assert!(folded.iter().any(|body| body.contains('x')), "{folded:?}");
+    }
+}
+
+/// Records what the reasoning fold retains.
+#[derive(Default)]
+struct FoldRecorder(std::sync::Mutex<Vec<String>>);
+impl CompletedSpillRenderer for FoldRecorder {
+    fn retain_completed(&self, output: &str) -> Option<u64> {
+        self.0.lock().unwrap().push(output.to_string());
+        Some(1)
+    }
+    fn render_completed(&self, _output: &str, _width: usize, _max_height: usize) -> usize {
+        0
+    }
+    fn is_active(&self) -> bool {
+        false
+    }
+    fn erase(&self) {}
+    fn discard(&self) {}
+}
+
+/// #2372: Ollama's native `thinking` channel is folded like the OpenAI wire's
+/// `reasoning_content`; together with an inline block both are folded and
+/// neither reaches the answer; whitespace-only thinking is not reasoning.
+#[tokio::test]
+async fn ollama_native_thinking_is_folded_with_the_accepted_answer() {
+    let _settings = thinking_folded();
+    let (reply, folded) = ollama_answer("Done.", Some("plan the change"), false, true).await;
+    assert_eq!(reply, "Done.");
+    assert!(
+        folded.iter().any(|body| body.contains("plan the change")),
+        "{folded:?}"
+    );
+
+    let (reply, folded) = ollama_answer(
+        "<think>inline step</think>Done.",
+        Some("native plan"),
+        false,
+        true,
+    )
+    .await;
+    assert_eq!(reply, "Done.");
+    assert!(
+        folded
+            .iter()
+            .any(|body| body.contains("native plan") && body.contains("inline step")),
+        "both reasoning sources fold: {folded:?}"
+    );
+
+    let (reply, folded) = ollama_answer("<think>x</think>Done.", Some("   "), false, true).await;
+    assert_eq!(reply, "Done.");
+    assert!(
+        folded.iter().all(|body| !body.trim().is_empty()),
+        "{folded:?}"
+    );
+    assert!(folded.iter().any(|body| body.contains('x')), "{folded:?}");
+    assert_eq!(
+        ollama_answer("Done.", Some("  \n "), false, true).await,
+        ("Done.".to_string(), vec![])
+    );
+}
+
+/// #2372: headless and piped runs print no reasoning, as the display stream's
+/// spinner never did off a colour terminal.
+#[tokio::test]
+async fn ollama_reasoning_is_not_folded_off_a_colour_terminal() {
+    let _settings = thinking_folded();
+    assert_eq!(
+        ollama_answer("<think>x</think>Done.", Some("native plan"), false, false).await,
+        ("Done.".to_string(), vec![])
+    );
+}
+
 struct EmptyStreamResponder;
 impl Respond for EmptyStreamResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
@@ -265,14 +415,14 @@ async fn suspicious_empty_generated_output_retries_with_nudge() {
             .expect("chat_complete should succeed");
 
     assert_eq!(reply, "recovered after empty retry");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 2);
     assert!(saw_nudge.load(Ordering::SeqCst));
-    assert!(
+    assert_eq!(
         usage
             .expect("usage survives suspicious retry")
-            .output_tokens
-            >= 2566,
+            .output_tokens,
+        2_559 + 3,
         "usage from the suspicious empty round must be preserved"
     );
 }
@@ -352,7 +502,7 @@ async fn repeated_thinking_only_gets_stronger_second_nudge() {
             .expect("second hidden-only nudge should recover the turn");
 
     assert_eq!(reply, "recovered after strong hidden-only nudge");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 3);
     assert!(saw_strong_nudge.load(Ordering::SeqCst));
 }

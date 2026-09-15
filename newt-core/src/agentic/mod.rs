@@ -1875,9 +1875,6 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         )
         .await;
     }
-    // Step 25.4 (#568): capture the markdown decision before `ctx` is consumed
-    // by the destructure (the destructures ignore it via `markdown: _`).
-    let markdown = ctx.markdown;
     let ChatCtx {
         verify_outcomes,
         smart_harness,
@@ -1987,30 +1984,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         None => &mut local_compress_state,
     };
     // Ollama Cloud speaks the same wire as LAN Ollama but behind bearer auth.
-    // The key is baked into BOTH clients' default headers so every request on
-    // this path (tool-round probe, streaming re-issue, `/api/show`, the
-    // cap-exit summary) authenticates — a per-site `.bearer_auth()` would be
-    // the N-call-sites trap (#1312) that produced the silent 401 this fixes.
+    // The key is baked into the client's default headers so every request on
+    // this path (the round probe, `/api/show`, the cap-exit summary)
+    // authenticates — a per-site `.bearer_auth()` would be the N-call-sites
+    // trap (#1312) that produced the silent 401 this fixes.
     let auth = ollama_auth_headers(api_key);
     let client = reqwest::Client::builder()
-        .default_headers(auth.clone())
-        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
-        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
-        .build()?;
-    // #643: the streaming re-issue (the final-text round consumed token-by-token
-    // by `stream_response`) must NOT use a whole-request `.timeout()`. That bounds
-    // connect + headers + the ENTIRE body, so a slow-but-progressing token stream
-    // is aborted mid-flight the instant total time crosses the deadline, and the
-    // retry envelope then restarts the full prefill — the DGX retry-storm wedge.
-    // An IDLE `read_timeout` is the right bound: it caps the gap between chunks and
-    // resets on every token, so a progressing stream runs as long as it keeps
-    // producing while a genuinely stalled connection still bails after
-    // `inference_timeout_secs` of silence. The one-shot `stream:false` probe below
-    // keeps `client` (a whole-request bound is correct for a single-shot response).
-    let stream_client = reqwest::Client::builder()
         .default_headers(auth)
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
-        .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
     let retry = tui_retry_policy(url);
@@ -2565,6 +2547,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // out and lets `round` advance, so recovery never consumes a tool-capable
         // round (critical at hard_tool_rounds == 1 or near the cap): the recovered
         // request is re-sent WITH tools, never demoted to the tools-disabled summary.
+        let probe_started = std::time::Instant::now();
         let (json, round_est_raw): (serde_json::Value, usize) = loop {
             preflight_full_message_request(
                 &messages,
@@ -2990,9 +2973,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
 
         let message = &json["message"];
-        // Capture the probe content now — it may be our only copy of the
-        // model's reply if the subsequent streaming re-issue returns empty.
-        let probe_content = message["content"].as_str().unwrap_or("").to_string();
+        // #2372: the probe is the only generation of this round, so reasoning
+        // leaves it here, once, with the stream filter's own policy (#385;
+        // #528's leading shape only when the backend declares it) — every final
+        // path below (answer, smart exit, read-only handoff) sees the same text.
+        let (probe_content, inline_reasoning) = crate::reasoning::ThinkFilter::filter_complete(
+            message["content"].as_str().unwrap_or(""),
+            emits_leading_reasoning,
+        );
 
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls a weak model emitted in CONTENT instead of the
@@ -3152,10 +3140,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
-            // A final text candidate can come from either the streaming re-issue
-            // or the non-streamed probe fallback. Run both through the same
-            // no-tool final-answer gates so "Let me inspect..." does not force a
-            // human "continue" just because the stream returned empty.
+            // The probe's text is the final answer candidate (#2372). It runs
+            // through the no-tool final-answer gates so "Let me inspect..."
+            // is nudged instead of forcing a human "continue".
             macro_rules! maybe_nudge_no_tool_content {
                 ($content:expr, $usage:expr) => {{
                     let content = $content;
@@ -3377,536 +3364,292 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     }
                 }};
             }
-            // No tool calls — re-issue with stream:true so the user sees tokens.
-            // `messages` already contains the task; just replay with streaming.
-            //
-            // IMPORTANT: the probe round already generated the model's answer in
-            // `probe_content`. The streaming re-issue is a *second* inference call
-            // from the same history; if it returns empty (non-determinism, context
-            // pressure, or model quirk) we fall back to the probe content so the
-            // user never sees a silent blank response.
-            let mut body_stream = serde_json::json!({
-                "model": model,
-                "messages": &messages,
-                "stream": true,
-                "tools": tools.clone(),
-            });
-            if let Some(options) = &ollama_options {
-                body_stream["options"] = options.clone();
+            // Esc after the answer arrived: the operator asked to stop, so the
+            // turn ends empty (the round-boundary contract) while the paid
+            // round's usage stands.
+            if is_cancelled(cancel) {
+                return Ok((
+                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
             }
-            // A no-tools model (set on a prior "does not support tools" 400)
-            // must not see the key on the streaming round either.
-            if !tools_supported {
-                if let Some(o) = body_stream.as_object_mut() {
-                    o.remove("tools");
-                }
-            }
-            // Retry the connection; if we connect successfully but the stream
-            // drops mid-token, that's a separate (harder) failure mode. Raced
-            // against the interrupt flag like the probe above.
-            let sresp = match cancellable(
-                cancel,
-                with_backoff_notify_error(
-                    &retry,
-                    || async {
-                        // Typed classification at the source (W0 #1511).
-                        attempt_capture::send(
-                            attempts,
-                            "primary",
-                            stream_client.post(&chat_url).json(&body_stream),
-                            "stream request failed",
-                        )
-                        .await
-                    },
-                    |attempt, delay, error| {
-                        print_retry_indicator(attempt, retry.max_retries, delay, error, color);
-                    },
-                ),
-            )
-            .await
-            {
-                Some(r) => r?,
-                None => {
-                    return Ok((
-                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
-                        false,
-                        accumulated_usage,
-                        hallucination_count,
-                    ))
-                }
-            };
-            let (sresp, stream_attempt) = sresp;
-
-            if !sresp.status().is_success() {
-                if debug {
-                    print_debug("stream request non-2xx — using probe content", color);
-                }
-                maybe_nudge_no_tool_content!(probe_content.as_str(), None);
-                // Phase 20 §2.2: the probe round produced usable content —
-                // quality gate met, report it before returning.
-                if !probe_content.is_empty() {
-                    emit_accepted(
-                        &mut on_round_usage,
-                        round_usage,
-                        truncation_suspect,
-                        round_est_raw,
-                    );
-                }
-                if probe_content.is_empty() {
-                    if let Some(slot) = &mut end_reason {
-                        **slot = Some(crate::TurnEndReason::Empty);
-                    }
-                    return Ok((probe_content, false, accumulated_usage, hallucination_count));
-                }
-                // #1964: this normal (non-cap) finish gets the same claim
-                // check + disclosure gate as a cap-exit summary.
-                let probe_content = finalize_final_text(
-                    probe_content,
-                    workspace,
-                    &caveats.fs_read,
-                    turn_start_head.as_deref(),
-                    disclosure,
+            // #2372: the probe's content is the answer. It is never generated a
+            // second time for display: the host renders the accepted reply, so
+            // the operator sees, the caller returns and the ledger counts one
+            // generation. Its reasoning — the native `thinking` channel and any
+            // inline block, both — is folded under the same gate the display
+            // stream's spinner had: a colour terminal, never a pipe.
+            if color {
+                let native_thinking = json["message"]["thinking"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|thinking| !thinking.is_empty())
+                    .map(str::to_string);
+                let reasoning = match (native_thinking, inline_reasoning.clone()) {
+                    (Some(native), Some(inline)) => Some(format!("{native}\n{inline}")),
+                    (native, inline) => native.or(inline),
+                };
+                commit_reasoning_fold(
+                    reasoning,
+                    probe_started.elapsed(),
+                    completed_spill_renderer.as_deref(),
+                    color,
                 );
-                return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
-            // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
-            // `[tui] thinking = "off"`. Never in a pipe / `newt worker`.
-            let show_thinking = color && thinking_stream_enabled();
-            // #528: models that stream a lone-leading `</think>` (Nemotron et al.)
-            // need the filter to start inside the reasoning block so the closer
-            // and the reasoning it follows don't leak into the reply.
-            let leading_reasoning = emits_leading_reasoning;
-            // Step 25.4 (#568): `markdown` is now resolved by the caller
-            // (`[tui].markdown` ∧ `/markdown` override ∧ color) and read off the
-            // ctx above — no longer hardcoded to `color`.
-            let (streamed, stream_usage, stream_complete) = match stream_response(
-                sresp,
-                color,
-                show_thinking,
-                leading_reasoning,
-                cancel,
-                markdown,
-                completed_spill_renderer.clone(),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    // #640: the stream connected (2xx) but the BODY broke
-                    // mid-response — the backend dropped/truncated the stream, or
-                    // an idle gap exceeded the read timeout. `stream_response`'s
-                    // only fallible step is the `resp.chunk()` body read, so any
-                    // error here IS a mid-stream break; left to `?` it surfaces as
-                    // an opaque "error decoding response body" and ends the whole
-                    // turn. It is recoverable, not fatal: the `stream:false` probe
-                    // above already produced the full answer in `probe_content`.
-                    // Warn and fall back to it — the SAME recovery as the non-2xx
-                    // path above. (Tiers 2+ of the ladder — retry / shrink /
-                    // fallback-model / prompt-and-save-preference — are #640.)
-                    print_harness_notice(
-                        &format!(
-                            "stream broke mid-response ({e}) — recovered the answer \
-                             from the non-streamed probe"
-                        ),
-                        color,
-                    );
-                    if !probe_content.is_empty() {
-                        maybe_nudge_no_tool_content!(probe_content.as_str(), None);
-                        emit_accepted(
-                            &mut on_round_usage,
-                            round_usage,
-                            truncation_suspect,
-                            round_est_raw,
-                        );
-                    }
-                    if probe_content.is_empty() {
-                        if let Some(slot) = &mut end_reason {
-                            **slot = Some(crate::TurnEndReason::Empty);
-                        }
-                        return Ok((probe_content, false, accumulated_usage, hallucination_count));
-                    }
-                    // #1964: this normal (non-cap) finish gets the same claim
-                    // check + disclosure gate as a cap-exit summary.
-                    let probe_content = finalize_final_text(
-                        probe_content,
-                        workspace,
-                        &caveats.fs_read,
-                        turn_start_head.as_deref(),
-                        disclosure,
-                    );
-                    return Ok((probe_content, false, accumulated_usage, hallucination_count));
-                }
-            };
-            // #2313: ok only for a stream that reached `done: true` without an
-            // interrupt; a cut stream or an interrupt is failed. Usage attaches
-            // either way.
-            attempt_capture::finish(
-                attempts,
-                stream_attempt.as_ref(),
-                if stream_complete {
-                    crate::attempts::AttemptState::Ok
-                } else {
-                    crate::attempts::AttemptState::Failed
-                },
-                stream_usage,
-            );
+            if probe_content.is_empty() {
+                let merged = accumulated_usage;
+                let empty_round_usage = round_usage;
+                let generated_unusable_output = empty_round_usage
+                    .as_ref()
+                    .map(|u| u.output_tokens > 0)
+                    .unwrap_or(false);
 
-            if streamed.is_empty() {
-                // The streaming re-issue produced no tokens. Fall back to the
-                // probe content rather than returning silence.
-                if debug {
-                    print_debug(
-                        &format!(
-                            "stream returned empty — falling back to probe content ({} chars)",
-                            probe_content.len()
-                        ),
-                        color,
-                    );
-                }
-                if probe_content.is_empty() {
-                    let merged = merge_round_usage(accumulated_usage, stream_usage);
-                    let empty_round_usage = merge_round_usage(round_usage, stream_usage);
-                    let generated_unusable_output = empty_round_usage
-                        .as_ref()
-                        .map(|u| u.output_tokens > 0)
-                        .unwrap_or(false);
-
-                    if generated_unusable_output
-                        && suspicious_empty_retries < SUSPICIOUS_EMPTY_RETRY_CAP
-                    {
-                        if trace {
-                            print_trace(&ollama_response_shape(&json), color);
-                        }
-                        if debug {
-                            let fields = ollama_non_content_fields(&json);
-                            let field_note = if fields.is_empty() {
-                                "no known non-content fields".to_string()
-                            } else {
-                                format!("non-content fields: {}", fields.join(", "))
-                            };
-                            print_debug(
-                                &format!(
-                                    "empty assistant content with generated tokens — retrying ({}/{SUSPICIOUS_EMPTY_RETRY_CAP}; {field_note})",
-                                    suspicious_empty_retries + 1
-                                ),
-                                color,
-                            );
-                        }
-                        // Phase 20 §2.2: empty content carrying non-content
-                        // fields is the thinking-only quirk — report it at
-                        // detection (at most once per turn) so the prompt-
-                        // inflating corrective retry isn't re-learned from
-                        // scratch every session.
-                        if !thinking_only_reported && !ollama_non_content_fields(&json).is_empty() {
-                            thinking_only_reported = true;
-                            if let Some(hook) = on_round_usage.as_deref_mut() {
-                                hook(RoundObservation::ThinkingOnly);
-                            }
-                        }
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": suspicious_empty_retry_nudge(suspicious_empty_retries, &json)
-                        }));
-                        accumulated_usage = merged;
-                        suspicious_empty_retries += 1;
-                        continue 'round_loop;
+                if generated_unusable_output
+                    && suspicious_empty_retries < SUSPICIOUS_EMPTY_RETRY_CAP
+                {
+                    if trace {
+                        print_trace(&ollama_response_shape(&json), color);
                     }
-
-                    // Both probe and stream are empty — likely context overflow.
-                    // `input_tokens` is the largest single prompt evaluated this
-                    // turn (Step 18.1), so the 85%-of-safe-context check now
-                    // compares one real prompt against the window instead of a
-                    // multi-round sum that inflated past it after ~2 rounds.
-                    let overflow_likely = merged
-                        .as_ref()
-                        .zip(safe_context)
-                        .map(|(u, safe)| u.input_tokens >= safe * 85 / 100)
-                        .unwrap_or(false);
-                    if overflow_likely && overflow_retries < 2 {
-                        emit_overflow_notice(
-                            color,
-                            merged.as_ref(),
-                            safe_context,
-                            model,
-                            overflow_retries + 1,
-                        );
-                        // Compress toward 3/4 of the safe window — comfortably
-                        // under the 85% trigger (was a blunt count trim before
-                        // Step 18.4). The retry happens regardless: it is
-                        // already bounded by `overflow_retries`. The target
-                        // arithmetic stays in real-token space (`safe_context`
-                        // and the schema overhead are real-token figures),
-                        // then converts once into the pipeline's chars/4
-                        // currency (Phase 20 §2.3).
-                        let target = calibrate_down(
-                            safe_context
-                                .map(|s| (s as usize).saturating_mul(3) / 4)
-                                .unwrap_or(0)
-                                .saturating_sub(tool_tokens_real),
-                            cal,
-                        );
-                        let compression = smart_harness::compress(
-                            CompressRequest {
-                                messages: &messages,
-                                budget: target,
-                                max_messages: None,
-                                replay_protected_tail_len: 0,
-                                task: active_task,
-                                hard_budget: true,
-                                // A suspected silent overflow is a real failure
-                                // signal — refuse semantics apply (Step 20.3).
-                                authoritative: true,
-                                focus: None,
-                                est: estimation,
-                                summary_input_cap_floor_chars,
-                                rewrites_history,
-                                compaction_store,
-                                compaction_stage: None,
-                            },
-                            summarizer,
-                            compress_state,
-                            smart_harness,
-                        );
-                        let Some(outcome) = cancellable(cancel, compression).await else {
-                            return Ok((
-                                smart_harness::cancelled(smart_harness, &mut end_reason)?,
-                                false,
-                                accumulated_usage,
-                                hallucination_count,
-                            ));
+                    if debug {
+                        let fields = ollama_non_content_fields(&json);
+                        let field_note = if fields.is_empty() {
+                            "no known non-content fields".to_string()
+                        } else {
+                            format!("non-content fields: {}", fields.join(", "))
                         };
-                        let outcome = outcome?;
-                        if let Some(notice) = outcome.notice {
-                            print_harness_notice(&notice, color);
+                        print_debug(
+                        &format!(
+                            "empty assistant content with generated tokens — retrying ({}/{SUSPICIOUS_EMPTY_RETRY_CAP}; {field_note})",
+                            suspicious_empty_retries + 1
+                        ),
+                        color,
+                    );
+                    }
+                    // Phase 20 §2.2: empty content carrying non-content
+                    // fields is the thinking-only quirk — report it at
+                    // detection (at most once per turn) so the prompt-
+                    // inflating corrective retry isn't re-learned from
+                    // scratch every session.
+                    if !thinking_only_reported && !ollama_non_content_fields(&json).is_empty() {
+                        thinking_only_reported = true;
+                        if let Some(hook) = on_round_usage.as_deref_mut() {
+                            hook(RoundObservation::ThinkingOnly);
                         }
-                        if outcome.fired {
-                            messages = outcome.messages;
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": suspicious_empty_retry_nudge(suspicious_empty_retries, &json)
+                    }));
+                    accumulated_usage = merged;
+                    suspicious_empty_retries += 1;
+                    continue 'round_loop;
+                }
+
+                // Both probe and stream are empty — likely context overflow.
+                // `input_tokens` is the largest single prompt evaluated this
+                // turn (Step 18.1), so the 85%-of-safe-context check now
+                // compares one real prompt against the window instead of a
+                // multi-round sum that inflated past it after ~2 rounds.
+                let overflow_likely = merged
+                    .as_ref()
+                    .zip(safe_context)
+                    .map(|(u, safe)| u.input_tokens >= safe * 85 / 100)
+                    .unwrap_or(false);
+                if overflow_likely && overflow_retries < 2 {
+                    emit_overflow_notice(
+                        color,
+                        merged.as_ref(),
+                        safe_context,
+                        model,
+                        overflow_retries + 1,
+                    );
+                    // Compress toward 3/4 of the safe window — comfortably
+                    // under the 85% trigger (was a blunt count trim before
+                    // Step 18.4). The retry happens regardless: it is
+                    // already bounded by `overflow_retries`. The target
+                    // arithmetic stays in real-token space (`safe_context`
+                    // and the schema overhead are real-token figures),
+                    // then converts once into the pipeline's chars/4
+                    // currency (Phase 20 §2.3).
+                    let target = calibrate_down(
+                        safe_context
+                            .map(|s| (s as usize).saturating_mul(3) / 4)
+                            .unwrap_or(0)
+                            .saturating_sub(tool_tokens_real),
+                        cal,
+                    );
+                    let compression = smart_harness::compress(
+                        CompressRequest {
+                            messages: &messages,
+                            budget: target,
+                            max_messages: None,
+                            replay_protected_tail_len: 0,
+                            task: active_task,
+                            hard_budget: true,
+                            // A suspected silent overflow is a real failure
+                            // signal — refuse semantics apply (Step 20.3).
+                            authoritative: true,
+                            focus: None,
+                            est: estimation,
+                            summary_input_cap_floor_chars,
+                            rewrites_history,
+                            compaction_store,
+                            compaction_stage: None,
+                        },
+                        summarizer,
+                        compress_state,
+                        smart_harness,
+                    );
+                    let Some(outcome) = cancellable(cancel, compression).await else {
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ));
+                    };
+                    let outcome = outcome?;
+                    if let Some(notice) = outcome.notice {
+                        print_harness_notice(&notice, color);
+                    }
+                    if outcome.fired {
+                        messages = outcome.messages;
+                        prompt_tracker.invalidate();
+                        apply_post_compaction_continuation(
+                            &mut messages,
+                            &mut narration_nudges,
+                            outcome.action,
+                            step_ledger,
+                            prompt_context,
+                            round > 0,
+                            action_nudges,
+                        );
+                        record_compaction_artifact(
+                            artifact_sink,
+                            artifact_context,
+                            outcome.action,
+                            outcome.tokens_before,
+                            outcome.tokens_after,
+                            target,
+                            round,
+                            "silent_overflow_recovery",
+                            None,
+                            false,
+                            compress_state.floor_trend(),
+                            color,
+                        );
+                    } else if !rewrites_history {
+                        // Append-only: this fallback is a structural rewrite
+                        // of prior turns, so the preset forbids it — and here
+                        // that matters MORE than under `standard`, not less.
+                        // Compress never fires under append-only, so what was
+                        // the rare branch becomes the only branch: leaving it
+                        // ungated would make the preset that promises the
+                        // transcript is never rewritten rewrite it on every
+                        // suspected overflow. The retry is then identical to
+                        // the request that just came back empty, so there is
+                        // nothing to gain by looping — let the retry budget
+                        // run out and the silent-overflow report stand.
+                    } else {
+                        // N1: the retry must differ from the request that
+                        // just returned empty — when compress was a no-op
+                        // (Fit / nothing reclaimable), fall back to one
+                        // structural prune with a tight protected tail.
+                        let fallback = crate::prune::prune(
+                            &messages,
+                            &crate::prune::PruneConfig {
+                                keep_last: 2,
+                                ..Default::default()
+                            },
+                        );
+                        if fallback.chars_reclaimed > 0 {
+                            let tokens_before = estimate_tokens(&messages, estimation);
+                            let tokens_after = estimate_tokens(&fallback.messages, estimation);
+                            messages = fallback.messages;
                             prompt_tracker.invalidate();
-                            apply_post_compaction_continuation(
-                                &mut messages,
-                                &mut narration_nudges,
-                                outcome.action,
-                                step_ledger,
-                                prompt_context,
-                                round > 0,
-                                action_nudges,
-                            );
                             record_compaction_artifact(
                                 artifact_sink,
                                 artifact_context,
-                                outcome.action,
-                                outcome.tokens_before,
-                                outcome.tokens_after,
+                                CompressAction::Pruned,
+                                tokens_before,
+                                tokens_after,
                                 target,
                                 round,
-                                "silent_overflow_recovery",
+                                "silent_overflow_structural_fallback",
                                 None,
                                 false,
                                 compress_state.floor_trend(),
                                 color,
                             );
-                        } else if !rewrites_history {
-                            // Append-only: this fallback is a structural rewrite
-                            // of prior turns, so the preset forbids it — and here
-                            // that matters MORE than under `standard`, not less.
-                            // Compress never fires under append-only, so what was
-                            // the rare branch becomes the only branch: leaving it
-                            // ungated would make the preset that promises the
-                            // transcript is never rewritten rewrite it on every
-                            // suspected overflow. The retry is then identical to
-                            // the request that just came back empty, so there is
-                            // nothing to gain by looping — let the retry budget
-                            // run out and the silent-overflow report stand.
-                        } else {
-                            // N1: the retry must differ from the request that
-                            // just returned empty — when compress was a no-op
-                            // (Fit / nothing reclaimable), fall back to one
-                            // structural prune with a tight protected tail.
-                            let fallback = crate::prune::prune(
-                                &messages,
-                                &crate::prune::PruneConfig {
-                                    keep_last: 2,
-                                    ..Default::default()
-                                },
-                            );
-                            if fallback.chars_reclaimed > 0 {
-                                let tokens_before = estimate_tokens(&messages, estimation);
-                                let tokens_after = estimate_tokens(&fallback.messages, estimation);
-                                messages = fallback.messages;
-                                prompt_tracker.invalidate();
-                                record_compaction_artifact(
-                                    artifact_sink,
-                                    artifact_context,
-                                    CompressAction::Pruned,
-                                    tokens_before,
-                                    tokens_after,
-                                    target,
-                                    round,
-                                    "silent_overflow_structural_fallback",
-                                    None,
-                                    false,
-                                    compress_state.floor_trend(),
-                                    color,
-                                );
-                            }
-                        }
-                        accumulated_usage = merged;
-                        overflow_retries += 1;
-                        continue 'round_loop;
-                    }
-                    // Phase 20 §2.2: persistent empties past the retry budget
-                    // at ≥85% of the safe window are silent-overflow evidence
-                    // — reported at the exit, with the merged prompt figure,
-                    // before either return below.
-                    if overflow_likely {
-                        if let (Some(hook), Some(u)) =
-                            (on_round_usage.as_deref_mut(), merged.as_ref())
-                        {
-                            hook(RoundObservation::SuspectedOverflow {
-                                prompt_tokens: u.input_tokens,
-                            });
                         }
                     }
-                    if generated_unusable_output {
-                        if trace {
-                            print_trace(&ollama_response_shape(&json), color);
-                        }
-                        // Phase 20 §2.2: the diagnostic exit is also a
-                        // thinking-only detection site (at most once per
-                        // turn; the function returns right after, so the
-                        // turn-local flag needs no update here).
-                        if !thinking_only_reported && !ollama_non_content_fields(&json).is_empty() {
-                            if let Some(hook) = on_round_usage.as_deref_mut() {
-                                hook(RoundObservation::ThinkingOnly);
-                            }
-                        }
-                        if let Some(slot) = &mut end_reason {
-                            **slot = Some(crate::TurnEndReason::Empty);
-                        }
-                        return Ok((
-                            suspicious_empty_ollama_diagnostic(&json),
-                            false,
-                            merged,
-                            hallucination_count,
-                        ));
+                    accumulated_usage = merged;
+                    overflow_retries += 1;
+                    continue 'round_loop;
+                }
+                // Phase 20 §2.2: persistent empties past the retry budget
+                // at ≥85% of the safe window are silent-overflow evidence
+                // — reported at the exit, with the merged prompt figure,
+                // before either return below.
+                if overflow_likely {
+                    if let (Some(hook), Some(u)) = (on_round_usage.as_deref_mut(), merged.as_ref())
+                    {
+                        hook(RoundObservation::SuspectedOverflow {
+                            prompt_tokens: u.input_tokens,
+                        });
                     }
-                    let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
+                }
+                if generated_unusable_output {
+                    if trace {
+                        print_trace(&ollama_response_shape(&json), color);
+                    }
+                    // Phase 20 §2.2: the diagnostic exit is also a
+                    // thinking-only detection site (at most once per
+                    // turn; the function returns right after, so the
+                    // turn-local flag needs no update here).
+                    if !thinking_only_reported && !ollama_non_content_fields(&json).is_empty() {
+                        if let Some(hook) = on_round_usage.as_deref_mut() {
+                            hook(RoundObservation::ThinkingOnly);
+                        }
+                    }
                     if let Some(slot) = &mut end_reason {
                         **slot = Some(crate::TurnEndReason::Empty);
                     }
-                    return Ok((msg.to_string(), false, merged, hallucination_count));
+                    observability::observe_harness_reply(&mut solve_obs);
+                    return Ok((
+                        suspicious_empty_ollama_diagnostic(&json),
+                        false,
+                        merged,
+                        hallucination_count,
+                    ));
                 }
-                // Use probe content; print it since it was never streamed.
-                maybe_nudge_no_tool_content!(probe_content.as_str(), stream_usage);
-                // Phase 20 §2.2: non-empty probe content is usable output.
-                emit_accepted(
-                    &mut on_round_usage,
-                    round_usage,
-                    truncation_suspect,
-                    round_est_raw,
-                );
-                // #1964: this normal (non-cap) finish gets the same claim
-                // check + disclosure gate as a cap-exit summary.
-                let probe_content = finalize_final_text(
-                    probe_content,
-                    workspace,
-                    &caveats.fs_read,
-                    turn_start_head.as_deref(),
-                    disclosure,
-                );
-                return Ok((
-                    probe_content,
-                    false,
-                    merge_round_usage(accumulated_usage, stream_usage),
-                    hallucination_count,
-                ));
-            }
-
-            // A second inference may regress from an answer to a promise. The
-            // probe already passed the completion guard; preserve that answer.
-            if !is_cancelled(cancel)
-                && !probe_content.trim().is_empty()
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &streamed)
-            {
-                emit_accepted(
-                    &mut on_round_usage,
-                    round_usage,
-                    truncation_suspect,
-                    round_est_raw,
-                );
+                let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
                 if let Some(slot) = &mut end_reason {
-                    **slot = Some(crate::TurnEndReason::Completed);
+                    **slot = Some(crate::TurnEndReason::Empty);
                 }
-                let out = finalize_final_text(
-                    probe_content,
-                    workspace,
-                    &caveats.fs_read,
-                    turn_start_head.as_deref(),
-                    disclosure,
-                );
-                return Ok((
-                    out,
-                    false,
-                    merge_round_usage(accumulated_usage, stream_usage),
-                    hallucination_count,
-                ));
+                observability::observe_harness_reply(&mut solve_obs);
+                return Ok((msg.to_string(), false, merged, hallucination_count));
             }
-            if !is_cancelled(cancel)
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &streamed)
-            {
-                let more_rounds = round + 1 < current_tool_round_limit;
-                accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                if retry_readonly_completion(
-                    &mut messages,
-                    &streamed,
-                    None,
-                    &mut readonly_completion_retried,
-                    more_rounds,
-                ) {
-                    continue 'round_loop;
-                }
-                let out = readonly_completion_handoff(
-                    &streamed,
-                    &mut end_reason,
-                    more_rounds,
-                    workspace,
-                    &caveats.fs_read,
-                    turn_start_head.as_deref(),
-                    disclosure,
-                );
-                return Ok((out, false, accumulated_usage, hallucination_count));
-            }
-            // Narrate-then-stop rescue: the model produced prose and no tool
-            // call. If it has already acted this turn (mid-task) or the prose
-            // reads as intent-to-act, nudge it to actually call the tool and run
-            // another round instead of ending the turn — what a human "continue"
-            // does. Bounded by the configured narration_nudge_cap and the round budget so a
-            // chronic narrator can't loop; after the cap the prose is accepted
-            // as the final answer (the return below). A genuine from-the-start
-            // final answer (no prior call, no intent cue) is never nudged.
-            maybe_nudge_no_tool_content!(streamed.as_str(), stream_usage);
-            // Phase 20 §2.2: a non-empty streamed answer is usable output.
+            maybe_nudge_no_tool_content!(probe_content.as_str(), None);
+            // Phase 20 §2.2: non-empty probe content is usable output.
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
                 truncation_suspect,
                 round_est_raw,
             );
-            // #1964: this normal (non-cap) finish gets the same claim check
-            // + disclosure gate as a cap-exit summary.
-            let streamed = finalize_final_text(
-                streamed,
+            // #1964: this normal (non-cap) finish gets the same claim check +
+            // disclosure gate as a cap-exit summary.
+            let probe_content = finalize_final_text(
+                probe_content,
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
                 disclosure,
             );
-            return Ok((
-                streamed,
-                true,
-                merge_round_usage(accumulated_usage, stream_usage),
-                hallucination_count,
-            ));
+            return Ok((probe_content, false, accumulated_usage, hallucination_count));
         }
 
         // Has tool calls — add the assistant turn, then VALIDATE the whole batch
@@ -4294,6 +4037,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         estimation,
         ollama_options,
         prompt_measurement: Default::default(),
+        fell_back: Default::default(),
     };
     let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -6182,6 +5926,8 @@ struct CapExit {
     /// Learning evidence from fresh counts of this immutable summary request.
     /// Admission still probes anew on every attempt; this is never a count cache.
     prompt_measurement: std::sync::Mutex<Option<context_recovery::PromptMeasurement>>,
+    /// Set when the harness wrote the cap-exit text itself (#2372).
+    fell_back: std::sync::atomic::AtomicBool,
 }
 
 impl CapExit {
@@ -6205,6 +5951,8 @@ impl CapExit {
     }
 
     fn fallback(&self) -> (String, bool, Option<crate::TokenUsage>) {
+        self.fell_back
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         (
             cap_exit_fallback(
                 self.max_tool_rounds,
@@ -6266,8 +6014,12 @@ impl CapExit {
                     attempt,
                     rejection.estimated_tokens,
                 )?;
+                observability::observe_harness_reply(observations);
                 return Ok(self.fallback());
             }
+        }
+        if self.fell_back.load(std::sync::atomic::Ordering::Relaxed) {
+            observability::observe_harness_reply(observations);
         }
         result
     }
@@ -6594,7 +6346,8 @@ async fn final_summary_openai(
 /// the OpenAI `tool_calls` / `tool_call_id` / `usage` shapes.
 ///
 /// Primary requests stream on the transport and are validated before tools
-/// execute. Accepted final answers retain the existing display reissue.
+/// execute. An accepted final answer is returned as generated; the host
+/// renders it (#2372).
 pub async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -6640,11 +6393,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         color,
-        // #123: bound, not discarded. The final round is re-issued as a
-        // stream and printed HERE, so the markdown block writer has to run on
-        // this path too — streaming plain text while the non-streaming arm
-        // renders markdown would be a rendering regression.
-        markdown,
+        // #2372: the host renders the accepted reply, markdown included.
+        markdown: _,
         tool_offload,
         spill_store,
         disclosure,
@@ -6716,17 +6466,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
-        // #123 gave this loop a streamed round with a `ThinkFilter` in it, so
-        // the flag is now MEANINGFUL here and still deliberately unused: the
-        // lone-leading-`</think>` quirk (#528) has only ever been observed on
-        // the Ollama wire, and starting the filter INSIDE a reasoning block
-        // would swallow a normal answer from every endpoint that does not have
-        // it. Flip this when a `/v1/chat/completions` endpoint is actually
-        // seen doing it. Bound and ignored rather than dropped from the
-        // pattern: a future field added to ChatCtx then fails HERE, forcing a
-        // decision about what it means for this wire instead of silently
-        // defaulting.
-        emits_leading_reasoning: _,
+        // #2372: the primary content is filtered with the stream filter's
+        // policy — a lone `</think>` is answer text unless the backend
+        // declares the #528 leading shape.
+        emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -6769,7 +6512,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
-    // #123 + #643: the streaming re-issue gets its OWN client, because a
+    // #643: streamed generations get their OWN client, because a
     // whole-request `.timeout()` bounds connect + headers + the ENTIRE body —
     // it aborts a slow-but-progressing token stream the instant total time
     // crosses the deadline (the DGX retry-storm wedge the Ollama path already
@@ -7733,8 +7476,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // and the separate `reasoning_content` channel (reasoning parser on) is read
         // but never concatenated into the reply. Normal replies (no reasoning) are
         // unchanged: `split_reasoning` returns the content verbatim.
-        let (oa_content, inline_reasoning) =
-            crate::reasoning::split_reasoning(message["content"].as_str().unwrap_or(""));
+        let (oa_content, inline_reasoning) = crate::reasoning::ThinkFilter::filter_complete(
+            message["content"].as_str().unwrap_or(""),
+            emits_leading_reasoning,
+        );
         let separate_reasoning = message["reasoning_content"]
             .as_str()
             .map(str::trim)
@@ -8271,159 +8016,33 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
             if content.is_empty() {
                 let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
-            // #123: the answer is ACCEPTED — re-issue it with `stream: true`
-            // so the operator watches it arrive instead of waiting on a
-            // finished paragraph.
-            //
-            // Placement is the whole trick. This sits AFTER the six nudge
-            // gates above, every one of which can `continue 'round_loop`: a
-            // re-issue placed before them would pay for a streamed answer the
-            // harness then throws away, double-billing every nudged round.
-            // The reissue retains the primary request's prompt, tools and
-            // generation policy, with the existing idle timeout for display.
-            let stream_wire_messages = openai_chat_wire_messages(&messages)?;
-            let stream_estimate = estimate_request_tokens(
-                &stream_wire_messages,
-                tools_supported.then_some(&tools),
-                estimation,
-            );
-            let mut stream_body = serde_json::json!({
-                "model": model,
-                "messages": stream_wire_messages,
-                "tools": tools.clone(),
-                "tool_choice": "auto",
-                "stream": true,
-                // Usage rides its own trailing chunk ONLY when asked for;
-                // without this the streamed round reports no tokens at all.
-                "stream_options": {"include_usage": true},
-            });
-            generation_policy.apply_to_chat_completions_body(&mut stream_body);
-            if !tools_supported {
-                if let Some(o) = stream_body.as_object_mut() {
-                    o.remove("tools");
-                    o.remove("tool_choice");
-                }
+            // Esc after the answer arrived: the operator asked to stop, so the
+            // turn ends empty (the round-boundary contract) while the paid
+            // round's usage stands.
+            if is_cancelled(cancel) {
+                return Ok((
+                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
             }
-            let mut stream_req = stream_client.post(&chat_url).json(&stream_body);
-            if let Some(key) = api_key {
-                stream_req = stream_req.bearer_auth(key);
-            }
-            let stream_budget = authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            );
-            let admitted = cancellable(cancel, async {
-                let count =
-                    count_openai_request(&client, &chat_url, api_key, &stream_body, stream_budget)
-                        .await?;
-                enforce_counted_budget(count.as_ref(), stream_budget, stream_estimate)?;
-                Ok::<_, anyhow::Error>(count.map(|count| context_recovery::PromptMeasurement {
-                    tokens: count.tokens,
-                    estimated_tokens: stream_estimate,
-                }))
-            })
-            .await;
-            let streamed = match admitted {
-                Some(Ok(measurement)) => {
-                    if let Some(measurement) = measurement {
-                        measurement.learn(compress_state);
-                    }
-                    openai_stream_final_answer(
-                        stream_req,
-                        attempts,
-                        io::stdout(),
-                        color,
-                        markdown,
-                        debug,
-                        cancel,
-                    )
-                    .await
-                }
-                Some(Err(error)) => {
-                    if let Some(measurement) =
-                        error.downcast_ref::<context_recovery::PromptMeasurement>()
-                    {
-                        measurement.learn(compress_state);
-                    }
-                    if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded
-                    {
-                        StreamOutcome::ContextExceeded(None)
-                    } else {
-                        StreamOutcome::UseProbe(None)
-                    }
-                }
-                None => StreamOutcome::Cancelled(None),
-            };
-            let (out, was_streamed) = match streamed {
-                // A second call, so a second usage record. Merged, not
-                // replaced — and when the server sent none, `merge_round_usage`
-                // keeps what the probe already reported rather than zeroing it.
-                StreamOutcome::Printed(text, stream_usage) => {
-                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    if !is_cancelled(cancel)
-                        && readonly_completion_pending(prompt_disposition, &nudge_classifier, &text)
-                    {
-                        // Re-use the accepted probe; it has already passed every
-                        // gate and the caller must print it after this promise.
-                        (content, false)
-                    } else {
-                        (text, true)
-                    }
-                }
-                // The re-issue produced no usable answer (or a cut fragment,
-                // announced as such). The probe answer is right here — never
-                // return silence, or a truncation, because the second call
-                // failed. Its tokens were still spent, so they still merge.
-                StreamOutcome::UseProbe(stream_usage) => {
-                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    (content, false)
-                }
-                StreamOutcome::ContextExceeded(stream_usage) => {
-                    context_recovery::terminal_optional(
-                        &mut solve_obs,
-                        compress_state,
-                        cal,
-                        round,
-                        cw_retries + 1,
-                        stream_estimate,
-                    )?;
-                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    (content, false)
-                }
-                // Esc, with nothing streamed. Same contract as the interrupt
-                // checkpoint at the top of this loop: the turn ends with an
-                // empty reply rather than printing an answer the operator
-                // just asked to stop. The usage merges like both arms above —
-                // an interrupted call is still a call the operator paid for,
-                // and billing that depended on WHICH way the second call ended
-                // would be a lie about the turn's cost.
-                StreamOutcome::Cancelled(stream_usage) => {
-                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    return Ok((
-                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
-                        false,
-                        accumulated_usage,
-                        hallucination_count,
-                    ));
-                }
-            };
-            // #1964: this normal (non-cap) finish gets the same claim check
-            // + disclosure gate as a cap-exit summary. Note the wart shared
-            // with the Ollama path (mod.rs `finalize_final_text` after
-            // `stream_response`): on the streamed arm this runs AFTER the text
-            // was printed, so a claim-check or disclosure edit changes the
-            // returned string without changing what the operator saw.
+            // #2372: the accepted, gated `content` IS the reply. It is never
+            // generated a second time for display: the host renders it (the TUI
+            // prints a non-streamed reply), so what the operator sees, what the
+            // caller returns and what the ledger counts are one generation.
+            // #1964: the same claim check + disclosure gate as a cap-exit summary.
             let out = finalize_final_text(
-                out,
+                content,
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
                 disclosure,
             );
-            return Ok((out, was_streamed, accumulated_usage, hallucination_count));
+            return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
         // Record the assistant turn (it carries the tool_calls), then VALIDATE the
@@ -8849,6 +8468,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         estimation,
         ollama_options: None,
         prompt_measurement: Default::default(),
+        fell_back: Default::default(),
     };
     let summary = final_summary_openai(
         (&client, &stream_client),
@@ -8941,12 +8561,10 @@ struct AnthropicDispatch<'a> {
 /// [`anthropic_wire::parse_messages_reply`] decodes it.
 ///
 /// `stream:true`: only send()+status-check sit in the retry envelope; the SSE
-/// body is consumed OUTSIDE it (mirrors the Ollama streaming re-issue — a
-/// re-sent body after visible output would re-print). Text deltas print live
-/// following `stream_response`'s display idioms (spinner teardown before the
-/// first visible char, the `▸  ` prefix, the markdown block writer when
-/// markdown is on); thinking deltas go to the spinner detail like the Ollama
-/// `thinking` field. A mid-stream failure follows the #640 policy: with no
+/// body is consumed OUTSIDE it (a re-sent body after visible output would
+/// re-print). Text deltas print live (spinner teardown before the first
+/// visible char, the `▸  ` prefix, the markdown block writer when markdown is
+/// on); thinking deltas go to the spinner detail. A mid-stream failure follows the #640 policy: with no
 /// visible output the round is re-issued under the retry budget; with partial
 /// visible output the partial answer is kept with a notice.
 ///
@@ -9040,8 +8658,8 @@ async fn anthropic_dispatch_round(
         };
         let (resp, attempt) = resp;
 
-        // The ONE spinner (`newt_core::tty`), gated exactly like
-        // `stream_response`; the accumulated round text stays RAW (it is
+        // The ONE spinner (`newt_core::tty`), gated on a colour terminal with
+        // thinking shown; the accumulated round text stays RAW (it is
         // persisted and re-sent), display styling never enters it.
         let mut spinner = crate::tty::Spinner::start_with_caps(
             legacy_caps(d.color && thinking_stream_enabled()),
@@ -9072,8 +8690,7 @@ async fn anthropic_dispatch_round(
         let mut resp = resp;
         while !acc.is_done() {
             match cancellable(cancel, resp.chunk()).await {
-                // Interrupted: stop reading and keep what already streamed
-                // (mirrors `stream_response`'s interrupt contract).
+                // Interrupted: stop reading and keep what already streamed.
                 None => {
                     interrupted = true;
                     break;
@@ -9088,8 +8705,7 @@ async fn anthropic_dispatch_round(
                                 if !started {
                                     // The answer is starting — close the
                                     // reasoning block while the spinner's clock
-                                    // is still readable, then tear it down
-                                    // (stream_response's display convention).
+                                    // is still readable, then tear it down.
                                     if let Some(sp) = spinner.as_ref() {
                                         anth_reason.close(
                                             sp.elapsed(),
@@ -10205,6 +9821,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let streamed = printed_live && !model_reply.text.is_empty();
             if model_reply.text.is_empty() {
                 let out = "the model declined this request (refusal)".to_string();
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, streamed, accumulated_usage, hallucination_count));
             }
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -10727,6 +10344,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let streamed = printed_live && !content.is_empty();
             if content.is_empty() {
                 let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, streamed, accumulated_usage, hallucination_count));
             }
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -11147,6 +10765,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         estimation,
         ollama_options: None,
         prompt_measurement: Default::default(),
+        fell_back: Default::default(),
     };
     let result = final_summary_anthropic(
         &client,
@@ -11538,11 +11157,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
-        // This loop does not call `stream_response`, the only consumer of the
-        // flag (the leading-`</think>` filter is Ollama-wire only today).
-        // Bound and ignored rather than dropped from the pattern: a future
-        // field added to ChatCtx then fails HERE, forcing a decision about
-        // what it means for this wire instead of silently defaulting.
+        // The Responses wire carries reasoning in its own items, never as a
+        // lone leading `</think>` closer, so the declared #528 shape does not
+        // apply. Bound and ignored rather than dropped from the pattern: a
+        // future field added to ChatCtx then fails HERE, forcing a decision
+        // about what it means for this wire instead of silently defaulting.
         emits_leading_reasoning: _,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -13036,84 +12655,6 @@ impl ReasoningTrickle {
     }
 }
 
-/// Who owns the answer sink while a streamed answer paints.
-///
-/// An enum and not two `Option`s because there is exactly ONE owner at a time:
-/// when markdown is on the block writer TAKES the sink, and the `▸  ` prefix
-/// has to be written raw before it does — pushed through the markdown writer
-/// it would be *content*, and a `#` heading right after it would stop being a
-/// heading. Writing the prefix to a second handle on the same stream instead
-/// is what the sprawl note in AGENTS.md is about; here the sink is passed in,
-/// so there is no second handle to reach for.
-enum AnswerSink<W: std::io::Write> {
-    Raw(W),
-    Markdown(MarkdownStreamWriter<W>),
-}
-
-impl<W: std::io::Write> AnswerSink<W> {
-    /// The first visible character of the answer: the `▸  ` prefix, after
-    /// which markdown (when on) takes the sink for the rest of the stream.
-    fn begin(self, color: bool, markdown: bool, cols: usize) -> Self {
-        let mut w = match self {
-            Self::Raw(w) => w,
-            // Called once, guarded by `started`.
-            already => return already,
-        };
-        if color {
-            execute!(
-                w,
-                SetForegroundColor(NEWT_ORANGE_CT),
-                Print("▸  "),
-                ResetColor,
-            )
-            .ok();
-        } else {
-            write!(w, "▸  ").ok();
-        }
-        w.flush().ok();
-        if markdown {
-            Self::Markdown(MarkdownStreamWriter::new(
-                w,
-                RenderOpts { color: true, cols },
-            ))
-        } else {
-            Self::Raw(w)
-        }
-    }
-
-    /// One think-filtered delta, flushed so the operator sees it arrive.
-    fn push(&mut self, t: &str) {
-        match self {
-            Self::Raw(w) => {
-                write!(w, "{t}").ok();
-                w.flush().ok();
-            }
-            Self::Markdown(w) => {
-                w.push(t).ok();
-            }
-        }
-    }
-
-    /// Close the answer and give the sink back, so a notice can be printed
-    /// BELOW it on the same terminal instead of racing it on another handle.
-    fn end(self, started: bool) -> W {
-        match self {
-            Self::Raw(mut w) => {
-                // The raw path closes its own line; `MarkdownStreamWriter`
-                // ends on a newline of its own.
-                if started {
-                    writeln!(w).ok();
-                }
-                w
-            }
-            Self::Markdown(mut w) => {
-                w.finish().ok();
-                w.into_inner()
-            }
-        }
-    }
-}
-
 /// Decode one wire chunk, holding an INCOMPLETE trailing character back for
 /// the next one.
 ///
@@ -13159,487 +12700,6 @@ fn decode_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
             }
         }
     }
-}
-
-/// What the streaming re-issue produced, and so what the caller owes the
-/// operator. Keep an observed capacity rejection distinct from an ordinary
-/// display failure, and an operator interrupt distinct from a broken wire.
-#[derive(Debug)]
-enum StreamOutcome {
-    /// Text reached the terminal: return it with `was_streamed = true` so the
-    /// caller does NOT print it a second time.
-    Printed(String, Option<crate::TokenUsage>),
-    /// The streamed answer is not usable — the request never landed, it
-    /// answered non-2xx, the body carried no text, or the stream was CUT
-    /// before `[DONE]` (the fragment stays on screen under a notice, but it is
-    /// not the answer). The probe answer the caller holds is complete: return
-    /// it with `was_streamed = false` so the caller prints it. Carries any
-    /// usage the second call did report — those tokens were spent whether or
-    /// not the answer arrived.
-    UseProbe(Option<crate::TokenUsage>),
-    /// Preserve the accepted answer, but learn and record the rejected display.
-    ContextExceeded(Option<crate::TokenUsage>),
-    /// The operator interrupted with nothing on screen. End the turn with an
-    /// empty reply, the same contract as the loop's round-boundary interrupt
-    /// checkpoint — an interrupt is not a wire failure to recover from.
-    ///
-    /// Carries usage for the SAME reason `UseProbe` does, and the reason is not
-    /// "the answer arrived" — it is that the tokens were spent. A cancelled
-    /// stream that had already reported usage was billed for a prefill the
-    /// operator paid for and stopped; dropping it here while merging it one arm
-    /// up would make the turn's cost depend on WHICH way the second call
-    /// failed. `None` when the send was never fired, because then nothing was
-    /// spent — an honest absence, not a zero.
-    Cancelled(Option<crate::TokenUsage>),
-}
-
-/// Re-issue an accepted OpenAI-compatible round as a stream and print it live.
-///
-/// `req` is the fully built `stream: true` request (body + auth); building it
-/// at the call site is what keeps this signature reviewable.
-///
-/// No retry envelope, deliberately: the probe answer IS the fallback, and it is
-/// strictly better than re-running a full prefill for a round whose answer is
-/// already in hand.
-///
-/// Display follows [`stream_response`]'s contract exactly — spinner torn down
-/// before the first visible character, the `▸  ` prefix, the markdown block
-/// writer when markdown is on, and the accumulated text kept RAW (it is
-/// returned, persisted and re-sent, so no styling may enter it).
-///
-/// **Reasoning deltas are DISCARDED here, on purpose.** `commit_reasoning_fold`
-/// has already shown this turn's reasoning — it runs on the *probe* response,
-/// before `has_tools` is even computed — so trickling the re-issue's reasoning
-/// would show the operator the same thinking block twice.
-///
-/// `out` is the sink every visible byte goes to — `io::stdout()` in the loop,
-/// a buffer under test. It is a parameter and not `io::stdout()` inline
-/// because the flag this returns is what tells the CALLER not to print: a
-/// suite that can only assert the flag cannot tell "streamed" from "printed
-/// nothing", and a deleted print site ships as a blank turn with the tests
-/// still green.
-async fn openai_stream_final_answer<W: std::io::Write>(
-    req: reqwest::RequestBuilder,
-    attempts: Option<attempt_capture::AttemptScope<'_>>,
-    out: W,
-    color: bool,
-    markdown: bool,
-    debug: bool,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> StreamOutcome {
-    // The re-issue is a WHOLE SECOND inference call, so the send is raced
-    // against the interrupt flag exactly like both sibling wires race theirs:
-    // an already-cancelled turn never fires it (and never pays for it), and Esc
-    // during a slow prefill is felt at once instead of after the server
-    // answers.
-    let sent = match cancellable(
-        cancel,
-        attempt_capture::send(attempts, "primary", req, "stream request failed"),
-    )
-    .await
-    {
-        Some(sent) => sent,
-        // Nothing was sent, so nothing was spent — `None` is the honest figure.
-        None => return StreamOutcome::Cancelled(None),
-    };
-    // Only a printed answer completes the attempt; every other outcome stays
-    // recorded failed until failure and cancellation carry their own usage.
-    let (resp, attempt) = match sent {
-        Ok((r, attempt)) if r.status().is_success() => (r, attempt),
-        Ok((response, _)) => {
-            let status = response.status();
-            let Some((bytes, _read_error)) =
-                cancellable(cancel, crate::retry::read_response_bytes(response)).await
-            else {
-                return StreamOutcome::Cancelled(None);
-            };
-            if cw_overflow::is_context_overflow(&String::from_utf8_lossy(&bytes)) {
-                return StreamOutcome::ContextExceeded(None);
-            }
-            if debug {
-                print_debug(
-                    &format!("stream request {status} — using probe content"),
-                    color,
-                );
-            }
-            return StreamOutcome::UseProbe(None);
-        }
-        Err(error) => {
-            if debug {
-                print_debug(
-                    &format!("stream request failed: {error} — using probe content"),
-                    color,
-                );
-            }
-            return StreamOutcome::UseProbe(None);
-        }
-    };
-
-    let mut spinner = crate::tty::Spinner::start_with_caps(
-        legacy_caps(color && thinking_stream_enabled()),
-        "thinking…",
-        crate::tty::Sink::Stdout,
-        color,
-    );
-    let cols = display::term_cols();
-    let mut sink = AnswerSink::Raw(out);
-    let mut acc = openai_sse::SseAccumulator::new_with_provider_errors();
-    // #385, on this wire: the non-streaming arm of this same loop runs every
-    // reply through `split_reasoning`, so an inline `<think>` block never
-    // reaches the answer. The streamed arm has to hold the identical line, or
-    // turning streaming on would start leaking reasoning into the reply text
-    // that gets printed, returned, persisted, and re-sent. The filter also
-    // spans token boundaries, which a per-delta check could not.
-    let mut think = crate::reasoning::ThinkFilter::new();
-    let mut text = String::new();
-    let mut started = false;
-    let mut transport_break: Option<String> = None;
-    let mut interrupted = false;
-    // The bytes of a character that has only half arrived. See `decode_chunk`.
-    let mut carry: Vec<u8> = Vec::new();
-    let mut resp = resp;
-    while !acc.is_done() && !acc.has_provider_error() {
-        match cancellable(cancel, resp.chunk()).await {
-            // Interrupted: stop reading and keep what already streamed. Record
-            // WHOSE stop this was — a cut socket and a keypress both end the
-            // loop without `[DONE]`, and only one of them is the wire's fault.
-            None => {
-                interrupted = true;
-                break;
-            }
-            Some(Ok(Some(chunk))) => {
-                // Two rolling buffers, one per layer, because `reqwest` splits
-                // where the socket did and the protocol cares about neither
-                // boundary: `decode_chunk` carries half a CHARACTER to the next
-                // chunk, and the accumulator carries half a LINE.
-                for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
-                    let openai_sse::StreamAction::TextDelta(raw) = action else {
-                        // See the doc comment: the fold above already showed it.
-                        continue;
-                    };
-                    // The reasoning half is dropped for the same reason.
-                    let (t, _reasoning) = think.feed_split(&raw);
-                    if t.is_empty() {
-                        continue;
-                    }
-                    if !started {
-                        drop(spinner.take());
-                        sink = sink.begin(color, markdown, cols);
-                        started = true;
-                    }
-                    sink.push(&t);
-                    text.push_str(&t);
-                }
-            }
-            Some(Ok(None)) => break,
-            Some(Err(e)) => {
-                transport_break = Some(e.to_string());
-                break;
-            }
-        }
-    }
-    // Flush any clean tail the filter held back (a trailing run that turned
-    // out not to be the start of a `<think>` tag). When nothing was printed at
-    // all there is nothing to append to: `text` stays empty, and the caller
-    // falls back to the probe answer — which loses nothing, because nothing
-    // reached the terminal.
-    let tail = think.finish();
-    if !tail.is_empty() && started {
-        sink.push(&tail);
-        text.push_str(&tail);
-    }
-    drop(spinner.take());
-    let mut out = sink.end(started);
-    let (round, provider_error) = acc.finish_with_error();
-    // #2313: one decision for the attempt, whatever the caller does with the
-    // text. Ok only for a stream that reached `[DONE]` with no error event and
-    // no interrupt; failed otherwise. Reported usage attaches either way.
-    attempt_capture::finish(
-        attempts,
-        attempt.as_ref(),
-        if round.done && provider_error.is_none() && !interrupted {
-            crate::attempts::AttemptState::Ok
-        } else {
-            crate::attempts::AttemptState::Failed
-        },
-        round.usage,
-    );
-    if !interrupted {
-        if let Some(error) = provider_error {
-            if started {
-                display::write_harness_notice(
-                    &mut out,
-                    "stream rejected the request — the complete answer follows",
-                    color,
-                );
-            }
-            return if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded
-            {
-                StreamOutcome::ContextExceeded(round.usage)
-            } else {
-                StreamOutcome::UseProbe(round.usage)
-            };
-        }
-    }
-    if text.is_empty() {
-        // Nothing reached the terminal, so an interrupt here ends the turn
-        // rather than printing the probe answer the operator just stopped.
-        // The usage still travels: the call FIRED, so whatever it reported was
-        // billed, exactly as on the `UseProbe` arms below.
-        if interrupted {
-            return StreamOutcome::Cancelled(round.usage);
-        }
-        if debug {
-            print_debug("stream produced no text — using probe content", color);
-        }
-        return StreamOutcome::UseProbe(round.usage);
-    }
-    // The operator stopped it. Keep the partial — it is on screen, and
-    // reprinting the complete answer under it is the opposite of what Esc
-    // asked for — but say who stopped it. Reporting a keypress as "the stream
-    // ended before [DONE]" blames the wire for the operator's own decision.
-    if interrupted {
-        display::write_harness_notice(&mut out, "interrupted — keeping the partial answer", color);
-        return StreamOutcome::Printed(text, round.usage);
-    }
-    // A stream that never reached `[DONE]` was CUT: the fragment on screen
-    // stops at whatever byte the socket died on. The probe answer is complete,
-    // was already accepted by every gate, and is what gets persisted and
-    // re-sent, so returning the fragment would silently truncate the turn's
-    // record to whatever arrived. Say the stream was cut, then hand the
-    // complete answer back for the caller to print under it.
-    //
-    // SCOPE — deliberate, and NOT "the siblings were checked and are fine".
-    // Anthropic streams its round directly, so its partial really is all it
-    // has. **Ollama is not in that position and has this exact defect.** It
-    // runs the same probe-then-reissue, is holding the complete answer in
-    // `probe_content`, and recovers only when `resp.chunk()` returns an `Err`
-    // (#640's "stream broke mid-response" arm at that call site). A clean EOF
-    // with no `done:true` chunk is `Ok(None)`, not an error: `stream_response`
-    // hands the fragment back as `Ok`, and the call site returns it as the
-    // turn's answer with `was_streamed = true` while `probe_content` is
-    // dropped. Measured, not inferred — an `/api/chat` mock that streams one
-    // token and closes returns the fragment today.
-    //
-    // Widening the fix there is a separate change, not three lines: `done` has
-    // to come out of `stream_response`, an `interrupted` flag has to come with
-    // it (or Esc gets reported as a broken wire — the defect this wire fixed
-    // one commit ago), and the cut-fragment-with-an-empty-probe corner has to
-    // be decided. It is the same probe-then-reissue question this branch has
-    // already left open, and it is the operator's call.
-    if !round.done {
-        let why = transport_break.unwrap_or_else(|| "stream ended before [DONE]".to_string());
-        display::write_harness_notice(
-            &mut out,
-            &format!("stream cut mid-answer ({why}) — the complete answer follows"),
-            color,
-        );
-        return StreamOutcome::UseProbe(round.usage);
-    }
-    StreamOutcome::Printed(text, round.usage)
-}
-
-/// Take the next complete NDJSON line out of `pending`, decoded and without its
-/// line ending. The buffer holds bytes because a chunk boundary can fall inside
-/// a character; a line is decoded only once it is whole.
-fn next_ndjson_line(pending: &mut Vec<u8>) -> Option<String> {
-    let end = pending.iter().position(|&byte| byte == b'\n')?;
-    let line: Vec<u8> = pending.drain(..=end).collect();
-    Some(
-        String::from_utf8_lossy(&line)
-            .trim_end_matches(['\n', '\r'])
-            .to_string(),
-    )
-}
-
-/// Stream an Ollama NDJSON response, printing tokens as they arrive.
-/// Returns `(accumulated_text, token_usage, complete)`, where `complete` means
-/// the stream reached `done: true` without an interrupt.
-/// Token usage is extracted from the final chunk (`done: true`).
-/// `show_thinking` opts into the cargo-style reasoning spinner (TTY only).
-/// `retain` is where a folded reasoning body is kept so its `/spill open <id>`
-/// handle names something real; `None` on a surface with no archive, and the
-/// fold then degrades to naming the generic command rather than lying about
-/// what can be reopened.
-async fn stream_response(
-    resp: reqwest::Response,
-    color: bool,
-    show_thinking: bool,
-    leading_reasoning: bool,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-    markdown: bool,
-    retain: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
-) -> anyhow::Result<(String, Option<crate::TokenUsage>, bool)> {
-    // The ONE spinner (`newt_core::tty`). `legacy_caps` preserves today's
-    // gating exactly; the shared 100ms OS-thread ticker replaces the old
-    // advance-only-on-a-reasoning-chunk clock, so a model STALL now shows a
-    // live glyph instead of a frozen one — the "looks hung" signature.
-    let mut spinner = crate::tty::Spinner::start_with_caps(
-        legacy_caps(show_thinking),
-        "thinking…",
-        crate::tty::Sink::Stdout,
-        color,
-    );
-    let mut full = String::new();
-    let mut started = false;
-    let mut usage: Option<crate::TokenUsage> = None;
-    // The reasoning block: bounded by the SAME budget committed tool results
-    // spend, so `/spill 5` sets both and the operator has one dial rather than
-    // two. `Stream` keeps the historical unbounded trickle by passing 0.
-    let fold_mode = thinking_mode() == crate::ThinkingMode::Fold;
-    let spill_budget = if fold_mode { display::spill_lines() } else { 0 };
-    let mut reason = ReasoningTrickle::default();
-    // Step 25.3 (#568): when markdown is active, route the *visible* token stream
-    // through the block-aware writer (inline lines render per completed line;
-    // fences/tables hold until they close). The accumulated `full` stays RAW —
-    // it is persisted and re-sent to the model, so it must carry no ANSI. The
-    // caller gates `markdown` on `color`, so the writer renders with `color: true`.
-    let cols = display::term_cols();
-    let mut md =
-        markdown.then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
-    // #385: suppress inline <think>…</think> reasoning from the live stream + the
-    // accumulated reply, even when a tag is split across token boundaries.
-    // #528: models that emit a lone leading `</think>` (no opener) start the
-    // filter *inside* the reasoning block so the closer + reasoning don't leak.
-    let mut think = if leading_reasoning {
-        crate::reasoning::ThinkFilter::with_leading_reasoning()
-    } else {
-        crate::reasoning::ThinkFilter::new()
-    };
-
-    let mut resp = resp;
-    let mut done = false;
-    let mut interrupted = false;
-    // The tail of an NDJSON line that arrived without its newline: a line
-    // straddles chunk boundaries, and the `done` line decides the attempt state.
-    // Bytes, not text: a chunk boundary can also fall inside a character.
-    let mut pending: Vec<u8> = Vec::new();
-    // Race each chunk read against the interrupt flag so Esc stops the token
-    // stream promptly; on interrupt, stop reading and return what we have.
-    'read: loop {
-        let chunk = match cancellable(cancel, resp.chunk()).await {
-            Some(c) => c?,
-            None => {
-                interrupted = true;
-                break;
-            }
-        };
-        let eof = chunk.is_none();
-        match chunk {
-            Some(chunk) => pending.extend_from_slice(&chunk),
-            // EOF terminates an unterminated final line.
-            None => pending.push(b'\n'),
-        }
-        while let Some(line) = next_ndjson_line(&mut pending) {
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            let raw = json["message"]["content"].as_str().unwrap_or("");
-            let (token, reasoning) = think.feed_split(raw);
-            // Surface reasoning live (cargo-style) — both the inline `<think>`
-            // span the filter just split out AND any separate `thinking` field.
-            //
-            // In `Fold` mode the trickle is BOUNDED: `reason` decides, per
-            // completed line, whether it still fits the `spill_lines` budget.
-            // Lines past it are retained rather than printed, so the block can
-            // be reopened whole instead of burying the answer under it. This
-            // is also where the Ollama path stopped DROPPING the body — before
-            // it went to the spinner and nowhere else, so a fold here would
-            // have had nothing to expand into.
-            if let Some(sp) = spinner.as_ref() {
-                if !reasoning.is_empty() {
-                    reason.feed(sp, &reasoning, spill_budget);
-                }
-                if let Some(t) = json["message"]["thinking"].as_str() {
-                    if !t.is_empty() {
-                        reason.feed(sp, t, spill_budget);
-                    }
-                }
-            }
-            let token = token.as_str();
-            if !token.is_empty() {
-                if !started {
-                    // The answer is starting — close the reasoning block, then
-                    // tear the spinner down. In that order: the closing line
-                    // reads the spinner's own clock, which is the one the
-                    // operator has been watching count up.
-                    if let Some(sp) = spinner.as_ref() {
-                        reason.close(sp.elapsed(), retain.as_deref(), color);
-                    }
-                    drop(spinner.take());
-                    if color {
-                        execute!(
-                            io::stdout(),
-                            SetForegroundColor(NEWT_ORANGE_CT),
-                            Print("▸  "),
-                            ResetColor,
-                        )
-                        .ok();
-                    } else {
-                        print!("▸  ");
-                    }
-                    started = true;
-                }
-                if let Some(w) = md.as_mut() {
-                    w.push(token).ok();
-                } else {
-                    print!("{token}");
-                    io::stdout().flush().ok();
-                }
-                full.push_str(token);
-            }
-            if json["done"].as_bool().unwrap_or(false) {
-                done = true;
-                // Extract token counts from the final Ollama chunk.
-                let input = json["prompt_eval_count"].as_u64().map(|n| n as u32);
-                let output = json["eval_count"].as_u64().map(|n| n as u32);
-                usage = input.zip(output).map(|(i, o)| crate::TokenUsage {
-                    input_tokens: i,
-                    output_tokens: o,
-                });
-                // Finished: never poll the socket (or the interrupt) again.
-                break 'read;
-            }
-        }
-        if eof {
-            break;
-        }
-    }
-    // #385: flush any clean tail the filter held back (a trailing run that turned out
-    // not to be the start of a `<think>` tag).
-    let tail = think.finish();
-    if !tail.is_empty() {
-        if !started {
-            drop(spinner.take());
-            print!("▸  ");
-            started = true;
-        }
-        if let Some(w) = md.as_mut() {
-            w.push(&tail).ok();
-        } else {
-            print!("{tail}");
-            io::stdout().flush().ok();
-        }
-        full.push_str(&tail);
-    }
-    // All-reasoning response (no clean content): tear the spinner down anyway so
-    // the terminal isn't left mid-spinner. (Belt-and-braces: `Drop` covers every
-    // path out of this function, INCLUDING the `?` on a mid-stream transport
-    // error above, which used to skip every hand-placed `finish()` and leave a
-    // glyph on screen with no live owner.)
-    drop(spinner.take());
-    // The markdown writer newline-terminates each line it emits, so it owns the
-    // trailing newline; only the raw path needs the closing `println!`.
-    if let Some(w) = md.as_mut() {
-        w.finish().ok();
-    }
-    if started && md.is_none() {
-        println!();
-    }
-    Ok((full, usage, done && !interrupted))
 }
 
 #[cfg(test)]
@@ -13713,9 +12773,8 @@ mod http_loop_tests;
 #[cfg(test)]
 #[path = "mod_tests/anthropic_loop.rs"]
 mod anthropic_loop_tests;
-// #123: the OpenAI-compatible streaming re-issue — that the loop streams the
-// round it accepts (and only that round), and that every way the second call
-// can fail lands on the probe answer instead of on silence.
+// The OpenAI-compatible final answer (#123, #2372): one generation, returned
+// as the gates accepted it, with no display reissue.
 #[cfg(test)]
 #[path = "mod_tests/openai_stream_loop.rs"]
 mod openai_stream_loop_tests;

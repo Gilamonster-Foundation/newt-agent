@@ -2,7 +2,7 @@
 //! at the send, from the exact bytes on the wire.
 //!
 //! Recording where round usage is merged cannot count attempts honestly: one
-//! merged round can be a probe plus a stream reissue, and every send sits inside
+//! merged round can span several sends, and every send sits inside
 //! a retry loop that resends identical bytes. Keying the attempt from the built
 //! request's body is the only point that sees exactly one attempt per HTTP
 //! request, and it sees smart-harness projected bytes as they are sent.

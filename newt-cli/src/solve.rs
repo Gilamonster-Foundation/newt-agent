@@ -818,6 +818,17 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             required: &args.require_feature,
         },
     ));
+    // #2372: the Chat and Ollama loops return their answer unprinted, so show it
+    // here, before anything that can fail — the model's final claim is what a
+    // transcript tail must carry. `▸` marks a model claim only; harness-written
+    // text (an empty-response note, a cap fallback) is a harness notice.
+    if let Some(o) = o_opt.filter(|o| !o.was_streamed && !o.reply.is_empty()) {
+        if o.harness_reply {
+            newt_core::agentic::print_harness_notice(&o.reply, false);
+        } else {
+            println!("▸  {}", o.reply);
+        }
+    }
     if let Some(path) = &args.events {
         let mut f = std::fs::OpenOptions::new()
             .create(true)

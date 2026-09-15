@@ -15,9 +15,11 @@
 //! Two surfaces:
 //! - [`split_reasoning`] — batch, for a fully-assembled reply (the non-streaming
 //!   completion paths).
-//! - [`ThinkFilter`] — incremental, for the streaming path, where a `<think>` block
+//! - [`ThinkFilter`] — incremental, for a streamed reply, where a `<think>` block
 //!   spans token boundaries (`<thi` / `nk>…</thi` / `nk>`) and must be suppressed
-//!   live without ever printing a partial tag.
+//!   live without ever printing a partial tag; and
+//!   [`ThinkFilter::filter_complete`] applies the same declared policy to a
+//!   complete reply (#2372).
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
@@ -182,6 +184,28 @@ impl ThinkFilter {
         (clean, reasoning)
     }
 
+    /// Filter a COMPLETE reply exactly as a stream of it would be (#2372):
+    /// [`new`](Self::new) for an undeclared backend — a lone `</think>` in the
+    /// text is ordinary answer text — or
+    /// [`with_leading_reasoning`](Self::with_leading_reasoning) when the backend
+    /// declares that shape (#384, #528). Returns the clean reply and any
+    /// suppressed reasoning; a reply with nothing suppressed is returned
+    /// byte-for-byte.
+    #[must_use]
+    pub fn filter_complete(content: &str, leading_reasoning: bool) -> (String, Option<String>) {
+        let mut filter = if leading_reasoning {
+            Self::with_leading_reasoning()
+        } else {
+            Self::new()
+        };
+        let (mut clean, reasoning) = filter.feed_split(content);
+        clean.push_str(&filter.finish());
+        match non_empty(reasoning.trim()) {
+            Some(reasoning) => (clean.trim().to_string(), Some(reasoning)),
+            None => (clean, None),
+        }
+    }
+
     /// Flush at end of stream: emits any buffered clean tail (an unterminated
     /// `<think>` leaves its reasoning suppressed).
     pub fn finish(&mut self) -> String {
@@ -241,6 +265,38 @@ fn safe_len(buf: &str, tag: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2372: a complete reply follows the declared stream policy, not the
+    /// batch lone-closer rule.
+    #[test]
+    fn filter_complete_follows_the_declared_reasoning_shape() {
+        let undeclared = "End the block with `</think>` and then answer.";
+        assert_eq!(
+            ThinkFilter::filter_complete(undeclared, false),
+            (undeclared.to_string(), None),
+            "an undeclared backend keeps a lone closer as answer text"
+        );
+        assert_eq!(
+            ThinkFilter::filter_complete("plan</think>Done.", true),
+            ("Done.".to_string(), Some("plan".to_string()))
+        );
+        let (clean, reasoning) =
+            ThinkFilter::filter_complete("plan</think>Use the <think> tag", true);
+        assert!(
+            !clean.contains("plan") && !clean.contains("</think>"),
+            "{clean:?}"
+        );
+        assert!(reasoning.is_some_and(|r| r.starts_with("plan")));
+        assert_eq!(
+            ThinkFilter::filter_complete("<think>x</think>Done.", false),
+            ("Done.".to_string(), Some("x".to_string()))
+        );
+        assert_eq!(
+            ThinkFilter::filter_complete("no reasoning at all", true),
+            ("no reasoning at all".to_string(), None),
+            "a declared backend that did not reason loses nothing"
+        );
+    }
 
     #[test]
     fn no_tags_is_untouched() {

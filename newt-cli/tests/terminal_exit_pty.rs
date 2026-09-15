@@ -31,14 +31,13 @@ const PROMPT: &str = "What is two plus two? Give a short answer.";
 const ANSWER: &str = "The answer is four. TERM_EXIT_ANSWER.";
 const LEAN_READY: &str = "TERM_EXIT_READY> ";
 // TurnMetrics::display_line for the provider turn, priced by the fixture's
-// `[pricing.overrides]` rate ($1 per 1k tokens each way). The turn sends two
-// generation requests (the accepted answer and its display reissue, #2372),
-// each reporting 32 in / 12 out, so the per-attempt totals are 64 in / 24 out
-// and the price is $0.088 (#2313). The line only reads this way when the TUI
-// passes its per-turn attempt ledger AND prices those totals: without the
-// ledger it reads "cost unknown", and priced on the context merge (32 in /
-// 24 out) it reads "~$0.0560". Independent of elapsed time.
-const TURN_METRICS: &str = " 64 in / 24 out · ~$0.0880";
+// `[pricing.overrides]` rate ($1 per 1k tokens each way). The turn sends one
+// generation request (the accepted answer is not reissued for display, #2372)
+// reporting 32 in / 12 out, so the per-attempt totals are 32 in / 12 out and the
+// price is $0.044 (#2313). The line only reads this way when the TUI passes its
+// per-turn attempt ledger AND prices those totals: without the ledger it reads
+// "cost unknown". Independent of elapsed time.
+const TURN_METRICS: &str = " 32 in / 12 out · ~$0.0440";
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {
@@ -429,8 +428,7 @@ net = []
     let saw_prompt = requests.iter().any(|request| carries_prompt(&request));
     // #2313: the metrics line above is priced on the turn's per-attempt
     // totals, and those attempts are exactly the turn's generation requests
-    // (the answer and its display reissue). The startup capability `ping` is
-    // not part of the turn.
+    // (one: the answer). The startup capability `ping` is not part of the turn.
     let turn_requests = requests
         .iter()
         .filter(|request| request.url.path() == "/v1/chat/completions")
@@ -438,7 +436,7 @@ net = []
         .count();
     assert_eq!(
         turn_requests,
-        if provider_turn { 2 } else { 0 },
+        if provider_turn { 1 } else { 0 },
         "{case}: attempts == the turn's generation requests"
     );
     assert_eq!(

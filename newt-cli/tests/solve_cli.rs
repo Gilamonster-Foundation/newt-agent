@@ -114,13 +114,12 @@ impl Respond for CaptureThenFinish {
             .lock()
             .expect("request capture lock")
             .push(body);
-        // Primary and final-display requests both use SSE. Each is
-        // captured like any other request — it goes to the same
-        // endpoint and carries the same wire controls, so the assertions about
-        // both apply to it too.
+        // The primary request uses SSE. Every generation reports 7 output tokens, so a contract that counts
+        // two generations for one answer reads 14 (#2372).
         if streaming {
             let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
-            let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+            let usage = serde_json::json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 7}});
+            let sse = format!("data: {frame}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
             return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
         }
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -128,7 +127,8 @@ impl Respond for CaptureThenFinish {
             "choices": [{
                 "message": {"role": "assistant", "content": "done"},
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 7}
         }))
     }
 }
@@ -809,6 +809,151 @@ async fn solve_scratchpad_state_reaches_wire_and_receipt() {
     );
 }
 
+/// #2372: `newt solve` shows the model's final claim on stdout exactly once on
+/// every wire. Chat Completions returns its answer unprinted, so solve prints
+/// it; Anthropic streams it itself, so solve must not print it again. The
+/// claim is what a transcript tail and false-completion forensics read.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
+    const CLAIM: &str = "FINAL-CLAIM-2372 every check passed";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["stream"].as_bool().unwrap_or(false) {
+                let frame = serde_json::json!({"choices": [{"delta": {"content": CLAIM}, "finish_reason": "stop"}]});
+                let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": CLAIM}, "finish_reason": "stop"}]
+            }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(|_request: &Request| {
+            let frames = [
+                serde_json::json!({"type": "message_start", "message": {"model": "m", "usage": {"input_tokens": 5}}}),
+                serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": CLAIM}}),
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+                serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}}),
+                serde_json::json!({"type": "message_stop"}),
+            ];
+            let body: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+            ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
+        })
+        .mount(&server)
+        .await;
+
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    for kind in ["openai", "anthropic"] {
+        let output = Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .env_remove("NEWT_ANTHROPIC_STREAM")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", "m"])
+            .args(["--backend-kind", kind])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .args(["--max-rounds", "1"])
+            .output()
+            .expect("run newt solve");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(stdout.matches(CLAIM).count(), 1, "{kind}: {stdout}");
+    }
+
+    // The answer is shown before anything that can fail: an unwritable
+    // --events path (a directory) fails the run, and the claim is still there.
+    let output = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .args(["--backend-endpoint", &server.uri()])
+        .args(["--backend-model", "m"])
+        .args(["--backend-kind", "openai"])
+        .args(["solve", "--cwd"])
+        .arg(fixture.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(fixture.path())
+        .args(["--max-rounds", "1"])
+        .output()
+        .expect("run newt solve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a directory is not an events file"
+    );
+    assert_eq!(
+        stdout.matches(&format!("▸  {CLAIM}")).count(),
+        1,
+        "{stdout}"
+    );
+}
+
+/// #2372: `▸` marks the model's claim. A reply the harness wrote itself — here
+/// the empty-response note — is printed as a harness notice, never as a claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["stream"].as_bool().unwrap_or(false) {
+                let frame = serde_json::json!({"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]});
+                let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]
+            }))
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    let output = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .args(["--backend-endpoint", &server.uri()])
+        .args(["--backend-model", "m"])
+        .args(["--backend-kind", "openai"])
+        .args(["solve", "--cwd"])
+        .arg(fixture.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .args(["--max-rounds", "1"])
+        .output()
+        .expect("run newt solve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("⚠  newt: (model returned an empty response"),
+        "the harness text is a notice: {stdout}"
+    );
+    assert!(
+        !stdout.contains("▸  (model returned"),
+        "never a claim: {stdout}"
+    );
+}
+
 /// An explicit config file selects the configuration source, but it must not
 /// defeat the higher-precedence per-invocation backend pin. This real process
 /// test leaves the file's endpoint unreachable: success therefore proves the
@@ -875,9 +1020,9 @@ kind = "openai"
         .success();
 
     let requests = requests.lock().expect("request capture lock");
-    // The probe round plus its #123 streaming re-issue — both to the CLI
-    // endpoint, both naming the CLI-overridden model.
-    assert_eq!(requests.len(), 2, "the CLI endpoint served the turn");
+    // #2372: one generation for the one answer, to the CLI endpoint, naming
+    // the CLI-overridden model.
+    assert_eq!(requests.len(), 1, "the CLI endpoint served the turn");
     for request in requests.iter() {
         assert_eq!(request["model"], "operator-model");
     }
@@ -893,6 +1038,8 @@ kind = "openai"
     let contract = contract_from(&events_path);
     assert_eq!(contract["requested_model"], "operator-model");
     assert_eq!(contract["backend"]["name"], "cli");
+    // #2372: the answer was generated once, so it is counted once.
+    assert_eq!(contract["timing"]["gen_tokens"], 7, "{contract}");
 }
 
 /// A cognition dial is an intent, not evidence that a backend received the
@@ -950,10 +1097,9 @@ api = "chat_completions"
         .success();
 
     let requests = requests.lock().expect("request capture lock");
-    // The probe round plus its #123 streaming re-issue. Neither may carry
-    // cognition controls: a dial is an intent, not evidence the endpoint
-    // supports the wire fields, and the streamed round is the same wire.
-    assert_eq!(requests.len(), 2);
+    // #2372: one generation. It may not carry cognition controls: a dial is an
+    // intent, not evidence the endpoint supports the wire fields.
+    assert_eq!(requests.len(), 1);
     for request in requests.iter() {
         assert!(request.get("max_tokens").is_none());
         assert!(request.get("chat_template_kwargs").is_none());
