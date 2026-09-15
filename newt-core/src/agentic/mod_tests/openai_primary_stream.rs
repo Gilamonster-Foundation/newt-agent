@@ -284,8 +284,8 @@ async fn invalid_streamed_arguments_are_rejected_per_call_and_retried() {
         let seen = seen.lock().unwrap();
         assert_eq!(
             seen.len(),
-            4,
-            "{label}: rejected batch, retried batch, answer, display reissue"
+            3,
+            "{label}: rejected batch, retried batch, answer (#2388 removed the display reissue)"
         );
         let echoed: Vec<_> = seen[1]["messages"]
             .as_array()
