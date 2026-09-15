@@ -45,6 +45,36 @@ pub struct RawModeGuard {
 }
 
 impl RawModeGuard {
+    /// Temporarily lend the terminal with the exact mode this owner inherited.
+    /// The returned guard restores the current mode when the borrower exits.
+    /// The borrow keeps this owner alive until that suspension has dropped.
+    ///
+    /// # Errors
+    ///
+    /// Reading or restoring stdin's terminal settings failed.
+    #[cfg(unix)]
+    pub fn suspend(&self) -> io::Result<impl Drop + '_> {
+        // SAFETY: same owned stdin termios round-trip as enter; the temporary
+        // guard records the current raw mode instead of replacing the owner's
+        // original snapshot. Both normal exit and unwind restore in order.
+        unsafe {
+            let mut current: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut current) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let saved = self
+                .prev
+                .as_ref()
+                .expect("a live guard retains its snapshot");
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                prev: Some(current),
+            })
+        }
+    }
+
     /// Take raw mode, remembering what to put back.
     ///
     /// # Errors

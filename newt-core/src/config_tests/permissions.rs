@@ -8,6 +8,46 @@ use crate::caveats::CaveatsExt;
 // --- ToolPermissions / to_caveats ---
 
 #[test]
+fn mcp_net_prompt_default_is_typed_and_roundtrips() {
+    use crate::PermissionAction;
+    let default: ToolPermissions = toml::from_str("").unwrap();
+    assert_eq!(default.mcp_net_prompt_default, PermissionAction::AllowOnce);
+    assert_eq!(default, ToolPermissions::default());
+    for action in [
+        PermissionAction::AllowOnce,
+        PermissionAction::AllowSession,
+        PermissionAction::AllowPermanent,
+        PermissionAction::Deny,
+        PermissionAction::DenyAlways,
+        PermissionAction::DenyPermanent,
+    ] {
+        let configured: ToolPermissions =
+            toml::from_str(&format!("mcp_net_prompt_default = {:?}", action.as_str())).unwrap();
+        assert_eq!(configured.mcp_net_prompt_default, action);
+        assert_eq!(
+            toml::from_str::<ToolPermissions>(&toml::to_string(&configured).unwrap()).unwrap(),
+            configured
+        );
+        assert_eq!(
+            configured.to_caveats("/ws"),
+            default.to_caveats("/ws"),
+            "a prompt default grants nothing before an answer"
+        );
+    }
+}
+
+#[test]
+fn mcp_net_prompt_default_rejects_controls_and_unknown_actions() {
+    for action in ["back", "exit", "allow_everything", "A"] {
+        assert!(
+            toml::from_str::<ToolPermissions>(&format!("mcp_net_prompt_default = {action:?}"))
+                .is_err(),
+            "invalid configured default {action}"
+        );
+    }
+}
+
+#[test]
 fn workspace_dev_allows_cargo_and_just() {
     let perms = ToolPermissions::default(); // WorkspaceDev
     let cav = perms.to_caveats("/workspace");
@@ -50,6 +90,7 @@ fn workspace_dev_allows_extra_exec() {
         extra_exec: vec!["bacon".into(), "make".into()],
         net: vec![],
         prompt: false,
+        ..Default::default()
     };
     let cav = perms.to_caveats("/workspace");
     assert!(cav.permits_exec("bacon"));
@@ -64,6 +105,7 @@ fn read_only_blocks_writes_and_exec() {
         extra_exec: vec![],
         net: vec![],
         prompt: false,
+        ..Default::default()
     };
     let cav = perms.to_caveats("/workspace");
     assert!(!cav.permits_fs_write("/workspace/src/main.rs"));
@@ -78,6 +120,7 @@ fn workspace_edit_allows_write_blocks_exec() {
         extra_exec: vec![],
         net: vec![],
         prompt: false,
+        ..Default::default()
     };
     let cav = perms.to_caveats("/workspace");
     assert!(!cav.permits_exec("cargo"));
@@ -126,6 +169,7 @@ fn full_access_is_top() {
         extra_exec: vec![],
         net: vec![],
         prompt: false,
+        ..Default::default()
     };
     let cav = perms.to_caveats("/workspace");
     assert_eq!(cav, crate::caveats::Caveats::top());
@@ -149,6 +193,7 @@ fn net_allowlist_controls_the_net_axis() {
         extra_exec: vec![],
         net: vec!["docs.rs".into(), "github.com".into()],
         prompt: false,
+        ..Default::default()
     }
     .to_caveats("/ws");
     assert!(
@@ -162,6 +207,7 @@ fn net_allowlist_controls_the_net_axis() {
         extra_exec: vec![],
         net: vec!["*".into()],
         prompt: false,
+        ..Default::default()
     }
     .to_caveats("/ws");
     assert!(
@@ -181,6 +227,7 @@ fn custom_is_workspace_dev_not_top() {
         extra_exec: vec!["bacon".into()],
         net: vec![],
         prompt: false,
+        ..Default::default()
     }
     .to_caveats("/workspace");
     assert_ne!(
@@ -197,6 +244,7 @@ fn custom_is_workspace_dev_not_top() {
         extra_exec: vec!["bacon".into()],
         net: vec![],
         prompt: false,
+        ..Default::default()
     }
     .to_caveats("/workspace");
     assert_eq!(
@@ -232,6 +280,7 @@ fn tool_permissions_toml_roundtrip() {
         extra_exec: vec!["bacon".into()],
         net: vec![],
         prompt: false,
+        ..Default::default()
     };
     let toml = toml::to_string(&perms).unwrap();
     assert!(toml.contains("workspace_dev"));

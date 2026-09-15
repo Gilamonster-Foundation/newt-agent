@@ -146,7 +146,7 @@ fn permission_policy(
     actions.push(OfferedAction {
         action: PromptChoice::Deny,
         key: "d",
-        label: "deny (default)",
+        label: "deny",
     });
     if terminal {
         actions.push(OfferedAction {
@@ -188,6 +188,33 @@ pub(crate) fn permission_definition(
     danger: &danger::DangerTable,
     audience: Audience,
 ) -> InteractionDefinition {
+    permission_definition_with_default(req, danger, audience, PromptChoice::Deny).0
+}
+
+fn permission_interaction(
+    req: &newt_core::PermissionRequest,
+    danger: &danger::DangerTable,
+    mcp_default: PromptChoice,
+) -> SurfaceInteraction {
+    if req.tool != "mcp connect" || req.kind != newt_core::DenialKind::Net {
+        return SurfaceInteraction::blocking(permission_definition(
+            req,
+            danger,
+            Audience::Terminal,
+        ));
+    }
+    let (definition, default) =
+        permission_definition_with_default(req, danger, Audience::Terminal, mcp_default);
+    SurfaceInteraction::blocking(definition)
+        .with_default_option(OptionId::new(default.as_str()).expect(WIRE_NAMES_ARE_OPTION_IDS))
+}
+
+fn permission_definition_with_default(
+    req: &newt_core::PermissionRequest,
+    danger: &danger::DangerTable,
+    audience: Audience,
+    default: PromptChoice,
+) -> (InteractionDefinition, PromptChoice) {
     use newt_core::DenialKind;
     let (verb, axis) = match req.kind {
         DenialKind::Exec => ("run", "outside the granted exec allowlist"),
@@ -220,6 +247,12 @@ pub(crate) fn permission_definition(
     };
 
     let (offered, note) = permission_policy(req, danger, audience);
+    // A configured default cannot introduce an action the policy withheld.
+    let default = if offered.iter().any(|offer| offer.action == default) {
+        default
+    } else {
+        PromptChoice::Deny
+    };
     let options = offered
         .into_iter()
         .map(|offer| ChoiceOption {
@@ -228,7 +261,11 @@ pub(crate) fn permission_definition(
             // the adapter round trip field-identical.
             id: OptionId::new(offer.action.as_str()).expect(WIRE_NAMES_ARE_OPTION_IDS),
             role: role_of(offer.action),
-            label: offer.label.to_string(),
+            label: if offer.action == default {
+                format!("{} (default)", offer.label)
+            } else {
+                offer.label.to_string()
+            },
             key: offer.key.to_string(),
             aliases: Vec::new(),
         })
@@ -238,8 +275,7 @@ pub(crate) fn permission_definition(
         id: ControlId::new(DECISION_CONTROL).expect(WIRE_NAMES_ARE_OPTION_IDS),
         kind: ControlKind::Choice { options },
         label: String::new(),
-        // A permission prompt must be answered: an unanswered one
-        // denies by default, which is a decision, not an absence.
+        // A permission prompt requires an answer; input loss is never consent.
         requirement: Requirement::Required,
     }];
     // DERIVED, not hardcoded (#1912). The offered actions vary by denial kind,
@@ -263,7 +299,7 @@ pub(crate) fn permission_definition(
         controls,
     );
     definition.note = note;
-    definition
+    (definition, default)
 }
 
 /// Why the `expect`s above cannot fire.
@@ -369,12 +405,15 @@ pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::Capability
 /// it is what makes a keystroke redraw the answer row rather than the menu.
 pub(crate) fn prompt_permission_choice(
     w: &PromptWindow,
-    definition: &InteractionDefinition,
+    interaction: &SurfaceInteraction,
 ) -> PromptChoice {
+    let definition = &interaction.definition;
     let prompt = format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(definition));
     // A permission menu offers visible options; there is nothing to mask.
     match read_prompt_window_line(w, &prompt, Echo::Chars) {
-        Ok(ModalLine::Line(answer)) => decode_answer(definition, &answer),
+        Ok(ModalLine::Line(answer)) => {
+            decode_answer(definition, interaction.answer_or_default(&answer))
+        }
         Ok(ModalLine::Back) => PromptChoice::Back,
         Ok(ModalLine::Exit) => PromptChoice::Exit,
         Ok(ModalLine::Eof) | Err(_) => PromptChoice::Deny,
@@ -588,6 +627,8 @@ mod slash_prompt_tests;
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
+    /// Trusted configured terminal MCP default; None uses the shipped choice.
+    pub(crate) mcp_net_prompt_default: Option<PromptChoice>,
     /// Opt-in attach-surface decision channel; `None` uses the terminal.
     pub(crate) web_store: Option<newt_core::ConversationStore>,
     /// The workspace fence this session is confined to (B0b-1, #1842).
@@ -703,7 +744,7 @@ impl PermissionPromptState {
 /// Prompts, records, and re-mints from the user root without widening the live key.
 pub(crate) struct PromptPermissionGate<
     'a,
-    F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice,
+    F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice,
 > {
     pub(crate) state: &'a mut PermissionPromptState,
     /// Enforced caveats at turn start.
@@ -756,7 +797,7 @@ fn direct_authorization_window() -> PromptWindow {
     Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization)
 }
 
-impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPermissionGate<'_, F> {
+impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermissionGate<'_, F> {
     /// Reuse the permission gate for MCP startup, preserving the lifetime of
     /// the operator's grant without changing the session capability.
     pub(crate) fn ask_mcp_net_grant(
@@ -1410,7 +1451,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
     }
 }
 
-impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core::PermissionGate
+impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::PermissionGate
     for PromptPermissionGate<'_, F>
 {
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
@@ -1513,16 +1554,19 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                     // which meant the value displayed and the value
                     // authorized against were two objects that happened to
                     // agree; now they are one.
-                    let interaction = SurfaceInteraction::blocking(permission_definition(
+                    let interaction = permission_interaction(
                         req,
                         &self.danger,
-                        Audience::Terminal,
-                    ));
+                        self.state.mcp_net_prompt_default.unwrap_or_else(|| {
+                            newt_core::ToolPermissions::default().mcp_net_prompt_default
+                        }),
+                    );
                     let decoded = match self.ask_surface {
                         Some(ask) => match ask(&interaction) {
-                            HumanQuestionOutcome::Answer(answer) => {
-                                decode_answer(&interaction.definition, &answer)
-                            }
+                            HumanQuestionOutcome::Answer(answer) => decode_answer(
+                                &interaction.definition,
+                                interaction.answer_or_default(&answer),
+                            ),
                             HumanQuestionOutcome::Cancelled => PromptChoice::Back,
                             HumanQuestionOutcome::ExitRequested => PromptChoice::Exit,
                             HumanQuestionOutcome::InputClosed
@@ -1531,7 +1575,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                         },
                         None => (self.ask_human)(
                             window.insert(direct_authorization_window()),
-                            &interaction.definition,
+                            &interaction,
                         ),
                     };
                     match self.authorize(&interaction.definition, Audience::Terminal, decoded) {
@@ -1773,4 +1817,4 @@ mod b0a;
 #[path = "permissions_tests/b0b.rs"]
 mod b0b;
 
-// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 15:32 EDT | Date: 2026-09-15
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15

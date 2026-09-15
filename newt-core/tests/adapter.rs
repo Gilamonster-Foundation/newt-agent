@@ -150,16 +150,23 @@ mod b0a {
 
     /// The chain each surface must walk to reach the one definition.
     const CHAIN: &[Link] = &[
-        // B0b-1 (#1842) changed this link's SHAPE, not its property: the
-        // terminal branch now builds the definition inline so the same
-        // value it renders is the authority the answer is checked
-        // against, rather than calling the `permission_question` facade
-        // and losing the definition. The facade still exists and still
-        // routes through `question_for`, which the next link pins.
+        // The terminal carries explicit default metadata beside the same
+        // definition it renders and authorizes. Both its MCP-default branch
+        // and its ordinary-deny branch must reach the shared builder.
         Link {
             caller: "ask",
+            needle: "permission_interaction(",
+            why: "the terminal answer reader must receive the semantic interaction",
+        },
+        Link {
+            caller: "permission_interaction",
             needle: "permission_definition(",
-            why: "the terminal answer reader must be handed the built form",
+            why: "ordinary terminal permissions must reach the shared definition",
+        },
+        Link {
+            caller: "permission_interaction",
+            needle: "permission_definition_with_default(",
+            why: "MCP defaults must use the same builder as ordinary permissions",
         },
         // C0a (#1856) MOVED this link rather than deleting it. `ask` used
         // to adapt the definition to a `Question` and hand THAT to the
@@ -201,8 +208,18 @@ mod b0a {
         },
         Link {
             caller: "permission_definition",
+            needle: "permission_definition_with_default(",
+            why: "the web and ordinary terminal wrapper must reach the shared builder",
+        },
+        Link {
+            caller: "permission_definition_with_default",
+            needle: "permission_policy(",
+            why: "the shared builder must get its offered actions from the policy",
+        },
+        Link {
+            caller: "permission_definition_with_default",
             needle: "InteractionDefinition::new(",
-            why: "the definition is constructed here",
+            why: "the one definition is constructed here",
         },
     ];
 
@@ -234,11 +251,13 @@ mod b0a {
         // ...and the surfaces must each name their OWN audience, so a
         // switch that routed both through one hard-coded audience is a
         // failure rather than a pass.
-        let terminal = function_body(&lines, "ask").expect("terminal entry point");
-        assert!(
-            terminal.contains("Audience::Terminal"),
-            "the terminal entry point does not select the Terminal audience"
-        );
+        for caller in ["ask", "permission_interaction"] {
+            let terminal = function_body(&lines, caller).expect("terminal path");
+            assert!(
+                terminal.contains("Audience::Terminal"),
+                "`fn {caller}` does not select the Terminal audience"
+            );
+        }
         let web = function_body(&lines, "await_web_decision").expect("web construction site");
         assert!(
             web.contains("Audience::Web"),
@@ -248,7 +267,12 @@ mod b0a {
         // The old builder is gone from the switched functions: a
         // surviving `Question {` literal there is the duplicate string
         // builder B0a deletes.
-        for caller in ["permission_definition", "await_web_decision"] {
+        for caller in [
+            "permission_interaction",
+            "permission_definition",
+            "permission_definition_with_default",
+            "await_web_decision",
+        ] {
             let body = function_body(&lines, caller).expect("body");
             assert!(
                 !body.contains("Question {"),
@@ -361,6 +385,14 @@ mod b0a {
             "    decode_answer(d, &answer)",
             "}",
             "fn permission_definition(req: &R) -> InteractionDefinition {",
+            "    permission_definition_with_default(req, danger, audience, PromptChoice::Deny).0",
+            "}",
+            "fn permission_interaction(req: &R) -> SurfaceInteraction {",
+            "    let ordinary = permission_definition(req, danger, Audience::Terminal);",
+            "    permission_definition_with_default(req, danger, Audience::Terminal, configured)",
+            "}",
+            "fn permission_definition_with_default(req: &R) -> InteractionDefinition {",
+            "    let offered = permission_policy(req, danger, audience);",
             "    InteractionDefinition::new(kind, markdown, controls)",
             "}",
         ]
@@ -372,9 +404,10 @@ mod b0a {
         assert!(
             missing
                 .iter()
-                .any(|m| m.contains("ask") && m.contains("permission_definition(")),
+                .any(|m| m.contains("`fn ask`") && m.contains("permission_interaction(")),
             "the guard did not notice that the TERMINAL surface never switched: {missing:#?}"
         );
+        assert_eq!(missing.len(), 1, "only the terminal entry is disconnected");
         // The web half really is switched — so the guard is discriminating
         // between the surfaces, not just failing on everything.
         assert!(
@@ -391,6 +424,31 @@ mod b0a {
             !web.contains("Question {"),
             "the body extractor bled the previous function into this one"
         );
+    }
+
+    /// Seed a broken edge in each named function, including both wrappers
+    /// around the shared builder. A matching call elsewhere cannot repair it.
+    #[test]
+    fn every_definition_link_is_required_in_its_own_function() {
+        let lines = production_lines("newt-tui/src/permissions.rs");
+        assert!(!lines.is_empty(), "the source scanner read nothing");
+        assert!(
+            missing_links(&lines, CHAIN).is_empty(),
+            "baseline is not connected"
+        );
+        let source = format!("{}\n", lines.join("\n"));
+        for link in CHAIN {
+            let body = function_body(&lines, link.caller).expect("baseline caller");
+            let disconnected = body.replace(link.needle, "disconnected(");
+            assert_ne!(body, disconnected, "seed did not remove a real edge");
+            let seeded = source.replacen(&body, &disconnected, 1);
+            assert_ne!(source, seeded, "seed did not reach its function body");
+            let seeded: Vec<String> = seeded.lines().map(String::from).collect();
+            let missing = missing_links(&seeded, CHAIN);
+            assert_eq!(missing.len(), 1, "wrong missing links: {missing:?}");
+            assert!(missing[0].contains(&format!("`fn {}`", link.caller)));
+            assert!(missing[0].contains(link.needle));
+        }
     }
 }
 

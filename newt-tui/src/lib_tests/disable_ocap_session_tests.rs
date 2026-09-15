@@ -325,10 +325,11 @@ async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
         web_decision_timeout: std::time::Duration::from_secs(2),
         cancel: None,
         exit: None,
-        ask_human: |_w: &newt_core::tty::PromptWindow,
-                    _definition: &newt_interaction::InteractionDefinition| {
-            PromptChoice::AllowOnce
-        },
+        ask_human:
+            |_w: &newt_core::tty::PromptWindow,
+             _interaction: &newt_core::interaction_surface::SurfaceInteraction| {
+                PromptChoice::AllowOnce
+            },
     };
 
     let out = execute_tool(
@@ -383,10 +384,11 @@ async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
         web_decision_timeout: std::time::Duration::from_secs(2),
         cancel: None,
         exit: None,
-        ask_human: |_w: &newt_core::tty::PromptWindow,
-                    _definition: &newt_interaction::InteractionDefinition| {
-            PromptChoice::AllowOnce
-        },
+        ask_human:
+            |_w: &newt_core::tty::PromptWindow,
+             _interaction: &newt_core::interaction_surface::SurfaceInteraction| {
+                PromptChoice::AllowOnce
+            },
     };
     let out = execute_tool(
         "read_file",

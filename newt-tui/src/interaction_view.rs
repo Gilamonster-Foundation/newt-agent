@@ -144,8 +144,8 @@ mod terminal {
 
     fn initial_view(interaction: &SurfaceInteraction) -> InteractionView {
         let mut view = InteractionView::new(interaction);
-        // Enter on a newly opened permission window retains the plain
-        // adapter's fail-closed default. The role, never label prose, decides.
+        // A host-selected offered default matches the plain adapter. Without
+        // one, permission and confirmation windows retain Deny/Cancel.
         let options: Vec<_> = interaction
             .definition
             .controls
@@ -156,15 +156,20 @@ mod terminal {
             })
             .flatten()
             .collect();
-        let denial = options
-            .iter()
-            .position(|option| option.role == SemanticRole::Deny)
+        let selected = interaction
+            .default_choice()
+            .and_then(|default| options.iter().position(|option| option.id == default.id))
+            .or_else(|| {
+                options
+                    .iter()
+                    .position(|option| option.role == SemanticRole::Deny)
+            })
             .or_else(|| {
                 options
                     .iter()
                     .position(|option| option.role == SemanticRole::Cancel)
             });
-        if let Some(index) = denial {
+        if let Some(index) = selected {
             view.move_selection(index as isize);
         }
         view
@@ -573,6 +578,36 @@ mod terminal {
                     Rect::new(0, 0, 80, 24)
                 ),
                 Some(newt_core::tty::PromptLine::Line("deny".into()))
+            );
+        }
+
+        #[test]
+        fn modal_input_enter_uses_the_configured_offered_default() {
+            for expected in ["once", "deny"] {
+                let interaction =
+                    interaction().with_default_option(OptionId::new(expected).unwrap());
+                let mut input = ModalInput::new(&interaction);
+                assert_eq!(input.view.answer_for_selection().as_deref(), Some(expected));
+                assert_eq!(
+                    input.event(
+                        key(KeyCode::Enter, KeyModifiers::NONE),
+                        Rect::new(0, 0, 80, 24)
+                    ),
+                    Some(PromptLine::Line(expected.into()))
+                );
+            }
+        }
+
+        #[test]
+        fn modal_input_ignores_an_unoffered_default() {
+            let interaction = interaction().with_default_option(OptionId::new("absent").unwrap());
+            let mut input = ModalInput::new(&interaction);
+            assert_eq!(
+                input.event(
+                    key(KeyCode::Enter, KeyModifiers::NONE),
+                    Rect::new(0, 0, 80, 24)
+                ),
+                Some(PromptLine::Line("deny".into()))
             );
         }
 

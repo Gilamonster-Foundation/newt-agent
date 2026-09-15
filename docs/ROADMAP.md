@@ -705,7 +705,13 @@ and recovery, bounded by effective capabilities.
 Route blocking permission requests through the terminal owner. All rich modal
 dialogs use an opaque bordered window that hides the composer, owns input until
 resolved, and restores the draft afterward. Show the request and its reason
-inside the window; permission dialogs default to deny.
+inside the window. Terminal MCP hostname prompts select `allow_once` by
+default, configurable with `[tui.permissions].mcp_net_prompt_default` and
+confirmed by Enter. The displayed default must be an offered action; other
+permission prompts and web arbitration retain their existing behavior.
+Operator `!` commands borrow the foreground terminal from its owner, including
+normal terminal settings and real stdio, then restore the editor on completion
+or interruption so interactive login commands can read input.
 **Tests:** saved-config reload across launch modes; wildcard alone does not
 approve private hosts; exact approvals cannot widen an attenuated capability;
 mocked connection, OAuth, refresh, and reconnect retain approvals; once,
@@ -714,7 +720,8 @@ no-prompt behavior. Session and permanent decisions deduplicate shared
 hostnames through the existing gate.
 Terminal ownership, modal occlusion, wrapped reasons and choices, cancellation,
 safe defaults, and draft restoration are covered through the shared renderer
-and real-terminal acceptance tests.
+and real-terminal acceptance tests. Real foreground-child tests cover typed
+input, interrupt, EOF, the next editor input, and exact terminal restoration.
 **Mocks:** existing in-memory transport, resolver, config-edit, and permission
 prompt seams. Real-resource checks ground persistence and HTTP behavior.
 **Out of scope:** new permission storage, wildcard approval of private hosts,
@@ -1990,4 +1997,4 @@ phase when it's ready to schedule.
 - **Bookkeeping:** as each step lands, tick it in this file or in the linked
   GitHub Project board (TBD when remote exists).
 
-Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:24 EDT | Date: 2026-09-15
+Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15

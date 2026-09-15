@@ -482,25 +482,31 @@ async fn cap_summary_stream_decodes_the_answer_and_usage_without_tools() {
 }
 
 async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
+    const FRAMES: [&[u8]; 4] = [
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"progressing \"}}]}\n\n",
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n",
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    ];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let uri = format!("http://{}", listener.local_addr().unwrap());
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (advance_tx, mut advance_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (written_tx, mut written_rx) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let (path, request) = read_request(&mut socket).await;
         assert_eq!(path, "/v1/chat/completions");
-        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n").await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket.write_all(FRAMES[0]).await.unwrap();
         started_tx.send(request.clone()).unwrap();
-        for frame in [
-            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"progressing \"}}]}\n\n".as_slice(),
-            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n".as_slice(),
-            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
-        ] {
+        for frame in &FRAMES[1..] {
             advance_rx.recv().await.expect("test advances the stream");
             socket.write_all(frame).await.unwrap();
-            written_tx.send(()).unwrap();
         }
         socket.shutdown().await.unwrap();
         request
@@ -515,7 +521,11 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         context.max_tool_rounds = 0;
     }
     let mut tools = NoMcp;
-    let mut completion = Box::pin(chat_complete(context, &mut tools));
+    let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut completion = Box::pin(
+        crate::retry::RESPONSE_BYTES_READ
+            .scope(consumed.clone(), chat_complete(context, &mut tools)),
+    );
     let request = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::select! {
             request = started_rx => request.unwrap(),
@@ -527,25 +537,40 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
     assert_eq!(request["stream"], true);
 
     tokio::time::pause();
-    for index in 0..3 {
-        tokio::time::advance(Duration::from_millis(400)).await;
-        advance_tx.send(()).unwrap();
-        written_rx.recv().await.unwrap();
-        if index < 2 {
+    let mut expected = 0;
+    let mut completed = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    for (index, frame) in FRAMES.iter().enumerate() {
+        if index > 0 {
+            tokio::time::advance(Duration::from_millis(400)).await;
+            advance_tx.send(()).unwrap();
+        }
+        expected += frame.len();
+        // A server write does not prove the client reset its idle timer. Drive
+        // the actual body reader until it consumes this frame before advancing
+        // time again. Yield stays runnable, preventing paused-time auto-advance
+        // while the real socket's readiness notification catches up.
+        while consumed.load(Ordering::SeqCst) < expected || index == FRAMES.len() - 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "client did not consume stream frame {index}"
+            );
             tokio::select! {
                 biased;
                 result = &mut completion => {
-                    panic!("stream ended before its terminal frame: {result:?}")
+                    assert_eq!(index, FRAMES.len() - 1,
+                        "stream ended before its terminal frame: {result:?}");
+                    completed = Some(result);
+                    break;
                 }
                 _ = tokio::task::yield_now() => {}
             }
         }
+        assert_eq!(consumed.load(Ordering::SeqCst), expected);
     }
     tokio::time::resume();
-    let (text, streamed, _, _) = tokio::time::timeout(Duration::from_secs(5), &mut completion)
-        .await
-        .expect("the progressing generation must finish")
-        .expect("progress must reset the idle timeout");
+    let result = completed.expect("the progressing generation must finish");
+    let (text, streamed, _, _) = result.expect("progress must reset the idle timeout");
     server.await.unwrap();
     // #2372: both the primary answer and the cap summary are returned as
     // generated; nothing is sent again for display.

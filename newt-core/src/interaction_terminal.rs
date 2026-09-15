@@ -115,7 +115,9 @@ fn present_on_terminal_with_layout(
 ) -> HumanQuestionOutcome {
     let prompt = prompt_text(&interaction.definition, width);
     match read_prompt_window_line(window, &prompt, echo_for(&interaction.definition)) {
-        Ok(PromptLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
+        Ok(PromptLine::Line(answer)) => {
+            HumanQuestionOutcome::Answer(interaction.answer_or_default(&answer).to_owned())
+        }
         Ok(PromptLine::Eof) => HumanQuestionOutcome::InputClosed,
         Ok(PromptLine::Back) => HumanQuestionOutcome::Cancelled,
         Ok(PromptLine::Exit) => HumanQuestionOutcome::ExitRequested,

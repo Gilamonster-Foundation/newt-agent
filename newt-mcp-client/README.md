@@ -22,6 +22,7 @@ with `--config`, or in the operator-owned user configuration:
 [tui.permissions]
 preset = "workspace_dev"
 net = ["mcp.corp.example", "login.corp.example"]
+mcp_net_prompt_default = "allow_once"
 ```
 
 The same saved names work in an OCAP-confined session, with `--full-access`,
@@ -36,7 +37,13 @@ Interactive sessions prompt for a missing MCP hostname grant at startup by
 default. Choose **allow once** for the current server connection, **session
 allow** to also permit reconnecting and other configured servers on that host,
 or **Allow permanently (adds host to config)** to save the exact hostname for
-future launches. **deny** remains the default. Session and permanent choices
+future launches. **allow once** is selected by default; press Enter to confirm.
+Set `mcp_net_prompt_default` to `allow_once`, `allow_session`, `allow_permanent`,
+`deny`, `deny_always`, or `deny_permanent` to choose a different default. The
+selected choice is marked `(default)`; configuring it grants nothing until
+you answer. Other permission prompts retain their existing defaults, and
+web-shared decisions still ignore Enter until you explicitly select an action.
+Session and permanent choices
 reuse the permission gate's cache across servers sharing a hostname.
 In the rich terminal, the request appears in a bordered modal with the server,
 hostname, and reason. The dialog covers the normal prompt and owns input until
@@ -85,4 +92,4 @@ patient server still gives up on a genuinely wedged call.
 
 Apache-2.0
 
-Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:24 EDT | Date: 2026-09-15
+Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15

@@ -80,7 +80,9 @@ fn prompt_scenario_child() {
     let visibility = std::env::var_os("NEWT_PROMPT_VISIBILITY_CHILD").is_some();
     let controls = std::env::var_os("NEWT_PROMPT_CONTROLS_CHILD").is_some();
     let web_controls = std::env::var_os("NEWT_PROMPT_WEB_CONTROLS_CHILD").is_some();
-    if !visibility && !controls && !web_controls {
+    let mcp_once = std::env::var_os("NEWT_PROMPT_MCP_ONCE_CHILD").is_some();
+    let mcp_deny = std::env::var_os("NEWT_PROMPT_MCP_DENY_CHILD").is_some();
+    if !visibility && !controls && !web_controls && !mcp_once && !mcp_deny {
         return;
     }
 
@@ -93,7 +95,8 @@ fn prompt_scenario_child() {
             &danger::DangerTable::builtin(),
             newt_interaction::Audience::Terminal,
         );
-        let choice = prompt_permission_choice(&window, &definition);
+        let interaction = newt_core::interaction_surface::SurfaceInteraction::blocking(definition);
+        let choice = prompt_permission_choice(&window, &interaction);
         drop(window);
         println!("PROMPT-CONTROL:{choice:?}");
         return;
@@ -158,9 +161,19 @@ fn prompt_scenario_child() {
         .expect("the pty is a real terminal, so the spinner takes the line");
     std::thread::sleep(Duration::from_millis(250));
 
-    let request = web_fetch_request("example.com");
+    let mut request = web_fetch_request("example.com");
     let mut state = PermissionPromptState::default();
-    {
+    if mcp_once || mcp_deny {
+        request.tool = "mcp connect".into();
+        let config: newt_core::ToolPermissions = toml::from_str(if mcp_deny {
+            "mcp_net_prompt_default = 'deny'"
+        } else {
+            ""
+        })
+        .expect("valid MCP prompt configuration");
+        state.mcp_net_prompt_default = Some(config.mcp_net_prompt_default);
+    }
+    let allowed = {
         let mut gate = PromptPermissionGate {
             state: &mut state,
             base: no_net_caveats(),
@@ -183,9 +196,15 @@ fn prompt_scenario_child() {
             open_panel: None,
             ask_human: prompt_permission_choice,
         };
-        let _decision = gate.ask(std::slice::from_ref(&request));
-    }
+        matches!(
+            gate.ask(std::slice::from_ref(&request)),
+            newt_core::PermissionDecision::Allow(_)
+        )
+    };
     drop(spinner);
+    if mcp_once || mcp_deny {
+        println!("PROMPT-MCP-DEFAULT:{allowed}:{}", state.decisions[0].scope);
+    }
 }
 
 fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
@@ -270,6 +289,24 @@ fn permission_prompt_controls_are_immediate_and_distinct() {
             "NEWT_PROMPT_WEB_CONTROLS_CHILD",
             &format!("PROMPT-WEB-CONTROL:{web}:"),
             key,
+            CHILD_TEST,
+        );
+    }
+}
+
+/// Grounds the mocked MCP blank-answer/lifetime tests: a real Enter byte
+/// confirms the shipped AllowOnce or configured Deny through the direct gate.
+#[serial_test::serial(prompt_stdin)]
+#[test]
+fn mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal() {
+    for (environment, allowed) in [
+        ("NEWT_PROMPT_MCP_ONCE_CHILD", true),
+        ("NEWT_PROMPT_MCP_DENY_CHILD", false),
+    ] {
+        prompt_control_child(
+            environment,
+            &format!("PROMPT-MCP-DEFAULT:{allowed}:once"),
+            "\r",
             CHILD_TEST,
         );
     }

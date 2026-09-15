@@ -98,6 +98,7 @@ async fn connect_persona(
                 extra_exec: Vec::new(),
                 net: Vec::new(),
                 prompt: false,
+                ..Default::default()
             }
             .to_caveats(&ws)
         });

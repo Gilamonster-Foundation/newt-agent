@@ -84,7 +84,7 @@ fn web_decisions_publish_and_consume_a_web_verdict_without_the_tty() {
         ask_surface: None,
         #[cfg(feature = "rich-tui")]
         open_panel: None,
-        ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
+        ask_human: |_w: &PromptWindow, _d: &SurfaceInteraction| {
             panic!("the TTY must not be read when web decisions are enabled")
         },
     };
@@ -126,7 +126,7 @@ fn web_decision_timeout_resolves_and_denies_without_hanging() {
         ask_surface: None,
         #[cfg(feature = "rich-tui")]
         open_panel: None,
-        ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
+        ask_human: |_w: &PromptWindow, _d: &SurfaceInteraction| {
             panic!("the TTY must not be read when web decisions are enabled")
         },
     };
@@ -168,7 +168,7 @@ fn web_publish_failure_records_web_unavailable_scope() {
         ask_surface: None,
         #[cfg(feature = "rich-tui")]
         open_panel: None,
-        ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
+        ask_human: |_w: &PromptWindow, _d: &SurfaceInteraction| {
             panic!("the TTY must not be read when web decisions are enabled");
         },
     };
@@ -287,7 +287,7 @@ macro_rules! web_gate {
             ask_surface: None,
             #[cfg(feature = "rich-tui")]
             open_panel: None,
-            ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
+            ask_human: |_w: &PromptWindow, _d: &SurfaceInteraction| {
                 panic!("run_web_wait must not read the TTY answer path")
             },
         }
@@ -841,7 +841,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
             ask_surface: None,
             #[cfg(feature = "rich-tui")]
             open_panel: None,
-            ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
+            ask_human: move |_w: &PromptWindow, _d: &SurfaceInteraction| {
                 PromptChoice::AllowPermanent
             },
         };
@@ -865,7 +865,7 @@ pub(super) fn scripted_gate<'a>(
     log_path: Option<std::path::PathBuf>,
     script: Vec<PromptChoice>,
     prompts: Rc<Cell<usize>>,
-) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> {
+) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> {
     let mut script = script.into_iter();
     PromptPermissionGate {
         state,
@@ -887,7 +887,7 @@ pub(super) fn scripted_gate<'a>(
         ask_surface: None,
         #[cfg(feature = "rich-tui")]
         open_panel: None,
-        ask_human: move |_w: &PromptWindow, _definition: &InteractionDefinition| {
+        ask_human: move |_w: &PromptWindow, _definition: &SurfaceInteraction| {
             prompts.set(prompts.get() + 1);
             script.next().expect("script exhausted — unexpected prompt")
         },
@@ -927,7 +927,7 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
         ),
         (
             HumanQuestionOutcome::Answer(String::new()),
-            false,
+            true,
             false,
             false,
             false,
@@ -998,11 +998,11 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
                 assert!(interaction.is_blocking());
                 assert!(interaction.wants_attention());
                 assert_eq!(
-                    interaction.definition,
-                    permission_definition(
+                    *interaction,
+                    permission_interaction(
                         &request,
                         &danger::DangerTable::builtin(),
-                        Audience::Terminal
+                        PromptChoice::AllowOnce,
                     ),
                     "the terminal receives the exact definition used to authorize the answer"
                 );
@@ -1047,6 +1047,116 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
                 assert!(!config.exists(), "only a permanent answer writes config");
             }
         }
+    }
+}
+
+#[test]
+fn mcp_net_prompt_configured_blank_answer_preserves_grant_lifetime() {
+    for (configured, allowed, remembered, persisted) in [
+        (None, true, false, false),
+        (Some(PromptChoice::AllowSession), true, true, false),
+        (Some(PromptChoice::AllowPermanent), true, true, true),
+        (Some(PromptChoice::Deny), false, false, false),
+        (Some(PromptChoice::Back), false, false, false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let mut state = PermissionPromptState {
+            mcp_net_prompt_default: configured,
+            ..Default::default()
+        };
+        let ask = |_interaction: &SurfaceInteraction| HumanQuestionOutcome::Answer(String::new());
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![],
+            Rc::new(Cell::new(0)),
+        );
+        gate.ask_surface = Some(&ask);
+        gate.config_path = Some(config.clone());
+        let grant = gate.ask_mcp_net_grant(&PermissionRequest {
+            tool: "mcp connect".into(),
+            kind: DenialKind::Net,
+            target: "mcp.example.test".into(),
+            reason: "connect the configured server".into(),
+        });
+        assert_eq!(grant.is_some(), allowed);
+        if let Some((_, _, retained)) = grant {
+            assert_eq!(retained, remembered);
+        }
+        assert_eq!(config.exists(), persisted);
+    }
+}
+
+#[test]
+fn mcp_net_prompt_defaults_are_offered_explicit_and_local_to_connect() {
+    let request = PermissionRequest {
+        tool: "mcp connect".into(),
+        kind: DenialKind::Net,
+        target: "mcp.example.test".into(),
+        reason: "connect the configured server".into(),
+    };
+    let danger = danger::DangerTable::builtin();
+    for configured in [
+        PromptChoice::AllowOnce,
+        PromptChoice::AllowSession,
+        PromptChoice::AllowPermanent,
+        PromptChoice::Deny,
+        PromptChoice::DenyAlways,
+        PromptChoice::DenyPermanent,
+        PromptChoice::Back,
+        PromptChoice::Exit,
+    ] {
+        let expected = if matches!(configured, PromptChoice::Back | PromptChoice::Exit) {
+            PromptChoice::Deny
+        } else {
+            configured
+        };
+        let interaction = permission_interaction(&request, &danger, configured);
+        let choice = interaction.default_choice().unwrap();
+        assert_eq!(choice.id.as_str(), expected.as_str());
+        assert!(choice.label.ends_with(" (default)"));
+        assert_eq!(
+            plain::render(&interaction.definition)
+                .matches("(default)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            decode_answer(&interaction.definition, interaction.answer_or_default("")),
+            expected
+        );
+        assert_eq!(
+            decode_answer(
+                &interaction.definition,
+                interaction.answer_or_default("unknown")
+            ),
+            PromptChoice::Deny
+        );
+    }
+    for (tool, kind, target) in [
+        ("web_fetch", DenialKind::Net, "mcp.example.test"),
+        ("mcp connect", DenialKind::Exec, "bash"),
+        ("run_command", DenialKind::Exec, "bash"),
+    ] {
+        let other = PermissionRequest {
+            tool: tool.into(),
+            kind,
+            target: target.into(),
+            reason: String::new(),
+        };
+        let interaction = permission_interaction(&other, &danger, PromptChoice::AllowPermanent);
+        assert!(interaction.default_choice().is_none());
+        assert_eq!(
+            decode_answer(&interaction.definition, interaction.answer_or_default("")),
+            PromptChoice::Deny
+        );
+        assert_eq!(
+            interaction.definition,
+            permission_definition(&other, &danger, Audience::Terminal)
+        );
     }
 }
 
@@ -1690,7 +1800,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             ask_surface: None,
             #[cfg(feature = "rich-tui")]
             open_panel: None,
-            ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
+            ask_human: move |_w: &PromptWindow, _d: &SurfaceInteraction| {
                 script.next().expect("script exhausted")
             },
         };
@@ -1730,7 +1840,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             ask_surface: None,
             #[cfg(feature = "rich-tui")]
             open_panel: None,
-            ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
+            ask_human: |_w: &PromptWindow, _d: &SurfaceInteraction| {
                 panic!("must NOT prompt: target was permanently denied")
             },
         };
@@ -1827,7 +1937,7 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
                 ask_surface: None,
                 #[cfg(feature = "rich-tui")]
                 open_panel: None,
-                ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
+                ask_human: move |_w: &PromptWindow, _d: &SurfaceInteraction| {
                     script.next().expect("script exhausted")
                 },
             };
@@ -3138,4 +3248,4 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
     );
 }
 
-// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:35 EDT | Date: 2026-09-15
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15

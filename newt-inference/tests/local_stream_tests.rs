@@ -13,6 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "support/local_stream.rs"]
+mod support;
+use support::request_body;
+
 #[tokio::test]
 async fn local_stream_preserves_answer_usage_and_model_without_exposing_reasoning() {
     let server = MockServer::start().await;
@@ -287,95 +291,6 @@ async fn changing_local_timeout_preserves_the_injected_client_configuration() {
             .await
             .expect("changing the deadline must retain caller-owned client settings");
     }
-}
-
-async fn request_body(socket: &mut tokio::net::TcpStream) -> Value {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        let read = socket.read(&mut chunk).await.unwrap();
-        assert!(read > 0, "request ended before its headers");
-        bytes.extend_from_slice(&chunk[..read]);
-        if let Some(end) = bytes.windows(4).position(|slice| slice == b"\r\n\r\n") {
-            break end + 4;
-        }
-    };
-    let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
-    let content_length: usize = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().unwrap())
-        })
-        .expect("the JSON request has a bounded content length");
-    while bytes.len() - header_end < content_length {
-        let read = socket.read(&mut chunk).await.unwrap();
-        assert!(read > 0, "request ended before its JSON body");
-        bytes.extend_from_slice(&chunk[..read]);
-    }
-    serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap()
-}
-
-#[tokio::test]
-async fn progressing_local_stream_resets_its_idle_timeout() {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (advance_tx, mut advance_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (written_tx, mut written_rx) = tokio::sync::mpsc::unbounded_channel();
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let request = request_body(&mut socket).await;
-        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n").await.unwrap();
-        started_tx.send(request).unwrap();
-        for frame in [
-            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"still progressing\"},\"finish_reason\":\"stop\"}]}\n\n".as_slice(),
-            b"data: [DONE]\n\n".as_slice(),
-        ] {
-            advance_rx.recv().await.expect("test advances the stream");
-            let _ = socket.write_all(frame).await;
-            written_tx.send(()).unwrap();
-        }
-        let _ = socket.shutdown().await;
-    });
-    let backend = LocalVllmBackend::new(endpoint, "stream-fixture")
-        .with_client(reqwest::Client::new())
-        .with_timeout(Duration::from_secs(5))
-        .with_retry_policy(RetryPolicy::immediate(0));
-    let mut completion = Box::pin(backend.complete(ChatRequest::new().user("keep generating")));
-    let request = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            request = started_rx => request.unwrap(),
-            result = &mut completion => panic!("stream ended before its first frame: {result:?}"),
-        }
-    })
-    .await
-    .expect("the first streamed frame must arrive");
-    assert_eq!(request["stream"], true);
-
-    tokio::time::pause();
-    for index in 0..2 {
-        tokio::time::advance(Duration::from_secs(3)).await;
-        advance_tx.send(()).unwrap();
-        written_rx.recv().await.unwrap();
-        if index == 0 {
-            tokio::select! {
-                biased;
-                result = &mut completion => panic!("stream ended before its terminal frame: {result:?}"),
-                _ = tokio::task::yield_now() => {}
-            }
-        }
-    }
-    tokio::time::resume();
-    let reply = tokio::time::timeout(Duration::from_secs(5), &mut completion)
-        .await
-        .expect("the completed stream must return")
-        .expect("progress must reset the idle read timeout");
-    server.await.unwrap();
-    assert_eq!(reply.content, "still progressing");
 }
 
 struct SlotCase {

@@ -1021,6 +1021,7 @@ mod tests {
             extra_exec: vec![],
             net: vec![],
             prompt: false,
+            ..Default::default()
         }
         .to_caveats("/ws");
         let widened = widen_net_for_host(&read_only, "mcp.example");

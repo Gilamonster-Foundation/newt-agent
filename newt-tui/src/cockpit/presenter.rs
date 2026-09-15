@@ -143,6 +143,16 @@ fn modal_cleanup_bytes(start: u16) -> io::Result<Vec<u8>> {
 }
 
 impl Screen {
+    fn terminal_size(&self) -> io::Result<(u16, u16)> {
+        use std::os::fd::AsRawFd;
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // fd 1 is the capture PTY; query the saved real terminal instead.
+        if unsafe { libc::ioctl(self.tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((size.ws_col.max(1), size.ws_row.max(1)))
+    }
+
     fn viewport_rect(&self) -> Rect {
         Rect::new(
             0,
@@ -813,6 +823,17 @@ impl Presenter {
                 self.editor.set_turn_running(true);
                 self.dirty = true;
             }
+            SurfaceRequest::RunBang {
+                command,
+                color,
+                verbose,
+                reply,
+            } => {
+                // Serve synchronously: this loop cannot consume a single key
+                // while the foreground command owns the real terminal.
+                let result = self.run_bang_command(&command, color, verbose);
+                let _ = reply.send(result.map_err(Into::into));
+            }
             // C1 (#1862): the cockpit owns the terminal, so it presents the
             // interaction itself. `suspend_for_prompt` takes the terminal from
             // under the cockpit and restores it on drop — the path #1770 fixed
@@ -852,10 +873,7 @@ impl Presenter {
                 // its bytes would wait in the capture until this same loop
                 // returned from the read — a prompt visible only after it was
                 // answered.
-                let window = newt_core::tty::Terminal::suspend_for_prompt_to(
-                    prompt_output,
-                    newt_core::tty::TerminalTaker::CockpitModal,
-                );
+                let window = Self::suspend_terminal(prompt_output);
                 let rich = self.screen.tty.try_clone().and_then(|out| {
                     let terminal = crate::inline_viewport::cockpit_panel_terminal(
                         out,
@@ -1076,15 +1094,7 @@ impl Presenter {
     /// A blocking dialog may have consumed every resize event while this
     /// presenter was parked. Read the real tty before restoring its draft.
     fn finish_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-        // SAFETY: the saved real tty is open for the presenter's lifetime,
-        // and ioctl writes only to this correctly sized winsize value. fd 1
-        // is the capture PTY and still carries the old dimensions here.
-        if unsafe { libc::ioctl(self.screen.tty.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let (cols, rows) = (size.ws_col.max(1), size.ws_row.max(1));
+        let (cols, rows) = self.screen.terminal_size()?;
         if (cols, rows) != (self.screen.cols, self.screen.rows) {
             // A narrower dialog may have expanded above its original top.
             // Clear the visible screen before rebuilding the editor at the
@@ -1095,6 +1105,52 @@ impl Presenter {
         } else {
             self.screen.cleanup_modal(reservation)
         }
+    }
+
+    fn suspend_terminal(output: File) -> newt_core::tty::PromptWindow {
+        newt_core::tty::Terminal::suspend_for_prompt_to(
+            output,
+            newt_core::tty::TerminalTaker::CockpitModal,
+        )
+    }
+
+    fn run_bang_command(&mut self, command: &str, color: bool, verbose: bool) -> io::Result<()> {
+        let (mut command, shell) = crate::bang_shell_command(command);
+        self.capture.foreground_stdio(&mut command)?;
+        self.drain_pty()?;
+        let result = (|| {
+            let _window = Self::suspend_terminal(self.screen.tty.try_clone()?);
+            let _cooked = self._raw.suspend()?;
+            let mut modes_output = self.screen.tty.try_clone()?;
+            let _modes = crate::RestoreOnDrop {
+                restore: move || {
+                    let _ = execute!(
+                        modes_output,
+                        crossterm::event::EnableBracketedPaste,
+                        DisableLineWrap
+                    );
+                },
+            };
+            self.screen.shutdown(&[])?;
+            crate::run_bang_escape_unix(command, &shell, color, verbose);
+            Ok(())
+        })();
+        // Keep the child's output above the editor, even if the command
+        // changed terminal dimensions. No cursor query or second input reader.
+        let resumed = (|| {
+            let (cols, rows) = self.screen.terminal_size()?;
+            let height = (self.editor.wanted_rows(cols, rows, &self.surface.chrome())
+                + self.status_rows())
+            .clamp(1, rows);
+            execute!(self.screen.tty, MoveTo(0, rows - 1))?;
+            self.screen
+                .tty
+                .write_all(&vec![b'\n'; usize::from(height)])?;
+            self.screen.top = rows - height;
+            self.on_event(Event::Resize(cols, rows))?;
+            self.draw()
+        })();
+        result.and(resumed)
     }
 
     /// Does this key press reach the operator's escape hatch right now?
@@ -1526,4 +1582,6 @@ mod tests {
 mod terminal_acceptance;
 
 #[cfg(test)]
-pub(crate) use terminal_acceptance::{cockpit_acceptance_case, panel_resize_case};
+pub(crate) use terminal_acceptance::{
+    cockpit_acceptance_case, cockpit_bang_case, panel_resize_case,
+};

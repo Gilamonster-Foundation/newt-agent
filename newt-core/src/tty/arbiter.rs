@@ -310,9 +310,9 @@ pub enum OnCollision {
 /// be claiming a guarantee we do not have.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TerminalTaker {
-    /// The cockpit presenter's `SurfaceRequest::Interact` arm. It **is** the
-    /// region holder (`Screen::region`) and has already reserved the modal's
-    /// rows and receded the chat chevron, so taking them is the whole point.
+    /// The cockpit presenter's blocking interaction or foreground command.
+    /// It **is** the region holder (`Screen::region`) and quiesces its own
+    /// editor before lending the terminal, so taking its rows is deliberate.
     CockpitModal,
     /// The permission gate's authorization prompt (`PromptPermissionGate::ask`).
     /// Runs on the session thread under a live cockpit, whose presenter holds

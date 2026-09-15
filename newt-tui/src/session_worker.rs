@@ -96,6 +96,13 @@ pub(crate) enum SurfaceRequest {
     },
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     TurnEnded,
+    /// The UI owner lends its terminal to an operator's foreground command.
+    RunBang {
+        command: String,
+        color: bool,
+        verbose: bool,
+        reply: SyncSender<anyhow::Result<()>>,
+    },
     /// **C1 (#1862): present one semantic interaction and report the outcome.**
     ///
     /// The envelope is thread-shaped — it carries a reply channel, like every
@@ -238,7 +245,10 @@ impl SurfaceRequest {
         }
         matches!(
             self,
-            Self::ReadLine { .. } | Self::Reload { .. } | Self::Interact { .. }
+            Self::ReadLine { .. }
+                | Self::Reload { .. }
+                | Self::Interact { .. }
+                | Self::RunBang { .. }
         )
     }
 }
@@ -368,6 +378,20 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.notify(SurfaceRequest::TurnEnded);
     }
 
+    fn run_bang_escape(&mut self, command: &str, color: bool, verbose: bool) -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.ask(
+            |reply| SurfaceRequest::RunBang {
+                command: command.to_string(),
+                color,
+                verbose,
+                reply,
+            },
+            rx,
+            tx,
+        )?
+    }
+
     #[cfg(feature = "rich-tui")]
     fn open_panel(&mut self, rows: u16) -> Option<PanelWindow> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -432,6 +456,14 @@ pub(crate) fn pump_surface(
             SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
             SurfaceRequest::TurnStarted { cancel } => surface.turn_started(cancel),
             SurfaceRequest::TurnEnded => surface.turn_ended(),
+            SurfaceRequest::RunBang {
+                command,
+                color,
+                verbose,
+                reply,
+            } => {
+                let _ = reply.send(surface.run_bang_escape(&command, color, verbose));
+            }
             SurfaceRequest::Interact { interaction, reply } => {
                 let _ = reply.send(surface.present_interaction(&interaction));
             }
@@ -778,6 +810,9 @@ mod tests {
             let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             surface.turn_started(flag());
             surface.turn_ended();
+            surface
+                .run_bang_escape("true", false, false)
+                .expect("served");
             surface.present_interaction(&an_interaction());
             #[cfg(feature = "rich-tui")]
             surface.open_panel(10);
@@ -939,6 +974,7 @@ mod tests {
         tabs: usize,
         turn_started: usize,
         turn_ended: usize,
+        run_bang_escape: usize,
         present_interaction: usize,
         #[cfg(feature = "rich-tui")]
         open_panel: usize,
@@ -949,7 +985,7 @@ mod tests {
         /// forward. The count follows the BUILD rather than being relaxed to
         /// the smaller number for both — a rich build that dropped a
         /// forwarding impl must still fail here.
-        const METHODS: usize = if cfg!(feature = "rich-tui") { 11 } else { 10 };
+        const METHODS: usize = if cfg!(feature = "rich-tui") { 12 } else { 11 };
 
         fn each(&self) -> Vec<(&'static str, usize)> {
             [
@@ -962,6 +998,7 @@ mod tests {
                 ("set_tabs", self.tabs),
                 ("turn_started", self.turn_started),
                 ("turn_ended", self.turn_ended),
+                ("run_bang_escape", self.run_bang_escape),
                 ("present_interaction", self.present_interaction),
                 #[cfg(feature = "rich-tui")]
                 ("open_panel", self.open_panel),
@@ -981,6 +1018,16 @@ mod tests {
     }
 
     impl crate::chat::InputSurface for CountingSurface {
+        fn run_bang_escape(
+            &mut self,
+            _command: &str,
+            _color: bool,
+            _verbose: bool,
+        ) -> anyhow::Result<()> {
+            self.run_bang_escape += 1;
+            Ok(())
+        }
+
         #[cfg(feature = "rich-tui")]
         /// A counting surface has no terminal to lend, so it answers `None` —
         /// the same honest answer a lean surface gives. What is under test is

@@ -135,6 +135,12 @@ pub async fn read_response_bytes(response: reqwest::Response) -> (Vec<u8>, Optio
     (bytes, error)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test synchronization after client consumption, never after a server write.
+    pub(crate) static RESPONSE_BYTES_READ: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
 /// Append observed body bytes to caller-owned storage. Keeping the buffer
 /// outside this future preserves evidence when a host deadline cancels the
 /// read; dropping the future still releases the in-flight HTTP response.
@@ -144,7 +150,13 @@ pub async fn read_response_bytes_into(
 ) -> Option<reqwest::Error> {
     loop {
         match response.chunk().await {
-            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                bytes.extend_from_slice(&chunk);
+                #[cfg(test)]
+                let _ = RESPONSE_BYTES_READ.try_with(|count| {
+                    count.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                });
+            }
             Ok(None) => return None,
             Err(error) => return Some(error),
         }

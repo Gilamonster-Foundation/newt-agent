@@ -966,6 +966,12 @@ pub(crate) trait InputSurface {
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     fn turn_ended(&mut self) {}
 
+    /// Run an operator's host command while this surface lends it the terminal.
+    fn run_bang_escape(&mut self, command: &str, color: bool, verbose: bool) -> anyhow::Result<()> {
+        crate::run_bang_escape(command, color, verbose);
+        Ok(())
+    }
+
     /// **C1 (#1862): present one semantic interaction and report what the
     /// operator did.**
     ///
@@ -1724,6 +1730,10 @@ fn session_body(
         .unwrap_or_default();
     let startup_cancel = std::sync::atomic::AtomicBool::new(false);
     let startup_exit = std::sync::atomic::AtomicBool::new(false);
+    permission_state.mcp_net_prompt_default = cfg
+        .tui
+        .as_ref()
+        .map(|tui| tui.permissions.mcp_net_prompt_default);
     let mut mcp = tokio::task::block_in_place(|| {
         let mut permission_gate = interactive.then(|| PromptPermissionGate {
             ask_surface: Some(&ask_surface),
@@ -1748,7 +1758,7 @@ fn session_body(
             ask_human: prompt_permission_choice
                 as fn(
                     &newt_core::tty::PromptWindow,
-                    &newt_interaction::InteractionDefinition,
+                    &newt_core::interaction_surface::SurfaceInteraction,
                 ) -> PromptChoice,
         });
         let mut grant_net = |request: &newt_core::PermissionRequest| {
@@ -2865,7 +2875,13 @@ fn session_body(
                 };
                 if let Some(rest) = human_bang {
                     if bang_escape_enabled {
-                        run_bang_escape(rest, color, verbose);
+                        if let Err(error) = surface.run_bang_escape(rest, color, verbose) {
+                            print_newt(
+                                &format!("! terminal handoff failed: {error}"),
+                                color,
+                                verbose,
+                            );
+                        }
                     } else {
                         print_newt(
                             "! bang-escape is disabled ([tui] allow_bang_escape = false)",
@@ -7378,6 +7394,10 @@ fn session_body(
                     // `authorization_prompts_enabled`. A truly headless session
                     // (non-interactive) still gets `None` and the honest headless
                     // response.
+                    permission_state.mcp_net_prompt_default = cfg
+                        .tui
+                        .as_ref()
+                        .map(|tui| tui.permissions.mcp_net_prompt_default);
                     let mut permission_gate = interactive.then(|| PromptPermissionGate {
                         // C1: ask the UI thread, never this one.
                         ask_surface: Some(&ask_surface),
@@ -7402,7 +7422,7 @@ fn session_body(
                         ask_human: prompt_permission_choice
                             as fn(
                                 &newt_core::tty::PromptWindow,
-                                &newt_interaction::InteractionDefinition,
+                                &newt_core::interaction_surface::SurfaceInteraction,
                             ) -> PromptChoice,
                     });
                     // Per-round observation hook (Phase 20,
