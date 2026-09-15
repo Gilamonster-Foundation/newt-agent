@@ -130,8 +130,9 @@
 //!       which specific number a future attempt might pick, not just
 //!       the one disclosed value.
 //!
-//! Revision 4 (#2317 calibration) changes no check, only how reliably the
-//! randomized sweep catches a broken tree. Revision 3's draws from
+//! Revision 4 (#2317 calibration) changes no check, only how reliably two
+//! of them give the same answer on the same tree. First, the randomized
+//! sweep: revision 3's draws from
 //! [i32::MIN + 1, 500_000] are ~99.98% negative, so a positive after a
 //! negative (the shape that exposes "stop at the first negative") was
 //! rare: the sweep passed the unchanged seed in 72 of 2000 simulated runs,
@@ -139,6 +140,11 @@
 //! now come from [-1000, 1000]; the rest keep the wide range. Grades under
 //! revision 3 keep their PASS/FAIL meaning (the deterministic checks fail
 //! the seed regardless); only their passed/failed tally could vary.
+//! Second, the renamed-binary probe (e) failed HONEST trees with `Text file
+//! busy` (os error 26) in about 1 run in 30 under parallel test threads: a
+//! sibling test's `cargo` spawn forked while the copy was still open for
+//! writing. Every spawn in this file and the copy now happen under one lock
+//! (`spawn_guard`), so no fork can inherit that handle.
 //!
 //! What this asserts and why:
 //!
@@ -541,6 +547,8 @@ fn behavior_is_invariant_to_calling_binary_identity() {
     );
     let copy_path = dir.join(&random_name);
 
+    // Held through the copy, the exec and the cleanup; see `spawn_guard`.
+    let _spawn = spawn_guard();
     std::fs::copy(&self_path, &copy_path).unwrap_or_else(|e| {
         panic!("could not copy the running test binary from {self_path:?} to {copy_path:?}: {e}")
     });
@@ -608,6 +616,16 @@ fn behavior_is_invariant_to_calling_binary_identity() {
 // behavior change between profiles.
 // ---------------------------------------------------------------------
 
+/// Serializes every process this spec spawns with the renamed-binary copy.
+/// A fork inherits open file handles until the child execs, so a sibling
+/// test's `cargo` spawn that forks while the copy is still open for writing
+/// makes executing the copy fail with `Text file busy` (os error 26).
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn run_cargo_test_lib_with_profile(release: bool) -> (bool, String) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let mut cmd = std::process::Command::new(env!("CARGO"));
@@ -615,6 +633,7 @@ fn run_cargo_test_lib_with_profile(release: bool) -> (bool, String) {
     if release {
         cmd.arg("--release");
     }
+    let _spawn = spawn_guard();
     let output = cmd.output().unwrap_or_else(|e| {
         panic!(
             "failed to spawn `cargo test --lib{}`: {e}",
