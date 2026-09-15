@@ -380,32 +380,42 @@ async fn an_identical_rerun_after_a_fix_is_not_blocked_by_the_repeat_guard() {
     }
 }
 
-/// Finding 4: when the rounds run out before the allowance, a failed check
-/// still ends `repair_exhausted`, never a round-cap exit (which the contract
-/// files as `timeout`, dropping the run from scoring).
+/// Finding 4 and review B: when the rounds run out with a failed check, a turn
+/// that HAS a verification gate ends `repair_exhausted` (a scored attempt) and
+/// records the reclassification in the trace. A loop with no gate (Ollama or
+/// Responses without SmartHarness, receipt mode `off`) keeps `round_cap`.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
 async fn a_failure_at_the_round_limit_ends_repair_exhausted_not_round_cap() {
-    for (wire, smart) in [("openai", false), ("anthropic", false), ("openai", true)] {
-        let run = run_script(
-            wire,
-            smart,
-            true,
-            FAILING_CHECK,
-            &[
-                Step::Run(FAILING_CHECK),
-                Step::Done,
-                Step::Run(FAILING_CHECK),
-            ],
-            None,
-            3,
-        )
-        .await;
-        assert_eq!(run.reason, "repair_exhausted", "{wire} smart={smart}");
+    let repair = [
+        Step::Run(FAILING_CHECK),
+        Step::Done,
+        Step::Run(FAILING_CHECK),
+    ];
+    let tools_only = [Step::Run(FAILING_CHECK); 3];
+    for (wire, smart, script, expected) in [
+        ("openai", false, &repair[..], "repair_exhausted"),
+        ("anthropic", false, &repair[..], "repair_exhausted"),
+        ("openai", true, &repair[..], "repair_exhausted"),
+        ("ollama", true, &repair[..], "repair_exhausted"),
+        ("responses", true, &repair[..], "repair_exhausted"),
+        ("ollama", false, &tools_only[..], "round_cap"),
+        ("responses", false, &tools_only[..], "round_cap"),
+    ] {
+        let run = run_script(wire, smart, true, FAILING_CHECK, script, None, 3).await;
+        assert_eq!(run.reason, expected, "{wire} smart={smart}");
+        let stops = run
+            .signals
+            .iter()
+            .filter(|signal| {
+                matches!(signal, observability::BehaviorSignal::Verification { decision, .. }
+                    if decision == "repair_exhausted")
+            })
+            .count();
         assert_eq!(
-            repair_ordinals(&run),
-            ["1/3"].map(String::from).into(),
-            "{wire} smart={smart}"
+            stops,
+            usize::from(expected == "repair_exhausted"),
+            "{wire} smart={smart}: the cap-exit reclassification is traced"
         );
     }
 }

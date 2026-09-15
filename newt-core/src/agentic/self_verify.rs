@@ -734,28 +734,47 @@ impl VerificationLedger {
         }
     }
 
-    /// The end reason of a round-cap exit in result-aware mode: a detected
-    /// check whose latest evidence is a failure makes it `RepairExhausted`
-    /// (a scored attempt), otherwise it stays `RoundCap`.
-    pub(crate) fn cap_exit_reason(&self, workspace: &str) -> crate::TurnEndReason {
-        if self.result_aware {
-            let checks = detect_checks(
-                &workspace_entries(std::path::Path::new(workspace)),
-                &self.task,
-            );
-            let (decision, _) = conclude(&Conclusion {
-                checks: &checks,
-                requested: &[],
-                ledger: self,
-                tree_now: self.tree_now(workspace),
-                repairs_used: VERIFY_REPAIR_ALLOWANCE,
-                rounds_left: false,
-            });
-            if decision == Decision::Stop(crate::TurnEndReason::RepairExhausted) {
-                return crate::TurnEndReason::RepairExhausted;
-            }
+    /// The end reason of a round-cap exit in result-aware mode. When this turn
+    /// has a gate (`gate_on`: the ordinary gate, or SmartHarness verification)
+    /// and a detected check's latest evidence is a failure, the exit is a scored
+    /// `RepairExhausted` and the reclassification is traced. Otherwise, and on
+    /// any loop without a gate, it stays `RoundCap`.
+    pub(crate) fn cap_exit_reason(
+        &self,
+        workspace: &str,
+        gate_on: bool,
+        round: usize,
+        solve_obs: Option<&mut super::observability::SolveObservation>,
+    ) -> crate::TurnEndReason {
+        if !(self.result_aware && gate_on) {
+            return crate::TurnEndReason::RoundCap;
         }
-        crate::TurnEndReason::RoundCap
+        let checks = detect_checks(
+            &workspace_entries(std::path::Path::new(workspace)),
+            &self.task,
+        );
+        let (decision, report) = conclude(&Conclusion {
+            checks: &checks,
+            requested: &[],
+            ledger: self,
+            tree_now: self.tree_now(workspace),
+            repairs_used: VERIFY_REPAIR_ALLOWANCE,
+            rounds_left: false,
+        });
+        if decision != Decision::Stop(crate::TurnEndReason::RepairExhausted) {
+            return crate::TurnEndReason::RoundCap;
+        }
+        if let Some(obs) = solve_obs {
+            obs.behavior_signals
+                .push(super::observability::BehaviorSignal::Verification {
+                    round,
+                    decision: "repair_exhausted".to_string(),
+                    repairs_used: VERIFY_REPAIR_ALLOWANCE,
+                    allowance: VERIFY_REPAIR_ALLOWANCE,
+                    report,
+                });
+        }
+        crate::TurnEndReason::RepairExhausted
     }
 
     /// The current tree state, computed only when some recorded pass could
