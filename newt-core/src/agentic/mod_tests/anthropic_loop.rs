@@ -861,6 +861,7 @@ async fn final_summary_provider_contracts() {
                 estimation: crate::tokens::TokenEstimation::default(),
                 ollama_num_ctx: None,
                 prompt_measurement: Default::default(),
+                fell_back: Default::default(),
             };
             let client = reqwest::Client::new();
             let url = server.uri();

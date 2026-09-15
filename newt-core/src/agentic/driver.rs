@@ -308,6 +308,8 @@ pub struct TurnOutcome {
     /// Whether the loop already printed `reply` as it arrived. A host that
     /// shows answers must print an unstreamed reply itself (#2372).
     pub was_streamed: bool,
+    /// `reply` is harness-written text, not the model's claim (#2372).
+    pub harness_reply: bool,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
 }
@@ -773,6 +775,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             features,
             output_allowance: solve_obs.output_allowance,
+            harness_reply: solve_obs.harness_reply,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -794,6 +797,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             features,
             output_allowance: solve_obs.output_allowance,
+            harness_reply: solve_obs.harness_reply,
         }),
     }
 }

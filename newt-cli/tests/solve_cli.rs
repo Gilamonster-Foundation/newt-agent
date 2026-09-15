@@ -827,6 +827,82 @@ async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
         );
         assert_eq!(stdout.matches(CLAIM).count(), 1, "{kind}: {stdout}");
     }
+
+    // The answer is shown before anything that can fail: an unwritable
+    // --events path (a directory) fails the run, and the claim is still there.
+    let output = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .args(["--backend-endpoint", &server.uri()])
+        .args(["--backend-model", "m"])
+        .args(["--backend-kind", "openai"])
+        .args(["solve", "--cwd"])
+        .arg(fixture.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(fixture.path())
+        .args(["--max-rounds", "1"])
+        .output()
+        .expect("run newt solve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a directory is not an events file"
+    );
+    assert_eq!(
+        stdout.matches(&format!("▸  {CLAIM}")).count(),
+        1,
+        "{stdout}"
+    );
+}
+
+/// #2372: `▸` marks the model's claim. A reply the harness wrote itself — here
+/// the empty-response note — is printed as a harness notice, never as a claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["stream"].as_bool().unwrap_or(false) {
+                let frame = serde_json::json!({"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]});
+                let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]
+            }))
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    let output = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .args(["--backend-endpoint", &server.uri()])
+        .args(["--backend-model", "m"])
+        .args(["--backend-kind", "openai"])
+        .args(["solve", "--cwd"])
+        .arg(fixture.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .args(["--max-rounds", "1"])
+        .output()
+        .expect("run newt solve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("⚠  newt: (model returned an empty response"),
+        "the harness text is a notice: {stdout}"
+    );
+    assert!(
+        !stdout.contains("▸  (model returned"),
+        "never a claim: {stdout}"
+    );
 }
 
 /// An explicit config file selects the configuration source, but it must not

@@ -15,9 +15,11 @@
 //! Two surfaces:
 //! - [`split_reasoning`] — batch, for a fully-assembled reply (the non-streaming
 //!   completion paths).
-//! - [`ThinkFilter`] — incremental, for the streaming path, where a `<think>` block
+//! - [`ThinkFilter`] — incremental, for a streamed reply, where a `<think>` block
 //!   spans token boundaries (`<thi` / `nk>…</thi` / `nk>`) and must be suppressed
-//!   live without ever printing a partial tag.
+//!   live without ever printing a partial tag; and
+//!   [`ThinkFilter::filter_complete`] applies the same declared policy to a
+//!   complete reply (#2372).
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";

@@ -2947,9 +2947,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
 
         let message = &json["message"];
-        // Capture the probe content now — it may be our only copy of the
-        // model's reply if the subsequent streaming re-issue returns empty.
-        let probe_content = message["content"].as_str().unwrap_or("").to_string();
+        // #2372: the probe is the only generation of this round, so reasoning
+        // leaves it here, once, with the stream filter's own policy (#385;
+        // #528's leading shape only when the backend declares it) — every final
+        // path below (answer, smart exit, read-only handoff) sees the same text.
+        let (probe_content, inline_reasoning) = crate::reasoning::ThinkFilter::filter_complete(
+            message["content"].as_str().unwrap_or(""),
+            emits_leading_reasoning,
+        );
 
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls a weak model emitted in CONTENT instead of the
@@ -3100,10 +3105,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
-            // A final text candidate can come from either the streaming re-issue
-            // or the non-streamed probe fallback. Run both through the same
-            // no-tool final-answer gates so "Let me inspect..." does not force a
-            // human "continue" just because the stream returned empty.
+            // The probe's text is the final answer candidate (#2372). It runs
+            // through the no-tool final-answer gates so "Let me inspect..."
+            // is nudged instead of forcing a human "continue".
             macro_rules! maybe_nudge_no_tool_content {
                 ($content:expr, $usage:expr) => {{
                     let content = $content;
@@ -3337,25 +3341,26 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // #2372: the probe's content is the answer. It is never generated a
             // second time for display: the host renders the accepted reply, so
             // the operator sees, the caller returns and the ledger counts one
-            // generation. Reasoning is filtered with the display stream's own
-            // policy (#385; #528's leading shape only when declared), and folded.
-            let (probe_content, inline_reasoning) = crate::reasoning::ThinkFilter::filter_complete(
-                &probe_content,
-                emits_leading_reasoning,
-            );
-            // Ollama's native `thinking` channel wins over inline tags, as
-            // `reasoning_content` does on the OpenAI wire.
-            let native_thinking = json["message"]["thinking"]
-                .as_str()
-                .map(str::trim)
-                .filter(|thinking| !thinking.is_empty())
-                .map(str::to_string);
-            commit_reasoning_fold(
-                native_thinking.or(inline_reasoning),
-                probe_started.elapsed(),
-                completed_spill_renderer.as_deref(),
-                color,
-            );
+            // generation. Its reasoning — the native `thinking` channel and any
+            // inline block, both — is folded under the same gate the display
+            // stream's spinner had: a colour terminal, never a pipe.
+            if color {
+                let native_thinking = json["message"]["thinking"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|thinking| !thinking.is_empty())
+                    .map(str::to_string);
+                let reasoning = match (native_thinking, inline_reasoning.clone()) {
+                    (Some(native), Some(inline)) => Some(format!("{native}\n{inline}")),
+                    (native, inline) => native.or(inline),
+                };
+                commit_reasoning_fold(
+                    reasoning,
+                    probe_started.elapsed(),
+                    completed_spill_renderer.as_deref(),
+                    color,
+                );
+            }
             if probe_content.is_empty() {
                 let merged = accumulated_usage;
                 let empty_round_usage = round_usage;
@@ -3575,6 +3580,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     if let Some(slot) = &mut end_reason {
                         **slot = Some(crate::TurnEndReason::Empty);
                     }
+                    observability::observe_harness_reply(&mut solve_obs);
                     return Ok((
                         suspicious_empty_ollama_diagnostic(&json),
                         false,
@@ -3586,6 +3592,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 if let Some(slot) = &mut end_reason {
                     **slot = Some(crate::TurnEndReason::Empty);
                 }
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((msg.to_string(), false, merged, hallucination_count));
             }
             maybe_nudge_no_tool_content!(probe_content.as_str(), None);
@@ -3978,6 +3985,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         estimation,
         ollama_num_ctx: num_ctx,
         prompt_measurement: Default::default(),
+        fell_back: Default::default(),
     };
     let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -5735,6 +5743,8 @@ struct CapExit {
     /// Learning evidence from fresh counts of this immutable summary request.
     /// Admission still probes anew on every attempt; this is never a count cache.
     prompt_measurement: std::sync::Mutex<Option<context_recovery::PromptMeasurement>>,
+    /// Set when the harness wrote the cap-exit text itself (#2372).
+    fell_back: std::sync::atomic::AtomicBool,
 }
 
 impl CapExit {
@@ -5758,6 +5768,8 @@ impl CapExit {
     }
 
     fn fallback(&self) -> (String, bool, Option<crate::TokenUsage>) {
+        self.fell_back
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         (
             cap_exit_fallback(
                 self.max_tool_rounds,
@@ -5819,8 +5831,12 @@ impl CapExit {
                     attempt,
                     rejection.estimated_tokens,
                 )?;
+                observability::observe_harness_reply(observations);
                 return Ok(self.fallback());
             }
+        }
+        if self.fell_back.load(std::sync::atomic::Ordering::Relaxed) {
+            observability::observe_harness_reply(observations);
         }
         result
     }
@@ -6131,7 +6147,8 @@ async fn final_summary_openai(
 /// the OpenAI `tool_calls` / `tool_call_id` / `usage` shapes.
 ///
 /// Primary requests stream on the transport and are validated before tools
-/// execute. Accepted final answers retain the existing display reissue.
+/// execute. An accepted final answer is returned as generated; the host
+/// renders it (#2372).
 pub async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -6248,17 +6265,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
-        // #123 gave this loop a streamed round with a `ThinkFilter` in it, so
-        // the flag is now MEANINGFUL here and still deliberately unused: the
-        // lone-leading-`</think>` quirk (#528) has only ever been observed on
-        // the Ollama wire, and starting the filter INSIDE a reasoning block
-        // would swallow a normal answer from every endpoint that does not have
-        // it. Flip this when a `/v1/chat/completions` endpoint is actually
-        // seen doing it. Bound and ignored rather than dropped from the
-        // pattern: a future field added to ChatCtx then fails HERE, forcing a
-        // decision about what it means for this wire instead of silently
-        // defaulting.
-        emits_leading_reasoning: _,
+        // #2372: the primary content is filtered with the stream filter's
+        // policy — a lone `</think>` is answer text unless the backend
+        // declares the #528 leading shape.
+        emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -6301,7 +6311,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
-    // #123 + #643: the streaming re-issue gets its OWN client, because a
+    // #643: streamed generations get their OWN client, because a
     // whole-request `.timeout()` bounds connect + headers + the ENTIRE body —
     // it aborts a slow-but-progressing token stream the instant total time
     // crosses the deadline (the DGX retry-storm wedge the Ollama path already
@@ -7244,8 +7254,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // and the separate `reasoning_content` channel (reasoning parser on) is read
         // but never concatenated into the reply. Normal replies (no reasoning) are
         // unchanged: `split_reasoning` returns the content verbatim.
-        let (oa_content, inline_reasoning) =
-            crate::reasoning::split_reasoning(message["content"].as_str().unwrap_or(""));
+        let (oa_content, inline_reasoning) = crate::reasoning::ThinkFilter::filter_complete(
+            message["content"].as_str().unwrap_or(""),
+            emits_leading_reasoning,
+        );
         let separate_reasoning = message["reasoning_content"]
             .as_str()
             .map(str::trim)
@@ -7740,6 +7752,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
             if content.is_empty() {
                 let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
             // Esc after the answer arrived: the operator asked to stop, so the
@@ -8172,6 +8185,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         estimation,
         ollama_num_ctx: None,
         prompt_measurement: Default::default(),
+        fell_back: Default::default(),
     };
     let summary = final_summary_openai(
         (&client, &stream_client),
@@ -8263,12 +8277,10 @@ struct AnthropicDispatch<'a> {
 /// [`anthropic_wire::parse_messages_reply`] decodes it.
 ///
 /// `stream:true`: only send()+status-check sit in the retry envelope; the SSE
-/// body is consumed OUTSIDE it (mirrors the Ollama streaming re-issue — a
-/// re-sent body after visible output would re-print). Text deltas print live
-/// following `stream_response`'s display idioms (spinner teardown before the
-/// first visible char, the `▸  ` prefix, the markdown block writer when
-/// markdown is on); thinking deltas go to the spinner detail like the Ollama
-/// `thinking` field. A mid-stream failure follows the #640 policy: with no
+/// body is consumed OUTSIDE it (a re-sent body after visible output would
+/// re-print). Text deltas print live (spinner teardown before the first
+/// visible char, the `▸  ` prefix, the markdown block writer when markdown is
+/// on); thinking deltas go to the spinner detail. A mid-stream failure follows the #640 policy: with no
 /// visible output the round is re-issued under the retry budget; with partial
 /// visible output the partial answer is kept with a notice.
 ///
@@ -8361,8 +8373,8 @@ async fn anthropic_dispatch_round(
             Some(r) => r?,
         };
 
-        // The ONE spinner (`newt_core::tty`), gated exactly like
-        // `stream_response`; the accumulated round text stays RAW (it is
+        // The ONE spinner (`newt_core::tty`), gated on a colour terminal with
+        // thinking shown; the accumulated round text stays RAW (it is
         // persisted and re-sent), display styling never enters it.
         let mut spinner = crate::tty::Spinner::start_with_caps(
             legacy_caps(d.color && thinking_stream_enabled()),
@@ -8390,8 +8402,7 @@ async fn anthropic_dispatch_round(
         let mut resp = resp;
         while !acc.is_done() {
             match cancellable(cancel, resp.chunk()).await {
-                // Interrupted: stop reading and keep what already streamed
-                // (mirrors `stream_response`'s interrupt contract).
+                // Interrupted: stop reading and keep what already streamed.
                 None => break,
                 Some(Ok(Some(chunk))) => {
                     // Lossy UTF-8 into the accumulator's ROLLING line buffer —
@@ -8403,8 +8414,7 @@ async fn anthropic_dispatch_round(
                                 if !started {
                                     // The answer is starting — close the
                                     // reasoning block while the spinner's clock
-                                    // is still readable, then tear it down
-                                    // (stream_response's display convention).
+                                    // is still readable, then tear it down.
                                     if let Some(sp) = spinner.as_ref() {
                                         anth_reason.close(
                                             sp.elapsed(),
@@ -9479,6 +9489,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let streamed = printed_live && !model_reply.text.is_empty();
             if model_reply.text.is_empty() {
                 let out = "the model declined this request (refusal)".to_string();
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, streamed, accumulated_usage, hallucination_count));
             }
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -9959,6 +9970,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let streamed = printed_live && !content.is_empty();
             if content.is_empty() {
                 let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, streamed, accumulated_usage, hallucination_count));
             }
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -10360,6 +10372,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         estimation,
         ollama_num_ctx: None,
         prompt_measurement: Default::default(),
+        fell_back: Default::default(),
     };
     let result = final_summary_anthropic(
         &client,
@@ -10729,11 +10742,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
-        // This loop does not call `stream_response`, the only consumer of the
-        // flag (the leading-`</think>` filter is Ollama-wire only today).
-        // Bound and ignored rather than dropped from the pattern: a future
-        // field added to ChatCtx then fails HERE, forcing a decision about
-        // what it means for this wire instead of silently defaulting.
+        // The Responses wire carries reasoning in its own items, never as a
+        // lone leading `</think>` closer, so the declared #528 shape does not
+        // apply. Bound and ignored rather than dropped from the pattern: a
+        // future field added to ChatCtx then fails HERE, forcing a decision
+        // about what it means for this wire instead of silently defaulting.
         emits_leading_reasoning: _,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -12254,9 +12267,8 @@ mod http_loop_tests;
 #[cfg(test)]
 #[path = "mod_tests/anthropic_loop.rs"]
 mod anthropic_loop_tests;
-// #123: the OpenAI-compatible streaming re-issue — that the loop streams the
-// round it accepts (and only that round), and that every way the second call
-// can fail lands on the probe answer instead of on silence.
+// The OpenAI-compatible final answer (#123, #2372): one generation, returned
+// as the gates accepted it, with no display reissue.
 #[cfg(test)]
 #[path = "mod_tests/openai_stream_loop.rs"]
 mod openai_stream_loop_tests;

@@ -55,13 +55,15 @@ async fn ollama_returns_the_accepted_probe_answer_without_a_reissue() {
 }
 
 /// One Ollama answer with `content` (and optionally native `thinking`),
-/// returned through a real turn; `renderer` records the reasoning fold.
+/// returned through a real turn. Returns the reply and every reasoning body
+/// the fold retained. Callers hold `GlobalSettingsGuard` with
+/// `NEWT_THINKING=fold`, so a missing fold cannot pass by being switched off.
 async fn ollama_answer(
     content: &str,
     thinking: Option<&str>,
     leading_reasoning: bool,
-    renderer: Option<Arc<FoldRecorder>>,
-) -> String {
+    color: bool,
+) -> (String, Vec<String>) {
     let server = MockServer::start().await;
     let mut message = serde_json::json!({"content": content});
     if let Some(thinking) = thinking {
@@ -77,39 +79,55 @@ async fn ollama_answer(
     let messages = msgs();
     let caveats = Caveats::top();
     let uri = server.uri();
+    let recorder = Arc::new(FoldRecorder::default());
     let mut c = ctx(&uri, &messages, &caveats);
     c.emits_leading_reasoning = leading_reasoning;
-    c.completed_spill_renderer = renderer.map(|r| r as Arc<dyn CompletedSpillRenderer>);
+    c.color = color;
+    c.completed_spill_renderer = Some(recorder.clone() as Arc<dyn CompletedSpillRenderer>);
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    reply
+    let folded = recorder.0.lock().unwrap().clone();
+    (reply, folded)
+}
+
+fn thinking_folded() -> crate::test_guard::GlobalSettingsGuard {
+    let guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::process_env::set_var("NEWT_THINKING", "fold");
+    guard
 }
 
 /// #2372: the accepted Ollama answer follows the display stream's reasoning
-/// policy. An undeclared backend keeps a lone `</think>` as answer text; only a
-/// backend declaring the leading shape (#384, #528) has it stripped; an inline
-/// `<think>` block never reaches the answer either way.
+/// policy, and what it strips is what it folds. An undeclared backend keeps a
+/// lone `</think>` as answer text; only a backend declaring the leading shape
+/// (#384, #528) has it stripped; an inline `<think>` block never reaches the
+/// answer either way.
 #[tokio::test]
 async fn the_ollama_answer_follows_the_declared_reasoning_policy() {
+    let _settings = thinking_folded();
     let undeclared = "End the block with `</think>` and then answer.";
     assert_eq!(
-        ollama_answer(undeclared, None, false, None).await,
-        undeclared
+        ollama_answer(undeclared, None, false, true).await,
+        (undeclared.to_string(), vec![])
     );
-    assert_eq!(
-        ollama_answer("plan</think>Done.", None, true, None).await,
-        "Done."
-    );
-    let declared = ollama_answer("plan</think>Use the <think> tag", None, true, None).await;
+    let (reply, folded) = ollama_answer("plan</think>Done.", None, true, true).await;
+    assert_eq!(reply, "Done.");
     assert!(
-        !declared.contains("plan") && !declared.contains("</think>"),
-        "{declared:?}"
+        folded.iter().any(|body| body.contains("plan")),
+        "{folded:?}"
+    );
+    let (reply, folded) = ollama_answer("plan</think>Use the <think> tag", None, true, true).await;
+    assert!(
+        !reply.contains("plan") && !reply.contains("</think>"),
+        "{reply:?}"
+    );
+    assert!(
+        folded.iter().any(|body| body.contains("plan")),
+        "{folded:?}"
     );
     for leading in [false, true] {
-        assert_eq!(
-            ollama_answer("<think>x</think>Done.", None, leading, None).await,
-            "Done."
-        );
+        let (reply, folded) = ollama_answer("<think>x</think>Done.", None, leading, true).await;
+        assert_eq!(reply, "Done.");
+        assert!(folded.iter().any(|body| body.contains('x')), "{folded:?}");
     }
 }
 
@@ -132,24 +150,54 @@ impl CompletedSpillRenderer for FoldRecorder {
 }
 
 /// #2372: Ollama's native `thinking` channel is folded like the OpenAI wire's
-/// `reasoning_content` — it is the reasoning, not lost with the display stream.
+/// `reasoning_content`; together with an inline block both are folded and
+/// neither reaches the answer; whitespace-only thinking is not reasoning.
 #[tokio::test]
 async fn ollama_native_thinking_is_folded_with_the_accepted_answer() {
-    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
-    crate::process_env::set_var("NEWT_THINKING", "fold");
-    let recorder = Arc::new(FoldRecorder::default());
-    let reply = ollama_answer(
-        "Done.",
-        Some("plan the change"),
+    let _settings = thinking_folded();
+    let (reply, folded) = ollama_answer("Done.", Some("plan the change"), false, true).await;
+    assert_eq!(reply, "Done.");
+    assert!(
+        folded.iter().any(|body| body.contains("plan the change")),
+        "{folded:?}"
+    );
+
+    let (reply, folded) = ollama_answer(
+        "<think>inline step</think>Done.",
+        Some("native plan"),
         false,
-        Some(recorder.clone()),
+        true,
     )
     .await;
     assert_eq!(reply, "Done.");
-    let retained = recorder.0.lock().unwrap();
     assert!(
-        retained.iter().any(|body| body.contains("plan the change")),
-        "the native thinking was folded: {retained:?}"
+        folded
+            .iter()
+            .any(|body| body.contains("native plan") && body.contains("inline step")),
+        "both reasoning sources fold: {folded:?}"
+    );
+
+    let (reply, folded) = ollama_answer("<think>x</think>Done.", Some("   "), false, true).await;
+    assert_eq!(reply, "Done.");
+    assert!(
+        folded.iter().all(|body| !body.trim().is_empty()),
+        "{folded:?}"
+    );
+    assert!(folded.iter().any(|body| body.contains('x')), "{folded:?}");
+    assert_eq!(
+        ollama_answer("Done.", Some("  \n "), false, true).await,
+        ("Done.".to_string(), vec![])
+    );
+}
+
+/// #2372: headless and piped runs print no reasoning, as the display stream's
+/// spinner never did off a colour terminal.
+#[tokio::test]
+async fn ollama_reasoning_is_not_folded_off_a_colour_terminal() {
+    let _settings = thinking_folded();
+    assert_eq!(
+        ollama_answer("<think>x</think>Done.", Some("native plan"), false, false).await,
+        ("Done.".to_string(), vec![])
     );
 }
 

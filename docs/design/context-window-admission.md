@@ -171,14 +171,11 @@ close; the `stream: false` control retains the slot until generation is explicit
 finished. This grounds the disconnect mechanism without claiming that every
 remote service releases its scheduler slot or KV allocation on the same schedule.
 
-Legacy mode retains the optional final-display request after accepting an
-answer. Its existing idle read deadline allows a progressing stream to continue.
-An actual SSE error envelope, including one received before a disconnect or
-without `[DONE]`, preserves the accepted answer; a capacity rejection also records
-`context_exceeded` and updates calibration. Quoting those words in answer text
-is ordinary content. Smart mode continues to omit the extra display request.
+An accepted answer is returned as generated; no mode sends a second,
+display-only request for it (#2372). A streamed primary request keeps its idle
+read deadline, so a progressing stream continues. Quoting a context-exceeded
+message in answer text is ordinary content.
 
-The [decoder tests](../../newt-core/src/agentic/openai_sse_strict_tests.rs),
-[primary-loop tests](../../newt-core/src/agentic/mod_tests/openai_primary_stream.rs),
-and [display-loop tests](../../newt-core/src/agentic/mod_tests/http_display_context_exceeded.rs)
+The [decoder tests](../../newt-core/src/agentic/openai_sse_strict_tests.rs)
+and [primary-loop tests](../../newt-core/src/agentic/mod_tests/openai_primary_stream.rs)
 cover these protocol and recovery boundaries without live models.

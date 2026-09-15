@@ -249,13 +249,19 @@ impl Respond for ToolThenAnswer {
     }
 }
 
-/// #2372: reasoning never reaches the accepted answer — the string that is
-/// returned, persisted and re-sent. Both shapes: an inline `<think>` block, and
-/// #528's lone leading closer. The deleted display stream used to filter these;
-/// the primary path's `split_reasoning` must.
+/// #2372: the accepted Chat answer — the string that is returned, persisted
+/// and re-sent — follows the reasoning policy the display stream's filter had.
+/// An inline `<think>` block never reaches it; a lone `</think>` is answer text
+/// unless the backend declares the #528 leading shape.
 #[tokio::test]
-async fn reasoning_does_not_leak_into_the_accepted_answer() {
-    for content in ["<think>x</think>Done.", "x</think>Done."] {
+async fn the_chat_answer_follows_the_declared_reasoning_policy() {
+    let undeclared = "End the block with `</think>` and then answer.";
+    for (content, leading, expected) in [
+        ("<think>x</think>Done.", false, "Done."),
+        ("<think>x</think>Done.", true, "Done."),
+        (undeclared, false, undeclared),
+        ("x</think>Done.", true, "Done."),
+    ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -265,12 +271,13 @@ async fn reasoning_does_not_leak_into_the_accepted_answer() {
 
         let messages = msgs();
         let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.emits_leading_reasoning = leading;
         let (reply, _streamed, _usage, _hallu) =
-            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-                .await
-                .expect("dispatch");
+            chat_complete(c, &mut NoMcp).await.expect("dispatch");
 
-        assert_eq!(reply, "Done.", "{content:?}");
+        assert_eq!(reply, expected, "{content:?} declared={leading}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

@@ -157,6 +157,16 @@ pub struct SolveObservation {
     pub behavior_signals: Vec<BehaviorSignal>,
     /// The output cap the turn's wire applied (#2312), when it applied one.
     pub output_allowance: Option<OutputAllowance>,
+    /// The reply is harness-written text (an empty-response note, a refusal
+    /// placeholder, a cap-exit fallback), not a model claim (#2372).
+    pub harness_reply: bool,
+}
+
+/// Mark the turn's reply as harness-written rather than model-authored.
+pub(crate) fn observe_harness_reply(obs: &mut Option<&mut SolveObservation>) {
+    if let Some(obs) = obs.as_deref_mut() {
+        obs.harness_reply = true;
+    }
 }
 
 /// An output cap as a turn applied it (#2312): the tokens, and whether the
