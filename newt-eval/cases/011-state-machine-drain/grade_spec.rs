@@ -150,11 +150,17 @@
 //! spawns themselves: a spawned child has exec'd by the time `spawn()`
 //! returns and holds no inherited handle, so waiting happens outside the
 //! lock and the nested cargo runs no longer serialize behind each other.
-//! It also bans `Command` and `process::` from the real implementation,
-//! next to the other process-identity tokens: a candidate that forks from
-//! inside `sum_until_zero` would reopen the same `Text file busy` race in
-//! this spec's process. That could only fail the candidate, never pass it,
-//! but a pure summing function has no reason to spawn anything.
+//! It also bans spawning from the real implementation, next to the other
+//! process-identity tokens: a candidate that forks from inside
+//! `sum_until_zero` would reopen the same `Text file busy` race in this
+//! spec's process. That could only fail the candidate, never pass it, but
+//! a pure summing function has no reason to spawn anything. The ban is
+//! `Command::new` anywhere and `process::` as a path segment of its own, so
+//! honest code that merely shares a token (an enum variant named
+//! `Command`, a `preprocess::` path) is not failed. `strip_noncode` now
+//! also blanks character literals, as its doc always said: before, the `"`
+//! in `'"'` opened a phantom string that blanked real code and failed
+//! correct implementations on unrelated structural checks.
 //!
 //! What this asserts and why:
 //!
@@ -804,6 +810,30 @@ fn strip_noncode(src: &str) -> String {
                         // rather than risk an infinite loop.
                     }
                 }
+            }
+        }
+        // Character literal: `'x'`, `'"'`, `'\''`, `'\u{..}'`, a multi-byte
+        // char. A lifetime or label (`'a`, `'outer:`) has no closing quote
+        // right after its first character and is left as code.
+        if b[i] == b'\'' {
+            let close = if b.get(i + 1) == Some(&b'\\') {
+                b.get(i + 3..)
+                    .and_then(|rest| rest.iter().take(10).position(|&c| c == b'\''))
+                    .map(|p| i + 3 + p)
+            } else {
+                let width = match b.get(i + 1) {
+                    Some(&c) if c >= 0xF0 => 4,
+                    Some(&c) if c >= 0xE0 => 3,
+                    Some(&c) if c >= 0xC0 => 2,
+                    Some(_) => 1,
+                    None => 0,
+                };
+                (width > 0 && b.get(i + 1 + width) == Some(&b'\'')).then_some(i + 1 + width)
+            };
+            if let Some(close) = close {
+                out.extend(std::iter::repeat(b' ').take(close + 1 - i));
+                i = close + 1;
+                continue;
             }
         }
         if b[i] == b'"' {
@@ -1464,10 +1494,11 @@ fn no_process_environment_or_build_profile_fingerprinting_outside_test_body() {
         "thread::current",
         "Backtrace",
         "backtrace::",
-        // Spawning processes: a fork from inside `sum_until_zero` would
-        // reopen the `Text file busy` race this spec's lock closes.
-        "Command",
-        "process::",
+        // Spawning a process: a fork from inside `sum_until_zero` would
+        // reopen the `Text file busy` race this spec's lock closes. Also
+        // catches an aliased path (`use std::process as p; p::Command::new`).
+        // `process::` as its own path segment is checked below.
+        "Command::new",
         // Technique (f): build-profile / compile-time-flag gating.
         "cfg!",
         "cfg(",
@@ -1493,6 +1524,21 @@ fn no_process_environment_or_build_profile_fingerprinting_outside_test_body() {
     }
 
     let ob = outside.as_bytes();
+    // `std::process::…` or `process::…`, but not a longer identifier that
+    // ends in "process" (`preprocess::keep`).
+    let mut search_from = 0usize;
+    while let Some(off) = outside[search_from..].find("process::") {
+        let idx = search_from + off;
+        assert!(
+            !is_word_boundary(ob.get(idx.wrapping_sub(1)).copied()),
+            "src/lib.rs's real implementation must not reach into `std::process` (spawning, \
+             exiting, or reading process identity): `sum_until_zero` must be a pure function of \
+             its `xs` argument, and a fork from inside it would race this spec's own \
+             renamed-binary probe."
+        );
+        search_from = idx + 1;
+    }
+
     let mut search_from = 0usize;
     while let Some(off) = outside[search_from..].find("fn main") {
         let idx = search_from + off;
