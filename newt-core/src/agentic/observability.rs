@@ -102,6 +102,16 @@ pub fn reasoning_overflow_signature(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BehaviorSignal {
+    /// #2315: one result-aware verification decision at a concluding answer:
+    /// `accept`, `nudge`, or the stop reason; the per-check status; and which
+    /// state evidence (`tree` or `mutation_chain`) decided freshness.
+    Verification {
+        round: usize,
+        decision: String,
+        repairs_used: usize,
+        allowance: usize,
+        report: super::self_verify::VerificationReport,
+    },
     /// A rejected request and the strictly smaller projection selected next.
     /// `None` means recovery stopped; attempts count within the user turn.
     ContextExceeded {

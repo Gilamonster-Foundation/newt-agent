@@ -804,6 +804,8 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             smart_harness: smart_manifest.as_ref(),
             output_allowance: o_opt.and_then(|o| o.output_allowance),
             features: o_opt.map(|o| o.features),
+            // The headless driver always arms action nudges.
+            verification: Some(newt_core::agentic::verification_receipt(true)),
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
             required: &args.require_feature,
         },

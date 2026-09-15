@@ -16,30 +16,43 @@ fn instruction(check: &str) -> String {
     format!("Fix the bug. You can run `{check}` to verify.")
 }
 
-/// One scripted reply: `Some(command)` is a `run_command` call, `None` the
-/// final text `done`.
-fn reply(wire: &str, command: Option<&str>) -> ResponseTemplate {
-    let value = match (wire, command) {
-        ("ollama", Some(c)) => serde_json::json!({"message":{"role":"assistant","content":"",
-            "tool_calls":[{"function":{"name":"run_command","arguments":{"command":c}}}]},"done":true}),
+/// One scripted step: a `run_command` call, or the final text `done`.
+#[derive(Clone, Copy)]
+enum Step {
+    Run(&'static str),
+    Done,
+}
+
+fn reply(wire: &str, step: Step) -> ResponseTemplate {
+    let call = match step {
+        Step::Run(command) => Some(("run_command", serde_json::json!({"command": command}))),
+        Step::Done => None,
+    };
+    let value = match (wire, call) {
+        ("ollama", Some((name, args))) => {
+            serde_json::json!({"message":{"role":"assistant","content":"",
+            "tool_calls":[{"function":{"name":name,"arguments":args}}]},"done":true})
+        }
         ("ollama", None) => {
             serde_json::json!({"message":{"role":"assistant","content":"done"},"done":true})
         }
-        ("anthropic", Some(c)) => serde_json::json!({"id":"msg_1","type":"message",
+        ("anthropic", Some((name, args))) => serde_json::json!({"id":"msg_1","type":"message",
             "role":"assistant","model":"test-model","stop_reason":"tool_use",
-            "content":[{"type":"tool_use","id":"call_1","name":"run_command","input":{"command":c}}]}),
+            "content":[{"type":"tool_use","id":"call_1","name":name,"input":args}]}),
         ("anthropic", None) => serde_json::json!({"id":"msg_1","type":"message",
             "role":"assistant","model":"test-model","stop_reason":"end_turn",
             "content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":5}}),
-        ("responses", Some(c)) => serde_json::json!({"id":"resp_1","status":"completed",
-            "output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"run_command",
-            "arguments":serde_json::json!({"command":c}).to_string()}]}),
+        ("responses", Some((name, args))) => serde_json::json!({"id":"resp_1","status":"completed",
+            "output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":name,
+            "arguments":args.to_string()}]}),
         ("responses", None) => serde_json::json!({"id":"resp_1","status":"completed",
             "model":"test-model","output":[{"type":"message","id":"msg_1","role":"assistant",
             "status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}]}),
-        (_, Some(c)) => serde_json::json!({"choices":[{"message":{"role":"assistant","content":"",
-            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"run_command",
-            "arguments":serde_json::json!({"command":c}).to_string()}}]},"finish_reason":"tool_calls"}]}),
+        (_, Some((name, args))) => {
+            serde_json::json!({"choices":[{"message":{"role":"assistant","content":"",
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":name,
+            "arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+        }
         (_, None) => {
             serde_json::json!({"choices":[{"message":{"role":"assistant","content":"done"},
             "finish_reason":"stop"}]})
@@ -55,7 +68,19 @@ struct Run {
 }
 
 /// The model runs `check` once, then answers `done` every time it is asked.
-async fn run(wire: &str, smart: bool, outcomes: bool, check: &str) -> Run {
+async fn run(wire: &str, smart: bool, outcomes: bool, check: &'static str) -> Run {
+    run_script(wire, smart, outcomes, check, &[Step::Run(check)], None).await
+}
+
+/// The model follows `script`, then answers `done` every time it is asked.
+async fn run_script(
+    wire: &str,
+    smart: bool,
+    outcomes: bool,
+    check: &str,
+    script: &[Step],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Run {
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
     let _outcomes = if outcomes {
@@ -68,11 +93,11 @@ async fn run(wire: &str, smart: bool, outcomes: bool, check: &str) -> Run {
 
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
-    let (wire_owned, check_owned) = (wire.to_string(), check.to_string());
+    let (wire_owned, script) = (wire.to_string(), script.to_vec());
     Mock::given(method("POST"))
         .respond_with(move |_: &Request| {
-            let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
-            reply(&wire_owned, first.then_some(check_owned.as_str()))
+            let i = calls.fetch_add(1, Ordering::SeqCst);
+            reply(&wire_owned, script.get(i).copied().unwrap_or(Step::Done))
         })
         .mount(&server)
         .await;
@@ -97,6 +122,7 @@ async fn run(wire: &str, smart: bool, outcomes: bool, check: &str) -> Run {
         "anthropic" => BackendKind::Anthropic,
         _ => BackendKind::Openai,
     };
+    context.cancel = cancel;
     let mut reason = None;
     context.end_reason = Some(&mut reason);
     if wire == "responses" {
@@ -190,4 +216,76 @@ async fn a_fresh_passing_check_completes_without_a_nudge() {
             "{wire} smart={smart}"
         );
     }
+}
+
+/// A8, and the measurement bias the tree basis exists to avoid: a read-only
+/// command after a pass changes no bytes, so the pass stays current and the
+/// turn completes. Twin: a shell write after the pass (the `sed -i` shape a
+/// write-tool ledger would miss) makes it stale, the model
+/// is told to re-run it, and a model that never does ends
+/// `verification_incomplete`. Grounds `tree_state` in the real filesystem.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn a_pass_goes_stale_on_a_write_but_not_on_a_read_only_command() {
+    let read_only = run_script(
+        "openai",
+        false,
+        true,
+        PASSING_CHECK,
+        &[Step::Run(PASSING_CHECK), Step::Run("ls")],
+        None,
+    )
+    .await;
+    assert_eq!(read_only.reason, "completed");
+    assert!(!read_only
+        .bodies
+        .iter()
+        .any(|b| b.contains("workspace changed after it ran")));
+
+    let written = run_script(
+        "openai",
+        false,
+        true,
+        PASSING_CHECK,
+        &[
+            Step::Run(PASSING_CHECK),
+            Step::Run("sh -c 'echo changed > notes.txt'"),
+        ],
+        None,
+    )
+    .await;
+    assert!(
+        written
+            .bodies
+            .iter()
+            .any(|b| b.contains("workspace changed after it ran")),
+        "the write made the pass stale"
+    );
+    assert_eq!(written.reason, "verification_incomplete");
+}
+
+/// A6: an interrupt while the check runs ends the turn `cancelled`, never a
+/// pass: the funnel records nothing for a call that did not return. SmartHarness
+/// is the path that stamps `cancelled` headless (the ordinary loop leaves it to
+/// the TUI).
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setter = flag.clone();
+    let interrupt = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        setter.store(true, Ordering::SeqCst);
+    });
+    const SLOW: &str = "sh -c 'sleep 5'";
+    let run = run_script("openai", true, true, SLOW, &[Step::Run(SLOW)], Some(&flag)).await;
+    interrupt.await.unwrap();
+    assert_eq!(run.reason, "cancelled");
+    assert_eq!(
+        run.bodies.len(),
+        1,
+        "no request after the interrupted check"
+    );
 }

@@ -4,7 +4,7 @@
 use super::*;
 use crate::ExecOutcome::{Denied, Failed, Passed, TimedOut, Unavailable};
 use crate::TurnEndReason::{RepairExhausted, VerificationIncomplete};
-use content_addressable::{ContentAddressable, ContentId};
+use content_addressable::ContentId;
 
 const CHECK: &str = "sh -c true";
 const OTHER: &str = "git status";
@@ -260,6 +260,46 @@ fn tree_state_follows_bytes_and_gives_up_past_its_bounds() {
     );
     assert_eq!(tree(&base, 1, 1 << 20), None, "entry bound exceeded");
     assert_eq!(tree(&base, 100, 4), None, "byte bound exceeded");
+}
+
+/// A14: the receipt names the mode the gate instantiates, from the same
+/// predicates the loop reads, and the allowance only where it applies.
+#[serial_test::serial(newt_self_verify_env)]
+#[test]
+fn the_verification_receipt_names_the_mode_the_gate_runs_in() {
+    let saved = [
+        std::env::var_os("NEWT_SELF_VERIFY"),
+        std::env::var_os("NEWT_VERIFY_OUTCOMES"),
+    ];
+    std::env::remove_var("NEWT_SELF_VERIFY");
+    std::env::remove_var("NEWT_VERIFY_OUTCOMES");
+    assert_eq!(
+        verification_receipt(true),
+        serde_json::json!({"mode": "attempted"})
+    );
+    assert_eq!(
+        verification_receipt(false),
+        serde_json::json!({"mode": "off"})
+    );
+    std::env::set_var("NEWT_VERIFY_OUTCOMES", "1");
+    assert_eq!(
+        verification_receipt(true),
+        serde_json::json!({"mode": "result_aware", "repair_allowance": VERIFY_REPAIR_ALLOWANCE})
+    );
+    std::env::set_var("NEWT_SELF_VERIFY", "0");
+    assert_eq!(
+        verification_receipt(true),
+        serde_json::json!({"mode": "off"})
+    );
+    for (key, value) in ["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"]
+        .iter()
+        .zip(saved)
+    {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
 }
 
 #[serial_test::serial(newt_self_verify_env)]

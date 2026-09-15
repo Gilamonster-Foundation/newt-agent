@@ -245,6 +245,7 @@ pub use scheduled::{
 pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
 };
+pub use self_verify::verification_receipt;
 pub use semantic::{
     chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,
     format_search_model, format_search_preview, format_search_rejects, gather_code_files,
@@ -2046,6 +2047,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::default();
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -3025,10 +3028,17 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     .await?;
                 let control = harness.verify_answer(
                     control,
-                    &messages,
-                    workspace,
-                    task,
-                    more && smart_verify,
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task,
+                        rounds_left: more,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    smart_verify,
+                    &probe_content,
                 )?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
@@ -4126,6 +4136,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification.observe(name, &args, ok, execution.get().copied(), workspace);
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -6610,6 +6621,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::default();
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -6711,6 +6724,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // verification the workspace ships before letting it conclude. Capped so a
     // model that refuses to verify still ends the turn.
     let mut self_verify_nudges: usize = 0;
+    let mut verification_nudges: usize = 0;
     const SELF_VERIFY_CAP: usize = 2;
     // Pending-plan final-answer gate counter (mirror of the Ollama path).
     let mut pending_plan_nudges: usize = 0;
@@ -7666,10 +7680,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .await?;
                 let control = harness.verify_answer(
                     control,
-                    &messages,
-                    workspace,
-                    task,
-                    more && smart_verify,
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task,
+                        rounds_left: more,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    smart_verify,
+                    &oa_content,
                 )?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
@@ -7906,7 +7927,37 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // mirrors the narration/stale-file nudges: on the FINAL round a
             // verify nudge would burn the pending answer into a cap-exit with
             // zero rounds left to actually run anything — step aside and accept.
-            if self_verify::enabled()
+            // #2315: in the opt-in result-aware mode the same position decides
+            // from observed outcomes instead (A12: one decision, three callers).
+            let mut verification_stop = None;
+            if self_verify::result_aware() && action_nudges && !content.is_empty() {
+                match self_verify::conclude_turn(
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task: active_task,
+                        rounds_left: round + 1 < current_tool_round_limit,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    verification_nudges,
+                ) {
+                    self_verify::Decision::Nudge(nudge) => {
+                        strip_trailing_nudge_exchange(&mut messages);
+                        messages
+                            .push(serde_json::json!({ "role": "assistant", "content": content }));
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
+                        }));
+                        verification_nudges += 1;
+                        continue 'round_loop;
+                    }
+                    self_verify::Decision::Stop(reason) => verification_stop = Some(reason),
+                    self_verify::Decision::Accept => {}
+                }
+            } else if self_verify::enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
@@ -7962,6 +8013,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             } else {
                 crate::TurnEndReason::Completed
             };
+            let accepted_reason = verification_stop.unwrap_or(accepted_reason);
             if debug && accepted_reason != crate::TurnEndReason::Completed {
                 print_debug(
                     &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
@@ -8447,6 +8499,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification.observe(name, &args, ok, execution.get().copied(), workspace);
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -9135,6 +9188,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::default();
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -9222,6 +9277,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut readonly_completion_retried = false;
     // Self-verify gate (#23) — mirrors the OpenAI path.
     let mut self_verify_nudges: usize = 0;
+    let mut verification_nudges: usize = 0;
     const SELF_VERIFY_CAP: usize = 2;
     // Pending-plan final-answer gate counter (mirrors the OpenAI path).
     let mut pending_plan_nudges: usize = 0;
@@ -10027,10 +10083,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     .await?;
                 let control = harness.verify_answer(
                     control,
-                    &messages,
-                    workspace,
-                    task,
-                    more && smart_verify,
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task,
+                        rounds_left: more,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    smart_verify,
+                    &oa_content,
                 )?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
@@ -10253,7 +10316,37 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 continue 'round_loop;
             }
             // Self-verify gate (#23) — mirrors the OpenAI path.
-            if self_verify::enabled()
+            // #2315: in the opt-in result-aware mode the same position decides
+            // from observed outcomes instead (A12: one decision, three callers).
+            let mut verification_stop = None;
+            if self_verify::result_aware() && action_nudges && !content.is_empty() {
+                match self_verify::conclude_turn(
+                    self_verify::Concluding {
+                        messages: &messages,
+                        workspace,
+                        task: active_task,
+                        rounds_left: round + 1 < current_tool_round_limit,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    verification_nudges,
+                ) {
+                    self_verify::Decision::Nudge(nudge) => {
+                        strip_trailing_nudge_exchange(&mut messages);
+                        messages
+                            .push(serde_json::json!({ "role": "assistant", "content": content }));
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge),
+                        }));
+                        verification_nudges += 1;
+                        continue 'round_loop;
+                    }
+                    self_verify::Decision::Stop(reason) => verification_stop = Some(reason),
+                    self_verify::Decision::Accept => {}
+                }
+            } else if self_verify::enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
@@ -10305,6 +10398,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             } else {
                 crate::TurnEndReason::Completed
             };
+            let accepted_reason = verification_stop.unwrap_or(accepted_reason);
             if debug && accepted_reason != crate::TurnEndReason::Completed {
                 print_debug(
                     &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
@@ -10633,6 +10727,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification.observe(name, &args, ok, execution.get().copied(), workspace);
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -11253,6 +11348,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let mut verification = self_verify::VerificationLedger::default();
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -11697,10 +11794,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     .await?;
                 let control = harness.verify_answer(
                     control,
-                    &input,
-                    workspace,
-                    task,
-                    more && smart_verify,
+                    self_verify::Concluding {
+                        messages: &input,
+                        workspace,
+                        task,
+                        rounds_left: more,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    smart_verify,
+                    &text,
                 )?;
                 let (text, reason) = match control {
                     smart_harness::Control::Continue(nudge) => {
@@ -12078,6 +12182,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
+            verification.observe(name, &args, ok, execution.get().copied(), workspace);
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,

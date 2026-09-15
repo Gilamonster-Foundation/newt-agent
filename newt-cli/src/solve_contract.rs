@@ -67,6 +67,8 @@ pub struct ContractInputs<'a> {
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
+    /// The self-verify gate's receipt entry (#2315); `None` omits it.
+    pub verification: Option<serde_json::Value>,
     /// Content id of the explicit scratchpad seed, when the run supplied one.
     pub scratchpad_seed: Option<&'a str>,
     /// The features the run was told to require (`--require-feature`).
@@ -126,7 +128,9 @@ pub fn terminal(
             | TurnEndReason::Cancelled
             | TurnEndReason::AwaitingOperator
             | TurnEndReason::NarrationCapExhausted
-            | TurnEndReason::NarrationFinalRound),
+            | TurnEndReason::NarrationFinalRound
+            | TurnEndReason::RepairExhausted
+            | TurnEndReason::VerificationIncomplete),
         ) => Terminal::StoppedShort(reason),
         Some(TurnEndReason::Completed) | None => Terminal::Completed,
         // `Failed` implies an error, so `clean` is false and this is
@@ -167,6 +171,13 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // run did not finish either, so it files the same way rather than
         // falling through to a wildcard.
         Terminal::StoppedShort(TurnEndReason::RoundCap | TurnEndReason::Cancelled) => "timeout",
+        // #2315: the model delivered an answer the harness's own verification
+        // did not confirm. That is a real attempt at a terminal state; whether
+        // it passes is the suite verifier's call (A13), so it is never `timeout`,
+        // which would drop it from capability scoring. `status` says incomplete.
+        Terminal::StoppedShort(
+            TurnEndReason::RepairExhausted | TurnEndReason::VerificationIncomplete,
+        ) => "completed",
         // The model was exercised but did not deliver an answer. A question is
         // a valid interactive pause, yet a headless solve still needs an answer.
         // Smart final-round narration remains a scored attempt. The legacy
@@ -400,7 +411,10 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "timing": timing,
     });
     conditional_stanza(&mut record, "model_digest", i.model_digest);
-    let receipt = feature_receipt(i.features, i.required, i.scratchpad_seed);
+    let mut receipt = feature_receipt(i.features, i.required, i.scratchpad_seed);
+    if let Some(verification) = &i.verification {
+        receipt.get_or_insert_with(|| serde_json::json!({}))["verification"] = verification.clone();
+    }
     conditional_stanza(&mut record, "receipt", receipt);
     record
 }
@@ -453,6 +467,8 @@ mod tests {
         TurnEndReason::Cancelled,
         TurnEndReason::Failed,
         TurnEndReason::AwaitingOperator,
+        TurnEndReason::RepairExhausted,
+        TurnEndReason::VerificationIncomplete,
     ];
 
     fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
@@ -511,6 +527,8 @@ mod tests {
             TurnEndReason::Cancelled => 5,
             TurnEndReason::Failed => 6,
             TurnEndReason::AwaitingOperator => 7,
+            TurnEndReason::RepairExhausted => 8,
+            TurnEndReason::VerificationIncomplete => 9,
         }
     }
 
@@ -689,6 +707,37 @@ mod tests {
         }
     }
 
+    /// #2315 (A14): the verification receipt entry rides the contract record
+    /// when solve supplies it, even with no features section, and is absent
+    /// otherwise (never invented).
+    #[test]
+    fn the_verification_receipt_is_carried_only_when_supplied() {
+        let entry = serde_json::json!({"mode": "result_aware", "repair_allowance": 3});
+        let mut with = inputs();
+        with.features = None;
+        with.verification = Some(entry.clone());
+        assert_eq!(contract_record(&with)["receipt"]["verification"], entry);
+        let without = inputs();
+        assert!(contract_record(&without)["receipt"]
+            .get("verification")
+            .is_none());
+    }
+
+    /// #2315 (A10/A13): an unconfirmed-verification ending is a scored attempt
+    /// (`completed`) whose own trace status is `incomplete`, never `timeout`.
+    #[test]
+    fn verification_endings_are_completed_attempts_with_incomplete_status() {
+        for reason in [
+            TurnEndReason::RepairExhausted,
+            TurnEndReason::VerificationIncomplete,
+        ] {
+            let t = terminal(true, None, Some(reason), false);
+            assert_eq!(t, Terminal::StoppedShort(reason));
+            assert_eq!(outcome_label(t), "completed");
+            assert_eq!(status_label(t), "incomplete");
+        }
+    }
+
     #[test]
     fn a_question_awaits_the_operator_instead_of_completing_the_task() {
         let t = terminal(true, None, Some(TurnEndReason::AwaitingOperator), false);
@@ -745,6 +794,7 @@ mod tests {
                 crew: true,
                 ..InstantiatedFeatures::default()
             }),
+            verification: None,
             scratchpad_seed: None,
             required: &[],
         }
