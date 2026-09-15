@@ -165,6 +165,22 @@ class Treatments(unittest.TestCase):
         with self.assertRaises(ValueError):  # names are the receipt keys: scratchpad, code_search, crew
             load_treatment(HARBOR / "tests/fixtures/treatment-requires-unknown.toml")
 
+    def test_the_verify_outcomes_treatment_reaches_the_adapter_and_is_observable(self):
+        # #2315: the result-aware switch is a treatment knob, and the arm is
+        # confirmed from the receipt, not assumed from the declared env.
+        t = load_treatment(HARBOR / "treatments/verify-outcomes.toml")
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_SELF_VERIFY": "1", "NEWT_BENCH_VERIFY_OUTCOMES": "1"})
+        treated = {"receipt": {"verification": {"mode": "result_aware", "repair_allowance": 3}}}
+        self.assertIs(observed(t["expect"], treated), True)
+        self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
+
+    def test_the_campaign_unsets_every_arm_changing_knob_it_does_not_set(self):
+        # An exported switch must not silently flip baseline cells.
+        script = (HARBOR / "tb-campaign.sh").read_text()
+        unset = next(line for line in script.splitlines() if line.startswith("unset "))
+        for knob in ("NEWT_BENCH_SMART", "NEWT_BENCH_VERIFY_OUTCOMES"):
+            self.assertIn(knob, unset.split(), knob)
+
     def test_a_refused_requirement_is_read_from_the_exit_message(self):
         message = ("Command failed (exit 1): newt solve ...\nstdout: None\n"
                    "stderr: Error: required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
