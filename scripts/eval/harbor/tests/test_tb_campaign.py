@@ -299,7 +299,7 @@ class PerTrialJobs(unittest.TestCase):
 
 
 class Windows(unittest.TestCase):
-    """The campaign runs only inside declared windows; dgx1 is the maintainer's
+    """The campaign runs only inside declared windows; the inference box is the maintainer's
     outside them. One schedule file is the only source of the windows."""
 
     SCHEDULE = "# nights on weekdays, whole weekend\nmon,tue,wed,thu,fri 20:00 08:00\nsat,sun 00:00 24:00\n"

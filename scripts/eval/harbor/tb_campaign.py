@@ -433,7 +433,7 @@ def job_state(results, exhausted=False):
 
 
 # ── windows and the hard deadline ────────────────────────────────────────────
-# dgx1 is the maintainer's outside declared windows. ONE schedule file is the
+# The inference box is the maintainer's outside declared windows. ONE schedule file is the
 # only source: "<days> <HH:MM start> <HH:MM end>" per line, days from
 # mon..sun, an end at or before the start running past midnight. A timer only
 # wakes the runner; the runner decides.
