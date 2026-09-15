@@ -1081,6 +1081,25 @@ async fn an_ollama_character_split_across_chunks_is_not_corrupted() {
     assert!(complete);
 }
 
+/// Review round 4, item b: the NDJSON line splitter without a socket. At every
+/// byte offset of a line holding multibyte characters, the line comes out whole
+/// and intact, and not before its newline arrives.
+#[test]
+fn an_ollama_line_split_at_every_byte_offset_is_not_corrupted() {
+    let line = "{\"message\":{\"content\":\"newt 🦎 蠑螈\"}}\n".as_bytes();
+    for cut in 0..line.len() {
+        let mut pending = line[..cut].to_vec();
+        assert_eq!(next_ndjson_line(&mut pending), None, "split at byte {cut}");
+        pending.extend_from_slice(&line[cut..]);
+        assert_eq!(
+            next_ndjson_line(&mut pending).as_deref(),
+            Some("{\"message\":{\"content\":\"newt 🦎 蠑螈\"}}"),
+            "split at byte {cut}"
+        );
+        assert!(pending.is_empty());
+    }
+}
+
 /// Review round 2, item 4: an Esc inside the read loop, after the first delta,
 /// keeps the partial text and is never complete. Deterministic: the flag is
 /// tripped only after the reader has drained megabytes of the body.

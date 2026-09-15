@@ -1642,22 +1642,20 @@ async fn an_anthropic_error_event_after_message_delta_keeps_the_complete_usage()
     );
 }
 
-/// Review round 2, item 4: an Esc inside the stream's read loop, after the first
-/// text delta, is a failed attempt. Deterministic: the flag is tripped only
-/// after the reader has drained megabytes of the body, so the send-time cancel
-/// cannot be what fires. Only `message_start` usage arrived, which is no usage
-/// (a known limit: `TokenUsage` cannot say "output unknown").
-#[tokio::test]
-async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt() {
-    let mut frames = anthropic_stream_head(6);
-    frames.push(
-        serde_json::json!({"type": "content_block_delta", "index": 0,
-        "delta": {"type": "text_delta", "text": "the beginning"}}),
-    );
-    let head: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+/// Dispatch one streamed Anthropic round against `serve_stream_parts`, bounded
+/// so a broken read loop fails instead of hanging. Returns the round, whether
+/// text was shown, and the attempts recorded.
+async fn raw_anthropic_round(
+    parts: &[&[u8]],
+    interrupt: bool,
+) -> (
+    anthropic_wire::AnthropicRound,
+    bool,
+    Vec<crate::attempts::AttemptRecord>,
+) {
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (url, server) =
-        super::http_loop_tests::serve_stream_parts(&[head.as_bytes()], Some(flag.clone())).await;
+        super::http_loop_tests::serve_stream_parts(parts, interrupt.then(|| flag.clone())).await;
     let messages_url = format!("{url}/v1/messages");
     let client = reqwest::Client::new();
     let retry = RetryPolicy {
@@ -1696,17 +1694,92 @@ async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attem
         ),
     )
     .await
-    .expect("the interrupt ends the read")
-    .expect("an interrupt is not an error")
+    .expect("the read ends: at message_stop, at EOF, or at the interrupt")
+    .expect("the round is not an error")
     .expect("the stream was read, so this is not the send-time cancel");
     server.abort();
+    let records = ledger.lock().unwrap().records().cloned().collect();
+    (round, started, records)
+}
+
+fn anthropic_sse_body(frames: &[serde_json::Value]) -> String {
+    frames.iter().map(|f| format!("data: {f}\n\n")).collect()
+}
+
+/// Review round 2, item 4: an Esc inside the stream's read loop, after the first
+/// text delta, is a failed attempt. Deterministic: the flag is tripped only
+/// after the reader has drained megabytes of the body, so the send-time cancel
+/// cannot be what fires. Only `message_start` usage arrived, which is no usage
+/// (a known limit: `TokenUsage` cannot say "output unknown").
+#[tokio::test]
+async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt() {
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "the beginning"}}),
+    );
+    let head = anthropic_sse_body(&frames);
+    let (round, started, records) = raw_anthropic_round(&[head.as_bytes()], true).await;
     assert!(started, "the first delta was shown");
     assert_eq!(round.text, "the beginning");
-    let ledger = ledger.lock().unwrap();
-    let records: Vec<_> = ledger.records().collect();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
     assert_eq!(records[0].usage, None);
+}
+
+const SPLIT_TEXT: &str = "newt 🦎 蠑螈";
+
+fn anthropic_split_text_body() -> String {
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": SPLIT_TEXT}}),
+    );
+    frames.push(serde_json::json!({"type": "content_block_stop", "index": 0}));
+    frames.push(serde_json::json!({"type": "message_delta",
+        "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}));
+    frames.push(serde_json::json!({"type": "message_stop"}));
+    anthropic_sse_body(&frames)
+}
+
+/// Review round 4, item b: a character split across two reads is still that
+/// character in the Anthropic stream's text. Decoding each chunk on its own
+/// turns both halves into U+FFFD.
+#[tokio::test]
+async fn an_anthropic_character_split_across_reads_is_not_corrupted() {
+    let body = anthropic_split_text_body();
+    let bytes = body.as_bytes();
+    let cut = bytes
+        .iter()
+        .position(|&b| b == 0xF0)
+        .expect("the emoji's lead byte")
+        + 2;
+    let (round, _, records) = raw_anthropic_round(&[&bytes[..cut], &bytes[cut..]], false).await;
+    assert_eq!(round.text, SPLIT_TEXT);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Ok);
+}
+
+/// The same property without a socket, which can coalesce the two writes and
+/// make the test above vacuous: at every byte offset, `decode_chunk` feeding the
+/// Anthropic accumulator yields the text intact.
+#[test]
+fn an_anthropic_text_delta_split_at_every_byte_offset_is_not_corrupted() {
+    let body = anthropic_split_text_body();
+    let bytes = body.as_bytes();
+    for cut in 0..=bytes.len() {
+        let mut carry = Vec::new();
+        let mut acc = anthropic_wire::SseAccumulator::new();
+        let mut text = String::new();
+        for part in [&bytes[..cut], &bytes[cut..]] {
+            for action in acc.feed(&decode_chunk(&mut carry, part)) {
+                if let anthropic_wire::StreamAction::TextDelta(t) = action {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(text, SPLIT_TEXT, "split at byte {cut}");
+        assert!(acc.is_done(), "split at byte {cut}");
+    }
 }
 
 /// Trips the interrupt flag as the response is served.
