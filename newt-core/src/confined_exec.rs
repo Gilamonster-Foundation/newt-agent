@@ -854,8 +854,9 @@ fn kill_child_tree(_child: &mut std::process::Child, pgid: u32) {
 /// SIGKILL an entire process group (`pgid`). Best-effort: `ESRCH` (the group is
 /// already gone) is fine. On non-unix this is a no-op — the confined executor is
 /// the Linux-normative path; other platforms fail closed before reaching here.
+/// Public so the eval harness's unconfined runner reaps with the same call.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) {
+pub fn kill_process_group(pgid: u32) {
     // SAFETY: `killpg` with a valid pgid and SIGKILL has no memory effects; a
     // stale pgid returns ESRCH which we ignore.
     unsafe {

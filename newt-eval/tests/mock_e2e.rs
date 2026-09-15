@@ -67,6 +67,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
         let cs = CaseScorecard {
             case_name: case.name.clone(),
             results,
+            behavioral: None,
         };
         if !cs.all_passed() {
             eprintln!(
@@ -113,102 +114,36 @@ async fn mock_ollama(content: &str) -> MockServer {
 
 // ── the ratchet row, parsed from REAL output (#2317) ────────────────────────
 //
-// `scripts/eval/ratchet.sh --mode single` read its behavioral grade out of
-// `newt-eval run`'s HUMAN table with a whitespace-column awk. #1883 turned that
-// table into a GFM pipe table; the awk kept running, matched nothing, and every
-// single-mode row since has read `FAIL tests_pass= all_evaluators_ok=yes`
-// (sweep.sh then files each as infra and skips the model). Nothing noticed,
-// because the only tests of the row fabricated it by hand. These drive the
-// real script over the real `newt-eval` binary and the real worker, so the
-// next renderer change breaks a test instead of an arm.
+// `scripts/eval/ratchet.sh` once read single mode's grade out of `newt-eval
+// run`'s HUMAN table; #1883 reshaped the table and emptied every single row,
+// and nothing noticed because the only tests of the row fabricated it. These
+// drive the real script over the real `newt-eval` binary: single mode with
+// the real worker and a mocked model, crew mode with a stub `newt plan` that
+// lands a fixed diff (tests/fixtures/stub-newt-plan.sh). Both modes end in the
+// ONE canonical grader, so the same tree must produce the same record.
 //
-// Unix-gated: ratchet.sh is a bash script over `python3` and a Unix stand-in
-// worker path; the sweep hosts that run it are Unix.
+// Unix-gated: ratchet.sh is a bash script over `python3`, and the stand-in
+// worker path and stub are Unix; the sweep hosts that run it are Unix.
 #[cfg(unix)]
 mod ratchet {
     use super::{cases, mock_ollama, worker_under_test};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    /// Run `ratchet.sh --mode single` on `case` against `worker` with the model
-    /// answering `reply`; return the one `RATCHET` row, split on tabs.
-    async fn ratchet_single_row(case: &str, reply: &str, worker: &std::path::Path) -> Vec<String> {
-        let mock = mock_ollama(reply).await;
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/eval/ratchet.sh");
-        let out = tokio::process::Command::new("bash")
-            .arg(&script)
-            .args(["--task", case, "--mode", "single", "--model", "mock-llama"])
-            .env("NEWT_EVAL_BIN", env!("CARGO_BIN_EXE_newt-eval"))
-            .env("NEWT_WORKER_BIN", worker)
-            .env("OLLAMA_HOST", mock.uri())
-            .output()
-            .await
-            .expect("spawn bash ratchet.sh");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let row = stdout
-            .lines()
-            .find(|l| l.starts_with("RATCHET\t"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "ratchet.sh printed no RATCHET row ({}):\n{stdout}\n{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            });
-        row.split('\t').map(String::from).collect()
-    }
-
-    /// The value of `key=` in a row's space-separated `details` column.
-    fn detail<'a>(row: &'a [String], key: &str) -> Option<&'a str> {
-        row[5]
-            .split(' ')
-            .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
-    }
-
-    /// #2317 regression: a single-mode run whose `tests_pass` evaluator passed
-    /// must land `PASS` + `tests_pass=ok` in the row, and say which grader ran.
-    /// On the pipe-table awk it read `FAIL tests_pass=`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ratchet_single_row_carries_the_tests_pass_grade() {
-        let case = cases::load_all(cases::default_cases_dir())
+    fn t0_honest_diff() -> String {
+        cases::load_all(cases::default_cases_dir())
             .expect("bundled cases load")
             .into_iter()
             .find(|c| c.name == "T0-fix-add")
-            .expect("T0-fix-add is bundled");
-        let row = ratchet_single_row(
-            "T0-fix-add",
-            &case.mock_response.content,
-            &worker_under_test().path,
-        )
-        .await;
-        assert_eq!(row[4], "PASS", "{row:?}");
-        assert_eq!(detail(&row, "tests_pass"), Some("ok"), "{row:?}");
-        assert_eq!(detail(&row, "grader"), Some("tests_pass"), "{row:?}");
-        assert_eq!(detail(&row, "all_evaluators_ok"), Some("yes"), "{row:?}");
+            .expect("T0-fix-add is bundled")
+            .mock_response
+            .content
     }
 
-    /// Twin: the model changes nothing, so T0's seed test still fails — the row
-    /// must say `FAIL` *because* `tests_pass=fail`, not because it read nothing.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ratchet_single_row_fails_an_unfixed_seed() {
-        let row = ratchet_single_row(
-            "T0-fix-add",
-            "I could not find anything to change.",
-            &worker_under_test().path,
-        )
-        .await;
-        assert_eq!(row[4], "FAIL", "{row:?}");
-        assert_eq!(detail(&row, "tests_pass"), Some("fail"), "{row:?}");
-        assert_eq!(detail(&row, "all_evaluators_ok"), Some("no"), "{row:?}");
-    }
+    // The diff lines below stay at column 0: a `\` continuation only strips the
+    // first line's indent, so re-indenting them corrupts the diff (it did once).
 
     /// The gaming move: leave `add` broken and delete the test that says so.
-    /// `tests_pass` then finds no `#[test]` and skips — which it reports as a
-    /// PASS. The row must not: a check that ran nothing is `UNGRADABLE`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ratchet_single_row_never_passes_a_tree_with_its_tests_deleted() {
-        // The diff lines stay at column 0: the `\` only strips the first
-        // line's indent, so re-indenting them corrupts the diff.
-        let delete_the_test = "\
+    const DELETE_THE_TEST: &str = "\
 diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs
@@ -228,21 +163,194 @@ diff --git a/src/lib.rs b/src/lib.rs
 -    }
 -}
 ";
-        let row =
-            ratchet_single_row("T0-fix-add", delete_the_test, &worker_under_test().path).await;
-        assert_eq!(row[4], "UNGRADABLE(no_tests)", "{row:?}");
-        assert_eq!(detail(&row, "tests_pass"), Some("skipped"), "{row:?}");
-        assert_eq!(detail(&row, "tests_run"), Some("0"), "{row:?}");
+
+    /// T0's round1-1: a `[[test]]` table named `grade_spec` pointed at another
+    /// file (here the lib itself), so `--test grade_spec` would never run the
+    /// installed spec.
+    const DECOY_TEST_TARGET: &str = "\
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,3 +6,7 @@ publish = false
+ 
+ [lib]
+ path = \"src/lib.rs\"
++
++[[test]]
++name = \"grade_spec\"
++path = \"src/lib.rs\"
+";
+
+    fn repo_path(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
     }
 
-    /// Twin: a worker that never speaks ACP produces no grade at all. That is
-    /// `ERROR(runner)` — never `FAIL` — and the row carries an EMPTY `tests_pass=`,
-    /// which is exactly what sweep.sh's `row_is_infra` keys on to keep it out of n.
+    /// Run ratchet.sh with `args` and `env`; return the one `RATCHET` row, split
+    /// on tabs. Removes the crew throwaway dir the row names.
+    async fn ratchet_row(args: &[&str], env: &[(&str, &Path)]) -> Vec<String> {
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg(repo_path("../scripts/eval/ratchet.sh"))
+            .args(["--task", "T0-fix-add"])
+            .args(args)
+            .env("NEWT_EVAL_BIN", env!("CARGO_BIN_EXE_newt-eval"))
+            // CI sets this workflow-wide; pin it so every host grades under it.
+            .env("CARGO_TERM_COLOR", "always");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().await.expect("spawn bash ratchet.sh");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let row: Vec<String> = stdout
+            .lines()
+            .find(|l| l.starts_with("RATCHET\t"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "ratchet.sh printed no RATCHET row ({}):\n{stdout}\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .split('\t')
+            .map(String::from)
+            .collect();
+        let throw = row[5].split(' ').find_map(|t| {
+            t.strip_prefix("dir=")
+                .or_else(|| t.strip_suffix("/.plan.log)"))
+        });
+        if let Some(dir) = throw.map(PathBuf::from) {
+            if dir.starts_with(std::env::temp_dir()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        row
+    }
+
+    async fn single_row(reply: &str, worker: &Path) -> Vec<String> {
+        let mock = mock_ollama(reply).await;
+        let uri = PathBuf::from(mock.uri());
+        ratchet_row(
+            &["--mode", "single", "--model", "mock-llama"],
+            &[("NEWT_WORKER_BIN", worker), ("OLLAMA_HOST", &uri)],
+        )
+        .await
+    }
+
+    /// Crew mode with the stub landing `diff` (`None`: the crew lands nothing).
+    async fn crew_row(diff: Option<&str>) -> Vec<String> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let stub = repo_path("tests/fixtures/stub-newt-plan.sh");
+        let mut env: Vec<(&str, &Path)> = vec![("NEWT_BIN", &stub)];
+        if let Some(diff) = diff {
+            std::fs::write(file.path(), diff).unwrap();
+            env.push(("STUB_CREW_DIFF", file.path()));
+        }
+        ratchet_row(&["--mode", "crew"], &env).await
+    }
+
+    /// The value of `key=` in a row's space-separated `details` column.
+    fn detail<'a>(row: &'a [String], key: &str) -> Option<&'a str> {
+        row[5]
+            .split(' ')
+            .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// The canonical record a row carries: the part both modes must agree on.
+    fn grade(row: &[String]) -> [&str; 5] {
+        let key = |k| detail(row, k).unwrap_or_else(|| panic!("no {k}= in {row:?}"));
+        [
+            &row[4],
+            key("grader"),
+            key("spec_cid"),
+            key("tests_run"),
+            key("timeout"),
+        ]
+    }
+
+    /// #2317: single mode's behavioral grade is the withheld spec, not the
+    /// candidate's `tests_pass`; the row says which grader ran and against
+    /// which spec. The structural diagnostics stay beside it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn ratchet_single_row_reports_a_dead_worker_as_error() {
-        let row = ratchet_single_row("T0-fix-add", "", std::path::Path::new("/usr/bin/true")).await;
+    async fn single_row_carries_the_canonical_grade() {
+        let row = single_row(&t0_honest_diff(), &worker_under_test().path).await;
+        assert_eq!(grade(&row)[..2], ["PASS", "grade_spec"], "{row:?}");
+        assert!(
+            detail(&row, "spec_cid").is_some_and(|c| c.starts_with('b')),
+            "{row:?}"
+        );
+        assert_eq!(detail(&row, "tests_run"), Some("1"), "{row:?}");
+        assert_eq!(detail(&row, "tests_pass"), Some("ok"), "{row:?}");
+    }
+
+    /// The same honest tree through crew mode gets the identical record:
+    /// verdict, grader, spec content id, tests run and timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_tree_gets_the_same_grade_in_both_modes() {
+        let honest = t0_honest_diff();
+        let single = single_row(&honest, &worker_under_test().path).await;
+        let crew = crew_row(Some(&honest)).await;
+        assert_eq!(
+            grade(&crew),
+            grade(&single),
+            "single {single:?}\ncrew {crew:?}"
+        );
+        assert_eq!(crew[4], "PASS", "{crew:?}");
+    }
+
+    /// Calibration in both modes: an unchanged seed FAILS the spec.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unchanged_seed_fails_in_both_modes() {
+        let single = single_row(
+            "I could not find anything to change.",
+            &worker_under_test().path,
+        )
+        .await;
+        let crew = crew_row(Some("")).await;
+        for row in [&single, &crew] {
+            assert_eq!(grade(row)[..2], ["FAIL", "grade_spec"], "{row:?}");
+        }
+        assert_eq!(detail(&single, "tests_pass"), Some("fail"), "{single:?}");
+    }
+
+    /// The candidate's own tests and the oracle disagree: with its failing test
+    /// deleted, `tests_pass` skips (once graded PASS, then UNGRADABLE). The spec
+    /// still runs, and `add` is still broken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tree_with_its_tests_deleted_fails_the_spec() {
+        let row = single_row(DELETE_THE_TEST, &worker_under_test().path).await;
+        assert_eq!(grade(&row)[..2], ["FAIL", "grade_spec"], "{row:?}");
+        assert_eq!(detail(&row, "tests_pass"), Some("skipped"), "{row:?}");
+    }
+
+    /// The #887 guard now stands in front of BOTH modes (single mode had none).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decoy_test_target_is_refused_in_both_modes() {
+        let single = single_row(DECOY_TEST_TARGET, &worker_under_test().path).await;
+        let crew = crew_row(Some(DECOY_TEST_TARGET)).await;
+        for row in [&single, &crew] {
+            assert_eq!(row[4], "FAIL", "{row:?}");
+            assert_eq!(
+                detail(row, "harness_subversion"),
+                Some("test-table"),
+                "{row:?}"
+            );
+        }
+    }
+
+    /// A worker that never speaks ACP produces no tree and no grade: ERROR,
+    /// with the EMPTY `tests_pass=` sweep.sh's `row_is_infra` also keys on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_worker_is_an_error() {
+        let row = single_row("", Path::new("/usr/bin/true")).await;
         assert_eq!(row[4], "ERROR(runner)", "{row:?}");
         assert_eq!(detail(&row, "tests_pass"), Some(""), "{row:?}");
+    }
+
+    /// Crew twin: a plan that never reached a model lands nothing and logs
+    /// nothing. ERROR(infra), which leaves n, not the FAIL it used to be.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crew_that_never_ran_is_an_error() {
+        let row = crew_row(None).await;
+        assert_eq!(row[4], "ERROR(infra)", "{row:?}");
     }
 }
 

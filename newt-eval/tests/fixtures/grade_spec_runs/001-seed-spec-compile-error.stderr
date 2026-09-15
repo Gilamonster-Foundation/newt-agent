@@ -1,0 +1,9 @@
+   Compiling rename-function v0.0.0 (<tree>)
+error[E0432]: unresolved import `rename_function::hello`
+   --> tests/grade_spec.rs:113:5
+    |
+113 | use rename_function::hello;
+    |     ^^^^^^^^^^^^^^^^^^^^^^ no `hello` in the root
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `rename-function` (test "grade_spec") due to 1 previous error
