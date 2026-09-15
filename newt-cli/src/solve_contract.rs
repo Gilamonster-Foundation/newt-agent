@@ -272,6 +272,40 @@ pub fn conditional_stanza(
     }
 }
 
+/// The `usage` stanza on the `solve_result` line (#2313): what the run's
+/// inference attempts sent and generated, summed per attempt.
+///
+/// `cost_usd` is present only when every attempt reported usage and the model
+/// is priced, so a real `0.0` stays and unknown is never zero. `ledger_head` is
+/// present only when the ledger's lines were emitted into the same trace, since
+/// a head with no lines to walk cannot be verified.
+pub fn usage_stanza(
+    totals: &newt_core::attempts::UsageTotals,
+    cost_usd: Option<f64>,
+    ledger_head: Option<&str>,
+) -> serde_json::Value {
+    let mut stanza = serde_json::json!({
+        "attempts": totals.attempts,
+        "in_tokens": totals.in_tokens,
+        "out_tokens": totals.out_tokens,
+        "usage_missing": totals.usage_missing,
+        "usage_complete": totals.usage_complete,
+    });
+    conditional_stanza(&mut stanza, "cost_usd", cost_usd);
+    conditional_stanza(&mut stanza, "ledger_head", ledger_head);
+    stanza
+}
+
+/// One attempt-ledger chain line as a trace event: the journal line itself,
+/// tagged `kind: "attempt"`, so it still deserializes as a `JournalLine`.
+pub fn attempt_line(
+    line: &newt_core::event_journal::JournalLine<newt_core::attempts::AttemptRecord>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(line).unwrap_or(serde_json::Value::Null);
+    conditional_stanza(&mut value, "kind", Some("attempt"));
+    value
+}
+
 /// A `receipt.features` entry a run can be told to require (#2314), spelled on
 /// the command line exactly as in the receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
