@@ -859,7 +859,7 @@ async fn final_summary_provider_contracts() {
                 request_budget: None,
                 calibration: 1.0,
                 estimation: crate::tokens::TokenEstimation::default(),
-                ollama_num_ctx: None,
+                ollama_options: None,
                 prompt_measurement: Default::default(),
             };
             let client = reqwest::Client::new();
