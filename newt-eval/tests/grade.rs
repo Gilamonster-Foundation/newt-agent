@@ -10,9 +10,11 @@ use std::path::Path;
 
 use std::sync::Mutex;
 
-use newt_eval::evaluators::{CommandRunner, RunOutcome, RunSpec, SubprocessRunner};
+use newt_eval::evaluators::{CommandRunner, RunOutcome, RunSpec};
+#[cfg(unix)]
+use newt_eval::{evaluators::SubprocessRunner, run_spec};
 use newt_eval::{
-    grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, run_spec, BehavioralVerdict,
+    grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, BehavioralVerdict,
     CaseScorecard, EvalResult, MockResponse, PreRun, TestCase, GRADE_SPEC_TIMEOUT_MS,
 };
 
@@ -571,9 +573,12 @@ fn round1_1_below_the_guard_fails_as_a_decoy_target() {
 }
 
 /// Forces cargo's color on every run, as CI's workflow-wide
-/// `CARGO_TERM_COLOR: always` does, and otherwise runs for real.
+/// `CARGO_TERM_COLOR: always` does, and otherwise runs for real. Unix-only,
+/// like the real-cargo tests that use it.
+#[cfg(unix)]
 struct ColorForcing;
 
+#[cfg(unix)]
 impl CommandRunner for ColorForcing {
     fn run(&self, spec: &RunSpec) -> RunOutcome {
         let mut spec = spec.clone();
