@@ -570,8 +570,10 @@ async fn a_check_created_after_the_first_scan_decides_the_cap_exit() {
 ///   and the check still classifies failed;
 /// - no checks: nothing to verify, and the trace says so.
 ///
-/// Trap: a bound that holds only because a case never ran. Each case asserts
-/// the class its check actually recorded.
+/// Traps: a bound that holds only because a case never ran (each case asserts
+/// the class its check recorded), and a round count that cannot fail (rounds
+/// are counted exactly, excluding only a request that replays the previous
+/// history).
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
@@ -580,6 +582,7 @@ async fn every_verification_case_ends_within_its_allowance() {
     const ABSENT: &str = "newt-absent-binary-2315-check --verify";
     const SLOW: &str = "sleep 5";
     const LOUD_FAILURE: &str = "sh -c 'seq 1 20000; exit 1'";
+    const EXHAUSTED: &[&str] = &["nudge", "nudge", "nudge", "repair_exhausted"];
     struct Case {
         name: &'static str,
         check: &'static str,
@@ -587,8 +590,13 @@ async fn every_verification_case_ends_within_its_allowance() {
         caveats: Caveats,
         env: &'static [(&'static str, &'static str)],
         reason: &'static str,
+        /// Primary model rounds: the scripted step, one answer per nudge, and
+        /// the final answer.
+        rounds: usize,
+        /// Every verification decision the trace records, in order.
+        decisions: &'static [&'static str],
+        /// The class the check recorded at the last decision.
         status: Option<CheckStatus>,
-        decision: &'static str,
     }
     let no_exec = Caveats {
         exec: crate::caveats::Scope::none(),
@@ -602,8 +610,9 @@ async fn every_verification_case_ends_within_its_allowance() {
             caveats: Caveats::top(),
             env: &[],
             reason: "verification_incomplete",
+            rounds: 2,
+            decisions: &["verification_incomplete"],
             status: Some(CheckStatus::Unexecuted),
-            decision: "verification_incomplete",
         },
         Case {
             name: "denied",
@@ -612,8 +621,9 @@ async fn every_verification_case_ends_within_its_allowance() {
             caveats: no_exec,
             env: &[("NEWT_SHELL_ENGINE", "safe-subset")],
             reason: "verification_incomplete",
+            rounds: 2,
+            decisions: &["verification_incomplete"],
             status: Some(CheckStatus::Denied),
-            decision: "verification_incomplete",
         },
         Case {
             name: "unavailable",
@@ -622,8 +632,9 @@ async fn every_verification_case_ends_within_its_allowance() {
             caveats: Caveats::top(),
             env: &[],
             reason: "verification_incomplete",
+            rounds: 2,
+            decisions: &["verification_incomplete"],
             status: Some(CheckStatus::Unavailable),
-            decision: "verification_incomplete",
         },
         Case {
             name: "timed out",
@@ -635,8 +646,9 @@ async fn every_verification_case_ends_within_its_allowance() {
                 ("NEWT_HOST_EXEC_TIMEOUT_SECS", "1"),
             ],
             reason: "repair_exhausted",
+            rounds: 5,
+            decisions: EXHAUSTED,
             status: Some(CheckStatus::TimedOut),
-            decision: "repair_exhausted",
         },
         Case {
             name: "failed with substantial output",
@@ -645,8 +657,9 @@ async fn every_verification_case_ends_within_its_allowance() {
             caveats: Caveats::top(),
             env: &[],
             reason: "repair_exhausted",
+            rounds: 5,
+            decisions: EXHAUSTED,
             status: Some(CheckStatus::Failed),
-            decision: "repair_exhausted",
         },
         Case {
             name: "no checks",
@@ -655,8 +668,9 @@ async fn every_verification_case_ends_within_its_allowance() {
             caveats: Caveats::top(),
             env: &[],
             reason: "completed",
+            rounds: 1,
+            decisions: &["no_checks"],
             status: None,
-            decision: "no_checks",
         },
     ];
     for case in &cases {
@@ -675,35 +689,49 @@ async fn every_verification_case_ends_within_its_allowance() {
             })
             .await;
             assert_eq!(run.reason, case.reason, "{label}");
-            // The scripted step, one answer per allowed nudge, and the final
-            // answer: nothing past the allowance. The ordinary loop re-issues
-            // an accepted answer as a stream for display; that is not a round.
-            let rounds = run
+            // Primary rounds only. The ordinary loop re-issues an accepted
+            // answer for display, replaying the same history, so a request
+            // whose messages equal the previous request's is not a round.
+            let histories: Vec<serde_json::Value> = run
                 .bodies
                 .iter()
-                .filter(|body| !body.contains("\"stream\":true"))
+                .map(|body| {
+                    serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].clone()
+                })
+                .collect();
+            let rounds = histories
+                .iter()
+                .enumerate()
+                .filter(|(i, history)| *i == 0 || histories[i - 1] != **history)
                 .count();
-            assert!(
-                rounds <= VERIFY_REPAIR_ALLOWANCE + 2,
-                "{label}: {rounds} model rounds"
-            );
-            let last = run.signals.iter().rev().find_map(|signal| match signal {
-                observability::BehaviorSignal::Verification {
-                    decision, report, ..
-                } => Some((
-                    decision.clone(),
-                    report
-                        .checks
-                        .iter()
-                        .map(|check| check.status)
-                        .collect::<Vec<_>>(),
-                )),
-                _ => None,
-            });
+            assert_eq!(rounds, case.rounds, "{label}: primary model rounds");
+            assert!(rounds <= VERIFY_REPAIR_ALLOWANCE + 2, "{label}");
+            let signals: Vec<_> = run
+                .signals
+                .iter()
+                .filter_map(|signal| match signal {
+                    observability::BehaviorSignal::Verification {
+                        decision, report, ..
+                    } => Some((decision.as_str(), report)),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(
-                last,
-                Some((case.decision.to_string(), case.status.into_iter().collect())),
-                "{label}"
+                signals
+                    .iter()
+                    .map(|(decision, _)| *decision)
+                    .collect::<Vec<_>>(),
+                case.decisions,
+                "{label}: the decision sequence"
+            );
+            assert_eq!(
+                signals.last().map(|(_, report)| report
+                    .checks
+                    .iter()
+                    .map(|check| check.status)
+                    .collect::<Vec<_>>()),
+                Some(case.status.into_iter().collect()),
+                "{label}: the class the check recorded"
             );
             if case.check == LOUD_FAILURE {
                 assert!(
