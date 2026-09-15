@@ -950,7 +950,12 @@ pub(crate) async fn response(
 /// error chain retained. JSON-only consumers retain their existing decoder.
 pub(crate) fn decode_openai_response(bytes: &[u8]) -> anyhow::Result<Value> {
     super::openai_sse::decode_response(bytes).map_err(|error| {
-        let classified = super::observability::DispatchError::http_status(format!("{error:#}"));
+        use super::observability::DispatchError;
+        let message = format!("{error:#}");
+        let classified = match super::openai_sse::rejection_class(&error) {
+            Some(class) => DispatchError::new(class, message),
+            None => DispatchError::http_status(message),
+        };
         error.context(classified)
     })
 }

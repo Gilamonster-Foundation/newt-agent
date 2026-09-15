@@ -381,3 +381,145 @@ fn a_changed_tool_call_id_remains_fatal() {
         "{error:#}"
     );
 }
+
+/// #2318: a strict-decode rejection is classified by its cause, not by the
+/// wrapper it rides in. A model-output defect is `model_error`; a body cut on a
+/// clean EOF (no read error for the client to see) is `transport_error`, even
+/// when the cut tore the last frame or character; a provider's own error follows
+/// its text; a shape this decoder does not support is ours, `harness_error`.
+#[test]
+fn strict_rejections_classify_by_cause() {
+    use crate::agentic::observability::{error_class, ErrorClass};
+    let frame = |value: Value| sse(&[value], false);
+    let call = |call: Value, finish: &str| {
+        sse(
+            &[json!({"choices":[{"delta":{"tool_calls":[call]},"finish_reason":finish}]})],
+            true,
+        )
+    };
+    let mut malformed_then_done = b"data: {broken JSON\n\n".to_vec();
+    malformed_then_done.extend(sse(
+        &[json!({"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})],
+        true,
+    ));
+    let mut changed_identity = sse(&[json!({"id":"resp-one","choices":[]})], false);
+    changed_identity.extend(sse(
+        &[json!({"id":"resp-two","choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})],
+        true,
+    ));
+    let cases: Vec<(&str, Vec<u8>, ErrorClass)> = vec![
+        (
+            "tool call without id",
+            call(
+                json!({"index":0,"function":{"name":"read_file","arguments":"{}"}}),
+                "tool_calls",
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "invalid tool arguments",
+            call(
+                json!({"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":"}}),
+                "tool_calls",
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "tool call index gap",
+            call(
+                json!({"index":1,"id":"a","function":{"name":"read_file","arguments":"{}"}}),
+                "tool_calls",
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "batch not ending tool_calls",
+            call(
+                json!({"index":0,"id":"a","function":{"name":"read_file","arguments":"{}"}}),
+                "length",
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "choice changed after its finish reason",
+            sse(
+                &[
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                    json!({"choices":[{"delta":{"content":"after"}}]}),
+                ],
+                true,
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "malformed frame, then [DONE]",
+            malformed_then_done,
+            ErrorClass::Model,
+        ),
+        (
+            "clean EOF between frames",
+            frame(json!({"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})),
+            ErrorClass::Transport,
+        ),
+        (
+            "clean EOF inside a frame",
+            b"data: {\"choices\":[{\"delta\":{\"con".to_vec(),
+            ErrorClass::Transport,
+        ),
+        (
+            "clean EOF inside a character",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"🦎".as_bytes()[..41].to_vec(),
+            ErrorClass::Transport,
+        ),
+        (
+            "response identity changed (#2334)",
+            changed_identity,
+            ErrorClass::Transport,
+        ),
+        (
+            "provider context error",
+            frame(json!({"error":{"message":"Context size has been exceeded."}})),
+            ErrorClass::ContextExceeded,
+        ),
+        (
+            "provider busy error",
+            frame(json!({"error":{"message":"busy","code":503}})),
+            ErrorClass::Model,
+        ),
+        (
+            "content as an array of parts",
+            sse(
+                &[
+                    json!({"choices":[{"delta":{"content":[{"type":"text","text":"a"}]},"finish_reason":"stop"}]}),
+                ],
+                true,
+            ),
+            ErrorClass::Harness,
+        ),
+        (
+            "empty-string response id",
+            sse(
+                &[json!({"id":"","choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})],
+                true,
+            ),
+            ErrorClass::Harness,
+        ),
+        (
+            "empty-string response model",
+            sse(
+                &[json!({"model":"","choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})],
+                true,
+            ),
+            ErrorClass::Harness,
+        ),
+        (
+            "chunk with no choices array",
+            sse(&[json!({"object":"chat.completion.chunk"})], true),
+            ErrorClass::Harness,
+        ),
+    ];
+    for (name, bytes, class) in cases {
+        let error = crate::agentic::smart_harness::decode_openai_response(&bytes).expect_err(name);
+        assert_eq!(error_class(&error), Some(class), "{name}: {error:#}");
+    }
+}

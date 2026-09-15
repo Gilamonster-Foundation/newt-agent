@@ -1203,3 +1203,77 @@ kind = "openai"
          `status` and `end_reason`'s to report: {contract}"
     );
 }
+
+/// #2318: a 2xx OpenAI stream that strict decoding rejects (a tool call without
+/// an id) is the model's answer, so the solve contract files it `model_error`.
+/// Its class used to be lost and the run filed as `harness_error`, which the
+/// bench excludes from capability scoring as the harness's fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strictly_rejected_stream_files_as_model_error() {
+    let server = MockServer::start().await;
+    let stream = [
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let config_path = workspace.path().join("solve.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "strict"
+
+[[backends]]
+name = "strict"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write solve config");
+    std::fs::write(&instruction_path, "Read the seed file.\n").expect("write solve instruction");
+
+    let _ = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["solve", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .assert();
+
+    let posts: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("journal")
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "exactly one POST: the rejection is not retried"
+    );
+    let result = solve_result_from(&events_path);
+    assert_eq!(result["tool_calls"], 0, "nothing ran: {result}");
+    assert_eq!(result["end_reason"], "None", "{result}");
+    let contract = contract_from(&events_path);
+    assert_eq!(contract["outcome"], "model_error", "{contract}");
+}

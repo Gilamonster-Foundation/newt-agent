@@ -186,6 +186,17 @@ pub(crate) enum BatchRejection {
     ContentInvalid(String),
 }
 
+/// Abort a turn whose tool calls cannot be correlated with their results. The
+/// model answered with unusable output, so this files as `model_error` on every
+/// wire, as the same defect does in a strictly decoded stream (#2318).
+pub(crate) fn uncorrelatable_tool_calls(reason: &str) -> anyhow::Error {
+    super::observability::DispatchError::new(
+        super::observability::ErrorClass::Model,
+        format!("malformed provider output: {reason}"),
+    )
+    .into()
+}
+
 impl BatchRejection {
     /// The human-readable reason, whichever class.
     pub(crate) fn reason(&self) -> &str {

@@ -58,26 +58,29 @@ impl StrictResponse {
             stable_string(target, &frame[key], field)?;
         }
         if !frame["usage"].is_null() {
-            anyhow::ensure!(frame["usage"].is_object(), "invalid stream usage object");
+            anyhow::ensure!(
+                frame["usage"].is_object(),
+                Unsupported("invalid stream usage object".into())
+            );
             self.usage = Some(frame["usage"].clone());
         }
         let choices = frame["choices"]
             .as_array()
-            .context("stream chunk has no choices array")?;
+            .ok_or_else(|| Unsupported("stream chunk has no choices array".into()))?;
         anyhow::ensure!(
             choices.len() <= 1,
-            "multiple streamed choices are unsupported"
+            Unsupported("multiple streamed choices are unsupported".into())
         );
         let Some(choice) = choices.first() else {
             return Ok(());
         };
         anyhow::ensure!(
             choice["index"].is_null() || choice["index"].as_u64() == Some(0),
-            "streamed choice index is not zero"
+            Unsupported("streamed choice index is not zero".into())
         );
         let delta = choice["delta"]
             .as_object()
-            .context("streamed choice has no delta object")?;
+            .ok_or_else(|| Unsupported("streamed choice has no delta object".into()))?;
         anyhow::ensure!(
             self.finish_reason.is_none() || delta.is_empty(),
             "stream changed a choice after its finish reason"
@@ -85,18 +88,18 @@ impl StrictResponse {
         for key in ["content", "reasoning_content", "reasoning"] {
             anyhow::ensure!(
                 choice["delta"][key].is_null() || choice["delta"][key].is_string(),
-                "streamed text delta has an invalid shape"
+                Unsupported("streamed text delta has an invalid shape".into())
             );
         }
         anyhow::ensure!(
             choice["delta"]["role"].is_null()
                 || choice["delta"]["role"].as_str() == Some("assistant"),
-            "streamed choice has a non-assistant role"
+            Unsupported("streamed choice has a non-assistant role".into())
         );
         if let Some(calls) = delta.get("tool_calls").filter(|calls| !calls.is_null()) {
             for call in calls
                 .as_array()
-                .context("streamed tool calls are not an array")?
+                .ok_or_else(|| Unsupported("streamed tool calls are not an array".into()))?
             {
                 let index = call["index"]
                     .as_u64()
@@ -115,13 +118,25 @@ impl StrictResponse {
         Ok(())
     }
 
-    pub(super) fn finish(self, round: OpenAiStreamRound) -> anyhow::Result<Value> {
+    pub(super) fn has_problem(&self) -> bool {
+        self.problem.is_some() || self.provider_error.is_some()
+    }
+
+    /// `cut`: the body ended before `[DONE]` with every complete line sound, so
+    /// a torn last line or character is the cut's doing (#2318).
+    pub(super) fn finish(self, round: OpenAiStreamRound, cut: bool) -> anyhow::Result<Value> {
         // A complete observed error is stronger evidence than a cut stream or
         // an unrelated malformed frame that preceded the server's rejection.
-        if let Some(error) = self.provider_error.or(self.problem) {
+        if let Some(error) = self.provider_error {
             return Err(error);
         }
-        anyhow::ensure!(round.done, "OpenAI stream ended before [DONE]");
+        if cut {
+            return Err(StreamCut.into());
+        }
+        if let Some(error) = self.problem {
+            return Err(error);
+        }
+        anyhow::ensure!(round.done, StreamCut);
         anyhow::ensure!(self.saw_choice, "OpenAI stream contained no choice");
         let finish = self
             .finish_reason
@@ -184,20 +199,18 @@ impl ToolFragments {
         stable_string(&mut self.id, &call["id"], "tool-call ID")?;
         anyhow::ensure!(
             call["type"].is_null() || call["type"].as_str() == Some("function"),
-            "streamed tool call is not a function"
+            Unsupported("streamed tool call is not a function".into())
         );
         if !call["function"].is_null() {
             anyhow::ensure!(
                 call["function"].is_object(),
-                "streamed tool function is not an object"
+                Unsupported("streamed tool function is not an object".into())
             );
             for (key, target) in [("name", &mut self.name), ("arguments", &mut self.arguments)] {
                 if !call["function"][key].is_null() {
-                    target.push_str(
-                        call["function"][key]
-                            .as_str()
-                            .context("streamed function fragment is not a string")?,
-                    );
+                    target.push_str(call["function"][key].as_str().ok_or_else(|| {
+                        Unsupported("streamed function fragment is not a string".into())
+                    })?);
                 }
             }
         }
@@ -212,7 +225,7 @@ fn stable_string(target: &mut Option<String>, value: &Value, field: &str) -> any
     let value = value
         .as_str()
         .filter(|value| !value.is_empty())
-        .with_context(|| format!("stream has invalid {field}"))?;
+        .ok_or_else(|| Unsupported(format!("stream has invalid {field}")))?;
     anyhow::ensure!(
         target.as_deref().is_none_or(|old| old == value),
         "stream changed {field}"
@@ -276,6 +289,32 @@ impl std::fmt::Display for IdentityChanged {
 }
 
 impl std::error::Error for IdentityChanged {}
+
+/// A response shape this strict decoder does not support: ours to widen, not a
+/// defect in the model's output (#2318).
+#[derive(Debug)]
+pub(super) struct Unsupported(String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
+/// A stream that ended before `[DONE]` on a clean EOF: the body was cut, and
+/// the client saw no read error to say so (#2318).
+#[derive(Debug)]
+pub(super) struct StreamCut;
+
+impl std::fmt::Display for StreamCut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpenAI stream ended before [DONE]")
+    }
+}
+
+impl std::error::Error for StreamCut {}
 
 /// A complete server error envelope, distinct from malformed or cut framing.
 #[derive(Debug)]

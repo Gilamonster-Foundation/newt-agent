@@ -8207,7 +8207,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }
                 // A missing/blank/duplicate `tool_call_id`: a tool result cannot
                 // be correlated. Abort the turn — do not fabricate an id.
-                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+                return Err(tools::uncorrelatable_tool_calls(&reason));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
                 if let Some(harness) = smart_harness {
@@ -10405,7 +10405,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 }
                 // A missing/blank/duplicate id: a tool result cannot be
                 // correlated. Abort the turn — do not fabricate an id.
-                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+                return Err(tools::uncorrelatable_tool_calls(&reason));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
                 if let Some(harness) = smart_harness {
@@ -11859,7 +11859,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 // cannot be correlated. Abort the turn — fabricating an id only
                 // produces a provider 400 or a silent mispairing. Nothing was
                 // echoed, so no malformed follow-up is dispatched.
-                return Err(anyhow::anyhow!("malformed provider output: {reason}"));
+                return Err(tools::uncorrelatable_tool_calls(&reason));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
                 if let Some(harness) = smart_harness {
