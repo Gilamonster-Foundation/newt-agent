@@ -570,10 +570,9 @@ async fn refused_budget_message(path_str: &str, output_allowance: Option<u32>) -
 /// The `None` row is the twin: without an override every surface falls back
 /// to the Contemplating table's 16,000 (16,768 input).
 ///
-/// EXCLUDED surface, a known discrepancy: the Anthropic loop. With no
-/// allowance it reserves nothing locally while sending the 8,192 wire default
-/// as `max_tokens`; this PR keeps that default unchanged and tracks the fix
-/// separately. With an explicit allowance it reserves and sends the same value.
+/// The Anthropic loop reserves the `max_tokens` it sends, default included; its
+/// surfaces are pinned by `a_declared_window_reserves_the_max_tokens_anthropic_sends`
+/// in `anthropic_loop.rs` (#2341).
 #[tokio::test]
 async fn output_allowance_resolves_once_across_every_budget_surface() {
     use crate::agentic::generation_policy::GenerationPolicy;

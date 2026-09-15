@@ -322,6 +322,7 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: cap,
@@ -421,6 +422,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             ollama_options: ollama_options(Some(4_096), None),
             prompt_measurement: Default::default(),
         },
+        None,
     )
     .await
     .expect("final summary helper should return a fallback");
@@ -568,6 +570,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             ollama_options: ollama_options(Some(2_500), None),
             prompt_measurement: Default::default(),
         },
+        None,
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
@@ -717,6 +720,7 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: cap,
@@ -868,6 +872,7 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: cap,
@@ -996,6 +1001,7 @@ async fn cap_exit_fallback_when_final_summary_errors() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: 2,
@@ -1126,6 +1132,7 @@ async fn accumulated_usage_survives_summary_failure() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: cap,

@@ -160,6 +160,11 @@ impl AttemptLedger {
         }
     }
 
+    /// The latest observation of every distinct attempt.
+    pub fn records(&self) -> impl Iterator<Item = &AttemptRecord> {
+        self.observed.values()
+    }
+
     /// The chain head, reported only when the lines were emitted.
     #[must_use]
     pub fn head(&self) -> Option<&content_addressable::ContentId> {

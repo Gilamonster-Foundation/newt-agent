@@ -59,6 +59,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         cognition: None,
         chat_completions_capability: Default::default(),
         output_allowance: None,
+        attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         emits_leading_reasoning: false,
         max_tool_rounds: 8,
@@ -270,6 +271,38 @@ async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
 
 /// Grounds scripted round accounting in real HTTP requests: each accepted
 /// answer is displayed once, and a later identical turn still advances.
+/// #2313: an Ollama probe answering `500` is a transient server failure and is
+/// retried through the loop's own backoff, so a second attempt that succeeds
+/// completes the turn. Before the fix its `Ollama 500 …` error text carried no
+/// status the classifier recognised, and the turn failed on the first attempt.
+#[tokio::test]
+async fn an_ollama_probe_500_is_retried_and_the_second_attempt_answers() {
+    let server = MockServer::start().await;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let seen = probes.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(move |req: &Request| {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({"message": {"content": "hi"}, "done": true})]);
+            }
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(500).set_body_string("model runner crashed")
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"content": "hi"}, "done": true}))
+            }
+        })
+        .mount(&server)
+        .await;
+    let (uri, messages, caveats) = (server.uri(), msgs(), Caveats::top());
+    let (reply, ..) = chat_complete(ctx(&uri, &messages, &caveats), &mut NoMcp)
+        .await
+        .expect("a transient 500 is retried, not fatal");
+    assert_eq!(reply, "hi");
+    assert_eq!(probes.load(Ordering::SeqCst), 2, "exactly one retry");
+}
+
 #[tokio::test]
 async fn scripted_openai_identical_next_turn_consumes_the_next_answer() {
     let server = MockServer::start().await;

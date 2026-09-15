@@ -124,6 +124,18 @@ struct GradeArgs {
     /// Emit the scorecard as JSON instead of the table.
     #[arg(long)]
     json: bool,
+    /// Before a candidate runs: print the spec's content id and whether the
+    /// spec is already visible in `--workspace`, as JSON, and grade nothing.
+    #[arg(long)]
+    pre_run: bool,
+    /// The spec content id `--pre-run` printed (`none` when the case had no
+    /// spec). A different id now is ERROR(spec_changed). Omitted: the current
+    /// id is trusted (ad-hoc grading).
+    #[arg(long)]
+    spec_cid_before: Option<String>,
+    /// `--pre-run` reported the spec visible in the tree: ERROR(spec_leak).
+    #[arg(long)]
+    spec_visible_before: bool,
 }
 
 /// Arguments for the `run` subcommand.
@@ -262,8 +274,21 @@ fn grade_command(args: GradeArgs) -> Result<RunOutcomeStatus> {
         .ok_or_else(|| {
             anyhow::anyhow!("case '{}' not found in {}", args.case, cases_dir.display())
         })?;
+    if args.pre_run {
+        let pre = newt_eval::pre_run(&case, &args.workspace)?;
+        println!("{}", serde_json::to_string(&pre)?);
+        return Ok(RunOutcomeStatus::AllPassed);
+    }
+    let pre = newt_eval::PreRun {
+        spec_cid: match args.spec_cid_before.as_deref() {
+            Some("none") => None,
+            Some(cid) => Some(cid.to_string()),
+            None => newt_eval::pre_run(&case, &args.workspace)?.spec_cid,
+        },
+        spec_visible: args.spec_visible_before,
+    };
     let mut scorecard = Scorecard::new();
-    scorecard.push(newt_eval::grade_workspace(&case, &args.workspace)?);
+    scorecard.push(newt_eval::grade_workspace(&case, &args.workspace, &pre)?);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&scorecard)?);
     } else {
@@ -405,6 +430,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
             scorecard.cases.push(CaseScorecard {
                 case_name: case.name.clone(),
                 results: vec![newt_eval::EvalResult::fail("runner", msg.clone())],
+                behavioral: None,
             });
         }
         return Ok(classify_outcome(&scorecard, legacy_exit_codes));
@@ -428,6 +454,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
                 let cs = CaseScorecard {
                     case_name: case.name.clone(),
                     results: vec![newt_eval::EvalResult::fail("runner", format!("{e:#}"))],
+                    behavioral: None,
                 };
                 scorecard.push(cs);
                 continue;
@@ -442,9 +469,12 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
         };
 
         let results = run_evaluators(&ctx)?;
+        // The canonical grade runs on the live tree before `outcome` drops it.
+        let behavioral = newt_eval::grade_behavioral(case, &outcome.workspace, &outcome.pre_run);
         scorecard.push(CaseScorecard {
             case_name: case.name.clone(),
             results,
+            behavioral: Some(behavioral),
         });
     }
 
@@ -521,6 +551,7 @@ mod tests {
             sc.push(CaseScorecard {
                 case_name: case_name.into(),
                 results: vec![r],
+                behavioral: None,
             });
         }
         sc
@@ -564,6 +595,7 @@ mod tests {
         sc.push(CaseScorecard {
             case_name: "a".into(),
             results: vec![EvalResult::pass("diff_applies", "ok")],
+            behavioral: None,
         });
         sc.push(CaseScorecard {
             case_name: "b".into(),
@@ -571,6 +603,7 @@ mod tests {
                 EvalResult::pass("diff_applies", "ok"),
                 EvalResult::fail("runner", "spawn failed"),
             ],
+            behavioral: None,
         });
         assert!(scorecard_has_runner_failure(&sc));
     }
@@ -582,6 +615,7 @@ mod tests {
         sc.push(CaseScorecard {
             case_name: "a".into(),
             results: vec![EvalResult::pass("runner", "all good")],
+            behavioral: None,
         });
         assert!(!scorecard_has_runner_failure(&sc));
     }

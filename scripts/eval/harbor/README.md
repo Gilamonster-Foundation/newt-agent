@@ -84,7 +84,48 @@ one Harbor job per cell, plus these records:
   served, the engine build, the harness version, the newt binary digest, the
   task-set digest and the expected trial count.
 
-Rerunning the command skips recorded cells.
+Each cell runs **one Harbor job per trial** (`<cell>/<task>__a<attempt>`). Harbor
+0.20 has no way to stop after the current trial: resuming a job deletes trial
+dirs that have no `result.json`, and SIGTERM cancels the trial in flight. Rerunning
+the command therefore does three things:
+- skips recorded cells;
+- inside an unrecorded cell, skips every trial job that already has a
+  non-cancelled result, so a graded trial never runs twice;
+- moves a partial or cancelled trial job to `<cell>/interrupted/` before that
+  attempt runs again.
+
+A cell is recorded only when every planned trial has a result.
+
+**Windows (#2318).** The inference box belongs to the maintainer outside the
+declared windows. Set `TB_SCHEDULE` to a schedule file, whose shape is shown in
+[`systemd/tb-windows.example`](systemd/tb-windows.example). It is the only
+source of windows.
+
+Before each trial the runner checks four things, in order:
+- **Stop file.** If `<campaign>/campaign.stop` exists, the runner exits at this
+  trial boundary.
+- **Window.** Outside a window it exits.
+- **Router.** If a model outside the roster is loaded, it waits
+  `TB_ROUTER_WAIT_MIN`. If the model is still loaded after that, it skips the
+  rest of the window. It never unloads anything.
+- **Deadline.** It sets a hard deadline at window end plus
+  `TB_DEADLINE_GRACE_MIN`, a maintainer setting. A trial still running at the
+  deadline is cancelled and archived to `interrupted/`, then re-runs in the next
+  window. A second deadline cancel of the same attempt is final: the attempt is
+  recorded as `DeadlineExhausted`, cause agent, and never re-run.
+
+**GPU-hour ledger.** Every trial run, cancelled ones included, appends one line
+to `<campaign>/ledger.jsonl`. Each line is `{cid, record}` and is addressed
+through `bench_scoreboard.trial_cid`, the same encoder as the trial store. A
+record holds the cell, task, attempt, window, state, agent seconds, the runner's
+wall seconds around Harbor, and the cumulative wall hours.
+
+With `TB_GPU_HOURS_CEILING` set, no trial starts once that total is reached. A
+line whose record no longer matches its cid refuses the run.
+
+[`systemd/`](systemd) holds a `systemd --user` service and timer template. The
+timer only wakes the runner every 15 minutes; the schedule decides whether
+trials run.
 
 **Treatments and pinning (#2318).**
 
@@ -102,6 +143,13 @@ declares the arms. Without it, every harness in `TB_HARNESSES` runs `none`.
 Treatments apply to newt only. The file's sha256 is recorded as the treatment's
 identity.
 
+*Required features.* A treatment may declare `requires = ["scratchpad", ...]`,
+using newt's receipt keys (`scratchpad`, `code_search`, `crew`). The adapter
+passes each one as `newt solve --require-feature`, so a feature the run cannot
+supply refuses before any inference. A cell whose trials all refuse is recorded
+as skipped with newt's refusal text. It is never graded, and no claim is counted
+for it. The baseline requires nothing.
+
 *Declared but not observed.* This column counts trials whose contract lacks a
 declared path. It reads `n/a` when a treatment declares nothing observable;
 today only `smart_harness` appears in the contract.
@@ -118,9 +166,12 @@ today only `smart_harness` appears in the contract.
 A later cell that differs from the pin is skipped as `pin mismatch: <fields>`.
 pi and Codex then install the pinned version.
 
-*Model identity.* The fingerprint is the server's model metadata plus the GGUF
-basename. It is a fingerprint, not a content digest: the router exposes no
-weights hash. A digest written after a model id in the roster is recorded as
+*Model identity.* The fingerprint is the server's model metadata, the GGUF
+basename, and the `chat-template-kwargs` set in the model's router preset or
+args. Those kwargs are where thinking is switched on or off, identically for
+every harness. A preset edit between cells is refused as
+`pin mismatch: model_fingerprint.chat_template_kwargs`. The fingerprint is not
+a content digest: the router exposes no weights hash. A digest written after a model id in the roster is recorded as
 declared and unverified, and newt receives it as `NEWT_MODEL_DIGEST`.
 
 `tb_campaign.py table <out> --pair` adds one section per treatment. It compares
@@ -142,6 +193,15 @@ Reading the table:
   is `turn.completed`. When no claim can be read, it counts as *unrecoverable*,
   not as "did not claim". A trial killed by Harbor's timeout counts as "did not
   claim".
+- **pi's session log.** pi's claim, inference failure, largest request output
+  and last event are read from its own session JSONL (`agent/pi/sessions/`) when
+  one exists. Harbor pipes pi through a block-buffered `grep`, so a **killed** pi
+  trial's `pi.txt` loses up to 4 KiB of its final events. `pi.txt` still decides
+  auto-retry exhaustion, and it is whole after a normal exit.
+- **Waiting on the model vs a tool.** A timeout whose log ends waiting on the
+  **model** has cause *unknown*, not agent: a lost or stalled request is not
+  provably the agent's doing. A timeout blocked on the harness's **own tool**
+  stays agent.
 - **False completion** means the harness claimed done and Harbor did not
   resolve the trial. **False incomplete** is the reverse.
 - **Tokens** for pi and Codex are Harbor's `agent_result`, parsed from the

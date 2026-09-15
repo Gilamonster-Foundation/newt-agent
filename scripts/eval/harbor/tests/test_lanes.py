@@ -39,5 +39,21 @@ class ModelDigest(unittest.TestCase):
             newt_agent._MODEL_DIGEST = ""
 
 
+class RequiredFeatures(unittest.TestCase):
+    """#2318/#2356: a treatment's `requires` becomes `--require-feature` on the
+    built newt command, so a default-off feature that cannot be supplied refuses
+    before inference; the baseline passes no flag."""
+
+    def test_declared_requirements_become_flags_and_none_adds_none(self):
+        try:
+            newt_agent._REQUIRE_FEATURES = "scratchpad,crew"
+            command = newt_agent._solve_command("/app")
+            self.assertIn(" --require-feature scratchpad --require-feature crew", command)
+            newt_agent._REQUIRE_FEATURES = ""
+            self.assertNotIn("--require-feature", newt_agent._solve_command("/app"))
+        finally:
+            newt_agent._REQUIRE_FEATURES = ""
+
+
 if __name__ == "__main__":
     unittest.main()

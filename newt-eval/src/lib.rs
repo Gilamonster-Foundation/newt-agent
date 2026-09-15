@@ -49,7 +49,10 @@ pub use evaluators::{
     DiffNonemptyEvaluator, Evaluator, OutputMatchesEvaluator, PatternMatchEvaluator, RunSpec,
     RustCompilesEvaluator, SubprocessRunner, TestsPassEvaluator,
 };
-pub use grade::grade_workspace;
+pub use grade::{
+    grade_behavioral, grade_behavioral_with, grade_workspace, harness_subversion, pre_run,
+    run_spec, verdict_from_run, BehavioralGrade, BehavioralVerdict, PreRun, GRADE_SPEC_TIMEOUT_MS,
+};
 pub use lint::{lint_case_prompts, lint_prompt, LintError};
 pub use runner::{run_case, RunOutcome, RunnerConfig};
 pub use scorecard::{CaseScorecard, EvalContext, EvalResult, Scorecard};

@@ -1,0 +1,20 @@
+
+running 1 test
+test add_returns_the_sum ... FAILED
+
+failures:
+
+---- add_returns_the_sum stdout ----
+
+thread 'add_returns_the_sum' (1307605) panicked at tests/grade_spec.rs:12:5:
+assertion `left == right` failed
+  left: -1
+ right: 5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    add_returns_the_sum
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -9,9 +9,13 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from pi_log import pi_inference_failure, pi_session_claim
+
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, error_cause, harness_evidence, load_treatment, newcombe, newt_claim, observed,
-    pair, pair_report, pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
+    PINNED, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
+    harness_evidence, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
+    newt_claim, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
+    render_profile, summarize, treatment_env, trial_plan, wilson, window_at,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -154,6 +158,24 @@ class Treatments(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_treatment(HARBOR / "tests/fixtures/treatment-bad-env.toml")
 
+    def test_requires_reaches_the_adapter_and_none_requires_nothing(self):
+        t = load_treatment(HARBOR / "tests/fixtures/treatment-requires-scratchpad.toml")
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_REQUIRE_FEATURES": "scratchpad"})
+        self.assertEqual(treatment_env(load_treatment("none")), {})
+        with self.assertRaises(ValueError):  # names are the receipt keys: scratchpad, code_search, crew
+            load_treatment(HARBOR / "tests/fixtures/treatment-requires-unknown.toml")
+
+    def test_a_refused_requirement_is_read_from_the_exit_message(self):
+        message = ("Command failed (exit 1): newt solve ...\nstdout: None\n"
+                   "stderr: Error: required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
+        # Wording from Feature::absence in newt-cli/src/solve_contract.rs (#2356).
+        self.assertEqual(refusal(message),
+                         "required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
+        self.assertIsNone(refusal("Command failed (exit 1): streamed tool batch did not finish with tool_calls"))
+        refused = [row(state="refused", claimed_done=True), row(state="refused", claimed_done=None)]
+        s = summarize({"expected": 2, "model": "m"}, refused)  # never reached the model: no grade, no claim
+        self.assertEqual((s["graded"], s["claimed"], s["unrecoverable_claims"], s["rate_agent_fail"]), (0, 0, 0, (0, 0)))
+
     def test_observed_reads_dotted_contract_paths(self):
         expect = {"effective_config.smart_harness": "*", "effective_config.ocap": "off"}
         on = {"outcome": "completed", "effective_config": {"smart_harness": {"enabled": True}, "ocap": "off"}}
@@ -183,9 +205,26 @@ class Pinning(unittest.TestCase):
         for k in PINNED:
             self.assertEqual(pin_mismatch(pin, {**self.CELL, k: "other"}), [k])
 
-    def test_a_changed_model_fingerprint_refuses(self):
+    def test_a_changed_model_fingerprint_refuses_naming_the_field(self):
         pin = pin_extend({}, dict(self.CELL))
-        self.assertEqual(pin_mismatch(pin, {**self.CELL, "model_fingerprint": {"size": 2, "ftype": "Q4_K"}}), ["model_fingerprint"])
+        self.assertEqual(pin_mismatch(pin, {**self.CELL, "model_fingerprint": {"size": 2, "ftype": "Q4_K"}}),
+                         ["model_fingerprint.size"])
+
+    def test_a_changed_router_preset_thinking_flag_refuses(self):
+        # The thinking switch lives in the router preset (identical for every harness);
+        # a preset edit between cells must not pool with the cells before it.
+        def served(kwargs):
+            preset = "[m]\njinja = 1\nctx-size = 131072\nmodel = /x/y/m.gguf\n" + (f"chat-template-kwargs = {kwargs}\n" if kwargs else "")
+            return {"id": "m", "meta": {"size": 1, "ftype": "Q8_0"},
+                    "status": {"value": "loaded", "args": ["--ctx-size", "131072"], "preset": preset}}
+
+        off = fingerprint(served('{"enable_thinking": false}'))
+        self.assertEqual(off["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(off["gguf"], "m.gguf")  # from the preset when the args carry no --model
+        self.assertIsNone(fingerprint(served(None))["chat_template_kwargs"])  # absent is recorded, not assumed
+        pin = pin_extend({}, {**self.CELL, "model_fingerprint": off})
+        on = {**self.CELL, "model_fingerprint": fingerprint(served('{"enable_thinking": true}'))}
+        self.assertEqual(pin_mismatch(pin, on), ["model_fingerprint.chat_template_kwargs"])
 
     def test_a_new_model_extends_the_pin_and_harness_versions_are_pinned_once_seen(self):
         pin = pin_extend({}, dict(self.CELL))
@@ -256,6 +295,129 @@ class Pairing(unittest.TestCase):
         report = pair_report(cells, rows)
         self.assertIn("Δ = 3/3 − 0/3 = +1.00", report)
         self.assertIn("task-clustered paired bootstrap 95% not reported (1 paired tasks; needs 5)", report)
+
+
+class PerTrialJobs(unittest.TestCase):
+    """One Harbor job per trial: Harbor has no stop-after-this-trial, deletes a
+    result-less trial dir on resume, and SIGTERM cancels the in-flight trial,
+    so the process boundary is the only clean trial boundary."""
+
+    def test_a_trial_job_is_done_only_with_a_non_cancelled_result(self):
+        self.assertEqual(job_state([]), "absent")
+        self.assertEqual(job_state([None]), "partial")  # a trial dir without result.json
+        self.assertEqual(job_state([{"exception_info": {"exception_type": "CancelledError"}}]), "partial")
+        # An errored trial is a recorded attempt: never re-run it.
+        self.assertEqual(job_state([{"exception_info": {"exception_type": "NonZeroAgentExitCodeError"}}]), "done")
+        self.assertEqual(job_state([{"exception_info": None, "verifier_result": {"rewards": {"reward": 0.0}}}]), "done")
+
+    def test_every_task_gets_its_first_attempt_before_any_second(self):
+        # Cutting third trials first (the design card's cut order) needs this order.
+        self.assertEqual(trial_plan(["a", "b"], 2), [("a", 1), ("b", 1), ("a", 2), ("b", 2)])
+
+    def test_trial_configs_are_told_from_job_configs(self):
+        self.assertTrue(is_trial_config({"task": {"path": "x"}, "trial_name": "t__1"}))
+        self.assertFalse(is_trial_config({"jobs_dir": "/x", "datasets": []}))
+
+
+class Windows(unittest.TestCase):
+    """The campaign runs only inside declared windows; the inference box is the maintainer's
+    outside them. One schedule file is the only source of the windows."""
+
+    SCHEDULE = "# nights on weekdays, whole weekend\nmon,tue,wed,thu,fri 20:00 08:00\nsat,sun 00:00 24:00\n"
+
+    def test_overnight_and_weekend_windows(self):
+        from datetime import datetime
+        sched = parse_schedule(self.SCHEDULE)
+        wed_night = window_at(sched, datetime(2026, 9, 16, 23, 30))   # a Wednesday
+        self.assertEqual(wed_night[1], datetime(2026, 9, 17, 8, 0))   # ends Thursday 08:00
+        thu_early = window_at(sched, datetime(2026, 9, 17, 7, 59))    # still Wednesday's window
+        self.assertEqual(thu_early, wed_night)
+        self.assertIsNone(window_at(sched, datetime(2026, 9, 17, 12, 0)))  # Thursday midday: his
+        sat = window_at(sched, datetime(2026, 9, 19, 15, 0))
+        self.assertEqual(sat[1], datetime(2026, 9, 20, 0, 0))
+
+    def test_a_malformed_schedule_line_refuses(self):
+        with self.assertRaises(ValueError):
+            parse_schedule("someday 20:00 08:00")
+
+    def test_a_second_deadline_cancel_exhausts_the_attempt(self):
+        # A runaway can hit the deadline every window; the second cancel is final.
+        archived = ["task-a__a1.1789430000.deadline", "task-a__a2.1789430001", "task-b__a1.1789430002.deadline"]
+        self.assertEqual(deadline_cancels(archived, "task-a__a1"), 1)
+        self.assertEqual(deadline_cancels(archived, "task-a__a2"), 0)  # a crash archive is not a deadline cancel
+        self.assertEqual(job_state([], exhausted=True), "done")
+
+
+class GpuHourLedger(unittest.TestCase):
+    """One content-addressed line per trial; the running wall total is checked
+    against the model's GPU-hour ceiling before each new trial."""
+
+    RECORD = dict(campaign="c", model="m", cell="m__newt", task="task-a", attempt=1, window="2026-09-19T00:00",
+                  state="done", agent_s=240.0, wall_s=300.0)
+
+    def test_an_entry_is_addressed_by_its_record(self):
+        entry = ledger_entry(dict(self.RECORD))
+        self.assertTrue(entry["cid"].startswith("b"))  # CIDv1 base32, via bench_scoreboard.trial_cid
+        self.assertEqual(entry["cid"], ledger_entry(dict(self.RECORD))["cid"])
+        self.assertNotEqual(entry["cid"], ledger_entry({**self.RECORD, "wall_s": 301.0})["cid"])
+
+    def test_the_total_counts_wall_seconds_and_refuses_a_tampered_line(self):
+        entries = [ledger_entry(dict(self.RECORD)), ledger_entry({**self.RECORD, "attempt": 2, "wall_s": 3300.0})]
+        self.assertEqual(ledger_total_s(entries), 3600.0)
+        tampered = [{**entries[0], "record": {**entries[0]["record"], "wall_s": 1.0}}]
+        with self.assertRaises(ValueError):
+            ledger_total_s(tampered)
+
+    def test_no_new_trial_once_the_ceiling_is_reached(self):
+        self.assertFalse(ceiling_reached(167.9 * 3600, 168))
+        self.assertTrue(ceiling_reached(168 * 3600, 168))
+        self.assertFalse(ceiling_reached(10**9, None))  # no ceiling declared
+
+
+class PiSessionLog(unittest.TestCase):
+    """Harbor pipes pi through a block-buffered grep (stdbuf applies only to tee),
+    so a KILLED pi trial's pi.txt loses up to 4 KiB of final events. pi's own
+    session JSONL is unbuffered: it decides pi's last events. Fixtures are the real
+    tails of pypi-server__N4dSxtG (2026-09-14 baseline), whose last act was a
+    foreground `python -m http.server` that never returned."""
+
+    FIX = HARBOR / "tests" / "fixtures"
+
+    def setUp(self):
+        self.session = (self.FIX / "pi-session-blocked-on-tool.jsonl").read_text().splitlines()
+        self.txt = (self.FIX / "pi-txt-truncated-tail.jsonl").read_text().splitlines()
+
+    def test_blocked_on_its_own_tool_is_agent(self):
+        self.assertEqual(awaiting("pi", self.txt, self.session), "tool")
+        self.assertEqual(error_cause("AgentTimeoutError", None, None, None, 14, "tool"), "agent")
+
+    def test_a_request_that_never_got_a_reply_is_unknown_on_timeout(self):
+        waiting_on_model = self.session[:-1]  # ends at a toolResult: the next reply never came
+        self.assertEqual(awaiting("pi", [], waiting_on_model), "model")
+        self.assertEqual(error_cause("AgentTimeoutError", None, None, None, 13, "model"), "unknown")
+        self.assertEqual(error_cause("NonZeroAgentExitCodeError", None, None, None, 13, "model"), "agent")  # timeouts only
+
+    def test_the_session_log_wins_over_a_truncated_pi_txt(self):
+        self.assertEqual(awaiting("pi", self.txt, []), "model")            # what the cut pi.txt alone says
+        self.assertEqual(awaiting("pi", self.txt, self.session), "tool")  # what happened
+        self.assertEqual(pi_inference_failure(self.txt, []), "no assistant message")  # the cut file misleads
+        self.assertIsNone(pi_inference_failure(self.txt, self.session))
+        self.assertEqual(pi_session_claim(self.session), (False, "session last assistant stopReason=toolUse"))
+
+    def test_a_timeout_with_no_readable_log_is_unknown_for_every_harness(self):
+        # newt writes newt-events.jsonl only after the turn ends, so a killed newt has no
+        # log at all; pi and codex with no log are in the same position. Same evidence
+        # standard for all three: no log, no attribution.
+        for harness in ("newt", "pi", "codex"):
+            waiting_on = awaiting(harness, [], [])
+            replies, _ = harness_evidence(harness, [], [])
+            self.assertIsNone(waiting_on, harness)
+            self.assertEqual(error_cause("AgentTimeoutError", None, None, None, replies, waiting_on), "unknown", harness)
+
+    def test_codex_last_event_says_what_it_waits_on(self):
+        self.assertEqual(awaiting("codex", jl({"type": "turn.started"}, {"type": "item.started"}), []), "tool")
+        self.assertEqual(awaiting("codex", jl({"type": "item.completed", "item": {"type": "command_execution"}}), []), "model")
+        self.assertIsNone(awaiting("newt", jl({"kind": "chat_completion_finish"}), []))
 
 
 if __name__ == "__main__":
