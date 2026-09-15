@@ -666,7 +666,8 @@ fn row_usage(row: u32) -> (serde_json::Value, Option<crate::TokenUsage>) {
 /// records its attempt by the state rule, with the usage the body reported
 /// attached whatever the state. A complete terminal response is ok whatever its
 /// content shape — an answer, a refusal, a truncation (`incomplete`), or content
-/// the loop rejects (malformed, mixed) under status `completed`. A failed,
+/// the loop rejects: mixed refusal and tool calls whatever the status, malformed
+/// content under status `completed`. A failed,
 /// provider-error or non-terminal body is failed, and so is a body that is not
 /// JSON or that has neither a status nor any output (round 3, item a).
 #[tokio::test]

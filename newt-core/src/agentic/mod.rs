@@ -11084,10 +11084,11 @@ where
 
 /// Record a decoded 2xx Responses reply's attempt by the #2313 state rule: a
 /// complete terminal response is ok whatever its content shape — an answer, a
-/// refusal, a truncation (`incomplete`), or, under status `completed`, content
-/// the loop rejects (malformed, mixed). A failed, provider-error or non-terminal
-/// body is failed, and so is a body with neither a status nor any output: that
-/// is not a Responses reply at all. How the loop handles the content is
+/// refusal, a truncation (`incomplete`), or content the loop rejects: a mixed
+/// refusal and tool calls (whatever the status, since it is real output), or
+/// malformed content under status `completed`. A failed, provider-error or
+/// non-terminal body is failed, and so is a body with neither a status nor any
+/// output: that is not a Responses reply at all. How the loop handles the content is
 /// separate from the attempt state. The usage the body reported attaches either
 /// way.
 fn complete_responses_attempt(
