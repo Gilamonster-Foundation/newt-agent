@@ -22,6 +22,7 @@ fn ctx<'a>(
     workspace: &'a str,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
         smart_harness: None,
         url: server_uri,
         model: "test-model",

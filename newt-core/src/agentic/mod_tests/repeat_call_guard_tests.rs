@@ -912,3 +912,66 @@ fn a_kernel_refused_binary_is_a_blocker_no_edit_can_clear() {
         Some("a required capability was refused by the confinement")
     );
 }
+
+/// #2374 review A: the default path's repeat steer is unchanged. With
+/// result-aware verification off, successful calls between two identical
+/// failing calls do not clear the failure memo, whatever those calls were.
+#[test]
+fn default_mode_keeps_steering_a_repeated_failure_across_successful_calls() {
+    let mut guard = RepeatCallGuard::default();
+    let fetch = serde_json::json!({"url": "https://fixture.invalid/doc"});
+    guard.record("web_fetch", &fetch, false, "error: fetch failed");
+    guard.record(
+        "update_plan",
+        &serde_json::json!({"plan": []}),
+        true,
+        "plan updated",
+    );
+    guard.record("state_get", &serde_json::json!({"key": "k"}), true, "v");
+    guard.record(
+        "run_command",
+        &serde_json::json!({"command": "echo x"}),
+        true,
+        "x",
+    );
+    guard.record(
+        "write_file",
+        &serde_json::json!({"path": "a.txt"}),
+        true,
+        "wrote a.txt",
+    );
+    assert!(
+        guard.repeat_steer("web_fetch", &fetch).is_some(),
+        "the default path must still steer the identical failing call"
+    );
+}
+
+/// #2374 review A, result-aware mode: only a real workspace change clears a
+/// failure memo. A read-only probe or a harness-state call keeps it; a
+/// mutating command or a write clears it.
+#[test]
+fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
+    let check = serde_json::json!({"command": "cargo test"});
+    for (name, args, clears) in [
+        ("run_command", serde_json::json!({"command": "ls"}), false),
+        ("state_get", serde_json::json!({"key": "k"}), false),
+        ("plan_get", serde_json::json!({}), false),
+        ("code_search", serde_json::json!({"query": "retry"}), false),
+        (
+            "run_command",
+            serde_json::json!({"command": "touch fixed"}),
+            true,
+        ),
+        ("write_file", serde_json::json!({"path": "a.txt"}), true),
+        ("delete_file", serde_json::json!({"path": "a.txt"}), true),
+    ] {
+        let mut guard = RepeatCallGuard::for_verification(true);
+        guard.record("run_command", &check, false, "error: command exited 101");
+        guard.record(name, &args, true, "ok");
+        assert_eq!(
+            guard.repeat_steer("run_command", &check).is_none(),
+            clears,
+            "{name} {args}"
+        );
+    }
+}

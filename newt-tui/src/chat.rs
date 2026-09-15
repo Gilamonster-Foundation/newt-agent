@@ -7573,6 +7573,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        verify_outcomes: newt_core::agentic::verify_outcomes_requested(),
                                         smart_harness: turn_smart_harness.as_deref(),
                                         rewrites_history: turn_rewrites_history,
                                         url: &inf_url,

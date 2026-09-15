@@ -820,7 +820,7 @@ impl SmartHarness {
         if !matches!(control, Control::Answer) || !gate_on {
             return Ok(control);
         }
-        if super::self_verify::result_aware() {
+        if turn.ledger.result_aware() {
             let used = self.state()?.verify_repairs;
             return Ok(match super::self_verify::conclude_turn(turn, used) {
                 super::self_verify::Decision::Accept => control,

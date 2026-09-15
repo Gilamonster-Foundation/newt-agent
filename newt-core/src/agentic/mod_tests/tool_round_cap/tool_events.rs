@@ -40,6 +40,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     let mut reaches = Vec::new();
     chat_complete(
         ChatCtx {
+            verify_outcomes: false,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -192,6 +193,7 @@ async fn openai_loop_records_tool_events_with_digested_args() {
     let mut events: Vec<crate::ToolEvent> = Vec::new();
     openai_chat_complete(
         ChatCtx {
+            verify_outcomes: false,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -310,6 +312,7 @@ fn outcome_ctx<'a>(
     events: &'a mut Vec<crate::ToolEvent>,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
         model: "test-model",
         workspace,
         safe_context: None,

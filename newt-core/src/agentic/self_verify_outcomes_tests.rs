@@ -438,18 +438,11 @@ fn a_status_masked_pass_is_unverified() {
     }
 }
 
-/// Finding 5: every non-read-only call is a mutation for the fallback chain,
-/// and a check-matching command that is not a plain run of the check is not
-/// exempt from it.
-#[serial_test::serial(newt_self_verify_env)]
+/// Finding 5: every call that may change the workspace is a mutation for the
+/// fallback chain, and a check-matching command that is not a plain run of the
+/// check is not exempt from it.
 #[test]
-fn the_mutation_chain_counts_every_non_read_only_call() {
-    let saved = [
-        std::env::var_os("NEWT_SELF_VERIFY"),
-        std::env::var_os("NEWT_VERIFY_OUTCOMES"),
-    ];
-    std::env::set_var("NEWT_SELF_VERIFY", "1");
-    std::env::set_var("NEWT_VERIFY_OUTCOMES", "1");
+fn the_mutation_chain_counts_every_workspace_changing_call() {
     let ws = "newt-core-test-workspace-that-does-not-exist";
     let run = |ledger: &mut VerificationLedger, command: &str| {
         ledger.observe(
@@ -460,7 +453,7 @@ fn the_mutation_chain_counts_every_non_read_only_call() {
             ws,
         );
     };
-    let mut deleted = VerificationLedger::default();
+    let mut deleted = VerificationLedger::for_turn("", true);
     run(&mut deleted, "cargo test");
     deleted.observe(
         "delete_file",
@@ -469,20 +462,9 @@ fn the_mutation_chain_counts_every_non_read_only_call() {
         None,
         ws,
     );
-    let mut sed = VerificationLedger::default();
+    let mut sed = VerificationLedger::for_turn("", true);
     run(&mut sed, "pytest");
     run(&mut sed, "sed -i s/a/b/ tests/test_util.py");
-    for key in ["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"]
-        .iter()
-        .zip(saved)
-        .map(|(k, v)| (*k, v))
-        .collect::<Vec<_>>()
-    {
-        match key.1 {
-            Some(v) => std::env::set_var(key.0, v),
-            None => std::env::remove_var(key.0),
-        }
-    }
     assert_ne!(
         decide_with(&cargo_checks(), &deleted, None),
         Decision::Accept,

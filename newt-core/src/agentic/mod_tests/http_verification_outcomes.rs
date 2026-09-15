@@ -86,11 +86,6 @@ async fn run_script(
 ) -> Run {
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
-    let _outcomes = if outcomes {
-        EnvVar::set("NEWT_VERIFY_OUTCOMES", "1")
-    } else {
-        EnvVar::unset("NEWT_VERIFY_OUTCOMES")
-    };
     let _confined = EnvVar::unset("NEWT_DISABLE_OCAP");
     let _no_anthropic_stream = EnvVar::set("NEWT_ANTHROPIC_STREAM", "off");
 
@@ -119,6 +114,7 @@ async fn run_script(
     context.workspace = &workspace;
     context.task = &task;
     context.max_tool_rounds = max_tool_rounds;
+    context.verify_outcomes = outcomes;
     let mut obs = observability::SolveObservation::default();
     context.solve_obs = Some(&mut obs);
     context.smart_harness = smart.then_some(&harness);

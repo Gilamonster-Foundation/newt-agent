@@ -246,7 +246,9 @@ pub use scheduled::{
 pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
 };
-pub use self_verify::{verification_gate_present, verification_receipt};
+pub use self_verify::{
+    outcomes_enabled as verify_outcomes_requested, verification_gate_present, verification_receipt,
+};
 pub use semantic::{
     chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,
     format_search_model, format_search_preview, format_search_rejects, gather_code_files,
@@ -1253,6 +1255,11 @@ pub struct ChatCtx<'a> {
     /// the Lean TUI and headless callers pass `None` and retain the static
     /// completion-only output from `display::spill_view_lines`.
     pub completed_spill_renderer: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
+    /// #2315: the operator asked for result-aware verification
+    /// (`NEWT_VERIFY_OUTCOMES`). The host reads it once when it builds the
+    /// context; the loop never reads the process env for it. The gate also
+    /// needs `NEWT_SELF_VERIFY` on.
+    pub verify_outcomes: bool,
     /// The injected embedded-git capability (PR4, #461). `Some` ⇒ the `git`
     /// tool is advertised and dispatches through it (`LocalGitTool` in
     /// `newt-git`, injected by the binary). `None` (every headless / eval
@@ -1862,6 +1869,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // by the destructure (the destructures ignore it via `markdown: _`).
     let markdown = ctx.markdown;
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -2062,9 +2070,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_task(task);
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -4324,12 +4334,23 @@ struct RepeatCallGuard {
     repeat_memos: std::collections::HashMap<String, RepeatMemo>,
     /// `name` → how many times it has failed this run (any args).
     fails_by_tool: std::collections::HashMap<String, usize>,
+    /// #2374: result-aware verification is on, so a failure memo describes the
+    /// tree it ran against and a workspace change releases it. Off (the
+    /// default path) keeps every failure memo for the turn.
+    clears_failures_on_change: bool,
 }
 
 impl RepeatCallGuard {
     /// How many consecutive failures of one tool before the steer escalates to
     /// "stop using it".
     const ESCALATE_AFTER: usize = 2;
+
+    fn for_verification(result_aware: bool) -> Self {
+        Self {
+            clears_failures_on_change: result_aware,
+            ..Self::default()
+        }
+    }
 
     fn key(name: &str, args: &serde_json::Value) -> String {
         // The model emits byte-identical args when it loops (confirmed by the
@@ -4470,10 +4491,10 @@ impl RepeatCallGuard {
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
-        // #2374: a failure memo describes the tree it ran against. After a
-        // successful call that may have changed the tree, the identical call is a
-        // legitimate re-check (the repair a verification nudge asks for).
-        if ok && !is_read_only_call(name, args) {
+        // #2374: in result-aware mode a failure memo describes the tree it ran
+        // against. After a real workspace change the identical call is the
+        // re-check a repair nudge asks for, so the memo is released.
+        if self.clears_failures_on_change && ok && may_change_workspace(name, args) {
             self.repeat_memos
                 .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
         }
@@ -4979,6 +5000,85 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
 /// counted there.
 pub fn is_workspace_write_call(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
+}
+
+/// #2374: built-in tools that never touch workspace files: harness state,
+/// plans, retrieval, operator prompts, mode switches.
+fn is_workspace_inert_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "code_search"
+            | "where_is"
+            | "tool_search"
+            | "memory_fetch"
+            | "re_read"
+            | "resume_context"
+            | "experience_recall"
+            | "experience_record"
+            | "state_get"
+            | "state_set"
+            | "state_clear"
+            | "plan_get"
+            | "update_plan"
+            | "render_report"
+            | "request_permissions"
+            | "request_user_input"
+            | "select_operating_mode"
+            | "enter_plan_mode"
+            | "exit_plan_mode"
+    ) || tools::is_context_remaining_call(name)
+}
+
+/// #2374: simple shell commands that only read, beyond
+/// [`is_read_only_shell_probe`]'s list. Used only by result-aware verification,
+/// so the default path's probe steering is unchanged; a candidate to merge into
+/// the shared list once that behaviour change is decided on its own.
+const VERIFICATION_READ_PROGRAMS: &[&str] = &[
+    "cat",
+    "ls",
+    "find",
+    "stat",
+    "file",
+    "tree",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+];
+
+/// #2374: whether a call may have changed the workspace: anything that is
+/// neither read-only nor a workspace-inert built-in. Unknown and MCP tools
+/// fail closed (they may).
+pub(crate) fn may_change_workspace(name: &str, args: &serde_json::Value) -> bool {
+    if name == "run_command" {
+        return args["command"]
+            .as_str()
+            .is_none_or(|command| !is_verification_read_command(command));
+    }
+    !is_read_only_call(name, args) && !is_workspace_inert_tool(name)
+}
+
+/// A single simple command that only reads: the shared probe list or
+/// [`VERIFICATION_READ_PROGRAMS`], with no shell metacharacters and no
+/// `find -delete` / `-exec`.
+pub(crate) fn is_verification_read_command(command: &str) -> bool {
+    let command = command.trim();
+    if is_read_only_shell_probe(command) {
+        return true;
+    }
+    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
+    if command.is_empty() || command.contains(SHELL_META) {
+        return false;
+    }
+    if command
+        .split_whitespace()
+        .any(|t| matches!(t, "-delete" | "-exec" | "-execdir" | "-ok"))
+    {
+        return false;
+    }
+    VERIFICATION_READ_PROGRAMS
+        .iter()
+        .any(|p| command == *p || command.starts_with(&format!("{p} ")))
 }
 
 /// Redact a model-/user-facing string through the session disclosure filter,
@@ -6450,6 +6550,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -6662,9 +6763,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_task(task);
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -7972,7 +8075,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // #2315: in the opt-in result-aware mode the same position decides
             // from observed outcomes instead (A12: one decision, three callers).
             let mut verification_stop = None;
-            if self_verify::result_aware() && action_nudges && !content.is_empty() {
+            if verification.result_aware() && action_nudges && !content.is_empty() {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
                         messages: &messages,
@@ -9004,6 +9107,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -9233,9 +9337,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_task(task);
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -10365,7 +10471,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // #2315: in the opt-in result-aware mode the same position decides
             // from observed outcomes instead (A12: one decision, three callers).
             let mut verification_stop = None;
-            if self_verify::result_aware() && action_nudges && !content.is_empty() {
+            if verification.result_aware() && action_nudges && !content.is_empty() {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
                         messages: &messages,
@@ -11148,6 +11254,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        verify_outcomes,
         smart_harness,
         url,
         model,
@@ -11405,9 +11512,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut repeat_calls = RepeatCallGuard::default();
+    // #2315: result-aware verification for this turn, decided once.
+    let result_aware = self_verify::enabled() && verify_outcomes;
+    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_task(task);
+    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();

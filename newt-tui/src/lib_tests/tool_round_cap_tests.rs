@@ -124,6 +124,7 @@ fn openai_loop_recovers_from_context_window_400() {
             };
             openai_chat_complete(
                 ChatCtx {
+                    verify_outcomes: false,
                     smart_harness: None,
                     rewrites_history: true,
                     url: &server.uri(),

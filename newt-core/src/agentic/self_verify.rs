@@ -593,11 +593,6 @@ pub fn outcomes_enabled() -> bool {
         .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
 }
 
-/// The gate runs in result-aware mode.
-pub fn result_aware() -> bool {
-    enabled() && outcomes_enabled()
-}
-
 /// Whether a turn on `kind` has a self-verify gate at all (#2374): SmartHarness
 /// verifies on every wire; without it only the OpenAI Chat Completions and
 /// Anthropic loops carry the ordinary gate. Headless solve always arms action
@@ -664,15 +659,27 @@ pub struct VerificationLedger {
     /// The instruction checks are detected against, so only a check's own pass
     /// pays for a tree hash.
     task: String,
+    /// Result-aware mode is on for this turn ([`ChatCtx::verify_outcomes`] and
+    /// the gate switch), decided once by the loop.
+    ///
+    /// [`ChatCtx::verify_outcomes`]: super::ChatCtx::verify_outcomes
+    result_aware: bool,
 }
 
 impl VerificationLedger {
-    /// A ledger for a turn whose instruction is `task`.
-    pub(crate) fn for_task(task: &str) -> Self {
+    /// A ledger for a turn whose instruction is `task`; it observes nothing
+    /// unless `result_aware`.
+    pub(crate) fn for_turn(task: &str, result_aware: bool) -> Self {
         Self {
             entries: Vec::new(),
             task: task.to_string(),
+            result_aware,
         }
+    }
+
+    /// Whether this turn runs the result-aware gate.
+    pub(crate) fn result_aware(&self) -> bool {
+        self.result_aware
     }
 
     /// Record a shell execution.
@@ -699,7 +706,7 @@ impl VerificationLedger {
         execution: Option<ExecOutcome>,
         workspace: &str,
     ) {
-        if !result_aware() {
+        if !self.result_aware {
             return;
         }
         let _ = ok;
@@ -722,7 +729,7 @@ impl VerificationLedger {
             }
             // Every call that is not read-only may have changed the tree, ok or
             // not (a failed write can still leave partial bytes).
-            None if !super::is_read_only_call(name, args) => self.record_write(),
+            None if super::may_change_workspace(name, args) => self.record_write(),
             None => {}
         }
     }
@@ -731,7 +738,7 @@ impl VerificationLedger {
     /// check whose latest evidence is a failure makes it `RepairExhausted`
     /// (a scored attempt), otherwise it stays `RoundCap`.
     pub(crate) fn cap_exit_reason(&self, workspace: &str) -> crate::TurnEndReason {
-        if result_aware() {
+        if self.result_aware {
             let checks = detect_checks(
                 &workspace_entries(std::path::Path::new(workspace)),
                 &self.task,

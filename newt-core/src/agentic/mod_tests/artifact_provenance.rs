@@ -23,6 +23,7 @@ fn ctx<'a>(
     caveats: &'a Caveats,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
         smart_harness: None,
         rewrites_history: true,
         url: server_uri,
