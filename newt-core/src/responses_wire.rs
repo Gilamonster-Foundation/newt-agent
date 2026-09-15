@@ -325,7 +325,7 @@ fn decode_output(json: &Value) -> (String, Vec<Value>, Vec<Value>, Option<String
 /// Responses API usage (`input_tokens`/`output_tokens`), accepting the Chat
 /// Completions names (`prompt_tokens`/`completion_tokens`) from lenient servers.
 /// Pass the `usage` sub-object, not the whole body.
-fn decode_usage(usage: &Value) -> Option<crate::TokenUsage> {
+pub(crate) fn decode_usage(usage: &Value) -> Option<crate::TokenUsage> {
     let input = usage["input_tokens"]
         .as_u64()
         .or_else(|| usage["prompt_tokens"].as_u64())

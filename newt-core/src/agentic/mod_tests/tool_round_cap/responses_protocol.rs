@@ -550,3 +550,306 @@ async fn responses_output_allowance_never_changes_the_request_body() {
     assert_eq!(bodies[1], bodies[0]);
     assert_eq!(bodies[2], bodies[0]);
 }
+
+// -----------------------------------------------------------------------
+// #2313 (b1d): every Responses primary request is one ledger attempt
+// -----------------------------------------------------------------------
+
+/// A function call while tools are offered and no tool result has come back;
+/// then a message (with usage) — which is also the tools-disabled summary.
+struct ResponsesToolThenMessage;
+impl Respond for ResponsesToolThenMessage {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let has_result = body["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|i| i["type"] == "function_call_output"));
+        if body.get("tools").is_some() && !has_result {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{"type": "function_call", "call_id": "call-1",
+                    "name": "definitely_not_a_real_tool", "arguments": "{}"}],
+                "usage": {"input_tokens": 50, "output_tokens": 2}
+            }));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "responses answer"}]}],
+            "usage": {"input_tokens": 60, "output_tokens": 5}
+        }))
+    }
+}
+
+/// Run one Responses turn against [`ResponsesToolThenMessage`] and assert the
+/// #2313 invariant: every received request is on `/v1/responses` (nothing else
+/// was hit, so the filter hides nothing) and the attempts are exactly those
+/// requests, keyed by their bodies. Returns the request count.
+///
+/// Scope of the count: the Responses primary loop's rounds and cap-exit summary.
+async fn responses_turn_attempts(max_tool_rounds: usize) -> usize {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponsesToolThenMessage)
+        .mount(&server)
+        .await;
+    let task = "use a tool then answer";
+    let messages = giant_prompt_messages(task);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+    ctx.safe_context = None;
+    ctx.max_ok_input = None;
+    ctx.max_tool_rounds = max_tool_rounds;
+    ctx.attempt_ledger = Some(&ledger);
+    let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+        .await
+        .expect("the turn completes");
+    assert!(reply.contains("responses answer"), "{reply}");
+
+    let received = server.received_requests().await.expect("journal");
+    assert!(
+        received.iter().all(|r| r.url.path() == "/v1/responses"),
+        "only /v1/responses may be hit: {:?}",
+        received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    let ledger = ledger.lock().unwrap();
+    let mut wire: Vec<_> = received
+        .iter()
+        .map(|r| content_addressable::RawContentId::from_content(&r.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger.records().map(|r| r.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire,
+        "attempts == wire requests, keyed by their bodies"
+    );
+    for record in ledger.records() {
+        assert!(
+            record.key.turn.starts_with("prompt:"),
+            "{}",
+            record.key.turn
+        );
+        assert_eq!(record.key.role, "primary");
+        assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+        assert!(record.usage.is_some());
+    }
+    received.len()
+}
+
+#[tokio::test]
+async fn every_responses_round_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
+    assert_eq!(responses_turn_attempts(5).await, 2, "tool round, answer");
+}
+
+#[tokio::test]
+async fn a_responses_cap_exit_summary_is_one_ledger_attempt() {
+    assert_eq!(
+        responses_turn_attempts(1).await,
+        2,
+        "tool round, tools-disabled summary"
+    );
+}
+
+/// Distinct reported usage per table row, so a row cannot pass on another's.
+fn row_usage(row: u32) -> (serde_json::Value, Option<crate::TokenUsage>) {
+    let usage = crate::TokenUsage {
+        input_tokens: 30 + row,
+        output_tokens: 1 + row,
+    };
+    (
+        serde_json::json!({"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}),
+        Some(usage),
+    )
+}
+
+/// #2313 review findings 6 and 7, and round 2 item 6: every 2xx Responses body
+/// records its attempt by the state rule, with the usage the body reported
+/// attached whatever the state. A complete terminal response is ok whatever its
+/// content shape — an answer, a refusal, a truncation (`incomplete`), or content
+/// the loop rejects: mixed refusal and tool calls whatever the status, malformed
+/// content under status `completed`. A failed,
+/// provider-error or non-terminal body is failed, and so is a body that is not
+/// JSON or that has neither a status nor any output (round 3, item a).
+#[tokio::test]
+async fn every_responses_body_records_its_attempt_state_and_usage() {
+    use crate::attempts::AttemptState::{Failed, Ok};
+    let message = serde_json::json!([{"type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "an answer"}]}]);
+    let json = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+    let u = row_usage;
+    let cases = [
+        (
+            "completed",
+            json(serde_json::json!({"status": "completed", "output": message, "usage": u(0).0})),
+            Ok,
+            u(0).1,
+        ),
+        (
+            "refused",
+            json(
+                serde_json::json!({"status": "completed", "usage": u(1).0, "output": [{"type": "message",
+            "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}]}]}),
+            ),
+            Ok,
+            u(1).1,
+        ),
+        (
+            "incomplete",
+            json(
+                serde_json::json!({"status": "incomplete", "usage": u(2).0, "output": message,
+            "incomplete_details": {"reason": "max_output_tokens"}}),
+            ),
+            Ok,
+            u(2).1,
+        ),
+        (
+            "malformed",
+            json(serde_json::json!({"status": "completed", "usage": u(3).0, "output": []})),
+            Ok,
+            u(3).1,
+        ),
+        (
+            "mixed",
+            json(
+                serde_json::json!({"status": "completed", "usage": u(4).0, "output": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}]},
+                    {"type": "function_call", "call_id": "c", "name": "definitely_not_a_real_tool", "arguments": "{}"}
+                ]}),
+            ),
+            Ok,
+            u(4).1,
+        ),
+        (
+            "failed",
+            json(serde_json::json!({"status": "failed", "usage": u(5).0, "output": []})),
+            Failed,
+            u(5).1,
+        ),
+        (
+            "provider error",
+            json(serde_json::json!({"error": {"message": "boom"}, "usage": u(6).0})),
+            Failed,
+            u(6).1,
+        ),
+        (
+            "non-terminal",
+            json(serde_json::json!({"status": "in_progress", "usage": u(7).0, "output": []})),
+            Failed,
+            u(7).1,
+        ),
+        ("empty object", json(serde_json::json!({})), Failed, None),
+        (
+            "usage with no status and no output",
+            json(serde_json::json!({"usage": u(10).0})),
+            Failed,
+            u(10).1,
+        ),
+        (
+            "no usage object",
+            json(serde_json::json!({"status": "completed", "output": message})),
+            Ok,
+            None,
+        ),
+        (
+            "invalid JSON",
+            ResponseTemplate::new(200).set_body_raw(r#"{"status": "compl"#, "application/json"),
+            Failed,
+            None,
+        ),
+    ];
+    for (name, body, state, usage) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(body)
+            .mount(&server)
+            .await;
+        let task = "record this body";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.max_tool_rounds = 5;
+        ctx.attempt_ledger = Some(&ledger);
+        let _ = openai_responses_complete(ctx, &mut NoMcp).await;
+
+        let received = server.received_requests().await.expect("journal");
+        let first = content_addressable::RawContentId::from_content(&received[0].body);
+        let ledger = ledger.lock().unwrap();
+        let record = ledger
+            .records()
+            .find(|r| r.key.request == first && r.key.ordinal == 0)
+            .unwrap_or_else(|| panic!("{name}: the first request is an attempt"));
+        assert_eq!(record.state, state, "{name}");
+        assert_eq!(
+            record.usage, usage,
+            "{name}: reported usage attaches whatever the state"
+        );
+    }
+}
+
+/// A tool round while tools are offered, then a malformed (empty) summary.
+struct ResponsesToolThenMalformedSummary;
+impl Respond for ResponsesToolThenMalformedSummary {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        if body.get("tools").is_some() {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{"type": "function_call", "call_id": "call-1",
+                    "name": "definitely_not_a_real_tool", "arguments": "{}"}],
+                "usage": row_usage(8).0,
+            }));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "completed", "output": [], "usage": row_usage(9).0,
+        }))
+    }
+}
+
+/// Round 2 item 6 at the cap-exit summary site: a completed but empty summary is
+/// a complete terminal response — ok with its usage — even though the loop falls
+/// back to its progress handoff.
+#[tokio::test]
+async fn a_malformed_responses_cap_exit_summary_is_ok_with_its_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponsesToolThenMalformedSummary)
+        .mount(&server)
+        .await;
+    let task = "use a tool then answer";
+    let messages = giant_prompt_messages(task);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+    ctx.safe_context = None;
+    ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 1;
+    ctx.attempt_ledger = Some(&ledger);
+    let _ = openai_responses_complete(ctx, &mut NoMcp).await;
+
+    let received = server.received_requests().await.expect("journal");
+    let summary = received
+        .iter()
+        .find(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .get("tools")
+                .is_none()
+        })
+        .expect("a tools-disabled summary was requested");
+    let summary = content_addressable::RawContentId::from_content(&summary.body);
+    let ledger = ledger.lock().unwrap();
+    let record = ledger
+        .records()
+        .find(|r| r.key.request == summary)
+        .expect("the summary is an attempt");
+    assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+    assert_eq!(record.usage, row_usage(9).1);
+}

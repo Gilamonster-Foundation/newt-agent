@@ -76,6 +76,8 @@ async fn run(
     };
     let mut reason = None;
     context.end_reason = Some(&mut reason);
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    context.attempt_ledger = Some(&ledger);
     let result = if wire == "responses" {
         openai_responses_complete(context, &mut NoMcp).await
     } else {
@@ -87,6 +89,24 @@ async fn run(
         harness.replay_last_request().unwrap(),
         requests.last().unwrap().body,
         "cold replay matches actual HTTP request bytes"
+    );
+    // #2313: in smart mode the wire bytes are the harness's projection, not the
+    // body value, and every attempt is still keyed by exactly those bytes.
+    let mut wire_ids: Vec<_> = requests
+        .iter()
+        .map(|request| content_addressable::RawContentId::from_content(&request.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger
+        .lock()
+        .unwrap()
+        .records()
+        .map(|record| record.key.request)
+        .collect();
+    wire_ids.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire_ids,
+        "{wire}: attempts == smart-harness wire requests"
     );
     (
         result.0,
