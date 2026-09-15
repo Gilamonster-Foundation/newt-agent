@@ -319,7 +319,8 @@ async fn stream_onto(body: ResponseTemplate, markdown: bool) -> (StreamOutcome, 
     let req = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", server.uri()))
         .json(&serde_json::json!({"stream": true}));
-    let out = openai_stream_final_answer(req, buf.clone(), false, markdown, false, None).await;
+    let out =
+        openai_stream_final_answer(req, None, buf.clone(), false, markdown, false, None).await;
     (out, buf.text())
 }
 
@@ -435,7 +436,8 @@ async fn an_interrupt_before_the_send_never_fires_the_second_call() {
         .json(&serde_json::json!({"stream": true}));
 
     let out =
-        openai_stream_final_answer(req, buf.clone(), false, false, false, Some(&cancel)).await;
+        openai_stream_final_answer(req, None, buf.clone(), false, false, false, Some(&cancel))
+            .await;
 
     assert_eq!(
         server.received_requests().await.unwrap().len(),
@@ -466,7 +468,9 @@ async fn an_interrupt_before_the_send_never_fires_the_second_call() {
 /// is running, so the pre-send check cannot be what fires. The padding is SSE
 /// COMMENT lines (`:…`), which `apply_line` drops before `serde_json` is ever
 /// reached, so this costs bytes and not parsing.
-async fn interrupt_once_the_client_is_reading(frames: &str) -> (StreamOutcome, String) {
+async fn interrupt_once_the_client_is_reading(
+    frames: &str,
+) -> (StreamOutcome, String, crate::attempts::AttemptRecord) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -507,14 +511,29 @@ async fn interrupt_once_the_client_is_reading(frames: &str) -> (StreamOutcome, S
     });
 
     let buf = Buf::default();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
     let req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({"stream": true}));
-    let out =
-        openai_stream_final_answer(req, buf.clone(), false, false, false, Some(cancel.as_ref()))
-            .await;
+    let out = openai_stream_final_answer(
+        req,
+        Some(scope),
+        buf.clone(),
+        false,
+        false,
+        false,
+        Some(cancel.as_ref()),
+    )
+    .await;
     server.abort();
-    (out, buf.text())
+    let record = ledger.lock().unwrap().records().next().cloned();
+    (out, buf.text(), record.expect("the reissue was sent"))
 }
 
 /// Serve an SSE body whose bytes are cut at a chosen offset, with a real gap
@@ -555,7 +574,7 @@ async fn stream_split_at(body: &str, cut: usize) -> (StreamOutcome, String) {
     let req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({"stream": true}));
-    let out = openai_stream_final_answer(req, buf.clone(), false, false, false, None).await;
+    let out = openai_stream_final_answer(req, None, buf.clone(), false, false, false, None).await;
     server.abort();
     (out, buf.text())
 }
@@ -653,7 +672,7 @@ async fn an_interrupt_before_any_text_ends_the_turn_and_still_bills_the_call() {
     // Usage FIRST, so it is parsed well before the interrupt can land; then a
     // role-only delta, which paints nothing. No text delta anywhere, and no
     // `[DONE]` — this stream is stopped, not finished.
-    let (out, painted) = interrupt_once_the_client_is_reading(
+    let (out, painted, record) = interrupt_once_the_client_is_reading(
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":5}}\n\n\
          data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
     )
@@ -677,6 +696,13 @@ async fn an_interrupt_before_any_text_ends_the_turn_and_still_bills_the_call() {
         }
         other => panic!("an interrupt with nothing on screen ends the turn, got {other:?}"),
     }
+    // #2313: the interrupted attempt is failed (cancellation is not modelled
+    // yet), never ok, and keeps the usage it reported.
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(
+        record.usage.map(|u| (u.input_tokens, u.output_tokens)),
+        Some((42, 5))
+    );
 }
 
 /// A sink that trips the interrupt flag the moment the answer starts
@@ -722,7 +748,7 @@ async fn an_interrupt_mid_answer_is_not_reported_as_a_broken_stream() {
         .post(format!("{}/v1/chat/completions", server.uri()))
         .json(&serde_json::json!({"stream": true}));
 
-    let out = openai_stream_final_answer(req, sink, false, false, false, Some(&cancel)).await;
+    let out = openai_stream_final_answer(req, None, sink, false, false, false, Some(&cancel)).await;
 
     let painted = buf.text();
     assert!(
@@ -739,6 +765,322 @@ async fn an_interrupt_mid_answer_is_not_reported_as_a_broken_stream() {
             "the partial already on screen is what comes back: {text:?} vs {painted:?}"
         ),
         other => panic!("an interrupt after visible text keeps the partial, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// #2313 review: the display reissue's attempt state and usage follow the rule
+// — a complete terminal response is ok; an interrupt, a cut stream or an error
+// event is failed; reported usage attaches either way.
+// -----------------------------------------------------------------------
+
+/// Run the display reissue once against `frames` with a real attempt ledger
+/// and return the single attempt it recorded.
+async fn reissue_attempt(
+    frames: &[&str],
+    interrupt_on_paint: bool,
+) -> (StreamOutcome, crate::attempts::AttemptRecord) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(frames))
+        .mount(&server)
+        .await;
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let buf = Buf::default();
+    let req = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", server.uri()))
+        .json(&serde_json::json!({"stream": true}));
+    let out = if interrupt_on_paint {
+        let sink = CancelOnWrite {
+            buf: buf.clone(),
+            flag: &cancel,
+        };
+        openai_stream_final_answer(req, Some(scope), sink, false, false, false, Some(&cancel)).await
+    } else {
+        openai_stream_final_answer(req, Some(scope), buf.clone(), false, false, false, None).await
+    };
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().cloned().collect();
+    assert_eq!(records.len(), 1, "one reissue, one attempt");
+    (out, records[0].clone())
+}
+
+const REISSUE_USAGE: &str = r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+
+fn reissue_usage() -> Option<crate::TokenUsage> {
+    Some(crate::TokenUsage {
+        input_tokens: 42,
+        output_tokens: 5,
+    })
+}
+
+/// Review finding 1: an interrupted reissue is a cancellation, which stays
+/// failed until cancellation is modelled — never ok — with the usage it
+/// reported attached.
+#[tokio::test]
+async fn an_interrupted_display_reissue_is_failed_with_its_reported_usage() {
+    let (out, record) = reissue_attempt(
+        &[
+            REISSUE_USAGE,
+            r#"{"choices":[{"delta":{"content":"the beginning of an"}}]}"#,
+        ],
+        true,
+    )
+    .await;
+    assert!(matches!(out, StreamOutcome::Printed(..)), "{out:?}");
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// Review finding 2: a reissue that reaches `[DONE]` with no visible text (all
+/// reasoning) was a complete, billed response — ok with its usage, even though
+/// the caller falls back to the probe answer.
+#[tokio::test]
+async fn a_display_reissue_that_finishes_without_text_is_ok_with_its_usage() {
+    let (out, record) = reissue_attempt(
+        &[
+            r#"{"choices":[{"delta":{"content":"<think>only reasoning</think>"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ],
+        false,
+    )
+    .await;
+    assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
+    assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// The rule's other half on this wire: a stream cut before `[DONE]` is failed,
+/// with whatever usage it reported.
+#[tokio::test]
+async fn a_cut_display_reissue_is_failed_with_its_reported_usage() {
+    let (out, record) = reissue_attempt(
+        &[
+            REISSUE_USAGE,
+            r#"{"choices":[{"delta":{"content":"half an answ"}}]}"#,
+        ],
+        false,
+    )
+    .await;
+    assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// Review round 2, item 2: an error event after a usage frame is failed with
+/// that usage even when `[DONE]` follows it, and the caller's outcome carries the same usage — whether the
+/// error is a context rejection or any other provider error.
+#[tokio::test]
+async fn a_display_reissue_rejected_by_an_error_event_is_failed_with_its_reported_usage() {
+    for (error, context_exceeded) in [
+        (
+            r#"{"error":{"message":"Context size has been exceeded."}}"#,
+            true,
+        ),
+        (r#"{"error":{"message":"busy","code":503}}"#, false),
+    ] {
+        let (out, record) = reissue_attempt(&[REISSUE_USAGE, error, "[DONE]"], false).await;
+        match out {
+            StreamOutcome::ContextExceeded(usage) if context_exceeded => {
+                assert_eq!(usage, reissue_usage());
+            }
+            StreamOutcome::UseProbe(usage) if !context_exceeded => {
+                assert_eq!(usage, reissue_usage());
+            }
+            other => panic!("{error}: {other:?}"),
+        }
+        assert_eq!(
+            record.state,
+            crate::attempts::AttemptState::Failed,
+            "{error}"
+        );
+        assert_eq!(record.usage, reissue_usage(), "{error}");
+    }
+}
+
+/// Review round 2, item 1: a complete `[DONE]` primary stream that strict
+/// decoding rejects (here a tool call without an id) was still generated and
+/// billed. Every attempt is failed WITH the usage the stream reported.
+#[tokio::test]
+async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reported_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ]))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let error = chat_complete(c, &mut NoMcp)
+        .await
+        .expect_err("a tool call without an id is rejected");
+    assert!(format!("{error:#}").contains("has no ID"), "{error:#}");
+
+    let received = server.received_requests().await.expect("journal").len();
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().collect();
+    assert_eq!(records.len(), received, "attempts == wire requests");
+    for record in records {
+        assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+        assert_eq!(record.usage, reissue_usage());
+    }
+}
+
+/// Send one request to `url` through `dispatch_with_decoder` (no retries) with
+/// the strict OpenAI decoder, expecting it to fail; returns the error and the
+/// one attempt it recorded.
+async fn failed_dispatch_attempt(
+    url: &str,
+    decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> (anyhow::Error, crate::attempts::AttemptRecord) {
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        jitter: false,
+    };
+    let error = dispatch_with_decoder(
+        &policy,
+        Some(scope),
+        || async {
+            Ok(reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({})))
+        },
+        "inference endpoint",
+        |_, _, _| {},
+        None,
+        decode,
+    )
+    .await
+    .expect_err("the response is rejected");
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().cloned().collect();
+    assert_eq!(records.len(), 1);
+    (error, records[0].clone())
+}
+
+/// Item 1's other primary send: `dispatch_with_decoder` (the cap-exit summary)
+/// keeps a strictly rejected response's usage on its failed attempt too.
+#[tokio::test]
+async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"delta":{"content":"a summary"}}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ]))
+        .mount(&server)
+        .await;
+    let url = format!("{}/v1/chat/completions", server.uri());
+    let (error, record) =
+        failed_dispatch_attempt(&url, smart_harness::decode_openai_response).await;
+    assert!(
+        format!("{error:#}").contains("no finish reason"),
+        "{error:#}"
+    );
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// Serve `body` under a `Content-Length` it never meets, so the client's body
+/// read fails (not a clean EOF), and dispatch it with `decode`.
+async fn dropped_body_attempt(
+    body: String,
+    decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> (anyhow::Error, crate::attempts::AttemptRecord) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut scratch = [0u8; 8192];
+        assert!(
+            sock.read(&mut scratch).await.unwrap() > 0,
+            "the client asked"
+        );
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n";
+        sock.write_all(format!("{head}{body}").as_bytes())
+            .await
+            .unwrap();
+        // Dropping the socket here cuts the body short of its declared length.
+    });
+    let (error, record) = failed_dispatch_attempt(&url, decode).await;
+    server.abort();
+    assert!(
+        format!("{error:#}").contains("request failed reading response"),
+        "{error:#}"
+    );
+    (error, record)
+}
+
+/// Review rounds 3 and 4, item e: a 2xx body whose read fails keeps the usage
+/// its bytes already reported — whether the decode of those bytes was rejected
+/// (a stream cut mid-answer), or succeeded (a whole `[DONE]` stream, or whole
+/// JSON, before the break).
+#[tokio::test]
+async fn a_body_read_failure_keeps_the_usage_its_bytes_reported() {
+    let answer = r#"{"choices":[{"delta":{"content":"an answer"},"finish_reason":"stop"}]}"#;
+    let json: fn(&[u8]) -> anyhow::Result<serde_json::Value> =
+        |bytes| Ok(serde_json::from_slice(bytes)?);
+    let cases = [
+        (
+            "stream cut mid-answer",
+            format!("data: {answer}\n\ndata: {REISSUE_USAGE}\n\n"),
+            smart_harness::decode_openai_response as fn(&[u8]) -> _,
+        ),
+        (
+            "whole [DONE] stream",
+            format!("data: {answer}\n\ndata: {REISSUE_USAGE}\n\ndata: [DONE]\n\n"),
+            smart_harness::decode_openai_response,
+        ),
+        (
+            "whole Ollama JSON",
+            r#"{"message":{"content":"an answer"},"prompt_eval_count":42,"eval_count":5}"#
+                .to_string(),
+            json,
+        ),
+    ];
+    for (name, body, decode) in cases {
+        let (_, record) = dropped_body_attempt(body, decode).await;
+        assert_eq!(
+            record.state,
+            crate::attempts::AttemptState::Failed,
+            "{name}"
+        );
+        assert_eq!(record.usage, reissue_usage(), "{name}");
     }
 }
 
@@ -905,6 +1247,142 @@ async fn a_tool_round_streams_once_before_the_final_display() {
         vec![true, true, true],
         "one tool batch, one accepted answer, then exactly one display reissue: {seen:?}"
     );
+}
+
+/// Assert the #2313 invariant for one OpenAI Chat turn: every received request
+/// is on the generation path (so no token-count probe, `/v1/models`, or other
+/// path was hit and the filter hides nothing), and the ledger's attempts are
+/// exactly those requests, keyed by their bodies.
+async fn assert_chat_attempts_equal_wire_requests(
+    server: &MockServer,
+    ledger: &std::sync::Mutex<crate::attempts::AttemptLedger>,
+) -> usize {
+    let received = server.received_requests().await.expect("journal");
+    assert!(
+        received
+            .iter()
+            .all(|request| request.url.path() == "/v1/chat/completions"),
+        "only /v1/chat/completions may be hit (no token-count probe paths): {:?}",
+        received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    let ledger = ledger.lock().unwrap();
+    let mut wire: Vec<_> = received
+        .iter()
+        .map(|request| content_addressable::RawContentId::from_content(&request.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger.records().map(|record| record.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire,
+        "attempts == wire requests, keyed by their bodies"
+    );
+    for record in ledger.records() {
+        assert!(
+            record.key.turn.starts_with("prompt:"),
+            "{}",
+            record.key.turn
+        );
+        assert_eq!(record.key.role, "primary");
+        assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+    }
+    wire.len()
+}
+
+/// #2313 (b1b): every primary OpenAI Chat request — the tool round, the
+/// accepted answer, and its display reissue — is exactly one ledger attempt.
+///
+/// Scope of the count: the Chat primary loop's rounds, display reissue and
+/// cap-exit summary.
+#[tokio::test]
+async fn every_openai_chat_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ToolThenAnswer {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            replay: Default::default(),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let (reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("tool round then streamed answer");
+    assert_eq!(reply, "answered after the tool");
+    assert!(streamed);
+
+    assert_eq!(
+        assert_chat_attempts_equal_wire_requests(&server, &ledger).await,
+        3,
+        "tool round, accepted answer, display reissue"
+    );
+    let totals = ledger.lock().unwrap().totals();
+    assert_eq!(
+        (totals.in_tokens, totals.out_tokens, totals.usage_complete),
+        (100 + 100 + 100, 4 + 7 + 5, true)
+    );
+}
+
+/// Tool calls while tools are offered; an SSE summary once they are not.
+struct ToolThenCapSummary;
+impl Respond for ToolThenCapSummary {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        if body_json(req).get("tools").is_some() {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": "{}"}
+                    }]
+                }}],
+                "usage": {"prompt_tokens": 90, "completion_tokens": 3},
+            }));
+        }
+        sse_text(&["capped summary"], 95, 6)
+    }
+}
+
+/// #2313 (b1b): the OpenAI Chat cap-exit summary is one attempt too.
+#[tokio::test]
+async fn an_openai_chat_cap_exit_summary_is_one_ledger_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ToolThenCapSummary)
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.max_tool_rounds = 1;
+    c.attempt_ledger = Some(&ledger);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the round cap ends the turn with a summary");
+    assert!(reply.contains("capped summary"), "{reply}");
+
+    let requests = assert_chat_attempts_equal_wire_requests(&server, &ledger).await;
+    let summaries = server
+        .received_requests()
+        .await
+        .expect("journal")
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .is_ok_and(|body| body.get("tools").is_none())
+        })
+        .count();
+    assert_eq!((requests, summaries), (2, 1), "one tool round, one summary");
 }
 
 struct ToolThenAnswer {

@@ -262,6 +262,8 @@ pub struct DispatchError {
     /// The structural class, decided from the typed source.
     pub class: ErrorClass,
     msg: String,
+    /// Usage the rejected response reported: it was generated and billed.
+    usage: Option<crate::TokenUsage>,
 }
 
 impl DispatchError {
@@ -270,6 +272,7 @@ impl DispatchError {
         Self {
             class,
             msg: msg.into(),
+            usage: None,
         }
     }
 
@@ -280,6 +283,7 @@ impl DispatchError {
         Self {
             class: classify_reqwest(&e),
             msg: format!("{prefix}: {e}"),
+            usage: None,
         }
     }
 
@@ -294,6 +298,7 @@ impl DispatchError {
                 ErrorClass::Transport
             },
             msg: format!("{prefix}: {e}"),
+            usage: None,
         }
     }
 
@@ -302,6 +307,7 @@ impl DispatchError {
         Self {
             class: ErrorClass::ContextExceeded,
             msg: message.into(),
+            usage: None,
         }
     }
 
@@ -317,8 +323,21 @@ impl DispatchError {
                 ErrorClass::Model
             },
             msg,
+            usage: None,
         }
     }
+
+    /// Attach the usage a rejected response reported.
+    pub(crate) fn with_usage(mut self, usage: Option<crate::TokenUsage>) -> Self {
+        self.usage = usage;
+        self
+    }
+}
+
+/// The usage a failed dispatch's response reported, if its chain carries any.
+pub(crate) fn reported_usage(e: &anyhow::Error) -> Option<crate::TokenUsage> {
+    // `downcast_ref` also reaches a DispatchError attached as context.
+    e.downcast_ref::<DispatchError>()?.usage
 }
 
 impl std::fmt::Display for DispatchError {

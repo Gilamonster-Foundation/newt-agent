@@ -971,13 +971,15 @@ pub(crate) async fn response(
 /// OpenAI interpretation errors are model/wire evidence, with their original
 /// error chain retained. JSON-only consumers retain their existing decoder.
 pub(crate) fn decode_openai_response(bytes: &[u8]) -> anyhow::Result<Value> {
-    super::openai_sse::decode_response(bytes).map_err(|error| {
-        use super::observability::DispatchError;
+    use super::observability::DispatchError;
+    let mut usage = None;
+    super::openai_sse::decode_response_reporting_usage(bytes, &mut usage).map_err(|error| {
         let message = format!("{error:#}");
         let classified = match super::openai_sse::rejection_class(&error) {
             Some(class) => DispatchError::new(class, message),
             None => DispatchError::http_status(message),
-        };
+        }
+        .with_usage(usage);
         error.context(classified)
     })
 }
@@ -1019,6 +1021,14 @@ impl Drop for ResponseObservation<'_> {
     }
 }
 
+/// The usage a decoded body reported, in whichever wire's shape it has:
+/// OpenAI `usage`, Anthropic or Responses `usage`, or Ollama's top level.
+fn body_usage(value: &Value) -> Option<crate::TokenUsage> {
+    super::trim::openai_usage(&value["usage"])
+        .or_else(|| super::anthropic_wire::anthropic_usage(&value["usage"]))
+        .or_else(|| super::trim::ollama_usage(value))
+}
+
 /// Observe exact response bytes once, then choose the provider's decoder.
 pub(crate) async fn response_with_decoder(
     response: reqwest::Response,
@@ -1054,10 +1064,18 @@ pub(crate) async fn response_with_decoder(
             if let Some(harness) = harness {
                 harness.provider_failure(&error.to_string())?;
             }
+            // The bytes before the break may already have reported usage: in a
+            // rejected decode, or in a body that decoded whole before the break.
+            let usage = match &decoded {
+                Some(Ok(value)) => body_usage(value),
+                Some(Err(error)) => super::observability::reported_usage(error),
+                None => None,
+            };
             return Err(super::observability::DispatchError::response_read(
                 "request failed reading response",
                 error,
             )
+            .with_usage(usage)
             .into());
         }
     }

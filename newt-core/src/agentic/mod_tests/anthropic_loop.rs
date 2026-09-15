@@ -880,6 +880,7 @@ async fn final_summary_provider_contracts() {
                         Vec::new(),
                         policy,
                         &cap,
+                        None,
                     )
                     .await
                 }

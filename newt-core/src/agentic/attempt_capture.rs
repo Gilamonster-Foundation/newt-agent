@@ -78,8 +78,34 @@ pub(crate) fn complete(
     key: Option<&AttemptKey>,
     usage: Option<TokenUsage>,
 ) {
+    finish(scope, key, AttemptState::Ok, usage);
+}
+
+/// Record how a sent attempt ended, attaching whatever usage the server
+/// reported whatever the state (#2313). `ok` is a complete terminal response —
+/// truncation included; `failed` is a transport error, non-2xx, cut stream,
+/// error event, or failed body, and (until cancellation is modelled) an
+/// interrupt.
+pub(crate) fn finish(
+    scope: Option<AttemptScope<'_>>,
+    key: Option<&AttemptKey>,
+    state: AttemptState,
+    usage: Option<TokenUsage>,
+) {
     if let (Some(scope), Some(key)) = (scope, key) {
-        scope.observe(key, usage, AttemptState::Ok);
+        scope.observe(key, usage, state);
+    }
+}
+
+/// Keep the usage a failed response still reported. The send already recorded
+/// the attempt failed, so without reported usage there is nothing to add.
+pub(crate) fn failed(
+    scope: Option<AttemptScope<'_>>,
+    key: Option<&AttemptKey>,
+    error: &anyhow::Error,
+) {
+    if let Some(usage) = super::observability::reported_usage(error) {
+        finish(scope, key, AttemptState::Failed, Some(usage));
     }
 }
 
