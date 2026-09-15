@@ -511,6 +511,57 @@ mod tests {
         }
     }
 
+    /// Every production shape that reaches the classifier, built with its
+    /// producer's own format string (the OpenAI stream shape through the real
+    /// decoder), keeps 5xx retryable and 4xx fatal. A future tightening of
+    /// [`status_code_in`] that drops a real producer fails here.
+    #[test]
+    fn every_production_status_format_still_classifies() {
+        use reqwest::StatusCode;
+        for (status, expected) in [
+            (StatusCode::INTERNAL_SERVER_ERROR, Retryability::Retry),
+            (StatusCode::SERVICE_UNAVAILABLE, Retryability::Retry),
+            (StatusCode::BAD_REQUEST, Retryability::Fatal),
+            (StatusCode::NOT_FOUND, Retryability::Fatal),
+        ] {
+            let code = status.as_u16();
+            let (body, read_diagnostic) = ("{\"error\":\"fixture\"}", "");
+            let endpoint = "http://embeddings.invalid";
+            let messages = [
+                // smart_harness::response_with_decoder, hosted/OpenAI loops.
+                {
+                    let prefix = "inference endpoint";
+                    format!("{prefix} {status}: {}{read_diagnostic}", body)
+                },
+                // The same producer with the Ollama loop's prefix.
+                {
+                    let prefix = "Ollama";
+                    format!("{prefix} {status}: {}{read_diagnostic}", body)
+                },
+                // warmup.rs.
+                format!("Ollama {}", status),
+                // semantic.rs.
+                format!("embeddings endpoint {endpoint} returned {}", status),
+            ];
+            for message in &messages {
+                assert_eq!(classify(&err(message)), expected, "{message}");
+            }
+            // openai_sse_response::provider_error, reached through the decoder.
+            let frame = serde_json::json!({"error": {"code": code, "message": "fixture"}});
+            let stream = crate::agentic::openai_sse::decode_response(
+                format!("data: {frame}\n\n").as_bytes(),
+            )
+            .unwrap_err();
+            assert!(
+                stream
+                    .to_string()
+                    .starts_with(&format!("OpenAI stream returned {code}:")),
+                "{stream}"
+            );
+            assert_eq!(classify(&stream), expected, "{stream}");
+        }
+    }
+
     #[test]
     fn classify_inference_endpoint_5xx_is_retry() {
         // Regression: hosted endpoints format errors as "inference endpoint <code> …"
