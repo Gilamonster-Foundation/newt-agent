@@ -31,6 +31,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
         smart_harness: None,

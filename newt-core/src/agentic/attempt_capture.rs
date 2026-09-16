@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use super::run_allowance::RunAllowance;
 use crate::attempts::{AttemptKey, AttemptLedger, AttemptRecord, AttemptState};
 use crate::TokenUsage;
 
@@ -24,6 +25,10 @@ pub(crate) struct AttemptScope<'a> {
     /// The turn's interrupt flag: an attempt dropped unsettled while it is set
     /// was cancelled (see [`Attempt`]).
     pub(crate) cancel: Option<&'a AtomicBool>,
+    /// The run's remaining call budget (#2313). `None` (every existing
+    /// caller today) is bit-for-bit unchanged behavior: no reservation, no
+    /// refusal.
+    pub(crate) run_allowance: Option<&'a RunAllowance>,
 }
 
 impl AttemptScope<'_> {
@@ -102,6 +107,11 @@ pub(crate) async fn send<'a>(
     let Some(scope) = scope else {
         return Ok((request.send().await.map_err(dispatch_error)?, None));
     };
+    // #2313: refused before any wire bytes are built or sent — an exhausted
+    // run allowance stops dispatch, it does not fail a request that went out.
+    if let Some(allowance) = scope.run_allowance {
+        allowance.try_reserve()?;
+    }
     let (client, request) = request.build_split();
     let request = request.map_err(dispatch_error)?;
     let Some(bytes) = request.body().and_then(reqwest::Body::as_bytes) else {
