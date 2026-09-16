@@ -75,7 +75,13 @@ fn multiplexer_precedence_requested_then_declared_then_served() {
     };
     // (C3/#1122: a request must be SERVED to win — unserved requests
     // drop fail-soft, covered by its own test below.)
-    let s = served(&["asked", "first", "second"]);
+    // #2400: the fixture must actually SERVE "declared" for this to test
+    // precedence honestly — the fixture used to omit it entirely, which
+    // meant this test passed for the wrong reason (an unvalidated pin
+    // string, not a real precedence win). See
+    // `multiplexer_drops_an_unserved_declared_model_fail_soft` for the
+    // now-covered unserved case.
+    let s = served(&["asked", "declared", "first", "second"]);
     assert_eq!(
         adopt(&b, &s, Some("asked")).model.as_deref(),
         Some("asked"),
@@ -134,6 +140,68 @@ fn multiplexer_drops_an_unserved_requested_model_fail_soft() {
     let trust = adopt(&b, &served(&[]), Some("anything"));
     assert_eq!(trust.model.as_deref(), Some("anything"));
     assert!(!trust.requested_unavailable);
+}
+
+/// #2400: the codex-dgx1 comparison that found this gap — that tool re-probes
+/// which model the server reports `"loaded"` on every launch rather than
+/// trusting a persisted name. Before this fix, a stale `[[backends]] model =`
+/// naming a model the server no longer serves (renamed, unloaded, removed)
+/// was used completely unvalidated whenever no session `/model` override was
+/// active — the exact shape of the #1122 bug, but for the FILE-declared model
+/// instead of a restored/typo'd request, and with no fail-soft flag at all.
+#[test]
+fn multiplexer_drops_an_unserved_declared_model_fail_soft() {
+    let b = BackendConfig {
+        name: "o".into(),
+        endpoint: "http://h:11434".into(),
+        model: Some("qwen3.8-flash-next".into()), // renamed/removed on the server
+        kind: Some(BackendKind::Ollama),
+        ..Default::default()
+    };
+    let s = served(&["qwen3-coder_30b", "other"]);
+    let a = adopt(&b, &s, None);
+    assert_eq!(
+        a.model.as_deref(),
+        Some("qwen3-coder_30b"),
+        "falls through to first-served, never dispatches to the dead name"
+    );
+    assert!(a.declared_unavailable);
+    assert!(
+        !a.requested_unavailable,
+        "no request was made at all — only the declared model failed"
+    );
+
+    // A SERVED declared model is honored, unflagged (unchanged behavior).
+    let ok = adopt(
+        &BackendConfig {
+            model: Some("other".into()),
+            ..b.clone()
+        },
+        &s,
+        None,
+    );
+    assert_eq!(ok.model.as_deref(), Some("other"));
+    assert!(!ok.declared_unavailable);
+
+    // When BOTH an unserved request and an unserved declared model are in
+    // play, both facts are reported — declared genuinely is a fallback
+    // candidate whenever the request doesn't win outright, so suppressing
+    // one flag because the other also fired would hide a true statement.
+    let both_bad = adopt(&b, &s, Some("also-missing"));
+    assert!(both_bad.requested_unavailable);
+    assert!(both_bad.declared_unavailable);
+    // But a SUCCESSFUL request makes the (bypassed) declared model's own
+    // servedness irrelevant to the outcome — it never becomes a candidate,
+    // so it is never flagged even when it, too, would have failed.
+    let request_wins = adopt(&b, &s, Some("other"));
+    assert!(!request_wins.requested_unavailable);
+    assert!(!request_wins.declared_unavailable);
+
+    // Empty served list (mid-restart): trust the declared model too, unflagged
+    // — matches the existing empty-list trust the request already gets.
+    let trust = adopt(&b, &served(&[]), None);
+    assert_eq!(trust.model.as_deref(), Some("qwen3.8-flash-next"));
+    assert!(!trust.declared_unavailable);
 }
 
 #[test]

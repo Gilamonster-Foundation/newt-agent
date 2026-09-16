@@ -1597,6 +1597,17 @@ pub struct Adoption {
     /// (#1122 fail-soft: a restored/typo'd model must not brick the session) —
     /// the caller warns and the adoption fell back to declared/first-served.
     pub requested_unavailable: bool,
+    /// True when NEITHER a request was made NOR was one served, and the
+    /// FILE-DECLARED model is not in a multiplexer's served list either — a
+    /// server that renamed or unloaded a model a config still names by its
+    /// old id must not silently dispatch to that dead name (the caller
+    /// warns and the adoption fell back to a warm/first-served model
+    /// instead). Unlike `requested_unavailable`, this covers the declared
+    /// model becoming the *pin* itself, which previously had no validity
+    /// check at all — see the codex-dgx1 comparison that found this gap:
+    /// that tool re-probes which model the server reports `"loaded"` on
+    /// every launch rather than trusting a persisted name.
+    pub declared_unavailable: bool,
     /// True when a `ManagedMode::Shared` backend adopted a currently-WARM model
     /// instead of forcing its pinned/first model to load — the cooperative path
     /// that avoids swapping a model another agent may be using. Always false for
@@ -1643,6 +1654,7 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
                 serving,
                 requested_ignored,
                 requested_unavailable: false,
+                declared_unavailable: false,
                 // An instance serves one bound model — there is nothing to
                 // adopt-warm and no swap to force.
                 adopted_warm: false,
@@ -1655,15 +1667,27 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
             // dropped with a flag — a typo'd restore must never brick every
             // future launch. An EMPTY served list (endpoint mid-restart)
             // trusts the request rather than second-guessing it.
-            let requested_ok =
-                requested.map(|r| served.models.is_empty() || served.models.iter().any(|m| m == r));
+            let is_served = |candidate: &str| {
+                served.models.is_empty() || served.models.iter().any(|m| m == candidate)
+            };
+            let requested_ok = requested.map(is_served);
             let requested_unavailable = requested_ok == Some(false);
             // The model this session pins: a served session request outranks
             // the file's declared model.
+            let declared = backend.effective_model();
             let pin: Option<String> = requested
                 .filter(|_| requested_ok == Some(true))
-                .map(str::to_string)
-                .or_else(|| backend.effective_model().map(str::to_string));
+                .or_else(|| declared.filter(|d| is_served(d)))
+                .map(str::to_string);
+            // #2400: the declared model is checked EXACTLY like a requested
+            // one — only when it is the thing actually deciding (no request
+            // was made, or the request was itself unavailable) and it fails
+            // that same check. A server that renamed/unloaded the model a
+            // stale config still names by its old id must not silently
+            // dispatch to that dead name; fall through to warm/first-served
+            // instead, same as an unserved requested model already does.
+            let declared_unavailable =
+                requested_ok != Some(true) && declared.is_some_and(|d| !is_served(d));
             // The first WARM model the server still lists (a stale `/api/ps`
             // entry not in `models` is ignored — see [`Served::warm`]).
             let warm: Option<String> = served
@@ -1696,6 +1720,7 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
                 serving,
                 requested_ignored: false,
                 requested_unavailable,
+                declared_unavailable,
                 adopted_warm,
                 pin_conflict,
             }

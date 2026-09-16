@@ -3650,6 +3650,17 @@ fn finish_adoption(
                     choice.url
                 ));
             }
+            if adoption.declared_unavailable {
+                // #2400 fail-soft: a config-declared model the server no
+                // longer serves (renamed, unloaded, removed) must not silently
+                // dispatch to that dead name — say what happened and what we
+                // used instead, same as the requested-model case above.
+                lines.push(format!(
+                    "configured model isn't on {} — falling back (was it renamed or \
+                     removed on the server?); /models to list",
+                    choice.url
+                ));
+            }
             if adoption.model.is_none() {
                 lines.push(format!(
                     "{} listed no models — pull one (or start the server with a model), \
