@@ -9039,6 +9039,7 @@ fn run_login_argv(argv: &[String], color: bool, verbose: bool) -> anyhow::Result
     }
     #[cfg(not(unix))]
     {
+        let _ = (color, verbose);
         let mut command = command;
         Ok(command.status()?.success())
     }
