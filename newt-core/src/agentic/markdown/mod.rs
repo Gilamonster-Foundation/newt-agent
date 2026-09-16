@@ -256,6 +256,7 @@ mod tests {
     #[test]
     fn color_off_is_byte_for_byte_passthrough() {
         for s in [
+            "first response paragraph\n\nsecond response paragraph",
             "**x** and `y`",
             "# h\n\n- a\n- b",
             "| a | b |\n| - | - |\n| 1 | 2 |",

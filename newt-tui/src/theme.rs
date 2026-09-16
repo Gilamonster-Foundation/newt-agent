@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn the_adapter_preserves_every_colour_a_surface_asks_for() {
         assert_eq!(color(Role::Accent), RtColor::Rgb(255, 165, 90));
-        assert_eq!(color(Role::Thinking), RtColor::Rgb(255, 165, 90));
+        assert_eq!(color(Role::Thinking), RtColor::DarkGray);
         assert_eq!(color(Role::Dim), RtColor::DarkGray);
         assert_eq!(color(Role::Muted), RtColor::Gray);
         assert_eq!(color(Role::Emphasis), RtColor::LightYellow);

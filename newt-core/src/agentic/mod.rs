@@ -12574,18 +12574,12 @@ fn commit_reasoning_fold(
         return;
     }
     let block = shown.join("\n");
-    if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(format!("{block}\n")),
-            ResetColor,
-        )
-        .ok();
-    } else {
-        println!("{block}");
-    }
-    io::stdout().flush().ok();
+    emit_reasoning(&block, color);
+}
+
+fn emit_reasoning(text: &str, color: bool) {
+    let notice = crate::tty::Notice::new(crate::tty::Level::Thinking, "", text);
+    crate::tty::Terminal::emit_line(crate::tty::Sink::Stdout, notice.writer(color));
 }
 
 /// The streaming half of a [`ThinkingFold`]: it owns the partial-line buffer
@@ -12603,8 +12597,8 @@ struct ReasoningTrickle {
 }
 
 impl ReasoningTrickle {
-    /// Feed a chunk. Completed lines within the budget go to the spinner (which
-    /// commits them dim); the rest are retained by the fold and never printed.
+    /// Feed a chunk. Completed lines within the budget go to the spinner with
+    /// the thinking style; the rest are retained by the fold and never printed.
     fn feed(&mut self, spinner: &crate::tty::Spinner, chunk: &str, budget: usize) {
         self.partial.push_str(chunk);
         while let Some(nl) = self.partial.find('\n') {
@@ -12649,18 +12643,7 @@ impl ReasoningTrickle {
         let Some(line) = self.fold.closing_line(elapsed, recovery) else {
             return;
         };
-        if color {
-            execute!(
-                io::stdout(),
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("{line}\n")),
-                ResetColor,
-            )
-            .ok();
-        } else {
-            println!("{line}");
-        }
-        io::stdout().flush().ok();
+        emit_reasoning(&line, color);
     }
 }
 

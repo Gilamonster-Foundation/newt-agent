@@ -133,14 +133,14 @@ fn effective_label(label: &str, presses: u32) -> Cow<'_, str> {
 // State
 // ---------------------------------------------------------------------------
 
-/// The dim, indented register the model's reasoning trickle scrolls in.
+/// The themed, indented register the model's reasoning trickle scrolls in.
 ///
 /// The indent lives in the text because [`Notice`](super::widgets::Notice)'s
 /// gutter is a *glyph* gutter and a trickle line has no glyph — the same shape
 /// the widget already documents for "text that leads with its own marker".
 fn detail_note(line: &str) -> Note {
     Note {
-        level: Level::Dim,
+        level: Level::Thinking,
         glyph: "",
         text: format!("  {line}"),
     }
@@ -617,12 +617,12 @@ mod tests {
         );
     }
 
-    /// A completed detail line commits as a dim, indented note — **byte for
+    /// A completed detail line commits as a themed, indented note — **byte for
     /// byte the line the spinner used to write itself**, now composed by the
     /// renderer from a `Durable` that says what it means.
     #[serial_test::serial(tty_arbiter)]
     #[test]
-    fn a_completed_detail_line_commits_as_an_indented_dim_note() {
+    fn a_completed_detail_line_commits_as_an_indented_thinking_note() {
         let sp = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, false)
             .expect("spinner");
         sp.detail("hello\nwor");
@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(
             committed,
             vec![Commit::Note(Note {
-                level: Level::Dim,
+                level: Level::Thinking,
                 glyph: "",
                 text: "  hello".into(),
             })],
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(
             committed_by(&state),
             vec![Commit::Note(Note {
-                level: Level::Dim,
+                level: Level::Thinking,
                 glyph: "",
                 text: "  no newline yet".into(),
             })],

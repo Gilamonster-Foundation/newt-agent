@@ -42,13 +42,13 @@
 use std::borrow::Cow;
 use std::io::{self, Write as _};
 
-use crossterm::queue;
-use crossterm::style::{Color as CtColor, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Color as CtColor, ContentStyle};
 
 use crate::tty::caps::{protocol_mode, LineCaps};
+use crate::tty::theme::{self, Role, Theme};
 use crate::tty::{LineWriter, Sink, Terminal};
 
-/// The ONE hue table. Six registers, each with a distinct meaning; every
+/// The ONE style table. Each register has a distinct meaning; every
 /// notice in the workspace lands in one of them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Level {
@@ -64,22 +64,28 @@ pub enum Level {
     /// The last-resort register — silent context loss and its kin. Loud on
     /// purpose; must not be spent on anything recoverable.
     Loud,
-    /// Secondary detail that should recede (the reasoning trickle's register).
+    /// Secondary detail that should recede.
     Dim,
+    /// Model reasoning, independently configurable from the final response.
+    Thinking,
     /// Diagnostics behind a debug/trace flag.
     Debug,
 }
 
 impl Level {
-    /// This level's foreground, or `None` for "leave the default alone".
-    fn hue(self) -> Option<CtColor> {
-        match self {
-            Self::Info => None,
-            Self::Ok => Some(CtColor::DarkGreen),
-            Self::Warn => Some(CtColor::DarkYellow),
-            Self::Loud => Some(CtColor::Red),
-            Self::Dim | Self::Debug => Some(CtColor::DarkGrey),
-        }
+    fn style(self, theme: &Theme) -> Option<ContentStyle> {
+        let color = match self {
+            Self::Info => return None,
+            Self::Thinking => return Some(theme.style(Role::Thinking)),
+            Self::Ok => CtColor::DarkGreen,
+            Self::Warn => CtColor::DarkYellow,
+            Self::Loud => CtColor::Red,
+            Self::Dim | Self::Debug => CtColor::DarkGrey,
+        };
+        Some(ContentStyle {
+            foreground_color: Some(color),
+            ..ContentStyle::default()
+        })
     }
 }
 
@@ -167,17 +173,15 @@ impl<'a> Notice<'a> {
     /// instead. Copying the styling into that second path is how the four
     /// amber encodings this widget replaced came about in the first place.
     pub(crate) fn writer(&self, color: bool) -> impl FnOnce(&mut LineWriter<'_>) -> io::Result<()> {
+        let line = self.styled_line(color, &theme::active());
+        move |w| w.write_all(line.as_bytes())
+    }
+
+    fn styled_line(&self, color: bool, theme: &Theme) -> String {
         let line = self.line();
-        let hue = if color { self.level.hue() } else { None };
-        move |w| match hue {
-            Some(h) => queue!(
-                w,
-                SetForegroundColor(h),
-                Print(&line),
-                ResetColor,
-                Print("\n"),
-            ),
-            None => writeln!(w, "{line}"),
+        match color.then(|| self.level.style(theme)).flatten() {
+            Some(style) => format!("{}{line}\x1b[0m\n", theme::ansi_style(style)),
+            None => format!("{line}\n"),
         }
     }
 }
@@ -185,6 +189,48 @@ impl<'a> Notice<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Level, Notice};
+
+    #[test]
+    fn thinking_notice_uses_full_independent_theme_style_and_resets_it() {
+        use crate::tty::theme::{Role, Theme};
+        use crossterm::style::{Attribute, Color};
+        let mut theme = Theme::builtin().overlaid(
+            "test",
+            &[
+                (
+                    Role::Thinking,
+                    Color::Rgb {
+                        r: 12,
+                        g: 34,
+                        b: 56,
+                    },
+                ),
+                (
+                    Role::AgentText,
+                    Color::Rgb {
+                        r: 78,
+                        g: 90,
+                        b: 123,
+                    },
+                ),
+            ],
+        );
+        let mut style = theme.style(Role::Thinking);
+        style.attributes.set(Attribute::Dim);
+        style.attributes.set(Attribute::Italic);
+        style.attributes.set(Attribute::Reverse);
+        theme.set_style(Role::Thinking, style);
+        let notice = Notice::new(Level::Thinking, "", "  first\n  second\nThought for 5s");
+        assert_eq!(
+            notice.styled_line(true, &theme),
+            format!("{}{}\x1b[0m\n", theme.ansi(Role::Thinking), notice.line())
+        );
+        assert_eq!(
+            notice.styled_line(false, &theme),
+            format!("{}\n", notice.line())
+        );
+        assert_eq!(theme.ansi(Role::AgentText), "\x1b[38;2;78;90;123m");
+    }
 
     /// Both spacing conventions render, and the composition is exactly
     /// glyph + gap + text with nothing else inserted.
@@ -215,6 +261,7 @@ mod tests {
             Level::Warn,
             Level::Loud,
             Level::Dim,
+            Level::Thinking,
             Level::Debug,
         ] {
             assert!(!Notice::new(level, "⚠", "text").line().contains('\u{1b}'));
@@ -227,7 +274,15 @@ mod tests {
     #[test]
     fn warn_is_the_single_amber() {
         use crossterm::style::Color as CtColor;
-        assert_eq!(Level::Warn.hue(), Some(CtColor::DarkYellow));
-        assert_eq!(Level::Info.hue(), None, "narration keeps the default fg");
+        let theme = crate::tty::theme::Theme::builtin();
+        assert_eq!(
+            Level::Warn.style(&theme).unwrap().foreground_color,
+            Some(CtColor::DarkYellow)
+        );
+        assert_eq!(
+            Level::Info.style(&theme),
+            None,
+            "narration keeps the default fg"
+        );
     }
 }

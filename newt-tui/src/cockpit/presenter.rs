@@ -1050,7 +1050,16 @@ impl Presenter {
         ];
         // SAFETY: poll on two descriptors we own.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, IDLE_POLL.as_millis() as i32) };
-        if ready <= 0 || fds[0].revents & libc::POLLIN == 0 {
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal input closed",
+            ));
+        }
+        // Cursor queries and earlier polls can leave parsed events in
+        // crossterm after the kernel fd is empty. Check that queue before
+        // waiting for another byte; keep the same exclusive stdin token.
+        if (ready <= 0 || fds[0].revents & libc::POLLIN == 0) && !event::poll(Duration::ZERO)? {
             return Ok(());
         }
         // Drain every event crossterm has parsed so far.
@@ -1583,5 +1592,5 @@ mod terminal_acceptance;
 
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
-    cockpit_acceptance_case, cockpit_bang_case, panel_resize_case,
+    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case, panel_resize_case,
 };

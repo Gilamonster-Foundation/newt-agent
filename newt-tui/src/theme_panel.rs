@@ -167,7 +167,7 @@ impl Screen for ThemePanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
         use newt_core::tty::theme::Role;
         let bottom: Line = if self.status.is_empty() {
-            hint_line("↑↓ field · ←→ / type color · Ctrl-S save · Enter apply · Esc cancel")
+            hint_line("↑↓ field · ←→ / type color · Ctrl-S save · Enter apply · Esc discard/back")
         } else {
             status_line(&self.status)
         };
@@ -181,7 +181,7 @@ impl Screen for ThemePanel {
         );
         let [form, preview, footer] = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(1),
         ])
         .areas(inner);
@@ -229,6 +229,10 @@ impl Screen for ThemePanel {
             Line::from(vec![
                 Span::raw("Human: "),
                 styled(Role::HumanText, "Please help with this task."),
+            ]),
+            Line::from(vec![
+                Span::raw("Thinking: "),
+                styled(Role::Thinking, "Considering the next step."),
             ]),
             Line::from(vec![
                 Span::raw("Agent: "),
@@ -410,6 +414,61 @@ mod tests {
     }
 
     #[test]
+    fn thinking_and_agent_previews_use_their_independent_draft_styles() {
+        use newt_core::tty::theme::Role;
+        use ratatui::style::{Color as DisplayColor, Modifier};
+
+        let original = Theme::builtin();
+        let mut panel = ThemePanel::from_themes(original.clone(), vec![original], String::new());
+        let mut thinking = crossterm::style::ContentStyle {
+            foreground_color: Some(Color::Rgb {
+                r: 112,
+                g: 91,
+                b: 83,
+            }),
+            ..Default::default()
+        };
+        thinking.attributes.set(Attribute::Italic);
+        panel.draft.set_style(Role::Thinking, thinking);
+        panel.draft.set_style(
+            Role::AgentText,
+            crossterm::style::ContentStyle {
+                foreground_color: Some(Color::Rgb {
+                    r: 28,
+                    g: 38,
+                    b: 48,
+                }),
+                ..Default::default()
+            },
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 17)).unwrap();
+        terminal.draw(|frame| panel.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for (label, color, italic) in [
+            ("Thinking:", DisplayColor::Rgb(112, 91, 83), true),
+            ("Agent:", DisplayColor::Rgb(28, 38, 48), false),
+        ] {
+            let row = buffer
+                .content
+                .chunks(100)
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .unwrap_or_else(|| panic!("missing {label} preview"));
+            let sample = row
+                .iter()
+                .find(|cell| cell.fg == color)
+                .unwrap_or_else(|| panic!("{label} preview must use its own draft style"));
+            assert_eq!(sample.modifier.contains(Modifier::ITALIC), italic);
+            assert!(!sample.modifier.contains(Modifier::DIM));
+        }
+    }
+
+    #[test]
     fn short_and_narrow_panels_keep_preview_visible_while_form_scrolls() {
         for height in [12, 17] {
             let original = Theme::builtin();
@@ -432,6 +491,7 @@ mod tests {
                 "Heading",
                 "src/main.rs",
                 "Human:",
+                "Thinking:",
                 "Agent:",
                 "Spill:",
             ] {

@@ -762,7 +762,7 @@ fn background_line(jobs: &[BackgroundJob], frame: usize) -> Option<Line<'static>
     Some(Line::from(vec![
         Span::styled(
             format!("{spinner} background{count}"),
-            crate::theme::style(crate::theme::Role::Thinking),
+            crate::theme::style(crate::theme::Role::Accent),
         ),
         Span::styled(
             format!(" · {labels}"),

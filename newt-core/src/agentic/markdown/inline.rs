@@ -185,6 +185,21 @@ mod theme_tests {
     use crossterm::style::Attribute;
 
     #[test]
+    fn agent_text_keeps_its_separate_color_and_accepts_explicit_theme_styles() {
+        let plain = Style {
+            role: Some(Role::AgentText),
+            ..Style::default()
+        };
+        assert_eq!(open_with_theme(plain, &Theme::builtin()), "\x1b[38;5;7m");
+        let (mut theme, warnings) = crate::tty::theme::from_env(Some("agent-text=#123456"));
+        assert!(warnings.is_empty());
+        let mut style = theme.style(Role::AgentText);
+        style.attributes.set(Attribute::Italic);
+        theme.set_style(Role::AgentText, style);
+        assert_eq!(open_with_theme(plain, &theme), "\x1b[3m\x1b[38;2;18;52;86m");
+    }
+
+    #[test]
     fn heading_and_code_obey_explicit_bold_off_and_custom_color() {
         let mut theme = Theme::builtin();
         for role in [
