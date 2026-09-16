@@ -1157,17 +1157,6 @@ pub(super) fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
     }
 }
 
-/// The allowlist NAME for an exec target — the trailing path component (the
-/// program's basename), so `/usr/bin/env` and `C:\tools\env.exe` resolve to the
-/// command a grant would actually allowlist. Used when lifting a denied exec
-/// into a #263 [`PermissionRequest`].
-pub(super) fn exec_allowlist_name(target: &str) -> &str {
-    target
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(target)
-}
-
 /// The standard `run_command` capability-denial result, composed EXACTLY ONCE:
 /// a single `capability denied: <bare reason>. <recovery hint>` for the model.
 ///
@@ -1595,7 +1584,7 @@ fn pr_next_step_hint(url: &str) -> String {
 ///
 /// Returns `Some` only when EVERY structured denial entry is an `exec` kind
 /// with a non-empty target — the case the human can meaningfully grant (the
-/// allowlist name, same basename rule as the config hint). Any other kind
+/// exact executable target). Any other kind
 /// (e.g. an `open` refused inside the shell) keeps the standard denial:
 /// guessing which fs axis an opaque `open` maps to would over-grant.
 /// #1150: a STRUCTURAL refusal is a can't, not a may-not — the confined shell
@@ -1634,7 +1623,7 @@ pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<P
         requests.push(PermissionRequest {
             tool: "run_command".to_string(),
             kind: DenialKind::Exec,
-            target: exec_allowlist_name(target).to_string(),
+            target: target.to_string(),
             reason: d
                 .get("reason")
                 .and_then(serde_json::Value::as_str)

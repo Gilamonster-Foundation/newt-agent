@@ -728,6 +728,20 @@ pub(crate) fn take_pending_once(
 }
 
 impl PermissionPromptState {
+    fn denied(&self, kind: newt_core::DenialKind, target: &str) -> bool {
+        let denied = |target: &str| {
+            let key = (kind, target.to_string());
+            self.session_denials.contains(&key)
+                || self.persistent_denials.contains(&key)
+                || newt_core::ocap_store::evaluate_request(&self.ocap_policy, kind, target)
+                    == Some(newt_core::ocap_store::Verdict::Deny)
+        };
+        // Older exec prompts stored basenames. Preserve those refusals when a
+        // new prompt names an exact path, without widening any approval.
+        denied(target)
+            || (kind == newt_core::DenialKind::Exec && denied(exec_grant_basename(target)))
+    }
+
     /// Load the persistent denylist from `path` into a fresh state (#904). A
     /// missing file yields an empty denylist. Called once at session start.
     pub(crate) fn with_persistent_denials(path: Option<&std::path::Path>) -> Self {
@@ -1499,16 +1513,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             }
         }
         // Previously recorded session, permanent, and OCAP denials short-circuit.
-        if requests.iter().any(|r| {
-            let key = (r.kind, r.target.clone());
-            self.state.session_denials.contains(&key)
-                || self.state.persistent_denials.contains(&key)
-                || newt_core::ocap_store::evaluate_request(
-                    &self.state.ocap_policy,
-                    r.kind,
-                    &r.target,
-                ) == Some(newt_core::ocap_store::Verdict::Deny)
-        }) {
+        if requests
+            .iter()
+            .any(|r| self.state.denied(r.kind, &r.target))
+        {
             return Deny;
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
@@ -1602,12 +1610,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     once_grants.push((req.kind, req.target.clone()));
                     // Carry proactive allow-once to the model's separate retry.
                     if req.tool == "request_permissions" {
-                        let key = if req.kind == newt_core::DenialKind::Exec {
-                            (req.kind, exec_grant_basename(&req.target).to_string())
-                        } else {
-                            (req.kind, req.target.clone())
-                        };
-                        self.state.pending_once_grants.insert(key);
+                        self.state
+                            .pending_once_grants
+                            .insert((req.kind, req.target.clone()));
                     }
                 }
                 PromptChoice::AllowSession => {
