@@ -1299,6 +1299,7 @@ fn help_request_treats_a_text_settings_value_as_a_value_not_help() {
 #[test]
 fn command_help_covers_every_listed_command_and_folds_aliases() {
     for cmd in [
+        "settings",
         "models",
         "model",
         "backend",

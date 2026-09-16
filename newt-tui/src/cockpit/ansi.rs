@@ -244,6 +244,7 @@ pub(crate) struct TranscriptStream {
     carry: Vec<u8>,
     /// The in-progress row (no newline yet). The spinner lives here.
     partial: Row,
+    styling: SgrState,
     /// Where the next print lands in `partial`, in display columns. `\r` and
     /// `ESC[nG` move it; text past the end appends, text before the end
     /// truncates then appends — the terminal would overwrite in place, and for
@@ -279,6 +280,7 @@ impl TranscriptStream {
                 Token::Sgr(seq) => {
                     // Styling never moves the column.
                     self.overwrite_at_col();
+                    self.styling.apply(&seq);
                     self.partial.extend_from_slice(&seq);
                     out.partial_changed = true;
                 }
@@ -318,6 +320,9 @@ impl TranscriptStream {
     fn overwrite_at_col(&mut self) {
         if self.col < visible_width(&self.partial) {
             self.truncate_to_col();
+        }
+        if self.partial.is_empty() {
+            self.partial = self.styling.prefix();
         }
     }
 
@@ -373,7 +378,7 @@ pub(crate) fn clip_to_width(row: &[u8], cols: usize) -> Row {
 /// Effective SGR attributes, bounded by attribute families rather than the
 /// number of color changes in a tool's output. Covers the crossterm SGR
 /// vocabulary consumed by this scanner, including indexed and RGB colors.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct SgrState(std::collections::BTreeMap<u16, Vec<u16>>);
 
 impl SgrState {
@@ -579,6 +584,52 @@ mod tests {
             "⚙  read_file: x".chars().count() + 1 - 1
         );
         assert_eq!(visible_width(b"\x1b[1mab\x1b[0m"), 2);
+    }
+
+    #[test]
+    fn stream_style_survives_paragraphs_chunk_boundaries_and_physical_wraps() {
+        let mut stream = TranscriptStream::new();
+        let style = "\x1b[2;3;38;2;70;80;90m";
+        let lines = feed_all(
+            &mut stream,
+            &[b"\x1b[2;3;38;2;70;80", b";90mone\n\ntw", b"o\r\nthree"],
+        );
+        assert_eq!(
+            lines,
+            [format!("{style}one"), String::new(), format!("{style}two")]
+        );
+        assert_eq!(stream.partial(), format!("{style}three").as_bytes());
+        assert_eq!(
+            wrap_row(stream.partial(), 3),
+            [
+                format!("{style}thr").into_bytes(),
+                format!("{style}ee").into_bytes()
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_style_respects_selective_and_full_resets_between_lines() {
+        let mut stream = TranscriptStream::new();
+        let lines = feed_all(
+            &mut stream,
+            &[b"\x1b[2;3;38;5;8ma\n\x1b[22;39mb\nc\n\x1b[0m"],
+        );
+        assert_eq!(lines[2], "\x1b[3mc");
+        let answer = feed_all(&mut stream, &[b"\x1b[38;5;7manswer\x1b[0m\nplain\n"]);
+        assert!(answer[0].ends_with("\x1b[0m\x1b[38;5;7manswer\x1b[0m"));
+        assert_eq!(answer[1], "plain");
+        assert!(stream.partial().is_empty());
+    }
+
+    #[test]
+    fn stream_style_survives_carriage_return_and_erased_status_rows() {
+        let mut stream = TranscriptStream::new();
+        let lines = feed_all(
+            &mut stream,
+            &[b"\x1b[38;5;8mold\r\x1b[2Knew\nnext\r\x1b[Kreplacement\n"],
+        );
+        assert_eq!(lines, ["\x1b[38;5;8mnew", "\x1b[38;5;8mreplacement"]);
     }
 
     /// Allowlisted DEC private modes (the mouse family) are for the real

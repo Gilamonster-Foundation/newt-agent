@@ -5,6 +5,97 @@ use crate::cockpit::test_tty::{
 
 const CTRL_C: &[u8] = &[0x03];
 
+/// Grounds the mounted editor's submission and escape-ladder key tests in a
+/// real tty: crossterm may already hold input after a terminal query or poll,
+/// leaving the kernel fd empty. Both Enter and Ctrl-C must work without a
+/// subsequent key, while another stdin owner must still keep those events.
+#[test]
+fn buffered_paste_enter_and_interrupt_do_not_need_another_key() {
+    crate::interaction_view_pty_test::drive_cockpit_buffered_input();
+}
+
+pub(crate) fn cockpit_buffered_input_case() {
+    let result = std::panic::catch_unwind(buffered_input_case);
+    if let Err(error) = result {
+        // The owned tty/capture have now restored stdout. Keep the actual
+        // failing assertion visible to the parent disposable-process harness.
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-text panic");
+        println!("BUFFERED_INPUT_FAILURE:{message}");
+        std::panic::resume_unwind(error);
+    }
+}
+
+fn buffered_input_case() {
+    let tty = TestTty::install();
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    let prefetch = |bytes: &[u8]| {
+        let _stdin = newt_core::tty::try_watch_stdin().expect("prefetch owns stdin");
+        tty.type_bytes(bytes);
+        assert!(event::poll(Duration::from_secs(1)).unwrap());
+        let mut fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: fd 0 is the test's owned tty. This observes readiness only.
+        assert_eq!(
+            unsafe { libc::poll(&mut fd, 1, 0) },
+            0,
+            "input must already be buffered by crossterm"
+        );
+    };
+
+    let (reply, received) = std::sync::mpsc::sync_channel(1);
+    cockpit
+        .handle_request(SurfaceRequest::ReadLine {
+            prompt: "buffered input".into(),
+            reply,
+        })
+        .unwrap();
+    prefetch(b"\x1b[200~atomic paste\x1b[201~\r");
+    cockpit.poll_keys().unwrap();
+    assert!(
+        matches!(received.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line == "atomic paste"),
+        "buffered paste and Enter must submit without another terminal byte"
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    cockpit
+        .handle_request(SurfaceRequest::TurnStarted {
+            cancel: Arc::clone(&cancel),
+        })
+        .unwrap();
+    prefetch(CTRL_C);
+    {
+        let _other_reader = newt_core::tty::try_watch_stdin().expect("another reader owns stdin");
+        cockpit.poll_keys().unwrap();
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "the cockpit must respect stdin ownership"
+        );
+    }
+    cockpit.poll_keys().unwrap();
+    assert!(
+        cancel.load(Ordering::SeqCst),
+        "buffered Ctrl-C must interrupt without another terminal byte"
+    );
+
+    // An invalid tty must fail before crossterm can enter its EOF read loop.
+    // Restore the owned fd before checking the result or dropping the cockpit.
+    let saved = unsafe { libc::dup(libc::STDIN_FILENO) };
+    assert!(saved >= 0);
+    assert_eq!(unsafe { libc::close(libc::STDIN_FILENO) }, 0);
+    let closed = cockpit.poll_keys();
+    assert_eq!(unsafe { libc::dup2(saved, libc::STDIN_FILENO) }, 0);
+    unsafe { libc::close(saved) };
+    assert!(matches!(closed, Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
+}
+
 /// Grounds surface forwarding in a real foreground terminal: the external
 /// command reads operator input, receives its own interrupt/EOF, and gives
 /// the keyboard and exact terminal mode back to the mounted editor.
@@ -104,6 +195,7 @@ pub(crate) fn panel_resize_case() {
 /// terminal handed back exactly as it was found.
 /// Grounds the modal reservation and interaction-renderer buffer tests in
 /// real terminal output, including the frame visible before an answer.
+/// Also grounds transcript style carry through the real captured stdout PTY.
 ///
 /// #1959: also serialized on `prompt_stdin` — this test constructs a real
 /// `PromptWindow` via `Terminal::suspend_for_prompt`, which bumps the same
@@ -148,6 +240,85 @@ pub(crate) fn cockpit_acceptance_case() {
         // ---- the terminal is genuinely taken ----
         assert!(!is_canonical(0), "the cockpit runs the terminal raw");
         assert!(!echoes(0), "and the kernel is not echoing over the editor");
+
+        use crossterm::style::{Attribute, Color};
+        use newt_core::tty::theme::{self, Role, Theme};
+        let mut custom = Theme::builtin().overlaid(
+            "test",
+            &[
+                (
+                    Role::Thinking,
+                    Color::Rgb {
+                        r: 12,
+                        g: 34,
+                        b: 56,
+                    },
+                ),
+                (
+                    Role::AgentText,
+                    Color::Rgb {
+                        r: 78,
+                        g: 90,
+                        b: 123,
+                    },
+                ),
+            ],
+        );
+        let mut thinking = custom.style(Role::Thinking);
+        thinking.attributes.set(Attribute::Italic);
+        custom.set_style(Role::Thinking, thinking);
+        let first_style = custom.ansi(Role::Thinking);
+        let answer_style = custom.ansi(Role::AgentText);
+        theme::set_active(custom);
+        let before_transcript = tty.painted().len();
+        newt_core::tty::Notice::new(
+            newt_core::tty::Level::Thinking,
+            "",
+            "THOUGHT_FIRST\n\nTHOUGHT_SECOND\nThought for 5s",
+        )
+        .emit(
+            newt_core::tty::LineCaps::Own,
+            newt_core::tty::Sink::Stdout,
+            true,
+        );
+        writeln!(
+            io::stdout(),
+            "{}",
+            newt_core::agentic::render_markdown(
+                "FINAL_RESPONSE",
+                newt_core::agentic::RenderOpts {
+                    color: true,
+                    cols: 80
+                },
+            )
+        )
+        .unwrap();
+        io::stdout().flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            cockpit.drain_pty().expect("drain styled transcript");
+            if tty.wait_for_painted_after(
+                before_transcript,
+                "FINAL_RESPONSE\x1b[0m",
+                Duration::from_millis(5),
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "styled transcript was not painted"
+            );
+        }
+        let painted = tty.painted();
+        let transcript = &painted[before_transcript..];
+        assert!(transcript.contains(&format!("{first_style}THOUGHT_FIRST\x1b[0m")));
+        for thought in ["THOUGHT_SECOND", "Thought for 5s"] {
+            assert!(
+                transcript.contains(&format!("\x1b[3;38;2;12;34;56m{thought}\x1b[0m")),
+                "thought style lost for {thought}: {transcript:?}"
+            );
+        }
+        assert!(transcript.contains(&format!("{answer_style}FINAL_RESPONSE\x1b[0m")));
 
         // ---- Ctrl-C: every press trips the cancel and is counted ----
         let cancel = Arc::new(AtomicBool::new(false));

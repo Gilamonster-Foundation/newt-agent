@@ -66,10 +66,7 @@ pub enum Role {
     Removed,
     RemovedBackground,
 
-    /// Work in progress: the activity row, and the thinking block that will
-    /// join it. Its own role rather than `Dim` because "the machine is busy"
-    /// is a different claim from "this is subordinate", and a theme will want
-    /// to say so.
+    /// Model reasoning and its closing label, independent of the final reply.
     Thinking,
 
     /// The slab a `!` or `:` command is rendered on.
@@ -210,14 +207,7 @@ impl Theme {
                 g: 29,
                 b: 32,
             },
-            // The activity row's existing accent, likewise by name. NOT
-            // `NEWT_ORANGE_CT` — that is the darker brand orange for small
-            // identity marks, and `tty::mod` documents the two as deliberately
-            // distinct. Naming the wrong one recolours the row by 35 points of
-            // green, which is precisely what
-            // `the_builtin_theme_preserves_every_colour_in_use` exists to
-            // catch, and did.
-            thinking: ACTIVE_INPUT_CT,
+            thinking: Color::DarkGrey,
             command_background: Color::Rgb {
                 r: 82,
                 g: 82,
@@ -655,7 +645,7 @@ fn overlay_env(base: Theme, raw: Option<&str>) -> (Theme, Vec<String>) {
             Err(why) => complaints.push(format!("{}: {why}", name.trim())),
         }
     }
-    (Theme::builtin().overlaid("custom", &overrides), complaints)
+    (base.overlaid("custom", &overrides), complaints)
 }
 
 /// Snapshot of the current theme. Seeded from the built-in table plus
@@ -723,6 +713,43 @@ pub mod preferences;
 mod tests {
     use super::*;
     use crate::tty::NEWT_ORANGE_CT;
+
+    #[test]
+    fn env_overrides_preserve_other_saved_styles() {
+        use crossterm::style::Attribute;
+        let mut saved = Theme::builtin().overlaid(
+            "saved",
+            &[
+                (
+                    Role::Thinking,
+                    Color::Rgb {
+                        r: 12,
+                        g: 34,
+                        b: 56,
+                    },
+                ),
+                (
+                    Role::AgentText,
+                    Color::Rgb {
+                        r: 78,
+                        g: 90,
+                        b: 123,
+                    },
+                ),
+            ],
+        );
+        let mut thinking = saved.style(Role::Thinking);
+        thinking.attributes.set(Attribute::Italic);
+        saved.set_style(Role::Thinking, thinking);
+        let (overlaid, warnings) = overlay_env(saved.clone(), Some("accent=cyan"));
+        assert!(warnings.is_empty());
+        assert_eq!(overlaid.color(Role::Accent), Color::DarkCyan);
+        assert_eq!(overlaid.style(Role::Thinking), saved.style(Role::Thinking));
+        assert_eq!(
+            overlaid.style(Role::AgentText),
+            saved.style(Role::AgentText)
+        );
+    }
 
     /// **A persisted preference never leaks into the default snapshot.** The
     /// markdown/stream goldens pin built-in SGR bytes through `active()`; if
@@ -822,7 +849,7 @@ mod tests {
             "the accent IS the active-input colour; two sources would drift"
         );
         assert_ne!(
-            t.color(Role::Thinking),
+            t.color(Role::Accent),
             NEWT_ORANGE_CT,
             "the activity row is the ACTIVE-INPUT accent, not the darker brand \
              orange; `tty::mod` documents the two as deliberately distinct"
@@ -863,18 +890,11 @@ mod tests {
         assert_eq!(t.color(Role::Identity), Color::DarkMagenta);
     }
 
-    /// `Thinking` keeps the activity row's existing colour, so naming the
-    /// role changed nothing on screen.
+    /// Reasoning and activity remain visibly distinct in the default theme.
     #[test]
-    fn thinking_keeps_the_activity_rows_colour() {
-        assert_eq!(
-            Theme::builtin().color(Role::Thinking),
-            Color::Rgb {
-                r: 255,
-                g: 165,
-                b: 90
-            }
-        );
+    fn thinking_and_activity_keep_separate_default_colors() {
+        assert_eq!(Theme::builtin().color(Role::Thinking), Color::DarkGrey);
+        assert_eq!(Theme::builtin().color(Role::Accent), ACTIVE_INPUT_CT);
     }
 
     /// **Every role is reachable by name, both ways.** A role the file cannot

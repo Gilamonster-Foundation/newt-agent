@@ -11,22 +11,32 @@ write that file plus one `backends/*.toml` drop-in per endpoint.
 
 ## Settings and communication style
 
-Open `/settings` → **Themes** to select **newt**, **daylight**, **phosphor**, or
-one of your saved themes. Up/Down chooses a field; Left/Right changes it.
+`/settings` is the primary entry point for harness controls: Session,
+Permissions, Audit, Backends, and Themes. Commands such as `/model`,
+`/backends`, and `/permissions` remain available as direct shortcuts.
+
+Open `/settings` → **Themes** (or press `t` at the settings index) to select
+**newt**, **daylight**, **phosphor**, or one of your saved themes.
+Up/Down chooses a field; Left/Right changes it.
 Choose a role to edit its color, bold, dim, italic, underline, reverse, or
 strikethrough. The color field also accepts `#rrggbb` or an ANSI index `0–255`.
-The fixed preview shows headings, file names, human and agent text, and spill
-output while you edit. Enter applies and remembers the theme; Esc discards the
-draft. To keep a named copy, type a Save name and press Ctrl-S, then Enter to
-apply. Built-in names are protected; saved custom names can be updated.
+The fixed preview shows headings, file names, human text, thinking, agent
+replies, and spill output while you edit. Enter accepts a typed color; Enter
+again applies and remembers the theme. Esc discards the unapplied draft and
+returns to the settings index; Esc there returns to chat. To keep a named copy,
+type a Save name and press Ctrl-S, then Enter to apply. Built-in names are
+protected; saved custom names can be updated.
 
 Themes live under `~/.newt/themes/`; `active.toml` stores the last applied
 selection. Changes affect subsequent output immediately; committed terminal
 scrollback retains the colors it had when printed. `NEWT_THEME` color overrides
 still apply at startup. The default uses light-blue headings, bright-white
 inline code/file names, cyan human prompts, gray agent replies, and dim-gray
-spill text. These are editable semantic roles, including `human-text`,
-`agent-text`, `markdown-heading`, `inline-code`, and `spill`.
+thinking and spill text. Edit `thinking` independently from `agent-text` to
+distinguish reasoning from replies. The thinking style covers streamed and
+folded reasoning and its closing label; the `accent` role colors the background
+activity indicator. Other editable roles include `human-text`,
+`markdown-heading`, `inline-code`, and `spill`.
 
 The rich TUI offers `/settings`, `/backends`, `/model` (also `/models`), and `/psyche` controls.
 The model picker supports arrow-key selection. Only resident models show a
@@ -127,3 +137,5 @@ free, friendly, local agentic coder.
 ## License
 
 Apache-2.0
+
+Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 11:13 EDT | Date: 2026-09-16

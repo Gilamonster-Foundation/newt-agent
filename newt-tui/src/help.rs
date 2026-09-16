@@ -23,6 +23,30 @@ pub(super) fn canonical_help_topic(cmd: &str) -> &str {
 /// a one-screen reference (the man-page-style browser is gilamonster's job).
 pub(super) fn command_help_page(cmd: &str) -> Option<&'static str> {
     let page = match canonical_help_topic(cmd) {
+        "settings" => {
+            "\
+/settings [field value] — the main entry point for session controls
+
+On a rich terminal, /settings opens an index:
+  Session      model, editor, reasoning, effort dials, prompt, and rounds
+  Permissions  permission posture and prompted-decision audit
+  Audit        settings receipts and verification
+  Backends     choose, edit, add, or remove a backend
+  Themes       presets, per-role colors and attributes, live preview, and save
+
+Use arrows then Enter, or a section's letter (t for Themes); / filters the
+index. Esc clears the filter, then leaves the index for chat.
+In Themes, Enter accepts a typed color; Enter again applies and persists the
+draft. Applying or cancelling with Esc returns to Settings. Ctrl-S saves a
+named copy; Enter applies it. Backends opens its
+separate chooser, which returns to chat when closed.
+
+The text form works everywhere; bare /settings uses it outside a rich terminal:
+  /settings thinking fold
+  /settings rounds 40
+
+/model, /backends, and /permissions remain direct shortcuts."
+        }
         "models" => {
             "\
 /models · /models capabilities — inspect the active endpoint's models
@@ -690,12 +714,12 @@ pub fn render_help(topic: Option<&str>, color: bool, verbose: bool) -> String {
 
 pub(crate) fn help_lines() -> &'static [&'static str] {
     &[
+        "  /settings [field value]  - main settings index: Session · Permissions · Audit · Backends · Themes; text setters also work",
         "  /models                  - list the models the active backend serves, marking the active one",
         "  /models capabilities     - the same list as a matrix: tool use, thinking, context window, tuning",
         "  /model [name]            - pick a model, or switch by name (sticks across runs)",
         "  /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name",
         "  /backend                 - alias of /backends",
-        "  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",

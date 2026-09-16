@@ -157,6 +157,9 @@ fn interaction_view_child() {
         "cockpit_bang" => {
             crate::cockpit::presenter::cockpit_bang_case();
         }
+        "cockpit_buffered_input" => {
+            crate::cockpit::presenter::cockpit_buffered_input_case();
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -313,7 +316,7 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
         .stdin(pty.slave_stdio())
         .stdout(pty.slave_stdio())
         .stderr(std::process::Stdio::null());
-    if mode == "cockpit_bang" {
+    if matches!(mode, "cockpit_bang" | "cockpit_buffered_input") {
         child.env("NEWT_EDIT_MODE", "emacs");
     }
     child.spawn().expect("spawn the pty child")
@@ -328,6 +331,10 @@ pub(crate) fn drive_cockpit_resize() {
 
 pub(crate) fn drive_cockpit_acceptance() {
     drive_cockpit_case("cockpit_acceptance");
+}
+
+pub(crate) fn drive_cockpit_buffered_input() {
+    drive_cockpit_case("cockpit_buffered_input");
 }
 
 pub(crate) fn drive_cockpit_bang() {

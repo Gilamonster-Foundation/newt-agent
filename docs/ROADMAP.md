@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (4 steps)
+# Phase 10 — newt-cli polish (5 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -727,6 +727,23 @@ prompt seams. Real-resource checks ground persistence and HTTP behavior.
 **Out of scope:** new permission storage, wildcard approval of private hosts,
 changed DNS/TLS/redirect/metadata checks, OAuth registration repair, separate
 authentication-host prompts, and blanket approval of runtime tool calls.
+
+## Step 10.5 — Settings-led themes and responsive cockpit input
+
+**Branch:** `step-10.5-settings-thinking-input`
+**Touches:** the existing settings help, theme editor and preference overlay,
+reasoning notices, and cockpit transcript/input paths.
+**Implements:** make `/settings` the documented primary entry point for Session,
+Permissions, Audit, Backends, and Themes, retaining direct commands as shortcuts.
+Preview and apply independent thinking and response styles. Carry reasoning
+styles across paragraphs and closing labels; preserve unrelated saved styles
+under environment overrides. Drain already-parsed input events even when stdin
+has no new bytes, preserving exclusive input ownership and bounded polling.
+**Tests:** theme preview buffers, independent role styles, saved-theme overlay,
+ANSI paragraph/reset cases, and command-help coverage. Real PTY tests ground
+themed reasoning/reply output and buffered paste, Enter, interrupt, and closure.
+**Out of scope:** terminal font/cursor controls, additional settings categories,
+backend discovery redesign, and external multiplexer transport changes.
 
 ---
 
@@ -1998,3 +2015,5 @@ phase when it's ready to schedule.
   GitHub Project board (TBD when remote exists).
 
 Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15
+
+Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 11:30 EDT | Date: 2026-09-16

@@ -1,11 +1,11 @@
 === newt help (top) ===
 >  Available commands:
+  /settings [field value]  - main settings index: Session · Permissions · Audit · Backends · Themes; text setters also work
   /models                  - list the models the active backend serves, marking the active one
   /models capabilities     - the same list as a matrix: tool use, thinking, context window, tuning
   /model [name]            - pick a model, or switch by name (sticks across runs)
   /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name
   /backend                 - alias of /backends
-  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)
   /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)
   /probe window [model]    - empirical input-boundary search (records max input at High confidence)
   /probe reset             - wipe all learned probe values (conformance, windows, calibration)
