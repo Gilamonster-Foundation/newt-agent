@@ -662,6 +662,117 @@ output_allowance = 12000
     }
 }
 
+/// #2313: `newt solve --run-allowance 0` configures an already-exhausted
+/// budget, so the first (and only) dispatch attempt is refused before any
+/// wire bytes are sent — the model never sees a request.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_with_an_exhausted_run_allowance_refuses_dispatch_before_any_request() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    let events_path = fixture.path().join("events.jsonl");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .args(["--backend-endpoint", &server.uri()])
+        .args(["--backend-model", NEMOTRON_MODEL])
+        .args(["--backend-kind", "openai"])
+        .args(["solve", "--cwd"])
+        .arg(fixture.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--run-allowance", "0"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("run allowance is exhausted"));
+
+    assert!(
+        requests.lock().expect("request capture lock").is_empty(),
+        "an exhausted run allowance must not reach the model"
+    );
+}
+
+/// #2313: a configured, non-exhausted run allowance is reported in the
+/// contract's effective_config, mirroring output_allowance's own reporting —
+/// and a run with NO run allowance configured is completely unaffected: no
+/// key in effective_config, and the request still reaches the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_run_allowance_is_reported_when_set_and_absent_when_not() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+
+    for (name, extra, expect_key) in [
+        (
+            "configured",
+            vec!["--run-allowance".to_string(), "5".to_string()],
+            true,
+        ),
+        ("unconfigured", vec![], false),
+    ] {
+        let events_path = fixture.path().join(format!("events-{name}.jsonl"));
+        Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", NEMOTRON_MODEL])
+            .args(["--backend-kind", "openai"])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(["--max-rounds", "1"])
+            .args(&extra)
+            .assert()
+            .success();
+
+        assert!(
+            !requests.lock().expect("request capture lock").is_empty(),
+            "{name}: the run reached the model"
+        );
+        requests.lock().expect("request capture lock").clear();
+
+        let effective_config = contract_from(&events_path)["effective_config"].clone();
+        if expect_key {
+            assert_eq!(
+                effective_config["run_allowance"],
+                serde_json::json!(5),
+                "{name}"
+            );
+        } else {
+            assert!(
+                effective_config.get("run_allowance").is_none(),
+                "{name}: no configured allowance must report no key: {effective_config}"
+            );
+        }
+    }
+}
+
 /// #2314: a required feature this run cannot supply stops the solve before any
 /// model request, naming the feature and why. `.failure()` alone would also
 /// pass for an unknown flag, so each refusal asserts its stderr text; the twin

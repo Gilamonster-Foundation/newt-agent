@@ -64,6 +64,11 @@ pub struct ContractInputs<'a> {
     pub smart_harness: Option<&'a serde_json::Value>,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<newt_core::agentic::OutputAllowance>,
+    /// The configured run-level call-count allowance, when one was set
+    /// (#2313). Unlike `output_allowance` there is no server-vs-local
+    /// enforcement distinction to report: a run allowance is always a local,
+    /// pre-dispatch admission check.
+    pub run_allowance: Option<u32>,
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
@@ -430,6 +435,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         .output_allowance
         .map(|a| serde_json::to_value(a).expect("OutputAllowance serializes infallibly"));
     conditional_stanza(&mut effective_config, "output_allowance", output_allowance);
+    conditional_stanza(&mut effective_config, "run_allowance", i.run_allowance);
     conditional_stanza(
         &mut effective_config,
         "smart_harness",
@@ -839,6 +845,7 @@ mod tests {
             gen_tokens: Some(500),
             smart_harness: None,
             output_allowance: None,
+            run_allowance: None,
             features: Some(InstantiatedFeatures {
                 crew: true,
                 ..InstantiatedFeatures::default()

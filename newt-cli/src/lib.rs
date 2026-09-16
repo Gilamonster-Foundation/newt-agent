@@ -856,6 +856,12 @@ pub enum Command {
         /// `[[model_tuning]] output_allowance` for the model (#2312).
         #[arg(long, value_name = "TOKENS")]
         output_allowance: Option<u32>,
+        /// Run-level call-count allowance for this solve; overrides
+        /// `[[model_tuning]] run_allowance` for the model (#2313). Further
+        /// primary inference dispatch is refused once this many calls have
+        /// been made.
+        #[arg(long, value_name = "CALLS")]
+        run_allowance: Option<u32>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy solve keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1759,6 +1765,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             scratchpad_state,
             require_feature,
             output_allowance,
+            run_allowance,
             hermetic,
             resume_from,
         } => {
@@ -1787,6 +1794,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 scratchpad_state,
                 require_feature,
                 output_allowance,
+                run_allowance,
                 launch,
             })
             .await?;

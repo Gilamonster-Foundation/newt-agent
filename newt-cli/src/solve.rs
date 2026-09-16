@@ -103,6 +103,8 @@ pub struct SolveArgs {
     pub require_feature: Vec<solve_contract::Feature>,
     /// `--output-allowance`: explicit output-token allowance (#2312).
     pub output_allowance: Option<u32>,
+    /// `--run-allowance`: explicit run-level call-count allowance (#2313).
+    pub run_allowance: Option<u32>,
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -439,6 +441,12 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         .output_allowance
         .or_else(|| cfg.find_model_tuning(&model)?.output_allowance);
     newt_core::agentic::validate_output_allowance(output_allowance, args.context_window)?;
+    // #2313: the flag, else the model's `[[model_tuning]]` entry -- same
+    // precedence as output_allowance. No context-window validation applies:
+    // a call-count budget has no relationship to the context window.
+    let run_allowance = args
+        .run_allowance
+        .or_else(|| cfg.find_model_tuning(&model)?.run_allowance);
     let tenacity_level = runtime.tenacity.label();
     let cognition = projected_cognition(runtime.cognition, kind, api, chat_capability);
     // `None` means Newt projects no cognition controls. Call that `default`
@@ -480,6 +488,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.output_allowance = output_allowance;
+    dc.run_allowance = run_allowance;
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = decision.reasoning_replay_scope();
@@ -831,6 +840,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 .map(|u| u64::from(u.output_tokens)),
             smart_harness: smart_manifest.as_ref(),
             output_allowance: o_opt.and_then(|o| o.output_allowance),
+            run_allowance,
             features: o_opt.map(|o| o.features),
             // The headless driver always arms action nudges; whether the loop
             // has a gate at all depends on the wire and SmartHarness.
