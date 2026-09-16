@@ -458,11 +458,19 @@ mod mocked {
         assert!(block.contains("alpha: First skill"));
         // The body must NOT leak into the index (progressive disclosure).
         assert!(!block.contains("Body of alpha."));
+        assert!(block.contains("newt skills install <path>"));
     }
 
+    /// #2331: field evidence showed a model asked to install a skill it had
+    /// never seen promised to "investigate" instead of running a real
+    /// command — it had never been told one exists. With zero skills
+    /// installed the block is no longer `None`; it still carries the install
+    /// path, which is the one thing the model needs to acquire the first one.
     #[test]
-    fn index_block_empty_when_no_skills() {
-        assert!(index_block(&[]).is_none());
+    fn index_block_carries_the_install_hint_with_zero_skills_installed() {
+        let block = index_block(&[]).expect("install hint must survive an empty catalog");
+        assert!(block.contains("newt skills install <path>"));
+        assert!(!block.contains("Available skills"));
     }
 }
 

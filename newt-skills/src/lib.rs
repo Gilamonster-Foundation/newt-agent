@@ -567,13 +567,23 @@ fn discover_paths_in(fs: &dyn SkillFs, dirs: &[PathBuf]) -> (Vec<Skill>, Vec<Ski
 // Body loading
 // ---------------------------------------------------------------------------
 
-/// Build the progressive-disclosure index block for the system prompt, or
-/// `None` when no skills are installed. ONLY names + descriptions (+ when_to_use)
-/// — never bodies.
+/// The documented, deterministic way to acquire a skill that is not on the
+/// index (#2331: "the model should not guess package-manager commands"). A
+/// trailing line on the block always, even with zero skills installed —
+/// field evidence showed a model that had *never* installed a skill also
+/// never learned this command exists, and defaulted to promising to
+/// investigate instead of running it.
+const INSTALL_HINT: &str = "To install a new skill from a local path, run via run_command: \
+     `newt skills install <path>` (add `--link` to symlink instead of copy).";
+
+/// Build the progressive-disclosure index block for the system prompt. ONLY
+/// names + descriptions (+ when_to_use) for installed skills — never bodies —
+/// plus the install hint, which is always present so the model has a real
+/// acquisition path even before any skill is installed.
 #[must_use]
 pub fn index_block(skills: &[Skill]) -> Option<String> {
     if skills.is_empty() {
-        return None;
+        return Some(format!("{INSTALL_HINT}\n"));
     }
     let mut out = String::from("Available skills (call `use_skill` to load one):\n");
     for s in skills {
@@ -581,6 +591,8 @@ pub fn index_block(skills: &[Skill]) -> Option<String> {
         out.push_str(&s.index_line());
         out.push('\n');
     }
+    out.push_str(INSTALL_HINT);
+    out.push('\n');
     Some(out)
 }
 
