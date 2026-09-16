@@ -1153,6 +1153,7 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
         extra_exec: Vec::new(),
         net: Vec::new(),
         prompt: false,
+        ..Default::default()
     }
     .to_caveats(workspace)
 }
@@ -1887,7 +1888,8 @@ fn full_access_banner() -> String {
      for this run — the Object-Capability attenuations (fs fence, net leash, exec \
      allowlist) are lifted and run_command uses the `host` shell engine (a real \
      /bin/sh inside the platform kernel jail). Writes are still prompted. Drop the \
-     flag to restore Object-Capability authority restrictions."
+     flag to restore Object-Capability authority restrictions. Private HTTP destinations \
+     still require exact MCP net grants in [tui.permissions] net."
         .to_string()
 }
 
@@ -8932,16 +8934,14 @@ fn bang_shell() -> (String, &'static str) {
 ///
 /// Interruptibility (unix, TTY): the child runs as its **own foreground process
 /// group** — like a shell foreground job. `setpgid` in the child (via
-/// `pre_exec`) and `tcsetpgrp` in the parent hand the terminal to the child, so
+/// `pre_exec`) and `tcsetpgrp` before exec hand the terminal to the child, so
 /// a terminal `Ctrl-C` is delivered to the *child's* group, not newt's. The
 /// child dies; newt reclaims the terminal and returns to the prompt instead of
 /// being killed alongside a hung command (e.g. `! pa login` waiting on a SAML
-/// browser round-trip that never completes). `SIGTTOU`/`SIGTTIN` are ignored
-/// across the swap so the `tcsetpgrp` calls don't stop newt.
+/// browser round-trip that never completes). `SIGTTOU` is ignored only during
+/// each foreground transfer so the `tcsetpgrp` calls cannot stop the caller.
 fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
-    let (shell, flag) = bang_shell();
-    let mut command = std::process::Command::new(&shell);
-    command.arg(flag).arg(cmd);
+    let (command, shell) = bang_shell_command(cmd);
 
     #[cfg(unix)]
     {
@@ -8949,6 +8949,7 @@ fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
     }
     #[cfg(not(unix))]
     {
+        let mut command = command;
         match command.status() {
             Ok(status) if status.success() => {}
             Ok(status) => print_newt(
@@ -8961,11 +8962,17 @@ fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
     }
 }
 
+fn bang_shell_command(cmd: &str) -> (std::process::Command, String) {
+    let (shell, flag) = bang_shell();
+    let mut command = std::process::Command::new(&shell);
+    command.arg(flag).arg(cmd);
+    (command, shell)
+}
+
 /// Unix launch for `run_bang_escape`: put the child in its own process group and
 /// give it the controlling terminal so `Ctrl-C` interrupts the *command* and
 /// returns to the newt prompt, rather than felling newt itself. Falls back to a
-/// plain inherited-stdio `wait` when stdin is not a TTY (piped / non-interactive)
-/// or the job-control setup fails.
+/// plain inherited-stdio `wait` when stdin has no controlling terminal.
 #[cfg(unix)]
 fn run_bang_escape_unix(
     mut command: std::process::Command,
@@ -8976,65 +8983,43 @@ fn run_bang_escape_unix(
     use std::os::unix::process::CommandExt as _;
 
     let tty = libc::STDIN_FILENO;
-    // Only take over the terminal when we actually own it interactively.
-    let interactive = io::stdin().is_terminal();
-
-    if interactive {
-        // Child leads a fresh process group; the parent later foregrounds it.
+    // Capture the actual foreground owner, not an assumption about our group.
+    // A PTY without a controlling session has no job-control handoff to make.
+    let foreground = unsafe { libc::tcgetpgrp(tty) };
+    if foreground >= 0 {
+        // Foreground before exec: otherwise a fast child can read before the
+        // parent transfers ownership and stop itself with SIGTTIN. Only libc
+        // operations (and OS-error construction) run in the post-fork child.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                Ok(())
+                let old = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                let changed = libc::tcsetpgrp(tty, libc::getpgrp());
+                let error = (changed != 0).then(io::Error::last_os_error);
+                libc::signal(libc::SIGTTOU, old);
+                error.map_or(Ok(()), Err)
             });
         }
     }
-
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose);
-            return;
-        }
+    let status = {
+        let _foreground = RestoreOnDrop {
+            restore: || {
+                if foreground >= 0 {
+                    // The parent is background while the child owns the tty.
+                    // Ignore SIGTTOU only for the reclaim, restoring its exact
+                    // prior disposition even on a failed spawn or wait.
+                    unsafe {
+                        let old = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                        libc::tcsetpgrp(tty, foreground);
+                        libc::signal(libc::SIGTTOU, old);
+                    }
+                }
+            },
+        };
+        command.status()
     };
-
-    // Hand the terminal to the child's group for the duration of the run.
-    // `tcsetpgrp` from a background write would raise SIGTTOU and stop newt, so
-    // ignore SIGTTOU/SIGTTIN across the swap and restore the handlers after.
-    let mut foregrounded = false;
-    let (old_ttou, old_ttin);
-    if interactive {
-        unsafe {
-            old_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-            old_ttin = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
-        }
-        let child_pgid = child.id() as libc::pid_t;
-        // setpgid also here in the parent to close the fork/exec race window.
-        unsafe {
-            libc::setpgid(child_pgid, child_pgid);
-        }
-        foregrounded = unsafe { libc::tcsetpgrp(tty, child_pgid) == 0 };
-    } else {
-        old_ttou = libc::SIG_DFL;
-        old_ttin = libc::SIG_DFL;
-    }
-
-    let status = child.wait();
-
-    if interactive {
-        // Reclaim the terminal for newt's process group, then restore handlers.
-        if foregrounded {
-            unsafe {
-                let newt_pgid = libc::getpgrp();
-                libc::tcsetpgrp(tty, newt_pgid);
-            }
-        }
-        unsafe {
-            libc::signal(libc::SIGTTOU, old_ttou);
-            libc::signal(libc::SIGTTIN, old_ttin);
-        }
-    }
 
     match status {
         Ok(status) if status.success() => {}
@@ -9046,7 +9031,7 @@ fn run_bang_escape_unix(
             };
             print_newt(&msg, color, verbose);
         }
-        Err(e) => print_newt(&format!("! `{shell}` wait failed: {e}"), color, verbose),
+        Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
     }
 }
 
@@ -9326,3 +9311,5 @@ mod env_resolution_tests;
 mod http_loop_tests;
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15

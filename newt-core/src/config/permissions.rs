@@ -140,6 +140,30 @@ pub struct ToolPermissions {
     /// recorded to `~/.newt/permission-log.jsonl` for later review.
     #[serde(default)]
     pub prompt: bool,
+
+    /// The choice selected by Enter at a terminal MCP hostname prompt.
+    /// Applies only to connection grants, never generic tools or web races.
+    /// This selects a displayed action; it grants nothing without an answer.
+    #[serde(deserialize_with = "deserialize_mcp_net_prompt_default")]
+    pub mcp_net_prompt_default: crate::PermissionAction,
+}
+
+fn deserialize_mcp_net_prompt_default<'de, D>(
+    deserializer: D,
+) -> std::result::Result<crate::PermissionAction, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let action = crate::PermissionAction::deserialize(deserializer)?;
+    if matches!(
+        action,
+        crate::PermissionAction::Back | crate::PermissionAction::Exit
+    ) {
+        return Err(serde::de::Error::custom(
+            "mcp_net_prompt_default must name a permission decision, not back or exit",
+        ));
+    }
+    Ok(action)
 }
 
 impl Default for ToolPermissions {
@@ -149,6 +173,7 @@ impl Default for ToolPermissions {
             extra_exec: Vec::new(),
             net: Vec::new(),
             prompt: false,
+            mcp_net_prompt_default: crate::PermissionAction::AllowOnce,
         }
     }
 }
@@ -300,6 +325,7 @@ impl Config {
                     extra_exec: Vec::new(),
                     net: Vec::new(),
                     prompt: false,
+                    ..Default::default()
                 }
                 .to_caveats(&ws)
             })

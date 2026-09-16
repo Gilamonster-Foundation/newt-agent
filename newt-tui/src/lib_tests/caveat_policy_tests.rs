@@ -37,6 +37,7 @@ fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
             extra_exec: Vec::new(),
             net: Vec::new(),
             prompt: false,
+            ..Default::default()
         },
         ..Default::default()
     }

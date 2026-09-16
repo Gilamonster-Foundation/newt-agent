@@ -82,6 +82,20 @@ impl Pty {
     /// see their output truncated into something their assertions cannot
     /// recognize (a fitted label, a clipped spinner).
     pub fn open() -> Self {
+        Self::open_with_reply(None)
+    }
+
+    /// Answer every cursor-position query, including those issued on resize.
+    ///
+    /// A bare PTY has no terminal emulator to answer DSR. This opt-in responder
+    /// supplies a fixed fixture position; it does not simulate screen geometry.
+    /// Use [`Pty::open`] when deliberately testing the unanswered-query fallback.
+    pub fn open_with_cursor_reply(row: u16, col: u16) -> Self {
+        assert!(row > 0 && col > 0, "cursor replies are one-based");
+        Self::open_with_reply(Some(format!("\x1b[{row};{col}R")))
+    }
+
+    fn open_with_reply(cursor_reply: Option<String>) -> Self {
         unsafe {
             let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
             assert!(master >= 0, "posix_openpt failed");
@@ -140,6 +154,7 @@ impl Pty {
             let reader = std::thread::spawn(move || {
                 let _done = done_tx;
                 let mut buf = [0u8; 8192];
+                let mut pending = Vec::new();
                 loop {
                     // This thread is the sole reader of `master`, which
                     // outlives it — the harness closes the master only in
@@ -151,6 +166,23 @@ impl Pty {
                         // descriptor closes, and only then: every byte written
                         // before that close has already been delivered above.
                         return;
+                    }
+                    if let Some(reply) = &cursor_reply {
+                        // Same split-query scan as the cockpit's TestTty:
+                        // process each request once, retaining only a possible
+                        // prefix across kernel reads. screen() takes must not
+                        // reset it or cause earlier queries to be answered again.
+                        pending.extend_from_slice(&buf[..n as usize]);
+                        while let Some(at) = pending.windows(4).position(|s| s == b"\x1b[6n") {
+                            assert_eq!(
+                                libc::write(master, reply.as_ptr().cast(), reply.len()),
+                                reply.len() as isize,
+                                "writing the cursor-position reply failed"
+                            );
+                            pending.drain(..at + 4);
+                        }
+                        let discard = pending.len().saturating_sub(3);
+                        pending.drain(..discard);
                     }
                     sink.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -648,6 +680,42 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::time::{Duration, Instant};
+
+    /// Grounds the resize fixture's emulator seam: every DSR gets one reply,
+    /// including a query split between reads or following a screen() take.
+    #[test]
+    fn cursor_replies_survive_split_drains_and_screen_takes() {
+        let pty = Pty::open_with_cursor_reply(1, 1);
+        let mut raw = pty.termios_snapshot();
+        raw.local_flags &= !(libc::ICANON | libc::ECHO);
+        pty.set_termios_snapshot(&raw);
+        for (output, expected) in [
+            ("first \x1b[", ""),
+            ("6n", "\x1b[1;1R"),
+            ("again \x1b[6n\x1b[6n", "\x1b[1;1R\x1b[1;1R"),
+        ] {
+            assert_eq!(
+                unsafe { libc::write(pty.slave, output.as_ptr().cast(), output.len()) },
+                output.len() as isize
+            );
+            assert!(pty.wait_for_screen(output, Duration::from_secs(2)));
+            assert_eq!(pty.screen(), output, "replying must preserve capture");
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                let mut poll = libc::pollfd {
+                    fd: pty.slave,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1);
+                let mut bytes = [0u8; 64];
+                let read = unsafe { libc::read(pty.slave, bytes.as_mut_ptr().cast(), bytes.len()) };
+                assert!(read > 0);
+                received.extend_from_slice(&bytes[..read as usize]);
+            }
+            assert_eq!(received, expected.as_bytes());
+        }
+    }
 
     /// Grounds the CLI's post-answer synchronization in real PTY drains:
     /// peeking must retain markers that arrive together, not discard readiness.

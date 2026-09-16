@@ -160,10 +160,9 @@ except (ValueError, KeyError, TypeError):
     edited_test=$(cd "$throw" && git diff "$base..$final" -- src/lib.rs | grep -qE '^[-+].*assert' && echo yes || echo no)
     # The canonical grade, the same call single mode makes: the #887 guard,
     # then the hidden spec in a copy of the tree (newt-eval/src/grade.rs).
-    visible_flag=()
-    [ "$visible_before" = yes ] && visible_flag=(--spec-visible-before)
-    out="$("$NEWT_EVAL" grade --json --case "$TASK" --workspace "$throw" \
-            --spec-cid-before "$cid_before" "${visible_flag[@]}" 2>/dev/null)"
+    grade_args=(--json --case "$TASK" --workspace "$throw" --spec-cid-before "$cid_before")
+    [ "$visible_before" = yes ] && grade_args+=(--spec-visible-before)
+    out="$("$NEWT_EVAL" grade "${grade_args[@]}" 2>/dev/null)"
     IFS=$'\t' read -r behavioral details < <(row_from_scorecard "$TASK" <<<"$out")
     emit "$behavioral" "$details leaves=$leaves touched_src_lib=$touched_seam edited_own_test=$edited_test files=[$files] plan_rc=$plan_rc dir=$throw"
     ;;

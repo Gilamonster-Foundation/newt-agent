@@ -26,6 +26,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // without a direct agent-bridle dependency.
 pub use agent_bridle::SandboxKind;
 
+mod net_policy;
+pub use net_policy::{HttpNetGrantRequired, HttpNetworkPolicy};
+
 /// The network-egress posture a connected MCP server actually achieved (#1243
 /// Leg 4). Honest — never over-claimed: `Gated(n)` means outbound traffic is
 /// routed through the loopback egress proxy enforcing an `n`-host allow-list,
@@ -1300,20 +1303,9 @@ fn build_pinned_client(
         .context("building DNS-pinned HTTP client")
 }
 
+#[cfg(test)]
 fn exact_host_is_explicitly_granted(caveats: &Caveats, host: &str) -> bool {
-    host_is_explicitly_granted(&caveats.net, host)
-}
-
-fn host_is_explicitly_granted(scope: &newt_core::caveats::Scope<String>, host: &str) -> bool {
-    match scope {
-        newt_core::caveats::Scope::Only(hosts) => hosts
-            .iter()
-            .filter_map(|granted| canonical_granted_host(granted))
-            .any(|granted| http_host_grant_matches(&granted, host)),
-        // Full network authority is deliberately not an SSRF-sensitive private
-        // host approval. A private destination must still be named exactly.
-        newt_core::caveats::Scope::All => false,
-    }
+    HttpNetworkPolicy::new(&caveats.net).explicitly_grants_host(host)
 }
 
 /// Whether one configured net-grant host and one URL host identify the same
@@ -1340,7 +1332,9 @@ pub fn net_scope_permits_http_host(scope: &newt_core::caveats::Scope<String>, ho
     }
     match scope {
         newt_core::caveats::Scope::All => true,
-        newt_core::caveats::Scope::Only(_) => host_is_explicitly_granted(scope, host),
+        newt_core::caveats::Scope::Only(hosts) => hosts
+            .iter()
+            .any(|granted| http_host_grant_matches(granted, host)),
     }
 }
 
@@ -1491,7 +1485,7 @@ impl HttpTransport {
         admitted: &newt_core::mcp::AdmittedServer<'_>,
         caveats: &Caveats,
     ) -> Result<Self> {
-        Self::connect_with_runtime_bearer(admitted, caveats, None, false)
+        Self::connect_with_runtime_bearer(admitted, caveats, None, false, &[])
     }
 
     fn connect_with_runtime_bearer(
@@ -1499,6 +1493,7 @@ impl HttpTransport {
         caveats: &Caveats,
         runtime_bearer: Option<&str>,
         allow_insecure_authorization: bool,
+        explicit_net_hosts: &[String],
     ) -> Result<Self> {
         Self::connect_with_runtime_bearer_and_resolver(
             admitted,
@@ -1506,6 +1501,7 @@ impl HttpTransport {
             runtime_bearer,
             allow_insecure_authorization,
             &system_resolver,
+            explicit_net_hosts,
         )
     }
 
@@ -1515,6 +1511,7 @@ impl HttpTransport {
         runtime_bearer: Option<&str>,
         allow_insecure_authorization: bool,
         resolver: &impl Fn(&str, u16) -> std::io::Result<Vec<std::net::SocketAddr>>,
+        explicit_net_hosts: &[String],
     ) -> Result<Self> {
         // Admission is a compile-time precondition of a dial (see stdio `spawn`).
         let entry = admitted.entry();
@@ -1608,15 +1605,17 @@ impl HttpTransport {
         // rejects RFC1918 destinations. The pinned path is still origin-closed:
         // no redirects, no environment proxy, and no second DNS lookup.
         if !net_scope_permits_http_host(&caveats.net, &canonical.host) {
-            return Err(anyhow!(
-                "MCP server `{}`: host `{}` is outside the session net allow-list",
-                entry.name,
-                canonical.host
-            ));
+            return Err(HttpNetGrantRequired {
+                host: canonical.host,
+                private: false,
+            }
+            .into());
         }
         let origin = resolve_origin(&parsed_url, resolver)
             .with_context(|| format!("MCP server `{}`: resolving HTTP origin", entry.name))?;
-        let exact_private_approval = exact_host_is_explicitly_granted(caveats, &canonical.host);
+        let exact_private_approval =
+            HttpNetworkPolicy::with_explicit_hosts(&caveats.net, explicit_net_hosts)
+                .explicitly_grants_host(&canonical.host);
         let loopback_origin = host_is_loopback(&canonical.host);
         if loopback_origin
             && origin
@@ -1634,12 +1633,20 @@ impl HttpTransport {
             .addresses
             .iter()
             .any(|address| ip_is_non_global(address.ip()));
-        if has_non_global && !exact_private_approval && !loopback_origin {
+        if origin.addresses.iter().any(|address| {
+            ip_is_non_global(address.ip()) && !ip_is_approvable_private(address.ip())
+        }) {
             return Err(anyhow!(
-                "MCP server `{}`: host `{}` resolved to a private/non-global address without an exact net grant",
-                entry.name,
+                "HTTP host `{}` resolved to a forbidden non-global address; an exact net grant cannot approve it",
                 canonical.host
             ));
+        }
+        if has_non_global && !exact_private_approval && !loopback_origin {
+            return Err(HttpNetGrantRequired {
+                host: canonical.host,
+                private: true,
+            }
+            .into());
         }
 
         let (client, proxy, private_origin_pinned) = if has_non_global {
@@ -2043,7 +2050,7 @@ pub async fn connect_http(
     admitted: &newt_core::mcp::AdmittedServer<'_>,
     caveats: &Caveats,
 ) -> Result<ConnectedServer> {
-    connect_http_with_runtime_bearer(admitted, caveats, None, false).await
+    connect_http_with_runtime_bearer(admitted, caveats, None, false, &[]).await
 }
 
 /// Connect an HTTP MCP server with an OAuth Bearer supplied at runtime rather
@@ -2054,6 +2061,7 @@ pub async fn connect_http_with_runtime_bearer(
     caveats: &Caveats,
     bearer: Option<&str>,
     allow_insecure_authorization: bool,
+    explicit_net_hosts: &[String],
 ) -> Result<ConnectedServer> {
     // step-1.1: admission proven at the gate (see `connect_stdio`).
     let entry = admitted.entry();
@@ -2068,6 +2076,7 @@ pub async fn connect_http_with_runtime_bearer(
         caveats,
         bearer,
         allow_insecure_authorization,
+        explicit_net_hosts,
     )?;
     let net = net_posture(
         caveats,
@@ -2178,6 +2187,7 @@ fn warn_on_insecure_transport(entry: &McpServerEntry) {
 struct ToolsetHttpReconnectState {
     entry: McpServerEntry,
     caveats: Caveats,
+    explicit_net_hosts: Vec<String>,
 }
 
 struct ToolsetServer {
@@ -2188,7 +2198,14 @@ struct ToolsetServer {
 async fn reconnect_toolset_http(state: &ToolsetHttpReconnectState) -> Result<ConnectedServer> {
     let admitted = newt_core::mcp::admit(&state.entry)
         .map_err(|denied| anyhow!("MCP reconnect was no longer admitted: {denied}"))?;
-    connect_http(&admitted, &state.caveats).await
+    connect_http_with_runtime_bearer(
+        &admitted,
+        &state.caveats,
+        None,
+        false,
+        &state.explicit_net_hosts,
+    )
+    .await
 }
 
 /// The session's connected MCP servers — the headless-crate-independent
@@ -2225,6 +2242,7 @@ impl McpToolset {
         // leash — the SAME `Caveats` a `run_command` dispatches under — instead
         // of as an ambient child with the host's full authority.
         caveats: &Caveats,
+        explicit_net_hosts: &[String],
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
@@ -2254,7 +2272,14 @@ impl McpToolset {
                 TransportKind::Stdio => connect_stdio(&admitted, caveats).await,
                 TransportKind::Http => {
                     warn_on_insecure_transport(entry);
-                    connect_http(&admitted, caveats).await
+                    connect_http_with_runtime_bearer(
+                        &admitted,
+                        caveats,
+                        None,
+                        false,
+                        explicit_net_hosts,
+                    )
+                    .await
                 }
                 TransportKind::Sse => {
                     tracing::warn!(
@@ -2281,6 +2306,7 @@ impl McpToolset {
                             ToolsetHttpReconnectState {
                                 entry: entry.clone(),
                                 caveats: caveats.clone(),
+                                explicit_net_hosts: explicit_net_hosts.to_vec(),
                             }
                         }),
                     });

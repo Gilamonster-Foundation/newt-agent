@@ -148,6 +148,15 @@ fn interaction_view_child() {
             drop(spinner);
             println!("OUTCOME:{outcome:?}");
         }
+        "cockpit_resize" => {
+            crate::cockpit::presenter::panel_resize_case();
+        }
+        "cockpit_acceptance" => {
+            crate::cockpit::presenter::cockpit_acceptance_case();
+        }
+        "cockpit_bang" => {
+            crate::cockpit::presenter::cockpit_bang_case();
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -294,15 +303,110 @@ fn visible_lines(screen: &str) -> Vec<String> {
 /// argv, no shell, no attacker- or model-controlled input; the child is the
 /// binary cargo just built, so it cannot be stale or foreign.
 fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
-    std::process::Command::new(std::env::current_exe().expect("the test binary re-invokes itself"))
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("the test binary re-invokes itself"),
+    );
+    child
         .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
         .env("NEWT_INTERACTION_PTY_CHILD", mode)
         .env("TERM", "xterm-256color")
         .stdin(pty.slave_stdio())
         .stdout(pty.slave_stdio())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn the pty child")
+        .stderr(std::process::Stdio::null());
+    if mode == "cockpit_bang" {
+        child.env("NEWT_EDIT_MODE", "emacs");
+    }
+    child.spawn().expect("spawn the pty child")
+}
+
+/// Ground the modal reservation's resize contract in a disposable process.
+/// Reusing this child launcher keeps the extra tty and Crossterm's global
+/// event source out of sibling keyboard tests, without dropping assertions.
+pub(crate) fn drive_cockpit_resize() {
+    drive_cockpit_case("cockpit_resize");
+}
+
+pub(crate) fn drive_cockpit_acceptance() {
+    drive_cockpit_case("cockpit_acceptance");
+}
+
+pub(crate) fn drive_cockpit_bang() {
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    let baseline = pty.termios_snapshot();
+    let mut child = spawn_child(&pty, "cockpit_bang");
+    let mut failure = None;
+    for (step, input) in ["hello child\r", "\x03", "\x04", "after interrupts\r"]
+        .into_iter()
+        .enumerate()
+    {
+        if !pty.wait_for_screen(&format!("BANG_READY_{step}>"), REACH_TIMEOUT) {
+            failure = Some(format!("child {step} never became ready"));
+            break;
+        }
+        if pty.termios_snapshot() != baseline {
+            failure = Some(format!(
+                "child {step} did not receive the inherited cooked terminal"
+            ));
+            break;
+        }
+        pty.type_in(input);
+        if !pty.wait_for_screen_after(&format!("BANG_RETURN_{step}"), "^D exit", REACH_TIMEOUT) {
+            failure = Some(format!("child {step} did not return to the editor"));
+            break;
+        }
+        if !pty.is_raw() {
+            failure = Some(format!("editor {step} did not regain raw input"));
+            break;
+        }
+        pty.type_in(&format!("next-{step}\r"));
+    }
+    let restored = if failure.is_none() && pty.wait_for_screen("BANG_RESTORED", REACH_TIMEOUT) {
+        let restored = pty.termios_snapshot();
+        pty.type_in("\n");
+        Some(restored)
+    } else {
+        failure.get_or_insert_with(|| "the cockpit never restored the terminal".into());
+        None
+    };
+    if failure.is_some() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    let screen = pty.screen_to_eof();
+    assert!(failure.is_none(), "{failure:?}: {screen:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {screen:?}"
+    );
+    assert!(screen.contains("BANG_READ_0:0:hello child"), "{screen:?}");
+    assert!(
+        !screen.contains("BANG_READ_1:"),
+        "Ctrl-C must interrupt the child: {screen:?}"
+    );
+    assert!(
+        screen.contains("BANG_READ_2:1:"),
+        "EOF must reach the child: {screen:?}"
+    );
+    assert!(
+        screen.contains("BANG_READ_3:0:after interrupts"),
+        "{screen:?}"
+    );
+    assert_eq!(
+        restored,
+        Some(baseline),
+        "full inherited terminal mode after cockpit shutdown"
+    );
+}
+
+fn drive_cockpit_case(mode: &str) {
+    let pty = Pty::open();
+    let mut child = spawn_child(&pty, mode);
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    let screen = pty.screen_to_eof();
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{mode} child failed: {status:?}; {screen:?}"
+    );
 }
 
 /// Everything the parent needs to judge one lifecycle.
@@ -639,7 +743,7 @@ fn overflowing(segment: &str, width: usize) -> Vec<String> {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_resize_reflows_the_frame_and_still_restores_the_terminal() {
     const NARROW: usize = 46;
-    let f = drive_present(24, 100, Some((12, NARROW as u16)), "d");
+    let f = drive_present(24, 100, Some((12, NARROW as u16)), "d\r");
     assert!(
         f.raw_during,
         "the pty was never raw — nothing was exercised"
@@ -673,7 +777,7 @@ fn a_resize_reflows_the_frame_and_still_restores_the_terminal() {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_narrow_terminal_wraps_rather_than_overflowing() {
     const COLS: usize = 28;
-    let f = drive_present(20, COLS as u16, None, "d");
+    let f = drive_present(20, COLS as u16, None, "d\r");
     assert!(
         f.raw_during,
         "the pty was never raw — nothing was exercised"
@@ -793,7 +897,7 @@ fn drive_active_turn(key: &str) -> (String, usize, String, bool, bool) {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_frame_opened_mid_turn_is_not_painted_over_by_the_spinner() {
-    let (all, frame_start, tail, raw_during, raw_after) = drive_active_turn("d");
+    let (all, frame_start, tail, raw_during, raw_after) = drive_active_turn("d\r");
 
     assert!(raw_during, "the frame never took raw mode");
     assert!(!raw_after, "the terminal was left RAW");

@@ -66,6 +66,7 @@ async fn headless_planner_never_spawns_an_untrusted_server() {
         std::slice::from_ref(&evil),
         false,
         &Caveats::top(),
+        &[],
     )
     .await;
 

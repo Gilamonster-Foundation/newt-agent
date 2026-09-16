@@ -98,10 +98,18 @@ async fn connect_persona(
                 extra_exec: Vec::new(),
                 net: Vec::new(),
                 prompt: false,
+                ..Default::default()
             }
             .to_caveats(&ws)
         });
-    let toolset = newt_mcp_client::McpToolset::connect(&ws, &cfg.mcp_servers, true, &caveats).await;
+    let explicit_hosts = cfg
+        .tui
+        .as_ref()
+        .map(|t| t.permissions.net.as_slice())
+        .unwrap_or_default();
+    let toolset =
+        newt_mcp_client::McpToolset::connect(&ws, &cfg.mcp_servers, true, &caveats, explicit_hosts)
+            .await;
     tracing::info!(
         persona = name,
         connected_servers = toolset.summary().len(),

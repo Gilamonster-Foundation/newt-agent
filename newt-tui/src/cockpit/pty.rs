@@ -143,6 +143,20 @@ impl PtyCapture {
         &self.tty
     }
 
+    /// Give a foreground child the original terminal, preserving a stderr
+    /// redirection instead of handing it the cockpit's output-capture PTY.
+    pub(crate) fn foreground_stdio(&self, command: &mut std::process::Command) -> io::Result<()> {
+        use std::os::fd::BorrowedFd;
+        command.stdout(self.tty.try_clone()?);
+        if let Some(fd) = self.saved_err {
+            // SAFETY: this capture owns saved_err until after the command has
+            // finished. The child receives its own close-on-exec duplicate.
+            let error = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+            command.stderr(File::from(error));
+        }
+        Ok(())
+    }
+
     /// The pty master, for `poll` + `read`.
     pub(crate) fn master_fd(&self) -> RawFd {
         self.master.as_raw_fd()

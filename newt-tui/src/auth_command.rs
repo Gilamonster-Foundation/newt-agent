@@ -8,6 +8,22 @@
 
 use super::*;
 
+fn oauth_policy_from_config(
+    config: &newt_core::Config,
+    workspace: &std::path::Path,
+) -> mcp_token::OAuthHopPolicy {
+    let permissions = config.tui.as_ref().map(|tui| &tui.permissions);
+    let net = permissions
+        .map(|permissions| permissions.to_caveats(&workspace.to_string_lossy()).net)
+        .unwrap_or_else(newt_core::Scope::none);
+    mcp_token::OAuthHopPolicy::with_explicit_hosts(
+        &net,
+        permissions
+            .map(|permissions| permissions.net.as_slice())
+            .unwrap_or_default(),
+    )
+}
+
 /// Report auth status for every discovered HTTP MCP server, and optionally run
 /// the interactive OAuth 2.1 PKCE browser flow for a named server.
 ///
@@ -21,12 +37,7 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
     let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let resolved = newt_core::Config::resolve()
         .map_err(|error| anyhow::anyhow!("failed to resolve Newt configuration: {error}"))?;
-    let oauth_net_scope = resolved
-        .tui
-        .as_ref()
-        .map(|tui| tui.permissions.to_caveats(&workspace.to_string_lossy()).net)
-        .unwrap_or_else(newt_core::Scope::none);
-    let oauth_policy = mcp_token::OAuthHopPolicy::new(&oauth_net_scope);
+    let oauth_policy = oauth_policy_from_config(&resolved, &workspace);
     let cfg_servers: Vec<newt_core::mcp::McpServerEntry> = resolved.mcp_servers;
     let mcp_toml = newt_core::Config::user_config_dir().map(|d| d.join("mcp.toml"));
     let entries = newt_core::mcp::discover(
@@ -128,5 +139,58 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
                 ))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_policy_reloads_permanent_hosts_in_confined_and_full_access_config() {
+        for (preset, grants) in [
+            ("workspace_dev", r#"["*", "auth.example.test"]"#),
+            ("full_access", r#"["auth.example.test"]"#),
+            ("workspace_dev", r#"["auth.example.test"]"#),
+        ] {
+            let original = format!(
+                "# Network approvals\n[tui.permissions]\npreset = \"{preset}\"\nnet = {grants} # Keep this note\n"
+            );
+            let saved = newt_core::Config::with_net_host(&original, "localhost").unwrap();
+            assert!(saved.contains("# Network approvals"));
+            assert!(saved.contains("# Keep this note"));
+            let config: newt_core::Config = toml::from_str(&saved).unwrap();
+            let policy = oauth_policy_from_config(&config, std::path::Path::new("."));
+            assert!(policy.permits_host("auth.example.test"));
+            assert!(policy.explicitly_grants_host("auth.example.test"));
+            assert!(policy.permits_host("localhost"));
+            assert!(policy.explicitly_grants_host("localhost"));
+            assert!(!policy.explicitly_grants_host("127.0.0.2"));
+            assert!(!policy.explicitly_grants_host("*"));
+            assert_eq!(
+                policy.permits_host("other.example.test"),
+                preset == "full_access" || grants.contains("\"*\"")
+            );
+        }
+    }
+
+    #[test]
+    fn auth_policy_keeps_default_and_confined_capabilities() {
+        let default =
+            oauth_policy_from_config(&newt_core::Config::default(), std::path::Path::new("."));
+        assert!(!default.permits_host("auth.example.test"));
+
+        let config: newt_core::Config = toml::from_str(
+            r#"
+                [tui.permissions]
+                preset = "workspace_dev"
+                net = ["auth.example.test"]
+            "#,
+        )
+        .unwrap();
+        let policy = oauth_policy_from_config(&config, std::path::Path::new("."));
+        assert!(policy.permits_host("auth.example.test"));
+        assert!(policy.explicitly_grants_host("auth.example.test"));
+        assert!(!policy.permits_host("other.example.test"));
     }
 }

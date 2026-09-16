@@ -182,8 +182,8 @@ reap_dir() { # dir
   local real root
   [ -e "$1" ] || return 0
   [ -L "$1" ] && { echo "sweep: refusing to reap symlink '$1'" >&2; return 1; }
-  real="$(realpath -m "$1" 2>/dev/null)" || return 1
-  root="$(realpath -m "$TMP_ROOT" 2>/dev/null)" || return 1
+  real="$(realpath "$1" 2>/dev/null)" || return 1
+  root="$(realpath "$TMP_ROOT" 2>/dev/null)" || return 1
   case "$real" in
     "$root"/*) [ -d "$real" ] && rm -rf "$real";;
     *) echo "sweep: refusing to reap '$1' (outside $TMP_ROOT)" >&2; return 1;;
@@ -245,7 +245,7 @@ self_test() {
   grid_merge "$grid" T2 crew m1 5   # raise, never lower
   grid_merge "$grid" T2 crew m1 3
   t "grid_merge dedups + keeps max trials" \
-    '[ "$(wc -l < "$grid")" = 2 ] && grep -qP "T2\tcrew\tm1\t5" "$grid"'
+    '[ "$(wc -l < "$grid")" -eq 2 ] && grep -qFx "$(printf "T2\tcrew\tm1\t5")" "$grid"'
   t "grid_target reads the recorded authority" '[ "$(grid_target "$grid" T2 crew m1)" = 5 ]'
 
   printf 'RATCHET\tT2\tcrew\tm1\tPASS\tleaves=1\t2026-01-01T00:00:00Z\t100\n' >> "$tsv"
@@ -496,3 +496,5 @@ case "$ACTION" in
     reap_dir "$(cat "$OUT/.tmproot")" && echo "sweep: reaped $(cat "$OUT/.tmproot")";;
   run) run_sweep;;
 esac
+
+# Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:59 EDT | Date: 2026-09-15

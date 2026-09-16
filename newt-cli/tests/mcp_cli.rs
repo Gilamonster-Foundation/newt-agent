@@ -375,8 +375,14 @@ mod composed_private_mcp_uat {
             .expect("grant config")
             .permissions
             .to_caveats(workspace);
-        let toolset =
-            McpToolset::connect(workspace, &runtime_config.mcp_servers, true, &caveats).await;
+        let toolset = McpToolset::connect(
+            workspace,
+            &runtime_config.mcp_servers,
+            true,
+            &caveats,
+            &runtime_config.tui.as_ref().unwrap().permissions.net,
+        )
+        .await;
         assert_eq!(toolset.summary(), vec![("review-source".to_string(), 1)]);
         assert!(
             toolset.tool_defs()[0].get("_meta").is_none(),

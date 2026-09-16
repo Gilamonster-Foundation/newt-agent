@@ -97,6 +97,7 @@ async fn http_json_response_lists_and_calls_tools() {
         &newt_core::caveats::Caveats::top(),
         Some("secret"),
         false,
+        &[],
     )
     .await
     .expect("connect_http should succeed");
@@ -325,6 +326,7 @@ async fn bearer_is_not_forwarded_to_a_redirect_target() {
         &newt_core::caveats::Caveats::top(),
         Some("secret"),
         false,
+        &[],
     )
     .await
     {

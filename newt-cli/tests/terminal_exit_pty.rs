@@ -259,7 +259,14 @@ net = []
     )
     .expect("isolated config");
 
-    let pty = Pty::open();
+    let pty = if resize_editor {
+        // Resize rebuilds the inline viewport and asks for the cursor again.
+        // Supply the terminal half of that protocol while testing input and
+        // draft preservation. This fixture does not assert screen geometry.
+        Pty::open_with_cursor_reply(1, 1)
+    } else {
+        Pty::open()
+    };
     let baseline = seed_baseline(&pty, customized);
     let binary = std::env::var_os("NEWT_TERMINAL_EXIT_TEST_BIN")
         .map(PathBuf::from)
@@ -306,8 +313,8 @@ net = []
     // parent-side slave duplicates so child exit can produce real PTY EOF.
     drop(cmd);
 
-    // Wait for painted input, not a guessed startup delay. The quiet PTY also
-    // exercises the existing bounded cursor-query fallback on rich surfaces.
+    // Wait for painted input, not a guessed startup delay. The non-resize cases
+    // keep a quiet PTY to exercise the bounded cursor-query fallback separately.
     let ready = pty.wait_for_screen(surface.ready_marker(), BUDGET);
     let mut screen = pty.screen();
     let resized = if ready && resize_editor {
@@ -405,6 +412,12 @@ net = []
     });
     assert!(status.success(), "{case}: CLI exited {status}: {screen:?}");
     surface.assert_selected(&screen);
+    if resize_editor {
+        assert!(
+            !screen.contains("terminal did not report the cursor position"),
+            "{case}: the resize fixture must answer cursor queries: {screen:?}"
+        );
+    }
     assert_eq!(
         restored, baseline,
         "{case}: /exit changed inherited termios"

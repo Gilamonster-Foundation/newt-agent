@@ -524,7 +524,7 @@ fn status_options(model: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for var in ["NEWT_LOADOUT", "NEWT_DGX_MODEL"] {
         if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() && !(var == "NEWT_DGX_MODEL" && v == model) {
+            if !(v.is_empty() || var == "NEWT_DGX_MODEL" && v == model) {
                 parts.push(v);
             }
         }
@@ -1554,6 +1554,10 @@ impl InputSurface for RichSurface {
         // The frame is gone by now (the guard erased it on drop); commit the
         // canonical projection so scrollback holds what a piped run would.
         let _ = window.notice(&canonical);
+        let (outcome, notice) = crate::permissions::apply_chat_prompt_policy(outcome);
+        if let Some(notice) = notice {
+            let _ = window.notice(notice);
+        }
         outcome
     }
 

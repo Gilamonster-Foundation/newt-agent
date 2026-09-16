@@ -282,6 +282,7 @@ mod tests {
             extra_exec: Vec::new(),
             net: Vec::new(),
             prompt: false,
+            ..Default::default()
         }
         .to_caveats("/ws")
     }

@@ -131,6 +131,10 @@ pub struct SurfaceInteraction {
     pub disposition: Disposition,
     /// Whether answering should interrupt the operator.
     pub attention: Attention,
+    /// The host-selected option accepted by an explicitly empty terminal answer.
+    /// Only an option offered by the sole choice control can be a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_option: Option<newt_interaction::OptionId>,
 }
 
 impl SurfaceInteraction {
@@ -141,6 +145,36 @@ impl SurfaceInteraction {
             definition,
             disposition: Disposition::Blocking,
             attention: Attention::Requested,
+            default_option: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_default_option(mut self, option: newt_interaction::OptionId) -> Self {
+        self.default_option = Some(option);
+        self
+    }
+
+    #[must_use]
+    pub fn default_choice(&self) -> Option<&newt_interaction::ChoiceOption> {
+        let [control] = self.definition.controls.as_slice() else {
+            return None;
+        };
+        let newt_interaction::ControlKind::Choice { options } = &control.kind else {
+            return None;
+        };
+        let id = self.default_option.as_ref()?;
+        options.iter().find(|option| &option.id == id)
+    }
+
+    /// Resolve a submitted empty answer; EOF and other non-answers never enter here.
+    #[must_use]
+    pub fn answer_or_default<'a>(&'a self, answer: &'a str) -> &'a str {
+        if answer.is_empty() {
+            self.default_choice()
+                .map_or(answer, |option| option.id.as_str())
+        } else {
+            answer
         }
     }
 
@@ -189,6 +223,44 @@ mod c1 {
         assert!(back.wants_attention());
     }
 
+    #[test]
+    fn an_explicit_default_survives_round_trip_and_only_resolves_blank_input() {
+        let interaction = SurfaceInteraction::blocking(crate::interaction_form::confirm(
+            "Connect once?",
+            "",
+            "allow once",
+            "deny",
+        ))
+        .with_default_option(newt_interaction::OptionId::new("yes").unwrap());
+        let encoded = serde_json::to_string(&interaction).unwrap();
+        let back: SurfaceInteraction = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(back.default_choice().unwrap().id.as_str(), "yes");
+        assert_eq!(back.answer_or_default(""), "yes");
+        for answer in ["no", "?", " ", "\t"] {
+            assert_eq!(back.answer_or_default(answer), answer);
+        }
+    }
+
+    #[test]
+    fn a_default_must_name_an_offered_choice() {
+        let interaction = SurfaceInteraction::blocking(crate::interaction_form::confirm(
+            "Connect once?",
+            "",
+            "allow once",
+            "deny",
+        ));
+        assert!(interaction.default_choice().is_none());
+        assert_eq!(interaction.answer_or_default(""), "");
+        let absent =
+            interaction.with_default_option(newt_interaction::OptionId::new("absent").unwrap());
+        assert!(absent.default_choice().is_none());
+        assert_eq!(absent.answer_or_default(""), "");
+        let text = SurfaceInteraction::blocking(definition())
+            .with_default_option(newt_interaction::OptionId::new("answer").unwrap());
+        assert!(text.default_choice().is_none());
+        assert_eq!(text.answer_or_default(""), "");
+    }
+
     /// **The derive that IS the guard is present.**
     ///
     /// The negative — that a `SyncSender` or an `Arc<AtomicBool>` field fails
@@ -225,6 +297,7 @@ mod c1 {
             definition: definition(),
             disposition: Disposition::Blocking,
             attention: Attention::Passive,
+            default_option: None,
         };
         assert!(quiet_block.is_blocking());
         assert!(!quiet_block.wants_attention());
@@ -233,6 +306,7 @@ mod c1 {
             definition: definition(),
             disposition: Disposition::NonBlocking,
             attention: Attention::Requested,
+            default_option: None,
         };
         assert!(!loud_nonblock.is_blocking());
         assert!(loud_nonblock.wants_attention());

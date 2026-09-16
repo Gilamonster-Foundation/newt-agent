@@ -55,6 +55,12 @@ async fn bounded_request<T>(
         .map_err(|_| anyhow::anyhow!("local inference request failed: deadline elapsed"))?
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test synchronization after client consumption, never after a server write.
+    static RESPONSE_BYTES_READ: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
 async fn decode_http_reply(
     mut response: reqwest::Response,
     idle_timeout: Duration,
@@ -67,7 +73,13 @@ async fn decode_http_reply(
     let mut bytes = Vec::new();
     let read_error = loop {
         match tokio::time::timeout(idle_timeout, response.chunk()).await {
-            Ok(Ok(Some(chunk))) => bytes.extend_from_slice(&chunk),
+            Ok(Ok(Some(chunk))) => {
+                bytes.extend_from_slice(&chunk);
+                #[cfg(test)]
+                let _ = RESPONSE_BYTES_READ.try_with(|count| {
+                    count.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                });
+            }
             Ok(Ok(None)) => break None,
             Ok(Err(error)) => break Some(anyhow::Error::from(error)),
             Err(error) => break Some(anyhow::Error::from(error)),
@@ -672,3 +684,7 @@ impl InferenceBackend for LocalVllmBackend {
         with_backoff(&self.retry, || self.try_complete(&req)).await
     }
 }
+
+#[cfg(test)]
+#[path = "local_timing_tests.rs"]
+mod timing_tests;

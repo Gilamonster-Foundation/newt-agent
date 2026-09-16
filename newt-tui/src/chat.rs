@@ -966,6 +966,12 @@ pub(crate) trait InputSurface {
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     fn turn_ended(&mut self) {}
 
+    /// Run an operator's host command while this surface lends it the terminal.
+    fn run_bang_escape(&mut self, command: &str, color: bool, verbose: bool) -> anyhow::Result<()> {
+        crate::run_bang_escape(command, color, verbose);
+        Ok(())
+    }
+
     /// **C1 (#1862): present one semantic interaction and report what the
     /// operator did.**
     ///
@@ -1301,6 +1307,11 @@ fn session_body(
         crate::session_worker::RemoteSurface::new(ask_to_ui.clone())
             .present_interaction(interaction)
     };
+    #[cfg(feature = "rich-tui")]
+    let panel_to_ui = to_ui.clone();
+    #[cfg(feature = "rich-tui")]
+    let open_permission_panel =
+        move |rows| crate::session_worker::RemoteSurface::new(panel_to_ui.clone()).open_panel(rows);
 
     // The session's only route to the terminal.
     let mut surface: Box<dyn InputSurface> =
@@ -1600,18 +1611,14 @@ fn session_body(
     let permission_denials_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-denials.jsonl"));
     // #904: the user config file that `[A]llow permanently` appends a net host to.
-    let permission_config_path = newt_core::Config::user_config_path();
+    let user_permission_config_path = newt_core::Config::user_config_path();
+    let permission_config_path = crate::permissions::durable_permission_config_target(
+        newt_core::Config::pinned_config_path(),
+        std::path::Path::new("./newt.toml").is_file(),
+        user_permission_config_path.clone(),
+    );
     let mut permission_state =
         PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
-    // A4/W6 (opt-in via NEWT_WEB_DECISIONS): route permission decisions to the
-    // attach surface (the web) through the store instead of the TTY — the gate
-    // publishes the decision and polls for the operator's verdict. Off by
-    // default, so the canonical TTY prompt is byte-for-byte unchanged. A durable
-    // conversation store is required (an ephemeral session has nothing to attach
-    // to); `clone` is cheap (shares the connection).
-    if std::env::var("NEWT_WEB_DECISIONS").is_ok() {
-        permission_state.web_store = conversation_store.clone();
-    }
     // B0b-1 (#1842): the fence the gate checks an answer against. Derived
     // the same way the store derives its own, and supplied to the
     // authorizer INDEPENDENTLY of the offer being checked.
@@ -1627,7 +1634,7 @@ fn session_body(
     // generated on first use, so an interactive session always has one).
     // Unsigned/tampered approve entries are dropped loudly at load, fail-closed
     // to the prompt; deny/ask load unsigned (narrowing is fail-safe).
-    if let Some(config_path) = permission_config_path.as_deref() {
+    if let Some(config_path) = user_permission_config_path.as_deref() {
         let root_vk = key_path
             .as_deref()
             .and_then(|p| newt_identity::load_or_generate(p).ok())
@@ -1716,7 +1723,50 @@ fn session_body(
         .as_ref()
         .map(|t| t.mcp_allow_insecure_hosts.clone())
         .unwrap_or_default();
+    let explicit_net_hosts = cfg
+        .tui
+        .as_ref()
+        .map(|t| t.permissions.net.clone())
+        .unwrap_or_default();
+    let startup_cancel = std::sync::atomic::AtomicBool::new(false);
+    let startup_exit = std::sync::atomic::AtomicBool::new(false);
+    permission_state.mcp_net_prompt_default = cfg
+        .tui
+        .as_ref()
+        .map(|tui| tui.permissions.mcp_net_prompt_default);
     let mut mcp = tokio::task::block_in_place(|| {
+        let mut permission_gate = interactive.then(|| PromptPermissionGate {
+            ask_surface: Some(&ask_surface),
+            #[cfg(feature = "rich-tui")]
+            open_panel: terminal_owns_turn.then_some(&open_permission_panel),
+            state: &mut permission_state,
+            base: cap.caveats().clone(),
+            key_path: key_path.clone(),
+            conversation_id: active_conversation_id.clone(),
+            log_path: permission_log_path.clone(),
+            denials_path: permission_denials_path.clone(),
+            config_path: permission_config_path.clone(),
+            preset_clamp: None,
+            delegation: cap.delegation(),
+            danger: production_danger_table(),
+            color,
+            verbose,
+            authorization_prompts_enabled: prompt_permissions_enabled,
+            web_decision_timeout: crate::permissions::WEB_DECISION_TIMEOUT,
+            cancel: Some(&startup_cancel),
+            exit: Some(&startup_exit),
+            ask_human: prompt_permission_choice
+                as fn(
+                    &newt_core::tty::PromptWindow,
+                    &newt_core::interaction_surface::SurfaceInteraction,
+                ) -> PromptChoice,
+        });
+        let mut grant_net = |request: &newt_core::PermissionRequest| {
+            if startup_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            permission_gate.as_mut()?.ask_mcp_net_grant(request)
+        };
         rt.block_on(Mcp::connect(
             workspace,
             &cfg_mcp_servers,
@@ -1725,8 +1775,19 @@ fn session_body(
             // #1243 Leg 3: the full session leash (not just its net axis) so a
             // spawned stdio MCP server is confined to the session's authority.
             cap.caveats(),
+            &explicit_net_hosts,
+            Some((&mut grant_net, &startup_cancel)),
         ))
     });
+    if startup_exit.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    // Startup grants stay on the terminal: a new conversation has no persisted
+    // row to receive web offers yet. A4/W6 applies to subsequent turn decisions
+    // once the conversation can be attached to through the durable store.
+    if std::env::var("NEWT_WEB_DECISIONS").is_ok() {
+        permission_state.web_store = conversation_store.clone();
+    }
     if !mcp.is_empty() {
         let summary = mcp
             .summary()
@@ -2814,7 +2875,13 @@ fn session_body(
                 };
                 if let Some(rest) = human_bang {
                     if bang_escape_enabled {
-                        run_bang_escape(rest, color, verbose);
+                        if let Err(error) = surface.run_bang_escape(rest, color, verbose) {
+                            print_newt(
+                                &format!("! terminal handoff failed: {error}"),
+                                color,
+                                verbose,
+                            );
+                        }
                     } else {
                         print_newt(
                             "! bang-escape is disabled ([tui] allow_bang_escape = false)",
@@ -7327,9 +7394,15 @@ fn session_body(
                     // `authorization_prompts_enabled`. A truly headless session
                     // (non-interactive) still gets `None` and the honest headless
                     // response.
+                    permission_state.mcp_net_prompt_default = cfg
+                        .tui
+                        .as_ref()
+                        .map(|tui| tui.permissions.mcp_net_prompt_default);
                     let mut permission_gate = interactive.then(|| PromptPermissionGate {
                         // C1: ask the UI thread, never this one.
                         ask_surface: Some(&ask_surface),
+                        #[cfg(feature = "rich-tui")]
+                        open_panel: terminal_owns_turn.then_some(&open_permission_panel),
                         state: &mut permission_state,
                         base: turn_caveats.clone(),
                         key_path: key_path.clone(),
@@ -7349,7 +7422,7 @@ fn session_body(
                         ask_human: prompt_permission_choice
                             as fn(
                                 &newt_core::tty::PromptWindow,
-                                &newt_interaction::InteractionDefinition,
+                                &newt_core::interaction_surface::SurfaceInteraction,
                             ) -> PromptChoice,
                     });
                     // Per-round observation hook (Phase 20,
@@ -8528,3 +8601,5 @@ mod incomplete_turn_persistence_tests;
 #[cfg(test)]
 #[path = "chat_tests/memory_retrieval.rs"]
 mod memory_retrieval_tests;
+
+// Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15

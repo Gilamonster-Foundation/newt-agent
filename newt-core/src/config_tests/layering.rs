@@ -113,6 +113,9 @@ nodes = []
 [network]
 owned_suffixes = [".com"]
 
+[tui.permissions]
+mcp_net_prompt_default = "allow_permanent"
+
 [merge]
 arrays = "append"
 "#,
@@ -143,6 +146,10 @@ arrays = "append"
     );
     assert!(cfg.shell.is_none(), "shell engine must be stripped");
     assert!(cfg.dgx.is_none(), "dgx endpoints must be stripped");
+    assert!(
+        cfg.tui.is_none(),
+        "an untrusted project cannot select a durable permission default"
+    );
     assert_eq!(
         cfg.default_backend, None,
         "default_backend selector must be stripped"

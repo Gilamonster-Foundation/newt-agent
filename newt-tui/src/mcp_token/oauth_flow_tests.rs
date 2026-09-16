@@ -61,6 +61,49 @@ fn oauth_hops_consume_the_complete_network_scope() {
 }
 
 #[test]
+fn oauth_hops_retain_durable_exact_host_grants_under_full_access() {
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::Scope::All, &["127.0.0.1".into()]);
+    assert!(validate_discovery_hop_with_policy(
+        "https://127.0.0.1/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .is_ok());
+    assert!(exact_host_is_approved(
+        &reqwest::Url::parse("https://127.0.0.1/token").unwrap(),
+        &policy,
+    ));
+
+    // Approval of one private issuer must not admit a different issuer.
+    assert!(validate_discovery_hop_with_policy(
+        "https://127.0.0.2/token",
+        "token endpoint",
+        false,
+        &policy,
+    )
+    .is_err());
+}
+
+#[test]
+fn oauth_hops_do_not_restore_durable_hosts_removed_from_the_active_scope() {
+    let policy = OAuthHopPolicy::with_explicit_hosts(
+        &newt_core::Scope::only(["mcp.example.test".into()]),
+        &["auth.example.test".into()],
+    );
+    let issuer = reqwest::Url::parse("https://auth.example.test/token").unwrap();
+    assert!(!exact_host_is_approved(&issuer, &policy));
+    let error =
+        validate_discovery_hop_with_policy(issuer.as_str(), "token endpoint", false, &policy)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("outside the session network capability"),
+        "{error}"
+    );
+}
+
+#[test]
 fn saved_dcr_requires_grants_response_type_and_requested_scope() {
     let base = ClientFile {
         client_id: "client".into(),
