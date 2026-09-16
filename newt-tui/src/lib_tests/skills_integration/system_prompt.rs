@@ -23,11 +23,19 @@ fn system_prompt_index_includes_discovered_skill_name_and_description() {
     assert!(!block.contains("Full body of commit-style."));
 }
 
+/// #2331: field evidence showed a model asked to install a skill it had never
+/// installed produced zero tool calls and promised to investigate instead,
+/// because it had never been told a real install command exists. The block is
+/// no longer `None` with zero skills installed — it still carries the install
+/// hint, which is the one thing the model needs to acquire the first one.
 #[serial_test::serial(real_fs)]
 #[test]
-fn system_prompt_index_is_none_when_no_skills() {
+fn system_prompt_index_carries_the_install_hint_when_no_skills() {
     let tmp = tempfile::TempDir::new().unwrap();
-    assert!(skills_index_for_prompt(&[tmp.path().to_path_buf()]).is_none());
+    let block =
+        skills_index_for_prompt(&[tmp.path().to_path_buf()]).expect("install hint survives");
+    assert!(block.contains("newt skills install"));
+    assert!(!block.contains("Available skills"));
 }
 
 #[serial_test::serial(real_fs)]
