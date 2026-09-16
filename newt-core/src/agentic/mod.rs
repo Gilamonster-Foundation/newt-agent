@@ -16,6 +16,7 @@
 mod attempt_capture;
 mod budget;
 pub mod digest_fold;
+pub mod run_allowance;
 // #867: path-claim verification for the cap-exit summary (the file-name
 // sibling of the #717 phantom-tool-reach telemetry).
 /// Anthropic `/v1/messages` wire mapping — `pub` so `newt-inference`'s simple
@@ -1253,6 +1254,11 @@ pub struct ChatCtx<'a> {
     /// trips it from a keyboard watcher, and inspects it after the call to tell
     /// an interrupted turn from a genuinely empty reply.
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// The run's remaining call budget (#2313). Checked once per dispatch, at
+    /// the same point every attempt is keyed from its exact wire bytes
+    /// ([`attempt_capture::send`]). `None` (every existing caller today) is
+    /// bit-for-bit unchanged behavior: no reservation, no refusal.
+    pub run_allowance: Option<&'a run_allowance::RunAllowance>,
     /// Optional TTY-owned live tool-output sink (#1235). Owned in an `Arc`
     /// because shell stdout/stderr drains may publish from worker threads.
     /// `None` is the mandatory headless/non-TTY path.
@@ -1950,6 +1956,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         write_ledger,
         attribution,
         cancel,
+        run_allowance,
         live_tool_output,
         completed_spill_renderer,
         git_tool,
@@ -2044,6 +2051,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         model,
         backend: url,
         cancel,
+        run_allowance,
     });
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
@@ -6456,6 +6464,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         write_ledger,
         attribution,
         cancel,
+        run_allowance,
         live_tool_output,
         git_tool,
         crew_runner,
@@ -6578,6 +6587,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         model,
         backend: url,
         cancel,
+        run_allowance,
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
@@ -8936,6 +8946,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         write_ledger,
         attribution,
         cancel,
+        run_allowance,
         live_tool_output,
         git_tool,
         crew_runner,
@@ -9085,6 +9096,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         model,
         backend: url,
         cancel,
+        run_allowance,
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
@@ -11144,6 +11156,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         write_ledger,
         attribution,
         cancel,
+        run_allowance,
         live_tool_output,
         git_tool,
         crew_runner,
@@ -11229,6 +11242,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         model,
         backend: url,
         cancel,
+        run_allowance,
     });
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
