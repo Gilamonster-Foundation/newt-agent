@@ -92,6 +92,12 @@ pub struct ModelTuning {
     /// output budget while cognition, thinking and sampling stay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_allowance: Option<u32>,
+
+    /// Per-model run-level call-count allowance (#2313): the number of
+    /// primary inference dispatches this model may make before further
+    /// dispatch is refused. `None` keeps the unlimited default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_allowance: Option<u32>,
 }
 
 /// Load tuning configuration for a specific model.

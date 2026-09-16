@@ -853,6 +853,7 @@ fn real_context_discovery_resolves_model_over_tui_default_false() {
             workflow_grace_rounds: None,
             narration_nudge_cap: None,
             output_allowance: None,
+            run_allowance: None,
         }],
         ..Default::default()
     };

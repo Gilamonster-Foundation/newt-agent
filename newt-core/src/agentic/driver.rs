@@ -176,6 +176,9 @@ pub struct TurnDriverConfig {
     /// #2312: explicit output-token allowance for driven turns. `None` keeps
     /// the cognition table and wire defaults.
     pub output_allowance: Option<u32>,
+    /// #2313: explicit run-level call-count allowance for driven turns.
+    /// `None` keeps dispatch unbudgeted (today's default behavior).
+    pub run_allowance: Option<u32>,
 }
 
 impl TurnDriverConfig {
@@ -220,6 +223,7 @@ impl TurnDriverConfig {
             context_manager: crate::ContextManager::default(),
             code_search: None,
             output_allowance: None,
+            run_allowance: None,
         }
     }
 
@@ -636,11 +640,14 @@ async fn run_one_turn(
         };
     // #2313: one attempt ledger per turn; its totals ride the outcome.
     let attempt_ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    // #2313: one run allowance per turn, built from the configured budget.
+    // `None` (today's default for every existing caller) is unbudgeted,
+    // bit-for-bit unchanged dispatch.
+    let run_allowance = config
+        .run_allowance
+        .map(super::run_allowance::RunAllowance::new);
     let ctx = ChatCtx {
-        // #2313: not yet wired into the headless driver's own config surface
-        // — the mechanism works the moment a caller passes one, but nothing
-        // here constructs a RunAllowance yet. Tracked as a fast follow.
-        run_allowance: None,
+        run_allowance: run_allowance.as_ref(),
         verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
         round_cap_hit: None,
         smart_harness: config.smart_harness.as_deref(),
