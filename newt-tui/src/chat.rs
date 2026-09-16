@@ -7591,6 +7591,8 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        // #2313: not yet wired into the TUI's own config surface.
+                                        run_allowance: None,
                                         verify_outcomes: newt_core::agentic::verify_outcomes_requested(),
                                         round_cap_hit: Some(&mut turn_round_cap_hit),
                                         smart_harness: turn_smart_harness.as_deref(),

@@ -4,6 +4,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn scope(ledger: &Mutex<AttemptLedger>) -> AttemptScope<'_> {
     AttemptScope {
+        run_allowance: None,
         ledger,
         turn: "prompt:turn",
         model: "test-model",
@@ -161,4 +162,106 @@ async fn a_dropped_attempt_is_cancelled_only_when_unsettled_under_an_interrupt()
         assert_eq!(records.len(), 1, "{name}");
         assert_eq!((records[0].state, records[0].usage), expected, "{name}");
     }
+}
+
+/// #2313: a run allowance is checked once, before any wire bytes are built —
+/// a refused dispatch never reaches the mock server and never gets a ledger
+/// entry (it is not a failed attempt; it is not an attempt at all).
+#[tokio::test]
+async fn an_exhausted_run_allowance_refuses_dispatch_before_any_request_is_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let ledger = Mutex::new(AttemptLedger::default());
+    let allowance = crate::agentic::run_allowance::RunAllowance::new(0);
+    let scope = AttemptScope {
+        run_allowance: Some(&allowance),
+        ..scope(&ledger)
+    };
+    let body = serde_json::json!({"case": "exhausted"});
+    let error = send(
+        Some(scope),
+        "primary",
+        reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", server.uri()))
+            .json(&body),
+        "request failed",
+    )
+    .await
+    .expect_err("no calls remain");
+    assert!(
+        error.to_string().contains("run allowance is exhausted"),
+        "{error}"
+    );
+    assert_eq!(
+        ledger.lock().unwrap().totals().attempts,
+        0,
+        "a refused call is not an attempt"
+    );
+}
+
+/// #2313: a dispatch under budget succeeds and reserves exactly one call;
+/// the reservation is exact for a call-count budget, so there is nothing to
+/// reconcile after the response arrives.
+#[tokio::test]
+async fn a_dispatch_under_budget_succeeds_and_reserves_exactly_one_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+    let ledger = Mutex::new(AttemptLedger::default());
+    let allowance = crate::agentic::run_allowance::RunAllowance::new(2);
+    let scope = AttemptScope {
+        run_allowance: Some(&allowance),
+        ..scope(&ledger)
+    };
+    let body = serde_json::json!({"case": "under-budget"});
+    let (_response, attempt) = send(
+        Some(scope),
+        "primary",
+        reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", server.uri()))
+            .json(&body),
+        "request failed",
+    )
+    .await
+    .expect("sent");
+    complete(attempt.as_ref(), None);
+    assert_eq!(allowance.remaining(), 1);
+    assert_eq!(ledger.lock().unwrap().totals().attempts, 1);
+}
+
+/// #2313: with no `RunAllowance` configured — every existing caller today —
+/// dispatch is completely unaffected: this is the same request the
+/// `each_retry_of_a_failing_request_is_one_attempt` test above already
+/// exercises, repeated here to pin it against a regression in this file
+/// specifically.
+#[tokio::test]
+async fn with_no_run_allowance_configured_dispatch_is_unaffected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+    let ledger = Mutex::new(AttemptLedger::default());
+    let body = serde_json::json!({"case": "no-allowance"});
+    let (_response, attempt) = send(
+        Some(scope(&ledger)),
+        "primary",
+        reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", server.uri()))
+            .json(&body),
+        "request failed",
+    )
+    .await
+    .expect("sent — no allowance means no refusal");
+    complete(attempt.as_ref(), None);
+    assert_eq!(ledger.lock().unwrap().totals().attempts, 1);
 }

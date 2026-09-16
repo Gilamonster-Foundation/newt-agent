@@ -166,6 +166,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
 
     let (reply, _, _, hallucinations) = chat_complete(
         ChatCtx {
+            run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
             smart_harness: None,

@@ -637,6 +637,10 @@ async fn run_one_turn(
     // #2313: one attempt ledger per turn; its totals ride the outcome.
     let attempt_ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let ctx = ChatCtx {
+        // #2313: not yet wired into the headless driver's own config surface
+        // — the mechanism works the moment a caller passes one, but nothing
+        // here constructs a RunAllowance yet. Tracked as a fast follow.
+        run_allowance: None,
         verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
         round_cap_hit: None,
         smart_harness: config.smart_harness.as_deref(),
