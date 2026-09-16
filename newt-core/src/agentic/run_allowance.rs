@@ -42,7 +42,15 @@ impl RunAllowance {
 
     /// Reserve one call, or refuse if none remain. Atomic: two callers
     /// racing this on a budget of one see exactly one success.
-    pub(crate) fn try_reserve(&self) -> Result<(), RunAllowanceExhausted> {
+    ///
+    /// Public (#2313 b3/b4): a helper-model call (summarizer) or a spawned
+    /// crew member is a real inference call against the same run, but it
+    /// dispatches through its own HTTP client outside
+    /// [`super::attempt_capture::send`]'s wire-byte-keyed ledger recording.
+    /// Exposing the bare reservation primitive lets those callers draw down
+    /// the same shared budget without needing the ledger machinery a primary
+    /// attempt's audit trail requires.
+    pub fn try_reserve(&self) -> Result<(), RunAllowanceExhausted> {
         self.remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(1)

@@ -124,6 +124,7 @@ fn summary_progress_child() {
             &None,
             None,
             true,
+            None,
         );
         assert_eq!(
             summary("summarize".into()).await.unwrap().0,

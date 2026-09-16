@@ -1909,6 +1909,22 @@ fn session_body(
     // closes the long-documented follow-up above).
     repick_active_profile(&cfg, &choice, &mut active_profile, color, verbose);
 
+    // #2313 b3: a whole-run call-count budget, resolved once here (unlike
+    // `output_allowance`, which is re-read from `model_tune` every turn) --
+    // this must persist and keep draining across every turn of the session,
+    // surviving a later `/model` switch, so it is constructed exactly once
+    // from the model active at session start. Shared via `Arc` (not the
+    // plain borrow `ChatCtx` takes elsewhere) because the summarizer's boxed
+    // `'static` closure needs its own owned handle to the same counter, and
+    // every `build_session_summarizer` call site below needs the same Arc
+    // the turn loop's own `ChatCtx` uses.
+    let run_allowance = cfg
+        .find_model_tuning(&inf_model)
+        .and_then(|t| t.run_allowance)
+        .map(|calls| {
+            std::sync::Arc::new(newt_core::agentic::run_allowance::RunAllowance::new(calls))
+        });
+
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
     // Memory/compression budget (Step 18.2, #247): the SAME empirical
@@ -2031,6 +2047,7 @@ fn session_body(
                         &inf_key,
                         Some(mem_budget),
                         color,
+                        run_allowance.clone(),
                     ));
                     mgr.add_provider(s);
                 }
@@ -3563,6 +3580,7 @@ fn session_body(
                             &inf_key,
                             Some(mem_budget),
                             color,
+                            run_allowance.clone(),
                         );
                         let active_task =
                             Some(active_operator_task(active_prompt_context.as_ref(), ""))
@@ -4494,6 +4512,7 @@ fn session_body(
                                 &inf_key,
                                 Some(mem_budget),
                                 color,
+                                run_allowance.clone(),
                             );
                             if let Some(notice) = tokio::task::block_in_place(|| {
                                 rt.block_on(run_close_extraction(
@@ -6958,6 +6977,7 @@ fn session_body(
                                     &inf_key,
                                     Some(active_memory_budget),
                                     color,
+                                    run_allowance.clone(),
                                 )
                             });
                             last_summarizer_route = route;
@@ -7316,6 +7336,7 @@ fn session_body(
                             &inf_key,
                             eff_num_ctx,
                             color,
+                            run_allowance.clone(),
                         )
                     });
                     // Per-turn tool-event recorder (Step 17.6, #246): the
@@ -7664,8 +7685,10 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
-                                        // #2313: not yet wired into the TUI's own config surface.
-                                        run_allowance: None,
+                                        // #2313 b3: the session-scoped allowance
+                                        // constructed above, shared with the
+                                        // summarizer.
+                                        run_allowance: run_allowance.as_deref(),
                                         verify_outcomes: newt_core::agentic::verify_outcomes_requested(),
                                         round_cap_hit: Some(&mut turn_round_cap_hit),
                                         smart_harness: turn_smart_harness.as_deref(),
@@ -8530,6 +8553,7 @@ fn session_body(
             &inf_key,
             Some(mem_budget),
             color,
+            run_allowance.clone(),
         );
         if let Some(notice) = tokio::task::block_in_place(|| {
             rt.block_on(run_close_extraction(

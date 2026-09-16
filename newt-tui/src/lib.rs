@@ -2051,6 +2051,13 @@ struct SummarizerOpts {
     /// real question). `None` — the default — emits zero bytes, so a headless
     /// or captured stream stays clean even under `NEWT_COLOR=always`.
     caps: newt_core::tty::LineCaps,
+    /// #2313 b3: the session's shared run allowance, when one is configured.
+    /// A summary request is a real inference call against the same run as
+    /// the primary loop, so it draws from the SAME budget the primary loop's
+    /// `ChatCtx.run_allowance` reserves against — this is the session's own
+    /// `Arc` clone, not a second counter. `None` (the default) is unbudgeted,
+    /// unchanged behavior.
+    run_allowance: Option<std::sync::Arc<newt_core::agentic::run_allowance::RunAllowance>>,
 }
 
 impl Default for SummarizerOpts {
@@ -2063,6 +2070,7 @@ impl Default for SummarizerOpts {
             fallback_model: None,
             color: false,
             caps: newt_core::tty::LineCaps::None,
+            run_allowance: None,
         }
     }
 }
@@ -2229,6 +2237,15 @@ async fn summarize_one_model(
             // Exponential backoff capped at ~4s: 250ms, 500ms, 1s, …
             let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(4));
             tokio::time::sleep(backoff).await;
+        }
+        // #2313 b3: reserve one call against the session's shared run
+        // allowance before each dispatch, including retries -- a summary
+        // request is a real inference call against the same run as the
+        // primary loop, and each attempt (not just the first) is one call.
+        // Refused here, before any wire bytes go out, exactly like the
+        // primary loop's own `attempt_capture::send`.
+        if let Some(allowance) = &opts.run_allowance {
+            allowance.try_reserve()?;
         }
         match summarize_attempt(&client, &chat_url, &body, api_key, openai).await {
             Ok(s) => return Ok(s),
@@ -7758,6 +7775,7 @@ fn summarizer_opts(
         retries: sum_cfg.retries,
         fallback_model: sum_cfg.fallback_model.clone(),
         color,
+        run_allowance: None,
         // The live-notice decision is ownership, not styling: detect it once
         // here rather than re-deriving it from `color` at three call sites.
         caps: newt_core::tty::LineCaps::detect(),
@@ -7944,6 +7962,10 @@ fn build_session_summarizer(
     inf_key: &Option<String>,
     num_ctx: Option<u32>,
     color: bool,
+    // #2313 b3: the session's shared run allowance (`None` when unconfigured),
+    // so this summarizer's own dispatch draws from the same budget the
+    // primary loop's `ChatCtx.run_allowance` reserves against.
+    run_allowance: Option<std::sync::Arc<newt_core::agentic::run_allowance::RunAllowance>>,
 ) -> newt_core::Summarizer {
     let (url, model, kind, key, model_path) = resolve_summarizer_backend(
         sum_cfg,
@@ -7953,7 +7975,10 @@ fn build_session_summarizer(
         inf_key,
         embedded_summarizer_default(),
     );
-    let opts = summarizer_opts(sum_cfg, cfg, num_ctx, color);
+    let opts = SummarizerOpts {
+        run_allowance,
+        ..summarizer_opts(sum_cfg, cfg, num_ctx, color)
+    };
     let caps = opts.caps;
     let summarizer = make_loop_summarizer(url, model, kind, key, model_path, opts);
     with_summary_progress(summarizer, caps, color)
