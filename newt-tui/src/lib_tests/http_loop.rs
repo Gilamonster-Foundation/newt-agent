@@ -71,6 +71,78 @@ async fn loop_summarizer_sends_num_ctx_to_ollama() {
     assert!(captured.get("options").is_none());
 }
 
+/// #2313 b3: a summary request is a real inference call against the same run
+/// as the primary loop, so an exhausted shared run allowance refuses it
+/// before any wire bytes go out -- the mock server must never see a request.
+#[tokio::test(flavor = "multi_thread")]
+async fn loop_summarizer_refuses_when_the_shared_run_allowance_is_exhausted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": "SUM"}
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let allowance = std::sync::Arc::new(newt_core::agentic::run_allowance::RunAllowance::new(0));
+    let s = make_loop_summarizer(
+        server.uri(),
+        "test-model".into(),
+        newt_core::BackendKind::Ollama,
+        None,
+        None,
+        SummarizerOpts {
+            run_allowance: Some(allowance),
+            ..Default::default()
+        },
+    );
+    let error = s("summarize the middle".into())
+        .await
+        .expect_err("an exhausted allowance must refuse the summary");
+    assert!(
+        error.to_string().contains("run allowance is exhausted"),
+        "{error}"
+    );
+}
+
+/// #2313 b3: a successful summary reserves exactly one call from the shared
+/// allowance -- the same counter the primary loop's `ChatCtx.run_allowance`
+/// draws down, proving the two dispatch paths share one budget rather than
+/// each getting their own.
+#[tokio::test(flavor = "multi_thread")]
+async fn loop_summarizer_reserves_one_call_from_the_shared_allowance_on_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": "SUM"}
+        })))
+        .mount(&server)
+        .await;
+
+    let allowance = std::sync::Arc::new(newt_core::agentic::run_allowance::RunAllowance::new(2));
+    let s = make_loop_summarizer(
+        server.uri(),
+        "test-model".into(),
+        newt_core::BackendKind::Ollama,
+        None,
+        None,
+        SummarizerOpts {
+            run_allowance: Some(allowance.clone()),
+            ..Default::default()
+        },
+    );
+    let (out, _) = s("summarize the middle".into()).await.unwrap();
+    assert_eq!(out, "SUM");
+    assert_eq!(
+        allowance.remaining(),
+        1,
+        "one successful summary call reserves exactly one from the shared budget"
+    );
+}
+
 /// Step 24.1 (#559): for Ollama, the summarizer warms the model
 /// (POST /api/generate, model + keep_alive) BEFORE the summary request, so a
 /// cold reload is absorbed off the (short) summary timeout.
