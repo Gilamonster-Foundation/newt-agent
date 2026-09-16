@@ -189,6 +189,23 @@ fn bang_command_strips_and_trims_the_escape() {
 }
 
 #[test]
+fn management_login_argv_is_literal_and_never_shell_expanded() {
+    let argv = vec![
+        "document-client".to_owned(),
+        "login".to_owned(),
+        "literal; argument $(no-expansion)".to_owned(),
+    ];
+    let command = operator_argv_command(&argv).unwrap();
+    assert_eq!(command.get_program(), "document-client");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        vec!["login", "literal; argument $(no-expansion)"]
+    );
+    assert!(operator_argv_command(&[]).is_err());
+    assert!(operator_argv_command(&[String::new()]).is_err());
+}
+
+#[test]
 fn bang_command_ignores_non_bang_and_bare_bang() {
     assert_eq!(bang_command("date"), None, "no leading bang");
     assert_eq!(bang_command("/help"), None, "slash is not a bang");

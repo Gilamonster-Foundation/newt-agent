@@ -15,6 +15,7 @@ fn http_test_entry(url: String) -> McpServerEntry {
         env: BTreeMap::new(),
         url: Some(url),
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
     }
@@ -120,6 +121,7 @@ fn handles_matches_sanitized_prefix_only() {
                 name: "modulex".to_string(),
                 conn: McpConnection::new(AnyTransport::Mock(MockTransport::new([]))),
                 tools: vec![RemoteTool {
+                    annotations: None,
                     name: "routine_run".to_string(),
                     description: String::new(),
                     input_schema: json!({}),

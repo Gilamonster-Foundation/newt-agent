@@ -370,11 +370,10 @@ async fn run_tool_captured_with_context_and_live(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> (String, String) {
     let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
-    // Mechanics helper: authorize the tool it is told to run (the MCP-auth
-    // tests use `run_remote_gated` instead). Post the `mcp-under-leash`
-    // name-grant closure an MCP call needs a structural grant; for a built-in
-    // tool `persona_tools` doesn't gate dispatch, so this is a no-op there.
-    let persona_grant = [name.to_string()];
+    // Display fixtures approve only their injected remote tool. Persona
+    // preferences must not be used as an authorization fixture.
+    let remote = mcp.handles(name);
+    let mut gate = MockGate::new(true, caveats);
     let out = execute_tool_with_display_cancellable(
         &mut display,
         name,
@@ -388,7 +387,7 @@ async fn run_tool_captured_with_context_and_live(
             prompt_context,
             artifact_context,
             live_tool_output,
-            persona_tools: Some(&persona_grant),
+            permission_gate: remote.then_some(&mut gate as &mut dyn PermissionGate),
             ..Default::default()
         },
         false,

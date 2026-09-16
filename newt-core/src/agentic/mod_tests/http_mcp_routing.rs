@@ -1,4 +1,5 @@
 use super::*;
+use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
 
 /// Mock MCP that handles exactly one namespaced tool for routing tests.
 struct OneToolMcp {
@@ -69,8 +70,8 @@ async fn openai_anthropic_native_tool_calls_route_correctly() {
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
-    let allowed_tools = ["my_server__my_tool".to_string()];
-    c.persona_tools = Some(&allowed_tools);
+    let mut permission = FixtureMcpPermission::new("my_server__my_tool", &caveats);
+    c.permission_gate = Some(&mut permission);
     let mut mcp = OneToolMcp {
         name: "my_server__my_tool",
         result: "tool-result-text",
@@ -141,8 +142,8 @@ async fn openai_hyphenated_server_name_routes_through_mcp() {
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
-    let allowed_tools = ["acme_server__probe_tool".to_string()];
-    c.persona_tools = Some(&allowed_tools);
+    let mut permission = FixtureMcpPermission::new("acme_server__probe_tool", &caveats);
+    c.permission_gate = Some(&mut permission);
     // OneToolMcp.handles() must match the underscore form the proxy returns.
     let mut mcp = OneToolMcp {
         name: "acme_server__probe_tool",

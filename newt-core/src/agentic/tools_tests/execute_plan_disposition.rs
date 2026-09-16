@@ -261,13 +261,10 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         PromptDisposition::Research,
     )
     .await;
-    assert!(
-        remote.contains("is not available for this request"),
-        "got: {remote}"
-    );
+    assert!(remote.contains("requires OCAP permission"), "got: {remote}");
     assert!(
         !mcp.called,
-        "generic MCP must be denied before remote routing in non-Act"
+        "a remote call without permission must not reach the server"
     );
 
     std::fs::write(ws.path().join("evidence.txt"), "durable evidence\n").unwrap();
@@ -294,7 +291,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
 /// reports it as present but not callable, and dispatch still refuses the call:
 /// discovery widened, authority did not.
 #[tokio::test]
-async fn explain_discovery_reports_a_hidden_mcp_tool_and_dispatch_still_refuses_it() {
+async fn explain_discovery_finds_mcp_but_dispatch_requires_permission() {
     let ws = std::path::Path::new("/nonexistent-workspace");
     let caveats = Caveats::top(); // disposition, not ambient authority, decides
     let mut mcp = OneRemoteTool::new("review__fetch_change");
@@ -311,8 +308,9 @@ async fn explain_discovery_reports_a_hidden_mcp_tool_and_dispatch_still_refuses_
     )
     .await;
     assert!(
-        found.contains("- review__fetch_change — not callable for this request"),
-        "an authorized tool must be reported hidden, not absent: {found}"
+        found.contains("- review__fetch_change — ")
+            && !found.contains("review__fetch_change — not callable"),
+        "connected MCP tools remain discoverable: {found}"
     );
 
     let call = run_tool_with_disposition(
@@ -327,12 +325,12 @@ async fn explain_discovery_reports_a_hidden_mcp_tool_and_dispatch_still_refuses_
     )
     .await;
     assert!(
-        call.contains("is not available for this request"),
+        call.contains("requires OCAP permission"),
         "dispatch remains the boundary: {call}"
     );
     assert!(
         !mcp.called,
-        "a hidden tool must not reach the remote server"
+        "a tool without permission must not reach the remote server"
     );
 
     // Twin: Ask admits no tool at all. Discovery itself is refused and

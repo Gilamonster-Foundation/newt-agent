@@ -66,6 +66,7 @@ const SECTIONS: &[(&str, char, &str)] = &[
     ("Audit", 'a', "settings receipts · does each still verify"),
     ("Backends", 'b', "choose · edit · add · remove"),
     ("Themes", 't', "presets · styles · live preview · save"),
+    ("MCP", 'm', "servers · connection · login · tools"),
 ];
 
 /// Index of the Session section in the shell — the one whose outcome
@@ -318,6 +319,10 @@ pub(crate) enum Outcome {
         lines: Vec<String>,
         model: Option<String>,
     },
+    OpenMcp {
+        lines: Vec<String>,
+        model: Option<String>,
+    },
 }
 
 pub(crate) struct SettingsPanel {
@@ -525,6 +530,7 @@ pub(crate) fn run(
     // because the fs read is the caller's, rendered by `receipt_audit_lines`
     // because the verification belongs with the rendering.
     audit: Vec<String>,
+    initial_section: Option<char>,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
     let mut panel = SettingsPanel::new(backend, models, current_model);
@@ -556,29 +562,33 @@ pub(crate) fn run(
             section(2, crate::shell::Body::Screen(&mut audit_panel)),
             section(3, crate::shell::Body::Link),
             section(4, crate::shell::Body::Screen(&mut theme_panel)),
+            section(5, crate::shell::Body::Link),
         ]);
+        if let Some(at) = initial_section.and_then(|key| {
+            SECTIONS
+                .iter()
+                .position(|(_, accelerator, _)| *accelerator == key)
+        }) {
+            for _ in 0..at {
+                shell.key(Key::Down);
+            }
+        }
         crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
         // **This section's flag, not the shell's.** With a second hosted
         // section the two are no longer the same question: `commit()` below
         // belongs to Session, and asking "did anything apply" would let a
         // future writing section put Session's messages on screen. Correct by
         // construction rather than by Permissions happening never to apply.
-        (
-            shell.section_applied(SESSION_SECTION),
-            shell.linked().is_some(),
-        )
+        (shell.section_applied(SESSION_SECTION), shell.linked())
     };
-    if linked {
-        // The index's Backends row and the panel's own door row are one act:
-        // both leave through `OpenBackends`, so the caller opens the chooser
-        // once, by one path.
-        return Ok(Outcome::OpenBackends {
-            lines: {
-                let mut lines = panel.commit();
-                lines.extend(theme_panel.applied.clone());
-                lines
-            },
-            model: panel.picked_model(),
+    if let Some(linked) = linked {
+        let mut lines = panel.commit();
+        lines.extend(theme_panel.applied.clone());
+        let model = panel.picked_model();
+        return Ok(if linked == 5 {
+            Outcome::OpenMcp { lines, model }
+        } else {
+            Outcome::OpenBackends { lines, model }
         });
     }
     if !applied {
@@ -621,6 +631,16 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use newt_core::test_guard::GlobalSettingsGuard;
+
+    #[test]
+    fn management_mcp_is_a_primary_settings_section() {
+        assert!(SECTIONS.iter().any(|(name, accelerator, summary)| {
+            *name == "MCP"
+                && *accelerator == 'm'
+                && summary.contains("servers")
+                && summary.contains("tools")
+        }));
+    }
 
     fn models(names: &[&str]) -> Option<Vec<ModelChoice>> {
         Some(

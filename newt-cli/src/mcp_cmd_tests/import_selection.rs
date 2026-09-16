@@ -35,6 +35,7 @@ fn import_sanitizer_preserves_only_safe_secret_references() {
                 SecretValue::literal("Bearer ${env:SAFE_TOKEN}"),
             ),
         ]),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Untrusted,
     };
@@ -62,6 +63,7 @@ fn import_validator_rejects_literal_url_and_arg_credentials_without_echoing_them
             env: BTreeMap::new(),
             url: Some("https://user:do-not-echo@example.test/mcp".into()),
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Untrusted,
         },
@@ -91,6 +93,7 @@ fn import_validator_rejects_literal_url_and_arg_credentials_without_echoing_them
             env: BTreeMap::new(),
             url: Some("https://${MCP_USERINFO}@example.test/mcp?token=${MCP_TOKEN}".into()),
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Untrusted,
         },

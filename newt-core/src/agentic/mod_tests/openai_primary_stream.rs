@@ -1,5 +1,6 @@
 //! Primary streaming dispatch, distinct from the final display reissue.
 use super::*;
+use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -160,8 +161,8 @@ async fn primary_stream_assembles_a_tool_batch_once_and_preserves_call_ids() {
     let caveats = Caveats::top();
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
-    let allowed = [TOOL.to_owned()];
-    context.persona_tools = Some(&allowed);
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+    context.permission_gate = Some(&mut permission);
     let mut tools = FixtureTools::default();
     let (text, streamed, usage, hallucinations) = chat_complete(context, &mut tools)
         .await
@@ -203,8 +204,8 @@ async fn primary_stream_rejects_a_cut_batch_before_any_tool_runs() {
     let caveats = Caveats::top();
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
-    let allowed = [TOOL.to_owned()];
-    context.persona_tools = Some(&allowed);
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+    context.permission_gate = Some(&mut permission);
     let mut tools = FixtureTools::default();
     assert!(chat_complete(context, &mut tools).await.is_err());
     assert!(tools.0.is_empty(), "no partial batch may authorize a tool");
@@ -273,8 +274,8 @@ async fn invalid_streamed_arguments_are_rejected_per_call_and_retried() {
         let caveats = Caveats::top();
         let mut context = ctx(&uri, &messages, &caveats);
         context.action_nudges = false;
-        let allowed = [TOOL.to_owned()];
-        context.persona_tools = Some(&allowed);
+        let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+        context.permission_gate = Some(&mut permission);
         let mut tools = FixtureTools::default();
         let (text, _, _, _) = chat_complete(context, &mut tools)
             .await
@@ -359,8 +360,8 @@ async fn cancelled_stream_with_a_complete_tool_call_dispatches_nothing() {
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
     context.cancel = Some(&cancel);
-    let allowed = [TOOL.to_owned()];
-    context.persona_tools = Some(&allowed);
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+    context.permission_gate = Some(&mut permission);
     let mut tools = FixtureTools::default();
     let mut completion = Box::pin(chat_complete(context, &mut tools));
     let request = tokio::time::timeout(Duration::from_secs(30), async {
@@ -408,8 +409,8 @@ async fn completed_stream_with_the_same_tool_call_dispatches_once() {
     let uri = server.uri();
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
-    let allowed = [TOOL.to_owned()];
-    context.persona_tools = Some(&allowed);
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+    context.permission_gate = Some(&mut permission);
     let mut tools = FixtureTools::default();
 
     chat_complete(context, &mut tools)
@@ -436,8 +437,8 @@ async fn provider_error_after_a_complete_tool_call_dispatches_nothing() {
     let uri = server.uri();
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
-    let allowed = [TOOL.to_owned()];
-    context.persona_tools = Some(&allowed);
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+    context.permission_gate = Some(&mut permission);
     let mut tools = FixtureTools::default();
 
     assert!(chat_complete(context, &mut tools).await.is_err());
@@ -1122,8 +1123,8 @@ async fn run_fixture_turn(
     let caveats = Caveats::top();
     let mut context = ctx(uri, &messages, &caveats);
     context.action_nudges = false;
-    let allowed = [TOOL.to_owned()];
-    context.persona_tools = Some(&allowed);
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
+    context.permission_gate = Some(&mut permission);
     context.end_reason = Some(reason);
     chat_complete(context, tools).await
 }

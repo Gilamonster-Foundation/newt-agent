@@ -972,6 +972,16 @@ pub(crate) trait InputSurface {
         Ok(())
     }
 
+    /// Run an explicitly confirmed, trusted login argv through the terminal owner.
+    fn run_login_argv(
+        &mut self,
+        argv: &[String],
+        color: bool,
+        verbose: bool,
+    ) -> anyhow::Result<bool> {
+        crate::run_login_argv(argv, color, verbose)
+    }
+
     /// **C1 (#1862): present one semantic interaction and report what the
     /// operator did.**
     ///
@@ -2958,6 +2968,68 @@ fn session_body(
                         println!();
                         continue;
                     }
+                    #[cfg(feature = "rich-tui")]
+                    macro_rules! manage_mcp {
+                        () => {{
+                            cfg = crate::resolve_runtime_or_default();
+                            let cancel =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let exit = std::sync::atomic::AtomicBool::new(false);
+                            let posture = newt_core::posture::active_posture();
+                            let mut gate = PromptPermissionGate {
+                                ask_surface: Some(&ask_surface),
+                                open_panel: terminal_owns_turn.then_some(&open_permission_panel),
+                                state: &mut permission_state,
+                                base: operating_mode_caveats(
+                                    active_operating_mode,
+                                    effective_caveats(cap.caveats(), posture.as_ref()),
+                                ),
+                                key_path: key_path.clone(),
+                                conversation_id: active_conversation_id.clone(),
+                                log_path: permission_log_path.clone(),
+                                denials_path: permission_denials_path.clone(),
+                                config_path: permission_config_path.clone(),
+                                preset_clamp: posture
+                                    .as_ref()
+                                    .and_then(ActivePosture::permission_clamp)
+                                    .cloned(),
+                                delegation: cap.delegation(),
+                                danger: production_danger_table(),
+                                color,
+                                verbose,
+                                authorization_prompts_enabled: prompt_permissions_enabled,
+                                web_decision_timeout: crate::permissions::WEB_DECISION_TIMEOUT,
+                                cancel: Some(cancel.as_ref()),
+                                exit: Some(&exit),
+                                ask_human: prompt_permission_choice
+                                    as fn(
+                                        &newt_core::tty::PromptWindow,
+                                        &newt_core::interaction_surface::SurfaceInteraction,
+                                    ) -> PromptChoice,
+                            };
+                            if let Err(error) = crate::mcp_manager::run(
+                                &mut mcp,
+                                surface.as_mut(),
+                                &mut gate,
+                                crate::mcp_manager::Context {
+                                    cfg: &cfg,
+                                    workspace,
+                                    runtime: &rt,
+                                    cancel: cancel.clone(),
+                                    terminal_owns_turn,
+                                },
+                            ) {
+                                print_newt(
+                                    &format!("MCP panel unavailable: {error}"),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            if exit.load(std::sync::atomic::Ordering::Relaxed) {
+                                return Ok(());
+                            }
+                        }};
+                    }
                     // `/mcp` — MCP management surface (#1149 + session mute):
                     // status table, session on/off (instant catalog filter), and
                     // durable enable/disable (config writeback). Handled here
@@ -2973,6 +3045,12 @@ fn session_body(
                                 .map_or((rest, ""), |(a, b)| (a, b.trim()));
                             match (verb, name) {
                                 ("", _) => {
+                                    #[cfg(feature = "rich-tui")]
+                                    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                                        manage_mcp!();
+                                        surface.save_history();
+                                        continue;
+                                    }
                                     // #2009 PR10a2: one rendering, in
                                     // `McpState::status_lines`, so the verb
                                     // and the cockpit's MCP view cannot
@@ -3053,7 +3131,7 @@ fn session_body(
                                     } else {
                                         print_newt(
                                             &format!(
-                                                "no connected MCP server `{n}` — config-disabled servers need `/mcp enable {n}` then relaunch (live reconnect: #1148)"
+                                                "no connected MCP server `{n}` — config-disabled servers need `/mcp enable {n}` then Reconnect in /settings → MCP"
                                             ),
                                             color,
                                             verbose,
@@ -3074,7 +3152,7 @@ fn session_body(
                                         }) {
                                         Ok(()) if on => print_newt(
                                             &format!(
-                                                "{n} enabled in config — connects at next launch (live connect: #1148). For this session use `/mcp on {n}` if already connected."
+                                                "{n} enabled in config — choose Reconnect in /settings → MCP, or `/mcp on {n}` if already connected."
                                             ),
                                             color,
                                             verbose,
@@ -5777,81 +5855,96 @@ fn session_body(
                             .ok()
                             .map(|c| c.display_model().to_string())
                             .unwrap_or_default();
-                        let window = surface.open_panel(settings_panel::panel_height());
-                        // #2009 PR10b: the Permissions section's rows, built
-                        // HERE because this is where the state is — the same
-                        // lines `/permissions` prints, so the section and the
-                        // verb cannot disagree about the posture.
-                        let mut permission_rows = permissions_command_lines(
-                            &permission_state,
-                            prompt_permissions_enabled,
-                            permission_log_path.as_deref(),
-                            newt_core::posture::active_posture().as_ref(),
-                        );
-                        if let Some(path) = permission_log_path.as_deref() {
-                            permission_rows.push(String::new());
-                            permission_rows.extend(crate::permission_audit_lines(path, 50));
-                        }
-                        // #2009 PR13: the Audit section's rows. The fs read
-                        // is here; the verification and the rendering are in
-                        // `receipt_audit_lines`, so a row cannot be printed
-                        // without saying whether it still verifies.
-                        let audit_rows = newt_core::settings_receipt::receipt_path()
-                            .and_then(|p| std::fs::read_to_string(p).ok())
-                            .map_or_else(
-                                || vec!["no settings receipts yet".to_string()],
-                                |body| crate::lines_panel::receipt_audit_lines(&body),
+                        let mut initial_section = None;
+                        loop {
+                            let mut walked_to_mcp = false;
+                            let window = surface.open_panel(settings_panel::panel_height());
+                            // #2009 PR10b: the Permissions section's rows, built
+                            // HERE because this is where the state is — the same
+                            // lines `/permissions` prints, so the section and the
+                            // verb cannot disagree about the posture.
+                            let mut permission_rows = permissions_command_lines(
+                                &permission_state,
+                                prompt_permissions_enabled,
+                                permission_log_path.as_deref(),
+                                newt_core::posture::active_posture().as_ref(),
                             );
-                        match settings_panel::run(
-                            active_backend_name(&cfg),
-                            models,
-                            current_model,
-                            permission_rows,
-                            audit_rows,
-                            window,
-                        ) {
-                            Ok(outcome) => {
-                                let (lines, model) = match outcome {
-                                    settings_panel::Outcome::Applied { lines, model } => {
-                                        (lines, model)
-                                    }
-                                    settings_panel::Outcome::OpenBackends { lines, model } => {
-                                        walked_to_backends = true;
-                                        (lines, model)
-                                    }
-                                };
-                                for line in lines {
-                                    print_newt(&line, color, verbose);
-                                }
-                                // The pick goes through `/model`'s own path,
-                                // which validates the name against what the
-                                // backend serves and refuses (with a
-                                // suggestion) if it does not — the same
-                                // handling `/psyche`'s spinner pick gets.
-                                if let Some(model) = model {
-                                    commands::model::apply_model_choice(&model, color, verbose);
-                                }
+                            if let Some(path) = permission_log_path.as_deref() {
+                                permission_rows.push(String::new());
+                                permission_rows.extend(crate::permission_audit_lines(path, 50));
                             }
-                            // A panel that could not open is not a dead end:
-                            // say why once and let the typed form ask, rather
-                            // than leaving the operator with no way to change a
-                            // setting on this terminal.
-                            Err(error) => {
-                                print_newt(
-                                    &format!(
-                                        "settings panel unavailable ({error}); asking instead"
-                                    ),
-                                    color,
-                                    verbose,
+                            // #2009 PR13: the Audit section's rows. The fs read
+                            // is here; the verification and the rendering are in
+                            // `receipt_audit_lines`, so a row cannot be printed
+                            // without saying whether it still verifies.
+                            let audit_rows = newt_core::settings_receipt::receipt_path()
+                                .and_then(|p| std::fs::read_to_string(p).ok())
+                                .map_or_else(
+                                    || vec!["no settings receipts yet".to_string()],
+                                    |body| crate::lines_panel::receipt_audit_lines(&body),
                                 );
-                                // The session's existing seam — the same one
-                                // `dispatch_slash_with_ask` hands the form, so
-                                // the fallback asks exactly where a `/settings`
-                                // typed anywhere else would.
-                                for line in crate::settings_form::run(&ask_surface, "") {
-                                    print_newt(&line, color, verbose);
+                            match settings_panel::run(
+                                active_backend_name(&cfg),
+                                models.clone(),
+                                current_model.clone(),
+                                permission_rows,
+                                audit_rows,
+                                initial_section,
+                                window,
+                            ) {
+                                Ok(outcome) => {
+                                    let (lines, model) = match outcome {
+                                        settings_panel::Outcome::Applied { lines, model } => {
+                                            (lines, model)
+                                        }
+                                        settings_panel::Outcome::OpenMcp { lines, model } => {
+                                            walked_to_mcp = true;
+                                            (lines, model)
+                                        }
+                                        settings_panel::Outcome::OpenBackends { lines, model } => {
+                                            walked_to_backends = true;
+                                            (lines, model)
+                                        }
+                                    };
+                                    for line in lines {
+                                        print_newt(&line, color, verbose);
+                                    }
+                                    // The pick goes through `/model`'s own path,
+                                    // which validates the name against what the
+                                    // backend serves and refuses (with a
+                                    // suggestion) if it does not — the same
+                                    // handling `/psyche`'s spinner pick gets.
+                                    if let Some(model) = model {
+                                        commands::model::apply_model_choice(&model, color, verbose);
+                                    }
+                                }
+                                // A panel that could not open is not a dead end:
+                                // say why once and let the typed form ask, rather
+                                // than leaving the operator with no way to change a
+                                // setting on this terminal.
+                                Err(error) => {
+                                    print_newt(
+                                        &format!(
+                                            "settings panel unavailable ({error}); asking instead"
+                                        ),
+                                        color,
+                                        verbose,
+                                    );
+                                    // The session's existing seam — the same one
+                                    // `dispatch_slash_with_ask` hands the form, so
+                                    // the fallback asks exactly where a `/settings`
+                                    // typed anywhere else would.
+                                    for line in crate::settings_form::run(&ask_surface, "") {
+                                        print_newt(&line, color, verbose);
+                                    }
                                 }
                             }
+                            if walked_to_mcp {
+                                manage_mcp!();
+                                initial_section = Some('m');
+                                continue;
+                            }
+                            break;
                         }
                         cfg = crate::resolve_runtime_or_default();
                         if !walked_to_backends {
@@ -7350,13 +7443,8 @@ fn session_body(
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
                     let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
                     let mut turn_round_cap_hit = false;
-                    // FR-1 part 2 (#997): the active persona's tool allow-list
-                    // (its `tools:` front-matter). Threaded into `ChatCtx` so the
-                    // loop advertises ONLY these tools and the executor refuses
-                    // the rest — the name-scoped complement to `turn_caveats`
-                    // (the axis-scoped clamp above, part 1 / #1002). `None` (no
-                    // persona, or a persona with no `tools:` list) leaves the
-                    // full catalog in play.
+                    // Persona tools guide catalog order. They neither remove
+                    // schemas nor grant or deny execution authority.
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());

@@ -166,7 +166,7 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
         .expect("legacy fixture has no durable writer")
         .unwrap();
         assert!(
-            out.contains("persona") && !out.contains("local branches: 1"),
+            !out.contains("persona") && out.contains("local branches: 1"),
             "{out}"
         );
     }

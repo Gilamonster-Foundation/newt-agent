@@ -18,6 +18,7 @@ async fn stdio_spawn_does_not_leak_secret_env() {
         env: std::collections::BTreeMap::new(),
         url: None,
         headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
     };

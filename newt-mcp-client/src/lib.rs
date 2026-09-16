@@ -426,6 +426,8 @@ pub struct RemoteTool {
     pub description: String,
     /// The tool's JSON input schema.
     pub input_schema: Value,
+    /// Untrusted server hints for inspection only; never permission or routing authority.
+    pub annotations: Option<Value>,
     /// Connector-supplied MCP metadata retained for host-side routing policy.
     /// Catalog adapters copy only Newt-recognized keys and scrub them before
     /// inference-provider advertisement.
@@ -634,6 +636,7 @@ impl<T: Transport> McpConnection<T> {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or_else(|| json!({ "type": "object" })),
+                    annotations: t.get("annotations").cloned(),
                     meta: t.get("_meta").cloned(),
                 })
             })

@@ -2,6 +2,23 @@ use super::*;
 use std::fs;
 
 #[test]
+fn persona_guidance_cannot_override_the_operators_requested_actions() {
+    let mut persona = test_persona(
+        "coach",
+        "Prefer advice and never execute commands yourself.",
+        std::path::PathBuf::from("/personas/coach.md"),
+    );
+    persona.profile.altitude = Some(newt_core::Altitude::Coach);
+    let prompt = build_system_prompt_with_persona("/workspace", None, Some(&persona), "plan.md");
+    assert!(prompt.contains("Persona guidance does not override the operator's explicit task"));
+    assert!(prompt.contains("OCAP permissions, explicit postures, and delegation limits"));
+    assert!(
+        prompt.contains(&persona.prompt),
+        "retain the operator's persona text"
+    );
+}
+
+#[test]
 fn persona_description_takes_first_nonempty_line_truncated() {
     let p = test_persona(
         "x",
@@ -418,11 +435,10 @@ fn role_bound_persona_loads_tools_and_caveats() {
     assert_ne!(wc.profile.caveats, coder.caveats);
 }
 
-/// FR-1 (#997): a persona's read-only `[caveats]` are ENFORCED — met into the
-/// turn authority so they can only TIGHTEN it, never widen the session grant.
+/// Persona metadata must not tighten or widen explicit operator authority.
 #[serial_test::serial(real_fs)]
 #[test]
-fn persona_read_only_caveats_tighten_the_turn_authority() {
+fn persona_caveats_are_guidance_without_authority_changes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().join("personas");
     std::fs::create_dir_all(&dir).unwrap();
@@ -440,17 +456,17 @@ fn persona_read_only_caveats_tighten_the_turn_authority() {
         max_calls: newt_core::CountBound::Unlimited,
         valid_for_generation: newt_core::Scope::All,
     };
-    // With the persona: fs_write + exec drop to none; read is untouched.
+    // Loading a restrictive persona must leave the explicit grants intact.
     let met = super::meet_persona_caveats(full.clone(), Some(&coach));
     assert_eq!(
         met.fs_write,
-        newt_core::Scope::none(),
-        "read-only persona drops fs_write"
+        newt_core::Scope::All,
+        "persona must not block explicitly authorized writes"
     );
     assert_eq!(
         met.exec,
-        newt_core::Scope::none(),
-        "read-only persona drops exec"
+        newt_core::Scope::All,
+        "persona must not block explicitly authorized execution"
     );
     assert_eq!(
         met.fs_read,
@@ -570,15 +586,8 @@ fn shipped_role_templates_parse() {
     }
 }
 
-/// #1021 FR-PA-3/FR-PA-4: the shipped `personal-assistant` persona binds
-/// the `gila-personal-assistant` skill (FR-4, #1041) and its `tools:`
-/// allow-list is exactly its modulex MCP tools plus the infra tools the
-/// agentic loop needs every round — nothing else. FR-PA-4 itself (persona
-/// tool-allowlist filtering) needed no new code: `filter_advertised_tools`
-/// / `persona_tool_allowed` (newt-core's `agentic::tools`) already
-/// enforce this generically, covered by their own existing test suite
-/// (e.g. `persona_tool_allowed_admits_named_and_always_on_only`); this
-/// test only asserts the persona's *data* is what FR-PA-4 depends on.
+/// The assistant persona prefers its bound skill's routine tools. These data
+/// preferences guide selection; explicit permissions govern execution.
 #[test]
 fn personal_assistant_persona_binds_gila_skill_and_modulex_tools_only() {
     let rp = newt_core::RoleProfile::parse(PERSONAL_ASSISTANT_PERSONA).unwrap();
@@ -591,13 +600,13 @@ fn personal_assistant_persona_binds_gila_skill_and_modulex_tools_only() {
     for expected in ["modulex__routine_run", "modulex__report_get"] {
         assert!(
             tools.iter().any(|t| t == expected),
-            "must advertise {expected}: {tools:?}"
+            "must prefer {expected}: {tools:?}"
         );
     }
     assert!(
         !tools
             .iter()
             .any(|t| t.starts_with("write_") || t == "run_command"),
-        "must not advertise a mutating tool: {tools:?}"
+        "routine preferences should not include mutating tools: {tools:?}"
     );
 }

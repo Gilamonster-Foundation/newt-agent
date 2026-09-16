@@ -396,16 +396,9 @@ fn is_persona_unfenceable_tool(name: &str) -> bool {
         })
 }
 
-/// FR-1 part 2 (#997): is `name` callable under a persona whose `tools:`
-/// front-matter is `allow`? True when the persona names it, OR it is an
-/// always-on infra tool the loop can't run without. This is the single
-/// predicate behind BOTH the advertise-filter ([`filter_advertised_tools`])
-/// and the executor reject ([`execute_tool_with_offload`]) so the set the model
-/// SEES and the set it may RUN can never drift apart.
-///
-/// `pub` (not `pub(crate)`) since #1021 PR 5.2: a headless entry point
-/// (`newt-mcp-server`) filters its own, separately-built catalog by the same
-/// rule rather than reimplementing it.
+/// Whether a persona prefers this tool, including session infrastructure.
+/// This is a ranking predicate, not execution authority. Explicit capability
+/// checks and the MCP permission gate remain at dispatch.
 pub fn persona_tool_allowed(name: &str, allow: &[String]) -> bool {
     allow.iter().any(|t| t == name) || is_persona_unfenceable_tool(name)
 }
@@ -418,41 +411,31 @@ fn tool_def_name(def: &serde_json::Value) -> Option<&str> {
         .and_then(|n| n.as_str())
 }
 
-/// FR-1 part 2 (#997): restrict an advertised catalog to a persona's allow-list.
-/// `allow = None` (no persona / no `tools:` list) returns `defs` untouched — the
-/// zero-cost path for every non-persona session. When `Some`, keep only the
-/// tools [`persona_tool_allowed`] admits (the persona's names ∪ the always-on
-/// infra). Pure over `serde_json::Value`; the caller wraps
-/// [`merged_tool_definitions`] with it at each catalog site.
-///
-/// `pub` (not `pub(crate)`) since #1021 PR 5.2: a headless entry point
-/// (`newt-mcp-server`) filters its own, separately-built catalog by the same
-/// rule rather than reimplementing it.
+/// Rank persona preferences without removing discoverable tools. The existing
+/// exposure controller can defer schemas; `tool_search` and hidden-tool
+/// promotion still reach the full catalog. Preferences confer no authority.
 pub fn filter_advertised_tools(
     defs: serde_json::Value,
     allow: Option<&[String]>,
 ) -> serde_json::Value {
     let Some(allow) = allow else { return defs };
-    let serde_json::Value::Array(arr) = defs else {
+    let serde_json::Value::Array(mut arr) = defs else {
         return defs;
     };
-    serde_json::Value::Array(
-        arr.into_iter()
-            .filter(|def| match tool_def_name(def) {
-                Some(name) => persona_tool_allowed(name, allow),
-                None => true,
-            })
-            .collect(),
-    )
+    arr.sort_by_key(|def| {
+        !tool_def_name(def).is_some_and(|name| persona_tool_allowed(name, allow))
+    });
+    serde_json::Value::Array(arr)
 }
 
 /// Whether `name` is available under the prompt's validated disposition.
 ///
 /// `Act` retains the complete catalog. `Explain`, `Research`, and `Plan` are
-/// deliberately a small, explicit read/recovery set (`Plan` additionally gets
-/// the harness-owned ledger writer): an unknown name is denied rather than
-/// assumed safe, which also fences every generic MCP name (`server__tool`)
-/// until MCP supplies machine-readable authority metadata. `Ask` is terminal
+/// a small, explicit read/recovery set (`Plan` additionally gets the
+/// harness-owned ledger writer). Explain/Research may discover remote MCP
+/// schemas: dispatch separately requires a connected server and an explicit
+/// permission grant. Neither a name nor a server's hints confer authority.
+/// `Ask` is terminal
 /// at the harness layer, so no model tool invocation is admitted as defense in
 /// depth.
 ///
@@ -463,7 +446,7 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
         PromptDisposition::Act => true,
         PromptDisposition::Ask => false,
         PromptDisposition::Explain | PromptDisposition::Research => {
-            common_read_only_tool_allowed(name)
+            common_read_only_tool_allowed(name) || is_mcp_tool_name(name)
         }
         PromptDisposition::Plan => {
             // Human/model Plan mode is deliberately offline. Do not advertise
@@ -477,6 +460,11 @@ pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
                 || matches!(name, "update_plan" | "exit_plan_mode")
         }
     }
+}
+
+pub(super) fn is_mcp_tool_name(name: &str) -> bool {
+    name.split_once("__")
+        .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
 }
 
 fn common_read_only_tool_allowed(name: &str) -> bool {
@@ -528,10 +516,9 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
 
 /// Restrict an advertised tool catalog to the current prompt disposition.
 ///
-/// Apply this alongside [`filter_advertised_tools`]: the persona filter scopes
-/// an operator-selected role, while this filter scopes the authority implied by
-/// the current prompt. Under a non-Act disposition, malformed definitions are
-/// dropped too because their callable name cannot be proven safe.
+/// Apply after persona preference ordering. Plan/Ask retain their explicit
+/// restrictions; evidence turns retain connected remote schemas for permission
+/// requests. Malformed definitions are dropped under non-Act dispositions.
 pub fn filter_tools_for_disposition(
     defs: serde_json::Value,
     disposition: PromptDisposition,
@@ -576,18 +563,6 @@ pub(super) fn disposition_tool_denied_message(
         "Act permits every tool and must never reach a disposition refusal"
     );
     super::super::DispositionVoices::default().denied_block(disposition, name)
-}
-
-/// The refusal returned to the model when it calls a tool the active persona
-/// does not grant (FR-1 part 2, #997). Names the tool and points at the escape
-/// hatch, so the model self-corrects to a granted tool instead of looping.
-pub(super) fn persona_tool_denied_message(name: &str) -> String {
-    format!(
-        "Tool `{name}` is not available under the active persona: its `tools:` \
-         front-matter restricts which tools it may call. Choose one of the \
-         granted tools, or clear the persona (`/persona clear`) if broader \
-         access is genuinely required."
-    )
 }
 
 /// Direct tool names the model must call as tool invocations, never as shell

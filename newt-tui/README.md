@@ -12,8 +12,37 @@ write that file plus one `backends/*.toml` drop-in per endpoint.
 ## Settings and communication style
 
 `/settings` is the primary entry point for harness controls: Session,
-Permissions, Audit, Backends, and Themes. Commands such as `/model`,
+Permissions, Audit, Backends, Themes, and MCP. Commands such as `/model`,
 `/backends`, and `/permissions` remain available as direct shortcuts.
+
+Open `/settings` → **MCP**, or `/mcp`, to manage discovered servers. The list
+shows configuration sources, namespace conflicts, connection status, and tool
+counts. Enter opens a server, then its tools and each tool's description and
+parameter schema. Up/Down navigates; Esc returns one level and keeps selection.
+Connection, saved authentication, and OCAP are separate: a connected stdio
+server has not necessarily authenticated its upstream services. Tool effect
+hints are server metadata, never permission grants.
+
+**Reconnect** recreates the selected connection and refreshes its tools.
+**Test** requests tool metadata only; it never calls a tool. A failed test or
+reconnect removes stale advertised tools. **Login** uses Newt's existing OAuth
+flow for HTTP servers, with the same exact-host permission prompts as startup.
+Configured Authorization references remain operator-managed. Stdio servers can
+provide an explicit operator login in trusted Newt configuration:
+
+```toml
+[[mcp_servers]]
+name = "documents"
+command = "documents-mcp"
+login_argv = ["documents", "login"]
+```
+
+The panel confirms the program and literal arguments before lending it the
+terminal. Successful login reconnects the MCP child so it can read updated
+credentials; failed or interrupted login leaves the connection unchanged.
+Borrowed project/Claude configuration and server metadata cannot supply login
+commands. Without `login_argv`, log in through the server's CLI and select
+Reconnect. Lean and nonterminal sessions retain the `/mcp` text commands.
 
 Open `/settings` → **Themes** (or press `t` at the settings index) to select
 **newt**, **daylight**, **phosphor**, or one of your saved themes.
@@ -138,4 +167,4 @@ free, friendly, local agentic coder.
 
 Apache-2.0
 
-Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 11:13 EDT | Date: 2026-09-16
+Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 14:42 EDT | Date: 2026-09-16

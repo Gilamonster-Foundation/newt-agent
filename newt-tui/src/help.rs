@@ -436,14 +436,18 @@ Use /help for the in-session command list."
             "\
 /mcp — manage MCP servers for this session
 
-  /mcp                         status of every discovered server
+  /mcp                         server manager (text status without a rich TTY)
   /mcp off [name]              mute this session (tools leave the catalog now;
                                connection stays — /mcp on restores instantly)
   /mcp on [name]               unmute this session (bare = unmute all)
   /mcp disable <name>          durable: write enabled=false to config + drop now
-  /mcp enable <name>           durable: write enabled=true (connects next launch;
-                               live reconnect is #1148)
+  /mcp enable <name>           durable: write enabled=true; choose Reconnect in MCP
   /mcp auth <name>             how to (re)authenticate (`newt auth <name>`)
+
+The same manager is under /settings → MCP. Enter opens server → tools → details;
+Up/Down navigates, Esc returns one level. Login reconnects after successful
+authentication; Reconnect refreshes the child/catalog; Test lists tools only.
+Tool effect hints are metadata, never permission grants.
 
 on/off is session-scoped (like /nudge) — use it while testing schema budget.
 enable/disable rewrites ~/.newt/config.toml."
@@ -773,7 +777,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /psyche                  - effort dial panel: cognition, tenacity, persona (Esc exits; /psyche obsessive = max)",
-        "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
+        "  /mcp [on|off|enable|disable|auth] [name] - MCP manager; session mute (on/off) or durable config (enable/disable)",
         "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",

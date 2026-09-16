@@ -98,10 +98,10 @@ pub(crate) enum SurfaceRequest {
     TurnEnded,
     /// The UI owner lends its terminal to an operator's foreground command.
     RunBang {
-        command: String,
+        command: crate::OperatorCommand,
         color: bool,
         verbose: bool,
-        reply: SyncSender<anyhow::Result<()>>,
+        reply: SyncSender<anyhow::Result<bool>>,
     },
     /// **C1 (#1862): present one semantic interaction and report the outcome.**
     ///
@@ -382,7 +382,27 @@ impl crate::chat::InputSurface for RemoteSurface {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.ask(
             |reply| SurfaceRequest::RunBang {
-                command: command.to_string(),
+                command: crate::OperatorCommand::Shell(command.to_string()),
+                color,
+                verbose,
+                reply,
+            },
+            rx,
+            tx,
+        )?
+        .map(|_| ())
+    }
+
+    fn run_login_argv(
+        &mut self,
+        argv: &[String],
+        color: bool,
+        verbose: bool,
+    ) -> anyhow::Result<bool> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.ask(
+            |reply| SurfaceRequest::RunBang {
+                command: crate::OperatorCommand::Argv(argv.to_vec()),
                 color,
                 verbose,
                 reply,
@@ -462,7 +482,15 @@ pub(crate) fn pump_surface(
                 verbose,
                 reply,
             } => {
-                let _ = reply.send(surface.run_bang_escape(&command, color, verbose));
+                let result = match command {
+                    crate::OperatorCommand::Shell(command) => surface
+                        .run_bang_escape(&command, color, verbose)
+                        .map(|()| true),
+                    crate::OperatorCommand::Argv(argv) => {
+                        surface.run_login_argv(&argv, color, verbose)
+                    }
+                };
+                let _ = reply.send(result);
             }
             SurfaceRequest::Interact { interaction, reply } => {
                 let _ = reply.send(surface.present_interaction(&interaction));
@@ -813,6 +841,9 @@ mod tests {
             surface
                 .run_bang_escape("true", false, false)
                 .expect("served");
+            assert!(!surface
+                .run_login_argv(&["literal-program".into(), "argument".into()], false, false)
+                .expect("served"));
             surface.present_interaction(&an_interaction());
             #[cfg(feature = "rich-tui")]
             surface.open_panel(10);
@@ -975,6 +1006,7 @@ mod tests {
         turn_started: usize,
         turn_ended: usize,
         run_bang_escape: usize,
+        run_login_argv: usize,
         present_interaction: usize,
         #[cfg(feature = "rich-tui")]
         open_panel: usize,
@@ -985,7 +1017,7 @@ mod tests {
         /// forward. The count follows the BUILD rather than being relaxed to
         /// the smaller number for both — a rich build that dropped a
         /// forwarding impl must still fail here.
-        const METHODS: usize = if cfg!(feature = "rich-tui") { 12 } else { 11 };
+        const METHODS: usize = if cfg!(feature = "rich-tui") { 13 } else { 12 };
 
         fn each(&self) -> Vec<(&'static str, usize)> {
             [
@@ -999,6 +1031,7 @@ mod tests {
                 ("turn_started", self.turn_started),
                 ("turn_ended", self.turn_ended),
                 ("run_bang_escape", self.run_bang_escape),
+                ("run_login_argv", self.run_login_argv),
                 ("present_interaction", self.present_interaction),
                 #[cfg(feature = "rich-tui")]
                 ("open_panel", self.open_panel),
@@ -1026,6 +1059,17 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.run_bang_escape += 1;
             Ok(())
+        }
+
+        fn run_login_argv(
+            &mut self,
+            argv: &[String],
+            _color: bool,
+            _verbose: bool,
+        ) -> anyhow::Result<bool> {
+            assert_eq!(argv, &["literal-program", "argument"]);
+            self.run_login_argv += 1;
+            Ok(false)
         }
 
         #[cfg(feature = "rich-tui")]

@@ -71,14 +71,15 @@ pub struct RoleProfile {
     /// Declared role name (e.g. `"dragon-rider"`, `"worker"`). Independent of
     /// the persona file's stem, so a file can name the role it embodies.
     pub role: Option<String>,
-    /// Allow-list of tool names this role may use. `None` = unconstrained
-    /// (today's behavior); enforcement is a follow-up.
+    /// Preferred tools for an interactive persona; `None` means no preference.
+    /// Dedicated worker/server entrypoints may apply this as a role boundary.
     pub tools: Option<Vec<String>>,
     /// Skill names (matching a `SKILL.md` `name` under `skill_search_dirs`)
     /// this role binds on activation (FR-4, #1041). `None` = no bound
     /// skills — today's behavior, unaffected.
     pub skills: Option<Vec<String>>,
-    /// Capability profile (agent-bridle caveats) this role carries.
+    /// Declared capability profile. Advisory for interactive personas; explicit
+    /// worker/server role bindings may use it as an authority ceiling.
     pub caveats: Option<CaveatProfile>,
     /// Preferred backend model id (router policy hint).
     pub model: Option<String>,

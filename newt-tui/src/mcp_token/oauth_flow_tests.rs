@@ -7,6 +7,43 @@ use super::*;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn management_cancelled_oauth_stops_before_configuration_or_network() {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let policy = OAuthHopPolicy::with_explicit_hosts(&newt_core::caveats::Scope::All, &[]);
+    let error =
+        run_oauth_flow_cancellable("unregistered-test", "invalid-url", &policy, Some(cancel))
+            .await
+            .unwrap_err();
+    assert_eq!(error.to_string(), "MCP login cancelled");
+}
+
+/// Grounds the UI cancellation flag against the real callback listener: cancelling
+/// must release the port, rather than leaving a detached five-minute waiter.
+#[test]
+fn management_cancelled_callback_releases_its_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled = cancel.clone();
+    let waiter = std::thread::spawn(move || {
+        wait_for_oauth_callback(
+            listener,
+            "/callback".into(),
+            "expected-state".into(),
+            "https://issuer.example.test".into(),
+            false,
+            Some(cancelled),
+        )
+    });
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        waiter.join().unwrap().unwrap_err().to_string(),
+        "MCP login cancelled"
+    );
+    assert!(std::net::TcpListener::bind(address).is_ok());
+}
+
 #[test]
 fn pkce_verifier_and_challenge_are_distinct() {
     let p = gen_pkce().unwrap();

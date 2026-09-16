@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (5 steps)
+# Phase 10 — newt-cli polish (6 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -744,6 +744,29 @@ ANSI paragraph/reset cases, and command-help coverage. Real PTY tests ground
 themed reasoning/reply output and buffered paste, Enter, interrupt, and closure.
 **Out of scope:** terminal font/cursor controls, additional settings categories,
 backend discovery redesign, and external multiplexer transport changes.
+
+## Step 10.7 — MCP management and task-driven tool access
+
+**Branch:** `step-10.7-mcp-management`
+**Touches:** existing MCP discovery/client lifecycle, settings panels, terminal
+handoff, tool discovery, and persona guidance.
+**Implements:** `/settings → MCP` and `/mcp` open the same grouped manager.
+Inspect a server, its tools, descriptions, and parameter schemas. Show source
+conflicts, connection status, authentication, and tool counts. Login through
+existing OAuth or an explicitly configured trusted native login command;
+reconnect after success so the new child reads refreshed credentials. Reuse
+boxed panels, arrow navigation, Enter, and Esc back one level, retaining focus.
+Persona metadata steers preferences without hiding tools, denying actions, or
+minting grants. Evidence turns discover connected MCP tools and obtain explicit
+OCAP permission before dispatch. Plan restrictions and inherited authority
+ceilings remain enforced. Reuse tool search and deferred-schema promotion.
+**Tests:** discovery precedence/conflicts, trusted login configuration, nested
+navigation and focus, permission-gated tool discovery/dispatch, exact argv,
+success-only reconnect, stale catalog removal, and cancellation. Real local
+HTTP and PTY checks ground connection lifecycle and terminal ownership.
+**Out of scope:** copying another client's credentials, granting authority from
+server annotations or tool names, arbitrary tool invocation as a connection
+test, and replacing the existing OCAP or modal framework.
 
 ---
 

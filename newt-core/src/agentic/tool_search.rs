@@ -453,16 +453,14 @@ mod tests {
         );
     }
 
-    /// Twin: a tool the session does not grant (here, a persona catalog without
-    /// `run_command`) is genuinely absent and must not appear at all. The
-    /// persona's always-on infra may still be listed as hidden; `run_command`
-    /// may not.
+    /// A tool absent from the actual session catalog must not be invented.
     #[test]
     fn explain_search_does_not_invent_an_ungranted_tool() {
-        let granted = crate::agentic::filter_advertised_tools(
-            full_catalog(),
-            Some(&["read_file".to_string()]),
-        );
+        let mut granted = full_catalog();
+        granted
+            .as_array_mut()
+            .unwrap()
+            .retain(|def| def["function"]["name"] != "run_command");
         let out = execute_tool_search_for_disposition(
             "run_command",
             &granted,

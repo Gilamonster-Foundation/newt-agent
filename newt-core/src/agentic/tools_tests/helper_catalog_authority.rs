@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn persona_preferences_keep_unlisted_tools_discoverable() {
+    let defs = serde_json::json!([
+        {"function": {"name": "mail__search"}},
+        {"function": {"name": "read_file"}},
+        {"function": {"name": "write_file"}}
+    ]);
+    let preferred = vec!["read_file".to_string()];
+    let ranked = filter_advertised_tools(defs, Some(&preferred));
+    let names: Vec<_> = ranked
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|def| def["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["read_file", "mail__search", "write_file"]);
+}
+
+/// Grounds the persona preference rule in a real filesystem write: authority
+/// comes from the scoped caveats, even when the persona suggests only reads.
+#[tokio::test]
+async fn persona_preferences_do_not_veto_an_authorized_file_write() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let preferred = vec!["read_file".to_string()];
+    let target = ws.path().join("allowed.txt");
+    let args = serde_json::json!({"path": target, "content": "authorized"});
+    let caveats = crate::ToolPermissions {
+        preset: crate::PermissionPreset::WorkspaceEdit,
+        ..Default::default()
+    }
+    .to_caveats(&ws.path().to_string_lossy());
+    let out = call_offload("write_file", &args, &ws, &caveats, Some(&preferred)).await;
+    assert_eq!(
+        std::fs::read_to_string(&target).ok().as_deref(),
+        Some("authorized"),
+        "{out}"
+    );
+}
+
+#[test]
 fn read_only_git_catalog_exposes_only_read_operations() {
     let full = serde_json::json!([crate::agentic::git_tool::git_tool_definition()]);
     for disposition in [
@@ -62,12 +101,9 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it()
     }
 }
 
-/// FR-1 part 2 (#997): a persona's `tools:` allow-list scopes the ADVERTISED
-/// catalog — only the named tools survive, PLUS the always-on infra tools the
-/// loop can't run without (which no persona may fence off). `None` leaves the
-/// catalog whole (the zero-cost path for every non-persona session).
+/// Persona preferences retain the full catalog for task-driven discovery.
 #[test]
-fn persona_allow_list_filters_the_advertised_catalog() {
+fn persona_preferences_rank_the_full_advertised_catalog() {
     let git = Some(&crate::caveats::Scope::All);
     let full = merged_tool_definitions(
         &NoMcp, true, true, true, git, true, true, true, true, true, true, true, true,
@@ -85,12 +121,11 @@ fn persona_allow_list_filters_the_advertised_catalog() {
         name_set(&full),
         "None must be a no-op"
     );
-    // A read-only coach (`tools = ["read_file"]`): read_file survives; the
-    // mutating built-ins are dropped; every always-on infra tool still rides.
+    // A coach suggests read_file first; all other connected tools remain discoverable.
     let allow = vec!["read_file".to_string()];
     let got = name_set(&filter_advertised_tools(full, Some(&allow)));
     assert!(got.iter().any(|n| n == "read_file"), "granted tool kept");
-    for denied in [
+    for available in [
         "write_file",
         "edit_file",
         "delete_file",
@@ -98,8 +133,8 @@ fn persona_allow_list_filters_the_advertised_catalog() {
         "list_dir",
     ] {
         assert!(
-            !got.iter().any(|n| n == denied),
-            "{denied} must be filtered out"
+            got.iter().any(|n| n == available),
+            "{available} must remain discoverable"
         );
     }
     for infra in [
@@ -170,7 +205,10 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
     };
 
     let research = filter_tools_for_disposition(defs.clone(), PromptDisposition::Research);
-    assert_eq!(names(&research), vec!["read_file", "select_operating_mode"]);
+    assert_eq!(
+        names(&research),
+        vec!["read_file", "select_operating_mode", "incident__read"]
+    );
     let plan = filter_tools_for_disposition(defs.clone(), PromptDisposition::Plan);
     assert_eq!(
         names(&plan),
@@ -207,7 +245,7 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
         "select_operating_mode"
     ));
     assert!(!tool_allowed(PromptDisposition::Explain, "write_file"));
-    assert!(!tool_allowed(PromptDisposition::Research, "incident__read"));
+    assert!(tool_allowed(PromptDisposition::Research, "incident__read"));
     assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
     assert!(tool_allowed(PromptDisposition::Act, "incident__write"));
     // #1258: `find` carries the size column (sort=size/show_size), so an
@@ -310,18 +348,16 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
     );
 }
 
-/// FR-1 part 2 (#997): the executor is the ENFORCEMENT half. Even a
-/// hallucinated call the advertise-filter can't intercept is refused BY NAME
-/// before any side effect — while a granted tool and the always-on infra
-/// pass. Regression for a coach persona whose `tools:` list must be a real
-/// boundary, not a cosmetic hint.
+/// Real-filesystem ground truth: persona preferences cannot bypass OCAP.
 #[tokio::test]
-async fn executor_refuses_tools_outside_the_persona_allow_list() {
+async fn persona_preferences_preserve_explicit_file_authority() {
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = crate::ToolPermissions {
+        preset: crate::PermissionPreset::ReadOnly,
+        ..Default::default()
+    }
+    .to_caveats(&ws.path().to_string_lossy());
     let allow = vec!["read_file".to_string()];
-    // write_file is NOT granted → refused with the persona message, and the
-    // file is never written (top caveats would otherwise permit it).
     let target = ws.path().join("blocked.txt");
     let args = serde_json::json!({
         "path": target.to_string_lossy(),
@@ -329,8 +365,8 @@ async fn executor_refuses_tools_outside_the_persona_allow_list() {
     });
     let out = call_offload("write_file", &args, &ws, &caveats, Some(&allow)).await;
     assert!(
-        out.contains("not available under the active persona"),
-        "expected persona refusal, got: {out}"
+        out.contains("fs_write"),
+        "expected explicit capability refusal, got: {out}"
     );
     assert!(!target.exists(), "a denied write must not touch the fs");
     // An always-on infra tool rides even though it is unlisted.

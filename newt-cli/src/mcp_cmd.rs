@@ -533,6 +533,7 @@ fn build_entry(
         env: parse_env_pairs(env)?,
         url,
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: timeout_secs,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,

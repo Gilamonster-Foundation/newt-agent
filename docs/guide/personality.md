@@ -51,6 +51,13 @@ in the saved file, even when their rows were untouched. Reselecting that saved
 persona can therefore affect more than communication style; inspect the full
 projection before saving.
 
+In interactive Newt, a persona steers behavior. Its `tools` list ranks preferred
+tools; other connected tools remain discoverable when the task needs them.
+Persona `caveats` are guidance and do not change the session's authority.
+Explicit OCAP settings, postures, and delegation ceilings control access.
+Remote MCP calls require an operator permission decision, including tools named
+by the persona. Manage permissions from `/settings → Permissions (OCAP)`.
+
 The save retains the selected profile's prose and other parsed metadata,
 including its tools, skills, and caveats. It does not preserve the original TOML
 comments or formatting. A failed save leaves the draft open; it must not be
