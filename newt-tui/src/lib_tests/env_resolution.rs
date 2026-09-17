@@ -789,7 +789,7 @@ fn venv_cmd_prefix_builds_exports_or_none() {
 #[cfg(unix)]
 #[serial_test::serial(real_fs)]
 #[test]
-fn scan_cli_exec_grants_collects_only_executables() {
+fn exact_executable_grants_scan_cli_paths_without_basename_authority() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::TempDir::new().unwrap();
     let exe = dir.path().join("mytool");
@@ -797,26 +797,39 @@ fn scan_cli_exec_grants_collects_only_executables() {
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(dir.path().join("README"), "not executable").unwrap();
     let dir_str = dir.path().to_string_lossy().into_owned();
+    let bin = dir.path().join("venv/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let interpreter = bin.join("python");
+    std::os::unix::fs::symlink(&exe, &interpreter).unwrap();
+    let venv = dir.path().join("venv").to_string_lossy().into_owned();
 
     with_env_vars(
-        &[("NEWT_EXEC_PATHS", &dir_str)],
-        &["NEWT_VENV", "VIRTUAL_ENV"],
+        &[("NEWT_EXEC_PATHS", &dir_str), ("NEWT_VENV", &venv)],
+        &["VIRTUAL_ENV"],
         || {
             let grants = scan_cli_exec_grants();
-            assert!(grants.contains(&"mytool".to_string()), "got: {grants:?}");
-            assert!(
-                !grants.contains(&"README".to_string()),
-                "non-executables excluded: {grants:?}"
+            assert_eq!(
+                grants,
+                vec![
+                    interpreter.to_string_lossy().into_owned(),
+                    exe.to_string_lossy().into_owned()
+                ]
             );
 
             // And policy_for widens a Scope::Only exec set with the grants.
-            let tui = newt_core::TuiConfig::default(); // WorkspaceDev preset
+            let mut tui = newt_core::TuiConfig::default();
+            tui.permissions.preset = newt_core::PermissionPreset::ReadOnly;
             let policy = policy_for(Some(tui), "/ws");
             use newt_core::CaveatsExt;
             assert!(
-                policy.permits_exec("mytool"),
+                policy.permits_exec(&exe.to_string_lossy()),
                 "CLI exec grant must widen the session exec scope"
             );
+            assert!(!policy.permits_exec("mytool"));
+            assert!(!policy.permits_exec("/another/bin/mytool"));
+            assert!(policy.permits_exec(&interpreter.to_string_lossy()));
+            assert!(!policy.permits_exec("python"));
+            assert!(!policy.permits_exec("/another/bin/python"));
         },
     );
 }

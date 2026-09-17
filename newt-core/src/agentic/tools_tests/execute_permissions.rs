@@ -371,6 +371,106 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
     assert_eq!(events.last(), Some(&expected_finish), "events: {events:?}");
 }
 
+/// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
+/// A harmless test executable is reached through temporary non-system symlinks;
+/// granting one must launch it without granting its same-named sibling.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = super::disable_ocap_tests::EnvVar::unset("NEWT_FULL_ACCESS");
+    let ws = tempfile::tempdir().unwrap();
+    let root = ws.path().canonicalize().unwrap();
+    let approved = root.join("approved");
+    let other = root.join("other");
+    std::fs::create_dir(&approved).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let executable = approved.join("python");
+    let sibling = other.join("python");
+    let image = std::env::current_exe().unwrap().canonicalize().unwrap();
+    std::os::unix::fs::symlink(&image, &executable).unwrap();
+    std::os::unix::fs::symlink(&image, &sibling).unwrap();
+    const CHILD: &str =
+        "agentic::tools::execute_tool_branch_tests::permissions::exact_executable_child";
+    let control = std::process::Command::new(&executable)
+        .args(["--exact", CHILD, "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    assert!(control.status.success(), "unconfined fixture must work");
+    assert!(String::from_utf8_lossy(&control.stdout)
+        .lines()
+        .any(|line| line == "EXACT_EXEC_OK"));
+    let base = Caveats {
+        fs_read: Scope::only([
+            root.to_string_lossy().into_owned(),
+            image.to_string_lossy().into_owned(),
+        ]),
+        fs_write: Scope::none(),
+        ..caveats_rw(&root)
+    };
+    let mut gate = MockGate::new(true, &base);
+    let command = format!(
+        "'{}' --exact {CHILD} --ignored --nocapture",
+        executable.display()
+    );
+    let result = run_tool_gated(
+        "run_command",
+        serde_json::json!({"command": command}),
+        &root,
+        &base,
+        &mut gate,
+    )
+    .await;
+    assert!(
+        result.lines().any(|line| line == "EXACT_EXEC_OK"),
+        "real sandbox result: {result}"
+    );
+    assert!(
+        !result.starts_with("error:"),
+        "child must exit successfully: {result}"
+    );
+    assert_eq!(
+        gate.asks,
+        vec![(
+            "run_command".into(),
+            format!("exec:{}", executable.display())
+        )]
+    );
+
+    let granted = crate::agentic::widen_caveats(
+        &base,
+        &[(DenialKind::Exec, executable.to_string_lossy().into_owned())],
+    );
+    let denied = run_tool(
+        "run_command",
+        serde_json::json!({"command": format!("'{}' WRONG_BINARY", sibling.display())}),
+        &root,
+        &granted,
+        None,
+    )
+    .await;
+    assert!(denied.starts_with("capability denied:"), "{denied}");
+    // The same one-call policy does not change the next invocation's baseline.
+    let again = run_tool(
+        "run_command",
+        serde_json::json!({"command": command}),
+        &root,
+        &base,
+        None,
+    )
+    .await;
+    assert!(again.starts_with("capability denied:"), "{again}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "private child entrypoint for the real exact-executable grant test"]
+fn exact_executable_child() {
+    println!("EXACT_EXEC_OK");
+}
+
 /// Gate denies → the result is the standard denial, bit-for-bit equal to
 /// the no-gate path (#263: deny = the current denial result).
 #[tokio::test]

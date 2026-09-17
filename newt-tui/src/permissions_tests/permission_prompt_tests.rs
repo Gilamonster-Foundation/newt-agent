@@ -2067,6 +2067,106 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
 }
 
 #[test]
+fn exact_executable_grants_preserve_immediate_and_proactive_once_authority() {
+    for proactive in [false, true] {
+        let target = "/opt/test-venv/bin/python";
+        let other = "/opt/other-venv/bin/python";
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![
+                PromptChoice::AllowOnce,
+                PromptChoice::Deny,
+                PromptChoice::Deny,
+            ],
+            prompts.clone(),
+        );
+        let mut request = exec_request(target);
+        if proactive {
+            request.tool = "request_permissions".into();
+        }
+        let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
+            panic!("exact executable should be grantable once");
+        };
+        assert_eq!(granted.exec, Scope::only(["cargo".into(), target.into()]));
+        assert_eq!(granted.fs_read, base.fs_read);
+        assert_eq!(granted.fs_write, base.fs_write);
+        assert_eq!(granted.net, base.net);
+        // A different executable with the same basename cannot consume the grant.
+        assert!(matches!(
+            gate.ask(&[exec_request(other)]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 2);
+        if proactive {
+            let newt_core::PermissionDecision::Allow(retry) = gate.ask(&[exec_request(target)])
+            else {
+                panic!("the exact pending grant must survive an unrelated request");
+            };
+            assert_eq!(retry.exec, granted.exec);
+            assert_eq!(
+                prompts.get(),
+                2,
+                "the exact retry consumes the pending approval"
+            );
+        }
+        assert!(matches!(
+            gate.ask(&[exec_request(target)]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 3, "allow once never becomes sticky");
+        drop(gate);
+        assert!(state.pending_once_grants.is_empty());
+        assert!(state.session_grants.is_empty());
+    }
+}
+
+#[test]
+fn exact_executable_grants_respect_existing_basename_denials() {
+    for source in ["session", "persistent", "ocap"] {
+        let mut state = PermissionPromptState::default();
+        let denied = (DenialKind::Exec, "python".into());
+        match source {
+            "session" => {
+                state.session_denials.insert(denied);
+            }
+            "persistent" => {
+                state.persistent_denials.insert(denied);
+            }
+            _ => {
+                state.ocap_policy = ocap(
+                    newt_core::ocap_store::Verdict::Deny,
+                    "[[exec]]\ntarget = \"python\"\n",
+                );
+            }
+        }
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        assert!(matches!(
+            gate.ask(&[exec_request("/opt/test-venv/bin/python")]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(
+            prompts.get(),
+            0,
+            "a previous deny must not become a new prompt"
+        );
+    }
+}
+
+#[test]
 fn session_grant_exec_matches_by_basename() {
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));
