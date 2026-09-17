@@ -360,6 +360,12 @@ fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
 }
 
 /// Pure status text for the canonical inference spinner.
+///
+/// `idle_timeout_secs` bounds the gap between response chunks, not the whole
+/// attempt — a slow-but-progressing stream can run up to
+/// `newt_inference::local::STREAM_TOTAL_TIMEOUT_MULTIPLIER` times longer
+/// before the attempt's total read deadline cuts it off, so the label says
+/// "idle timeout" rather than implying attempts are bounded at this figure.
 fn inference_progress_label(
     model: &str,
     attempt: u32,
