@@ -1,5 +1,6 @@
 //! Completion publication occurs before presentation can discard the return.
 use super::*;
+use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
 use crate::agentic::smart_harness::SmartHarness;
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W
     let batch = harness.fixture_tool_batch("fixture__read", serde_json::json!({}));
     let invocation = batch.start(0, None).unwrap();
     let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    let mut permission = FixtureMcpPermission::new("fixture__read", &caveats);
     let mut display = crate::agentic::display::ToolDisplay::new(writer, false, 80, 20, false);
     let error = execute_tool_with_display_cancellable(
         &mut display,
@@ -46,7 +48,7 @@ async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W
         &mut mcp,
         ToolCollaborators {
             invocation: Some(&invocation),
-            persona_tools: Some(&["fixture__read".to_string()]),
+            permission_gate: Some(&mut permission),
             ..Default::default()
         },
         false,
@@ -81,12 +83,12 @@ async fn persistence_failure_preserves_result_with_captured_or_discarded_display
     assert!(format!("{error:#}").contains("frame storage"));
 }
 
-/// Grounds pre-dispatch persona and permission refusals in the real dispatcher:
-/// denied file writes and an ungranted remote call never execute, and their
+/// Grounds pre-dispatch posture and permission refusals in the real dispatcher:
+/// Plan-mode file writes and an ungranted remote call never execute, and their
 /// authored refusal is retained as Harness material rather than tool evidence.
 #[tokio::test]
 #[serial_test::serial]
-async fn persona_and_permission_refusals_retain_host_origin() {
+async fn posture_and_permission_refusals_retain_host_origin() {
     for name in ["write_file", "fixture__read"] {
         let workspace = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -102,6 +104,11 @@ async fn persona_and_permission_refusals_retain_host_origin() {
         let batch = harness.fixture_tool_batch(name, args.clone());
         let invocation = batch.start(0, None).unwrap();
         let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+        let disposition = if name == "write_file" {
+            PromptDisposition::Plan
+        } else {
+            PromptDisposition::Act
+        };
         let mut display =
             crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
         let output = execute_tool_with_display_cancellable(
@@ -119,7 +126,7 @@ async fn persona_and_permission_refusals_retain_host_origin() {
                 ..Default::default()
             },
             false,
-            PromptDisposition::Act,
+            disposition,
             None,
         )
         .await

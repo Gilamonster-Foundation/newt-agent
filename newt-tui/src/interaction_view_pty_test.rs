@@ -344,6 +344,8 @@ pub(crate) fn drive_cockpit_bang() {
     let mut failure = None;
     for (step, input) in ["hello child\r", "\x03", "\x04", "after interrupts\r"]
         .into_iter()
+        .cycle()
+        .take(8)
         .enumerate()
     {
         if !pty.wait_for_screen(&format!("BANG_READY_{step}>"), REACH_TIMEOUT) {

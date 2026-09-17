@@ -457,6 +457,11 @@ pub struct McpServerEntry {
     /// stdio: arguments to the executable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Operator-configured login command, executed as literal argv after confirmation.
+    /// Only trusted, enabled stdio entries may offer it; borrowed configuration
+    /// cannot supply host-side login commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub login_argv: Vec<String>,
     /// stdio: extra environment for the child. Each value is a [`SecretValue`]
     /// (a literal — possibly `${...}`-interpolated — or a `{ env | file | cmd }`
     /// reference), resolved host-side at spawn.
@@ -496,6 +501,18 @@ pub struct McpServerEntry {
 }
 
 impl McpServerEntry {
+    /// The explicitly configured operator login, never a server-advertised command.
+    pub fn operator_login_argv(&self) -> Option<&[String]> {
+        (self.enabled
+            && self.trust == McpTrust::Trusted
+            && self.transport == TransportKind::Stdio
+            && self
+                .login_argv
+                .first()
+                .is_some_and(|program| !program.trim().is_empty()))
+        .then_some(self.login_argv.as_slice())
+    }
+
     /// Whether this entry has the fields its transport requires. An invalid
     /// entry (e.g. a stdio server with no `command`) is dropped during discovery
     /// rather than silently producing a server that can never connect.
@@ -553,6 +570,9 @@ pub(crate) fn entry_to_toml_table(
     }
     if !entry.args.is_empty() {
         table["args"] = toml_edit::value(toml_edit::Array::from_iter(&entry.args));
+    }
+    if !entry.login_argv.is_empty() {
+        table["login_argv"] = toml_edit::value(toml_edit::Array::from_iter(&entry.login_argv));
     }
     if !entry.env.is_empty() {
         table["env"] = toml_edit::value(secret_map_to_inline_table(&entry.env));
@@ -621,6 +641,7 @@ pub fn parse_claude_mcp(value: &serde_json::Value) -> Vec<McpServerEntry> {
             // mark it UNTRUSTED at the single parse funnel so its secrets never
             // interpolate / execute a `${cmd:…}` or `{ cmd = … }` (#1301).
             parsed.trust = McpTrust::Untrusted;
+            parsed.login_argv.clear();
             Some(parsed)
         })
         .collect()
@@ -1037,6 +1058,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         env: BTreeMap::new(),
                         url: Some(url),
                         headers,
+                        login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
                         trust: McpTrust::Untrusted,
                     })
@@ -1087,6 +1109,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         env: forwarded_env,
                         url: None,
                         headers: BTreeMap::new(),
+                        login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
                         trust: McpTrust::Untrusted,
                     })
@@ -1280,24 +1303,87 @@ pub fn runtime_server_prefix_is_unambiguous(name: &str, sanitize: bool) -> bool 
     !runtime_server_prefix(name, sanitize).contains("__")
 }
 
-/// Dedup a precedence-ordered source list: first valid claimant of an emitted
-/// runtime prefix wins. Invalid entries are dropped before they can claim it.
-fn dedup_valid_first_wins(
-    sources: Vec<McpServerEntry>,
-    sanitize_server_names: bool,
-) -> Vec<McpServerEntry> {
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for entry in sources {
-        let prefix = runtime_server_prefix(&entry.name, sanitize_server_names);
-        if entry.is_valid()
-            && runtime_server_prefix_is_unambiguous(&entry.name, sanitize_server_names)
-            && seen.insert(prefix)
-        {
-            out.push(entry);
+/// Discovery origin, retained for inspection without changing authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpSource {
+    /// The resolved Newt configuration; individual entries retain their trust.
+    Configuration,
+    /// The user-owned Newt MCP file.
+    UserMcpFile,
+    /// Borrowed Claude user configuration.
+    ClaudeUser,
+    /// Borrowed workspace configuration.
+    ClaudeProject,
+}
+
+/// A valid discovered entry and its source, before connection.
+#[derive(Debug, Clone)]
+pub struct DiscoveredMcpServer {
+    /// The winning configuration, including its original trust marker.
+    pub entry: McpServerEntry,
+    /// Where discovery found it.
+    pub source: McpSource,
+}
+
+/// A lower-precedence entry hidden by an existing tool namespace.
+#[derive(Debug, Clone)]
+pub struct McpConflict {
+    /// The hidden server name.
+    pub name: String,
+    /// Its discovery source.
+    pub source: McpSource,
+    /// The selected server owning the emitted namespace.
+    pub winner: String,
+}
+
+/// An ephemeral discovery view. It grants no authority and contains no resolved secrets.
+#[derive(Debug, Default)]
+pub struct McpDiscoveryReport {
+    /// Valid entries in precedence order.
+    pub servers: Vec<DiscoveredMcpServer>,
+    /// Valid entries shadowed by an earlier namespace.
+    pub conflicts: Vec<McpConflict>,
+}
+
+fn dedup_report(sources: Vec<DiscoveredMcpServer>, sanitize: bool) -> McpDiscoveryReport {
+    let mut seen = BTreeMap::new();
+    let mut report = McpDiscoveryReport::default();
+    for server in sources {
+        let entry = &server.entry;
+        if !entry.is_valid() || !runtime_server_prefix_is_unambiguous(&entry.name, sanitize) {
+            continue;
+        }
+        let prefix = runtime_server_prefix(&entry.name, sanitize);
+        if let Some(winner) = seen.get(&prefix) {
+            report.conflicts.push(McpConflict {
+                name: entry.name.clone(),
+                source: server.source,
+                winner: String::clone(winner),
+            });
+        } else {
+            seen.insert(prefix, entry.name.clone());
+            report.servers.push(server);
         }
     }
-    out
+    report
+}
+
+#[cfg(test)]
+fn dedup_valid_first_wins(sources: Vec<McpServerEntry>, sanitize: bool) -> Vec<McpServerEntry> {
+    dedup_report(
+        sources
+            .into_iter()
+            .map(|entry| DiscoveredMcpServer {
+                entry,
+                source: McpSource::Configuration,
+            })
+            .collect(),
+        sanitize,
+    )
+    .servers
+    .into_iter()
+    .map(|server| server.entry)
+    .collect()
 }
 
 /// Resolve the merged, deduped MCP server list.
@@ -1333,49 +1419,52 @@ pub fn discover_with_namespace_mode(
     workspace: &Path,
     sanitize_server_names: bool,
 ) -> Vec<McpServerEntry> {
-    // Provenance is stamped at each merge point (the #1301 trust boundary):
-    // the two newt-owned sources are TRUSTED, the two borrowed Claude overlays
-    // are UNTRUSTED (also enforced at the `parse_claude_mcp` funnel).
-    let trusted = |mut e: McpServerEntry| {
-        e.trust = McpTrust::Trusted;
-        e
+    discover_report_with_namespace_mode(
+        newt_servers,
+        newt_mcp_toml,
+        home,
+        workspace,
+        sanitize_server_names,
+    )
+    .servers
+    .into_iter()
+    .map(|server| server.entry)
+    .collect()
+}
+
+/// The same discovery and precedence used for connection, retaining origins and conflicts.
+pub fn discover_report_with_namespace_mode(
+    newt_servers: &[McpServerEntry],
+    newt_mcp_toml: Option<&Path>,
+    home: Option<&Path>,
+    workspace: &Path,
+    sanitize_server_names: bool,
+) -> McpDiscoveryReport {
+    // Resolved project entries retain Untrusted; native user files are trusted.
+    // Borrowed parsers stamp Untrusted and strip operator-only login commands.
+    let mut sources = Vec::new();
+    let mut append = |entries: Vec<McpServerEntry>, source| {
+        sources.extend(
+            entries
+                .into_iter()
+                .map(|entry| DiscoveredMcpServer { entry, source }),
+        );
     };
-    // `newt_servers` come from `Config::resolve`, which already stamps a
-    // walked-up project `.newt/config.toml`'s entries UNTRUSTED (a cloned repo
-    // can ship one — the residual #1301 vector). PRESERVE that mark; only a
-    // genuinely newt-owned entry (default-Trusted, or a hand-built one) is
-    // (re-)stamped Trusted. This closure must never re-elevate an Untrusted
-    // entry back to Trusted.
-    let preserve_or_trust = |mut e: McpServerEntry| {
-        if e.trust != McpTrust::Untrusted {
-            e.trust = McpTrust::Trusted;
-        }
-        e
-    };
-    let untrusted = |mut e: McpServerEntry| {
-        e.trust = McpTrust::Untrusted;
-        e
-    };
-    let mut sources: Vec<McpServerEntry> = Vec::new();
-    sources.extend(newt_servers.iter().cloned().map(preserve_or_trust));
+    append(newt_servers.to_vec(), McpSource::Configuration);
     if let Some(path) = newt_mcp_toml {
-        // `~/.newt/mcp.toml` is a purely user-owned source (never a walk-up),
-        // so its entries are unconditionally TRUSTED.
-        sources.extend(load_newt_mcp_toml(path).into_iter().map(trusted));
+        append(load_newt_mcp_toml(path), McpSource::UserMcpFile);
     }
     if let Some(home) = home {
-        sources.extend(
-            load_claude_file(&home.join(".claude.json"))
-                .into_iter()
-                .map(untrusted),
+        append(
+            load_claude_file(&home.join(".claude.json")),
+            McpSource::ClaudeUser,
         );
     }
-    sources.extend(
-        load_claude_file(&workspace.join(".mcp.json"))
-            .into_iter()
-            .map(untrusted),
+    append(
+        load_claude_file(&workspace.join(".mcp.json")),
+        McpSource::ClaudeProject,
     );
-    dedup_valid_first_wins(sources, sanitize_server_names)
+    dedup_report(sources, sanitize_server_names)
 }
 
 #[cfg(test)]

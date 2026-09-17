@@ -116,7 +116,7 @@ async fn private_address_fetch_failure_routes_to_connected_mcp_first() {
 
     // Exercise the instructed route against the same live catalog: discovery
     // returns the exact MCP name, and the dispatcher invokes that remote tool
-    // under an explicit persona grant. No shell or human-input tool enters the
+    // under an explicit operator grant. No shell or human-input tool enters the
     // sequence.
     let catalog = callable_mcp_catalog(&mcp, None, PromptDisposition::Act);
     let discovered =
@@ -125,16 +125,17 @@ async fn private_address_fetch_failure_routes_to_connected_mcp_first() {
         discovered.contains("opaque_bridge__read_object"),
         "tool_search must discover the connector: {discovered}"
     );
-    let allowed = vec!["opaque_bridge__read_object".to_string()];
+    let caveats = Caveats::top();
+    let mut gate = MockGate::new(true, &caveats);
     let mut routed_mcp = OneRemoteTool::new("opaque_bridge__read_object")
         .with_resource_url_prefixes(&["https://reviews.example.test/reviews/"]);
     let result = run_remote_gated(
         "opaque_bridge__read_object",
         std::path::Path::new("."),
-        &Caveats::top(),
-        Some(&allowed),
-        &mut routed_mcp,
+        &caveats,
         None,
+        &mut routed_mcp,
+        Some(&mut gate),
     )
     .await;
     assert_eq!(result, "remote-tool-ran");

@@ -1490,6 +1490,17 @@ pub async fn run_oauth_flow(
     server_url: &str,
     policy: &OAuthHopPolicy,
 ) -> anyhow::Result<()> {
+    run_oauth_flow_cancellable(server_name, server_url, policy, None).await
+}
+
+/// Interactive variant using the terminal owner's existing cancellation flag.
+pub(crate) async fn run_oauth_flow_cancellable(
+    server_name: &str,
+    server_url: &str,
+    policy: &OAuthHopPolicy,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<()> {
+    check_login_cancel(cancel.as_deref())?;
     let dir = {
         let home = platform_home_dir()
             .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
@@ -1630,6 +1641,8 @@ pub async fn run_oauth_flow(
         requested_scope.as_deref(),
     )?;
 
+    check_login_cancel(cancel.as_deref())?;
+
     // ── 5. Open browser ───────────────────────────────────────────────────
     println!("\nMCP OAuth: authorization required for `{server_name}`.");
     println!("Opening your browser to complete the login…\n");
@@ -1648,78 +1661,19 @@ pub async fn run_oauth_flow(
     let expected_state = state.clone();
     let expected_issuer = issuer.clone();
     let issuer_parameter_advertised = discovered.authorization_response_iss_parameter_supported;
-    let code = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        listener.set_nonblocking(true)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-        loop {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        anyhow::bail!("timed out waiting for OAuth callback");
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-            let mut buf = [0u8; 8192];
-            let n = match stream.read(&mut buf) {
-                Ok(n) => n,
-                Err(_) => {
-                    write_callback_response(&mut stream, "408 Request Timeout", b"Invalid callback");
-                    continue;
-                }
-            };
-            let request = match std::str::from_utf8(&buf[..n]) {
-                Ok(request) if request.contains("\r\n\r\n") => request,
-                _ => {
-                    write_callback_response(&mut stream, "400 Bad Request", b"Invalid callback");
-                    continue;
-                }
-            };
-            let target = match callback_request_target(request) {
-                Ok(target) => target,
-                Err(_) => {
-                    write_callback_response(&mut stream, "400 Bad Request", b"Invalid callback");
-                    continue;
-                }
-            };
-            let returned_path = target.split_once('?').map_or(target, |(path, _)| path);
-            if returned_path != expected_callback_path {
-                write_callback_response(&mut stream, "404 Not Found", b"Unknown callback path");
-                continue;
-            }
-            let callback = parse_callback(target);
-            match validate_authorization_response(
-                &callback,
-                &expected_state,
-                &expected_issuer,
-                issuer_parameter_advertised,
-            ) {
-                Ok(code) => {
-                    write_callback_response(
-                        &mut stream,
-                        "200 OK",
-                        b"<html><body><h2>Authorization successful</h2><p>You can close this tab and return to newt.</p></body></html>",
-                    );
-                    return Ok(code);
-                }
-                Err(error)
-                    if callback.state.as_deref() == Some(expected_state.as_str())
-                        && callback.error.is_some() =>
-                {
-                    write_callback_response(&mut stream, "400 Bad Request", b"Authorization rejected");
-                    return Err(error);
-                }
-                Err(_) => {
-                    write_callback_response(&mut stream, "400 Bad Request", b"Invalid callback");
-                }
-            }
-        }
+    let callback_cancel = cancel.clone();
+    let code = tokio::task::spawn_blocking(move || {
+        wait_for_oauth_callback(
+            listener,
+            expected_callback_path,
+            expected_state,
+            expected_issuer,
+            issuer_parameter_advertised,
+            callback_cancel,
+        )
     })
     .await??;
+    check_login_cancel(cancel.as_deref())?;
 
     // ── 7. Token exchange ─────────────────────────────────────────────────
     println!("Authorization code received — exchanging for tokens…");
@@ -1753,6 +1707,8 @@ pub async fn run_oauth_flow(
     let body = bounded_response_body(resp).await?;
     let tok = parse_token_response(&body)?;
 
+    check_login_cancel(cancel.as_deref())?;
+
     // ── 8. Persist ────────────────────────────────────────────────────────
     let transaction = acquire_credential_lock(&dir, server_name)?;
     ensure_credential_snapshot(&dir, server_name, &initial_snapshot)?;
@@ -1779,6 +1735,94 @@ pub async fn run_oauth_flow(
 
     println!("✓ Authenticated `{server_name}`. Newt credential generation saved privately.");
     Ok(())
+}
+
+fn check_login_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+        "MCP login cancelled"
+    );
+    Ok(())
+}
+
+fn wait_for_oauth_callback(
+    listener: std::net::TcpListener,
+    expected_callback_path: String,
+    expected_state: String,
+    expected_issuer: String,
+    issuer_parameter_advertised: bool,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<String> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        check_login_cancel(cancel.as_deref())?;
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting for OAuth callback");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let mut buf = [0u8; 8192];
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => {
+                write_callback_response(&mut stream, "408 Request Timeout", b"Invalid callback");
+                continue;
+            }
+        };
+        let request = match std::str::from_utf8(&buf[..n]) {
+            Ok(request) if request.contains("\r\n\r\n") => request,
+            _ => {
+                write_callback_response(&mut stream, "400 Bad Request", b"Invalid callback");
+                continue;
+            }
+        };
+        let target = match callback_request_target(request) {
+            Ok(target) => target,
+            Err(_) => {
+                write_callback_response(&mut stream, "400 Bad Request", b"Invalid callback");
+                continue;
+            }
+        };
+        let returned_path = target.split_once('?').map_or(target, |(path, _)| path);
+        if returned_path != expected_callback_path {
+            write_callback_response(&mut stream, "404 Not Found", b"Unknown callback path");
+            continue;
+        }
+        let callback = parse_callback(target);
+        match validate_authorization_response(
+            &callback,
+            &expected_state,
+            &expected_issuer,
+            issuer_parameter_advertised,
+        ) {
+            Ok(code) => {
+                write_callback_response(
+                        &mut stream,
+                        "200 OK",
+                        b"<html><body><h2>Authorization successful</h2><p>You can close this tab and return to newt.</p></body></html>",
+                    );
+                return Ok(code);
+            }
+            Err(error)
+                if callback.state.as_deref() == Some(expected_state.as_str())
+                    && callback.error.is_some() =>
+            {
+                write_callback_response(&mut stream, "400 Bad Request", b"Authorization rejected");
+                return Err(error);
+            }
+            Err(_) => {
+                write_callback_response(&mut stream, "400 Bad Request", b"Invalid callback");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

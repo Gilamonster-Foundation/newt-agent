@@ -642,6 +642,7 @@ async fn probe_stdio(
             env: env.clone(),
             url: None,
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: args.timeout_secs,
             // Operator-typed on the CLI — newt-owned, trusted config.
             trust: McpTrust::Trusted,
@@ -707,6 +708,7 @@ async fn probe_url(
         env: BTreeMap::new(),
         url: Some(url.to_string()),
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: args.timeout_secs,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
@@ -1077,6 +1079,7 @@ mod tests {
                 env: BTreeMap::new(),
                 url: None,
                 headers: BTreeMap::new(),
+                login_argv: Vec::new(),
                 request_timeout_secs: None,
                 trust: McpTrust::Trusted,
             },

@@ -115,12 +115,22 @@ pub(crate) fn cockpit_bang_case() {
     let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
     let worker = std::thread::spawn(move || {
         let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
-        for step in 0..4 {
+        for step in 0..8 {
             let command = format!(
                 "printf 'BANG_READY_{step}>'; IFS= read -r answer; result=$?; \
                  printf '\\nBANG_READ_{step}:%s:%s\\n' \"$result\" \"$answer\"; exit $result"
             );
-            remote.run_bang_escape(&command, false, false).unwrap();
+            if step < 4 {
+                remote.run_bang_escape(&command, false, false).unwrap();
+            } else {
+                // The configured-login path must lend the same real tty and
+                // report failure/interrupt so the manager reconnects only on
+                // success. Fixed fixture argv; no server-controlled shell.
+                let success = remote
+                    .run_login_argv(&["/bin/sh".into(), "-c".into(), command], false, false)
+                    .unwrap();
+                assert_eq!(success, matches!(step, 4 | 7));
+            }
             assert_eq!(unsafe { libc::tcgetpgrp(0) }, unsafe { libc::getpgrp() });
             println!("BANG_RETURN_{step}");
             match remote.read_line("after bang").unwrap() {

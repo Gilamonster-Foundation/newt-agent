@@ -1,5 +1,6 @@
 //! Completed calls must survive an interrupted sibling in the same provider batch.
 use super::*;
+use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
 use crate::launch_authority::{self, LaunchAuthority};
 
 const TOOL: &str = "durability__get_result";
@@ -140,13 +141,13 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
     let cancel = AtomicBool::new(false);
     let mut reason = None;
     let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-    let allow = vec![TOOL.to_string()];
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
     let uri = server.uri();
     let current = msgs();
     let mut context = ctx(&uri, &current, &caveats);
     context.workspace = workspace.path().to_str().unwrap();
     context.smart_harness = Some(&harness);
-    context.persona_tools = Some(&allow);
+    context.permission_gate = Some(&mut permission);
     context.cancel = Some(&cancel);
     context.end_reason = Some(&mut reason);
     context.kind = match wire {
@@ -282,7 +283,7 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
     let mut context = ctx(&uri, &current, &caveats);
     context.workspace = workspace.path().to_str().unwrap();
     context.smart_harness = Some(&harness);
-    context.persona_tools = Some(&allow);
+    context.permission_gate = Some(&mut permission);
     context.kind = backend(wire);
     let resumed = if wire == "responses" {
         openai_responses_complete(context, &mut mcp).await
@@ -493,13 +494,13 @@ async fn all_four_completed_batches_preserve_observed_errors_and_large_sources()
             permissions: None,
         };
         let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-        let allow = vec![TOOL.to_owned()];
+        let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
         let uri = server.uri();
         let current = msgs();
         let mut context = ctx(&uri, &current, &caveats);
         context.workspace = workspace.path().to_str().unwrap();
         context.smart_harness = Some(&harness);
-        context.persona_tools = Some(&allow);
+        context.permission_gate = Some(&mut permission);
         context.kind = backend(wire);
         let result = if wire == "responses" {
             openai_responses_complete(context, &mut mcp).await
@@ -592,13 +593,13 @@ async fn all_four_persistence_failures_preserve_return_and_stop_before_next_tool
             permissions: None,
         };
         let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-        let allow = vec![TOOL.to_owned()];
+        let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
         let uri = server.uri();
         let current = msgs();
         let mut context = ctx(&uri, &current, &caveats);
         context.workspace = workspace.path().to_str().unwrap();
         context.smart_harness = Some(&harness);
-        context.persona_tools = Some(&allow);
+        context.permission_gate = Some(&mut permission);
         context.kind = backend(wire);
         let error = if wire == "responses" {
             openai_responses_complete(context, &mut mcp).await
@@ -818,13 +819,13 @@ async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
         permissions: None,
     };
     let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-    let allow = vec![TOOL.to_owned()];
+    let mut permission = FixtureMcpPermission::new(TOOL, &caveats);
     let uri = server.uri();
     let current = msgs();
     let mut context = ctx(&uri, &current, &caveats);
     context.workspace = workspace.path().to_str().unwrap();
     context.smart_harness = Some(&harness);
-    context.persona_tools = Some(&allow);
+    context.permission_gate = Some(&mut permission);
     context.spill_store = Some(&store);
     context.kind = backend(wire);
     let error = if wire == "responses" {
@@ -883,7 +884,7 @@ async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
         let mut context = ctx(&uri, &current, &caveats);
         context.workspace = workspace.path().to_str().unwrap();
         context.smart_harness = Some(&harness);
-        context.persona_tools = Some(&allow);
+        context.permission_gate = Some(&mut permission);
         context.kind = backend(wire);
         let resumed = openai_responses_complete(context, &mut mcp)
             .await

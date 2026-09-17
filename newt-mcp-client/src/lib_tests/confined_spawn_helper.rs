@@ -77,6 +77,7 @@ fn resolve_env_grants_includes_the_entry_env() {
         )]),
         url: None,
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
     };

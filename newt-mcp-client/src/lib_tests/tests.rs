@@ -1,5 +1,23 @@
 use super::*;
 
+#[tokio::test]
+async fn management_tool_annotations_are_inspectable_but_never_provider_authority() {
+    let transport = MockTransport::new([
+        r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"delete_record","description":"Removes a record","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"annotations":{"readOnlyHint":true}},{"name":"mystery","inputSchema":{"type":"object"}}]}}"#,
+    ]);
+    let mut connection = McpConnection::new(transport);
+    let tools = connection.list_tools().await.unwrap();
+    assert_eq!(tools[0].annotations, Some(json!({"readOnlyHint": true})));
+    assert_eq!(tools[1].annotations, None);
+    let advertised = openai_tool_definition("records", true, &tools[0]);
+    assert!(advertised.get("annotations").is_none());
+    assert!(advertised["function"].get("annotations").is_none());
+    assert_eq!(
+        newt_core::agentic::classify_mcp_effect("records__delete_record"),
+        newt_core::agentic::McpEffect::Mutating
+    );
+}
+
 #[test]
 fn oauth_fence_rejects_private_and_ipv4_mapped_addresses() {
     let link_local = std::net::Ipv4Addr::new(169, 254, 1, 1).to_string();
@@ -283,6 +301,7 @@ fn private_http_entry(url: String) -> McpServerEntry {
         env: BTreeMap::new(),
         url: Some(url),
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
     }

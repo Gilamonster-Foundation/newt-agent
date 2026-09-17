@@ -64,9 +64,9 @@ use serde_json::Value;
 /// `destructiveHint` (untrusted under the hostile-server threat model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpEffect {
-    /// A read-only lookup — low-risk; permitted even without an explicit grant.
+    /// A name that resembles a lookup. Informational only; still needs a grant.
     Read,
-    /// A state-changing or unknown operation — fail-closed: it needs a grant.
+    /// A state-changing or unknown name. Informational only; still needs a grant.
     Mutating,
 }
 
@@ -99,8 +99,6 @@ pub fn classify_mcp_effect(tool: &str) -> McpEffect {
 /// (`get_…`) earns NOTHING here, because a read verb is not a grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpGrant {
-    /// The active persona's tool allow-list explicitly names this operation.
-    PersonaAllowList,
     /// A present human `PermissionGate` approved THIS specific call.
     HumanApproved,
 }
@@ -157,9 +155,8 @@ pub struct LeashDenied {
 /// Mint a [`LeasedMcpCall`] iff a structural [`McpGrant`] authorizes it — the
 /// SOLE minter of the witness [`McpTools::call`] requires.
 ///
-/// `grant` is the provenance the caller resolved: the active persona's tool
-/// allow-list ([`McpGrant::PersonaAllowList`]) or a present human's decision
-/// ([`McpGrant::HumanApproved`]). `None` fails closed. Authority NEVER comes from
+/// `grant` is the operator permission decision ([`McpGrant::HumanApproved`]).
+/// Persona preferences cannot supply it. `None` fails closed. Authority NEVER comes from
 /// the tool NAME — a read-verb name is not a grant (the name-classification
 /// vector a hostile admitted server could otherwise exploit).
 pub fn leash_mcp_call<'a>(
@@ -213,11 +210,11 @@ mod leash_tests {
         let args = serde_json::json!({});
         // A structural grant mints a witness carrying tool + args + provenance +
         // the server identity (the namespace prefix, not server metadata).
-        let leased = leash_mcp_call("srv__delete", &args, Some(McpGrant::PersonaAllowList))
+        let leased = leash_mcp_call("srv__delete", &args, Some(McpGrant::HumanApproved))
             .expect("a grant mints");
         assert_eq!(leased.tool(), "srv__delete");
         assert_eq!(leased.args(), &args);
-        assert_eq!(leased.grant(), McpGrant::PersonaAllowList);
+        assert_eq!(leased.grant(), McpGrant::HumanApproved);
         assert_eq!(leased.server(), "srv");
         // A human decision is a distinct provenance.
         assert_eq!(

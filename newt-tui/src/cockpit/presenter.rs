@@ -1123,8 +1123,13 @@ impl Presenter {
         )
     }
 
-    fn run_bang_command(&mut self, command: &str, color: bool, verbose: bool) -> io::Result<()> {
-        let (mut command, shell) = crate::bang_shell_command(command);
+    fn run_bang_command(
+        &mut self,
+        command: &crate::OperatorCommand,
+        color: bool,
+        verbose: bool,
+    ) -> io::Result<bool> {
+        let (mut command, shell) = command.prepare()?;
         self.capture.foreground_stdio(&mut command)?;
         self.drain_pty()?;
         let result = (|| {
@@ -1141,8 +1146,7 @@ impl Presenter {
                 },
             };
             self.screen.shutdown(&[])?;
-            crate::run_bang_escape_unix(command, &shell, color, verbose);
-            Ok(())
+            Ok(crate::run_bang_escape_unix(command, &shell, color, verbose))
         })();
         // Keep the child's output above the editor, even if the command
         // changed terminal dimensions. No cursor query or second input reader.
@@ -1159,7 +1163,7 @@ impl Presenter {
             self.on_event(Event::Resize(cols, rows))?;
             self.draw()
         })();
-        result.and(resumed)
+        result.and_then(|success| resumed.map(|()| success))
     }
 
     /// Does this key press reach the operator's escape hatch right now?

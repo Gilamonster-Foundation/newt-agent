@@ -1,6 +1,71 @@
 use super::*;
 
 #[test]
+fn management_discovery_retains_sources_and_namespace_conflicts_without_changing_winners() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let workspace = dir.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let native = home.join("mcp.toml");
+    std::fs::write(&native, "[[mcp_servers]]\nname = 'docs_server'\ncommand = 'native-docs'\n[[mcp_servers]]\nname = 'native'\ncommand = 'native-tool'\n").unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"mcpServers":{"borrowed":{"command":"borrowed-tool"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(workspace.join(".mcp.json"), r#"{"mcpServers":{"borrowed":{"command":"project-tool"},"project":{"command":"project-only"}}}"#).unwrap();
+    let configured = [stdio("docs-server", "configured-docs")];
+    let report = discover_report_with_namespace_mode(
+        &configured,
+        Some(&native),
+        Some(&home),
+        &workspace,
+        true,
+    );
+    assert_eq!(
+        report
+            .servers
+            .iter()
+            .map(|server| (server.entry.name.as_str(), server.source))
+            .collect::<Vec<_>>(),
+        vec![
+            ("docs-server", McpSource::Configuration),
+            ("native", McpSource::UserMcpFile),
+            ("borrowed", McpSource::ClaudeUser),
+            ("project", McpSource::ClaudeProject),
+        ]
+    );
+    assert_eq!(report.conflicts.len(), 2);
+    assert_eq!(report.conflicts[0].name, "docs_server");
+    assert_eq!(report.conflicts[0].source, McpSource::UserMcpFile);
+    assert_eq!(report.conflicts[0].winner, "docs-server");
+    assert_eq!(report.conflicts[1].source, McpSource::ClaudeProject);
+    assert_eq!(report.conflicts[1].winner, "borrowed");
+    let legacy =
+        discover_with_namespace_mode(&configured, Some(&native), Some(&home), &workspace, true);
+    assert_eq!(
+        legacy,
+        report
+            .servers
+            .into_iter()
+            .map(|server| server.entry)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn management_discovery_does_not_elevate_project_configuration() {
+    let mut entry = stdio("project", "tool");
+    entry.trust = McpTrust::Untrusted;
+    let dir = tempfile::tempdir().unwrap();
+    let report = discover_report_with_namespace_mode(&[entry], None, None, dir.path(), true);
+    assert_eq!(report.servers[0].source, McpSource::Configuration);
+    assert_eq!(report.servers[0].entry.trust, McpTrust::Untrusted);
+    assert!(admit(&report.servers[0].entry).is_err());
+}
+
+#[test]
 fn discovers_from_claude_user_and_project_files() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");

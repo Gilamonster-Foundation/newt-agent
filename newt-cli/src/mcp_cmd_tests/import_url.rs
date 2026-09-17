@@ -12,6 +12,7 @@ fn exact_http_hosts_are_normalized_and_deduplicated() {
             env: BTreeMap::new(),
             url: Some("https://BROKER.Example.test:8443/mcp".into()),
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
         },
@@ -29,6 +30,7 @@ fn exact_http_hosts_are_normalized_and_deduplicated() {
             env: BTreeMap::new(),
             url: Some("https://disabled.example.test/mcp".into()),
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
         },
@@ -52,6 +54,7 @@ fn http_url_is_canonicalized_once_for_persistence_and_grants() {
         env: BTreeMap::new(),
         url: Some("https://BÜCHER.example:443/mcp".into()),
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Trusted,
     };
@@ -81,6 +84,7 @@ fn import_url_validation_is_independent_of_network_grants_and_rejects_fragments(
             env: BTreeMap::new(),
             url: Some(url.into()),
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Untrusted,
         };

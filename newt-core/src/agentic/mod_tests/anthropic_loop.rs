@@ -69,16 +69,43 @@ fn msgs() -> Vec<MemMessage> {
     ]
 }
 
-/// The MCP tests here exercise a remote tool's MECHANICS (delta parsing,
-/// parallel results, tool round-trip, spill) through `my_server__get_thing` —
-/// they are NOT about authorization. Post the `mcp-under-leash` name-grant
-/// closure, an MCP call needs a structural grant, so the shared ctx puts that
-/// operation on a persona allow-list. `NoMcp` tests are unaffected: they never
-/// dispatch an MCP call, and `persona_tools` gates only the MCP path.
-fn persona_allow() -> &'static [String] {
+/// Catalog preference only. Tests exercising remote dispatch separately install
+/// an exact fixture permission; the default context has no permission gate.
+fn preferred_mcp_tools() -> &'static [String] {
     static ALLOW: std::sync::LazyLock<Vec<String>> =
         std::sync::LazyLock::new(|| vec!["my_server__get_thing".to_string()]);
     ALLOW.as_slice()
+}
+
+/// The loop mechanics fixtures approve only their named remote operation. This
+/// reuses the PermissionGate seam without granting built-in or unrelated tools.
+pub(super) struct FixtureMcpPermission<'a> {
+    target: &'a str,
+    caveats: &'a Caveats,
+}
+
+impl<'a> FixtureMcpPermission<'a> {
+    pub(super) fn new(target: &'a str, caveats: &'a Caveats) -> Self {
+        Self { target, caveats }
+    }
+}
+
+impl crate::PermissionGate for FixtureMcpPermission<'_> {
+    fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
+        crate::HumanQuestionOutcome::Unavailable
+    }
+
+    fn ask(&mut self, requests: &[crate::PermissionRequest]) -> crate::PermissionDecision {
+        if requests.len() == 1
+            && requests[0].kind == crate::DenialKind::RemoteTool
+            && requests[0].target == self.target
+            && requests[0].tool == self.target
+        {
+            crate::PermissionDecision::Allow(self.caveats.clone())
+        } else {
+            crate::PermissionDecision::Deny
+        }
+    }
 }
 
 /// The loop tests' workspace: a path that deliberately does NOT exist.
@@ -126,7 +153,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         experience_store: None,
         step_ledger: None,
         caveats,
-        persona_tools: Some(persona_allow()),
+        persona_tools: Some(preferred_mcp_tools()),
         cognition: None,
         chat_completions_capability: Default::default(),
         output_allowance: None,
@@ -481,7 +508,11 @@ async fn tool_use_round_trip_replays_blocks_verbatim() {
         result: "tool-result-text",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
-    let (reply, _, _, hallu) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut mcp)
+    let uri = server.uri();
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let (reply, _, _, hallu) = chat_complete(context, &mut mcp)
         .await
         .expect("tool round trip should succeed");
 
@@ -580,7 +611,11 @@ async fn parallel_tool_results_land_in_one_user_message_in_call_order() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
-    let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut mcp)
+    let uri = server.uri();
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
         .await
         .expect("parallel round should succeed");
 
@@ -653,7 +688,11 @@ async fn input_json_delta_split_mid_token_executes_with_the_full_object() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
-    let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut mcp)
+    let uri = server.uri();
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
         .await
         .expect("streamed tool round should succeed");
 
@@ -699,7 +738,11 @@ async fn zero_argument_tool_use_executes_with_an_empty_object() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
-    let (reply, _, _, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut mcp)
+    let uri = server.uri();
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
         .await
         .expect("zero-arg tool round should succeed");
 
@@ -777,6 +820,8 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    c.permission_gate = Some(&mut permission);
     let (reply, streamed, usage, _) = chat_complete(c, &mut mcp)
         .await
         .expect("cap exit should produce the summary");
@@ -1258,9 +1303,11 @@ async fn usage_across_rounds_takes_max_input_and_sums_output() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
-    let (reply, _, usage, _) = chat_complete(ctx(&server.uri(), &messages, &caveats), &mut mcp)
-        .await
-        .expect("dispatch");
+    let uri = server.uri();
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let (reply, _, usage, _) = chat_complete(context, &mut mcp).await.expect("dispatch");
 
     assert_eq!(reply, "usage merged");
     let u = usage.expect("accumulated usage");
@@ -1342,6 +1389,8 @@ async fn every_non_streaming_anthropic_round_is_one_ledger_attempt() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    c.permission_gate = Some(&mut permission);
     chat_complete(c, &mut mcp).await.expect("dispatch");
 
     let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
@@ -1442,6 +1491,8 @@ async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
+    let mut permission = FixtureMcpPermission::new(mcp.name, &caveats);
+    c.permission_gate = Some(&mut permission);
     let (reply, _, _, _) = chat_complete(c, &mut mcp).await.expect("cap exit");
     assert!(reply.starts_with("capped summary"), "{reply}");
 
@@ -2029,7 +2080,7 @@ async fn anthropic_funnel_records_the_execution_class() {
     let mut context = ctx(&uri, &messages, &caveats);
     context.workspace = &workspace;
     context.action_nudges = false;
-    // The shared ctx allow-lists one MCP tool; this test needs the built-in shell.
+    // This fixture does not need a persona catalog preference.
     context.persona_tools = None;
     context.tool_events = Some(&mut events);
     chat_complete(context, &mut NoMcp)

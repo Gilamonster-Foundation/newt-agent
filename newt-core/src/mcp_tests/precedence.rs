@@ -12,6 +12,7 @@ fn invalid_entries_are_dropped() {
         env: BTreeMap::new(),
         url: None,
         headers: BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Trusted,
     };
@@ -44,6 +45,7 @@ fn newt_entry_wins_on_name_clash_and_dedups() {
             env: BTreeMap::new(),
             url: None,
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
         },
@@ -56,6 +58,7 @@ fn newt_entry_wins_on_name_clash_and_dedups() {
             env: BTreeMap::new(),
             url: None,
             headers: BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
         },

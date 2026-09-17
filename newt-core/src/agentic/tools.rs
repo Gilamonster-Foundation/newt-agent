@@ -9,7 +9,7 @@ use super::content_spill::{self, SpillStore};
 #[cfg(test)]
 use super::display::ToolDisplay;
 use super::display::ToolPresentation;
-use super::mcp::{classify_mcp_effect, leash_mcp_call, McpEffect, McpGrant, McpTools};
+use super::mcp::{leash_mcp_call, McpGrant, McpTools};
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition};
 use super::note_sink::{execute_save_note, save_note_tool_definition};
 use super::permissions::{
@@ -79,8 +79,8 @@ pub(crate) use catalog::{
     known_builtin_tool_name, merged_tool_definitions, resolve_tool_alias, AliasOutcome,
 };
 use catalog::{
-    disposition_tool_denied_message, persona_tool_denied_message,
-    run_command_creates_shell_git_commit, run_command_redirect, unknown_tool_message,
+    disposition_tool_denied_message, is_mcp_tool_name, run_command_creates_shell_git_commit,
+    run_command_redirect, unknown_tool_message,
 };
 pub use catalog::{
     filter_advertised_tools, filter_tools_for_disposition, persona_tool_allowed, tool_allowed,
@@ -2529,11 +2529,16 @@ async fn execute_authorized_tool(
         .as_ref()
         .map_or((name, args), |args| ("git", args));
 
-    // Prompt-comprehension boundary: enforce the validated disposition BEFORE
-    // every other routing or grant path. In particular, unknown names (including
-    // generic `server__tool` MCP calls) fail closed under a non-Act disposition;
-    // there is no safe way to infer a remote tool's authority from its name.
+    // Persona preferences affect discovery only. Evidence turns can request a
+    // remote operation, but only a connected bridge and the human permission
+    // gate below can authorize it. Plan/Ask still refuse before any prompt.
+    let remote_call = mcp.handles(name);
+    let evidence_turn = matches!(
+        disposition,
+        PromptDisposition::Explain | PromptDisposition::Research
+    );
     if !tool_allowed(disposition, name)
+        || (evidence_turn && is_mcp_tool_name(name) && !remote_call)
         || (name == "git"
             && disposition != PromptDisposition::Act
             && !args
@@ -2544,14 +2549,9 @@ async fn execute_authorized_tool(
         return host_return(disposition_tool_denied_message(disposition, name));
     }
 
-    // A read/recovery tool can itself hit a caveat denial (for example
-    // `web_fetch` outside the net allow-list). Non-Act turns must never turn
-    // that into an authority grant, so remove the human grant seam even for the
-    // narrow tools the disposition permits. `request_user_input` is the sole
-    // exception: its question path mints no caveat and cannot widen this turn,
-    // but it must still be able to hand control back to an interactive operator.
-    // The existing caveats continue to decide whether each read is legal.
-    if disposition != PromptDisposition::Act && name != "request_user_input" {
+    // Keep the existing read-only boundary for built-ins. A remote call is an
+    // explicit human decision, not authority inferred from a research prompt.
+    if disposition != PromptDisposition::Act && name != "request_user_input" && !remote_call {
         permission_gate = None;
     }
 
@@ -2567,101 +2567,34 @@ async fn execute_authorized_tool(
         return host_return(denied.reason);
     }
 
-    // FR-1 part 2 (#997): persona tool allow-list — refuse a BUILT-IN tool the
-    // active persona does not grant, before any routing (alias, run_command
-    // redirect). Checked against the CANONICAL name (aliases resolved first) so a
-    // denied tool can't slip past under a foreign spelling; the always-on infra
-    // tools (always-on infrastructure plus presence-gated session controls)
-    // always pass or the loop could wedge.
-    //
-    // Remote MCP tools are EXCLUDED here (FR-2, #1001): they carry no fs/exec/net
-    // axis, so instead of a hard veto they fall through to the `mcp.handles`
-    // branch, which PROMPTS the human for a name-based grant. A built-in stays
-    // hard-vetoed — only remote tools get the softer prompt.
-    if let Some(allow) = persona_tools {
-        let canonical = match resolve_tool_alias(name) {
-            Some(AliasOutcome::Rewrite(canonical)) => canonical,
-            _ => name,
-        };
-        if !persona_tool_allowed(canonical, allow) && !mcp.handles(name) {
-            return host_return(persona_tool_denied_message(canonical));
-        }
-    }
-
-    // #2331: an authorized tool whose schema the model was never sent. Every
-    // authority check above has already passed, so a refused tool never gets
-    // here; this call does not run, and the loop sends the schema next request.
+    // A known deferred schema is promoted through the existing exposure
+    // controller. Promotion does not execute the call or grant permission;
+    // the retry must pass the same dispatch checks and remote gate below.
     if let Some(message) = hidden_tools.and_then(|hidden| hidden.promote(name).message(name)) {
         return host_return(message);
     }
 
-    // Remote MCP tools (namespaced `server__tool`) route to their server before
-    // the built-in match. They map to NONE of the fs/exec/net caveat axes, so
-    // FR-2 (#1001) gives them a NAME-based leash: the active persona's tool
-    // allow-list. A tool the persona already grants dispatches directly; one it
-    // does not is PROMPTED through the #263 [`PermissionGate`] (allow once /
-    // session / deny) rather than hard-vetoed — so a human can grant a remote
-    // READ tool on demand while a mutating one stays gated. With NO persona
-    // (`persona_tools == None`) "no persona" is NOT "unrestricted"
-    // (`mcp-under-leash`): a read-class tool passes, but a mutating/unknown one
-    // must be granted by a human `PermissionGate`, else it is denied — closing
-    // the pre-leash hole where a no-persona session dispatched every remote tool
-    // unmediated. The effect class comes from the tool NAME by a droppable
-    // convention (`classify_mcp_effect`), never the server's own hints.
-    if mcp.handles(name) {
-        // `PermissionRequest` for the human-in-the-loop cases (persona
-        // out-of-list, or a no-persona mutating tool).
-        let prompt_gate = |permission_gate: Option<&mut dyn PermissionGate>, reason: String| {
-            let request = PermissionRequest {
-                tool: name.to_string(),
-                kind: DenialKind::RemoteTool,
-                target: name.to_string(),
-                reason,
-            };
-            match permission_gate {
-                Some(gate) => matches!(gate.ask(&[request]), PermissionDecision::Allow(_)),
-                // Headless / no operator to consult: fail-closed.
-                None => false,
-            }
+    if remote_call {
+        let Some(gate) = permission_gate else {
+            return host_return(format!(
+                "MCP tool `{name}` requires OCAP permission, but no interactive permission gate is available. \
+                 Enable permission prompts in an interactive session, then retry."
+            ));
         };
-        // Authority is a structural GRANT provenance, NEVER the server-chosen
-        // tool name (`mcp-under-leash`). A hostile admitted server that names a
-        // destructive tool with a read verb (`get_…`) earns nothing here — a
-        // read verb is not a grant.
-        let grant: Option<McpGrant> = match persona_tools {
-            // Persona path: allow-listed operations dispatch; otherwise the
-            // human is prompted and an explicit deny hard-stops.
-            Some(allow) if persona_tool_allowed(name, allow) => Some(McpGrant::PersonaAllowList),
-            Some(_) => prompt_gate(
-                permission_gate,
-                format!("remote tool `{name}` is outside the active persona's tool allow-list"),
-            )
-            .then_some(McpGrant::HumanApproved),
-            // No-persona path (`mcp-under-leash`): "no persona" is NOT
-            // "unrestricted" and is NOT read-tolerant by tool name. EVERY
-            // operation is human-gated — the name-classified effect is shown only
-            // as a HINT (it grants nothing) — and fails closed when headless, so
-            // a server-renamed `get_…` cannot self-authorize.
-            None => {
-                let hint = match classify_mcp_effect(name) {
-                    McpEffect::Read => "appears read-class",
-                    McpEffect::Mutating => "mutating/unknown",
-                };
-                prompt_gate(
-                    permission_gate,
-                    format!(
-                        "remote tool `{name}` ({hint}) has no persona to bound it — \
-                         no persona is not unrestricted, and a tool name is not a grant"
-                    ),
-                )
-                .then_some(McpGrant::HumanApproved)
-            }
+        let request = PermissionRequest {
+            tool: name.to_string(),
+            kind: DenialKind::RemoteTool,
+            target: name.to_string(),
+            reason: "Approve this remote MCP operation. Persona preferences and server tool hints do not grant permission.".into(),
         };
-        // The witness leash: `mcp.call` requires a `LeasedMcpCall`, so this is
-        // the only way to dispatch — an un-leashed call does not type-check.
+        let grant = matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
+            .then_some(McpGrant::HumanApproved);
         return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,
-            Err(_) => host_return(persona_tool_denied_message(name)),
+            Err(_) => host_return(format!(
+                "MCP tool `{name}` was not run: OCAP permission was denied or cancelled. \
+                 Respect that decision; do not retry it through another tool."
+            )),
         };
     }
 

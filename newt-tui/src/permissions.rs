@@ -224,7 +224,7 @@ fn permission_definition_with_default(
             ("reach", "MCP connection requires a named host grant")
         }
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
-        DenialKind::RemoteTool => ("call", "not in the active persona's tool allow-list"),
+        DenialKind::RemoteTool => ("call", "requires operator permission"),
         DenialKind::GitWrite => (
             "commit/stage via git",
             "outside the granted git-write authority",
@@ -798,6 +798,15 @@ fn direct_authorization_window() -> PromptWindow {
 }
 
 impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermissionGate<'_, F> {
+    pub(crate) fn session_net_hosts(&self) -> Vec<String> {
+        self.state
+            .session_grants
+            .iter()
+            .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
+            .map(|(_, host)| host.clone())
+            .collect()
+    }
+
     /// Reuse the permission gate for MCP startup, preserving the lifetime of
     /// the operator's grant without changing the session capability.
     pub(crate) fn ask_mcp_net_grant(
@@ -809,13 +818,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         }
         match newt_core::PermissionGate::ask(self, std::slice::from_ref(request)) {
             newt_core::PermissionDecision::Allow(caveats) => {
-                let mut hosts: Vec<_> = self
-                    .state
-                    .session_grants
-                    .iter()
-                    .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
-                    .map(|(_, host)| host.clone())
-                    .collect();
+                let mut hosts = self.session_net_hosts();
                 if !hosts.contains(&request.target) {
                     hosts.push(request.target.clone());
                 }
@@ -855,6 +858,12 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     }
 
     /// Re-mint baseline plus grants from the root; never widen the live key.
+    /// The live session policy, through the same grant and delegation clamps as tool calls.
+    #[cfg(feature = "rich-tui")]
+    pub(crate) fn current_caveats(&self) -> newt_core::Caveats {
+        self.mint(&[])
+    }
+
     fn mint(&self, once_grants: &[(newt_core::DenialKind, String)]) -> newt_core::Caveats {
         let mut grants: Vec<(newt_core::DenialKind, String)> =
             self.state.session_grants.iter().cloned().collect();

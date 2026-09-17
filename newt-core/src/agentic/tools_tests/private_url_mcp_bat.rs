@@ -22,6 +22,26 @@ const USER_REVIEW_URL: &str = "https://reviews.example.test/reviews/42";
 const PRIVATE_FETCH_TARGET: &str = "http://127.0.0.1/reviews/42";
 const MCP_RESULT: &str = "authenticated review 42 loaded";
 
+struct ReviewPermission(usize);
+
+impl crate::PermissionGate for ReviewPermission {
+    fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
+        crate::HumanQuestionOutcome::Unavailable
+    }
+
+    fn ask(&mut self, requests: &[crate::PermissionRequest]) -> crate::PermissionDecision {
+        if requests.len() == 1
+            && requests[0].kind == crate::DenialKind::RemoteTool
+            && requests[0].target == REVIEW_TOOL
+        {
+            self.0 += 1;
+            crate::PermissionDecision::Allow(Caveats::top())
+        } else {
+            crate::PermissionDecision::Deny
+        }
+    }
+}
+
 fn last_tool_result(body: &serde_json::Value) -> Option<&str> {
     body["messages"]
         .as_array()?
@@ -153,6 +173,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
         MemMessage::user(task.clone()),
     ];
     let caveats = Caveats::top();
+    let mut permission = ReviewPermission(0);
     let persona_tools = vec![
         "web_fetch".to_string(),
         "tool_search".to_string(),
@@ -233,7 +254,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             phantom_reaches: None,
             end_reason: None,
             solve_obs: None,
-            permission_gate: None,
+            permission_gate: Some(&mut permission),
             on_round_usage: None,
             estimate_ratio: None,
             estimation: crate::tokens::TokenEstimation::default(),
@@ -271,6 +292,10 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
         "the discovered namespaced MCP must execute exactly once"
     );
     assert_eq!(hallucinations, 0, "all three tool names are real");
+    assert_eq!(
+        permission.0, 1,
+        "the remote tool required explicit permission"
+    );
     assert!(reply.contains("connector"), "final answer: {reply}");
 
     let wire = model

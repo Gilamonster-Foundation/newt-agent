@@ -5,18 +5,18 @@
 //! ```text
 //! known      = registry.all()                      // every dispatchable name
 //! present    = filter_presence(known, session)     // Gate / injected capability
-//! authorized = filter_authority(present, persona, disposition, caveats)
+//! authorized = filter_authority(present, disposition, caveats)
 //! exposed    = exposure_policy.select(authorized, budget, active)   // THIS module
 //! ```
 //!
 //! `present` is [`super::catalog::merged_tool_definitions`] (gate/presence),
-//! `authorized` is [`super::catalog::filter_advertised_tools`] (persona) then
-//! [`super::catalog::filter_tools_for_disposition`] (disposition). This module
+//! Persona preferences rank the full catalog without removing tools.
+//! [`super::catalog::filter_tools_for_disposition`] applies turn restrictions. This module
 //! is the final `exposed` stage: it decides which *authorized* tools are worth a
 //! schema slot given the model's LIVE usable budget.
 //!
 //! **Exposure is never authorization.** Dispatch still checks the authorized set
-//! (`tool_allowed` / `persona_tool_allowed`); hiding a schema to save tokens
+//! (disposition, explicit caveats, and MCP permission); hiding a schema to save tokens
 //! never changes what the model may RUN, only what it is SHOWN. A model that
 //! calls a real, authorized-but-unexposed tool is not hallucinating — see the
 //! `ToolReach::KnownHidden` recovery reserved in `docs/design/tool-exposure-controller.md`.
@@ -42,7 +42,7 @@ use super::catalog::BASE_TOOL_NAMES;
 pub(crate) const OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS: usize = 128;
 
 /// How a tool earns a schema slot, independent of whether it is *available*
-/// (gate) or *authorized* (persona/disposition/caveats). Pure data — the class
+/// (gate) or *authorized* (disposition/caveats). Pure data — the class
 /// for each tool lives in [`EXPOSURE_CLASSES`], guarded against drift by
 /// [`tests::every_known_tool_is_classified`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

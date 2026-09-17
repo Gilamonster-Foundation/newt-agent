@@ -22,6 +22,10 @@ use newt_mcp_client::{
 };
 use serde_json::Value;
 
+#[path = "mcp_management.rs"]
+mod management;
+use management::connect_entry;
+
 /// Per-server launch outcome for the `/mcp` surface (#1149).
 #[derive(Debug, Clone)]
 pub(crate) enum McpStatus {
@@ -247,6 +251,17 @@ fn request_http_net_grant(
     server_name: &str,
     prompt: &mut Option<&mut McpNetGrantPrompt<'_>>,
 ) -> Option<(newt_core::Caveats, Vec<String>, bool)> {
+    request_net_grant(error, server_name, prompt, "mcp connect",
+        "Allow once opens this server connection; session/permanent also allows reconnecting and other configured servers on this host.")
+}
+
+fn request_net_grant(
+    error: &anyhow::Error,
+    server_name: &str,
+    prompt: &mut Option<&mut McpNetGrantPrompt<'_>>,
+    tool: &str,
+    scope_note: &str,
+) -> Option<(newt_core::Caveats, Vec<String>, bool)> {
     let required = error.downcast_ref::<newt_mcp_client::HttpNetGrantRequired>()?;
     let reason = if required.private {
         "the private destination requires an exact host approval"
@@ -254,13 +269,10 @@ fn request_http_net_grant(
         "the host is outside the session network capability"
     };
     let request = newt_core::PermissionRequest {
-        tool: "mcp connect".into(),
+        tool: tool.into(),
         kind: newt_core::DenialKind::Net,
         target: required.host.clone(),
-        reason: format!(
-            "MCP server `{server_name}`: {reason}. Allow once opens this server connection; \
-             session/permanent also allows reconnecting and other configured servers on this host."
-        ),
+        reason: format!("MCP server `{server_name}`: {reason}. {scope_note}"),
     };
     let (caveats, mut hosts, remembered) = prompt.as_mut()?(&request)?;
     if !hosts.contains(&required.host) {
@@ -685,65 +697,14 @@ impl Mcp {
                 statuses.push((entry.name.clone(), McpStatus::Disabled));
                 continue;
             }
-            // Dispatch on transport. The legacy SSE-only transport (a separate
-            // GET event-stream + POST endpoint) is not implemented; modern
-            // servers use streamable-HTTP (`type: "http"`).
-            let result = match entry.transport {
-                // step-1.1: admission gate before spawn. An untrusted repo
-                // overlay (`.mcp.json` / project config) with no approval is
-                // refused here, not connected. (The interactive approval path
-                // is a follow-up; until then untrusted fails closed.)
-                TransportKind::Stdio => match newt_core::mcp::admit(entry) {
-                    Ok(admitted) => connect_stdio(&admitted, caveats)
-                        .await
-                        .map(|live| ReconnectableServer { live, http: None }),
-                    Err(denied) => {
-                        tracing::warn!("MCP server `{}` not admitted: {denied}", entry.name);
-                        statuses.push((entry.name.clone(), McpStatus::Skipped(denied.to_string())));
-                        continue;
-                    }
-                },
-                TransportKind::Http => {
-                    // Admission is the first operation in the HTTP branch.
-                    // Token loading may refresh over the network, so even that
-                    // convenience path must be unreachable without the same
-                    // trust witness required by the transport constructor.
-                    let admitted = match newt_core::mcp::admit(entry) {
-                        Ok(admitted) => admitted,
-                        Err(denied) => {
-                            tracing::warn!("MCP server `{}` not admitted: {denied}", entry.name);
-                            statuses
-                                .push((entry.name.clone(), McpStatus::Skipped(denied.to_string())));
-                            continue;
-                        }
-                    };
-                    if has_plaintext_authorization_header(entry) {
-                        let reason = "plaintext Authorization credential in MCP config; replace it with an environment/file reference";
-                        tracing::warn!("MCP server `{}`: {reason} — skipped", entry.name);
-                        statuses.push((entry.name.clone(), McpStatus::Skipped(reason.to_string())));
-                        continue;
-                    }
-                    connect_http_with_net_prompt(
-                        &admitted,
-                        &mut http_startup,
-                        allow_insecure_hosts,
-                        &mut grant_net,
-                    )
-                    .await
-                }
-                TransportKind::Sse => {
-                    tracing::warn!(
-                        "MCP server `{}`: legacy SSE transport is not supported \
-                         (use streamable-HTTP, `type = \"http\"`) — skipped",
-                        entry.name
-                    );
-                    statuses.push((
-                        entry.name.clone(),
-                        McpStatus::Skipped("legacy SSE transport (use type = \"http\")".into()),
-                    ));
-                    continue;
-                }
-            };
+            let result = connect_entry(
+                entry,
+                caveats,
+                &mut http_startup,
+                allow_insecure_hosts,
+                &mut grant_net,
+            )
+            .await;
             match result {
                 Ok(connected) => {
                     let prefix = server_prefix(&connected.live.name, sanitize_server_names);
@@ -984,6 +945,101 @@ fn format_result(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Grounds manager lifecycle assertions against the real HTTP client and
+    /// JSON-RPC codec. The fixture exposes metadata only: any tool invocation
+    /// fails the test, including one accidentally issued while "testing".
+    #[tokio::test]
+    async fn management_reconnect_replaces_catalog_and_test_preserves_mute_without_tool_calls() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let mock = MockServer::start().await;
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&requests);
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let method = body["method"].as_str().unwrap();
+                let mut methods = captured.lock().unwrap();
+                methods.push(method.into());
+                let result = match method {
+                    "initialize" => serde_json::json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+                    "notifications/initialized" => return ResponseTemplate::new(202),
+                    "tools/list" => {
+                        let generation = methods.iter().filter(|method| method.as_str() == "initialize").count();
+                        serde_json::json!({"tools":[{"name":format!("catalog_{generation}"),"inputSchema":{"type":"object"}}]})
+                    }
+                    _ => panic!("management must not invoke tools or other operations"),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+            })
+            .mount(&mock).await;
+        let entry = http_entry(&format!("{}/mcp", mock.uri()));
+        let host = vec!["127.0.0.1".to_owned()];
+        let caveats = newt_core::Caveats {
+            net: newt_core::Scope::only(host.clone()),
+            ..newt_core::Caveats::top()
+        };
+        let mut mcp = Mcp::empty();
+        mcp.reconnect(&entry, &caveats, &host, &[], None)
+            .await
+            .unwrap();
+        assert!(mcp.handles(&format!("{}__catalog_1", entry.name)));
+        assert!(mcp.mute(&entry.name));
+        assert_eq!(mcp.test_connection(&entry.name).await.unwrap(), 1);
+        assert!(mcp.is_muted(&entry.name));
+        assert!(mcp.tool_defs().is_empty());
+        mcp.reconnect(&entry, &caveats, &host, &[], None)
+            .await
+            .unwrap();
+        assert!(mcp.is_muted(&entry.name));
+        assert_eq!(
+            mcp.summary().len(),
+            1,
+            "reconnect replaces, never duplicates a server"
+        );
+        mcp.unmute(&entry.name);
+        let catalog = mcp.tool_defs();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog[0]["function"]["name"],
+            format!("{}__catalog_2", entry.name)
+        );
+        mock.reset().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+        assert!(mcp.test_connection(&entry.name).await.is_err());
+        assert!(
+            mcp.tool_defs().is_empty(),
+            "a failed test must not leave stale tools advertised"
+        );
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "tools/call"));
+    }
+
+    #[tokio::test]
+    async fn management_reconnect_does_not_bypass_admission_or_disabled_state() {
+        let mut entry = http_entry("https://uncontacted.example.test/mcp");
+        let caveats = newt_core::Caveats::top();
+        let mut mcp = Mcp::empty();
+        entry.trust = newt_core::mcp::McpTrust::Untrusted;
+        assert!(mcp
+            .reconnect(&entry, &caveats, &[], &[], None)
+            .await
+            .is_err());
+        entry.trust = newt_core::mcp::McpTrust::Trusted;
+        entry.enabled = false;
+        assert!(mcp
+            .reconnect(&entry, &caveats, &[], &[], None)
+            .await
+            .is_err());
+        assert!(mcp.is_empty());
+    }
 
     #[test]
     fn mcp_net_retry_prompts_only_for_typed_network_denials() {
@@ -1580,6 +1636,7 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             url: Some(url.into()),
             headers: std::collections::BTreeMap::new(),
+            login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: newt_core::mcp::McpTrust::Trusted,
         }

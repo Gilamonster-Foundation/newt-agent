@@ -345,7 +345,7 @@ impl McpTools for RefusedRemote {
 }
 
 /// Twin: a capability the request refuses is never `KnownHidden`. Under
-/// Explain with `minimal` exposure, the refused MCP tool is not marked
+/// Plan with `minimal` exposure, the refused MCP tool is not marked
 /// unloaded by search, its call is refused rather than promoted, and it never
 /// reaches the wire.
 #[tokio::test]
@@ -364,7 +364,7 @@ async fn a_refused_capability_is_never_marked_hidden_or_promoted() {
     let uri = server.uri();
     let mut context = ctx(&uri, &messages, &caveats);
     context.action_nudges = false;
-    context.prompt_disposition = PromptDisposition::Explain;
+    context.prompt_disposition = PromptDisposition::Plan;
     context.exposure.profile = crate::config::ExposureProfile::Minimal;
     let mut mcp = RefusedRemote { calls: 0 };
     wire.run(context, &mut mcp).await;

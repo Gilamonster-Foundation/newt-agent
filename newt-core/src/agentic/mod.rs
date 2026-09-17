@@ -979,13 +979,8 @@ pub struct ChatCtx<'a> {
     /// not advertised (scheduled off). Shared `&dyn` (interior mut).
     pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
     pub caveats: &'a crate::caveats::Caveats,
-    /// FR-1 part 2 (#997): the active persona's tool allow-list (its `tools:`
-    /// front-matter), or `None` when no persona is active / the persona sets no
-    /// list. When `Some`, the loop advertises ONLY these tools (plus the
-    /// always-on infra tools the loop can't run without), and the executor
-    /// REFUSES any tool outside the list — a name-scoped complement to the
-    /// axis-scoped `caveats` (which part 1, #1002, already meets in). Headless
-    /// / driver / eval callers pass `None` (no persona surface).
+    /// Preferred tools from the active persona's `tools:` metadata. This only
+    /// ranks discovery; it never hides a tool or grants/denies its execution.
     pub persona_tools: Option<&'a [String]>,
     /// The psyche **cognition** dial for this turn — how much reasoning effort to
     /// request. `Some(level)` emits OpenAI **Responses** `reasoning.effort` or,
@@ -2133,9 +2128,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         advertise_plan_mode,
         advertise_plan_mode_active,
     );
-    // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
-    // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
-    // enforces the same set, so what the model sees and what it may run agree.
+    // Put the persona's preferred tools first without removing other tools.
+    // Dispatch separately checks explicit permissions and delegation authority.
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(
         smart_harness::advertise(tools, smart_harness),
@@ -6653,9 +6647,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         advertise_plan_mode,
         advertise_plan_mode_active,
     );
-    // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
-    // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
-    // enforces the same set, so what the model sees and what it may run agree.
+    // Put the persona's preferred tools first without removing other tools.
+    // Dispatch separately checks explicit permissions and delegation authority.
     let tools = filter_advertised_tools(tools, persona_tools);
     let tools = filter_tools_for_disposition(
         smart_harness::advertise(tools, smart_harness),

@@ -76,6 +76,7 @@ command = \"modulex-mcp\"
         )]),
         url: None,
         headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: Some(120),
         trust: crate::mcp::McpTrust::Trusted,
     };
@@ -117,6 +118,7 @@ fn with_mcp_server_added_creates_section_in_empty_text() {
         env: std::collections::BTreeMap::new(),
         url: None,
         headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
     };
@@ -138,6 +140,7 @@ fn with_mcp_server_added_writes_sse_transport_and_url() {
         env: std::collections::BTreeMap::new(),
         url: Some("https://mcp.example/sse".into()),
         headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
     };
@@ -162,6 +165,7 @@ fn with_mcp_server_added_rejects_duplicates_and_invalid_entries() {
         env: std::collections::BTreeMap::new(),
         url: None,
         headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
     };
@@ -242,6 +246,7 @@ fn mcp_writer_error_branches_are_loud() {
         env: std::collections::BTreeMap::new(),
         url: None,
         headers: std::collections::BTreeMap::new(),
+        login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
     };
@@ -255,6 +260,7 @@ fn mcp_writer_error_branches_are_loud() {
     assert!(err.to_string().contains("not an array of tables"), "{err}");
     // A timeout that does not fit TOML's i64 integers.
     let oversized = crate::mcp::McpServerEntry {
+        login_argv: Vec::new(),
         request_timeout_secs: Some(u64::MAX),
         ..entry
     };

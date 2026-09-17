@@ -9,6 +9,10 @@ lists. Stdio JSON-RPC 2.0 (newline-delimited) and streamable HTTP share a
 servers are namespaced `server__tool` so two servers exposing the same tool name
 do not collide. The protocol logic (`McpConnection`) is generic over `Transport`
 and unit-tested against an in-memory mock — no subprocess needed.
+Server tool annotations are retained for inspection. They are not copied into
+provider tool definitions and never authorize a tool call. The rich terminal's
+`/settings` → MCP manager can reconnect a server or refresh its tool list
+without calling any advertised tool.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
 free, friendly, local agentic coder.
@@ -92,4 +96,4 @@ patient server still gives up on a genuinely wedged call.
 
 Apache-2.0
 
-Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15
+Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 14:42 EDT | Date: 2026-09-16

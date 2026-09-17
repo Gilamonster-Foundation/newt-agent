@@ -160,6 +160,10 @@ mod transcript_pager;
 mod type_ahead;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
 mod mcp;
+#[cfg(feature = "rich-tui")]
+mod mcp_manager;
+#[cfg(feature = "rich-tui")]
+mod mcp_panel;
 mod mcp_token;
 pub mod probe;
 pub mod terminal_hyperlink;
@@ -1693,16 +1697,14 @@ fn effective_caveats(
     }
 }
 
-/// FR-1 (#997): a persona's read-only `[caveats]` are now ENFORCED, not merely
-/// shown by `/persona show`. Meet them into the turn's authority — `meet` is the
-/// greatest lower bound, so a persona can only TIGHTEN the session grant (e.g. a
-/// read-only coach drops `fs_write`/`exec`), never widen it. No persona, or a
-/// persona without a `[caveats]` block, leaves the authority unchanged.
-fn meet_persona_caveats(base: newt_core::Caveats, persona: Option<&Persona>) -> newt_core::Caveats {
-    match persona.and_then(|p| p.profile.caveats.as_ref()) {
-        Some(profile) => base.meet(&profile.to_caveats()),
-        None => base,
-    }
+/// Persona selection cannot change the operator's permission policy. Profile
+/// caveats remain inspectable guidance; explicit postures and OCAP grants own
+/// authority. Keep this turn boundary pure for both restrictive and broad roles.
+fn meet_persona_caveats(
+    base: newt_core::Caveats,
+    _persona: Option<&Persona>,
+) -> newt_core::Caveats {
+    base
 }
 
 /// #774 (P0): the always-on exec FLOOR threaded to `execute_tool` as
@@ -4357,7 +4359,7 @@ struct Persona {
     /// The parsed role profile. For a plain prompt-only persona (no `+++`
     /// front-matter) every field except `prompt` is `None`, so behavior is
     /// identical to before role profiles existed. When the file carries
-    /// front-matter, this surfaces the role's tool allow-list, caveat profile,
+    /// front-matter, this surfaces the role's preferred tools, advisory caveats,
     /// and model/tier router policy.
     profile: newt_core::RoleProfile,
 }
@@ -4554,14 +4556,11 @@ impl PersonaStore {
     /// each MISSING one is written on any store access, so an upgrade that
     /// predates a new default still receives it (the old empty-dir gate would
     /// strand it forever). `coder` is the doer identity (DEFAULT_SOUL); `coach`
-    /// is the read-only advise-first persona — its `[caveats]` are enforced by
-    /// FR-1 and its `altitude = "coach"` swaps in COACH_SOUL via FR-5.
-    /// `personal-assistant` (#1021, FR-PA-3) is `coach`'s domain-specific
-    /// specialization for enterprise routine automation — its `skills:`
-    /// binding (FR-4, #1041) preloads `gila-personal-assistant`, and its
-    /// `tools:` allow-list (already enforced by FR-1) restricts it to that
-    /// skill's `modulex__*` MCP tools plus infra tools; FR-PA-4 needed no new
-    /// code since `filter_advertised_tools` already does this. `steady`,
+    /// prefers advising first; its `altitude = "coach"` selects COACH_SOUL.
+    /// `personal-assistant` specializes in routine automation. Its `skills:`
+    /// binding preloads `gila-personal-assistant`, and its `tools:` preferences
+    /// prioritize that skill's MCP tools. Explicit permissions still determine
+    /// which actions may run for every persona. `steady`,
     /// `direct`, and `sociable` contain only communication-style preferences,
     /// not capability or action-policy settings. A user who deletes a default
     /// gets it back next launch; empty the file to suppress it.
@@ -5040,6 +5039,12 @@ fn build_system_prompt_with_persona(
             "\nActive persona: {}\n{}\n",
             persona.name, persona.prompt
         ));
+        ctx.push_str(
+            "\nPersona guidance does not override the operator's explicit task. \
+             Treat advice-only wording and preferred tools as defaults; use the tools \
+             needed for the requested work. OCAP permissions, explicit postures, and \
+             delegation limits still govern every action.\n",
+        );
     }
 
     // Per-session plan instruction (issue #220). Injected here, with the
@@ -5287,10 +5292,10 @@ fn persona_status(active: Option<&Persona>) -> String {
     }
     match &profile.tools {
         Some(tools) if !tools.is_empty() => {
-            out.push_str(&format!("\n  tools: {}", tools.join(", ")));
+            out.push_str(&format!("\n  preferred tools: {}", tools.join(", ")));
         }
-        Some(_) => out.push_str("\n  tools: (none)"),
-        None => out.push_str("\n  tools: (unconstrained)"),
+        Some(_) => out.push_str("\n  preferred tools: (none)"),
+        None => out.push_str("\n  preferred tools: (no preference)"),
     }
     // FR-4 (#1041): list the persona's bound skill names, same shape as `tools`.
     if let Some(skills) = &profile.skills {
@@ -5301,7 +5306,7 @@ fn persona_status(active: Option<&Persona>) -> String {
         }
     }
     if let Some(caveats) = &profile.caveats {
-        out.push_str(&format!("\n  caveats: {}", caveats.summary()));
+        out.push_str(&format!("\n  advisory caveats: {}", caveats.summary()));
     }
     match (&profile.model, &profile.tier) {
         (Some(m), Some(t)) => out.push_str(&format!("\n  router: model={m} tier={t:?}")),
@@ -8998,6 +9003,48 @@ fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum OperatorCommand {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+impl OperatorCommand {
+    #[cfg(all(unix, feature = "rich-tui"))]
+    fn prepare(&self) -> io::Result<(std::process::Command, String)> {
+        match self {
+            Self::Shell(command) => Ok(bang_shell_command(command)),
+            Self::Argv(argv) => Ok((operator_argv_command(argv)?, argv[0].clone())),
+        }
+    }
+}
+
+fn operator_argv_command(argv: &[String]) -> io::Result<std::process::Command> {
+    let program = argv
+        .first()
+        .filter(|program| !program.trim().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "login argv requires a program")
+        })?;
+    let mut command = std::process::Command::new(program);
+    command.args(&argv[1..]);
+    Ok(command)
+}
+
+fn run_login_argv(argv: &[String], color: bool, verbose: bool) -> anyhow::Result<bool> {
+    let command = operator_argv_command(argv)?;
+    #[cfg(unix)]
+    {
+        Ok(run_bang_escape_unix(command, &argv[0], color, verbose))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (color, verbose);
+        let mut command = command;
+        Ok(command.status()?.success())
+    }
+}
+
 fn bang_shell_command(cmd: &str) -> (std::process::Command, String) {
     let (shell, flag) = bang_shell();
     let mut command = std::process::Command::new(&shell);
@@ -9015,7 +9062,7 @@ fn run_bang_escape_unix(
     shell: &str,
     color: bool,
     verbose: bool,
-) {
+) -> bool {
     use std::os::unix::process::CommandExt as _;
 
     let tty = libc::STDIN_FILENO;
@@ -9058,7 +9105,7 @@ fn run_bang_escape_unix(
     };
 
     match status {
-        Ok(status) if status.success() => {}
+        Ok(status) if status.success() => true,
         Ok(status) => {
             // A signalled child (e.g. interrupted by Ctrl-C) has no exit code.
             let msg = match status.code() {
@@ -9066,8 +9113,12 @@ fn run_bang_escape_unix(
                 None => "interrupted".to_string(),
             };
             print_newt(&msg, color, verbose);
+            false
         }
-        Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+        Err(e) => {
+            print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose);
+            false
+        }
     }
 }
 
