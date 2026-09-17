@@ -970,11 +970,15 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     }
 
     /// Re-mint baseline plus grants from the root; never widen the live key.
-    fn mint(&self, once_grants: &[(newt_core::DenialKind, String)]) -> newt_core::Caveats {
+    fn mint(
+        &self,
+        base: &newt_core::Caveats,
+        once_grants: &[(newt_core::DenialKind, String)],
+    ) -> newt_core::Caveats {
         let mut grants: Vec<(newt_core::DenialKind, String)> =
             self.state.recalled_grants(&self.danger).cloned().collect();
         grants.extend(once_grants.iter().cloned());
-        let mut policy = newt_core::widen_caveats(&self.base, &grants);
+        let mut policy = newt_core::widen_caveats(base, &grants);
         // Re-clamping is load-bearing: widening may repopulate an emptied scope.
         if let Some(clamp) = &self.preset_clamp {
             policy = policy.meet(clamp);
@@ -1011,7 +1015,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
 
     /// Live policy, through the same grant and delegation clamps as tool calls.
     pub(crate) fn current_caveats(&self) -> newt_core::Caveats {
-        self.mint(&[])
+        self.mint(&self.base, &[])
     }
 
     /// Publish the same typed form the web renders and poll for its answer.
@@ -1574,6 +1578,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
 impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::PermissionGate
     for PromptPermissionGate<'_, F>
 {
+    fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
+        newt_core::PermissionDecision::Allow(self.mint(baseline, &[]))
+    }
+
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
         use newt_core::PermissionDecision::{Allow, Deny};
         if requests.is_empty() {
@@ -1833,7 +1841,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
         }
-        Allow(self.mint(&once_grants))
+        Allow(self.mint(&self.base, &once_grants))
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {

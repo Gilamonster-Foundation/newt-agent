@@ -142,13 +142,13 @@ pub(super) struct FramePermissionGate<'a> {
     pub refusal: Option<String>,
 }
 
-impl super::permissions::PermissionGate for FramePermissionGate<'_> {
-    fn ask(
+impl FramePermissionGate<'_> {
+    fn validate_decision(
         &mut self,
-        requests: &[super::permissions::PermissionRequest],
+        decision: super::permissions::PermissionDecision,
     ) -> super::permissions::PermissionDecision {
         use super::permissions::PermissionDecision;
-        match self.inner.ask(requests) {
+        match decision {
             PermissionDecision::Allow(caveats) => {
                 match self
                     .harness
@@ -163,6 +163,24 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
             }
             PermissionDecision::Deny => PermissionDecision::Deny,
         }
+    }
+}
+
+impl super::permissions::PermissionGate for FramePermissionGate<'_> {
+    fn refresh_caveats(
+        &mut self,
+        baseline: &crate::caveats::Caveats,
+    ) -> super::permissions::PermissionDecision {
+        let decision = self.inner.refresh_caveats(baseline);
+        self.validate_decision(decision)
+    }
+
+    fn ask(
+        &mut self,
+        requests: &[super::permissions::PermissionRequest],
+    ) -> super::permissions::PermissionDecision {
+        let decision = self.inner.ask(requests);
+        self.validate_decision(decision)
     }
 
     fn ask_question(&mut self, question: &str) -> super::permissions::HumanQuestionOutcome {

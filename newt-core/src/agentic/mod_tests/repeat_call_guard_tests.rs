@@ -96,6 +96,7 @@ fn repeat_steer_value_filters_a_registered_session_secret() {
         &args,
         false,
         &format!("error: unexpected token {secret} in response"),
+        None,
     );
     // The model repeats the exact call → the steer re-injects the prior line.
     let steer = g
@@ -120,7 +121,13 @@ fn short_circuits_exact_repeat_and_escalates() {
     // First sight of the call → let it run (no steer).
     assert!(g.repeat_steer("run_command", &args).is_none());
     // After a failure, an exact repeat is steered, quoting the prior error.
-    g.record("run_command", &args, false, "error: shell unavailable");
+    g.record(
+        "run_command",
+        &args,
+        false,
+        "error: shell unavailable",
+        None,
+    );
     let s = g.repeat_steer("run_command", &args).expect("repeat steers");
     assert!(s.contains("already called"), "{s}");
     assert!(s.contains("error: shell unavailable"), "{s}");
@@ -134,6 +141,7 @@ fn short_circuits_exact_repeat_and_escalates() {
         &serde_json::json!({"command": "ls"}),
         false,
         "error: denied",
+        None,
     );
     let s2 = g.repeat_steer("run_command", &args).expect("still steers");
     assert!(s2.contains("stop using"), "escalates: {s2}");
@@ -143,11 +151,11 @@ fn short_circuits_exact_repeat_and_escalates() {
 fn ignores_successes_and_distinct_calls() {
     let mut g = RepeatCallGuard::default();
     let a = serde_json::json!({"path": "f.rs"});
-    g.record("read_file", &a, true, "file contents"); // success → not remembered
+    g.record("read_file", &a, true, "file contents", None); // success → not remembered
     assert!(g.repeat_steer("read_file", &a).is_none());
     // A failure under different args does not short-circuit a distinct call.
     let b = serde_json::json!({"path": "g.rs"});
-    g.record("read_file", &b, false, "error reading g.rs");
+    g.record("read_file", &b, false, "error reading g.rs", None);
     assert!(
         g.repeat_steer("read_file", &a).is_none(),
         "distinct args still run"
@@ -174,6 +182,7 @@ fn steers_no_result_repeats_on_second_issuance() {
         &q,
         true,
         "no matches in past conversations for \"newt-tui PyO3 bindings\" — try different keywords.",
+        None,
     );
     let s = g
         .repeat_steer("recall", &q)
@@ -191,7 +200,7 @@ fn steers_no_result_repeats_on_second_issuance() {
     // state_get "no such key" — same: 2nd identical probe is steered.
     let k = serde_json::json!({"key": "current_task"});
     assert!(g.repeat_steer("state_get", &k).is_none());
-    g.record("state_get", &k, true, "no such key: current_task");
+    g.record("state_get", &k, true, "no such key: current_task", None);
     assert!(
         g.repeat_steer("state_get", &k).is_some(),
         "2nd identical state_get steers"
@@ -206,6 +215,7 @@ fn steers_no_result_repeats_on_second_issuance() {
         &empty_plan_args,
         true,
         "no active plan — if this is multi-step work, call update_plan next",
+        None,
     );
     let plan_steer = g
         .repeat_steer("plan_get", &empty_plan_args)
@@ -214,7 +224,7 @@ fn steers_no_result_repeats_on_second_issuance() {
 
     // A genuine success with content is still NEVER steered on repeat.
     let f = serde_json::json!({"path": "f.rs"});
-    g.record("read_file", &f, true, "file contents");
+    g.record("read_file", &f, true, "file contents", None);
     assert!(g.repeat_steer("read_file", &f).is_none());
 
     // A no-result under DIFFERENT args is a distinct call — let it run.
@@ -236,7 +246,7 @@ fn steers_duplicate_successful_web_fetch() {
         g.repeat_steer("web_fetch", &issue).is_none(),
         "first fetch must run"
     );
-    g.record("web_fetch", &issue, true, "# Issue\n\nbody");
+    g.record("web_fetch", &issue, true, "# Issue\n\nbody", None);
     let steer = g
         .repeat_steer("web_fetch", &issue)
         .expect("2nd identical successful fetch steers");
@@ -256,7 +266,7 @@ fn steers_duplicate_successful_web_fetch() {
     );
 
     let file = serde_json::json!({"path": "src/lib.rs"});
-    g.record("read_file", &file, true, "file contents");
+    g.record("read_file", &file, true, "file contents", None);
     assert!(
         g.repeat_steer("read_file", &file).is_none(),
         "ordinary successful reads are still not steered"
@@ -279,6 +289,7 @@ fn steers_duplicate_successful_read_only_run_command() {
         &args,
         true,
         "9439:fn help_lines() -> &'static [&'static str] {",
+        None,
     );
 
     let steer = g
@@ -296,7 +307,7 @@ fn does_not_steer_successful_write_capable_run_command() {
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({"command": "cargo test -p newt-tui"});
 
-    g.record("run_command", &args, true, "test result: ok");
+    g.record("run_command", &args, true, "test result: ok", None);
 
     assert!(
         g.repeat_steer("run_command", &args).is_none(),
@@ -308,19 +319,19 @@ fn does_not_steer_successful_write_capable_run_command() {
 fn classifier_leaves_ordinary_successes_repeatable() {
     let file = serde_json::json!({"path": "src/lib.rs"});
     assert_eq!(
-        RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents"),
+        RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
         None
     );
 
     let tests = serde_json::json!({"command": "cargo test -p newt-core"});
     assert_eq!(
-        RepeatCallGuard::classify_repeat_memo("run_command", &tests, true, "test result: ok"),
+        RepeatCallGuard::classify_repeat_memo("run_command", &tests, true, "test result: ok", None),
         None
     );
 
     let mut g = RepeatCallGuard::default();
-    g.record("read_file", &file, true, "file contents");
-    g.record("run_command", &tests, true, "test result: ok");
+    g.record("read_file", &file, true, "file contents", None);
+    g.record("run_command", &tests, true, "test result: ok", None);
     assert!(
         g.repeat_memos.is_empty(),
         "ordinary successful calls must stay repeatable"
@@ -562,7 +573,7 @@ fn no_result_reason_classifies_and_routes() {
     // classification: it lands in repeat_memos as escalation-eligible.
     let mut g = RepeatCallGuard::default();
     let q = serde_json::json!({"query": "x"});
-    g.record("recall", &q, false, "error: index unavailable");
+    g.record("recall", &q, false, "error: index unavailable", None);
     assert!(matches!(
         g.repeat_memos.get(&RepeatCallGuard::key("recall", &q)),
         Some(RepeatMemo::Failure { first_line, .. }) if first_line == "error: index unavailable"
@@ -598,7 +609,7 @@ fn a_failing_build_now_memoizes_and_steers_the_repeat() {
     );
 
     assert!(g.repeat_steer("run_command", &args).is_none());
-    g.record("run_command", &args, ok, result);
+    g.record("run_command", &args, ok, result, None);
     let steer = g
         .repeat_steer("run_command", &args)
         .expect("a repeated failing build is not steered");
@@ -614,7 +625,7 @@ fn a_passing_build_stays_repeatable() {
     let result = "    Finished dev [unoptimized] target(s) in 0.04s\n";
     let ok = crate::agentic::tools::tool_result_ok(result);
     assert!(ok, "a successful build is being read as a failure");
-    g.record("run_command", &args, ok, result);
+    g.record("run_command", &args, ok, result, None);
     assert!(
         g.repeat_steer("run_command", &args).is_none(),
         "a passing build was memoized; re-running a build is legitimate"
@@ -880,13 +891,14 @@ fn workflow_blocker_ignores_an_os_permission_error_the_model_can_fix() {
 fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
     let mut guard = RepeatCallGuard::default();
     let args = serde_json::json!({});
-    guard.record("plan_get", &args, true, "no active plan");
+    guard.record("plan_get", &args, true, "no active plan", None);
     assert!(guard.repeat_steer("plan_get", &args).is_some());
     guard.record(
         "update_plan",
         &serde_json::json!({"plan": [{"step": "inspect"}]}),
         true,
         "<plan>inspect</plan>",
+        None,
     );
     assert!(
         guard.repeat_steer("plan_get", &args).is_none(),
@@ -951,25 +963,34 @@ fn a_kernel_refused_binary_is_a_blocker_no_edit_can_clear() {
 fn default_mode_keeps_steering_a_repeated_failure_across_successful_calls() {
     let mut guard = RepeatCallGuard::default();
     let fetch = serde_json::json!({"url": "https://fixture.invalid/doc"});
-    guard.record("web_fetch", &fetch, false, "error: fetch failed");
+    guard.record("web_fetch", &fetch, false, "error: fetch failed", None);
     guard.record(
         "update_plan",
         &serde_json::json!({"plan": []}),
         true,
         "plan updated",
+        None,
     );
-    guard.record("state_get", &serde_json::json!({"key": "k"}), true, "v");
+    guard.record(
+        "state_get",
+        &serde_json::json!({"key": "k"}),
+        true,
+        "v",
+        None,
+    );
     guard.record(
         "run_command",
         &serde_json::json!({"command": "echo x"}),
         true,
         "x",
+        None,
     );
     guard.record(
         "write_file",
         &serde_json::json!({"path": "a.txt"}),
         true,
         "wrote a.txt",
+        None,
     );
     assert!(
         guard.repeat_steer("web_fetch", &fetch).is_some(),
@@ -1022,8 +1043,14 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     .into_iter()
     .filter_map(|(name, args, clears)| {
         let mut guard = RepeatCallGuard::for_verification(true);
-        guard.record("run_command", &check, false, "error: command exited 101");
-        guard.record(name, &args, true, "ok");
+        guard.record(
+            "run_command",
+            &check,
+            false,
+            "error: command exited 101",
+            None,
+        );
+        guard.record(name, &args, true, "ok", None);
         (guard.repeat_steer("run_command", &check).is_none() != clears)
             .then(|| format!("{name} {args}: clears={}", !clears))
     })

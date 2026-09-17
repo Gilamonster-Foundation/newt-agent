@@ -275,6 +275,16 @@ pub enum HumanQuestionOutcome {
 /// the design notes). Implementations that auto-allow previously
 /// session-granted targets must still return freshly minted caveats.
 pub trait PermissionGate {
+    /// Read current standing authority without prompting or consuming an
+    /// allow-once grant. Apply approved grants to the caller's baseline without
+    /// restoring unrelated authority from a broader base. Implementations must
+    /// retain their preset and delegation ceilings; wrappers may refuse an invalid
+    /// refresh.
+    /// The default preserves the caller's baseline for gates without live state.
+    fn refresh_caveats(&mut self, baseline: &Caveats) -> PermissionDecision {
+        PermissionDecision::Allow(baseline.clone())
+    }
+
     /// Ask about a batch of denials from ONE tool call (a compound command
     /// can be refused on several targets at once). `Allow` means every
     /// request was allowed; any single deny keeps the whole denial.

@@ -924,9 +924,10 @@ mod tests {
         );
     }
 
-    // --- session semantics (process-global: serialized) ---
+    // Session and real-fs tests share this process-global singleton and its
+    // environment, so they must also share the same serialization lock.
 
-    #[serial_test::serial(secrets_session)]
+    #[serial_test::serial(real_fs)]
     #[test]
     fn session_passphrase_set_clear_and_env_memoization() {
         session().reset_for_test();
@@ -951,7 +952,7 @@ mod tests {
         session().reset_for_test();
     }
 
-    #[serial_test::serial(secrets_session)]
+    #[serial_test::serial(real_fs)]
     #[test]
     fn warn_once_reports_each_path_exactly_once() {
         session().reset_for_test();

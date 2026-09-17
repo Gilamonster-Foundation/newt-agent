@@ -103,7 +103,7 @@ async fn run_tool_gated(
     args: serde_json::Value,
     ws: &std::path::Path,
     caveats: &Caveats,
-    gate: &mut MockGate,
+    gate: &mut dyn super::PermissionGate,
 ) -> String {
     execute_tool(
         name,

@@ -97,6 +97,50 @@ impl PermissionGate for WidenAll {
     }
 }
 
+/// Grounds passive-refresh rejection in an actual child side effect: a gate's
+/// newly recalled authority cannot expose a private frame, even when the
+/// requested command itself would fit the old workspace-only policy.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial_test::serial]
+async fn live_permission_refresh_cannot_bypass_frame_isolation() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
+    struct RecalledAll;
+    impl PermissionGate for RecalledAll {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            panic!("passive refresh must not ask for new authority");
+        }
+        fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
+            PermissionDecision::Allow(Caveats::top())
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let (harness, _) = harness(directory.path());
+    let marker = workspace.path().join("must-not-run");
+    let baseline = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    let output = dispatch(
+        &harness,
+        workspace.path(),
+        &baseline,
+        "run_command",
+        serde_json::json!({"command": format!("/usr/bin/touch '{}'", marker.display())}),
+        Some(&mut RecalledAll),
+    )
+    .await;
+    assert!(output.contains("frame isolation"), "{output}");
+    assert!(
+        !marker.exists(),
+        "refused refresh must stop before any child runs"
+    );
+}
+
 /// Grounds the mocked permission decision against a private payload file:
 /// re-minting authority during a turn cannot bypass the frame read boundary.
 #[tokio::test]

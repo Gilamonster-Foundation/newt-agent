@@ -1,4 +1,5 @@
 use super::*;
+use crate::ExecOutcome;
 
 // -- #721 recoverable denials + request_permissions ---------------------
 
@@ -199,8 +200,9 @@ fn permission_grant_releases_only_cached_authority_failures() {
             &args,
             false,
             &denied_fs_result("fs_read", "report.txt"),
+            None,
         );
-        guard.record("list_dir", &args, false, "error: not a directory");
+        guard.record("list_dir", &args, false, "error: not a directory", None);
         let command = serde_json::json!({"command": "compiler report.txt"});
         guard.record(
             "run_command",
@@ -210,6 +212,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 "error: {}\ncapability denied: exec does not permit compiler",
                 "x".repeat(240)
             ),
+            None,
         );
         let os_error = serde_json::json!({"command": "check permissions"});
         guard.record(
@@ -217,10 +220,11 @@ fn permission_grant_releases_only_cached_authority_failures() {
             &os_error,
             false,
             "error: fixture asserted Permission denied",
+            None,
         );
-        guard.record("state_get", &args, true, "no such key: report.txt");
+        guard.record("state_get", &args, true, "no such key: report.txt", None);
         let fetch = serde_json::json!({"url": "https://example.test/report"});
-        guard.record("web_fetch", &fetch, true, "observed report");
+        guard.record("web_fetch", &fetch, true, "observed report", None);
         assert!(guard.repeat_steer("read_file", &args).is_some());
 
         let mut allow = MockGate::new(true, &Caveats::top());
@@ -259,7 +263,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 granted.clone(),
             ),
         ] {
-            guard.record(name, &request, tool_result_ok(&result), &result);
+            guard.record(name, &request, tool_result_ok(&result), &result, None);
             assert!(
                 guard.repeat_steer("read_file", &args).is_some(),
                 "{name}: {result}"
@@ -271,6 +275,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
             &permission,
             tool_result_ok(&granted),
             &granted,
+            None,
         );
         assert!(
             guard.repeat_steer("read_file", &args).is_none(),
@@ -298,6 +303,80 @@ fn permission_grant_releases_only_cached_authority_failures() {
     }
 }
 
+#[test]
+fn permission_grant_releases_native_command_failure_for_recheck() {
+    use crate::agentic::RepeatCallGuard;
+
+    let command = serde_json::json!({"command": "/usr/bin/head -n 1 /approved/config"});
+    let permission = serde_json::json!({"capability": "fs_read", "target": "/approved/config"});
+    let unrelated = serde_json::json!({"path": "/other/report"});
+    // This is the real confined-child result shape grounded by the native
+    // session-grant test below; it carries no structured capability refusal.
+    for result_aware in [false, true] {
+        for (name, outcome, released) in [
+            ("run_command", Some(ExecOutcome::Failed), true),
+            ("lifecycle", Some(ExecOutcome::Failed), true),
+            ("run_command", Some(ExecOutcome::Denied), true),
+            ("run_command", Some(ExecOutcome::TimedOut), false),
+            ("run_command", Some(ExecOutcome::Unavailable), false),
+            ("run_command", Some(ExecOutcome::Passed), false),
+            ("run_command", None, false),
+            ("read_file", Some(ExecOutcome::Failed), false),
+        ] {
+            for failed in [
+                "error: command exited 1\nhead: /approved/config: Operation not permitted",
+                "error: command exited 101\ncompilation failed",
+            ] {
+                let mut guard = RepeatCallGuard::for_verification(result_aware);
+                guard.record(name, &command, tool_result_ok(failed), failed, outcome);
+                guard.record(
+                    "read_file",
+                    &unrelated,
+                    false,
+                    "error: not a directory",
+                    None,
+                );
+                assert!(guard.repeat_steer(name, &command).is_some());
+                let declined = execute_request_permissions(&permission, None, false, 20);
+                guard.record(
+                    "request_permissions",
+                    &permission,
+                    tool_result_ok(&declined),
+                    &declined,
+                    None,
+                );
+                assert!(guard.repeat_steer(name, &command).is_some());
+
+                let mut gate = MockGate::new(true, &Caveats::top());
+                let granted = execute_request_permissions(&permission, Some(&mut gate), false, 20);
+                guard.record(
+                    "request_permissions",
+                    &permission,
+                    tool_result_ok(&granted),
+                    &granted,
+                    None,
+                );
+                assert_eq!(
+                    guard.repeat_steer(name, &command).is_none(),
+                    released,
+                    "only a typed failed native call can re-enter confinement: {name} {outcome:?}"
+                );
+                assert!(guard.repeat_steer("read_file", &unrelated).is_some());
+                assert_eq!(
+                    guard.total_failures(),
+                    2,
+                    "executed failures remain history"
+                );
+                guard.record(name, &command, tool_result_ok(failed), failed, outcome);
+                assert!(
+                    guard.repeat_steer(name, &command).is_some(),
+                    "a retry that still fails must be memoized again"
+                );
+            }
+        }
+    }
+}
+
 /// Grounds the cached-denial unit test in real dispatch and a regular file:
 /// after the operator grants its exact path, the identical list_dir call must
 /// reach the filesystem and report ENOTDIR, rather than replay a stale denial.
@@ -317,7 +396,7 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
     let mut guard = RepeatCallGuard::default();
     let denied = run_tool("list_dir", args.clone(), workspace.path(), &base, None).await;
     assert!(denied.starts_with("capability denied:"), "{denied}");
-    guard.record("list_dir", &args, tool_result_ok(&denied), &denied);
+    guard.record("list_dir", &args, tool_result_ok(&denied), &denied, None);
     assert!(guard.repeat_steer("list_dir", &args).is_some());
 
     let mut gate = MockGate::new(true, &base);
@@ -329,6 +408,7 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
         &permission,
         tool_result_ok(&granted),
         &granted,
+        None,
     );
     assert!(
         guard.repeat_steer("list_dir", &args).is_none(),
@@ -345,12 +425,13 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
         .asks
         .iter()
         .all(|(_, target)| target == &format!("fs_read:{}", file.display())));
-    guard.record("list_dir", &args, tool_result_ok(&retried), &retried);
+    guard.record("list_dir", &args, tool_result_ok(&retried), &retried, None);
     guard.record(
         "request_permissions",
         &permission,
         tool_result_ok(&granted),
         &granted,
+        None,
     );
     assert!(
         guard.repeat_steer("list_dir", &args).is_some(),
@@ -705,6 +786,167 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
 #[ignore = "private child entrypoint for the real exact-executable grant test"]
 fn exact_executable_child() {
     println!("EXACT_EXEC_OK");
+}
+
+#[test]
+fn live_permission_refresh_defaults_to_the_supplied_baseline() {
+    let baseline = Caveats {
+        fs_read: Scope::only(["workspace".into()]),
+        fs_write: Scope::none(),
+        exec: Scope::only(["head".into()]),
+        net: Scope::none(),
+        max_calls: CountBound::AtMost(3),
+        valid_for_generation: Scope::only([7]),
+    };
+    let mut gate = MockGate::new(false, &Caveats::top());
+    let PermissionDecision::Allow(current) = gate.refresh_caveats(&baseline) else {
+        panic!("an unchanged gate must retain the caller's baseline");
+    };
+    assert_eq!(current, baseline);
+    assert!(gate.asks.is_empty(), "refresh must not ask the operator");
+}
+
+/// Grounds the live-policy seam and exact session-grant tests in a real native
+/// child's Seatbelt file read. The baseline stays unchanged across calls: only
+/// the gate remembers approval, and the sibling remains outside its scope.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
+    use crate::agentic::RepeatCallGuard;
+
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = super::disable_ocap_tests::EnvVar::unset("NEWT_FULL_ACCESS");
+    let workspace = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let approved = private.path().canonicalize().unwrap().join("approved.txt");
+    let sibling = approved.with_file_name("sibling.txt");
+    std::fs::write(&approved, "NATIVE_SESSION_READ\n").unwrap();
+    std::fs::write(&sibling, "UNGRANTED_SIBLING\n").unwrap();
+    let control = std::process::Command::new("/usr/bin/head")
+        .args(["-n", "1"])
+        .arg(&approved)
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "fixture must be readable before confinement"
+    );
+    assert_eq!(control.stdout, b"NATIVE_SESSION_READ\n");
+
+    struct SessionGate {
+        current: Caveats,
+        prompts: usize,
+    }
+    impl PermissionGate for SessionGate {
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            assert!(requests.iter().all(|r| r.tool == "request_permissions"));
+            self.prompts += 1;
+            let grants: Vec<_> = requests
+                .iter()
+                .map(|r| (r.kind, r.target.clone()))
+                .collect();
+            self.current = crate::agentic::widen_caveats(&self.current, &grants);
+            PermissionDecision::Allow(self.current.clone())
+        }
+        fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
+            PermissionDecision::Allow(self.current.clone())
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+    let baseline = Caveats {
+        exec: Scope::only(["/usr/bin/head".into()]),
+        ..crate::confined_exec::workspace_confined_caveats(&root)
+    };
+    let mut gate = SessionGate {
+        current: baseline.clone(),
+        prompts: 0,
+    };
+    let command =
+        serde_json::json!({"command": format!("/usr/bin/head -n 1 '{}'", approved.display())});
+    let execution = std::sync::OnceLock::new();
+    let denied = execute_tool_with_collaborators(
+        "run_command",
+        &command,
+        &root.to_string_lossy(),
+        false,
+        20,
+        &baseline,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate),
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        denied.contains("Operation not permitted"),
+        "native denial: {denied}"
+    );
+    assert!(!denied.contains("NATIVE_SESSION_READ"));
+    assert_eq!(gate.prompts, 0, "native stderr is not a permission request");
+    assert_eq!(execution.get(), Some(&ExecOutcome::Failed));
+    let mut repeats = RepeatCallGuard::default();
+    repeats.record(
+        "run_command",
+        &command,
+        tool_result_ok(&denied),
+        &denied,
+        execution.get().copied(),
+    );
+    assert!(repeats.repeat_steer("run_command", &command).is_some());
+
+    let permission = serde_json::json!({"capability": "fs_read", "target": approved});
+    let grant = run_tool_gated(
+        "request_permissions",
+        permission.clone(),
+        &root,
+        &baseline,
+        &mut gate,
+    )
+    .await;
+    assert!(grant.starts_with("granted:"), "{grant}");
+    repeats.record(
+        "request_permissions",
+        &permission,
+        tool_result_ok(&grant),
+        &grant,
+        None,
+    );
+    assert!(
+        repeats.repeat_steer("run_command", &command).is_none(),
+        "the real native failure must reach refreshed confinement after a grant"
+    );
+    let allowed = run_tool_gated("run_command", command, &root, &baseline, &mut gate).await;
+    assert!(
+        allowed.lines().any(|line| line == "NATIVE_SESSION_READ"),
+        "the same-turn native child must receive the session grant: {allowed}"
+    );
+    let other = run_tool_gated(
+        "run_command",
+        serde_json::json!({"command": format!("/usr/bin/head -n 1 '{}'", sibling.display())}),
+        &root,
+        &baseline,
+        &mut gate,
+    )
+    .await;
+    assert!(
+        other.contains("Operation not permitted"),
+        "sibling must remain denied: {other}"
+    );
+    assert!(!other.contains("UNGRANTED_SIBLING"));
+    assert_eq!(gate.prompts, 1, "only the explicit request prompts");
+    assert!(!baseline.permits_fs_read(&approved.to_string_lossy()));
 }
 
 /// Gate denies → the result is the standard denial, bit-for-bit equal to
