@@ -71,7 +71,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use super::ansi::{clip_to_width, wrap_row, Row, TranscriptStream};
 use super::pty::PtyCapture;
 use crate::rich_input::{Chrome, EditorOutcome, MountedEditor, RichSurface, ScrollbackSink};
-use crate::session_worker::SurfaceRequest;
+use crate::session_worker::{PanelMode, SurfaceRequest};
 use crate::{InputSurface, ReadOutcome};
 
 /// How long the loop sleeps in `poll` when nothing is happening. Bounds the
@@ -864,7 +864,7 @@ impl Presenter {
                 }
                 if let Err(error) = self.screen.place_cursor(reservation.start) {
                     self.chat_inactive = false;
-                    let _ = self.finish_modal(&reservation);
+                    let _ = self.finish_modal(Some(&reservation));
                     let _ = self.draw();
                     return Err(error);
                 }
@@ -890,7 +890,7 @@ impl Presenter {
                     ),
                 };
                 drop(window);
-                let modal_cleanup = self.finish_modal(&reservation);
+                let modal_cleanup = self.finish_modal(Some(&reservation));
                 self.chat_inactive = false;
                 // The modal wrote outside ratatui's diff. Repaint the inline
                 // region from a clean buffer so focus returns to chat without
@@ -911,14 +911,11 @@ impl Presenter {
                 modal_cleanup?;
                 repaint?;
             }
-            // The panel sibling of `Interact`. Same reservation, same focus
-            // transfer, same repaint — the difference is only WHO draws in the
-            // reserved rows: the presenter renders a semantic interaction
-            // itself, while a panel is lent the rows and draws its own loop on
-            // the session thread. This arm PARKS the presenter for that whole
-            // time, which is what keeps two writers off one terminal and
-            // leaves the keyboard to the panel.
-            SurfaceRequest::Panel { rows, reply } => {
+            // The panel sibling of `Interact`: lend the real terminal and
+            // park while the session draws. Inline panels reserve rows;
+            // alternate-screen panels preserve the primary buffer themselves.
+            // Both use the same focus transfer and release channel.
+            SurfaceRequest::Panel { mode, reply } => {
                 let panel_output = match self.screen.tty.try_clone() {
                     Ok(tty) => tty,
                     // A failed clone is not fatal: tell the session there are
@@ -934,9 +931,17 @@ impl Presenter {
                 if self.dirty {
                     self.draw()?;
                 }
-                let reservation = self.screen.reserve_modal_rows(rows)?;
+                let reservation = match mode {
+                    PanelMode::Inline(rows) => Some(self.screen.reserve_modal_rows(rows)?),
+                    // The caller's alternate buffer occludes the composer and
+                    // saves the primary screen. Do not erase or scroll it first.
+                    PanelMode::AlternateScreen => None,
+                };
                 self.chat_inactive = true;
-                if reservation.chat_visible {
+                if reservation
+                    .as_ref()
+                    .is_some_and(|window| window.chat_visible)
+                {
                     if let Err(error) = self.draw() {
                         self.chat_inactive = false;
                         return Err(error);
@@ -947,10 +952,13 @@ impl Presenter {
                 // unwind — so the rows cannot be stranded by a panel that
                 // returns through a path nobody thought about.
                 let (release, released) = std::sync::mpsc::sync_channel(1);
+                let (top, rows) = reservation
+                    .as_ref()
+                    .map_or((0, self.screen.rows), |window| (window.start, window.rows));
                 let window = crate::session_worker::PanelWindow::new(
                     panel_output,
-                    reservation.start,
-                    reservation.rows,
+                    top,
+                    rows,
                     self.screen.cols,
                     Some(release),
                 );
@@ -958,7 +966,7 @@ impl Presenter {
                     // The session vanished between asking and receiving. Undo
                     // the reservation rather than parking forever.
                     self.chat_inactive = false;
-                    let cleanup = self.finish_modal(&reservation);
+                    let cleanup = self.finish_modal(reservation.as_ref());
                     let _ = self.screen.term.clear();
                     let _ = self.draw();
                     return cleanup;
@@ -967,7 +975,7 @@ impl Presenter {
                 // send — the same "the panel is done" signal, reached by a
                 // path that could not send. Either way: clean up.
                 let _ = released.recv();
-                let modal_cleanup = self.finish_modal(&reservation);
+                let modal_cleanup = self.finish_modal(reservation.as_ref());
                 self.chat_inactive = false;
                 // The panel wrote outside ratatui's diff, so the mounted block
                 // is repainted from a clean buffer — the same restore the
@@ -1102,17 +1110,21 @@ impl Presenter {
 
     /// A blocking dialog may have consumed every resize event while this
     /// presenter was parked. Read the real tty before restoring its draft.
-    fn finish_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+    fn finish_modal(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
         let (cols, rows) = self.screen.terminal_size()?;
         if (cols, rows) != (self.screen.cols, self.screen.rows) {
-            // A narrower dialog may have expanded above its original top.
-            // Clear the visible screen before rebuilding the editor at the
-            // actual dimensions; terminal scrollback is retained.
-            self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
-            self.screen.tty.flush()?;
+            // A narrower inline dialog may have expanded above its old top.
+            // Alternate-screen loans never painted the primary buffer; only
+            // inline dialogs need their old pixels cleared before resizing.
+            if reservation.is_some() {
+                self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+                self.screen.tty.flush()?;
+            }
             self.on_event(Event::Resize(cols, rows))
-        } else {
+        } else if let Some(reservation) = reservation {
             self.screen.cleanup_modal(reservation)
+        } else {
+            Ok(())
         }
     }
 
@@ -1594,6 +1606,8 @@ mod tests {
 #[path = "presenter_terminal_acceptance.rs"]
 mod terminal_acceptance;
 
+#[cfg(all(test, feature = "live-spill"))]
+pub(crate) use terminal_acceptance::cockpit_pager_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case, panel_resize_case,

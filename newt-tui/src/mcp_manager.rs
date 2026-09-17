@@ -178,7 +178,7 @@ where
             .is_none_or(|tui| tui.sanitize_mcp_server_names),
     );
     loop {
-        let window = surface.open_panel(24);
+        let window = surface.open_panel(crate::session_worker::PanelMode::Inline(24));
         crate::panel::drive(&mut panel, 24, window.as_ref())?;
         drop(window);
         let Some(action) = panel.take_action() else {

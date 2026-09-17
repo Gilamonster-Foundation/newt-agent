@@ -73,14 +73,15 @@ fn transcript_pager_child() {
         "pager" => {
             let turns = synthetic_turns(40);
             let mut state = PagerState::new("pty transcript", &turns);
-            run_pager(&mut state).expect("pager runs to a clean quit");
+            let mut surface = crate::lean_input::LeanSurface::new(None).unwrap();
+            run_pager(&mut state, &mut surface, false).expect("pager runs to a clean quit");
         }
         // The failure path AFTER entry: the guard is live and the process
         // unwinds. Restoration must not depend on reaching the end of
         // `run_pager` — it is a Drop obligation, and this proves it against a
         // real terminal rather than by inspection.
         "panic" => {
-            let _guard = AltScreenGuard::enter().expect("enter the alternate screen");
+            let _guard = AltScreenGuard::enter(None).expect("enter the alternate screen");
             // HOLD the guard until the parent has sampled the tty. Panicking
             // immediately is a race the parent loses: the unwind restores
             // cooked mode before the first `is_raw()` read, and the test then

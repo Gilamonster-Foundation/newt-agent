@@ -62,6 +62,15 @@ use std::sync::mpsc::{Receiver, RecvError, SyncSender};
 
 use crate::chat::{BackgroundJob, ReadOutcome};
 
+/// How a blocking panel uses the terminal lent by the presenter.
+#[cfg(feature = "rich-tui")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanelMode {
+    Inline(u16),
+    /// The caller's alternate-screen guard preserves the primary screen.
+    AlternateScreen,
+}
+
 /// What a session thread asks the UI thread to do on its behalf.
 ///
 /// Mirrors `InputSurface` one-for-one. Everything the surface can do is either
@@ -129,14 +138,15 @@ pub(crate) enum SurfaceRequest {
     /// config and its filesystem writers — `!Send`, and not expressible as a
     /// `SurfaceInteraction` — so the loop cannot be moved to the UI thread the
     /// way a semantic interaction is. What CAN move is the terminal: the
-    /// presenter reserves the rows, hands back a [`PanelWindow`] onto the real
-    /// tty, and parks until the window is dropped.
+    /// presenter reserves inline rows (or leaves the primary buffer intact
+    /// for an alternate-screen caller), hands back a [`PanelWindow`] onto the
+    /// real tty, and parks until the window is dropped.
     ///
     /// `None` means "no cockpit here" — a lean or piped surface has no rows to
     /// lend, and the caller keeps its existing stdout path.
     #[cfg(feature = "rich-tui")]
     Panel {
-        rows: u16,
+        mode: PanelMode,
         reply: SyncSender<Option<PanelWindow>>,
     },
 }
@@ -218,6 +228,12 @@ impl PanelWindow {
             self.out.try_clone()?,
             ratatui::layout::Rect::new(0, self.top, self.cols, self.rows),
         )
+    }
+
+    /// An operator-invoked alternate-screen pager keeps this window alive but
+    /// measures its full-screen viewport afresh after every terminal resize.
+    pub(crate) fn output(&self) -> std::io::Result<std::fs::File> {
+        self.out.try_clone()
     }
 
     /// Acquire input only after the presenter has lent the dialog its rows.
@@ -413,11 +429,11 @@ impl crate::chat::InputSurface for RemoteSurface {
     }
 
     #[cfg(feature = "rich-tui")]
-    fn open_panel(&mut self, rows: u16) -> Option<PanelWindow> {
+    fn open_panel(&mut self, mode: PanelMode) -> Option<PanelWindow> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         // A UI thread that cannot lend rows is not an error: the caller keeps
         // its own stdout path, exactly as it does on a lean surface.
-        self.ask(|reply| SurfaceRequest::Panel { rows, reply }, rx, tx)
+        self.ask(|reply| SurfaceRequest::Panel { mode, reply }, rx, tx)
             .ok()
             .flatten()
     }
@@ -496,8 +512,8 @@ pub(crate) fn pump_surface(
                 let _ = reply.send(surface.present_interaction(&interaction));
             }
             #[cfg(feature = "rich-tui")]
-            SurfaceRequest::Panel { rows, reply } => {
-                let _ = reply.send(surface.open_panel(rows));
+            SurfaceRequest::Panel { mode, reply } => {
+                let _ = reply.send(surface.open_panel(mode));
             }
         }
     }
@@ -702,7 +718,7 @@ mod tests {
         {
             let (ptx, _prx) = std::sync::mpsc::sync_channel(1);
             assert!(SurfaceRequest::Panel {
-                rows: 10,
+                mode: PanelMode::Inline(10),
                 reply: ptx,
             }
             .expects_reply());
@@ -846,7 +862,7 @@ mod tests {
                 .expect("served"));
             surface.present_interaction(&an_interaction());
             #[cfg(feature = "rich-tui")]
-            surface.open_panel(10);
+            surface.open_panel(PanelMode::Inline(10));
         }
 
         let seen = served.join().expect("terminal thread");
@@ -1076,7 +1092,7 @@ mod tests {
         /// A counting surface has no terminal to lend, so it answers `None` —
         /// the same honest answer a lean surface gives. What is under test is
         /// that the call CROSSED, not that rows came back.
-        fn open_panel(&mut self, _rows: u16) -> Option<PanelWindow> {
+        fn open_panel(&mut self, _mode: PanelMode) -> Option<PanelWindow> {
             self.open_panel += 1;
             None
         }
