@@ -2,9 +2,12 @@
 //! Newt binary. Cloud APIs live behind opt-in `ProviderPluginBackend`.
 //!
 //! Local requests default to a 120-second send/header deadline and maximum
-//! idle gap between response chunks. Callers can override both with
-//! `with_timeout` without replacing an injected HTTP client. OpenAI-compatible
-//! and native Ollama completion requests stream.
+//! idle gap between response chunks, plus a total read deadline
+//! ([`STREAM_TOTAL_TIMEOUT_MULTIPLIER`] times the idle gap) so a stream that
+//! keeps trickling bytes without ever finishing is still bounded. Callers
+//! can override the send/idle timeout with `with_timeout` without replacing
+//! an injected HTTP client. OpenAI-compatible and native Ollama completion
+//! requests stream.
 
 use std::future::Future;
 use std::time::Duration;
@@ -17,6 +20,16 @@ use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
 use crate::retry::{with_backoff, RetryPolicy};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A stream whose idle gap between chunks never exceeds `idle_timeout` can
+/// still run forever: a model-swap proxy that drip-feeds one byte just under
+/// the idle window (or a cold-loaded model producing a token every ~90s)
+/// resets the per-chunk timer on every arrival and is never caught. The total
+/// read deadline is `idle_timeout * this multiplier`, wide enough to cover a
+/// slow-but-progressing generation while still bounding a stream that never
+/// finishes. Diagnosed from a `newt` session stuck 5689s past its stated
+/// "120s idle timeout" against a DGX model-swap backend.
+const STREAM_TOTAL_TIMEOUT_MULTIPLIER: u32 = 5;
 
 #[derive(Debug)]
 struct ObservedProviderError(String);
@@ -64,6 +77,7 @@ tokio::task_local! {
 async fn decode_http_reply(
     mut response: reqwest::Response,
     idle_timeout: Duration,
+    total_deadline: Instant,
     backend: &str,
     decode: impl FnOnce(&[u8]) -> anyhow::Result<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
@@ -72,7 +86,14 @@ async fn decode_http_reply(
     // close the response after an error frame arrived but before its EOF.
     let mut bytes = Vec::new();
     let read_error = loop {
-        match tokio::time::timeout(idle_timeout, response.chunk()).await {
+        let remaining = total_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Some(anyhow::anyhow!(
+                "total read deadline elapsed (each chunk arrived within the \
+                 {idle_timeout:?} idle window, but the stream never finished)"
+            ));
+        }
+        match tokio::time::timeout(idle_timeout.min(remaining), response.chunk()).await {
             Ok(Ok(Some(chunk))) => {
                 bytes.extend_from_slice(&chunk);
                 #[cfg(test)]
@@ -398,7 +419,15 @@ impl LocalOllamaBackend {
         })
         .await?;
 
-        let json = decode_http_reply(resp, self.timeout, "Ollama", decode_ollama_stream).await?;
+        let total_deadline = Instant::now() + self.timeout * STREAM_TOTAL_TIMEOUT_MULTIPLIER;
+        let json = decode_http_reply(
+            resp,
+            self.timeout,
+            total_deadline,
+            "Ollama",
+            decode_ollama_stream,
+        )
+        .await?;
         // #385: strip inline <think>…</think> reasoning from the content.
         let (content, _reasoning) =
             newt_core::split_reasoning(json["message"]["content"].as_str().unwrap_or(""));
@@ -574,9 +603,11 @@ impl LocalVllmBackend {
         })
         .await?;
 
+        let total_deadline = Instant::now() + self.timeout * STREAM_TOTAL_TIMEOUT_MULTIPLIER;
         let json = decode_http_reply(
             resp,
             self.timeout,
+            total_deadline,
             "vLLM",
             newt_core::agentic::openai_sse::decode_response,
         )

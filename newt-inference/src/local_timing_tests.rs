@@ -101,3 +101,94 @@ async fn progressing_local_stream_resets_its_idle_timeout() {
     server.await.unwrap();
     assert_eq!(reply.content, "still progressing");
 }
+
+/// A stream that keeps every gap under the idle timeout but never finishes
+/// must still be cut off — otherwise a model-swap proxy that drip-feeds
+/// heartbeat bytes just under the idle window can wedge a turn forever, as
+/// diagnosed from a `newt` session stuck ~95 minutes past its stated "120s
+/// idle timeout". The per-attempt total read deadline
+/// (`STREAM_TOTAL_TIMEOUT_MULTIPLIER * idle_timeout`) is the backstop.
+///
+/// Uses paused virtual time (never a real sleep) per the unit-tier rule: a
+/// real-clock version of this test flaked by tripping the idle timer instead
+/// of the total deadline under scheduler jitter.
+#[tokio::test]
+async fn never_ending_local_stream_hits_its_total_read_deadline() {
+    const HEARTBEAT: &[u8] = b": heartbeat\n\n";
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (advance_tx, mut advance_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _request = request_body(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        // Keep trickling a comment frame (no `data:` payload, never `[DONE]`)
+        // every time the test asks, well within the idle window, forever.
+        while advance_rx.recv().await.is_some() {
+            if socket.write_all(HEARTBEAT).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let idle_timeout = Duration::from_secs(2);
+    let backend = LocalVllmBackend::new(endpoint, "never-ending-fixture")
+        .with_client(reqwest::Client::new())
+        .with_timeout(idle_timeout)
+        .with_retry_policy(RetryPolicy::immediate(0));
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let mut completion = Box::pin(RESPONSE_BYTES_READ.scope(
+        consumed.clone(),
+        backend.complete(ChatRequest::new().user("keep generating forever")),
+    ));
+
+    tokio::time::pause();
+    let mut expected = 0usize;
+    let mut completed = None;
+    // Total deadline is 5 * idle_timeout = 10s. Advance 1s per heartbeat (well
+    // under the 2s idle window) for 12 heartbeats — 12s of stream time,
+    // crossing the total deadline without a single gap tripping the idle timer.
+    for _ in 0..12 {
+        advance_tx
+            .send(())
+            .expect("server task must still be running");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        expected += HEARTBEAT.len();
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut completion => {
+                    completed = Some(result);
+                    break;
+                }
+                _ = tokio::task::yield_now() => {
+                    if consumed.load(Ordering::SeqCst) >= expected {
+                        break;
+                    }
+                }
+            }
+        }
+        if completed.is_some() {
+            break;
+        }
+    }
+    tokio::time::resume();
+    drop(advance_tx);
+    let _ = server.await;
+
+    let result = completed.expect(
+        "the total read deadline must cut the stream off within 12 heartbeats, not hang forever",
+    );
+    let error = result.expect_err("a stream that never finishes must not hang forever");
+    assert!(
+        error.to_string().contains("total read deadline elapsed"),
+        "expected a total-deadline error, got: {error}"
+    );
+}
