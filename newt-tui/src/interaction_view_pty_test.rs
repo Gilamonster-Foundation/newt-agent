@@ -160,6 +160,10 @@ fn interaction_view_child() {
         "cockpit_buffered_input" => {
             crate::cockpit::presenter::cockpit_buffered_input_case();
         }
+        #[cfg(feature = "live-spill")]
+        "cockpit_pager" => {
+            crate::cockpit::presenter::cockpit_pager_case();
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -316,7 +320,10 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
         .stdin(pty.slave_stdio())
         .stdout(pty.slave_stdio())
         .stderr(std::process::Stdio::null());
-    if matches!(mode, "cockpit_bang" | "cockpit_buffered_input") {
+    if matches!(
+        mode,
+        "cockpit_bang" | "cockpit_buffered_input" | "cockpit_pager"
+    ) {
         child.env("NEWT_EDIT_MODE", "emacs");
     }
     child.spawn().expect("spawn the pty child")
@@ -335,6 +342,121 @@ pub(crate) fn drive_cockpit_acceptance() {
 
 pub(crate) fn drive_cockpit_buffered_input() {
     drive_cockpit_case("cockpit_buffered_input");
+}
+
+#[cfg(feature = "live-spill")]
+pub(crate) fn drive_cockpit_pager() {
+    for sizes in [
+        &[][..],
+        &[(12, 46), (30, 100), (24, 80)][..],
+        &[(12, 46), (30, 100)][..],
+    ] {
+        drive_cockpit_pager_sizes(sizes);
+    }
+}
+
+#[cfg(feature = "live-spill")]
+fn drive_cockpit_pager_sizes(sizes: &[(u16, u16)]) {
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(24, 80);
+    let baseline = pty.termios_snapshot();
+    let mut child = spawn_child(&pty, "cockpit_pager");
+    let mut transcript = String::new();
+    let result = (|| -> Result<(), String> {
+        if !pty.wait_for_screen_after("spill-row-00", "╯", REACH_TIMEOUT) {
+            return Err("pager never painted its bottom border".into());
+        }
+        let first = pty.screen();
+        transcript.push_str(&first);
+        let (primary, frame) = first
+            .split_once("\x1b[?1049h")
+            .ok_or("pager must enter the real alternate screen, not stdout capture")?;
+        let (_, after_history) = primary
+            .split_once("HISTORY_BEFORE_PAGER")
+            .ok_or("fixture must paint primary-screen history before the pager")?;
+        // screen_grid deliberately ignores erase and alternate-buffer commands.
+        // Check the real primary-screen bytes too: the loan must neither scroll
+        // the history away nor erase it before the terminal saves that screen.
+        if after_history.contains('\n')
+            || after_history.contains("\x1b[1;1H\x1b[J")
+            || after_history.contains("\x1b[2J")
+        {
+            return Err(
+                "pager loan moved or cleared visible history before alternate entry".into(),
+            );
+        }
+        let rows = screen_grid(frame);
+        if !rows.get(1).is_some_and(|row| row.contains("spill-row-00"))
+            || !rows.get(2).is_some_and(|row| row.contains("spill-row-01"))
+            || frame.contains("^D exit")
+        {
+            return Err(format!(
+                "pager must show separate body rows and occlude the composer: {rows:?}"
+            ));
+        }
+        for &(height, width) in sizes {
+            pty.resize(height, width);
+            signal_winch(child.id());
+            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
+                return Err(format!("no repaint after resize to {width}x{height}"));
+            }
+            let repaint = pty.screen();
+            transcript.push_str(&repaint);
+            let rows = screen_grid(&repaint);
+            if rows.len() != usize::from(height)
+                || rows
+                    .last()
+                    .is_none_or(|row| row.chars().nth(usize::from(width - 1)) != Some('╯'))
+                || !rows.get(1).is_some_and(|row| row.contains("spill-row-00"))
+                || repaint.contains("^D exit")
+            {
+                return Err(format!(
+                    "pager geometry or input ownership lost after resize: {rows:?}"
+                ));
+            }
+        }
+        pty.type_in("z\x1b");
+        if !pty.wait_for_screen_after("PAGER_RETURNED", "^D exit", REACH_TIMEOUT) {
+            return Err("pager did not return the editor after Esc".into());
+        }
+        let tail = pty.screen();
+        transcript.push_str(&tail);
+        if !tail.contains("\x1b[?1049l") || tail.contains("spill-row-") {
+            return Err("pager pixels escaped into the restored transcript".into());
+        }
+        let (_, restored) = tail.split_once("\x1b[?1049l").unwrap();
+        if restored.contains("\x1b[1;1H\x1b[J") || restored.contains("\x1b[2J") {
+            return Err("pager release cleared the restored primary screen".into());
+        }
+        // Exclude every alternate-screen frame. The marker was in row zero;
+        // the primary stream must neither erase it (above) nor overwrite it.
+        let rows = screen_grid(&format!("{primary}{restored}"));
+        if !rows
+            .first()
+            .is_some_and(|row| row.contains("HISTORY_BEFORE_PAGER"))
+        {
+            return Err(format!("prior visible history was not restored: {rows:?}"));
+        }
+        pty.type_in("after-view\r");
+        if !pty.wait_for_screen("PAGER_RESTORED", REACH_TIMEOUT) {
+            return Err("the next submission was lost or contaminated by modal keys".into());
+        }
+        if pty.termios_snapshot() != baseline {
+            return Err("pager/cockpit did not restore the exact terminal mode".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    transcript.push_str(&pty.screen_to_eof());
+    assert!(result.is_ok(), "{result:?}: {transcript:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {transcript:?}"
+    );
 }
 
 pub(crate) fn drive_cockpit_bang() {

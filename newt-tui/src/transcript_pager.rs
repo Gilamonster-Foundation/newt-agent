@@ -318,6 +318,9 @@ pub(crate) use terminal::AltScreenGuard;
 #[cfg(feature = "rich-tui")]
 mod terminal {
     use super::{PagerState, RowKind};
+    use crate::inline_viewport::PanelOut;
+    use crate::session_worker::{PanelMode, PanelWindow};
+    use crate::InputSurface;
 
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -344,6 +347,7 @@ mod terminal {
     /// field. Rust drops fields AFTER the `Drop::drop` body, so the screen is
     /// left before raw mode is released — the order this guard already had.
     pub(crate) struct AltScreenGuard {
+        out: PanelOut,
         /// **The whole screen, held (#1980).** Entering the alternate screen IS
         /// taking every row, and until now the arbiter did not know: an inline
         /// surface could mint the bottom rows while the pager owned the screen.
@@ -354,10 +358,30 @@ mod terminal {
         /// advertise rows it had not finished with.
         _region: newt_core::tty::RegionLease,
         _raw: RawModeGuard,
+        // Release the cockpit only after leaving the alternate screen and
+        // restoring raw mode. Until then its input/output loop stays parked.
+        _window: Option<PanelWindow>,
     }
 
     impl AltScreenGuard {
-        pub(crate) fn enter() -> io::Result<Self> {
+        fn for_surface(
+            surface: &mut dyn InputSurface,
+            terminal_owns_turn: bool,
+        ) -> io::Result<Self> {
+            let window = surface.open_panel(PanelMode::AlternateScreen);
+            if terminal_owns_turn && window.is_none() {
+                return Err(io::Error::other(
+                    "the terminal owner could not lend the pager its screen",
+                ));
+            }
+            Self::enter(window)
+        }
+
+        pub(crate) fn enter(window: Option<PanelWindow>) -> io::Result<Self> {
+            let out = match window.as_ref() {
+                Some(window) => PanelOut::Tty(window.output()?),
+                None => PanelOut::Stdout(io::stdout()),
+            };
             let raw = RawModeGuard::enter()?;
             // `SuspendHolder`, and it is the honest policy rather than the
             // convenient one: the alternate screen genuinely DOES suspend
@@ -385,11 +409,13 @@ mod terminal {
             // session on the alternate screen with no owner alive to leave
             // it, for the rest of its life. Reviewer-reproduced against real
             // crossterm on a would-block fd (#1677 review).
-            let guard = Self {
+            let mut guard = Self {
+                out,
                 _region: region,
                 _raw: raw,
+                _window: window,
             };
-            crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+            crossterm::execute!(&mut guard.out, EnterAlternateScreen)?;
             Ok(guard)
         }
     }
@@ -397,7 +423,7 @@ mod terminal {
     impl Drop for AltScreenGuard {
         fn drop(&mut self) {
             // Screen only; raw mode is released by `_raw` after this returns.
-            let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = crossterm::execute!(&mut self.out, LeaveAlternateScreen);
         }
     }
 
@@ -416,9 +442,13 @@ mod terminal {
 
     /// Run the pager until the operator quits (q / Esc). Blocking; owns the
     /// terminal for its lifetime and restores it on return.
-    pub(crate) fn run_pager(state: &mut PagerState) -> io::Result<()> {
-        let _guard = AltScreenGuard::enter()?;
-        let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    pub(crate) fn run_pager(
+        state: &mut PagerState,
+        surface: &mut dyn InputSurface,
+        terminal_owns_turn: bool,
+    ) -> io::Result<()> {
+        let mut guard = AltScreenGuard::for_surface(surface, terminal_owns_turn)?;
+        let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(&mut guard.out))?;
         terminal.clear()?;
         loop {
             let mut page_rows = 1usize;
@@ -487,9 +517,13 @@ mod terminal {
     /// transcript pager's alternate-screen guard and navigation vocabulary,
     /// but has no folds: every retained line is immediately visible.
     #[cfg(feature = "live-spill")]
-    pub(crate) fn run_output_pager(spill: &CompletedSpill) -> io::Result<()> {
-        let _guard = AltScreenGuard::enter()?;
-        let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    pub(crate) fn run_output_pager(
+        spill: &CompletedSpill,
+        surface: &mut dyn InputSurface,
+        terminal_owns_turn: bool,
+    ) -> io::Result<()> {
+        let mut guard = AltScreenGuard::for_surface(surface, terminal_owns_turn)?;
+        let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(&mut guard.out))?;
         terminal.clear()?;
         let mut scroll = 0usize;
         loop {
@@ -561,6 +595,15 @@ mod terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn cockpit_pager_refuses_a_missing_terminal_loan() {
+        let mut surface = crate::lean_input::LeanSurface::new(None).unwrap();
+        let mut state = PagerState::new("unavailable owner", &[]);
+        let error = run_pager(&mut state, &mut surface, true).unwrap_err();
+        assert!(error.to_string().contains("terminal owner could not lend"));
+    }
 
     fn turn(user: &str, assistant: &str, tools: usize) -> ConversationTurn {
         ConversationTurn {

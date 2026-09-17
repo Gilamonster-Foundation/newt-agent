@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "rich-tui")]
+use crate::session_worker::PanelMode;
 use newt_core::agentic::chat_complete_with_prompt_and_artifacts;
 
 mod navigation_execution;
@@ -529,18 +531,21 @@ fn render_transcript(
     surface_is_rich: bool,
     color: bool,
     verbose: bool,
+    surface: &mut dyn InputSurface,
+    terminal_owns_turn: bool,
 ) {
     #[cfg(feature = "rich-tui")]
     if surface_is_rich {
         let mut pager = crate::transcript_pager::PagerState::new(&record.title, &record.turns);
-        if let Err(e) = crate::transcript_pager::run_pager(&mut pager) {
+        if let Err(e) = crate::transcript_pager::run_pager(&mut pager, surface, terminal_owns_turn)
+        {
             print_newt(&format!("transcript pager error: {e}"), color, verbose);
         }
         return;
     }
     // Lean (and the rich build's non-rich surface): the plain spine into
     // scrollback — searchable, copy-pasteable, no terminal takeover.
-    let _ = surface_is_rich;
+    let _ = (surface_is_rich, surface, terminal_owns_turn);
     print_newt(&conversation_show_message(record), color, verbose);
 }
 
@@ -1004,8 +1009,7 @@ pub(crate) trait InputSurface {
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
     ) -> newt_core::HumanQuestionOutcome;
 
-    /// **Lend a panel `rows` rows on the real terminal, if this surface has
-    /// any to lend.**
+    /// Lend the real terminal for inline rows or an alternate-screen panel.
     ///
     /// `None` — the default — means "draw yourself the way you always have".
     /// That is the honest answer for every surface without a cockpit: a lean
@@ -1022,7 +1026,7 @@ pub(crate) trait InputSurface {
     /// `session_worker`'s proxy-forwarding test still catches a `RemoteSurface`
     /// that forgets to forward it.
     #[cfg(feature = "rich-tui")]
-    fn open_panel(&mut self, _rows: u16) -> Option<crate::session_worker::PanelWindow> {
+    fn open_panel(&mut self, _mode: PanelMode) -> Option<crate::session_worker::PanelWindow> {
         None
     }
 }
@@ -1320,8 +1324,10 @@ fn session_body(
     #[cfg(feature = "rich-tui")]
     let panel_to_ui = to_ui.clone();
     #[cfg(feature = "rich-tui")]
-    let open_permission_panel =
-        move |rows| crate::session_worker::RemoteSurface::new(panel_to_ui.clone()).open_panel(rows);
+    let open_permission_panel = move |rows| {
+        crate::session_worker::RemoteSurface::new(panel_to_ui.clone())
+            .open_panel(PanelMode::Inline(rows))
+    };
 
     // The session's only route to the terminal.
     let mut surface: Box<dyn InputSurface> =
@@ -3540,7 +3546,7 @@ fn session_body(
                             };
                             match workflow.run_panel(
                                 &ask_surface,
-                                |height| surface.open_panel(height),
+                                |height| surface.open_panel(PanelMode::Inline(height)),
                                 |state| {
                                     crate::permission_panel_lines(
                                         state,
@@ -3951,7 +3957,7 @@ fn session_body(
                                         )
                                     })
                                     .and_then(|spill| {
-                                        crate::transcript_pager::run_output_pager(&spill)
+                                        crate::transcript_pager::run_output_pager(&spill, surface.as_mut(), terminal_owns_turn)
                                             .map_err(anyhow::Error::from)
                                     })
                                 };
@@ -4038,7 +4044,14 @@ fn session_body(
                                         verbose,
                                     ),
                                     Ok(record) => {
-                                        render_transcript(&record, surface_is_rich, color, verbose);
+                                        render_transcript(
+                                            &record,
+                                            surface_is_rich,
+                                            color,
+                                            verbose,
+                                            surface.as_mut(),
+                                            terminal_owns_turn,
+                                        );
                                     }
                                     Err(e) => print_newt(
                                         &format!("could not load this conversation: {e}"),
@@ -5922,7 +5935,8 @@ fn session_body(
                         loop {
                             let mut walked_to_permissions = false;
                             let mut walked_to_mcp = false;
-                            let window = surface.open_panel(settings_panel::panel_height());
+                            let window = surface
+                                .open_panel(PanelMode::Inline(settings_panel::panel_height()));
                             // #2009 PR13: the Audit section's rows. The fs read
                             // is here; the verification and the rendering are in
                             // `receipt_audit_lines`, so a row cannot be printed
@@ -6015,7 +6029,7 @@ fn session_body(
                                 };
                                 match workflow.run_panel(
                                     &ask_surface,
-                                    |height| surface.open_panel(height),
+                                    |height| surface.open_panel(PanelMode::Inline(height)),
                                     |state| {
                                         crate::permission_panel_lines(
                                             state,
@@ -6386,7 +6400,8 @@ fn session_body(
                     {
                         let cfg_now = crate::resolve_runtime_or_default();
                         if let Ok(panel_choice) = crate::resolve_backend_choice(&cfg_now) {
-                            let panel_window = surface.open_panel(models_panel::panel_height());
+                            let panel_window =
+                                surface.open_panel(PanelMode::Inline(models_panel::panel_height()));
                             match models_panel::choose(&panel_choice, panel_window) {
                                 Err(e) => {
                                     print_newt(&format!("models panel error: {e}"), color, verbose);
@@ -6444,7 +6459,8 @@ fn session_body(
                         // panel's own stdout path. Held for the panel's whole
                         // life — dropping it is what releases the rows and
                         // repaints the chat block.
-                        let panel_window = surface.open_panel(backend_panel::PANEL_HEIGHT);
+                        let panel_window =
+                            surface.open_panel(PanelMode::Inline(backend_panel::PANEL_HEIGHT));
                         let close = match backend_chooser::choose(&cfg, panel_window) {
                             Ok(close) => close,
                             // A mid-panel terminal failure still hands back the

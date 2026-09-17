@@ -5,6 +5,56 @@ use crate::cockpit::test_tty::{
 
 const CTRL_C: &[u8] = &[0x03];
 
+/// Grounds the pager's row model and modal reservation in the real cockpit:
+/// cursor-addressed rows must reach the operator tty, own input through resize,
+/// and disappear before the restored composer accepts its next submission.
+/// Primary-screen history must survive both unchanged and resized pager visits.
+#[cfg(feature = "live-spill")]
+#[test]
+fn completed_spill_pager_owns_the_terminal_through_resize_and_close() {
+    crate::interaction_view_pty_test::drive_cockpit_pager();
+}
+
+#[cfg(feature = "live-spill")]
+pub(crate) fn cockpit_pager_case() {
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let before = termios_of(0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit
+        .screen
+        .insert_rows(vec![b"HISTORY_BEFORE_PAGER".to_vec()])
+        .unwrap();
+    cockpit.draw().unwrap();
+    let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
+    let worker = std::thread::spawn(move || {
+        let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
+        let archive = crate::completed_spill::CompletedSpillArchive::default();
+        let body = (0..50)
+            .map(|i| format!("spill-row-{i:02}\n"))
+            .collect::<String>();
+        let id = archive.retain(&body);
+        crate::transcript_pager::run_output_pager(&archive.get(id).unwrap(), &mut remote, true)
+            .unwrap();
+        println!("PAGER_RETURNED");
+        match remote.read_line("after pager").unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "after-view", "modal keys leaked"),
+            other => panic!("pager left the editor unusable: {other:?}"),
+        }
+    });
+    cockpit.run(&requests).unwrap();
+    worker.join().unwrap();
+    assert!(
+        modes_equal(&before, &termios_of(0)),
+        "exact termios restore"
+    );
+    println!("PAGER_RESTORED");
+    // Let the parent sample modes before session-leader exit hangs up the tty.
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
 /// Grounds the mounted editor's submission and escape-ladder key tests in a
 /// real tty: crossterm may already hold input after a terminal query or poll,
 /// leaving the kernel fd empty. Both Enter and Ctrl-C must work without a
@@ -191,7 +241,10 @@ pub(crate) fn panel_resize_case() {
         drop(window);
     });
     cockpit
-        .handle_request(SurfaceRequest::Panel { rows: 8, reply })
+        .handle_request(SurfaceRequest::Panel {
+            mode: PanelMode::Inline(8),
+            reply,
+        })
         .unwrap();
     panel.join().unwrap();
     assert_eq!((cockpit.screen.cols, cockpit.screen.rows), (46, 12));
@@ -697,7 +750,7 @@ pub(crate) fn cockpit_acceptance_case() {
         let before_panel = tty.painted().len();
         cockpit
             .handle_request(SurfaceRequest::Panel {
-                rows: 6,
+                mode: PanelMode::Inline(6),
                 reply: panel_reply,
             })
             .expect("the presenter lends the panel its rows");
@@ -764,41 +817,43 @@ pub(crate) fn cockpit_acceptance_case() {
         // vanishes between asking for rows and taking them. Either would
         // strand the presenter parked on rows nobody will release, which
         // presents as a frozen cockpit rather than as an error.
-        let (early_reply, early_window) =
-            std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
-        let early = std::thread::spawn(move || {
-            // Took the rows, drew nothing, gave them straight back — the
-            // shape of a panel whose seed was empty or whose terminal
-            // failed to build.
-            drop(early_window.recv().expect("the presenter answers"));
-        });
-        cockpit
-            .handle_request(SurfaceRequest::Panel {
-                rows: 6,
-                reply: early_reply,
-            })
-            .expect("an undrawn panel still returns");
-        early.join().expect("early-drop panel");
-        assert!(
-            !cockpit.chat_inactive,
-            "focus returns when a panel drops its window without drawing"
-        );
+        for mode in [PanelMode::Inline(6), PanelMode::AlternateScreen] {
+            let (early_reply, early_window) =
+                std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+            let early = std::thread::spawn(move || {
+                // Took the rows, drew nothing, gave them straight back — the
+                // shape of a panel whose seed was empty or whose terminal
+                // failed to build.
+                drop(early_window.recv().expect("the presenter answers"));
+            });
+            cockpit
+                .handle_request(SurfaceRequest::Panel {
+                    mode,
+                    reply: early_reply,
+                })
+                .expect("an undrawn panel still returns");
+            early.join().expect("early-drop panel");
+            assert!(
+                !cockpit.chat_inactive,
+                "focus returns when a panel drops its window without drawing"
+            );
 
-        // And the session that disappears mid-ask: the reply send fails,
-        // which must undo the reservation rather than park on it.
-        let (orphan_reply, orphan_window) =
-            std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
-        drop(orphan_window);
-        cockpit
-            .handle_request(SurfaceRequest::Panel {
-                rows: 6,
-                reply: orphan_reply,
-            })
-            .expect("a vanished session is not a presenter error");
-        assert!(
-            !cockpit.chat_inactive,
-            "a panel request nobody received must not leave chat dimmed"
-        );
+            // And the session that disappears mid-ask: the reply send fails,
+            // which must undo the reservation rather than park on it.
+            let (orphan_reply, orphan_window) =
+                std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+            drop(orphan_window);
+            cockpit
+                .handle_request(SurfaceRequest::Panel {
+                    mode,
+                    reply: orphan_reply,
+                })
+                .expect("a vanished session is not a presenter error");
+            assert!(
+                !cockpit.chat_inactive,
+                "a panel request nobody received must not leave chat dimmed"
+            );
+        }
         assert_eq!(
             cockpit.editor.draft(),
             draft,

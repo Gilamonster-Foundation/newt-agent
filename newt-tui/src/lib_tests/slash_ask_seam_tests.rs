@@ -167,7 +167,9 @@ fn the_crew_form_asks_through_a_seam_rather_than_its_own_terminal() {
 fn a_panel_asks_the_surface_for_rows_before_it_draws() {
     let chat = include_str!("../chat.rs").replace([' ', '\n'], "");
     assert!(
-        chat.contains("letpanel_window=surface.open_panel(backend_panel::PANEL_HEIGHT);"),
+        chat.contains(
+            "letpanel_window=surface.open_panel(PanelMode::Inline(backend_panel::PANEL_HEIGHT));"
+        ),
         "the /backend arm must ask its surface for rows"
     );
     assert!(
