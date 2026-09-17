@@ -1,0 +1,24 @@
+# The repo's own lifecycle commands (`newt-core::tooling`, resolution tier 1).
+#
+# Without this override, newt auto-detects a toolchain from marker files at
+# the repo root. This workspace carries BOTH `Cargo.toml` (the Rust
+# workspace) and `pyproject.toml` (the newt-mcp-server wheel packaging,
+# ROADMAP Step 11.2) at its root, which trips the built-in `pyo3` compound
+# pack (`require_all: ["Cargo.toml", "pyproject.toml"]`) and hands every
+# `check`/`test` run a `maturin develop && pytest -x` tail this workspace
+# does not need — and that a sandboxed agent session, correctly, has no
+# `exec` grant for. That surfaced as a session concluding "no build tools
+# are available" when `cargo`/`rustc` were present and working the whole
+# time; the tool it actually asked for was never the workspace's real gate.
+#
+# The real gate is documented in CLAUDE.md and `docs/ROADMAP.md`: `just
+# check` (fmt + clippy + test + coverage floor). Pin it here so every future
+# `newt lifecycle <phase>` / crew normalize-before-commit run in this repo
+# uses that gate instead of the misdetected pyo3 pack.
+[lifecycle]
+setup = "just install-hooks"
+format = "just fmt"
+lint = "just lint"
+test = "just test"
+check = "just check"
+clean = "just clean"
