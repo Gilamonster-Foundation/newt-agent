@@ -925,8 +925,12 @@ mod tests {
     }
 
     // --- session semantics (process-global: serialized) ---
+    //
+    // These share the `real_fs` lock with the on-disk tier below rather than
+    // taking a key of their own: those tests also call `reset_for_test()`, so
+    // a separate key let them wipe the session mid-assertion here.
 
-    #[serial_test::serial(secrets_session)]
+    #[serial_test::serial(real_fs)]
     #[test]
     fn session_passphrase_set_clear_and_env_memoization() {
         session().reset_for_test();
@@ -951,7 +955,7 @@ mod tests {
         session().reset_for_test();
     }
 
-    #[serial_test::serial(secrets_session)]
+    #[serial_test::serial(real_fs)]
     #[test]
     fn warn_once_reports_each_path_exactly_once() {
         session().reset_for_test();
