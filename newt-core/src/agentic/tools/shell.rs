@@ -1180,39 +1180,44 @@ pub(super) fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
 /// The #263 prompt path still falls back here on deny (and on a second denial
 /// after a re-execution).
 pub(super) fn denied_run_command_result(envelope: &serde_json::Value, _color: bool) -> String {
-    // Model-facing message: composed exactly once — and it names the exact
-    // recovery call (#1160), since the envelope carries axis + target.
+    let recovery = denial_recovery_hints(envelope)
+        .map(|hints| hints.join(" "))
+        .unwrap_or_else(|| {
+            "No actionable capability grant is identified. Take a different approach within your current authority.".into()
+        });
     format!(
         "capability denied: {}. {}",
         envelope_denial_reason(envelope),
-        denial_recovery_hint(
-            denial_axis_label(envelope),
-            &exec_denial_target_label(envelope)
-        )
+        recovery
     )
 }
 
-/// The bare target for the human exec-denial NOTICE: the denied command name(s)
-/// the leash refused, NEVER the reason sentence. Joins multiple targets with
-/// `, `; falls back to a generic label so the notice always prints one clean
-/// `{axis} does not permit '{target}'` line. (#775 — restores
-/// the former denial notice's bare-`'{target}'` contract.)
-pub(super) fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
-    let targets: Vec<&str> = envelope
-        .get("denials")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|d| d.get("target").and_then(serde_json::Value::as_str))
-                .filter(|t| !t.is_empty())
-                .collect()
+/// Preserve each grantable denial's axis and target. A structural or opaque
+/// refusal makes the batch ungrantable; never guess an axis or join targets.
+pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<String>> {
+    let denials = envelope
+        .get("denials")?
+        .as_array()
+        .filter(|rows| !rows.is_empty())?;
+    denials
+        .iter()
+        .map(|denial| {
+            let kind = denial.get("kind")?.as_str()?;
+            if !matches!(kind, "exec" | "fs_read" | "fs_write" | "net")
+                || denial
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_structural_refusal)
+            {
+                return None;
+            }
+            let target = denial
+                .get("target")?
+                .as_str()
+                .filter(|target| !target.trim().is_empty())?;
+            Some(denial_recovery_hint(kind, target))
         })
-        .unwrap_or_default();
-    if targets.is_empty() {
-        "a command".to_string()
-    } else {
-        targets.join(", ")
-    }
+        .collect()
 }
 
 /// #2274 — absence must never be ambiguous.
@@ -1667,23 +1672,4 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
         });
     }
     Some(requests)
-}
-
-/// #905: the axis label for the human denial NOTICE — `net` when EVERY denial is
-/// a net (host) refusal, else `exec` (exec / mixed / empty default). Keeps a net
-/// denial from being mislabeled `exec does not permit '<host>'`.
-pub(super) fn denial_axis_label(envelope: &serde_json::Value) -> &'static str {
-    let all_net = envelope
-        .get("denials")
-        .and_then(serde_json::Value::as_array)
-        .filter(|arr| !arr.is_empty())
-        .is_some_and(|arr| {
-            arr.iter()
-                .all(|d| d.get("kind").and_then(serde_json::Value::as_str) == Some("net"))
-        });
-    if all_net {
-        "net"
-    } else {
-        "exec"
-    }
 }

@@ -16,6 +16,10 @@ fn rich_file_change_child() {
     if std::env::var_os("NEWT_RICH_FILE_CHANGE_CHILD").is_none() {
         return;
     }
+    // Crossterm measures /dev/tty first; this disposable child must own the
+    // same terminal that the parent resizes through the fixture's master.
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
     let before = "old\u{1b}]52;c;ignored\u{7}\n".repeat(12);
     let after = format!("{}last_visible\n", "new source\n".repeat(11));
     let unified = format!(
@@ -61,10 +65,24 @@ fn rich_file_change_child() {
         renderer.erase();
     });
     println!("receipt-terminal-done");
+    // Keep the session leader alive while the parent verifies restoration:
+    // macOS revokes the controlling PTY when its session leader exits.
+    let mut ready = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut ready, 1, REACH.as_millis() as i32) },
+        1
+    );
+    let mut release = String::new();
+    std::io::stdin().read_line(&mut release).unwrap();
+    assert_eq!(release, "\n");
 }
 
 fn reach(pty: &Pty, grid: &mut ScreenModel, transcript: &mut String, needle: &str) {
-    reach_since(pty, grid, transcript, needle, 0);
+    reach_since(pty, grid, transcript, needle, 0, false);
 }
 
 /// Like [`reach`], but the needle must also appear in bytes the child wrote
@@ -77,6 +95,7 @@ fn reach_since(
     transcript: &mut String,
     needle: &str,
     since: usize,
+    complete_line: bool,
 ) {
     let deadline = Instant::now() + REACH;
     loop {
@@ -84,7 +103,14 @@ fn reach_since(
         grid.apply(bytes.as_bytes());
         transcript.push_str(&bytes);
         let fresh = strip_csi(&transcript[since..]);
-        if fresh.contains(needle) && grid.nonempty_rows().iter().any(|row| row.contains(needle)) {
+        let witnessed = if complete_line {
+            fresh
+                .split_inclusive('\n')
+                .any(|line| line.ends_with('\n') && line.trim_end_matches(['\r', '\n']) == needle)
+        } else {
+            fresh.contains(needle)
+        };
+        if witnessed && grid.nonempty_rows().iter().any(|row| row.contains(needle)) {
             return;
         }
         assert!(
@@ -146,7 +172,7 @@ fn rich_file_changes_use_real_scroll_resize_interrupt_and_termios_restoration() 
     grid.resize(12);
     // The child repaints a narrow source/header projection before widening
     // again; reflowed wide rows do not count.
-    reach_since(&pty, &mut grid, &mut transcript, "⎵ Complete", since);
+    reach_since(&pty, &mut grid, &mut transcript, "⎵ Completed", since, true);
     let since = transcript.len();
     pty.resize(24, 80);
     grid.resize(80);
@@ -156,16 +182,19 @@ fn rich_file_changes_use_real_scroll_resize_interrupt_and_termios_restoration() 
         &mut transcript,
         "Modified state.txt",
         since,
+        false,
     );
     // The first press leaves explore mode; the second interrupts the turn.
     pty.type_in("\x03\x03");
     reach(&pty, &mut grid, &mut transcript, "receipt-terminal-done");
+    let restored = pty.termios_snapshot();
+    pty.type_in("\n");
     let status = crate::prompt_visibility_test::wait_for_child(&mut child, REACH);
     assert!(
         status.is_some_and(|status| status.success()),
         "{transcript:?}"
     );
-    assert_eq!(pty.termios_snapshot(), before);
+    assert_eq!(restored, before);
     assert!(grid
         .nonempty_rows()
         .iter()

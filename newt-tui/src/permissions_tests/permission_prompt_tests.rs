@@ -1091,7 +1091,44 @@ fn mcp_net_prompt_configured_blank_answer_preserves_grant_lifetime() {
 }
 
 #[test]
-fn mcp_net_prompt_defaults_are_offered_explicit_and_local_to_connect() {
+fn terminal_blank_answer_allows_once_and_never_closure() {
+    for outcome in [
+        HumanQuestionOutcome::Answer(String::new()),
+        HumanQuestionOutcome::InputClosed,
+        HumanQuestionOutcome::Cancelled,
+    ] {
+        let mut state = PermissionPromptState::default();
+        let ask = |_interaction: &SurfaceInteraction| outcome.clone();
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![],
+            Rc::new(Cell::new(0)),
+        );
+        gate.ask_surface = Some(&ask);
+        let request = PermissionRequest {
+            tool: "remote__search".into(),
+            kind: DenialKind::RemoteTool,
+            target: "remote__search".into(),
+            reason: "operator approval required".into(),
+        };
+        let result = gate.ask(&[request]);
+        assert_eq!(
+            matches!(result, newt_core::PermissionDecision::Allow(_)),
+            matches!(outcome, HumanQuestionOutcome::Answer(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            state.session_grants.is_empty(),
+            "Enter cannot create standing authority"
+        );
+    }
+}
+
+#[test]
+fn mcp_net_prompt_defaults_are_offered_and_generic_defaults_cannot_add_standing_authority() {
     let request = PermissionRequest {
         tool: "mcp connect".into(),
         kind: DenialKind::Net,
@@ -1148,7 +1185,7 @@ fn mcp_net_prompt_defaults_are_offered_explicit_and_local_to_connect() {
             reason: String::new(),
         };
         let interaction = permission_interaction(&other, &danger, PromptChoice::AllowPermanent);
-        assert!(interaction.default_choice().is_none());
+        assert_eq!(interaction.default_choice().unwrap().id.as_str(), "deny");
         assert_eq!(
             decode_answer(&interaction.definition, interaction.answer_or_default("")),
             PromptChoice::Deny
@@ -3060,7 +3097,7 @@ fn permissions_command_lists_decisions_and_log_location() {
         .iter()
         .any(|l| l.contains("no prompted permission decisions")));
     // With decisions + a log path: one row per decision, log named,
-    // promotion stays a human config edit.
+    // and promotion remains an explicit human action.
     state.decisions.push(newt_core::PermissionRecord::new(
         "conv-1",
         "run_command",

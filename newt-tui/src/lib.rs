@@ -202,6 +202,8 @@ mod panel;
 // same driver and the same chrome as /psyche and /backends. The typed form
 // stays for every surface that has no region to draw in.
 #[cfg(feature = "rich-tui")]
+mod permissions_panel;
+#[cfg(feature = "rich-tui")]
 mod settings_panel;
 #[cfg(feature = "rich-tui")]
 mod theme_panel;
@@ -1747,9 +1749,7 @@ fn exec_floor_from(
 }
 
 /// Render the `/permissions` listing: this session's prompted decisions (in
-/// prompt order) plus where the durable record lives. Promotion to a lasting
-/// grant is deliberately NOT offered here — that is a human editing
-/// `[tui.permissions]` in the config (see issues #263/#181).
+/// prompt order), retained authority, and the explicit promotion entrypoints.
 ///
 /// `active_posture` (issue #307) reflects an applied `/posture` preset as an
 /// authority floor at the top of the listing, even when prompting is off.
@@ -1784,6 +1784,12 @@ pub(crate) fn permissions_command_lines(
                 .to_string(),
         );
     }
+    lines.push(format!(
+        "session allows: {} · encrypted permanent allows: {} · terminal default: {}",
+        state.session_allow_count(),
+        state.durable_grants.len(),
+        state.terminal_default().as_str()
+    ));
     if state.decisions.is_empty() {
         lines.push("no prompted permission decisions this session".to_string());
     } else {
@@ -1798,12 +1804,28 @@ pub(crate) fn permissions_command_lines(
     if let Some(path) = log_path {
         lines.push(format!("log: {}", path.display()));
         lines.push(
-            "to make an allow permanent, edit [tui.permissions] in your newt config \
-             (extra_exec / net) — the log is a record, never authority"
+            "make session allows permanent in /settings → Permissions (OCAP), or /permissions save. \
+             The reviewed snapshot is signed and encrypted; the log is never authority. \
+             The hostname prompt's [A] choice still saves net hosts to TOML config."
                 .to_string(),
         );
     }
     lines
+}
+
+#[cfg(feature = "rich-tui")]
+pub(crate) fn permission_panel_lines(
+    state: &PermissionPromptState,
+    enabled: bool,
+    log: Option<&std::path::Path>,
+    posture: Option<&ActivePosture>,
+) -> Vec<String> {
+    let mut rows = permissions_command_lines(state, enabled, log, posture);
+    if let Some(path) = log {
+        rows.push(String::new());
+        rows.extend(permission_audit_lines(path, 50));
+    }
+    rows
 }
 
 /// Parse the permission log into human-readable audit rows (newest-first).

@@ -28,6 +28,7 @@ pub mod denial_journal;
 pub mod dgx;
 pub mod dock_registry;
 pub mod drift_cache;
+pub mod durable_grants;
 pub mod enrollment;
 pub mod error;
 pub mod event_journal;

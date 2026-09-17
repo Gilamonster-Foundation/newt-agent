@@ -62,7 +62,11 @@ use crate::settings_form::{Field, ValueSpace};
 /// Order is the index order, and `SESSION_SECTION` indexes into it.
 const SECTIONS: &[(&str, char, &str)] = &[
     ("Session", 's', "dials, editor, reasoning, prompt"),
-    ("Permissions", 'p', "posture · prompted decisions · audit"),
+    (
+        "Permissions (OCAP)",
+        'p',
+        "defaults · session allows · audit",
+    ),
     ("Audit", 'a', "settings receipts · does each still verify"),
     ("Backends", 'b', "choose · edit · add · remove"),
     ("Themes", 't', "presets · styles · live preview · save"),
@@ -298,6 +302,10 @@ impl Row {
 /// What the panel wants to happen after it closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    OpenPermissions {
+        lines: Vec<String>,
+        model: Option<String>,
+    },
     /// Lines to print, and the model the operator dialled to (if any).
     ///
     /// The model pick is REPORTED, not applied. `/model` validates a name
@@ -517,15 +525,36 @@ fn section(i: usize, body: crate::shell::Body<'_>) -> crate::shell::Section<'_> 
     }
 }
 
+fn settings_shell<'a>(
+    panel: &'a mut dyn Screen,
+    audit: &'a mut dyn Screen,
+    theme: &'a mut dyn Screen,
+    initial_section: Option<char>,
+) -> crate::shell::Shell<'a> {
+    let mut shell = crate::shell::Shell::new(vec![
+        section(0, crate::shell::Body::Screen(panel)),
+        section(1, crate::shell::Body::Link),
+        section(2, crate::shell::Body::Screen(audit)),
+        section(3, crate::shell::Body::Link),
+        section(4, crate::shell::Body::Screen(theme)),
+        section(5, crate::shell::Body::Link),
+    ]);
+    if let Some(index) = initial_section.and_then(|initial| {
+        SECTIONS
+            .iter()
+            .position(|(_, accelerator, _)| *accelerator == initial.to_ascii_lowercase())
+    }) {
+        for _ in 0..index {
+            shell.key(Key::Down);
+        }
+    }
+    shell
+}
+
 pub(crate) fn run(
     backend: Option<String>,
     models: Option<Vec<ModelChoice>>,
     current_model: String,
-    // The Permissions section's rows — `permissions_command_lines` plus the
-    // audit tail, produced by the caller because they are the caller's state.
-    // Passed as LINES rather than as the state itself, so this function never
-    // learns what a posture is.
-    permissions: Vec<String>,
     // The Audit section's rows — the receipts journal, read by the caller
     // because the fs read is the caller's, rendered by `receipt_audit_lines`
     // because the verification belongs with the rendering.
@@ -548,31 +577,17 @@ pub(crate) fn run(
     //
     // The panel is still owned HERE, so `commit()` and `picked_model()` below
     // read it exactly as before; the shell borrows it for the loop.
-    // #2009 PR10b: Permissions is a HOSTED section, not a link. It is
-    // read-only — status and the audit — so it has no commit path, and §5.1's
-    // LINK rule is about a commit path that is out of reach. The half that
-    // writes (the posture field, grants, decision reopen) waits for #1999.
-    let mut permissions_panel = crate::lines_panel::LinesPanel::new("permissions", permissions);
+    // Permissions now also links: chat owns the live grant snapshot and the
+    // confirmation and persistence path, so this shell reports only intent.
     let mut audit_panel = crate::lines_panel::LinesPanel::new("audit", audit);
     let mut theme_panel = crate::theme_panel::ThemePanel::new();
     let (applied, linked) = {
-        let mut shell = crate::shell::Shell::new(vec![
-            section(0, crate::shell::Body::Screen(&mut panel)),
-            section(1, crate::shell::Body::Screen(&mut permissions_panel)),
-            section(2, crate::shell::Body::Screen(&mut audit_panel)),
-            section(3, crate::shell::Body::Link),
-            section(4, crate::shell::Body::Screen(&mut theme_panel)),
-            section(5, crate::shell::Body::Link),
-        ]);
-        if let Some(at) = initial_section.and_then(|key| {
-            SECTIONS
-                .iter()
-                .position(|(_, accelerator, _)| *accelerator == key)
-        }) {
-            for _ in 0..at {
-                shell.key(Key::Down);
-            }
-        }
+        let mut shell = settings_shell(
+            &mut panel,
+            &mut audit_panel,
+            &mut theme_panel,
+            initial_section,
+        );
         crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
         // **This section's flag, not the shell's.** With a second hosted
         // section the two are no longer the same question: `commit()` below
@@ -587,6 +602,8 @@ pub(crate) fn run(
         let model = panel.picked_model();
         return Ok(if linked == 5 {
             Outcome::OpenMcp { lines, model }
+        } else if linked == 1 {
+            Outcome::OpenPermissions { lines, model }
         } else {
             Outcome::OpenBackends { lines, model }
         });
@@ -1095,4 +1112,37 @@ mod tests {
     fn the_session_constant_indexes_the_session_row() {
         assert_eq!(SECTIONS[SESSION_SECTION].0, "Session");
     }
+
+    #[test]
+    fn permissions_opens_the_caller_owned_workflow_by_arrows_or_shortcut() {
+        let _g = GlobalSettingsGuard::acquire();
+        for keys in [vec![Key::Down, Key::Enter], vec![Key::Char('p')]] {
+            let mut panel = panel();
+            let mut audit = crate::lines_panel::LinesPanel::new("audit", Vec::new());
+            let mut theme = crate::theme_panel::ThemePanel::new();
+            let mut shell = settings_shell(&mut panel, &mut audit, &mut theme, None);
+            let mut flow = Flow::Stay;
+            for key in keys {
+                flow = shell.key(key);
+            }
+            assert_eq!(flow, Flow::Close(false));
+            assert_eq!(shell.linked(), Some(1));
+            assert!(!shell.section_applied(SESSION_SECTION));
+        }
+    }
+
+    #[test]
+    fn returning_from_permissions_or_mcp_keeps_its_parent_selection() {
+        let _g = GlobalSettingsGuard::acquire();
+        for (shortcut, index) in [('p', 1), ('m', 5)] {
+            let mut panel = panel();
+            let mut audit = crate::lines_panel::LinesPanel::new("audit", Vec::new());
+            let mut theme = crate::theme_panel::ThemePanel::new();
+            let mut shell = settings_shell(&mut panel, &mut audit, &mut theme, Some(shortcut));
+            assert_eq!(shell.key(Key::Enter), Flow::Close(false));
+            assert_eq!(shell.linked(), Some(index));
+        }
+    }
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 14:19 EDT | Date: 2026-09-16

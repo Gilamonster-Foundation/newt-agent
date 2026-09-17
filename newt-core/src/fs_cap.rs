@@ -170,6 +170,57 @@ impl WorkspaceDir {
         Ok(file)
     }
 
+    /// Read a granted regular file, including a grant naming the file itself.
+    /// An exact grant exposes only its basename, never the parent capability;
+    /// following a final link would grant a different object, even next door.
+    pub(crate) fn open_granted_file(root: &Path, rel: &Path, nofollow: bool) -> io::Result<File> {
+        if rel == Path::new(".") {
+            let (parent, name) = Self::exact_file_parent(root)?;
+            parent.open_regular(&name, true)
+        } else {
+            Self::open_root(root)?.open_regular(rel, nofollow)
+        }
+    }
+
+    /// Create or replace the granted file without granting its siblings.
+    /// Exact-file parents must exist; truncation follows regular-file validation
+    /// on the opened descriptor, with no second pathname resolution.
+    pub(crate) fn create_granted_file(root: &Path, rel: &Path) -> io::Result<File> {
+        if rel == Path::new(".") {
+            let (parent, name) = Self::exact_file_parent(root)?;
+            let file = File::from(parent.resolve(
+                &name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::from_raw_mode(0o644),
+            )?);
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path is not a regular file",
+                ));
+            }
+            file.set_len(0)?;
+            Ok(file)
+        } else {
+            let directory = Self::open_root(root)?;
+            if let Some(parent) = rel.parent().filter(|path| !path.as_os_str().is_empty()) {
+                directory.create_dir_all(parent)?;
+            }
+            directory.create(rel)
+        }
+    }
+
+    fn exact_file_parent(path: &Path) -> io::Result<(Self, std::path::PathBuf)> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok((Self::open_root(parent)?, Path::new(name).to_path_buf()))
+    }
+
     /// Create (or truncate) a file for writing, contained beneath the root.
     ///
     /// The final component is created *inside* the resolved-beneath path or the
@@ -297,3 +348,5 @@ impl WorkspaceDir {
         Ok(names)
     }
 }
+
+// Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 14:19 EDT | Date: 2026-09-16

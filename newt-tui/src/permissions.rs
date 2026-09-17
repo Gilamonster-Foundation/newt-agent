@@ -18,7 +18,10 @@ use newt_core::tty::{
     PromptWindow, Terminal, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
 use newt_core::HumanQuestionOutcome;
+#[path = "permission_workflow.rs"]
+mod workflow;
 pub(crate) use newt_core::PermissionAction as PromptChoice;
+pub(crate) use workflow::{load_session_grants, PermissionWorkflow};
 // D0 (#1878): the legacy form is not named here at all any more. C0a moved
 // rendering off it; C3c removed the web card's reconstruction; D0 moved the
 // decode onto `newt_interaction::binding::resolve_typed` and deleted the
@@ -191,20 +194,28 @@ pub(crate) fn permission_definition(
     permission_definition_with_default(req, danger, audience, PromptChoice::Deny).0
 }
 
-fn permission_interaction(
+pub(crate) fn permission_interaction(
     req: &newt_core::PermissionRequest,
     danger: &danger::DangerTable,
-    mcp_default: PromptChoice,
+    configured_default: PromptChoice,
 ) -> SurfaceInteraction {
-    if req.tool != "mcp connect" || req.kind != newt_core::DenialKind::Net {
-        return SurfaceInteraction::blocking(permission_definition(
-            req,
-            danger,
-            Audience::Terminal,
-        ));
-    }
-    let (definition, default) =
-        permission_definition_with_default(req, danger, Audience::Terminal, mcp_default);
+    let configured_default = if req.tool == "mcp connect" && req.kind == newt_core::DenialKind::Net
+        || matches!(
+            configured_default,
+            PromptChoice::AllowOnce | PromptChoice::Deny
+        ) {
+        configured_default
+    } else {
+        PromptChoice::Deny
+    };
+    let (definition, default) = if configured_default == PromptChoice::Deny {
+        (
+            permission_definition(req, danger, Audience::Terminal),
+            PromptChoice::Deny,
+        )
+    } else {
+        permission_definition_with_default(req, danger, Audience::Terminal, configured_default)
+    };
     SurfaceInteraction::blocking(definition)
         .with_default_option(OptionId::new(default.as_str()).expect(WIRE_NAMES_ARE_OPTION_IDS))
 }
@@ -627,6 +638,7 @@ mod slash_prompt_tests;
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
+    pub(crate) prompt_default: Option<PromptChoice>,
     /// Trusted configured terminal MCP default; None uses the shipped choice.
     pub(crate) mcp_net_prompt_default: Option<PromptChoice>,
     /// Opt-in attach-surface decision channel; `None` uses the terminal.
@@ -640,6 +652,7 @@ pub(crate) struct PermissionPromptState {
     /// supplied values instead of one value with itself.
     pub(crate) workspace_key: String,
     session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    pub(crate) durable_grants: newt_core::durable_grants::GrantSet,
     session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// Durable deny-only entries loaded at session start.
     persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
@@ -742,6 +755,81 @@ impl PermissionPromptState {
             || (kind == newt_core::DenialKind::Exec && denied(exec_grant_basename(target)))
     }
 
+    /// Scope has no exclusions. Do not recall a broad grant that would let a
+    /// denied target bypass the gate; leave independently configured authority
+    /// unchanged. The same check rejects an unreplayable promotion snapshot.
+    fn recall_conflicts_with_denial(&self, kind: newt_core::DenialKind, target: &str) -> bool {
+        use newt_core::{ocap_store::Verdict, DenialKind};
+        let overlaps = |denied: &str| match kind {
+            DenialKind::FsRead | DenialKind::FsWrite => newt_core::caveats::permits_path(
+                &newt_core::caveats::Scope::only([target.to_string()]),
+                denied,
+            ),
+            DenialKind::Exec => {
+                target == exec_grant_basename(denied) || denied == exec_grant_basename(target)
+            }
+            _ => target == denied,
+        };
+        self.denied(kind, target)
+            || self
+                .session_denials
+                .iter()
+                .chain(&self.persistent_denials)
+                .any(|(denied_kind, denied)| *denied_kind == kind && overlaps(denied))
+            || self
+                .ocap_policy
+                .files
+                .get(&Verdict::Deny)
+                .is_some_and(|policy| match kind {
+                    DenialKind::FsRead | DenialKind::FsWrite => {
+                        policy.fs.iter().any(|entry| overlaps(&entry.path))
+                    }
+                    DenialKind::Exec => policy.exec.iter().any(|entry| overlaps(&entry.target)),
+                    _ => false,
+                })
+    }
+
+    fn recalled_grants<'a>(
+        &'a self,
+        danger: &'a danger::DangerTable,
+    ) -> impl Iterator<Item = &'a (newt_core::DenialKind, String)> {
+        self.session_grants
+            .iter()
+            .chain(&self.durable_grants)
+            .filter(|(kind, target)| {
+                !self.recall_conflicts_with_denial(*kind, target)
+                    && danger.classify(*kind, target) != danger::DangerTier::High
+            })
+    }
+
+    pub(crate) fn recalled_caveats(
+        &self,
+        base: &newt_core::Caveats,
+        ceiling: Option<&newt_core::Caveats>,
+    ) -> newt_core::Caveats {
+        let grants = self
+            .recalled_grants(&production_danger_table())
+            .cloned()
+            .collect::<Vec<_>>();
+        let policy = newt_core::widen_caveats(base, &grants);
+        ceiling.map_or_else(|| policy.clone(), |ceiling| policy.meet(ceiling))
+    }
+
+    pub(crate) fn retained_net_hosts(&self) -> Vec<String> {
+        self.recalled_grants(&production_danger_table())
+            .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
+            .map(|(_, target)| target.clone())
+            .collect()
+    }
+
+    pub(crate) fn session_allow_count(&self) -> usize {
+        self.session_grants.len()
+    }
+
+    pub(crate) fn terminal_default(&self) -> PromptChoice {
+        self.prompt_default.unwrap_or(PromptChoice::AllowOnce)
+    }
+
     /// Load the persistent denylist from `path` into a fresh state (#904). A
     /// missing file yields an empty denylist. Called once at session start.
     pub(crate) fn with_persistent_denials(path: Option<&std::path::Path>) -> Self {
@@ -812,13 +900,9 @@ fn direct_authorization_window() -> PromptWindow {
 }
 
 impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermissionGate<'_, F> {
-    pub(crate) fn session_net_hosts(&self) -> Vec<String> {
-        self.state
-            .session_grants
-            .iter()
-            .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
-            .map(|(_, host)| host.clone())
-            .collect()
+    #[cfg(feature = "rich-tui")]
+    pub(crate) fn retained_net_hosts(&self) -> Vec<String> {
+        self.state.retained_net_hosts()
     }
 
     /// Reuse the permission gate for MCP startup, preserving the lifetime of
@@ -832,14 +916,28 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         }
         match newt_core::PermissionGate::ask(self, std::slice::from_ref(request)) {
             newt_core::PermissionDecision::Allow(caveats) => {
-                let mut hosts = self.session_net_hosts();
+                use newt_core::CaveatsExt as _;
+                if !caveats.permits_net(&request.target) {
+                    return None;
+                }
+                let mut hosts: Vec<_> = self
+                    .state
+                    .recalled_grants(&self.danger)
+                    .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
+                    .filter(|(_, host)| caveats.permits_net(host))
+                    .map(|(_, host)| host.clone())
+                    .collect();
                 if !hosts.contains(&request.target) {
                     hosts.push(request.target.clone());
                 }
                 Some((
                     caveats,
                     hosts,
-                    session_grant_covers(&self.state.session_grants, request),
+                    session_grant_covers(&self.state.session_grants, request)
+                        || self
+                            .state
+                            .durable_grants
+                            .contains(&(request.kind, request.target.clone())),
                 ))
             }
             newt_core::PermissionDecision::Deny => None,
@@ -872,15 +970,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     }
 
     /// Re-mint baseline plus grants from the root; never widen the live key.
-    /// The live session policy, through the same grant and delegation clamps as tool calls.
-    #[cfg(feature = "rich-tui")]
-    pub(crate) fn current_caveats(&self) -> newt_core::Caveats {
-        self.mint(&[])
-    }
-
     fn mint(&self, once_grants: &[(newt_core::DenialKind, String)]) -> newt_core::Caveats {
         let mut grants: Vec<(newt_core::DenialKind, String)> =
-            self.state.session_grants.iter().cloned().collect();
+            self.state.recalled_grants(&self.danger).cloned().collect();
         grants.extend(once_grants.iter().cloned());
         let mut policy = newt_core::widen_caveats(&self.base, &grants);
         // Re-clamping is load-bearing: widening may repopulate an emptied scope.
@@ -915,6 +1007,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             Some(key) => newt_identity::enforced_caveats(&key).unwrap_or(policy),
             None => policy,
         }
+    }
+
+    /// Live policy, through the same grant and delegation clamps as tool calls.
+    pub(crate) fn current_caveats(&self) -> newt_core::Caveats {
+        self.mint(&[])
     }
 
     /// Publish the same typed form the web renders and poll for its answer.
@@ -1482,16 +1579,6 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         if requests.is_empty() {
             return Deny;
         }
-        // Authorization prompting disabled (`--no-prompt-for-permissions`): fail
-        // closed WITHOUT opening a prompt. This gate still exists (the session is
-        // interactive) so `ask_question` keeps working — disabling permission
-        // prompts must not turn a present operator into "headless".
-        if !self.authorization_prompts_enabled {
-            for req in requests {
-                self.record(req, "deny", "authorization-prompts-disabled");
-            }
-            return Deny;
-        }
         // A delegated session's inherited ceiling is preflighted over the WHOLE
         // batch, before any prompt is opened, any cache is consulted, and any
         // durable approval is honoured. Clamping the result afterwards would be
@@ -1534,6 +1621,15 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             if session_grant_covers(&self.state.session_grants, req) {
                 continue;
             }
+            if self
+                .state
+                .durable_grants
+                .contains(&(req.kind, req.target.clone()))
+                && self.danger.classify(req.kind, &req.target) != danger::DangerTier::High
+            {
+                self.record(req, "allow", "encrypted-permanent");
+                continue;
+            }
             // Durable approval pre-answers only a low-danger request.
             if newt_core::ocap_store::evaluate_request(
                 &self.state.ocap_policy,
@@ -1553,6 +1649,13 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     once_grants.push(key);
                     continue;
                 }
+            }
+            // Disabling prompts forbids new interactive grants, while verified
+            // standing authority still works after the preflights above. Keep
+            // this gate for `ask_question`, which is not an authorization.
+            if !self.authorization_prompts_enabled {
+                self.record(req, "deny", "authorization-prompts-disabled");
+                return Deny;
             }
             // The session hands semantic authorization to its terminal owner,
             // just as `ask_question` does. Taking stdin on this worker would
@@ -1574,8 +1677,14 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     let interaction = permission_interaction(
                         req,
                         &self.danger,
-                        self.state.mcp_net_prompt_default.unwrap_or_else(|| {
-                            newt_core::ToolPermissions::default().mcp_net_prompt_default
+                        self.state.prompt_default.unwrap_or_else(|| {
+                            if req.tool == "mcp connect" && req.kind == newt_core::DenialKind::Net {
+                                self.state.mcp_net_prompt_default.unwrap_or(
+                                    newt_core::ToolPermissions::default().mcp_net_prompt_default,
+                                )
+                            } else {
+                                PromptChoice::AllowOnce
+                            }
                         }),
                     );
                     let decoded = match self.ask_surface {
@@ -1771,6 +1880,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
 #[cfg(test)]
 #[path = "permissions_tests/permission_prompt_tests.rs"]
 mod permission_prompt_tests;
+
+#[cfg(test)]
+#[path = "permissions_tests/session_promotion.rs"]
+mod session_promotion;
 
 /// **A0 byte goldens (#1823, epic #1803): the plain permission-prompt
 /// rendering, frozen verbatim.** These strings ARE the current contract —

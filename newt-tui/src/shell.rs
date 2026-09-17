@@ -324,12 +324,15 @@ impl Screen for Shell<'_> {
                 "↑↓ move · Enter open · / filter · Esc leave",
             ),
         };
+        let label_width = self.sections.iter().fold(14, |width, section| {
+            width.max(section.name.chars().count() + 2)
+        });
         crate::config_panel::render_panel(
             frame,
             &title,
             &rows,
             crate::config_panel::hint_line(hint),
-            14,
+            label_width,
             40,
         );
     }
@@ -737,6 +740,40 @@ mod tests {
             vec![1],
             "the whole word was typed, not bound"
         );
+    }
+
+    #[test]
+    fn long_section_labels_keep_a_gap_before_their_summary() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut permissions = link("Permissions (OCAP)", 'p');
+        permissions.summary = "defaults · session allows · audit".into();
+        let mut shell = Shell::new(vec![link("Session", 's'), permissions]);
+        for selected in [false, true] {
+            if selected {
+                shell.key(Key::Down);
+            }
+            for width in [72, 152] {
+                let mut term = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                term.draw(|frame| shell.draw(frame)).unwrap();
+                let buffer = term.backend().buffer();
+                let row = (0..8)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                            .collect::<String>()
+                    })
+                    .find(|line| line.contains("Permissions (OCAP)"))
+                    .expect("the complete section label remains visible");
+                let (_, after_label) = row.split_once("Permissions (OCAP)").unwrap();
+                assert!(
+                    after_label.starts_with("  "),
+                    "label and summary need a visible gap: {row:?}"
+                );
+                assert!(row.contains("defaults · session allows · audit"), "{row}");
+                assert!(row.contains("[p]"), "{row}");
+            }
+        }
     }
 
     /// The index renders one row per section, with its accelerator, and the
