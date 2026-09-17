@@ -166,7 +166,7 @@ fn durable_allows_are_exact_and_denials_still_win() {
         assert!(caveats.permits_net("example.test"));
         assert_eq!(hosts, vec!["example.test"]);
         assert!(retained);
-        assert!(!gate.mint(&[]).permits_net("sibling.test"));
+        assert!(!gate.mint(&gate.base, &[]).permits_net("sibling.test"));
     }
     assert_eq!(prompts.get(), 0);
     assert!(state.session_grants.is_empty());
@@ -185,7 +185,7 @@ fn durable_allows_are_exact_and_denials_still_win() {
         gate.ask(&[request]),
         newt_core::PermissionDecision::Deny
     ));
-    assert!(!gate.mint(&[]).permits_net("example.test"));
+    assert!(!gate.mint(&gate.base, &[]).permits_net("example.test"));
 }
 
 /// Grounds recalled-scope denial filtering in the real built-in filesystem

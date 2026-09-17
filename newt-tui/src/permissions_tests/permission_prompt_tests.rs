@@ -2020,6 +2020,246 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
 }
 
 #[test]
+fn refresh_caveats_includes_new_session_filesystem_grants_without_prompting() {
+    for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        let request = PermissionRequest {
+            tool: "request_permissions".into(),
+            kind,
+            target: "/approved/config.toml".into(),
+            reason: "read or update the requested configuration".into(),
+        };
+        assert!(matches!(
+            gate.ask(&[request]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+            panic!("existing session authority must be refreshable");
+        };
+        assert_eq!(
+            refreshed.permits_fs_read("/approved/config.toml"),
+            kind == DenialKind::FsRead
+        );
+        assert_eq!(
+            refreshed.permits_fs_write("/approved/config.toml"),
+            kind == DenialKind::FsWrite
+        );
+        assert!(!refreshed.permits_fs_read("/approved/sibling.toml"));
+        assert!(!refreshed.permits_fs_write("/approved/sibling.toml"));
+        assert!(newt_core::caveats::permits_path(
+            &refreshed.fs_read,
+            "/ws/source.rs"
+        ));
+        assert_eq!(refreshed.exec, base.exec);
+        assert_eq!(refreshed.net, base.net);
+        assert_eq!(prompts.get(), 1, "refresh must not ask again");
+        assert_eq!(gate.state.decisions.len(), 1, "refresh is not a decision");
+    }
+}
+
+#[test]
+fn refresh_caveats_preserves_a_narrower_caller_baseline_while_adding_session_grants() {
+    let baseline = Caveats {
+        fs_write: Scope::none(),
+        net: Scope::only(["allowed.test".into()]),
+        max_calls: CountBound::AtMost(2),
+        valid_for_generation: Scope::only([7]),
+        ..base_caveats("/ws")
+    };
+    let gate_base = Caveats {
+        fs_read: Scope::only(["/ws".into(), "/gate-only".into()]),
+        fs_write: Scope::only(["/ws".into(), "/gate-only".into()]),
+        exec: Scope::only(["cargo".into(), "npm".into()]),
+        net: Scope::only(["allowed.test".into(), "gate-only.test".into()]),
+        ..Caveats::top()
+    };
+    assert!(baseline.leq(&gate_base));
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        gate_base,
+        None,
+        None,
+        vec![PromptChoice::AllowSession],
+        prompts.clone(),
+    );
+    let request = PermissionRequest {
+        tool: "request_permissions".into(),
+        kind: DenialKind::FsRead,
+        target: "/approved/config.toml".into(),
+        reason: "read the requested configuration".into(),
+    };
+    assert!(matches!(
+        gate.ask(&[request]),
+        newt_core::PermissionDecision::Allow(_)
+    ));
+    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
+        panic!("the standing grant must compose with the caller's narrower baseline");
+    };
+    assert_eq!(
+        refreshed,
+        Caveats {
+            fs_read: Scope::only(["/ws".into(), "/approved/config.toml".into()]),
+            ..baseline
+        },
+        "only the approved read target may widen; retain every other caller bound"
+    );
+    assert!(!refreshed.permits_fs_read("/approved/sibling.toml"));
+    assert_eq!(prompts.get(), 1, "refresh must not ask again");
+    assert_eq!(gate.state.decisions.len(), 1);
+}
+
+#[test]
+fn refresh_caveats_neither_publishes_nor_consumes_pending_once_grants() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let base = base_caveats("/ws");
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    let mut request = exec_request("/opt/test-venv/bin/python");
+    request.tool = "request_permissions".into();
+    assert!(matches!(
+        gate.ask(std::slice::from_ref(&request)),
+        newt_core::PermissionDecision::Allow(_)
+    ));
+    let pending = gate.state.pending_once_grants.clone();
+    assert_eq!(pending.len(), 1);
+    for _ in 0..2 {
+        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+            panic!("refresh must preserve the baseline");
+        };
+        assert_eq!(
+            refreshed, base,
+            "one-shot authority is not session authority"
+        );
+        assert_eq!(gate.state.pending_once_grants, pending);
+        assert_eq!(gate.state.decisions.len(), 1);
+    }
+    request.tool = "run_command".into();
+    let newt_core::PermissionDecision::Allow(once) = gate.ask(&[request]) else {
+        panic!("the exact operation must still consume its pending grant");
+    };
+    assert!(once.permits_exec("/opt/test-venv/bin/python"));
+    assert!(gate.state.pending_once_grants.is_empty());
+    assert!(gate.state.session_grants.is_empty());
+    assert_eq!(prompts.get(), 1);
+    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+        panic!("refresh must preserve the baseline after the one-shot call");
+    };
+    assert_eq!(refreshed, base);
+}
+
+#[test]
+fn refresh_caveats_reapplies_preset_and_delegation_ceilings() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let ceiling = Caveats {
+        fs_read: Scope::only(["/ws".into(), "/approved/config.toml".into()]),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    for delegated in [false, true] {
+        let mut state = PermissionPromptState::default();
+        state.session_grants.extend([
+            (DenialKind::FsRead, "/approved/config.toml".into()),
+            (DenialKind::FsRead, "/outside/secret.txt".into()),
+            (DenialKind::FsWrite, "/approved/config.toml".into()),
+            (DenialKind::Exec, "npm".into()),
+        ]);
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![],
+            prompts.clone(),
+        );
+        if delegated {
+            gate.delegation = Some(&delegation);
+        } else {
+            gate.preset_clamp = Some(ceiling.clone());
+        }
+        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+            panic!("refresh must retain authority inside the ceiling");
+        };
+        assert!(refreshed.permits_fs_read("/approved/config.toml"));
+        assert!(
+            refreshed.leq(&ceiling),
+            "delegated={delegated}: {refreshed:?}"
+        );
+        assert!(!refreshed.permits_fs_read("/outside/secret.txt"));
+        assert!(!refreshed.permits_fs_write("/approved/config.toml"));
+        assert!(!refreshed.permits_exec("cargo"));
+        assert!(!refreshed.permits_exec("npm"));
+        assert_eq!(prompts.get(), 0);
+        assert!(gate.state.decisions.is_empty());
+    }
+}
+
+#[test]
+fn refresh_caveats_preserves_denials_and_filters_conflicting_cached_grants() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let base = base_caveats("/ws");
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowSession, PromptChoice::DenyAlways],
+        prompts.clone(),
+    );
+    let mut request = PermissionRequest {
+        tool: "request_permissions".into(),
+        kind: DenialKind::FsRead,
+        target: "/approved".into(),
+        reason: "inspect the requested configuration".into(),
+    };
+    assert!(matches!(
+        gate.ask(std::slice::from_ref(&request)),
+        newt_core::PermissionDecision::Allow(_)
+    ));
+    request.target = "/approved/denied.toml".into();
+    assert!(matches!(
+        gate.ask(std::slice::from_ref(&request)),
+        newt_core::PermissionDecision::Deny
+    ));
+    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+        panic!("a denial must not remove independent baseline authority");
+    };
+    assert_eq!(
+        refreshed, base,
+        "the broad recalled grant conflicts with a denial"
+    );
+    assert!(matches!(
+        gate.ask(&[request]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 2, "refresh cannot clear an operator refusal");
+    assert_eq!(gate.state.decisions.len(), 2);
+}
+
+#[test]
 fn allow_once_grants_one_call_and_reprompts_next_time() {
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));

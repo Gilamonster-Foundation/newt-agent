@@ -3919,7 +3919,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if ok && meaningful_workflow_progress(name, &result) {
                 round_progress = true;
             }
-            repeat_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -4103,6 +4103,10 @@ fn first_line(s: &str) -> String {
 enum RepeatMemo {
     Failure {
         first_line: String,
+        /// A confinement refusal or typed failed native execution can be
+        /// rechecked after a confirmed grant. This does not infer authority
+        /// or a failure's cause from native stderr.
+        retry_after_grant: bool,
     },
     NoResult {
         reason: String,
@@ -4148,7 +4152,9 @@ impl RepeatCallGuard {
     fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
         let key = Self::key(name, args);
         let raw: String = match self.repeat_memos.get(&key)? {
-            RepeatMemo::Failure { first_line: prev } => {
+            RepeatMemo::Failure {
+                first_line: prev, ..
+            } => {
                 let mut msg = format!(
                     "You already called `{name}` with these exact arguments and it failed: {prev}. \
                      Do NOT repeat the same call — use a different tool or different arguments."
@@ -4244,10 +4250,20 @@ impl RepeatCallGuard {
         args: &serde_json::Value,
         ok: bool,
         result: &str,
+        execution: Option<crate::ExecOutcome>,
     ) -> Option<RepeatMemo> {
         if !ok {
+            let lower = result.to_ascii_lowercase();
             return Some(RepeatMemo::Failure {
                 first_line: first_line(result),
+                retry_after_grant: CONFINEMENT_DENIAL_NEEDLES
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+                    || (matches!(name, "run_command" | "lifecycle")
+                        && matches!(
+                            execution,
+                            Some(crate::ExecOutcome::Failed | crate::ExecOutcome::Denied)
+                        )),
             });
         }
         if let Some(reason) = Self::no_result_reason(name, result) {
@@ -4275,7 +4291,25 @@ impl RepeatCallGuard {
     /// Record a just-executed call's outcome. Failures are also counted so the
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
-    fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+    fn record(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        ok: bool,
+        result: &str,
+        execution: Option<crate::ExecOutcome>,
+    ) {
+        if tools::permission_grant_succeeded(name, args, ok, result) {
+            self.repeat_memos.retain(|_, memo| {
+                !matches!(
+                    memo,
+                    RepeatMemo::Failure {
+                        retry_after_grant: true,
+                        ..
+                    }
+                )
+            });
+        }
         // #2374: in result-aware mode a failure memo describes the tree it ran
         // against. After a real workspace change the identical call is the
         // re-check a repair nudge asks for, so the memo is released.
@@ -4291,7 +4325,7 @@ impl RepeatCallGuard {
         if !ok {
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
         }
-        if let Some(memo) = Self::classify_repeat_memo(name, args, ok, result) {
+        if let Some(memo) = Self::classify_repeat_memo(name, args, ok, result, execution) {
             self.repeat_memos.insert(Self::key(name, args), memo);
         }
     }
@@ -8354,7 +8388,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if ok && meaningful_workflow_progress(name, &result) {
                 round_progress = true;
             }
-            repeat_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -10660,7 +10694,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if ok && meaningful_workflow_progress(name, &result) {
                 round_progress = true;
             }
-            repeat_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -12193,7 +12227,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
-            repeat_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings

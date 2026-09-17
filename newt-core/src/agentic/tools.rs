@@ -1074,6 +1074,31 @@ fn parse_capability(s: &str) -> Option<DenialKind> {
     }
 }
 
+fn permission_granted_result(capability: &str, target: &str) -> String {
+    format!(
+        "granted: the operator allowed {capability} for '{target}'. \
+         Retry the original operation now."
+    )
+}
+
+/// Recognize only the built-in's actual grant response, never arbitrary tool
+/// output or a success-shaped refusal. This releases loop suppression only;
+/// the retried operation still passes through its ordinary authority gate.
+pub(super) fn permission_grant_succeeded(
+    name: &str,
+    args: &serde_json::Value,
+    ok: bool,
+    result: &str,
+) -> bool {
+    let capability = args["capability"].as_str().unwrap_or("").trim();
+    let target = args["target"].as_str().unwrap_or("").trim();
+    name == "request_permissions"
+        && ok
+        && parse_capability(capability).is_some()
+        && !target.is_empty()
+        && result == permission_granted_result(capability, target)
+}
+
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
 /// path. It builds a [`PermissionRequest`] from `{capability, target, reason}`
 /// and consults the SAME #263 [`PermissionGate`] a denial would: `Allow` reports
@@ -1127,10 +1152,7 @@ fn execute_request_permissions(
         // here — the model retries its original tool call, which rides the #263
         // re-exec path under the now-granted caveats.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
-            PermissionDecision::Allow(_widened) => format!(
-                "granted: the operator allowed {capability} for '{target}'. \
-                 Retry the original operation now."
-            ),
+            PermissionDecision::Allow(_widened) => permission_granted_result(capability, target),
             PermissionDecision::Deny => format!(
                 "denied: the operator declined {capability} for '{target}'. \
                  Do not retry it — take a different approach."

@@ -486,7 +486,7 @@ pub(super) async fn exec_confined_command(
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     exec_floor: Option<&crate::caveats::Scope<String>>,
-    permission_gate: Option<&mut dyn PermissionGate>,
+    mut permission_gate: Option<&mut dyn PermissionGate>,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
@@ -550,6 +550,23 @@ pub(super) async fn exec_confined_command(
             Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
         };
     }
+
+    // A proactive session grant can change standing authority during this
+    // turn. Refresh before spawning: a child filesystem refusal is not a
+    // structured denial that can enter the permission-retry path below.
+    let refreshed = match permission_gate.as_deref_mut() {
+        Some(gate) => match gate.refresh_caveats(caveats) {
+            PermissionDecision::Allow(current) => Some(current),
+            PermissionDecision::Deny => {
+                return (
+                    "capability denied: current permission authority was refused".to_string(),
+                    ExecOutcome::Denied,
+                );
+            }
+        },
+        None => None,
+    };
+    let caveats = refreshed.as_ref().unwrap_or(caveats);
 
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.

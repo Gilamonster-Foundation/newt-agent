@@ -808,6 +808,17 @@ the existing permission, cancellation, and round-budget boundaries. Reuse the
 bounded workspace snapshot to omit unrelated inferred checks for unchanged
 workspaces; preserve explicit and attempted checks, failed-check recovery, and
 conservative handling of unknown state.
+After a confirmed built-in permission grant, release cached capability failures
+and typed failed native shell/lifecycle executions so the original operation can
+pass through its authority gate again. A native receipt permits re-evaluation
+without inferring a permission-related cause from stderr. Preserve untyped and
+other-tool failure suppression and executed-failure history; a refusal or an
+unavailable operator must not release the memo.
+Refresh standing session and verified durable grants before confined shell or
+lifecycle execution so the next call in the same turn receives them. Preserve
+the caller's baseline while adding approved grants. Retain preset, delegation,
+denial, and private-frame boundaries without consuming
+pending allow-once grants.
 Describe absolute file paths accurately and distinguish missing workspace files
 from external references the claim checker does not inspect.
 Reduce narration false positives from common report words while preserving
@@ -821,9 +832,17 @@ controls. Ground external path annotations with real files and retain the
 resolver boundary, learned bases, and shared display limit.
 Exercise a narration-to-real-tool-to-report recovery and a genuine remaining
 promise under the same unchanged rescue cap.
+Ground permission-retry cache invalidation with real tool dispatch against a
+regular file, retaining its actual not-a-directory error after authorization.
+Ground standing-grant refresh with a real confined native child: denied read,
+typed execution receipt, exact session approval, repeat-guard release, same-turn
+successful read, and sibling refusal. Keep
+allow-once, narrower-caller-baseline, preset/delegation, denial, and private-frame
+refusal controls.
 **Out of scope:** new authority or persisted records, permission-policy changes,
 automatic plan replacement, document-only classification within the workspace,
-new symlink-isolation semantics, and claims that guidance guarantees model
+new symlink-isolation semantics, automatic native-child denial observation or
+one-shot filesystem grant consumption, and claims that guidance guarantees model
 obedience or proves external edits occurred.
 
 ---
@@ -2128,3 +2147,5 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 23:19 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 EDT | Date: 2026-09-17
