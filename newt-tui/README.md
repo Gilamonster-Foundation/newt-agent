@@ -11,6 +11,23 @@ write that file plus one `backends/*.toml` drop-in per endpoint.
 
 ## Settings and communication style
 
+### Exact executable grants
+
+An exec permission prompt preserves the executable's full path. Allow once
+authorizes that executable for the retry; another executable with the same
+name remains outside the grant. A proactive `request_permissions` approval
+keeps the same exact target until the matching operation consumes it.
+Previously saved bare-name denials still apply to matching executable names.
+
+`--venv` and `--exec-path` grant the absolute paths of executable files in the
+selected directories, including their symlink spellings. Under restricted
+exec authority, invoke non-system tools by those absolute paths. Deliberate
+bare-name system grants still resolve through the sandbox's trusted system
+directories. These grants do not add filesystem or network access, resolve
+arbitrary programs from ambient PATH, or make interpreter approval permanent.
+
+### Panels
+
 `/settings` is the primary entry point for harness controls: Session,
 Permissions, Audit, Backends, Themes, and MCP. Commands such as `/model`,
 `/backends`, and `/permissions` remain available as direct shortcuts.
@@ -112,6 +129,50 @@ binding survives conversation and persona changes within the session.
 See [personality and named personas](../docs/guide/personality.md) for tab-local
 overrides, save/reload behavior, and the meaning of each preference.
 
+## Remembering permissions
+
+Open `/settings` → **Permissions (OCAP)** to choose the terminal approval
+default or **Make session allows permanent**. The default is **Allow once**;
+save **Deny** to require an explicit approval choice each time. Enter confirms
+the displayed choice. Closing the prompt, losing input, or running without an
+interactive terminal does not approve a request. The setting grants no
+authority by itself and is saved as `[tui.permissions].prompt_default`.
+When that setting is absent, MCP connection prompts retain the older
+`mcp_net_prompt_default` preference; other terminal approvals use Allow once.
+
+Permanent promotion shows every current session allow and asks **Are you sure?**
+with cancellation selected. Only that reviewed snapshot is saved; once-only
+answers and previously loaded permanent approvals are excluded. The grant
+kinds remain distinct: executable, file read, file write, network host, remote
+tool, and git write. Recall checks current denials before applying permission
+ceilings. A recalled directory or executable-basename grant that covers a denied
+target is withheld entirely because the scope cannot express an exclusion;
+independently configured authority is unchanged.
+If any entry cannot become standing authority, Newt refuses the whole save
+and explains why. Disabling new permission prompts still honors verified
+permanent approvals; requests without an existing grant remain denied.
+
+The hostname prompt's **[A] Allow permanently** remains a separate legacy
+action: it appends that network host to TOML configuration. Use the Permissions
+panel or `/permissions save` for the reviewed, signed and encrypted snapshot.
+
+The encrypted store is `ocap/session-grants.age` beside the selected durable
+configuration file. Its content-addressed payload is signed by the local
+operator key and bound to the canonical workspace. Newt verifies the entire
+existing store before merging a confirmed snapshot and atomically replacing
+the ciphertext. Wrong keys, invalid signatures, damaged files, or missing
+keys fail closed; existing data is not replaced with an empty policy. Startup
+loads keys without creating them. A first confirmed save may create an
+encryption identity only when no store exists.
+
+Keep both the signing key and encryption identity: losing either prevents
+loading existing approvals. Removing the encrypted store revokes its approvals
+on the next load; restart running sessions to discard their cached approvals.
+This does not remove grants from ordinary configuration or other policy files.
+There is no automatic live revocation between processes or protection against
+restoring an older, valid encrypted store. Anyone holding both private keys can
+create valid records.
+
 ## Context summaries
 
 Context summarization uses the shared progress row and can be interrupted while
@@ -167,4 +228,4 @@ free, friendly, local agentic coder.
 
 Apache-2.0
 
-Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 14:42 EDT | Date: 2026-09-16
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16

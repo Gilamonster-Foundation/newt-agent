@@ -523,3 +523,158 @@ async fn approved_external_write_retains_shrink_guard() {
     assert!(output.contains("would shrink"), "{output}");
     assert_eq!(std::fs::read_to_string(path).unwrap(), original);
 }
+
+/// Real filesystem grounding for `cli_fs_grants_widen_read_and_write_scopes`:
+/// the CLI's exact-file scope must permit the actual read, without granting
+/// sibling files or following a replacement link through the permitted name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn cli_exact_file_read_grant_reads_only_the_named_object() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let granted = outside.path().join("allowed.txt");
+    let sibling = outside.path().join("sibling.txt");
+    std::fs::write(&granted, "allowed contents\n").unwrap();
+    std::fs::write(&sibling, "ungranted sibling contents\n").unwrap();
+    let workspace = ws.path().to_string_lossy();
+    let mut caveats = crate::ToolPermissions {
+        preset: crate::PermissionPreset::ReadOnly,
+        ..Default::default()
+    }
+    .to_caveats(&workspace);
+    crate::caveats::lock_fs_to_workspace(
+        &mut caveats,
+        &workspace,
+        &[granted.to_string_lossy().into_owned()],
+        &[],
+    );
+
+    let out = run_tool(
+        "read_file",
+        serde_json::json!({"path": granted}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert_eq!(out, "allowed contents\n", "exact-file read failed: {out}");
+
+    let out = run_tool(
+        "read_file",
+        serde_json::json!({"path": sibling}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(out.starts_with("capability denied: fs_read"), "{out}");
+    assert!(!out.contains("ungranted sibling contents"), "{out}");
+
+    std::fs::remove_file(&granted).unwrap();
+    std::os::unix::fs::symlink("sibling.txt", &granted).unwrap();
+    let out = run_tool(
+        "read_file",
+        serde_json::json!({"path": granted}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(out.starts_with("capability denied: fs_read"), "{out}");
+    assert!(!out.contains("ungranted sibling contents"), "{out}");
+}
+
+/// Real filesystem grounding for the CLI write-implies-read scope contract:
+/// an exact target may be created and updated, while siblings and a replacement
+/// symlink remain outside the grant. No scripted permission gate is involved.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn cli_exact_file_write_grant_creates_and_updates_only_the_named_object() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let granted = outside.path().join("allowed.txt");
+    let sibling = outside.path().join("sibling.txt");
+    std::fs::write(&sibling, "unchanged sibling\n").unwrap();
+    let workspace = ws.path().to_string_lossy();
+    let mut caveats = crate::ToolPermissions {
+        preset: crate::PermissionPreset::ReadOnly,
+        ..Default::default()
+    }
+    .to_caveats(&workspace);
+    crate::caveats::lock_fs_to_workspace(
+        &mut caveats,
+        &workspace,
+        &[],
+        &[granted.to_string_lossy().into_owned()],
+    );
+
+    for content in ["created contents\n", "updated contents\n"] {
+        let out = run_tool(
+            "write_file",
+            serde_json::json!({"path": granted, "content": content}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("wrote "), "exact-file write failed: {out}");
+        assert_eq!(std::fs::read_to_string(&granted).unwrap(), content);
+        let out = run_tool(
+            "read_file",
+            serde_json::json!({"path": granted}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert_eq!(out, content, "write grant must also permit read: {out}");
+    }
+
+    let large = (0..100)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    std::fs::write(&granted, &large).unwrap();
+    let out = run_tool(
+        "write_file",
+        serde_json::json!({"path": granted, "content": "too short\n"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(
+        out.contains("would shrink"),
+        "exact-file preimage must retain the shrink guard: {out}"
+    );
+    assert_eq!(std::fs::read_to_string(&granted).unwrap(), large);
+
+    let out = run_tool(
+        "write_file",
+        serde_json::json!({"path": sibling, "content": "forbidden change\n"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(out.starts_with("capability denied: fs_write"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&sibling).unwrap(),
+        "unchanged sibling\n"
+    );
+
+    std::fs::remove_file(&granted).unwrap();
+    std::os::unix::fs::symlink("sibling.txt", &granted).unwrap();
+    let out = run_tool(
+        "write_file",
+        serde_json::json!({"path": granted, "content": "forbidden change\n"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(out.starts_with("capability denied: fs_write"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&sibling).unwrap(),
+        "unchanged sibling\n"
+    );
+}

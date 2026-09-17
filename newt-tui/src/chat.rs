@@ -1510,6 +1510,23 @@ fn session_body(
     });
     apply_openai_api_env(choice.api);
     let key_path = newt_identity::default_key_path().ok();
+    let user_permission_config_path = newt_core::Config::user_config_path();
+    let permission_config_path = crate::permissions::durable_permission_config_target(
+        newt_core::Config::pinned_config_path(),
+        std::path::Path::new("./newt.toml").is_file(),
+        user_permission_config_path.clone(),
+    );
+    let (key_path, durable_grants) = match crate::permissions::load_session_grants(
+        permission_config_path.as_deref(),
+        key_path.as_deref(),
+        std::path::Path::new(workspace),
+    ) {
+        Ok(grants) => (key_path, grants),
+        Err(error) => {
+            print_newt(&format!("Permanent permissions unavailable: {error}. No approvals loaded and no identity generated."), color, verbose);
+            (None, newt_core::durable_grants::GrantSet::new())
+        }
+    };
     let mut cap =
         SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
     let smart_startup_caveats = cap.caveats().clone();
@@ -1621,14 +1638,13 @@ fn session_body(
     let permission_denials_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-denials.jsonl"));
     // #904: the user config file that `[A]llow permanently` appends a net host to.
-    let user_permission_config_path = newt_core::Config::user_config_path();
-    let permission_config_path = crate::permissions::durable_permission_config_target(
-        newt_core::Config::pinned_config_path(),
-        std::path::Path::new("./newt.toml").is_file(),
-        user_permission_config_path.clone(),
-    );
     let mut permission_state =
         PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
+    permission_state.durable_grants = durable_grants;
+    permission_state.prompt_default = cfg
+        .tui
+        .as_ref()
+        .and_then(|tui| tui.permissions.prompt_default);
     // B0b-1 (#1842): the fence the gate checks an answer against. Derived
     // the same way the store derives its own, and supplied to the
     // authorizer INDEPENDENTLY of the offer being checked.
@@ -1733,11 +1749,16 @@ fn session_body(
         .as_ref()
         .map(|t| t.mcp_allow_insecure_hosts.clone())
         .unwrap_or_default();
-    let explicit_net_hosts = cfg
+    let mut explicit_net_hosts = cfg
         .tui
         .as_ref()
         .map(|t| t.permissions.net.clone())
         .unwrap_or_default();
+    explicit_net_hosts.extend(permission_state.retained_net_hosts());
+    explicit_net_hosts.sort();
+    explicit_net_hosts.dedup();
+    let startup_caveats =
+        permission_state.recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()));
     let startup_cancel = std::sync::atomic::AtomicBool::new(false);
     let startup_exit = std::sync::atomic::AtomicBool::new(false);
     permission_state.mcp_net_prompt_default = cfg
@@ -1750,7 +1771,7 @@ fn session_body(
             #[cfg(feature = "rich-tui")]
             open_panel: terminal_owns_turn.then_some(&open_permission_panel),
             state: &mut permission_state,
-            base: cap.caveats().clone(),
+            base: startup_caveats.clone(),
             key_path: key_path.clone(),
             conversation_id: active_conversation_id.clone(),
             log_path: permission_log_path.clone(),
@@ -1771,6 +1792,9 @@ fn session_body(
                     &newt_core::interaction_surface::SurfaceInteraction,
                 ) -> PromptChoice,
         });
+        let connect_caveats = permission_gate
+            .as_ref()
+            .map_or_else(|| startup_caveats.clone(), |gate| gate.current_caveats());
         let mut grant_net = |request: &newt_core::PermissionRequest| {
             if startup_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
@@ -1784,7 +1808,7 @@ fn session_body(
             &allow_insecure_hosts,
             // #1243 Leg 3: the full session leash (not just its net axis) so a
             // spawned stdio MCP server is confined to the session's authority.
-            cap.caveats(),
+            &connect_caveats,
             &explicit_net_hosts,
             Some((&mut grant_net, &startup_cancel)),
         ))
@@ -3452,8 +3476,35 @@ fn session_body(
                             println!();
                             continue;
                         }
+                        if perm_tail == "save" {
+                            let posture = newt_core::posture::active_posture();
+                            let result = if interactive {
+                                crate::permissions::PermissionWorkflow {
+                                    state: &mut permission_state,
+                                    config_path: permission_config_path.as_deref(),
+                                    key_path: key_path.as_deref(),
+                                    workspace: std::path::Path::new(workspace),
+                                    preset: posture
+                                        .as_ref()
+                                        .and_then(ActivePosture::permission_clamp),
+                                    ceiling: cap.delegation().map(|d| d.caveats()),
+                                }
+                                .promote(&ask_surface)
+                            } else {
+                                Err("Saving permissions requires interactive operator confirmation.".into())
+                            };
+                            print_newt(
+                                &result.unwrap_or_else(|error| {
+                                    format!("Permission save failed: {error}")
+                                }),
+                                color,
+                                verbose,
+                            );
+                            println!();
+                            continue;
+                        }
                         if !perm_tail.is_empty() {
-                            print_newt("usage: /permissions [audit N]", color, verbose);
+                            print_newt("usage: /permissions [save | audit N]", color, verbose);
                             println!();
                             continue;
                         }
@@ -3478,27 +3529,39 @@ fn session_body(
                         if perm_tail.is_empty()
                             && std::io::IsTerminal::is_terminal(&std::io::stdout())
                         {
-                            let mut rows = status.clone();
-                            if let Some(path) = permission_log_path.as_deref() {
-                                rows.push(String::new());
-                                rows.extend(crate::permission_audit_lines(path, 50));
-                            }
-                            let window =
-                                surface.open_panel(crate::lines_panel::LinesPanel::height());
-                            let mut panel =
-                                crate::lines_panel::LinesPanel::new("permissions", rows);
-                            match crate::panel::drive(
-                                &mut panel,
-                                crate::lines_panel::LinesPanel::height(),
-                                window.as_ref(),
+                            let posture = newt_core::posture::active_posture();
+                            let mut workflow = crate::permissions::PermissionWorkflow {
+                                state: &mut permission_state,
+                                config_path: permission_config_path.as_deref(),
+                                key_path: key_path.as_deref(),
+                                workspace: std::path::Path::new(workspace),
+                                preset: posture.as_ref().and_then(ActivePosture::permission_clamp),
+                                ceiling: cap.delegation().map(|d| d.caveats()),
+                            };
+                            match workflow.run_panel(
+                                &ask_surface,
+                                |height| surface.open_panel(height),
+                                |state| {
+                                    crate::permission_panel_lines(
+                                        state,
+                                        prompt_permissions_enabled,
+                                        permission_log_path.as_deref(),
+                                        posture.as_ref(),
+                                    )
+                                },
                             ) {
-                                Ok(_) => {}
+                                Ok(messages) => {
+                                    for message in messages {
+                                        print_newt(&message, color, verbose);
+                                    }
+                                }
                                 Err(e) => print_newt(
                                     &format!("permissions panel error: {e}"),
                                     color,
                                     verbose,
                                 ),
                             }
+                            cfg = crate::resolve_runtime_or_default();
                             surface.save_history();
                             println!();
                             continue;
@@ -5857,22 +5920,9 @@ fn session_body(
                             .unwrap_or_default();
                         let mut initial_section = None;
                         loop {
+                            let mut walked_to_permissions = false;
                             let mut walked_to_mcp = false;
                             let window = surface.open_panel(settings_panel::panel_height());
-                            // #2009 PR10b: the Permissions section's rows, built
-                            // HERE because this is where the state is — the same
-                            // lines `/permissions` prints, so the section and the
-                            // verb cannot disagree about the posture.
-                            let mut permission_rows = permissions_command_lines(
-                                &permission_state,
-                                prompt_permissions_enabled,
-                                permission_log_path.as_deref(),
-                                newt_core::posture::active_posture().as_ref(),
-                            );
-                            if let Some(path) = permission_log_path.as_deref() {
-                                permission_rows.push(String::new());
-                                permission_rows.extend(crate::permission_audit_lines(path, 50));
-                            }
                             // #2009 PR13: the Audit section's rows. The fs read
                             // is here; the verification and the rendering are in
                             // `receipt_audit_lines`, so a row cannot be printed
@@ -5887,7 +5937,6 @@ fn session_body(
                                 active_backend_name(&cfg),
                                 models.clone(),
                                 current_model.clone(),
-                                permission_rows,
                                 audit_rows,
                                 initial_section,
                                 window,
@@ -5899,6 +5948,13 @@ fn session_body(
                                         }
                                         settings_panel::Outcome::OpenMcp { lines, model } => {
                                             walked_to_mcp = true;
+                                            (lines, model)
+                                        }
+                                        settings_panel::Outcome::OpenPermissions {
+                                            lines,
+                                            model,
+                                        } => {
+                                            walked_to_permissions = true;
                                             (lines, model)
                                         }
                                         settings_panel::Outcome::OpenBackends { lines, model } => {
@@ -5939,14 +5995,53 @@ fn session_body(
                                     }
                                 }
                             }
+                            cfg = crate::resolve_runtime_or_default();
                             if walked_to_mcp {
                                 manage_mcp!();
                                 initial_section = Some('m');
                                 continue;
                             }
+                            if walked_to_permissions {
+                                let posture = newt_core::posture::active_posture();
+                                let mut workflow = crate::permissions::PermissionWorkflow {
+                                    state: &mut permission_state,
+                                    config_path: permission_config_path.as_deref(),
+                                    key_path: key_path.as_deref(),
+                                    workspace: std::path::Path::new(workspace),
+                                    preset: posture
+                                        .as_ref()
+                                        .and_then(ActivePosture::permission_clamp),
+                                    ceiling: cap.delegation().map(|d| d.caveats()),
+                                };
+                                match workflow.run_panel(
+                                    &ask_surface,
+                                    |height| surface.open_panel(height),
+                                    |state| {
+                                        crate::permission_panel_lines(
+                                            state,
+                                            prompt_permissions_enabled,
+                                            permission_log_path.as_deref(),
+                                            posture.as_ref(),
+                                        )
+                                    },
+                                ) {
+                                    Ok(messages) => {
+                                        for message in messages {
+                                            print_newt(&message, color, verbose);
+                                        }
+                                    }
+                                    Err(error) => print_newt(
+                                        &format!("Permission settings: {error}"),
+                                        color,
+                                        verbose,
+                                    ),
+                                }
+                                cfg = crate::resolve_runtime_or_default();
+                                initial_section = Some('p');
+                                continue;
+                            }
                             break;
                         }
-                        cfg = crate::resolve_runtime_or_default();
                         if !walked_to_backends {
                             surface.save_history();
                             println!();
@@ -7122,10 +7217,12 @@ fn session_body(
                     // Resolve the turn's authority before automatic Git metadata,
                     // not only before tool dispatch. The same value is the gate
                     // base and the ChatCtx authority later in this turn.
+                    let recalled_caveats = permission_state
+                        .recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()));
                     let turn_caveats = operating_mode_caveats(
                         turn_operating_mode,
                         meet_persona_caveats(
-                            effective_caveats(cap.caveats(), turn_posture.as_ref()),
+                            effective_caveats(&recalled_caveats, turn_posture.as_ref()),
                             active_persona.as_ref(),
                         ),
                     );
@@ -7507,6 +7604,10 @@ fn session_body(
                         .tui
                         .as_ref()
                         .map(|tui| tui.permissions.mcp_net_prompt_default);
+                    permission_state.prompt_default = cfg
+                        .tui
+                        .as_ref()
+                        .and_then(|tui| tui.permissions.prompt_default);
                     let mut permission_gate = interactive.then(|| PromptPermissionGate {
                         // C1: ask the UI thread, never this one.
                         ask_surface: Some(&ask_surface),

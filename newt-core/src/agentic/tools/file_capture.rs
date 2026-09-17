@@ -28,11 +28,7 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
         let full = path.to_string_lossy();
         match super::object_bound_target(scope, &full) {
             Some(Some((root, relative))) => {
-                let directory =
-                    crate::fs_cap::WorkspaceDir::open_root(Path::new(root)).map_err(|error| {
-                        io::Error::other(format!("could not open authorized root: {error}"))
-                    })?;
-                directory.open_regular(&relative, nofollow)
+                crate::fs_cap::WorkspaceDir::open_granted_file(Path::new(root), &relative, nofollow)
             }
             Some(None) => super::open_regular_file(path, nofollow),
             None => Err(io::Error::new(

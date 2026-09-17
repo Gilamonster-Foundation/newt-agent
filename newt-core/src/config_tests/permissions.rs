@@ -8,6 +8,43 @@ use crate::caveats::CaveatsExt;
 // --- ToolPermissions / to_caveats ---
 
 #[test]
+fn terminal_prompt_default_roundtrips_without_granting_authority() {
+    let baseline = ToolPermissions::default();
+    for action in ["allow_once", "deny"] {
+        let configured: ToolPermissions =
+            toml::from_str(&format!("prompt_default = {action:?}")).unwrap();
+        let encoded = toml::Value::try_from(&configured).unwrap();
+        assert_eq!(
+            encoded.get("prompt_default").and_then(toml::Value::as_str),
+            Some(action)
+        );
+        assert_eq!(configured.to_caveats("/ws"), baseline.to_caveats("/ws"));
+        assert_eq!(
+            toml::from_str::<ToolPermissions>(&toml::to_string(&configured).unwrap()).unwrap(),
+            configured
+        );
+    }
+}
+
+#[test]
+fn terminal_prompt_default_rejects_standing_grants_denials_and_controls() {
+    for action in [
+        "allow_session",
+        "allow_permanent",
+        "deny_always",
+        "deny_permanent",
+        "back",
+        "exit",
+        "unknown",
+    ] {
+        assert!(
+            toml::from_str::<ToolPermissions>(&format!("prompt_default = {action:?}")).is_err(),
+            "invalid terminal default {action}"
+        );
+    }
+}
+
+#[test]
 fn mcp_net_prompt_default_is_typed_and_roundtrips() {
     use crate::PermissionAction;
     let default: ToolPermissions = toml::from_str("").unwrap();
@@ -343,4 +380,77 @@ fn with_net_host_is_idempotent_no_duplicate() {
 #[test]
 fn with_net_host_rejects_invalid_toml() {
     assert!(Config::with_net_host("this = = not toml", "github.com").is_err());
+}
+
+/// Grounds the comment-preserving transformer in the same real-file writer
+/// used for permanent network approvals; changing the default grants nothing.
+#[test]
+fn set_permission_prompt_default_preserves_config_and_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let original = "# operator config\n[tui.permissions]\npreset = \"read_only\"\nnet = [\"docs.example\"]\nprompt_default = \"deny\" # deliberate choice\n[unmodeled]\nretain = true\n";
+    std::fs::write(&path, original).unwrap();
+    let before: Config = toml::from_str(original).unwrap();
+    Config::set_permission_prompt_default(&path, crate::PermissionAction::AllowOnce).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# operator config"));
+    assert!(saved.contains("# deliberate choice"));
+    assert!(saved.contains("[unmodeled]"));
+    let after: Config = toml::from_str(&saved).unwrap();
+    let before = before.tui.unwrap().permissions;
+    let after = after.tui.unwrap().permissions;
+    assert_eq!(
+        after.prompt_default,
+        Some(crate::PermissionAction::AllowOnce)
+    );
+    assert_eq!(after.to_caveats("/ws"), before.to_caveats("/ws"));
+    Config::set_permission_prompt_default(&path, crate::PermissionAction::Deny).unwrap();
+    let saved: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        saved.tui.unwrap().permissions.prompt_default,
+        Some(crate::PermissionAction::Deny)
+    );
+}
+
+#[test]
+fn set_permission_prompt_default_rejects_invalid_actions_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing/config.toml");
+    for action in [
+        crate::PermissionAction::AllowSession,
+        crate::PermissionAction::AllowPermanent,
+        crate::PermissionAction::DenyAlways,
+        crate::PermissionAction::DenyPermanent,
+        crate::PermissionAction::Back,
+        crate::PermissionAction::Exit,
+    ] {
+        assert!(Config::set_permission_prompt_default(&path, action).is_err());
+        assert!(!path.parent().unwrap().exists());
+    }
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "broken = = toml").unwrap();
+    assert!(
+        Config::set_permission_prompt_default(&path, crate::PermissionAction::AllowOnce).is_err()
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "broken = = toml");
+}
+
+#[test]
+fn set_permission_prompt_default_and_net_updates_share_the_locked_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::thread::scope(|scope| {
+        let path = &path;
+        scope.spawn(move || {
+            Config::set_permission_prompt_default(path, crate::PermissionAction::Deny).unwrap();
+        });
+        scope.spawn(move || Config::append_permission_net_host(path, "docs.example").unwrap());
+    });
+    let saved: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let permissions = saved.tui.unwrap().permissions;
+    assert_eq!(
+        permissions.prompt_default,
+        Some(crate::PermissionAction::Deny)
+    );
+    assert_eq!(permissions.net, vec!["docs.example"]);
 }

@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (7 steps)
+# Phase 10 — newt-cli polish (9 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -745,6 +745,32 @@ themed reasoning/reply output and buffered paste, Enter, interrupt, and closure.
 **Out of scope:** terminal font/cursor controls, additional settings categories,
 backend discovery redesign, and external multiplexer transport changes.
 
+## Step 10.6 — Review and remember session permissions
+
+**Branch:** `step-10.6-session-permission-workflow`
+**Touches:** the existing Permissions settings panel, terminal permission gate,
+configuration writer, exact-file capability handles, and denial recovery hints;
+adds the signed, encrypted durable-grant store using existing content-addressing,
+operator signing keys, encryption identities, and atomic filesystem writes.
+**Implements:** `/settings` → Permissions (OCAP) reviews the actual session
+allows and offers one explicit, default-cancel confirmation to make the entire
+snapshot permanent. Keep all six capability kinds and targets exact, bind the
+record to the canonical workspace, and update the cache only after verified
+persistence. Preserve denial, danger, preset, and delegation checks. Terminal
+approval defaults to Allow once; the operator may save Deny instead. Neither
+the default nor terminal closure grants standing authority. Repair exact-file
+read/write grants without broadening sibling access. Report structured shell
+denials with the correct capability and target, and explain workspace-only
+`find` limits before opening an ineffective permission dialog.
+**Tests:** confirmed/cancelled/closed promotion, six-kind snapshots, denial and
+ceiling precedence, default configuration, signature/encryption verification,
+key loss, workspace isolation, atomic concurrent merge, and bounded decoding.
+Real filesystem tests ground ciphertext-only storage and exact-file grants,
+including sibling refusal, link replacement, and retained shrink checks.
+**Out of scope:** automatic promotion, new ambient authority, headless approval,
+cryptographic primitives, remote key distribution, anti-rollback storage,
+live cross-process revocation, broader `find` roots, and MCP lifecycle changes.
+
 ## Step 10.7 — MCP management and task-driven tool access
 
 **Branch:** `step-10.7-mcp-management`
@@ -799,6 +825,24 @@ promise under the same unchanged rescue cap.
 automatic plan replacement, document-only classification within the workspace,
 new symlink-isolation semantics, and claims that guidance guarantees model
 obedience or proves external edits occurred.
+
+---
+
+## Step 10.10 — Exact executable grants
+
+**Branch:** `step-10.10-exact-executable-grants`
+**Touches:** existing shell denial prompts, one-shot permission storage,
+CLI executable-directory scanning, and their regression tests.
+**Implements:** preserve the requested executable path through approval and
+retry. A full-path grant must not authorize a different same-named executable.
+Keep intentionally bare system-command grants and existing bare-name denials.
+`--venv` and `--exec-path` retain absolute executable paths for kernel projection.
+**Tests:** exact prompt and recovery targets, immediate and proactive allow-once,
+same-name negative controls, saved denials, executable scans and venv symlinks.
+A real Seatbelt subprocess test grounds the permission-to-execution path with
+a harmless temporary executable outside trusted system directories.
+**Out of scope:** ambient PATH resolution, broader exec or filesystem presets,
+sticky interpreter approval, and changes to sandbox enforcement.
 
 ---
 
@@ -2073,6 +2117,14 @@ Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2
 
 Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 11:30 EDT | Date: 2026-09-16
 
+Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 16:52 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 18:19 EDT | Date: 2026-09-16
+
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 18:41 EDT | Date: 2026-09-16
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21:03 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 23:19 EDT | Date: 2026-09-16

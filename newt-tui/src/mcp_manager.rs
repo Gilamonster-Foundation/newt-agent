@@ -233,7 +233,7 @@ where
             .tui
             .as_ref()
             .map_or_else(Vec::new, |tui| tui.permissions.net.clone());
-        hosts.extend(gate.session_net_hosts());
+        hosts.extend(gate.retained_net_hosts());
         hosts.sort();
         hosts.dedup();
         let insecure = context

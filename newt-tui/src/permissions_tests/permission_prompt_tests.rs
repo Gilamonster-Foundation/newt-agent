@@ -1091,7 +1091,44 @@ fn mcp_net_prompt_configured_blank_answer_preserves_grant_lifetime() {
 }
 
 #[test]
-fn mcp_net_prompt_defaults_are_offered_explicit_and_local_to_connect() {
+fn terminal_blank_answer_allows_once_and_never_closure() {
+    for outcome in [
+        HumanQuestionOutcome::Answer(String::new()),
+        HumanQuestionOutcome::InputClosed,
+        HumanQuestionOutcome::Cancelled,
+    ] {
+        let mut state = PermissionPromptState::default();
+        let ask = |_interaction: &SurfaceInteraction| outcome.clone();
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![],
+            Rc::new(Cell::new(0)),
+        );
+        gate.ask_surface = Some(&ask);
+        let request = PermissionRequest {
+            tool: "remote__search".into(),
+            kind: DenialKind::RemoteTool,
+            target: "remote__search".into(),
+            reason: "operator approval required".into(),
+        };
+        let result = gate.ask(&[request]);
+        assert_eq!(
+            matches!(result, newt_core::PermissionDecision::Allow(_)),
+            matches!(outcome, HumanQuestionOutcome::Answer(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            state.session_grants.is_empty(),
+            "Enter cannot create standing authority"
+        );
+    }
+}
+
+#[test]
+fn mcp_net_prompt_defaults_are_offered_and_generic_defaults_cannot_add_standing_authority() {
     let request = PermissionRequest {
         tool: "mcp connect".into(),
         kind: DenialKind::Net,
@@ -1148,7 +1185,7 @@ fn mcp_net_prompt_defaults_are_offered_explicit_and_local_to_connect() {
             reason: String::new(),
         };
         let interaction = permission_interaction(&other, &danger, PromptChoice::AllowPermanent);
-        assert!(interaction.default_choice().is_none());
+        assert_eq!(interaction.default_choice().unwrap().id.as_str(), "deny");
         assert_eq!(
             decode_answer(&interaction.definition, interaction.answer_or_default("")),
             PromptChoice::Deny
@@ -2067,6 +2104,106 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
 }
 
 #[test]
+fn exact_executable_grants_preserve_immediate_and_proactive_once_authority() {
+    for proactive in [false, true] {
+        let target = "/opt/test-venv/bin/python";
+        let other = "/opt/other-venv/bin/python";
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![
+                PromptChoice::AllowOnce,
+                PromptChoice::Deny,
+                PromptChoice::Deny,
+            ],
+            prompts.clone(),
+        );
+        let mut request = exec_request(target);
+        if proactive {
+            request.tool = "request_permissions".into();
+        }
+        let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
+            panic!("exact executable should be grantable once");
+        };
+        assert_eq!(granted.exec, Scope::only(["cargo".into(), target.into()]));
+        assert_eq!(granted.fs_read, base.fs_read);
+        assert_eq!(granted.fs_write, base.fs_write);
+        assert_eq!(granted.net, base.net);
+        // A different executable with the same basename cannot consume the grant.
+        assert!(matches!(
+            gate.ask(&[exec_request(other)]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 2);
+        if proactive {
+            let newt_core::PermissionDecision::Allow(retry) = gate.ask(&[exec_request(target)])
+            else {
+                panic!("the exact pending grant must survive an unrelated request");
+            };
+            assert_eq!(retry.exec, granted.exec);
+            assert_eq!(
+                prompts.get(),
+                2,
+                "the exact retry consumes the pending approval"
+            );
+        }
+        assert!(matches!(
+            gate.ask(&[exec_request(target)]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 3, "allow once never becomes sticky");
+        drop(gate);
+        assert!(state.pending_once_grants.is_empty());
+        assert!(state.session_grants.is_empty());
+    }
+}
+
+#[test]
+fn exact_executable_grants_respect_existing_basename_denials() {
+    for source in ["session", "persistent", "ocap"] {
+        let mut state = PermissionPromptState::default();
+        let denied = (DenialKind::Exec, "python".into());
+        match source {
+            "session" => {
+                state.session_denials.insert(denied);
+            }
+            "persistent" => {
+                state.persistent_denials.insert(denied);
+            }
+            _ => {
+                state.ocap_policy = ocap(
+                    newt_core::ocap_store::Verdict::Deny,
+                    "[[exec]]\ntarget = \"python\"\n",
+                );
+            }
+        }
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        assert!(matches!(
+            gate.ask(&[exec_request("/opt/test-venv/bin/python")]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(
+            prompts.get(),
+            0,
+            "a previous deny must not become a new prompt"
+        );
+    }
+}
+
+#[test]
 fn session_grant_exec_matches_by_basename() {
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));
@@ -2960,7 +3097,7 @@ fn permissions_command_lists_decisions_and_log_location() {
         .iter()
         .any(|l| l.contains("no prompted permission decisions")));
     // With decisions + a log path: one row per decision, log named,
-    // promotion stays a human config edit.
+    // and promotion remains an explicit human action.
     state.decisions.push(newt_core::PermissionRecord::new(
         "conv-1",
         "run_command",

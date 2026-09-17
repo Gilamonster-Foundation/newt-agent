@@ -236,21 +236,13 @@ fn envelope_denial_reason_joins_or_falls_back() {
     );
 }
 
-#[test]
-fn exec_allowlist_name_takes_basename() {
-    assert_eq!(exec_allowlist_name("env"), "env");
-    assert_eq!(exec_allowlist_name("/usr/bin/env"), "env");
-    assert_eq!(exec_allowlist_name("/usr/bin/"), "bin");
-    assert_eq!(exec_allowlist_name("C:\\tools\\env.exe"), "env.exe");
-}
-
 /// #775 (§2.5): denial recovery uses the BARE command target(s), never the
 /// reason sentence. Stuffing the full reason into the former notice's
 /// `'{target}'` field produced the
 /// field-report garble `capability denied: exec does not permit '<whole
 /// reason sentence>'`.
 #[test]
-fn exec_denial_target_label_is_the_bare_command_not_the_reason() {
+fn denial_recovery_uses_bare_targets_not_reason_sentences() {
     let one = serde_json::json!({
         "denied": true,
         "denials": [{
@@ -259,24 +251,25 @@ fn exec_denial_target_label_is_the_bare_command_not_the_reason() {
             "reason": "exec of \"export\" is not within the granted authority"
         }]
     });
-    let label = exec_denial_target_label(&one);
-    assert_eq!(label, "export");
+    let hints = denial_recovery_hints(&one).unwrap();
+    assert_eq!(hints, [denial_recovery_hint("exec", "export")]);
     // It is the bare command — NEVER the reason sentence (which, in the
     // `'{target}'` slot, was the nested garble).
-    assert!(!label.contains("is not within the granted authority"));
-    // Multiple targets join cleanly; an envelope with no target falls back
-    // to a generic label so the notice still prints one clean line.
+    assert!(!hints[0].contains("is not within the granted authority"));
     let multi = serde_json::json!({
         "denials": [
             {"kind": "exec", "target": "export", "reason": "r"},
             {"kind": "exec", "target": "set", "reason": "r"}
         ]
     });
-    assert_eq!(exec_denial_target_label(&multi), "export, set");
     assert_eq!(
-        exec_denial_target_label(&serde_json::json!({})),
-        "a command"
+        denial_recovery_hints(&multi).unwrap(),
+        [
+            denial_recovery_hint("exec", "export"),
+            denial_recovery_hint("exec", "set")
+        ]
     );
+    assert!(denial_recovery_hints(&serde_json::json!({})).is_none());
 }
 
 #[test]
@@ -298,7 +291,7 @@ fn host_of_url_extracts_hosts_conservatively() {
 #[test]
 fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
     // The promptable case: every entry is an exec denial with a target;
-    // the request target is the allowlist basename (the grantable name).
+    // preserve exact paths while retaining intentionally bare-name requests.
     let exec_only = serde_json::json!({
         "denied": true,
         "denials": [
@@ -311,8 +304,8 @@ fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
     assert_eq!(reqs[0].tool, "run_command");
     assert_eq!(reqs[0].kind, DenialKind::Exec);
     assert_eq!(
-        reqs[0].target, "npm",
-        "basename, same rule as the config hint"
+        reqs[0].target, "/usr/bin/npm",
+        "the prompt must grant the executable that was actually denied"
     );
     assert_eq!(reqs[0].reason, "exec npm denied");
     assert_eq!(reqs[1].target, "node");
@@ -374,6 +367,19 @@ fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
     assert!(exec_denial_requests(&authority).is_some());
 }
 
+#[test]
+fn exact_executable_grants_preserve_interpreter_prompt_and_recovery_target() {
+    let target = "/opt/test-venv/bin/python";
+    let envelope = serde_json::json!({"denials": [{
+        "kind": "exec", "target": target, "reason": "interpreter denied"
+    }]});
+    assert_eq!(exec_denial_requests(&envelope).unwrap()[0].target, target);
+    assert!(
+        denied_run_command_result(&envelope, false).contains(&format!("target=\"{target}\"")),
+        "recovery must request the same exact executable"
+    );
+}
+
 /// #905: a NET denial envelope (agent-bridle #196 shape) lifts to a per-host
 /// net PermissionRequest; the target is the CONNECT host verbatim (no
 /// basename mangling). Non-net / mixed / empty batches stay flat.
@@ -413,8 +419,6 @@ fn net_denial_requests_lifts_only_pure_net_envelopes() {
     assert!(net_denial_requests(&empty_target).is_none());
 }
 
-/// #905: the human denial NOTICE labels a pure-net refusal `net` (not `exec`),
-/// so it never reads "exec does not permit '<host>'". Exec / mixed stay `exec`.
 #[test]
 fn denials_name_the_exact_recovery_call() {
     // #1160: the model shouldn't infer parameters the harness holds — a
@@ -432,14 +436,26 @@ fn denials_name_the_exact_recovery_call() {
 }
 
 #[test]
-fn denial_axis_label_is_net_only_for_pure_net() {
+fn denial_recovery_preserves_net_and_exec_axes_in_mixed_batches() {
     let net = serde_json::json!({"denials": [{"kind": "net", "target": "github.com"}]});
-    assert_eq!(denial_axis_label(&net), "net");
+    assert_eq!(
+        denial_recovery_hints(&net).unwrap(),
+        [denial_recovery_hint("net", "github.com")]
+    );
     let exec = serde_json::json!({"denials": [{"kind": "exec", "target": "rm"}]});
-    assert_eq!(denial_axis_label(&exec), "exec");
+    assert_eq!(
+        denial_recovery_hints(&exec).unwrap(),
+        [denial_recovery_hint("exec", "rm")]
+    );
     let mixed = serde_json::json!({
         "denials": [{"kind": "net", "target": "h"}, {"kind": "exec", "target": "rm"}]
     });
-    assert_eq!(denial_axis_label(&mixed), "exec", "mixed defaults to exec");
-    assert_eq!(denial_axis_label(&serde_json::json!({})), "exec");
+    assert_eq!(
+        denial_recovery_hints(&mixed).unwrap(),
+        [
+            denial_recovery_hint("net", "h"),
+            denial_recovery_hint("exec", "rm")
+        ]
+    );
+    assert!(denial_recovery_hints(&serde_json::json!({})).is_none());
 }
