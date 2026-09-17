@@ -565,7 +565,7 @@ fn no_result_reason_classifies_and_routes() {
     g.record("recall", &q, false, "error: index unavailable");
     assert!(matches!(
         g.repeat_memos.get(&RepeatCallGuard::key("recall", &q)),
-        Some(RepeatMemo::Failure { first_line }) if first_line == "error: index unavailable"
+        Some(RepeatMemo::Failure { first_line, .. }) if first_line == "error: index unavailable"
     ));
 }
 

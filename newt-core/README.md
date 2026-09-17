@@ -24,6 +24,11 @@ grant is available, or an alternative within existing authority. An unresolved
 blocker remains incomplete work. These reminders neither grant permissions nor
 replace the tool gates or cancellation and round-budget limits.
 
+A successful built-in permission grant releases cached capability failures so
+the original operation can be checked again under the new authority. Refused or
+unavailable permission requests leave the cache unchanged; unrelated failures
+remain cached, and every retry still passes through the normal tool gate.
+
 Verification uses the existing bounded workspace snapshot to avoid requiring
 unrelated code suites for an unchanged workspace, such as a permission-only
 turn or a report written elsewhere. Explicitly named checks and attempted
@@ -89,3 +94,5 @@ free, friendly, local agentic coder.
 Apache-2.0
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21:03 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 12:17 EDT | Date: 2026-09-17

@@ -4097,6 +4097,9 @@ fn first_line(s: &str) -> String {
 enum RepeatMemo {
     Failure {
         first_line: String,
+        /// Classified before truncating the display line, including wrapped
+        /// confinement results. OS error strings alone are not authority proof.
+        permission_denied: bool,
     },
     NoResult {
         reason: String,
@@ -4142,7 +4145,9 @@ impl RepeatCallGuard {
     fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
         let key = Self::key(name, args);
         let raw: String = match self.repeat_memos.get(&key)? {
-            RepeatMemo::Failure { first_line: prev } => {
+            RepeatMemo::Failure {
+                first_line: prev, ..
+            } => {
                 let mut msg = format!(
                     "You already called `{name}` with these exact arguments and it failed: {prev}. \
                      Do NOT repeat the same call — use a different tool or different arguments."
@@ -4240,8 +4245,12 @@ impl RepeatCallGuard {
         result: &str,
     ) -> Option<RepeatMemo> {
         if !ok {
+            let lower = result.to_ascii_lowercase();
             return Some(RepeatMemo::Failure {
                 first_line: first_line(result),
+                permission_denied: CONFINEMENT_DENIAL_NEEDLES
+                    .iter()
+                    .any(|needle| lower.contains(needle)),
             });
         }
         if let Some(reason) = Self::no_result_reason(name, result) {
@@ -4270,6 +4279,17 @@ impl RepeatCallGuard {
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+        if tools::permission_grant_succeeded(name, args, ok, result) {
+            self.repeat_memos.retain(|_, memo| {
+                !matches!(
+                    memo,
+                    RepeatMemo::Failure {
+                        permission_denied: true,
+                        ..
+                    }
+                )
+            });
+        }
         // #2374: in result-aware mode a failure memo describes the tree it ran
         // against. After a real workspace change the identical call is the
         // re-check a repair nudge asks for, so the memo is released.

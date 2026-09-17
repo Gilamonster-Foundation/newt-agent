@@ -186,6 +186,178 @@ fn request_permissions_grant_deny_and_no_gate() {
     assert!(out.contains("no operator available"), "got: {out}");
 }
 
+#[test]
+fn permission_grant_releases_only_cached_authority_failures() {
+    use crate::agentic::RepeatCallGuard;
+
+    let args = serde_json::json!({"path": "report.txt"});
+    let permission = serde_json::json!({"capability": "fs_read", "target": "report.txt"});
+    for result_aware in [false, true] {
+        let mut guard = RepeatCallGuard::for_verification(result_aware);
+        guard.record(
+            "read_file",
+            &args,
+            false,
+            &denied_fs_result("fs_read", "report.txt"),
+        );
+        guard.record("list_dir", &args, false, "error: not a directory");
+        let command = serde_json::json!({"command": "compiler report.txt"});
+        guard.record(
+            "run_command",
+            &command,
+            false,
+            &format!(
+                "error: {}\ncapability denied: exec does not permit compiler",
+                "x".repeat(240)
+            ),
+        );
+        let os_error = serde_json::json!({"command": "check permissions"});
+        guard.record(
+            "run_command",
+            &os_error,
+            false,
+            "error: fixture asserted Permission denied",
+        );
+        guard.record("state_get", &args, true, "no such key: report.txt");
+        let fetch = serde_json::json!({"url": "https://example.test/report"});
+        guard.record("web_fetch", &fetch, true, "observed report");
+        assert!(guard.repeat_steer("read_file", &args).is_some());
+
+        let mut allow = MockGate::new(true, &Caveats::top());
+        let mut deny = MockGate::new(false, &Caveats::top());
+        let granted = execute_request_permissions(&permission, Some(&mut allow), false, 20);
+        for (name, request, result) in [
+            (
+                "request_permissions",
+                permission.clone(),
+                execute_request_permissions(&permission, Some(&mut deny), false, 20),
+            ),
+            (
+                "request_permissions",
+                permission.clone(),
+                execute_request_permissions(&permission, None, false, 20),
+            ),
+            (
+                "request_permissions",
+                serde_json::json!({}),
+                execute_request_permissions(&serde_json::json!({}), Some(&mut allow), false, 20),
+            ),
+            ("read_file", args.clone(), granted.clone()),
+            (
+                "request_permissions",
+                permission.clone(),
+                "granted:".to_string(),
+            ),
+            (
+                "request_permissions",
+                permission.clone(),
+                format!("{granted} trailing text"),
+            ),
+            (
+                "request_permissions",
+                serde_json::json!({}),
+                granted.clone(),
+            ),
+        ] {
+            guard.record(name, &request, tool_result_ok(&result), &result);
+            assert!(
+                guard.repeat_steer("read_file", &args).is_some(),
+                "{name}: {result}"
+            );
+        }
+
+        guard.record(
+            "request_permissions",
+            &permission,
+            tool_result_ok(&granted),
+            &granted,
+        );
+        assert!(
+            guard.repeat_steer("read_file", &args).is_none(),
+            "a confirmed grant must allow re-evaluation"
+        );
+        assert!(
+            guard.repeat_steer("run_command", &command).is_none(),
+            "wrapped denials survive first-line truncation"
+        );
+        assert!(
+            guard.repeat_steer("run_command", &os_error).is_some(),
+            "arbitrary OS-error text is not a capability denial"
+        );
+        assert!(
+            guard.repeat_steer("list_dir", &args).is_some(),
+            "ordinary I/O failures stay memoized"
+        );
+        assert!(guard.repeat_steer("state_get", &args).is_some());
+        assert!(guard.repeat_steer("web_fetch", &fetch).is_some());
+        assert_eq!(
+            guard.total_failures(),
+            4,
+            "invalidation does not erase executed history"
+        );
+    }
+}
+
+/// Grounds the cached-denial unit test in real dispatch and a regular file:
+/// after the operator grants its exact path, the identical list_dir call must
+/// reach the filesystem and report ENOTDIR, rather than replay a stale denial.
+#[tokio::test]
+async fn permission_grant_retry_reaches_the_real_file_error() {
+    use crate::agentic::RepeatCallGuard;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let file = outside.path().join("report.txt");
+    std::fs::write(&file, "a regular file, not a directory").unwrap();
+    let args = serde_json::json!({"path": file});
+    let base = Caveats {
+        fs_read: Scope::none(),
+        ..caveats_rw(workspace.path())
+    };
+    let mut guard = RepeatCallGuard::default();
+    let denied = run_tool("list_dir", args.clone(), workspace.path(), &base, None).await;
+    assert!(denied.starts_with("capability denied:"), "{denied}");
+    guard.record("list_dir", &args, tool_result_ok(&denied), &denied);
+    assert!(guard.repeat_steer("list_dir", &args).is_some());
+
+    let mut gate = MockGate::new(true, &base);
+    let permission = serde_json::json!({"capability": "fs_read", "target": file});
+    let granted = execute_request_permissions(&permission, Some(&mut gate), false, 20);
+    assert!(granted.starts_with("granted:"), "{granted}");
+    guard.record(
+        "request_permissions",
+        &permission,
+        tool_result_ok(&granted),
+        &granted,
+    );
+    assert!(
+        guard.repeat_steer("list_dir", &args).is_none(),
+        "the authorized retry must execute"
+    );
+
+    let retried =
+        run_tool_gated("list_dir", args.clone(), workspace.path(), &base, &mut gate).await;
+    let actual_error = std::fs::read_dir(&file).unwrap_err();
+    assert_eq!(actual_error.kind(), std::io::ErrorKind::NotADirectory);
+    assert_eq!(retried, format!("error: {actual_error}"));
+    assert_eq!(gate.asks.len(), 2, "the retry still checks authority");
+    assert!(gate
+        .asks
+        .iter()
+        .all(|(_, target)| target == &format!("fs_read:{}", file.display())));
+    guard.record("list_dir", &args, tool_result_ok(&retried), &retried);
+    guard.record(
+        "request_permissions",
+        &permission,
+        tool_result_ok(&granted),
+        &granted,
+    );
+    assert!(
+        guard.repeat_steer("list_dir", &args).is_some(),
+        "a new grant cannot repair ENOTDIR"
+    );
+}
+
 /// #1547: the headless `request_permissions` answer must be ACTIONABLE, not
 /// a dead-end. With no gate, authority cannot be widened mid-run, so the
 /// model must be told to (a) stop re-asking and (b) proceed within the
