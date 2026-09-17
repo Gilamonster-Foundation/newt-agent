@@ -69,6 +69,70 @@ fn run_command_denial_is_single_level_not_nested() {
 }
 
 #[test]
+fn run_command_denial_hints_preserve_each_axis_and_target() {
+    let denials = [
+        ("exec", "/usr/bin/helper", "helper"),
+        ("fs_read", "/", "/"),
+        (
+            "fs_write",
+            "/workspace/report \"draft\".md",
+            "/workspace/report \"draft\".md",
+        ),
+        ("net", "api.example.test", "api.example.test"),
+    ];
+    let envelope = serde_json::json!({
+        "denials": denials.iter().map(|(kind, target, _)| {
+            serde_json::json!({"kind": kind, "target": target, "reason": "outside granted authority"})
+        }).collect::<Vec<_>>()
+    });
+    let out = denied_run_command_result(&envelope, false);
+    assert_eq!(out.matches("capability denied:").count(), 1, "{out}");
+    assert_eq!(
+        out.matches("request_permissions(").count(),
+        denials.len(),
+        "{out}"
+    );
+    for (kind, _, granted_target) in denials {
+        let expected = format!(
+            "request_permissions(capability={kind:?}, target={}",
+            serde_json::json!(granted_target)
+        );
+        assert!(out.contains(&expected), "missing {expected}: {out}");
+    }
+}
+
+#[test]
+fn run_command_ungrantable_denials_do_not_invent_permission_requests() {
+    for denials in [
+        serde_json::json!([]),
+        serde_json::json!([{"kind": "open", "target": "/workspace/data"}]),
+        serde_json::json!([{"kind": "fs_read"}]),
+        serde_json::json!([{"target": "/workspace/data"}]),
+        serde_json::json!([{"kind": "exec", "target": ""}]),
+        serde_json::json!([{"kind": "exec", "target": "   "}]),
+        serde_json::json!([{
+            "kind": "exec", "target": "dynamic syntax",
+            "reason": "refused by design: dynamic construct the confined shell does not interpret"
+        }]),
+        serde_json::json!([
+            {"kind": "exec", "target": "helper"},
+            {"kind": "exec", "target": "unsupported syntax",
+             "reason": "not yet supported by the confined shell engine"}
+        ]),
+        serde_json::json!([
+            {"kind": "exec", "target": "helper"},
+            {"kind": "open", "target": "/workspace/data"}
+        ]),
+    ] {
+        let out = denied_run_command_result(&serde_json::json!({"denials": denials}), false);
+        assert!(!out.contains("request_permissions"), "{out}");
+        assert!(out.contains("different approach"), "{out}");
+    }
+    let out = denied_run_command_result(&serde_json::json!({}), false);
+    assert!(!out.contains("request_permissions"), "{out}");
+}
+
+#[test]
 fn parse_capability_maps_synonyms_and_rejects_unknown() {
     assert_eq!(parse_capability("exec"), Some(DenialKind::Exec));
     assert_eq!(parse_capability("shell"), Some(DenialKind::Exec));

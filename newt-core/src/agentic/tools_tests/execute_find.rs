@@ -261,20 +261,55 @@ async fn find_denied_without_fs_read() {
     )
     .await;
     assert!(out.starts_with("capability denied"), "got: {out}");
+    let mut gate = MockGate::new(true, &denied);
+    let out = run_tool_gated(
+        "find",
+        serde_json::json!({"name": "secret.txt"}),
+        ws.path(),
+        &denied,
+        &mut gate,
+    )
+    .await;
+    assert_eq!(out, "secret.txt");
+    assert_eq!(
+        gate.asks.len(),
+        1,
+        "in-workspace authority remains grantable"
+    );
 }
 
-/// A `..` root that escapes the workspace is refused even when the session
-/// grants fs_read everywhere (defence-in-depth for a recursive read).
+/// Grounds the permission gate's no-prompt refusal in real root containment:
+/// a recursive search outside the workspace cannot be enabled by an fs grant.
 #[tokio::test]
 async fn find_refuses_root_outside_workspace() {
     let parent = tempfile::TempDir::new().unwrap();
     std::fs::write(parent.path().join("outside.txt"), b"x").unwrap();
     let ws = parent.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    // fs_read: All, so the only thing that can stop the escape is the
-    // canonical-root containment check.
-    let out = run_find(serde_json::json!({ "path": ".." }), &ws).await;
-    assert!(out.starts_with("capability denied"), "got: {out}");
+    for path in [
+        "..".to_string(),
+        parent.path().to_string_lossy().into_owned(),
+    ] {
+        for fs_read in [Scope::All, Scope::none()] {
+            let caveats = Caveats {
+                fs_read,
+                ..caveats_rw(&ws)
+            };
+            let mut gate = MockGate::new(true, &caveats);
+            let out = run_tool_gated(
+                "find",
+                serde_json::json!({"path": path}),
+                &ws,
+                &caveats,
+                &mut gate,
+            )
+            .await;
+            assert!(out.starts_with("capability denied"), "got: {out}");
+            assert!(out.contains("workspace-only"), "got: {out}");
+            assert!(!out.contains("request_permissions"), "got: {out}");
+            assert!(gate.asks.is_empty(), "an unsupported root must not prompt");
+        }
+    }
 }
 
 /// An empty `name` is treated as "match everything" (the `!g.is_empty()`

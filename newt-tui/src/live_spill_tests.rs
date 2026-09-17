@@ -9,7 +9,7 @@ use std::io::Write;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 
-#[cfg(all(unix, feature = "rich-tui"))]
+#[cfg(all(test, unix, feature = "rich-tui"))]
 #[path = "live_spill_pty_tests.rs"]
 mod terminal;
 

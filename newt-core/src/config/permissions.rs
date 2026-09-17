@@ -141,11 +141,36 @@ pub struct ToolPermissions {
     #[serde(default)]
     pub prompt: bool,
 
+    /// Enter's highlighted choice at terminal permission prompts. This is a
+    /// presentation preference, never a grant. Omitted uses AllowOnce, retaining
+    /// the older MCP-specific setting for MCP connection prompts.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_prompt_default"
+    )]
+    pub prompt_default: Option<crate::PermissionAction>,
+
     /// The choice selected by Enter at a terminal MCP hostname prompt.
     /// Applies only to connection grants, never generic tools or web races.
     /// This selects a displayed action; it grants nothing without an answer.
     #[serde(deserialize_with = "deserialize_mcp_net_prompt_default")]
     pub mcp_net_prompt_default: crate::PermissionAction,
+}
+
+fn deserialize_prompt_default<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::PermissionAction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let action = crate::PermissionAction::deserialize(deserializer)?;
+    match action {
+        crate::PermissionAction::AllowOnce | crate::PermissionAction::Deny => Ok(Some(action)),
+        _ => Err(serde::de::Error::custom(
+            "prompt_default must be allow_once or deny",
+        )),
+    }
 }
 
 fn deserialize_mcp_net_prompt_default<'de, D>(
@@ -173,6 +198,7 @@ impl Default for ToolPermissions {
             extra_exec: Vec::new(),
             net: Vec::new(),
             prompt: false,
+            prompt_default: None,
             mcp_net_prompt_default: crate::PermissionAction::AllowOnce,
         }
     }
@@ -340,6 +366,27 @@ impl Config {
     /// filesystem. This is the durable "allow permanently" grant path — it is
     /// only ever driven by an explicit human keypress at the permission prompt.
     pub fn with_net_host(text: &str, host: &str) -> Result<String> {
+        Self::update_permissions_text(text, |perms_tbl| {
+            let net =
+                perms_tbl
+                    .entry("net")
+                    .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
+                        toml_edit::Array::new(),
+                    )));
+            let arr = net.as_array_mut().ok_or_else(|| {
+                NewtError::Config("[tui.permissions] net is not an array".to_string())
+            })?;
+            if !arr.iter().any(|v| v.as_str() == Some(host)) {
+                arr.push(host);
+            }
+            Ok(())
+        })
+    }
+
+    fn update_permissions_text(
+        text: &str,
+        update: impl FnOnce(&mut toml_edit::Table) -> Result<()>,
+    ) -> Result<String> {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
@@ -356,18 +403,7 @@ impl Config {
         let perms_tbl = perms
             .as_table_mut()
             .ok_or_else(|| NewtError::Config("[tui.permissions] is not a table".to_string()))?;
-        let net =
-            perms_tbl
-                .entry("net")
-                .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
-                    toml_edit::Array::new(),
-                )));
-        let arr = net.as_array_mut().ok_or_else(|| {
-            NewtError::Config("[tui.permissions] net is not an array".to_string())
-        })?;
-        if !arr.iter().any(|v| v.as_str() == Some(host)) {
-            arr.push(host);
-        }
+        update(perms_tbl)?;
         Ok(doc.to_string())
     }
 
@@ -376,6 +412,42 @@ impl Config {
     /// A missing file is treated as empty (the table is created). Creates parent
     /// dirs as needed. Used by the interactive gate's "allow permanently" choice.
     pub fn append_permission_net_host(path: &Path, host: &str) -> Result<()> {
+        Self::update_permissions_file(path, |text| Self::with_net_host(text, host))
+    }
+
+    /// Save the operator's default for a terminal approval, without granting
+    /// authority. Only an explicit Allow once or Deny choice is accepted.
+    pub fn set_permission_prompt_default(
+        path: &Path,
+        action: crate::PermissionAction,
+    ) -> Result<()> {
+        if !matches!(
+            action,
+            crate::PermissionAction::AllowOnce | crate::PermissionAction::Deny
+        ) {
+            return Err(NewtError::Config(
+                "permission prompt default must be allow_once or deny".into(),
+            ));
+        }
+        Self::update_permissions_file(path, |text| {
+            Self::update_permissions_text(text, |permissions| {
+                let mut value = toml_edit::Value::from(action.as_str());
+                if let Some(previous) = permissions
+                    .get("prompt_default")
+                    .and_then(toml_edit::Item::as_value)
+                {
+                    *value.decor_mut() = previous.decor().clone();
+                }
+                permissions.insert("prompt_default", toml_edit::Item::Value(value));
+                Ok(())
+            })
+        })
+    }
+
+    fn update_permissions_file(
+        path: &Path,
+        update: impl FnOnce(&str) -> Result<String>,
+    ) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
         }
@@ -392,7 +464,7 @@ impl Config {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(NewtError::Io(error)),
         };
-        let updated = Self::with_net_host(&text, host)?;
+        let updated = update(&text)?;
         destination
             .atomic_write(updated.as_bytes())
             .map_err(|error| NewtError::Config(format!("write {}: {error:#}", path.display())))

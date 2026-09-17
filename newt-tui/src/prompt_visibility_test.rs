@@ -7,7 +7,8 @@ use tests_pty::Pty;
 
 use crate::danger;
 use crate::permissions::{
-    permission_definition, prompt_permission_choice, PermissionPromptState, PromptPermissionGate,
+    permission_definition, permission_interaction, prompt_permission_choice, PermissionPromptState,
+    PromptPermissionGate,
 };
 use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::tty::{LineCaps, Sink, Spinner, MODAL_INPUT_GLYPH};
@@ -351,11 +352,12 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     // C0a (#1856): the expectation is re-derived from the production
     // renderer, so this real-PTY grounding tracks `plain::render` rather
     // than a copy of its output.
-    let expected_prompt = newt_core::markup::plain::render(&permission_definition(
+    let expected_interaction = permission_interaction(
         &web_fetch_request("example.com"),
         &danger::DangerTable::builtin(),
-        newt_interaction::Audience::Terminal,
-    ));
+        newt_core::PermissionAction::AllowOnce,
+    );
+    let expected_prompt = newt_core::markup::plain::render(&expected_interaction.definition);
 
     let window_lf = window.replace("\r\n", "\n");
     assert!(

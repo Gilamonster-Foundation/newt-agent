@@ -59,10 +59,10 @@ pub use shell::venv_cmd_prefix;
 pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
 #[cfg(test)]
 use shell::{
-    confined_dispatch_args, decode_shell_stream, denial_axis_label, denied_run_command_result,
+    confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
     envelope_denial_reason, envelope_denied, exec_allowlist_name, exec_denial_requests,
-    exec_denial_target_label, exec_floor_permits, net_denial_requests, pr_creation_url,
-    shadow_records, shell_engine, shell_envelope_output, venv_env_map,
+    exec_floor_permits, net_denial_requests, pr_creation_url, shadow_records, shell_engine,
+    shell_envelope_output, venv_env_map,
 };
 use shell::{exec_confined_command, resolve_exec_cwd, split_leading_cd};
 #[cfg(all(test, not(windows)))]
@@ -393,8 +393,8 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
 
 /// The root in `scope` that lexically authorises `full_path`, if any.
 ///
-/// `Some(Some(root))` — permitted, and `root` is the granted directory the path
-/// must resolve *beneath* (the object-binding anchor). `Some(None)` — permitted
+/// `Some(Some(root))` — permitted, and `root` is the granted file or directory
+/// that anchors the object-bound access. `Some(None)` — permitted
 /// with no containing root (`Scope::All`, e.g. `--full-access`), so there is no
 /// object fence. `None` — not permitted. Mirrors [`tui_permits_path`]'s matching
 /// exactly (same normalisation + `starts_with`), so the object-bound read
@@ -497,14 +497,16 @@ fn object_bound_read(
             std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
         }
         Some(Some((root, rel))) => {
-            let read = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root)).and_then(
-                |dir| {
-                    let mut f = dir.open(&rel)?;
-                    let mut s = String::new();
-                    f.read_to_string(&mut s)?;
-                    Ok(s)
-                },
-            );
+            let read = crate::fs_cap::WorkspaceDir::open_granted_file(
+                std::path::Path::new(root),
+                &rel,
+                false,
+            )
+            .and_then(|mut f| {
+                let mut s = String::new();
+                f.read_to_string(&mut s)?;
+                Ok(s)
+            });
             match read {
                 Ok(s) => Ok(s),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
@@ -598,17 +600,12 @@ fn object_bound_write(
         None => Err(denied_fs_result(axis, path)),
         Some(None) => std_write(full, path, content),
         Some(Some((root, rel))) => {
-            let write = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
-                .and_then(|dir| {
-                    if let Some(parent) = rel.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            dir.create_dir_all(parent)?;
-                        }
-                    }
-                    let mut f = dir.create(&rel)?;
-                    f.write_all(content.as_bytes())?;
-                    Ok(())
-                });
+            let write =
+                crate::fs_cap::WorkspaceDir::create_granted_file(std::path::Path::new(root), &rel)
+                    .and_then(|mut f| {
+                        f.write_all(content.as_bytes())?;
+                        Ok(())
+                    });
             match write {
                 Ok(()) => Ok(()),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
@@ -933,9 +930,11 @@ fn failing_build_check_cmd(message: &str) -> String {
 /// The model shouldn't have to infer parameters the harness already holds
 /// (headless there is no operator to guess-and-check against).
 fn denial_recovery_hint(capability: &str, target: &str) -> String {
+    let capability = serde_json::json!(capability);
+    let target = serde_json::json!(target);
     format!(
         "This is outside your granted authority — to ask the operator, call \
-         request_permissions(capability=\"{capability}\", target=\"{target}\", \
+         request_permissions(capability={capability}, target={target}, \
          reason=\"<why you need it>\"), or take a different approach that stays \
          within your current authority."
     )
@@ -2173,8 +2172,11 @@ fn artifact_open_scoped_regular_file(
         else {
             return Err(std::io::Error::from_raw_os_error(libc::EACCES));
         };
-        return crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))?
-            .open_regular(&relative, true);
+        return crate::fs_cap::WorkspaceDir::open_granted_file(
+            std::path::Path::new(root),
+            &relative,
+            true,
+        );
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = scope;
@@ -3806,6 +3808,10 @@ async fn execute_authorized_tool(
             let path = args["path"].as_str().unwrap_or(".");
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
+            const WORKSPACE_ONLY: &str = "capability denied: find is workspace-only; an fs_read grant cannot enable an external search root. Use list_dir for an authorized directory, or run_command within your granted authority.";
+            if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
+                return WORKSPACE_ONLY.to_string();
+            }
             if !tui_permits_path(&caveats.fs_read, &full_str) {
                 let allowed = permission_gate.is_some_and(|gate| {
                     fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
@@ -3832,13 +3838,10 @@ async fn execute_authorized_tool(
             if !full.exists() {
                 return format!("error: no such path '{path}'");
             }
-            // step-52.6: object-bound root containment for a *recursive* read —
-            // resolve the search root beneath the granted fs_read root
-            // (openat2 RESOLVE_BENEATH on Linux; canonicalize fallback elsewhere),
-            // The legacy walk below reopens this path, so smart sessions must
-            // use the confined shell instead of relying on this separate check.
+            // Recheck workspace containment after any human prompt. The legacy
+            // walk still reopens this path; smart sessions refuse this adapter.
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
-                return denied_fs_result("fs_read", path);
+                return WORKSPACE_ONLY.to_string();
             }
             // #1264: stream hits through the LIVE viewport as the walk
             // discovers them — the first built-in on the #1235 machinery (the
