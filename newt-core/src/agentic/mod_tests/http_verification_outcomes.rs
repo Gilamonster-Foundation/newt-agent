@@ -118,6 +118,7 @@ async fn run_script(
         max_tool_rounds,
         caveats: Caveats::top(),
         env: &[],
+        workspace_task: None,
     })
     .await
 }
@@ -135,6 +136,7 @@ struct Turn<'a> {
     caveats: Caveats,
     /// Set under the env lock for the turn, after the defaults below.
     env: &'a [(&'static str, &'static str)],
+    workspace_task: Option<(&'a std::path::Path, &'a str)>,
 }
 
 async fn run_turn(turn: Turn<'_>) -> Run {
@@ -148,6 +150,7 @@ async fn run_turn(turn: Turn<'_>) -> Run {
         max_tool_rounds,
         caveats,
         env,
+        workspace_task,
     } = turn;
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
@@ -176,8 +179,11 @@ async fn run_turn(turn: Turn<'_>) -> Run {
     .unwrap();
 
     let ws = tempfile::TempDir::new().unwrap();
-    let workspace = ws.path().to_string_lossy().into_owned();
-    let task = instruction(check);
+    let workspace = workspace_task
+        .map_or(ws.path(), |(path, _)| path)
+        .to_string_lossy()
+        .into_owned();
+    let task = workspace_task.map_or_else(|| instruction(check), |(_, task)| task.to_string());
     let (uri, messages) = (server.uri(), msgs());
     let mut context = ctx(&uri, &messages, &caveats);
     context.workspace = &workspace;
@@ -229,6 +235,74 @@ fn repair_ordinals(run: &Run) -> std::collections::BTreeSet<String> {
         .filter_map(|rest| rest.split(')').next())
         .map(str::to_string)
         .collect()
+}
+
+/// Grounds verification eligibility in real files and the existing shell:
+/// an external report does not change the code workspace, while a local source
+/// change still requires its checks. Both ordinary gates and all smart wires
+/// must make the same decision in attempted and result-aware modes.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn unchanged_workspace_does_not_turn_an_external_report_into_a_coding_task() {
+    for (wire, smart) in [
+        ("openai", false),
+        ("anthropic", false),
+        ("openai", true),
+        ("anthropic", true),
+        ("ollama", true),
+        ("responses", true),
+    ] {
+        for outcomes in [false, true] {
+            for source_change in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let workspace = root.path().join("code");
+                std::fs::create_dir(&workspace).unwrap();
+                std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+                std::fs::write(workspace.join("package.json"), "{}\n").unwrap();
+                std::fs::create_dir(workspace.join("tests")).unwrap();
+                let command = if source_change {
+                    "sh -c 'printf changed > source.rs'"
+                } else {
+                    "sh -c 'printf report > ../dashboard.md'"
+                };
+                let run = run_turn(Turn {
+                    wire,
+                    smart,
+                    outcomes,
+                    check: "",
+                    script: &[Step::Run(command)],
+                    cancel: None,
+                    max_tool_rounds: 8,
+                    caveats: Caveats::top(),
+                    env: &[],
+                    workspace_task: Some((&workspace, "Complete the requested file update.")),
+                })
+                .await;
+                let label =
+                    format!("{wire} smart={smart} outcomes={outcomes} source={source_change}");
+                let output = if source_change {
+                    workspace.join("source.rs")
+                } else {
+                    root.path().join("dashboard.md")
+                };
+                assert_eq!(
+                    std::fs::read_to_string(output).unwrap(),
+                    if source_change { "changed" } else { "report" },
+                    "{label}"
+                );
+                let nudged = run
+                    .bodies
+                    .iter()
+                    .any(|body| body.contains("Before you finish"));
+                assert_eq!(nudged, source_change, "{label}");
+                if !source_change {
+                    assert_eq!(run.reason, "completed", "{label}");
+                    assert_eq!(run.bodies.len(), 2, "{label}: no unrelated test rounds");
+                }
+            }
+        }
+    }
 }
 
 /// A4/A10/A11: a failing check is repaired up to the declared allowance, then
@@ -686,6 +760,7 @@ async fn every_verification_case_ends_within_its_allowance() {
                 max_tool_rounds: 8,
                 caveats: case.caveats.clone(),
                 env: case.env,
+                workspace_task: None,
             })
             .await;
             assert_eq!(run.reason, case.reason, "{label}");

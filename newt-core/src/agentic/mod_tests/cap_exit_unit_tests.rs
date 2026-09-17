@@ -399,6 +399,30 @@ fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
     assert!(nudge.contains("write_file"), "{nudge}");
     assert!(nudge.contains("request_permissions"), "{nudge}");
     assert!(nudge.contains("exact blocker"), "{nudge}");
+    assert!(nudge.contains("operator declined"), "{nudge}");
+}
+
+#[test]
+fn workflow_action_nudges_honor_operator_stop_and_report_only_requests() {
+    let ledger = SessionStepLedger::default();
+    ledger.set_plan(&["finish the original task".into(), "verify it".into()]);
+    let step = Some("finish the original task");
+    for nudge in [
+        narration_action_nudge(),
+        escalated_narration_action_nudge(2, 2, Some(&ledger)),
+        read_only_action_nudge(3, 2, None, None),
+        pending_plan_completion_nudge(Some(&ledger), false, None).unwrap(),
+        pending_plan_completion_nudge(Some(&ledger), true, None).unwrap(),
+        workflow_step_lock_nudge("error", 1, step),
+        workflow_rediscovery_nudge("error", step),
+        workflow_cap_grace_nudge("error", step, 4, 2),
+        workflow_post_write_grace_nudge("error", step, 4, 2),
+        workflow_progress_grace_nudge(step, 4, 2),
+    ] {
+        assert!(nudge.contains("latest operator instruction"), "{nudge}");
+        assert!(nudge.contains("newer steering"), "{nudge}");
+        assert!(nudge.contains("stop or report-only"), "{nudge}");
+    }
 }
 
 #[test]
@@ -421,6 +445,12 @@ fn read_only_action_nudge_mentions_active_plan_when_present() {
     let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger), None);
     assert!(nudge.contains("active multi-step plan"), "{nudge}");
     assert!(nudge.contains("ACTIVE step"), "{nudge}");
+    assert!(nudge.contains("latest operator instruction"), "{nudge}");
+    assert!(nudge.contains("update_plan"), "{nudge}");
+    assert!(
+        !nudge.contains("instead of restarting or re-planning"),
+        "{nudge}"
+    );
 }
 
 /// #<issue>: when a `WorkflowSteerer` match offers a delegate hint (e.g.

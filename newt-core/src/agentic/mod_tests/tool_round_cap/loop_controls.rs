@@ -260,6 +260,13 @@ async fn steering_submitted_mid_turn_appears_in_the_next_rounds_request() {
     ctx.safe_context = None;
     ctx.max_tool_rounds = 3;
     ctx.steering = Some(inbox.as_ref() as &dyn SteeringInbox);
+    let plan = SessionStepLedger::default();
+    plan.set_plan(&[
+        "inspect the old approach".into(),
+        "change the public API".into(),
+    ]);
+    plan.advance();
+    ctx.step_ledger = Some(&plan);
     let (reply, _, _, _) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("turn completes");
@@ -281,6 +288,14 @@ async fn steering_submitted_mid_turn_appears_in_the_next_rounds_request() {
         user_contents(&reqs[1])
     );
     assert_eq!(inbox.pending(), 0, "delivery consumes the queue");
+    let second = user_contents(&reqs[1]);
+    let pointer = second
+        .iter()
+        .find(|text| text.contains("[Plan progress:"))
+        .expect("the second round carries the existing active-plan reminder");
+    assert!(pointer.contains("latest operator instruction"), "{pointer}");
+    assert!(pointer.contains("update_plan"), "{pointer}");
+    assert!(!pointer.contains("do not restart or re-plan"), "{pointer}");
 }
 
 /// The regression floor: with no inbox lent, nothing about the request

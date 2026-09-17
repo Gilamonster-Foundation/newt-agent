@@ -132,6 +132,15 @@ async fn all_four_wires_deliver_a_real_answer_after_a_nudge_without_regeneration
             String::from_utf8_lossy(&requests[1].body).contains("[loop-guidance]"),
             "{wire}"
         );
+        let next_request = String::from_utf8_lossy(&requests[1].body);
+        assert!(
+            next_request.contains("latest operator instruction"),
+            "{wire}: {next_request}"
+        );
+        assert!(
+            next_request.contains("stop or report-only"),
+            "{wire}: {next_request}"
+        );
     }
 }
 

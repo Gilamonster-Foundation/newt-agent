@@ -687,6 +687,37 @@ fn environmental_blocker_guidance_does_not_demand_an_edit() {
     );
 }
 
+#[test]
+fn workflow_blockers_allow_recovery_without_reasking_declined_permissions() {
+    for result in [
+        "capability denied: exec does not permit 'head'. Use request_permissions for the exact command.",
+        "capability denied: fs_read does not permit '/outside'. The operator declined this request.",
+        "error: command not found: absent-fixture-command",
+    ] {
+        let mut state = WorkflowRuntimeState::default();
+        assert!(state.record_tool_result(result, false));
+        state.record_round_outcome(false, false);
+        let classification = crate::NudgeClassification {
+            class: crate::NudgeClass::PlanUpdate,
+            score: 1.0,
+        };
+        for nudge in [
+            state.round_start_nudge(None),
+            state.rediscovery_nudge(Some(&classification), "Summary of Findings", None),
+            state.cap_grace_nudge(None, 12, 2),
+        ] {
+            let nudge = nudge.expect("every existing blocker path supplies recovery guidance");
+            assert!(nudge.contains("request_permissions"), "{nudge}");
+            assert!(nudge.contains("already-authorized alternative"), "{nudge}");
+            assert!(nudge.contains("operator declined"), "{nudge}");
+            assert!(nudge.contains("Do not bypass"), "{nudge}");
+            assert!(nudge.contains("If no permitted recovery remains"), "{nudge}");
+            assert!(!nudge.contains("Make the smallest edit"), "{nudge}");
+            assert!(nudge.contains("reporting the task complete"), "{nudge}");
+        }
+    }
+}
+
 /// The twin, and the reason this change is not a weakening: a model that
 /// declared completion without doing the work has no failing probe, so it must
 /// STILL be pushed to edit. If this passes with the change reverted it proves

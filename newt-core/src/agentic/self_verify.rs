@@ -445,12 +445,12 @@ pub fn verify_gate_nudge(checks: &[VerifyCheck], commands: &[String]) -> Option<
         .map(|c| c.label.as_str())
         .collect::<Vec<_>>()
         .join("; ");
-    Some(format!(
+    Some(super::workflow_guidance(format!(
         "Before you finish: you have NOT run the verification this task ships — {named}. \
          Do not declare the task done on an unverified solution. Run it now with run_command, \
          read the output, and if it fails, FIX the code and run it again until it passes. \
          Only conclude once you have seen it pass (or have proven there is nothing to run)."
-    ))
+    )))
 }
 
 /// The `run_command` command strings the model issued this turn, read straight
@@ -729,6 +729,9 @@ enum Observed {
 #[derive(Debug, Default, Clone)]
 pub struct VerificationLedger {
     entries: Vec<Observed>,
+    /// Bounded workspace state before the turn. Unknown keeps inferred checks
+    /// eligible; an unchanged workspace only needs explicit or attempted checks.
+    initial_tree: Option<ContentId>,
     /// The instruction checks are detected against, so only a check's own pass
     /// pays for a tree hash.
     task: String,
@@ -748,10 +751,54 @@ impl VerificationLedger {
     pub(crate) fn for_turn(task: &str, result_aware: bool) -> Self {
         Self {
             entries: Vec::new(),
+            initial_tree: None,
             task: task.to_string(),
             result_aware,
             checks: None,
         }
+    }
+
+    pub(crate) async fn for_workspace(
+        task: &str,
+        result_aware: bool,
+        workspace: &str,
+        gate_on: bool,
+    ) -> Self {
+        let mut ledger = Self::for_turn(task, result_aware);
+        if gate_on && enabled() {
+            ledger.initial_tree = tree_state_off_worker(workspace).await;
+        }
+        ledger
+    }
+
+    /// Workspace manifests alone do not make a permission, read, or external
+    /// report turn a coding task. Retain explicitly named and attempted checks
+    /// even without a mutation, including their failures and denials. Unknown
+    /// snapshots keep the existing conservative behavior and resource bounds.
+    pub(crate) async fn applicable_checks(
+        &self,
+        workspace: &str,
+        task: &str,
+        requested: &[String],
+    ) -> Option<Vec<VerifyCheck>> {
+        let mut checks = detect_off_worker(workspace, task).await?;
+        if !checks.is_empty()
+            && self.initial_tree.is_some()
+            && tree_state_off_worker(workspace).await == self.initial_tree
+        {
+            let explicit = detect_checks(&[], task);
+            checks.retain(|check| {
+                explicit.contains(check)
+                    || requested
+                        .iter()
+                        .any(|command| check.invocation(command).is_some())
+                    || self.entries.iter().any(|entry| {
+                        matches!(entry,
+                        Observed::Exec { command, .. } if check.invocation(command).is_some())
+                    })
+            });
+        }
+        Some(checks)
     }
 
     /// This turn's detected checks, rescanned after any call that may have
@@ -853,7 +900,7 @@ impl VerificationLedger {
         if !(self.result_aware && gate_on) {
             return crate::TurnEndReason::RoundCap;
         }
-        let scanned = detect_off_worker(workspace, &self.task).await;
+        let scanned = self.applicable_checks(workspace, &self.task, &[]).await;
         let (decision, report) = conclude(&Conclusion {
             checks: scanned.as_deref().unwrap_or_default(),
             requested: &[],
@@ -904,8 +951,8 @@ impl VerificationLedger {
 /// with no checks.
 const SCAN_FAILED: &str = "check_scan_failed";
 
-/// The trace decision for a conclusion with nothing to verify: the workspace
-/// and the task afford no check, so the answer is accepted unverified.
+/// The trace decision for a conclusion with no applicable check, so the answer
+/// is accepted without claiming code verification.
 const NO_CHECKS: &str = "no_checks";
 
 /// [`detect_checks`] over a fresh [`workspace_entries`] scan, on the blocking
@@ -947,9 +994,12 @@ pub(crate) struct Concluding<'a> {
 /// state run here, off the async worker, so only a real conclusion pays for
 /// them.
 pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> Decision {
-    let scanned = detect_off_worker(turn.workspace, turn.task).await;
-    let checks = scanned.as_deref().unwrap_or_default();
     let requested = commands_from_messages(turn.messages);
+    let scanned = turn
+        .ledger
+        .applicable_checks(turn.workspace, turn.task, &requested)
+        .await;
+    let checks = scanned.as_deref().unwrap_or_default();
     let (decision, report) = conclude(&Conclusion {
         checks,
         requested: &requested,
@@ -1250,11 +1300,11 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        return Decision::Nudge(format!(
+        return Decision::Nudge(super::workflow_guidance(format!(
             "Before you finish (verification repair {n}/{VERIFY_REPAIR_ALLOWANCE}): {items}. \
              Read its output above, fix the cause, and run it again. Conclude only after you \
              have seen it pass."
-        ));
+        )));
     }
     if can_nudge && !unverified.is_empty() {
         let items = unverified
@@ -1272,10 +1322,10 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        return Decision::Nudge(format!(
+        return Decision::Nudge(super::workflow_guidance(format!(
             "Before you finish (verification {n}/{VERIFY_REPAIR_ALLOWANCE}): {items}. Run it with \
              run_command and read the output before you conclude."
-        ));
+        )));
     }
     Decision::Stop(if broken.is_empty() {
         crate::TurnEndReason::VerificationIncomplete

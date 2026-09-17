@@ -1107,6 +1107,13 @@ async fn narration_nudge_redispatch_keeps_strict_alternation() {
         .expect("nudged turn should complete");
 
     assert_eq!(calls.load(Ordering::SeqCst), 2, "one nudge re-dispatch");
+    let requests = server.received_requests().await.unwrap();
+    let retry = body_json(&requests[1])["messages"].to_string();
+    assert_eq!(retry.matches("Guidance is advisory").count(), 1, "{retry}");
+    assert!(
+        retry.contains("Honor stop or report-only requests"),
+        "{retry}"
+    );
     assert!(
         reply.contains("complete"),
         "returns the post-nudge answer: {reply}"

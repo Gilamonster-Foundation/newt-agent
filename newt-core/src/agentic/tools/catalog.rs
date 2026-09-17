@@ -2,6 +2,9 @@ use super::super::prompt_intake::PromptDisposition;
 use super::*;
 use std::sync::LazyLock;
 
+const FILE_PATH_DESCRIPTION: &str = "Absolute or workspace-relative file path. \
+    Preserve an operator-supplied absolute path. The target must be within granted file access.";
+
 pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
         {
@@ -31,7 +34,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file in the workspace. Returns up to `limit` lines \
+                "description": "Read a file within granted file access. Returns up to `limit` lines \
                                 (default 2000) starting at 1-based `offset` (default 1). Large \
                                 files come back with a footer pointing at the next window — read \
                                 them in pages with offset/limit rather than all at once, or the \
@@ -39,7 +42,7 @@ pub fn tool_definitions() -> serde_json::Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to workspace root" },
+                        "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
                         "offset": { "type": "integer", "description": "1-based line number to start at (default 1)" },
                         "limit": { "type": "integer", "description": "Maximum number of lines to return (default 2000)" }
                     },
@@ -51,7 +54,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write or overwrite a file in the workspace. \
+                "description": "Write or overwrite a file within granted file access. \
                                 WARNING: use edit_file instead when modifying an existing file — \
                                 write_file replaces the entire contents and will fail if the new \
                                 content is significantly shorter than the original (shrink guard). \
@@ -60,7 +63,7 @@ pub fn tool_definitions() -> serde_json::Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to workspace root" },
+                        "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
                         "content": { "type": "string", "description": "The complete new file contents" }
                     },
                     "required": ["path", "content"]
@@ -79,7 +82,7 @@ pub fn tool_definitions() -> serde_json::Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to workspace root" },
+                        "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
                         "old_string": { "type": "string", "description": "Exact string to find and replace (must match exactly once)" },
                         "new_string": { "type": "string", "description": "Replacement string" }
                     },

@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn file_tool_path_schemas_preserve_operator_absolute_paths() {
+    let definitions = tool_definitions();
+    for name in ["read_file", "write_file", "edit_file"] {
+        let definition = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|definition| definition["function"]["name"] == name)
+            .unwrap();
+        let description = definition["function"]["parameters"]["properties"]["path"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("absolute"), "{name}: {description}");
+        assert!(
+            description.contains("workspace-relative"),
+            "{name}: {description}"
+        );
+        assert!(
+            description.contains("Preserve an operator-supplied absolute path"),
+            "{name}: {description}"
+        );
+        if name == "write_file" {
+            let summary = definition["function"]["description"].as_str().unwrap();
+            assert!(!summary.contains("file in the workspace"), "{summary}");
+        }
+    }
+}
+
+#[test]
 fn use_skill_tool_is_advertised_in_definitions() {
     let defs = tool_definitions();
     let names: Vec<&str> = defs

@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (8 steps)
+# Phase 10 — newt-cli polish (9 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -793,6 +793,38 @@ HTTP and PTY checks ground connection lifecycle and terminal ownership.
 **Out of scope:** copying another client's credentials, granting authority from
 server annotations or tool names, arbitrary tool invocation as a connection
 test, and replacing the existing OCAP or modal framework.
+
+## Step 10.9 — Operator-directed workflow recovery
+
+**Branch:** `step-10.9-operator-workflow-recovery`
+**Touches:** existing plan reminders, workflow recovery, narration classification and guidance,
+verification eligibility, file-tool schemas, and final path annotations.
+**Implements:** treat saved plans and harness reminders as advisory working
+state. Honor newer operator corrections and explicit stop or report-only
+requests. For an observed capability or environment blocker, permit an exact
+permission request when available or an already-authorized alternative;
+otherwise report the remaining blocker. Respect operator refusals and retain
+the existing permission, cancellation, and round-budget boundaries. Reuse the
+bounded workspace snapshot to omit unrelated inferred checks for unchanged
+workspaces; preserve explicit and attempted checks, failed-check recovery, and
+conservative handling of unknown state.
+Describe absolute file paths accurately and distinguish missing workspace files
+from external references the claim checker does not inspect.
+Reduce narration false positives from common report words while preserving
+configured promises and close paraphrases. Apply operator-precedence guidance
+to configured narration directions on every existing rescue path.
+**Tests:** existing prompt and workflow-state regressions, mid-turn steering
+over a real local HTTP connection, and narration guidance on all four provider
+wire formats. Real external-report and source-change controls cover verification
+eligibility on the same wires. Preserve no-cosmetic-edit and no-false-completion
+controls. Ground external path annotations with real files and retain the
+resolver boundary, learned bases, and shared display limit.
+Exercise a narration-to-real-tool-to-report recovery and a genuine remaining
+promise under the same unchanged rescue cap.
+**Out of scope:** new authority or persisted records, permission-policy changes,
+automatic plan replacement, document-only classification within the workspace,
+new symlink-isolation semantics, and claims that guidance guarantees model
+obedience or proves external edits occurred.
 
 ---
 
@@ -2089,4 +2121,10 @@ Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 16:52 EDT | Dat
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 18:19 EDT | Date: 2026-09-16
 
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 18:41 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21:03 EDT | Date: 2026-09-16
+
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 23:19 EDT | Date: 2026-09-16

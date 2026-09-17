@@ -53,7 +53,11 @@ async fn openai_unverified_run_command_blocker_gets_ground_truth_retry() {
 
 /// [`run_openai_script`] against a workspace the caller chooses, so a test can
 /// point the loop at a directory that actually affords a verification.
-async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -> (String, usize) {
+async fn run_openai_script_in(
+    script: Vec<serde_json::Value>,
+    workspace: &str,
+    task: &str,
+) -> (String, usize) {
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -70,6 +74,7 @@ async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
     c.workspace = workspace;
+    c.task = task;
     let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
     (reply, round.load(Ordering::SeqCst))
 }
@@ -80,7 +85,8 @@ async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -
 /// stays out of their way — which would leave the armed gate exactly as
 /// unexercised as the env var left it, and that is the failure this whole PR
 /// is about. So one test points the loop at a workspace that DOES ship a
-/// verification and holds it to firing.
+/// verification explicitly requested by the operator and holds it to firing,
+/// even when the turn makes no edit.
 ///
 /// `.` under `cargo test -p newt-core` is this crate's directory, which ships
 /// a `Cargo.toml`. That is a deliberate real-filesystem dependency in exactly
@@ -116,7 +122,8 @@ async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check
         serde_json::json!({ "content": "Still done." }),
         serde_json::json!({ "content": "Confirmed complete." }),
     ];
-    let (_, rounds) = run_openai_script_in(script.clone(), ".").await;
+    let (_, rounds) =
+        run_openai_script_in(script.clone(), ".", "Run `cargo test` to verify.").await;
     assert_eq!(
         rounds, 3,
         "an unverified conclusion in a workspace shipping `cargo test` costs a round per nudge, capped at SELF_VERIFY_CAP = 2 — that is #1943"
@@ -125,7 +132,8 @@ async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check
     // The anti-vacuous twin, in the same test so the two can never drift: the
     // extra round is the GATE, not something else in the loop. The same script
     // against a workspace that affords nothing concludes in one.
-    let (_, rounds) = run_openai_script_in(script, NO_CHECKS_WORKSPACE).await;
+    let (_, rounds) =
+        run_openai_script_in(script, NO_CHECKS_WORKSPACE, "Complete the request.").await;
     assert_eq!(
         rounds, 1,
         "with nothing to verify the gate must stay silent — otherwise the assertion above is measuring some other nudge"

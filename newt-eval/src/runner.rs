@@ -120,22 +120,29 @@ pub async fn run_case(case: &TestCase, config: &RunnerConfig) -> anyhow::Result<
     // `_home_guard` isolates the worker's `HOME`; it must outlive the child.
     let (mut child, _home_guard) = spawn_worker(config)?;
 
-    let result = tokio::time::timeout(
-        config.timeout,
-        drive_acp(
+    let result = tokio::time::timeout(config.timeout, async {
+        let reply = drive_acp(
             &mut child,
             &workspace,
             &case.prompt,
             config.model_override.as_deref(),
-        ),
-    )
+        )
+        .await?;
+        // drive_acp closes stdin. Let EOF finish the worker and its exit-time
+        // writes under the SAME case deadline before grading its reply.
+        let status = child.wait().await?;
+        anyhow::ensure!(status.success(), "worker exited with {status}");
+        Ok(reply)
+    })
     .await;
 
-    // Always try to clean up the child whether the conversation
-    // succeeded or not — `Child::kill_on_drop(true)` handles it on drop,
-    // but eagerly waiting here keeps tests deterministic.
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    // A failed or timed-out conversation still kills and reaps its child.
+    // Successful workers are already reaped; killing after a reply used to
+    // race their finalization (including instrumentation profile writes).
+    if !matches!(result, Ok(Ok(_))) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
 
     let reply = match result {
         Ok(Ok(reply)) => reply,
@@ -452,6 +459,139 @@ content = ""
         let cfg = RunnerConfig::new("/nonexistent/newt");
         let err = run_case(&case, &cfg).await.unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[cfg(unix)]
+    fn finalizing_worker(body: &str) -> (tempfile::TempDir, TestCase, RunnerConfig) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("workspace")).unwrap();
+        std::fs::write(dir.path().join("workspace/input.txt"), "fixture").unwrap();
+        std::fs::write(
+            dir.path().join("case.toml"),
+            "name = 'shutdown'\ndescription = ''\nlanguage = 'text'\nprompt = ''\nevaluators = []\n[mock_response]\ncontent = ''\n",
+        )
+        .unwrap();
+        let worker = dir.path().join("worker");
+        let script = format!(
+            r#"#!/bin/sh
+fixture=${{0%/*}}
+printf '%s' "$$" > "$fixture/pid"
+IFS= read -r request || exit 90
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+IFS= read -r request || exit 91
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"session_id":"fixture"}}}}'
+IFS= read -r request || exit 92
+printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"model_id":"fixture","content":"done","diff":"","empty_diff":true,"diff_applied":false}}}}'
+IFS= read -r request && exit 93
+printf '%s' eof > "$fixture/eof"
+{body}
+"#
+        );
+        std::fs::write(&worker, script).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let case = TestCase::load_dir(dir.path()).unwrap();
+        let config = RunnerConfig::new(worker).with_timeout(Duration::from_secs(5));
+        (dir, case, config)
+    }
+
+    /// Grounds the ACP EOF cleanup contract in a real child: a successful reply
+    /// does not authorize killing a worker while it finalizes its output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_shutdown_waits_for_eof_finalization() {
+        let (dir, case, config) = finalizing_worker(
+            "while [ ! -f \"$fixture/release\" ]; do :; done\nprintf '%s' finalized > \"$fixture/finalized\"",
+        );
+        let run = run_case(&case, &config);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("runner returned before releasing worker finalization: {result:?}"),
+            () = wait_for_worker_eof(dir.path()) => {}
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut run)
+                .await
+                .is_err(),
+            "runner must wait for the child's finalization barrier"
+        );
+        std::fs::write(dir.path().join("release"), "release").unwrap();
+        let outcome = run.await.expect("clean worker exit");
+        assert_eq!(outcome.reply.content, "done");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("finalized")).unwrap(),
+            "finalized"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_shutdown_rejects_nonzero_exit_after_reply() {
+        let (_dir, case, config) = finalizing_worker("exit 17");
+        let error = run_case(&case, &config).await.unwrap_err();
+        assert!(error.to_string().contains("worker exited"), "{error:#}");
+        assert!(error.to_string().contains("17"), "{error:#}");
+    }
+
+    /// A valid reply cannot make an uncooperative child outlive the case's
+    /// existing deadline; waiting still kills and reaps that real process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_shutdown_timeout_kills_and_reaps() {
+        let (dir, case, config) = finalizing_worker("while :; do :; done");
+        let run = run_case(&case, &config);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("runner returned before worker reached shutdown: {result:?}"),
+            () = wait_for_worker_eof(dir.path()) => {}
+        }
+        // Expire the existing case deadline only after real ACP consumption
+        // and EOF. Resume before waiting on OS reaping so virtual auto-advance
+        // cannot race SIGCHLD; protocol startup has its normal fixture budget.
+        tokio::time::pause();
+        tokio::time::advance(config.timeout).await;
+        tokio::time::resume();
+        let error = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("cleanup must stay bounded")
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(dir.path().join("eof").exists(), "worker reached shutdown");
+        assert_worker_reaped(dir.path());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_worker_eof(dir: &Path) {
+        while !dir.join("eof").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_shutdown_preserves_protocol_error_and_reaps() {
+        let (dir, case, config) = finalizing_worker("while :; do :; done");
+        let script = std::fs::read_to_string(&config.worker_bin).unwrap();
+        let script = script.replace("\"id\":4,\"result\":", "\"id\":4,\"error\":");
+        std::fs::write(&config.worker_bin, script).unwrap();
+        let error = run_case(&case, &config).await.unwrap_err();
+        assert!(
+            error.to_string().contains("worker returned JSON-RPC error"),
+            "{error:#}"
+        );
+        assert_worker_reaped(dir.path());
+    }
+
+    #[cfg(unix)]
+    fn assert_worker_reaped(dir: &Path) {
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "worker must be reaped");
     }
 
     #[test]
