@@ -142,6 +142,38 @@ fn multiplexer_drops_an_unserved_requested_model_fail_soft() {
     assert!(!trust.requested_unavailable);
 }
 
+#[test]
+fn declared_unavailable_is_false_when_nothing_is_declared() {
+    // No declared model AND no session request: there is nothing to be
+    // "unavailable" — `declared_unavailable` must stay false. This is the
+    // mirror image of `multiplexer_drops_an_unserved_declared_model_fail_soft`,
+    // which checks the opposite shape (a declared model the server no longer
+    // serves flags true here).
+    let b = BackendConfig {
+        name: "o".into(),
+        endpoint: "http://h:11434".into(),
+        model: None,
+        kind: Some(BackendKind::Ollama),
+        ..Default::default()
+    };
+    let s = served(&["first-served", "second", "third"]);
+    let a = adopt(&b, &s, None);
+    // Nothing was declared or requested, so the declared-model validity check
+    // never fires — it stays false (a real bug would set it true and wrongly
+    // warn about a model that was never named).
+    assert!(
+        !a.declared_unavailable,
+        "nothing declared → nothing unavailable"
+    );
+    // With nothing requested or declared on a multiplexer, fall back to the
+    // first served model (server order), never to a dead declared name.
+    assert_eq!(
+        a.model.as_deref(),
+        Some("first-served"),
+        "falls back to the first served model"
+    );
+}
+
 /// #2400: the codex-dgx1 comparison that found this gap — that tool re-probes
 /// which model the server reports `"loaded"` on every launch rather than
 /// trusting a persisted name. Before this fix, a stale `[[backends]] model =`
