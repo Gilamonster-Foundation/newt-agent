@@ -189,7 +189,7 @@ pub fn tool_definitions() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "capability": { "type": "string", "enum": ["exec", "fs_read", "fs_write", "net"], "description": "Which capability axis to request" },
-                        "target": { "type": "string", "description": "What to grant: a command name (exec), a path (fs_read/fs_write), or a host (net)" },
+                        "target": { "type": "string", "description": "What to grant: the denied executable's exact path or deliberately bare command name (exec), a path (fs_read/fs_write), or a host (net)" },
                         "reason": { "type": "string", "description": "Why you need it — shown to the operator deciding" }
                     },
                     "required": ["capability", "target", "reason"]

@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (7 steps)
+# Phase 10 — newt-cli polish (8 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -793,6 +793,24 @@ HTTP and PTY checks ground connection lifecycle and terminal ownership.
 **Out of scope:** copying another client's credentials, granting authority from
 server annotations or tool names, arbitrary tool invocation as a connection
 test, and replacing the existing OCAP or modal framework.
+
+---
+
+## Step 10.10 — Exact executable grants
+
+**Branch:** `step-10.10-exact-executable-grants`
+**Touches:** existing shell denial prompts, one-shot permission storage,
+CLI executable-directory scanning, and their regression tests.
+**Implements:** preserve the requested executable path through approval and
+retry. A full-path grant must not authorize a different same-named executable.
+Keep intentionally bare system-command grants and existing bare-name denials.
+`--venv` and `--exec-path` retain absolute executable paths for kernel projection.
+**Tests:** exact prompt and recovery targets, immediate and proactive allow-once,
+same-name negative controls, saved denials, executable scans and venv symlinks.
+A real Seatbelt subprocess test grounds the permission-to-execution path with
+a harmless temporary executable outside trusted system directories.
+**Out of scope:** ambient PATH resolution, broader exec or filesystem presets,
+sticky interpreter approval, and changes to sandbox enforcement.
 
 ---
 
@@ -2068,3 +2086,7 @@ Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2
 Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 11:30 EDT | Date: 2026-09-16
 
 Model: GPT-6 | Harness: Codex | Operator: Shawn Hartsock | Time: 16:52 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 18:19 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16

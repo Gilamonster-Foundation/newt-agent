@@ -985,7 +985,7 @@ fn null_device_path() -> &'static str {
     "/dev/null"
 }
 
-/// Collect the basenames of all executables in the CLI-granted directories
+/// Collect the absolute paths of executables in the CLI-granted directories
 /// (`--venv` and `--exec-path`). Used to widen the exec caveat at session start
 /// so the agent can run tools from those directories without needing them in
 /// `[tui.permissions] extra_exec` in the config file.
@@ -1015,7 +1015,10 @@ fn scan_cli_exec_grants() -> Vec<String> {
             if mode & 0o111 == 0 {
                 return None;
             }
-            path.file_name()?.to_str().map(str::to_string)
+            // Retain the executable spelling, including venv symlinks. The
+            // sandbox canonicalizes it for kernel projection; a basename would
+            // instead select only trusted system binaries with that name.
+            std::path::absolute(path).ok()?.to_str().map(str::to_string)
         })
         .collect()
 }

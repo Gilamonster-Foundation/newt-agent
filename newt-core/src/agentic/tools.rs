@@ -60,9 +60,9 @@ pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
-    envelope_denial_reason, envelope_denied, exec_allowlist_name, exec_denial_requests,
-    exec_floor_permits, net_denial_requests, pr_creation_url, shadow_records, shell_engine,
-    shell_envelope_output, venv_env_map,
+    envelope_denial_reason, envelope_denied, exec_denial_requests, exec_floor_permits,
+    net_denial_requests, pr_creation_url, shadow_records, shell_engine, shell_envelope_output,
+    venv_env_map,
 };
 use shell::{exec_confined_command, resolve_exec_cwd, split_leading_cd};
 #[cfg(all(test, not(windows)))]
@@ -1105,7 +1105,7 @@ fn execute_request_permissions(
         );
     };
     if target.is_empty() {
-        return "request_permissions: 'target' is required — the command name (exec), \
+        return "request_permissions: 'target' is required — the executable path or command name (exec), \
                    the path (fs_read/fs_write), or the host (net)."
             .to_string();
     }

@@ -11,6 +11,23 @@ write that file plus one `backends/*.toml` drop-in per endpoint.
 
 ## Settings and communication style
 
+### Exact executable grants
+
+An exec permission prompt preserves the executable's full path. Allow once
+authorizes that executable for the retry; another executable with the same
+name remains outside the grant. A proactive `request_permissions` approval
+keeps the same exact target until the matching operation consumes it.
+Previously saved bare-name denials still apply to matching executable names.
+
+`--venv` and `--exec-path` grant the absolute paths of executable files in the
+selected directories, including their symlink spellings. Under restricted
+exec authority, invoke non-system tools by those absolute paths. Deliberate
+bare-name system grants still resolve through the sandbox's trusted system
+directories. These grants do not add filesystem or network access, resolve
+arbitrary programs from ambient PATH, or make interpreter approval permanent.
+
+### Panels
+
 `/settings` is the primary entry point for harness controls: Session,
 Permissions, Audit, Backends, Themes, and MCP. Commands such as `/model`,
 `/backends`, and `/permissions` remain available as direct shortcuts.
@@ -211,4 +228,4 @@ free, friendly, local agentic coder.
 
 Apache-2.0
 
-Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 16:47 EDT | Date: 2026-09-16
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16

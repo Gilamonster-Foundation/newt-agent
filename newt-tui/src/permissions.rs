@@ -742,11 +742,17 @@ pub(crate) fn take_pending_once(
 
 impl PermissionPromptState {
     fn denied(&self, kind: newt_core::DenialKind, target: &str) -> bool {
-        let key = (kind, target.to_string());
-        self.session_denials.contains(&key)
-            || self.persistent_denials.contains(&key)
-            || newt_core::ocap_store::evaluate_request(&self.ocap_policy, kind, target)
-                == Some(newt_core::ocap_store::Verdict::Deny)
+        let denied = |target: &str| {
+            let key = (kind, target.to_string());
+            self.session_denials.contains(&key)
+                || self.persistent_denials.contains(&key)
+                || newt_core::ocap_store::evaluate_request(&self.ocap_policy, kind, target)
+                    == Some(newt_core::ocap_store::Verdict::Deny)
+        };
+        // Older exec prompts stored basenames. Preserve those refusals when a
+        // new prompt names an exact path, without widening any approval.
+        denied(target)
+            || (kind == newt_core::DenialKind::Exec && denied(exec_grant_basename(target)))
     }
 
     /// Scope has no exclusions. Do not recall a broad grant that would let a
@@ -1713,12 +1719,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     once_grants.push((req.kind, req.target.clone()));
                     // Carry proactive allow-once to the model's separate retry.
                     if req.tool == "request_permissions" {
-                        let key = if req.kind == newt_core::DenialKind::Exec {
-                            (req.kind, exec_grant_basename(&req.target).to_string())
-                        } else {
-                            (req.kind, req.target.clone())
-                        };
-                        self.state.pending_once_grants.insert(key);
+                        self.state
+                            .pending_once_grants
+                            .insert((req.kind, req.target.clone()));
                     }
                 }
                 PromptChoice::AllowSession => {

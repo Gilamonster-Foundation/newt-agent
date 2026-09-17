@@ -236,14 +236,6 @@ fn envelope_denial_reason_joins_or_falls_back() {
     );
 }
 
-#[test]
-fn exec_allowlist_name_takes_basename() {
-    assert_eq!(exec_allowlist_name("env"), "env");
-    assert_eq!(exec_allowlist_name("/usr/bin/env"), "env");
-    assert_eq!(exec_allowlist_name("/usr/bin/"), "bin");
-    assert_eq!(exec_allowlist_name("C:\\tools\\env.exe"), "env.exe");
-}
-
 /// #775 (§2.5): denial recovery uses the BARE command target(s), never the
 /// reason sentence. Stuffing the full reason into the former notice's
 /// `'{target}'` field produced the
@@ -299,7 +291,7 @@ fn host_of_url_extracts_hosts_conservatively() {
 #[test]
 fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
     // The promptable case: every entry is an exec denial with a target;
-    // the request target is the allowlist basename (the grantable name).
+    // preserve exact paths while retaining intentionally bare-name requests.
     let exec_only = serde_json::json!({
         "denied": true,
         "denials": [
@@ -312,8 +304,8 @@ fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
     assert_eq!(reqs[0].tool, "run_command");
     assert_eq!(reqs[0].kind, DenialKind::Exec);
     assert_eq!(
-        reqs[0].target, "npm",
-        "basename, same rule as the config hint"
+        reqs[0].target, "/usr/bin/npm",
+        "the prompt must grant the executable that was actually denied"
     );
     assert_eq!(reqs[0].reason, "exec npm denied");
     assert_eq!(reqs[1].target, "node");
@@ -373,6 +365,19 @@ fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
                      "reason": "exec of \"cargo\" is not within the granted authority"}]
     });
     assert!(exec_denial_requests(&authority).is_some());
+}
+
+#[test]
+fn exact_executable_grants_preserve_interpreter_prompt_and_recovery_target() {
+    let target = "/opt/test-venv/bin/python";
+    let envelope = serde_json::json!({"denials": [{
+        "kind": "exec", "target": target, "reason": "interpreter denied"
+    }]});
+    assert_eq!(exec_denial_requests(&envelope).unwrap()[0].target, target);
+    assert!(
+        denied_run_command_result(&envelope, false).contains(&format!("target=\"{target}\"")),
+        "recovery must request the same exact executable"
+    );
 }
 
 /// #905: a NET denial envelope (agent-bridle #196 shape) lifts to a per-host
