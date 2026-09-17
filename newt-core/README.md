@@ -13,6 +13,29 @@ Turn metrics distinguish an answer from a question awaiting the operator and
 from incomplete narration. `TurnEndReason::AwaitingOperator` serializes as
 `awaiting_operator`; both narration exits report incomplete work. These are
 control outcomes, not evidence that a claimed external action succeeded.
+Pending-action matching keeps whole-reply similarity for paraphrases and boosts
+prototype recall only when its configured opening phrase occurs in the reply.
+This reduces false narration warnings from shared nouns in completed reports.
+
+Saved plans and workflow reminders guide execution; newer operator instructions
+can correct the plan or request a stop or report-only response. Recovery guidance
+allows an exact permission request when the operator has not declined it and a
+grant is available, or an alternative within existing authority. An unresolved
+blocker remains incomplete work. These reminders neither grant permissions nor
+replace the tool gates or cancellation and round-budget limits.
+
+Verification uses the existing bounded workspace snapshot to avoid requiring
+unrelated code suites for an unchanged workspace, such as a permission-only
+turn or a report written elsewhere. Explicitly named checks and attempted
+checks remain eligible, including failed and denied runs. A changed or unknown
+workspace remains conservative. Isolated `.worktrees` are excluded; workspace
+documents and Newt instructions still affect verification state.
+
+File-tool schemas accept absolute or workspace-relative paths within granted
+access and tell the model to preserve supplied absolute paths. Final path checks
+distinguish missing workspace files from unverified external references. The
+checker retains its lexical boundary and existing symlink behavior; it does not
+inspect lexically external paths or establish completion of external edits.
 
 It also hosts the shared agentic tool executor used by the TUI and headless
 paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
@@ -64,3 +87,5 @@ free, friendly, local agentic coder.
 ## License
 
 Apache-2.0
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21:03 EDT | Date: 2026-09-16

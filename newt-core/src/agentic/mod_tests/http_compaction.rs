@@ -311,12 +311,9 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
 }
 
 #[test]
-fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
-    // #1163 (F): the corporate-box repro showed the model REWRITE its own
-    // plan post-compaction (dropping the implement steps for "stop
-    // implementation"). The directive must re-inject the WHOLE plan (every
-    // step + status) and order advance-not-rewrite, so the plan is an
-    // anchor the model continues from.
+fn post_compaction_continuation_preserves_work_but_defers_to_operator_corrections() {
+    // Preserve the full plan and its progress while allowing the operator to
+    // correct it; continuity must not turn an old checklist into authority.
     use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
     let ledger = SessionStepLedger::default();
     ledger.set_plan(&[
@@ -339,16 +336,14 @@ fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
         "future step present: {d}"
     );
     assert!(d.contains("verify state"), "done step present: {d}");
-    // The advance-not-rewrite instruction.
-    assert!(
-        d.contains("NEVER to \\\n                 replace") || d.contains("NEVER to replace"),
-        "{d}"
-    );
-    assert!(d.contains("advance"), "{d}");
+    assert!(d.contains("latest operator instruction"), "{d}");
+    assert!(d.contains("update_plan"), "{d}");
+    assert!(!d.contains("NEVER to replace"), "{d}");
+    assert!(!d.contains("do not re-plan"), "{d}");
     // No plan → no plan clause (and no panic).
     let empty =
         post_compaction_continuation(None, prompt_read::PromptReadContext::new(None, "", None));
-    assert!(!empty.contains("active plan is below"), "{empty}");
+    assert!(!empty.contains("saved plan is below"), "{empty}");
 }
 
 #[test]
@@ -369,7 +364,7 @@ fn post_compaction_continuation_points_to_the_immutable_prompt_without_quoting_i
     assert!(d.contains(turn.active().model_digest()), "{d}");
     assert!(d.contains("prompt_read"), "{d}");
     assert!(!d.contains(task), "must not duplicate operator text: {d}");
-    assert!(d.contains("do not narrow the task"), "{d}");
+    assert!(d.contains("silently narrow the task"), "{d}");
 }
 
 #[test]

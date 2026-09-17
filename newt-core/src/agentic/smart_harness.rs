@@ -753,7 +753,7 @@ impl SmartHarness {
                 let nudge = format!(
                     "{} {}",
                     super::compress::LOOP_GUIDANCE_PREFIX,
-                    self.settings.nudge
+                    super::workflow_guidance(&self.settings.nudge)
                 );
                 s.session.record_host_message(&nudge, reply)?;
                 s.session.record_outcome(reply, "continue", &nudge)?;
@@ -838,9 +838,12 @@ impl SmartHarness {
         }
         if turn.rounds_left && super::self_verify::enabled() && !self.state()?.verified {
             let (messages, workspace, task) = (turn.messages, turn.workspace, turn.task);
-            let entries = super::self_verify::workspace_entries(std::path::Path::new(workspace));
-            let checks = super::self_verify::detect_checks(&entries, task);
             let commands = super::self_verify::commands_from_messages(messages);
+            let checks = turn
+                .ledger
+                .applicable_checks(workspace, task, &commands)
+                .await
+                .unwrap_or_default();
             if let Some(text) = super::self_verify::verify_gate_nudge(&checks, &commands) {
                 let text = format!("{} {text}", super::compress::LOOP_GUIDANCE_PREFIX);
                 self.intervention(&text)?;

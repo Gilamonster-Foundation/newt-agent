@@ -267,6 +267,85 @@ async fn accepted_narration_reports_cap_exhausted_end_reason() {
     );
 }
 
+/// Real loopback HTTP and temporary files ground the classifier regression:
+/// a recovered turn can report actual reads, while a further promise after
+/// those same reads still exhausts the unchanged narration budget.
+#[tokio::test]
+async fn completed_check_report_after_tool_reads_keeps_completed_end_reason() {
+    let report = "Both operations executed and returned real results this turn.\n\n\
+        Git operations check: state.txt returned STATE_CANARY; git-check.txt returned GIT_CANARY.\n\n\
+        The state and git check results are above. Stopping here.";
+    let promise = "Let me check the current working directory and available git operations.";
+    for (answer, expected) in [
+        (promise, crate::TurnEndReason::NarrationCapExhausted),
+        (report, crate::TurnEndReason::Completed),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("state.txt"), "STATE_CANARY").unwrap();
+        std::fs::write(workspace.path().join("git-check.txt"), "GIT_CANARY").unwrap();
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script: vec![
+                    serde_json::json!({"content": promise}),
+                    serde_json::json!({"tool_calls": [
+                        {"id": "state", "function": {"name": "read_file", "arguments": "{\"path\":\"state.txt\"}"}},
+                        {"id": "git_check", "function": {"name": "read_file", "arguments": "{\"path\":\"git-check.txt\"}"}}
+                    ]}),
+                    serde_json::json!({"content": answer}),
+                ],
+            })
+            .mount(&server)
+            .await;
+        let task = "Execute two read_file calls for state.txt and git-check.txt, report the results, and stop.";
+        assert!(crate::classifiers::user_turn_invites_action(task));
+        let messages = vec![MemMessage::system("you are a test"), MemMessage::user(task)];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut end_reason = None;
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.task = task;
+        c.workspace = workspace.path().to_str().unwrap();
+        c.end_reason = Some(&mut end_reason);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+        assert_eq!(
+            round.load(Ordering::SeqCst),
+            3,
+            "one rescue, actual reads, final reply"
+        );
+        assert_eq!(reply, answer);
+        let requests = server.received_requests().await.unwrap();
+        let recovery = body_json(&requests[1]);
+        let guidance = recovery["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            guidance.contains(compress::LOOP_GUIDANCE_PREFIX),
+            "{guidance}"
+        );
+        let final_request = body_json(&requests[2]);
+        let tool_results: Vec<_> = final_request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert_eq!(tool_results.len(), 2, "{tool_results:?}");
+        for canary in ["STATE_CANARY", "GIT_CANARY"] {
+            assert!(
+                tool_results.iter().any(|result| result.contains(canary)),
+                "{tool_results:?}"
+            );
+        }
+        assert_eq!(end_reason, Some(expected), "{answer}");
+    }
+}
+
 #[tokio::test]
 async fn readonly_completion_retries_an_unfinished_promise_without_action_authority() {
     // The branch-count incident ended after eighteen reads with only "Let me
@@ -626,6 +705,13 @@ async fn narration_nudge_reaches_the_wire_tagged_as_loop_guidance() {
         saw_tag.load(Ordering::SeqCst),
         "the narration nudge must carry LOOP_GUIDANCE_PREFIX on the wire"
     );
+    let requests = server.received_requests().await.unwrap();
+    let retry = body_json(&requests[1])["messages"].to_string();
+    assert_eq!(retry.matches("Guidance is advisory").count(), 1, "{retry}");
+    assert!(
+        retry.contains("Honor stop or report-only requests"),
+        "{retry}"
+    );
     assert!(reply.contains("complete"), "{reply}");
 }
 
@@ -690,6 +776,13 @@ async fn ollama_loop_honors_cap_two_and_escalates_the_second_nudge() {
     assert!(
         saw_escalated.load(Ordering::SeqCst),
         "the second nudge must be the escalated Reminder 2/2 variant"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let retry = body_json(&requests[1])["messages"].to_string();
+    assert_eq!(retry.matches("Guidance is advisory").count(), 1, "{retry}");
+    assert!(
+        retry.contains("Honor stop or report-only requests"),
+        "{retry}"
     );
     assert!(reply.contains("complete"), "{reply}");
 }

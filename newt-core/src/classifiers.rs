@@ -220,7 +220,8 @@ impl NudgeClassifier {
             };
         }
 
-        let opening: Vec<_> = words(text).take(3).collect();
+        let query_words: Vec<_> = words(text).collect();
+        let opening = &query_words[..query_words.len().min(3)];
         let deferred_prototypes: Vec<_> = self
             .cfg
             .classes
@@ -253,14 +254,27 @@ impl NudgeClassifier {
             .filter_map(|(class, class_cfg)| {
                 let class = parse_nudge_class(class)?;
                 // A subtype never competes with or expands the configured
-                // coarse corpus: Act's scores and ambiguity margin stay intact.
+                // coarse corpus or its ambiguity margin.
                 if class == NudgeClass::DeferredAnswer {
                     return None;
                 }
                 let best = class_cfg
                     .matchers
                     .iter()
-                    .map(|example| prototype_similarity(&query, &tokens(example)))
+                    .map(|example| {
+                        let prototype = tokens(example);
+                        if class == NudgeClass::PendingAction {
+                            // Boost recall only for a configured opening phrase;
+                            // shared nouns alone still use whole-reply similarity.
+                            let phrase: Vec<_> = words(example).take(3).collect();
+                            if phrase.is_empty()
+                                || !query_words.windows(phrase.len()).any(|part| part == phrase)
+                            {
+                                return jaccard(&query, &prototype);
+                            }
+                        }
+                        prototype_similarity(&query, &prototype)
+                    })
                     .fold(0.0_f32, f32::max);
                 Some((class, best))
             })
@@ -391,6 +405,69 @@ mod tests {
     }
 
     #[test]
+    fn pending_handoffs_preserve_action_and_object_paraphrases() {
+        let classifier = NudgeClassifier::builtin();
+        for text in [
+            "Next steps: replace the redundant wrapper, then run the check.",
+            "Next steps: remove the duplicate helper, then run cargo check.",
+        ] {
+            assert!(
+                classifier.is_pending_action(text),
+                "{text}: {:?}",
+                classifier.classify(text)
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_verification_promises_preserve_action_paraphrases() {
+        let classifier = NudgeClassifier::builtin();
+        for text in [
+            "The issue is understood. Let me inspect the code before running the check.",
+            "Now I understand the issue. Let me verify by looking at format_rollup_detail.",
+        ] {
+            assert!(
+                classifier.is_pending_action(text),
+                "{text}: {:?}",
+                classifier.classify(text)
+            );
+        }
+    }
+
+    #[test]
+    fn reports_and_partial_answers_do_not_become_recovery_promises() {
+        let classifier = NudgeClassifier::builtin();
+        for text in [
+            "partial answer before the break",
+            "First I checked the build and verified the result. The work is complete; the tests pass.",
+            "Let me summarize the completed work: the file was edited, the tests passed, and the requested result is ready.",
+            "The next steps are complete: the duplicate helper was removed and the check passed.",
+        ] {
+            assert!(!classifier.is_pending_action(text), "{text}: {:?}", classifier.classify(text));
+        }
+    }
+
+    #[test]
+    fn completed_check_report_is_not_a_deferred_promise() {
+        let report = "Both operations executed and returned real results this turn.
+
+## Restart Smoke Check
+
+| Check | Result |
+|---|---|
+| `scrybe__state` (read-only) | MCP reachable — live state returned: active tab `report.md` (not dirty), view `both`, theme `default`, vim off, wrap on. **4 open tabs** now (the original dashboard, the project board note, the companion DRAFT, and v2). |
+| `git rev-parse --is-inside-work-tree` | **`true`** — exit 0; `/workspace/project` is a valid work tree, so the `git` executable and filesystem grants are intact after restart. |
+
+Both permanent grants (MCP and exec/fs) survived the restart. Nothing opened, edited, tested, queried, or sent. Stopping here.";
+        let classifier = NudgeClassifier::builtin();
+        assert!(
+            !classifier.is_pending_action(report),
+            "shared check/state/git nouns are not a promise: {:?}",
+            classifier.classify(report)
+        );
+    }
+
+    #[test]
     fn nudge_classifier_builtin_matches_known_phrases() {
         let classifier = NudgeClassifier::builtin();
         assert!(classifier.is_pending_action(
@@ -445,6 +522,7 @@ Next steps needed:
         for text in [
             "Let me check the current working directory and available git operations.",
             "Let me summarize the current state and what could be improved.",
+            "Let me verify the code before I give the answer.",
         ] {
             assert_eq!(
                 classifier.classify(text).class,
@@ -487,6 +565,8 @@ Next steps needed:
         for text in [
             "There are three local branches. Let me check the current implementation and identify any gaps.",
             "Let me be clear: I cannot check the current implementation because access is unavailable.",
+            "Do not let me check the current implementation and identify any gaps.",
+            "The earlier reply said 'Let me check the current implementation and identify any gaps.'",
         ] {
             assert_ne!(classifier.classify(text).class, NudgeClass::DeferredAnswer, "{text}");
         }
@@ -534,6 +614,25 @@ Next steps needed:
             assert_eq!(
                 current, previous,
                 "subtype fallback must not expand a configured action corpus"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_action_recall_preserves_custom_exact_and_paraphrased_promises() {
+        let mut config = NudgeClassifierConfig::default();
+        config.classes.get_mut("pending_action").unwrap().matchers =
+            vec!["Proceeding with the patch by editing the target file.".to_string()];
+        let classifier = NudgeClassifier::from_config(config);
+        for text in [
+            "Proceeding with the patch by editing the target file.",
+            "I am editing the target file for this patch.",
+            "The location is confirmed. Proceeding with the patch by editing the target file.",
+        ] {
+            assert!(
+                classifier.is_pending_action(text),
+                "{text}: {:?}",
+                classifier.classify(text)
             );
         }
     }

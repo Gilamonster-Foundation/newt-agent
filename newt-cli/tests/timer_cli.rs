@@ -280,7 +280,7 @@ async fn fire_run_drains_all_due_timers() {
 ///
 /// So a scheduled solve pays the gate like any other turn, and the cost is
 /// pinned here as a NUMBER: a model that concludes without ever attempting the
-/// workspace's verification is nudged `SELF_VERIFY_CAP` (2) times and then
+/// task's explicitly requested verification is nudged `SELF_VERIFY_CAP` (2) times and then
 /// accepted — 3 model calls, never more. The mock here is the worst case by
 /// construction: it answers "done" and never calls a tool. A model that
 /// ATTEMPTS the check pays one extra round instead, because the gate is
@@ -299,8 +299,8 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
 
     let fixture = tempfile::tempdir().expect("timer + solve fixture");
     let config_path = write_solve_config(fixture.path(), &server.uri());
-    // The one thing that differs from `fire_run_reaches_solve_entry_point`:
-    // this workspace SHIPS a verification.
+    // This workspace ships the check the scheduled task explicitly requests.
+    // An unchanged workspace alone no longer makes an unrelated task coding work.
     std::fs::write(
         fixture.path().join("Cargo.toml"),
         "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
@@ -312,7 +312,12 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
-        .args(["timer", "schedule", "0s", "tidy the parser"])
+        .args([
+            "timer",
+            "schedule",
+            "0s",
+            "Run `cargo test` to verify the parser.",
+        ])
         .arg("--dir")
         .arg(fixture.path())
         .current_dir(fixture.path())
@@ -335,7 +340,7 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
     assert_eq!(
         requests.len(),
         3,
-        "a scheduled turn that never attempts the workspace's `cargo test` is \
+        "a scheduled turn that never attempts its requested `cargo test` is \
          nudged twice and then accepted: 1 + SELF_VERIFY_CAP model calls, and \
          the cap is what stops it being unbounded"
     );

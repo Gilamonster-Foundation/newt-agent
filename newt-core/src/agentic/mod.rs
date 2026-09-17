@@ -2071,7 +2071,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
+    let mut verification = self_verify::VerificationLedger::for_workspace(
+        task,
+        result_aware,
+        workspace,
+        action_nudges || (smart_harness.is_some() && smart_verify),
+    )
+    .await;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -3306,7 +3312,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             let direction = if narration_nudges == 0 {
                                 nudge_classifier
                                     .direction_for(nudge_classification.class)
-                                    .map(str::to_string)
+                                    .map(workflow_guidance)
                                     .unwrap_or_else(narration_action_nudge)
                             } else {
                                 escalated_narration_action_nudge(
@@ -4624,26 +4630,28 @@ fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> O
         .map(|step| step.description.clone())
 }
 
-/// The guidance for a blocker no workspace edit can repair (#2273).
-///
-/// The repair nudges this stands in for are absolute — "make the smallest
-/// edit", "call the concrete edit tool now", and a `disallowed_actions` line
-/// that forbids restating findings without editing. Against a missing binary
-/// or a refused capability those instructions cannot be followed honestly, so
-/// the model either argues with the harness or invents a fix. This says the
-/// opposite thing with the same force: name the probe, and stop.
-///
-/// It deliberately still forbids reporting the task COMPLETE. Ending on a
-/// stated blocker is an honest terminal answer; ending by claiming the work is
-/// done is the false completion this release has been measuring. The exit this
-/// opens must not become a second route to that.
+fn workflow_guidance(direction: impl std::fmt::Display) -> String {
+    format!(
+        "{direction} Guidance is advisory: follow the latest operator instruction, including \
+         newer steering. Honor stop or report-only requests. Reconcile changed plans with \
+         update_plan; preserve completed work."
+    )
+}
+
+const PERMISSION_RECOVERY_GUIDANCE: &str =
+    "Use an already-authorized alternative if permitted. For an exact requestable grant with \
+     an available operator, call request_permissions once. Never re-ask for or retry a permission \
+     the operator declined, or ask again with no operator available. Do not bypass a refusal.";
+
+/// A failed tool can require permission or an authorized alternative rather
+/// than a workspace edit. An unresolved blocker still cannot become completion.
 fn workflow_blocked_nudge(fingerprint: &str, reason: &str, active_step: Option<&str>) -> String {
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
-        "<workflow_state>\nactive_step = \"report a blocker no edit can clear\"\nlast_error_fingerprint = \"{fingerprint}\"\nblocker = \"{reason}\"\nnext_allowed_actions = \"state the blocker, quote the exact failing probe (the command and the error it returned), then end the turn\"\ndisallowed_actions = \"editing a file to satisfy this guidance, inventing a fix for an environmental blocker, or reporting the task complete\"\n</workflow_state>\n{active} The recorded failure is not something a workspace edit can repair: {reason}. Do not make a cosmetic or placeholder edit to satisfy this guidance. State what is blocked, quote the failing probe, and end the turn. Reporting a blocker with its evidence is a correct and complete answer here; claiming the task itself is finished is not."
-    )
+    workflow_guidance(format!(
+        "<workflow_state>\nactive_step = \"recover a blocker no edit can clear\"\nlast_error_fingerprint = \"{fingerprint}\"\nblocker = \"{reason}\"\nnext_allowed_actions = \"recover within granted authority or report the unresolved blocker\"\ndisallowed_actions = \"editing a file to satisfy this guidance, bypassing a refusal, or reporting the task complete\"\n</workflow_state>\n{active} The recorded failure is not something a workspace edit can repair: {reason}. Do not make a cosmetic or placeholder edit to satisfy this guidance. {PERMISSION_RECOVERY_GUIDANCE} If no permitted recovery remains, state what is blocked, quote the failing probe and its error, and end the turn. The overall task remains incomplete."
+    ))
 }
 
 fn workflow_step_lock_nudge(
@@ -4654,18 +4662,18 @@ fn workflow_step_lock_nudge(
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "<workflow_state>\nactive_step = \"repair the current tool/build error\"\nlast_error_fingerprint = \"{fingerprint}\"\nobservations = {observations}\nnext_allowed_actions = \"use the latest file evidence, then edit_file/write_file for the active repair, then run the focused verification\"\ndisallowed_actions = \"re-reading the same evidence, re-deriving the same plan, or restating findings without editing\"\n</workflow_state>\n{active} You already have the error evidence above. Do not re-read or summarize it again unless you need one exact replacement span. Make the smallest edit that addresses this exact fingerprint, then run the focused check."
-    )
+    ))
 }
 
 fn workflow_rediscovery_nudge(fingerprint: &str, active_step: Option<&str>) -> String {
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "You are rediscovering an error that is already recorded: {fingerprint}.{active} Do not restate findings, update the same plan, or claim handoff. Call the concrete edit tool for this repair now. After the edit, run one focused verification command and use its new output as ground truth."
-    )
+    ))
 }
 
 fn workflow_cap_grace_nudge(
@@ -4677,9 +4685,9 @@ fn workflow_cap_grace_nudge(
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nconfigured_workflow_grace_rounds = {workflow_grace_rounds}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"call edit_file or write_file now using the latest observed file contents; then run the focused verification\"\ndisallowed_actions = \"summary of findings, handoff, plan rediscovery, or another broad read-only pass\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after repair evidence without a successful workspace edit.{active} This is a bounded grace window, not a final-answer round. Use the latest observed contents and call the concrete edit tool now. If one exact replacement span is still missing, read only that minimal span, then edit in the grace window."
-    )
+    ))
 }
 
 fn workflow_post_write_grace_nudge(
@@ -4691,9 +4699,9 @@ fn workflow_post_write_grace_nudge(
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nconfigured_workflow_grace_rounds = {workflow_grace_rounds}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"run the focused verification for the edit you just made, or continue the active implementation step with one concrete tool call\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after a workspace edit related to recorded repair evidence.{active} This is a bounded verification window. Do not summarize or stop because of the normal cap; run the focused check or the next concrete implementation tool now."
-    )
+    ))
 }
 
 fn workflow_progress_grace_nudge(
@@ -4704,9 +4712,9 @@ fn workflow_progress_grace_nudge(
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nconfigured_workflow_grace_rounds = {workflow_grace_rounds}\nnext_allowed_actions = \"continue the active workflow step with one concrete tool call, then update the plan or verify\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached while the active workflow was still making concrete progress.{active} This is a bounded grace window, not a final-answer round. Continue with the next concrete implementation or verification tool now."
-    )
+    ))
 }
 
 fn looks_like_error_rediscovery(content: &str) -> bool {
@@ -5329,12 +5337,13 @@ fn looks_like_unverified_stale_file_blocker(content: &str) -> bool {
 /// The corrective injected when the model narrated its next action but emitted
 /// no tool call (the narrate-then-stop stall). Sibling of [`read_only_action_nudge`].
 fn narration_action_nudge() -> String {
-    "You described what you were about to do but did not call any tool, so \
+    workflow_guidance(
+        "You described what you were about to do but did not call any tool, so \
      nothing actually happened. If you intended to act, emit the tool call now \
      (for example edit_file or write_file with the real arguments) — do not just \
      describe it. If you are genuinely finished, say so explicitly in one \
-     sentence."
-        .to_string()
+     sentence.",
+    )
 }
 
 /// The act-now directive appended after a mid-turn compaction replaced the
@@ -5355,19 +5364,14 @@ fn post_compaction_continuation(
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
 ) -> String {
-    // #1163 (F): re-inject the FULL plan verbatim — every step with its
-    // status — not just the active one. The corporate-box repro showed the
-    // model, post-compaction, REWRITE its own plan (dropping the in-progress
-    // implement steps for "stop implementation"). Showing the whole plan back
-    // + ordering "advance, don't rewrite" makes the plan an anchor the model
-    // continues from instead of re-deriving.
+    // Retain every step and status after compaction without making the saved
+    // plan override a newer operator correction.
     let plan_clause = step_ledger
         .and_then(scheduled::plan_block)
         .map(|plan| {
             format!(
-                " Your active plan is below — CONTINUE from the `→` step; call \
-                 update_plan only to mark a step done (advance), NEVER to \
-                 replace or shrink it:\n{plan}\n"
+                " Your saved plan is below. Continue from the `→` step when it still \
+                 matches the operator's request; otherwise reconcile it with update_plan:\n{plan}\n"
             )
         })
         .unwrap_or_default();
@@ -5390,21 +5394,17 @@ fn post_compaction_continuation(
             )
         },
     );
-    format!(
+    workflow_guidance(format!(
         "{} You are mid-task: the context above was just compacted, not \
          completed.{instruction_clause}{plan_clause} For prompt-rooted work, \
-         recover the objective's artifact chain with artifact_read {{\"address\":\"root\"}} \
-         before deciding what remains. Continue working — your \
-         next output should be the next concrete tool call (re-read any file \
-         you are about to edit first, since full file contents were not \
-         preserved). Before concluding ANYTHING about prior work, re-anchor on \
-         ground truth: check the current git branch and the last few commits — \
-         work from earlier in this task may already be COMMITTED (by you), so a \
-         clean working tree does NOT mean no work happened (#1163). Do not \
-         summarize what happened, do not re-plan, do not narrow the task, and \
-         do not repeat work the log shows is done.",
+         use artifact_read {{\"address\":\"root\"}} before deciding what remains. \
+         When continuing, your next output should be the next concrete tool call; re-read \
+         files before editing. To re-anchor on ground truth, check the current git branch and the last few \
+         commits: earlier work may already be COMMITTED, so a clean working tree does NOT mean \
+         no work happened. Preserve completed work; \
+         do not repeat work the log shows is done or silently narrow the task.",
         compress::CONTINUATION_PREFIX
-    )
+    ))
 }
 
 /// After a compaction pass replaced the middle with a summary (or the static
@@ -5463,25 +5463,26 @@ fn escalated_narration_action_nudge(
     let step_clause = active_step_description(step_ledger)
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "Reminder {attempt}/{cap}: you again described an action without calling \
          a tool, so nothing has happened.{step_clause} Your NEXT output must be \
          exactly one tool call that starts that action (for example read_file, \
          edit_file, or run_command with real arguments) — no prose before it. \
          If you are blocked, state the one concrete blocker in a single \
          sentence instead of announcing more intentions."
-    )
+    ))
 }
 
 fn stale_file_ground_truth_nudge() -> String {
-    "You claimed the file changed under you or that your edit context is stale, \
+    workflow_guidance(
+        "You claimed the file changed under you or that your edit context is stale, \
      but you did not prove that with ground truth. Before stopping or asking the \
      operator to restore/revert anything, run read-only verification: git status \
      --short, git diff -- <file>, wc -l <file>, and re-read the exact target \
      range. If those checks do not prove an actual concurrent change, continue \
      from the verified file contents. Never recommend git checkout/revert unless \
-     git diff proves unwanted changes and the operator approves."
-        .to_string()
+     git diff proves unwanted changes and the operator approves.",
+    )
 }
 
 fn workflow_classifier_text(messages: &[serde_json::Value], current_content: &str) -> String {
@@ -5559,7 +5560,7 @@ fn pending_plan_completion_nudge(
         .map(|hint| format!("\n\n{hint}"))
         .unwrap_or_default();
     if needs_plan_update {
-        Some(format!(
+        Some(workflow_guidance(format!(
             "You ended with a findings/next-steps summary while the active plan still has \
              {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
              immediate prerequisite repair work now blocks the active step. Call update_plan now \
@@ -5567,14 +5568,14 @@ fn pending_plan_completion_nudge(
              blocker repair the active step, and keep later feature work pending. Then call the \
              next concrete tool for that active repair. Do not repeat the findings summary or \
              claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
-        ))
+        )))
     } else {
-        Some(format!(
+        Some(workflow_guidance(format!(
             "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
              {step_word}.{active_clause} Either call update_plan with completed steps marked \
              completed, call the next tool for the active step, or state the concrete blocker. \
              Do not hand off by only describing remaining work."
-        ))
+        )))
     }
 }
 
@@ -5585,24 +5586,23 @@ fn read_only_action_nudge(
     delegate_hint: Option<&str>,
 ) -> String {
     let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
-        " You have an active multi-step plan; keep working the ACTIVE step instead of \
-         restarting or re-planning."
+        " You have an active multi-step plan; continue the ACTIVE step when it still \
+         matches the operator's request."
     } else {
         ""
     };
     let delegate_clause = delegate_hint
         .map(|hint| format!(" {hint}"))
         .unwrap_or_default();
-    format!(
+    workflow_guidance(format!(
         "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
          making the change. This is a nudge, not a limit — you may still read, but if \
-         you have enough context, call edit_file or write_file now. If a capability \
-         denial blocks you, call request_permissions with the exact capability and \
-         target, or take a different approach. If you truly cannot edit yet, state the \
+         you have enough context, call edit_file or write_file now. {PERMISSION_RECOVERY_GUIDANCE} \
+         If you truly cannot proceed yet, state the \
          exact blocker. Before edit_file, read the ONE file you are about to change so \
          old_string matches exact text; never guess old_string or repeat a failed edit.\
          {plan_clause}{delegate_clause} ~{remaining_rounds} round(s) left.]"
-    )
+    ))
 }
 
 /// Append the memory-nudge line to the current user message — the last
@@ -6603,7 +6603,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
+    let mut verification = self_verify::VerificationLedger::for_workspace(
+        task,
+        result_aware,
+        workspace,
+        action_nudges || (smart_harness.is_some() && smart_verify),
+    )
+    .await;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -7886,7 +7892,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
-                        .map(str::to_string)
+                        .map(workflow_guidance)
                         .unwrap_or_else(narration_action_nudge)
                 } else {
                     escalated_narration_action_nudge(
@@ -7951,9 +7957,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 && round + 1 < current_tool_round_limit
                 && !content.is_empty()
             {
-                let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
-                let checks = self_verify::detect_checks(&entries, active_task);
                 let cmds = self_verify::commands_from_messages(&messages);
+                let checks = verification
+                    .applicable_checks(workspace, active_task, &cmds)
+                    .await
+                    .unwrap_or_default();
                 if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
                     if debug {
                         print_debug(
@@ -9111,7 +9119,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
+    let mut verification = self_verify::VerificationLedger::for_workspace(
+        task,
+        result_aware,
+        workspace,
+        action_nudges || (smart_harness.is_some() && smart_verify),
+    )
+    .await;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -10229,7 +10243,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
-                        .map(str::to_string)
+                        .map(workflow_guidance)
                         .unwrap_or_else(narration_action_nudge)
                 } else {
                     escalated_narration_action_nudge(
@@ -10284,9 +10298,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 && round + 1 < current_tool_round_limit
                 && !content.is_empty()
             {
-                let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
-                let checks = self_verify::detect_checks(&entries, active_task);
                 let cmds = self_verify::commands_from_messages(&messages);
+                let checks = verification
+                    .applicable_checks(workspace, active_task, &cmds)
+                    .await
+                    .unwrap_or_default();
                 if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
                     if debug {
                         print_debug(
@@ -11346,7 +11362,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let result_aware = self_verify::enabled() && verify_outcomes;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::for_turn(task, result_aware);
+    let mut verification = self_verify::VerificationLedger::for_workspace(
+        task,
+        result_aware,
+        workspace,
+        action_nudges || (smart_harness.is_some() && smart_verify),
+    )
+    .await;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();

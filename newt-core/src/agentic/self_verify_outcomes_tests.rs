@@ -9,6 +9,80 @@ use content_addressable::ContentId;
 const CHECK: &str = "sh -c true";
 const OTHER: &str = "git status";
 
+/// Grounds the shared scanner boundary in real files: isolated checkouts and
+/// their builds are not this workspace; its instructions and source still are.
+#[test]
+fn workspace_state_ignores_isolated_worktrees_but_keeps_source_and_instructions() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source.rs"), "before").unwrap();
+    let initial = workspace_tree_state(root.path()).unwrap();
+    let isolated = root.path().join(".worktrees/other");
+    std::fs::create_dir_all(&isolated).unwrap();
+    std::fs::write(isolated.join("source.rs"), "unrelated").unwrap();
+    assert_eq!(workspace_tree_state(root.path()), Some(initial));
+    std::fs::write(root.path().join("source.rs"), "after").unwrap();
+    let source = workspace_tree_state(root.path()).unwrap();
+    assert_ne!(source, initial);
+    std::fs::create_dir(root.path().join(".newt")).unwrap();
+    std::fs::write(root.path().join(".newt/plan.md"), "instructions").unwrap();
+    assert_ne!(workspace_tree_state(root.path()), Some(source));
+}
+
+#[tokio::test]
+async fn unchanged_workspace_retains_explicit_and_attempted_checks_and_unknown_is_conservative() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+    let workspace = root.path().to_str().unwrap();
+    let mut ledger = VerificationLedger::for_turn("", true);
+    ledger.initial_tree = workspace_tree_state(root.path());
+    assert!(ledger
+        .applicable_checks(workspace, "Report status.", &[])
+        .await
+        .unwrap()
+        .is_empty());
+    let task = "Run `cargo test -p example` to verify.";
+    let explicit = ledger
+        .applicable_checks(workspace, task, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit,
+        detect_checks(&[], task),
+        "a check-only task remains eligible"
+    );
+    let requested = vec!["cargo test".to_string()];
+    let attempted = ledger
+        .applicable_checks(workspace, "Report status.", &requested)
+        .await
+        .unwrap();
+    assert_eq!(
+        attempted,
+        cargo_checks(),
+        "only the attempted suite stays relevant"
+    );
+    ledger.record_exec("cargo test", Failed, None);
+    let failed = ledger
+        .applicable_checks(workspace, "Report status.", &[])
+        .await
+        .unwrap();
+    assert_eq!(failed, cargo_checks());
+    assert!(
+        matches!(decide_with(&failed, &ledger, None), Decision::Nudge(_)),
+        "an observed failure still requires repair"
+    );
+    ledger.initial_tree = None;
+    assert_eq!(
+        ledger
+            .applicable_checks(workspace, "Report status.", &[])
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "unknown state cannot prove the workspace unchanged"
+    );
+}
+
 fn checks() -> Vec<VerifyCheck> {
     detect_checks(&[], &format!("You can run `{CHECK}` to verify."))
 }
@@ -41,6 +115,23 @@ fn nudge(decision: &Decision) -> &str {
     match decision {
         Decision::Nudge(text) => text,
         other => panic!("expected a nudge, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_verification_nudge_honors_operator_steering_exactly_once() {
+    let attempted = verify_gate_nudge(&checks(), &[]).unwrap();
+    let pending = decide(&VerificationLedger::default(), &[], None, 0, true).0;
+    let mut ledger = VerificationLedger::default();
+    ledger.record_exec(CHECK, Failed, None);
+    let repair = decide(&ledger, &[CHECK], None, 0, true).0;
+    for text in [attempted.as_str(), nudge(&pending), nudge(&repair)] {
+        assert_eq!(
+            text.matches("latest operator instruction").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("stop or report-only"), "{text}");
     }
 }
 

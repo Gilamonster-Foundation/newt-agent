@@ -12,14 +12,14 @@
 //! the check only ever *appends* a clearly-marked annotation, so the user
 //! sees exactly what the model said plus what did not check out.
 //!
-//! Pure by construction: extraction is string processing and existence is an
-//! injected `FnMut(&str) -> bool` seam, so the unit tier stays fully mocked.
+//! Pure by construction: extraction is string processing and resolution is an
+//! injected seam, so the unit tier stays fully mocked.
 //! Only the [`annotate_against_workspace`] wiring (called from every final
 //! (no-tool-call) answer a turn produces — cap-exit summary and normal
 //! finish alike, #1964) touches the real filesystem — and it never probes
-//! outside the workspace root: the fs fence applies to the checker too, so
-//! an absolute or `..`-escaping claim is reported as not-found rather than
-//! stat'd.
+//! lexically outside the workspace root: an absolute or `..`-escaping claim
+//! is unverified, not missing, and is not probed. This lexical boundary does
+//! not provide symlink isolation for paths that start inside the workspace.
 
 /// Path-like tokens in assistant prose — the same recognition rule as the
 /// crew planner's claim check (`newt-cli/src/crew.rs::path_tokens`): a token
@@ -56,46 +56,50 @@ pub(crate) fn path_claims(text: &str) -> Vec<String> {
     out
 }
 
-/// The subset of [`path_claims`] that `exists` refutes, in citation order.
-/// `exists` is `FnMut` (not `Fn`): [`workspace_resolver`] learns a new base
-/// directory each time a claim verifies, so a later claim in the same text
-/// can resolve under an earlier one's directory (#1970).
-pub(crate) fn missing_claims(text: &str, mut exists: impl FnMut(&str) -> bool) -> Vec<String> {
-    path_claims(text)
-        .into_iter()
-        .filter(|c| !exists(c))
-        .collect()
-}
-
 /// Cap on how many refuted paths the annotation lists verbatim — beyond it
 /// the count is summarized, so a pathological summary can't bloat the reply.
 const LISTED_CLAIMS: usize = 8;
 
-/// Append the claim-check refutation to `text` when any cited path fails to
-/// resolve; return `text` unchanged (no annotation, no trailing noise) when
-/// every claim checks out or there are no claims at all. The original prose
-/// is always preserved as an exact prefix — the check labels, never rewrites.
-pub(crate) fn annotate_missing_claims(text: String, exists: impl FnMut(&str) -> bool) -> String {
-    let missing = missing_claims(&text, exists);
-    if missing.is_empty() {
-        return text;
+/// Append distinct missing and unverified annotations, preserving the prose
+/// exactly. `Some` is an in-workspace existence result; `None` means the
+/// checker cannot inspect the claim. Both lists share the existing display cap.
+fn annotate_path_claims(mut text: String, mut resolve: impl FnMut(&str) -> Option<bool>) -> String {
+    let mut missing = Vec::new();
+    let mut unverified = Vec::new();
+    for claim in path_claims(&text) {
+        match resolve(&claim) {
+            Some(true) => {}
+            Some(false) => missing.push(claim),
+            None => unverified.push(claim),
+        }
     }
-    let listed: Vec<String> = missing
-        .iter()
-        .take(LISTED_CLAIMS)
-        .map(|p| format!("`{p}`"))
-        .collect();
-    let more = missing.len().saturating_sub(LISTED_CLAIMS);
-    let overflow = if more > 0 {
-        format!(" (+{more} more)")
-    } else {
-        String::new()
-    };
-    format!(
-        "{text}\n\n⚠ claim check (#867): cited path(s) not found in this workspace: {}{overflow} \
-         — verify these before acting on the summary above.",
-        listed.join(", ")
-    )
+    let mut remaining = LISTED_CLAIMS;
+    for (claims, label) in [
+        (missing, "not found in this workspace"),
+        (unverified, "unverified outside workspace (not inspected)"),
+    ] {
+        if claims.is_empty() {
+            continue;
+        }
+        let listed: Vec<_> = claims
+            .iter()
+            .take(remaining)
+            .map(|p| format!("`{p}`"))
+            .collect();
+        remaining -= listed.len();
+        let more = claims.len() - listed.len();
+        let overflow = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        text = format!(
+            "{text}\n\n⚠ claim check (#867): cited path(s) {label}: {}{overflow} \
+             — verify these before acting on the summary above.",
+            listed.join(", ")
+        );
+    }
+    text
 }
 
 /// Bound on learned extra bases (below), mirroring [`OBSERVED_CAP`]'s reasoning:
@@ -106,9 +110,9 @@ const EXTRA_BASES_CAP: usize = 40;
 /// its lexically-normalized absolute form, joined either to the workspace
 /// root OR to a "learned" extra base, stays inside the workspace AND exists
 /// on disk. Claims that normalize outside the root (absolute paths
-/// elsewhere, `..` escapes) are refuted without ever being stat'd — the
-/// checker honors the same workspace fence as the fs tools. Shared by the
-/// cap-exit annotation and the [`ObservedPaths`] ledger.
+/// elsewhere, `..` escapes) are unverified without being probed. This is a
+/// lexical fence, not symlink isolation. The [`ObservedPaths`] adapter below
+/// records only positive existence results.
 ///
 /// #1970: a bare relative fragment (`src/lib.rs`) cited alongside an earlier
 /// claim that verified under a subdirectory (`agent-voice/agent-voice-tts/Cargo.toml`)
@@ -120,34 +124,51 @@ const EXTRA_BASES_CAP: usize = 40;
 /// fragment resolves under the directory an earlier, fully-qualified claim
 /// in the same text already established. A hit under more than one base is
 /// still a verify, never a refutation — this checks existence, not identity.
-pub(crate) fn workspace_resolver(workspace: &str) -> impl FnMut(&str) -> bool {
+fn workspace_claim_resolver(
+    workspace: &str,
+    mut exists: impl FnMut(&std::path::Path) -> bool,
+) -> impl FnMut(&str) -> Option<bool> {
     let root = super::lexical_normalize(std::path::Path::new(workspace));
     let mut extra_bases: Vec<std::path::PathBuf> = Vec::new();
     move |claim: &str| {
         let p = std::path::Path::new(claim);
         if p.is_absolute() {
             let norm = super::lexical_normalize(p);
-            return norm.starts_with(&root) && norm.exists();
+            return norm.starts_with(&root).then(|| exists(&norm));
         }
+        let mut in_workspace = false;
         for base in std::iter::once(&root).chain(extra_bases.iter()) {
             let norm = super::lexical_normalize(&base.join(p));
-            if norm.starts_with(&root) && norm.exists() {
+            if !norm.starts_with(&root) {
+                continue;
+            }
+            in_workspace = true;
+            if exists(&norm) {
                 if let Some(parent) = norm.parent().map(std::path::Path::to_path_buf) {
                     if extra_bases.len() < EXTRA_BASES_CAP && !extra_bases.contains(&parent) {
                         extra_bases.push(parent);
                     }
                 }
-                return true;
+                return Some(true);
             }
         }
-        false
+        in_workspace.then_some(false)
     }
 }
 
+/// The observed-path ledger admits only claims that actually verified.
+pub(crate) fn workspace_resolver(workspace: &str) -> impl FnMut(&str) -> bool {
+    let mut resolve = workspace_claim_resolver(workspace, std::path::Path::exists);
+    move |claim| resolve(claim) == Some(true)
+}
+
 /// Final-answer wiring (cap-exit AND normal finish): annotate `text` against
-/// the REAL workspace tree via [`workspace_resolver`].
+/// the real workspace tree without treating an uninspected claim as missing.
 pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> String {
-    annotate_missing_claims(text, workspace_resolver(workspace))
+    annotate_path_claims(
+        text,
+        workspace_claim_resolver(workspace, std::path::Path::exists),
+    )
 }
 
 /// Ledger cap: enough to name every file a real investigation touches while
@@ -291,7 +312,7 @@ pub(crate) fn claimed_branches(text: &str) -> Vec<String> {
 }
 
 /// #1214: append refutations for claimed ACTIONS the workspace's git state
-/// contradicts — the sibling of [`annotate_missing_claims`] for work products
+/// contradicts — the sibling of [`annotate_path_claims`] for work products
 /// instead of paths. Same posture: append-only, prose preserved as an exact
 /// prefix, no annotation when everything checks out (or no evidence exists —
 /// a non-git workspace refutes nothing). Two checks:
@@ -405,15 +426,15 @@ mod tests {
     #[test]
     fn annotate_is_a_noop_when_claims_verify_or_are_absent() {
         let clean = "all good, nothing cited".to_string();
-        assert_eq!(annotate_missing_claims(clean.clone(), |_| false), clean);
+        assert_eq!(annotate_path_claims(clean.clone(), |_| Some(false)), clean);
         let cited = "the fix is in a/b.rs and c/d.rs".to_string();
-        assert_eq!(annotate_missing_claims(cited.clone(), |_| true), cited);
+        assert_eq!(annotate_path_claims(cited.clone(), |_| Some(true)), cited);
     }
 
     #[test]
     fn annotate_appends_refutation_and_preserves_the_prose_prefix() {
         let cited = "the fix is in a/b.rs and c/d.rs".to_string();
-        let out = annotate_missing_claims(cited.clone(), |c| c == "a/b.rs");
+        let out = annotate_path_claims(cited.clone(), |c| Some(c == "a/b.rs"));
         assert!(out.starts_with(&cited), "prose must be an exact prefix");
         assert!(out.contains("⚠ claim check (#867)"), "got: {out}");
         assert!(out.contains("`c/d.rs`"), "the missing path is named");
@@ -425,7 +446,7 @@ mod tests {
         let cited: String = (0..12)
             .map(|i| format!("see dir{i}/f{i}.rs "))
             .collect::<String>();
-        let out = annotate_missing_claims(cited, |_| false);
+        let out = annotate_path_claims(cited, |_| Some(false));
         assert!(out.contains("`dir0/f0.rs`"));
         assert!(out.contains("`dir7/f7.rs`"));
         assert!(!out.contains("`dir8/f8.rs`"), "capped at {LISTED_CLAIMS}");
@@ -549,6 +570,109 @@ mod tests {
             bad.contains("`/etc/hosts.d/y.rs`"),
             "outside refuted: {bad}"
         );
+    }
+
+    /// Real existing and absent external files ground the annotation boundary:
+    /// neither can be declared missing or verified by a workspace-only checker.
+    #[test]
+    fn external_path_claims_are_unverified_not_missing() {
+        let tree = tempfile::tempdir().unwrap();
+        let workspace = tree.path().join("workspace");
+        let reports = tree.path().join("reports");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&reports).unwrap();
+        let existing = reports.join("report.md");
+        std::fs::write(&existing, "observed report").unwrap();
+        // The existing prose tokenizer recognizes slash paths, not Windows
+        // drive prefixes. Resolver boundary coverage below is platform-neutral.
+        let absolute = cfg!(unix).then(|| existing.to_string_lossy().into_owned());
+        for claim in absolute
+            .as_deref()
+            .into_iter()
+            .chain(["../reports/report.md", "../reports/absent.md"])
+        {
+            let text = format!("See `{claim}`.");
+            let out = annotate_against_workspace(text.clone(), workspace.to_str().unwrap());
+            let annotation = out.strip_prefix(&text).expect("preserve original prose");
+            assert!(
+                annotation.contains("unverified outside workspace"),
+                "external existence is not known to this checker: {out}"
+            );
+            assert!(!annotation.contains("not found"), "{out}");
+            assert!(annotation.contains(&format!("`{claim}`")), "{out}");
+        }
+    }
+
+    #[test]
+    fn mixed_path_claims_keep_missing_and_unverified_separate() {
+        let workspace = env!("CARGO_MANIFEST_DIR");
+        let text = "See src/lib.rs, src/absent-file.rs and ../../reports/report.md.".to_string();
+        let out = annotate_against_workspace(text.clone(), workspace);
+        let annotation = out.strip_prefix(&text).expect("preserve original prose");
+        let (missing, unverified) = annotation
+            .split_once("unverified outside workspace")
+            .expect("external claims have a distinct annotation");
+        assert!(missing.contains("not found in this workspace"), "{out}");
+        assert!(missing.contains("`src/absent-file.rs`"), "{out}");
+        assert!(!missing.contains("`../../reports/report.md`"), "{out}");
+        assert!(unverified.contains("`../../reports/report.md`"), "{out}");
+        assert!(!annotation.contains("`src/lib.rs`"), "{out}");
+    }
+
+    #[test]
+    fn external_path_annotation_keeps_the_existing_list_bound() {
+        let text: String = (0..12)
+            .map(|i| format!("See ../reports/report{i}.md. "))
+            .collect();
+        let out = annotate_against_workspace(text.clone(), env!("CARGO_MANIFEST_DIR"));
+        let annotation = out.strip_prefix(&text).expect("preserve original prose");
+        assert!(annotation.contains("unverified outside workspace"), "{out}");
+        assert!(annotation.contains("`../reports/report0.md`"), "{out}");
+        assert!(annotation.contains("`../reports/report7.md`"), "{out}");
+        assert!(!annotation.contains("`../reports/report8.md`"), "{out}");
+        assert!(annotation.contains("(+4 more)"), "{out}");
+    }
+
+    #[test]
+    fn unverified_external_claims_do_not_enter_observed_paths() {
+        let mut observed = ObservedPaths::default();
+        observed.record(
+            "See src/lib.rs and ../../reports/report.md.",
+            workspace_resolver(env!("CARGO_MANIFEST_DIR")),
+        );
+        assert_eq!(observed.into_vec(), vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn workspace_claim_resolver_never_probes_lexical_escapes() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let outside = workspace.parent().unwrap().join("external-report.md");
+        let mut probes = Vec::new();
+        {
+            let mut resolve = workspace_claim_resolver(workspace.to_str().unwrap(), |path| {
+                probes.push(path.to_path_buf());
+                true
+            });
+            assert_eq!(resolve(outside.to_str().unwrap()), None);
+            assert_eq!(resolve("../../reports/report.md"), None);
+            assert_eq!(resolve("src/lib.rs"), Some(true));
+            // Learning src/ must not permit an escape beyond that base either.
+            assert_eq!(resolve("../../reports/report.md"), None);
+        }
+        assert_eq!(probes, vec![workspace.join("src/lib.rs")]);
+    }
+
+    #[test]
+    fn missing_and_unverified_claims_share_one_display_cap() {
+        let text: String = (0..12).map(|i| format!("See dir/file{i}.md. ")).collect();
+        let out = annotate_path_claims(text.clone(), |claim| {
+            claim.ends_with("0.md").then_some(false)
+        });
+        let annotation = out.strip_prefix(&text).unwrap();
+        assert_eq!(annotation.matches('`').count(), LISTED_CLAIMS * 2);
+        assert!(annotation.contains("not found in this workspace"));
+        assert!(annotation.contains("unverified outside workspace"));
+        assert!(annotation.contains("(+4 more)"));
     }
 
     /// #1970 regression, reproduced against this repo's own workspace root

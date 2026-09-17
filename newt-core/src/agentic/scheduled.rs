@@ -243,13 +243,13 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
         .iter()
         .filter(|s| s.status == StepStatus::Done)
         .count();
-    Some(format!(
-        "[Plan progress: {done}/{} done. ACTIVE \u{2192} step {}: {}. Keep working \
-         THIS step; earlier steps are already done — do not restart or re-plan them.]",
+    Some(super::workflow_guidance(format!(
+        "[Plan progress: {done}/{} done. ACTIVE \u{2192} step {}: {}. Continue this step \
+         when it still matches the operator's request.]",
         steps.len(),
         active + 1,
         truncate(&steps[active].description, STEP_DESC_CAP)
-    ))
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +550,9 @@ mod tests {
         assert!(p.contains("step 1: a"), "names the active step: {p}");
         assert!(p.contains("0/3 done"), "shows progress: {p}");
         assert_eq!(p.lines().count(), 1, "compact (one line): {p}");
+        assert!(p.contains("latest operator instruction"), "{p}");
+        assert!(p.contains("update_plan"), "{p}");
+        assert!(!p.contains("do not restart or re-plan them"), "{p}");
         l.advance(); // a Done, b Active
         let ptr = plan_reseat_pointer(&l).unwrap();
         assert!(

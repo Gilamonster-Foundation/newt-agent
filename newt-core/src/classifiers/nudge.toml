@@ -20,6 +20,8 @@ matchers = [
   "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.",
   "I have two issues: duplicate definitions and a stray brace. Let me fix both, read around the duplicate, then verify with a build check.",
   "Next I will add the tests.",
+  "Next steps: remove the duplicate helper, then run the check.",
+  "Let me verify the code and the result of the check.",
   "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.",
   "What remains: fix the compile error, add tests, and run the check.",
 ]
@@ -35,6 +37,7 @@ matchers = [
   "Let me check the current working directory and available git operations.",
   "Let me understand what was already done on this branch and compare it with the issue requirements.",
   "Let me check the current implementation and identify any gaps.",
+  "Let me verify the code and the result of the check.",
 ]
 
 [classes.plan_update]

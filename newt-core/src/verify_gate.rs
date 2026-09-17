@@ -301,6 +301,7 @@ pub fn gate_python_workspace_with(
 /// data with one home and the gates that need it read it here.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
+    ".worktrees",
     ".venv",
     "venv",
     "site-packages",
