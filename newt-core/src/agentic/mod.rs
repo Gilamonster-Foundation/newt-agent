@@ -6724,13 +6724,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // The endpoint speaks the OpenAI function-tool wire even when the serving
     // model is hosted behind vLLM/LiteLLM/NIM. Enforce that wire's 128-function
     // envelope after authorization + exposure, keeping Kernel tools ahead of
-    // optional MCP schemas. Omitted tools remain dispatch-authorized and
-    // listable through tool_search; dynamic schema activation is separate.
-    let mut tools = crate::agentic::tools::select_openai_compatible_tools(tools);
-    hidden_tools.limit_to(
-        crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS,
-        tools.as_array().map_or(0, Vec::len),
-    );
+    // optional MCP schemas. Retain omitted schemas in the same controller for
+    // exact-name activation without changing dispatch authority.
+    let mut tools = crate::agentic::tools::select_openai_compatible_tools(tools, &hidden_tools);
     let mut tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -11380,11 +11376,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &std::collections::BTreeSet::new(),
         estimation,
     );
-    let mut tools_chat = crate::agentic::tools::select_openai_compatible_tools(tools_chat);
-    hidden_tools.limit_to(
-        crate::agentic::tools::exposure::OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS,
-        tools_chat.as_array().map_or(0, Vec::len),
-    );
+    let mut tools_chat =
+        crate::agentic::tools::select_openai_compatible_tools(tools_chat, &hidden_tools);
     let mut tools = tools_to_responses(&tools_chat);
     let mut tools_for_estimate = serde_json::Value::Array(tools.clone());
     let mut cal = compress_state.calibration.ratio(estimate_ratio);

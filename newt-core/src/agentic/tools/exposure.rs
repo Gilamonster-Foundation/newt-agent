@@ -180,7 +180,8 @@ pub struct ExposurePlan {
 }
 
 /// How `tool_search` marks an authorized tool whose schema is off the wire.
-pub(crate) const HIDDEN_SEARCH_MARK: &str = "[schema not loaded: call it once to load it]";
+pub(crate) const HIDDEN_SEARCH_MARK: &str =
+    "[schema not loaded: use tool_search with this exact name to load it]";
 
 /// What a call to a hidden tool did (#2331).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,20 +202,21 @@ impl Promotion {
             Self::NotHidden => None,
             Self::Promoted => Some(format!(
                 "Tool `{name}` did not run (schema not loaded). Its schema is loaded for your \
-                 next request; call `{name}` again with arguments that match it."
+                 next request; call `{name}` with arguments that match it."
             )),
             Self::AtCap(cap) => Some(format!(
                 "Tool `{name}` did not run and could not be loaded: the tool list is at its limit \
-                 of {cap} function tools. Continue with the tools you have."
+                 of {cap} function tools, with no replaceable slot. Kernel tools and activations \
+                 already queued for the next request are protected."
             )),
         }
     }
 }
 
-/// The turn's authorized-but-unexposed tools (#2331). A call to one promotes
-/// it: the loop appends its schema, after the tools already sent, before the
-/// next request, so the provider's cached prefix changes as little as
-/// possible. Promotion lasts for the turn.
+/// The turn's authorized-but-unexposed tools (#2331). Exact-name search or a
+/// hidden call queues its schema for the next request without executing it.
+/// Below the wire cap schemas append; at the cap the oldest optional schema
+/// moves back here. Kernel tools and queued activations cannot be displaced.
 #[derive(Debug, Default)]
 pub(crate) struct HiddenTools {
     state: std::sync::Mutex<HiddenState>,
@@ -224,11 +226,11 @@ pub(crate) struct HiddenTools {
 struct HiddenState {
     /// Hidden definitions, in catalog order.
     defs: Vec<Value>,
-    /// Names called since the last append, in call order.
+    /// Names activated since the last append, in request order.
     promoted: Vec<String>,
-    /// `(cap, sent)`: the wire's function-tool cap and how many tools the
-    /// request carries, promotions included. `None` for a wire with no cap.
-    cap: Option<(usize, usize)>,
+    /// `(cap, sent)`: the wire cap and its reserved next-request definitions,
+    /// in order. Keep the actual narrowed schemas, not a rebuilt catalog.
+    cap: Option<(usize, Vec<Value>)>,
 }
 
 impl HiddenTools {
@@ -246,35 +248,54 @@ impl HiddenTools {
             .any(|def| entry_name(def) == Some(name))
     }
 
-    /// Bound promotions by a wire's function-tool `cap`, given the `sent`
-    /// tools the request already carries (#2331 review: a request over the cap
-    /// is rejected whole).
-    pub(crate) fn limit_to(&self, cap: usize, sent: usize) {
-        self.state().cap = Some((cap, sent));
+    /// Register the actual wire projection so replacements preserve its
+    /// narrowed definitions and can never displace Kernel schemas.
+    fn limit_to(&self, cap: usize, sent: &[Value]) {
+        self.state().cap = Some((cap, sent.to_vec()));
     }
 
-    /// Promote `name` if it is hidden and the request has room for it. A tool
-    /// this request refuses is never in the hidden set.
+    /// Reserve a slot for a hidden schema. At capacity replace the oldest
+    /// unqueued optional schema; a refused tool never enters this state.
     pub(crate) fn promote(&self, name: &str) -> Promotion {
         let mut state = self.state();
-        if !state.defs.iter().any(|def| entry_name(def) == Some(name)) {
+        let Some(requested) = state
+            .defs
+            .iter()
+            .find(|def| entry_name(def) == Some(name))
+            .cloned()
+        else {
             return Promotion::NotHidden;
-        }
+        };
         if state.promoted.iter().any(|promoted| promoted == name) {
             return Promotion::Promoted;
         }
-        if let Some((cap, sent)) = state.cap.as_mut() {
-            if *sent >= *cap {
-                return Promotion::AtCap(*cap);
+        let HiddenState {
+            defs,
+            promoted,
+            cap,
+        } = &mut *state;
+        if let Some((cap, sent)) = cap {
+            if sent.len() >= *cap {
+                let Some(at) = sent.iter().position(|def| {
+                    entry_name(def).is_some_and(|name| {
+                        classify(name) != ExposureClass::Kernel
+                            && !promoted.iter().any(|queued| queued == name)
+                    })
+                }) else {
+                    return Promotion::AtCap(*cap);
+                };
+                // A reserved victim is immediately discoverable/reactivatable;
+                // later requests in this batch still cannot steal queued slots.
+                defs.push(sent.remove(at));
             }
-            *sent += 1;
+            sent.push(requested);
         }
-        state.promoted.push(name.to_owned());
+        promoted.push(name.to_owned());
         Promotion::Promoted
     }
 
-    /// Append every promoted schema to `tools`, in promotion order. Returns
-    /// whether the tool list changed.
+    /// Remove reserved victims and append queued schemas in activation order.
+    /// Returns whether the tool list changed; the loop reprices the result.
     pub(crate) fn append_promoted(&self, tools: &mut Value) -> bool {
         let mut state = self.state();
         if state.promoted.is_empty() {
@@ -283,6 +304,16 @@ impl HiddenTools {
         let Value::Array(sent) = tools else {
             return false;
         };
+        if let Some((_, next)) = &state.cap {
+            sent.retain(|def| {
+                let name = entry_name(def);
+                next.iter().any(|kept| entry_name(kept) == name)
+                    && !state
+                        .promoted
+                        .iter()
+                        .any(|queued| Some(queued.as_str()) == name)
+            });
+        }
         for name in std::mem::take(&mut state.promoted) {
             if let Some(at) = state
                 .defs
@@ -447,11 +478,12 @@ pub fn select_exposed(
 /// here remain governed by the dispatch boundary and listable through
 /// `tool_search`, without implying that this projection activates them.
 #[must_use]
-pub(crate) fn select_openai_compatible_tools(defs: Value) -> Value {
+pub(crate) fn select_openai_compatible_tools(defs: Value, hidden: &HiddenTools) -> Value {
     let Value::Array(arr) = defs else {
         return defs;
     };
     if arr.len() <= OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS {
+        hidden.limit_to(OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS, &arr);
         return Value::Array(arr);
     }
 
@@ -484,12 +516,19 @@ pub(crate) fn select_openai_compatible_tools(defs: Value) -> Value {
         }
     }
 
-    Value::Array(
-        arr.into_iter()
-            .zip(keep)
-            .filter_map(|(def, keep)| keep.then_some(def))
-            .collect(),
-    )
+    let mut sent = Vec::with_capacity(kept);
+    {
+        let mut state = hidden.state();
+        for (def, keep) in arr.into_iter().zip(keep) {
+            if keep {
+                sent.push(def);
+            } else {
+                state.defs.push(def);
+            }
+        }
+    }
+    hidden.limit_to(OPENAI_COMPATIBLE_MAX_FUNCTION_TOOLS, &sent);
+    Value::Array(sent)
 }
 
 #[cfg(test)]
@@ -569,6 +608,67 @@ mod tests {
     }
 
     #[test]
+    fn queued_activations_keep_kernel_and_can_reactivate_evicted_schemas() {
+        let hidden = HiddenTools {
+            state: std::sync::Mutex::new(HiddenState {
+                defs: vec![
+                    tool("remote__a", "a"),
+                    tool("remote__b", "b"),
+                    tool("remote__c", "c"),
+                ],
+                ..Default::default()
+            }),
+        };
+        let mut sent = json!([
+            tool("read_file", "kernel"),
+            tool("git", "oldest optional"),
+            tool("tool_search", "kernel"),
+            tool("impact", "optional")
+        ]);
+        hidden.limit_to(4, sent.as_array().unwrap());
+        assert_eq!(hidden.promote("unknown__tool"), Promotion::NotHidden);
+        assert_eq!(hidden.promote("remote__a"), Promotion::Promoted);
+        assert_eq!(hidden.promote("remote__a"), Promotion::Promoted);
+        assert_eq!(hidden.promote("remote__b"), Promotion::Promoted);
+        assert_eq!(hidden.promote("remote__c"), Promotion::AtCap(4));
+        assert_eq!(hidden.promote("git"), Promotion::AtCap(4));
+        assert!(hidden.append_promoted(&mut sent));
+        assert_eq!(
+            sent,
+            json!([
+                tool("read_file", "kernel"),
+                tool("tool_search", "kernel"),
+                tool("remote__a", "a"),
+                tool("remote__b", "b")
+            ])
+        );
+        assert!(hidden.is_hidden("git"));
+        assert!(hidden.is_hidden("impact"));
+        assert!(!hidden.is_hidden("remote__a"));
+        assert!(!hidden.append_promoted(&mut sent));
+
+        assert_eq!(hidden.promote("git"), Promotion::Promoted);
+        // Reactivate a just-reserved victim in the same batch. Only another
+        // unqueued optional slot may move; neither queued promise is stolen.
+        assert_eq!(hidden.promote("remote__a"), Promotion::Promoted);
+        assert_eq!(hidden.promote("remote__b"), Promotion::AtCap(4));
+        assert!(hidden.append_promoted(&mut sent));
+        assert_eq!(
+            sent,
+            json!([
+                tool("read_file", "kernel"),
+                tool("tool_search", "kernel"),
+                tool("git", "oldest optional"),
+                tool("remote__a", "a")
+            ])
+        );
+        assert!(hidden.is_hidden("remote__b"));
+        assert!(!hidden.is_hidden("git"));
+        assert_eq!(hidden.promote("git"), Promotion::NotHidden);
+        assert!(!hidden.append_promoted(&mut sent));
+    }
+
+    #[test]
     fn openai_wire_cap_keeps_kernel_before_optional_mcp_tools() {
         let mut defs = vec![tool("optional_server__tool_000", "remote")];
         defs.extend(
@@ -580,7 +680,7 @@ mod tests {
         defs.push(tool("run_command", "kernel"));
         defs.push(tool("tool_search", "kernel"));
 
-        let out = select_openai_compatible_tools(Value::Array(defs));
+        let out = select_openai_compatible_tools(Value::Array(defs), &HiddenTools::default());
         let names = out
             .as_array()
             .unwrap()

@@ -2965,6 +2965,15 @@ async fn execute_authorized_tool(
         // build lives here and presentation stays at the dispatcher boundary.
         "tool_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            // An exact known name is an explicit schema request through an
+            // already-exposed tool. Reuse only the controller's admitted
+            // definitions; fuzzy search never activates or executes anything.
+            if let Some(message) = hidden_tools
+                .filter(|_| tool_allowed(disposition, query.trim()))
+                .and_then(|hidden| hidden.promote(query.trim()).message(query.trim()))
+            {
+                return host_return(message);
+            }
             // FR-1 part 2 (#997): search only what THIS persona may call, so
             // discovery never surfaces a tool the executor would then refuse.
             let catalog = filter_advertised_tools(
