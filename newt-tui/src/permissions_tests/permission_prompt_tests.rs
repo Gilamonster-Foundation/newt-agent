@@ -2310,7 +2310,7 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
     let ask = PermissionRequest {
         tool: "request_permissions".to_string(),
         kind: DenialKind::Exec,
-        target: "python3".to_string(),
+        target: "/usr/bin/python3".to_string(),
         reason: "need to run the tests".to_string(),
     };
     assert!(matches!(
@@ -2321,7 +2321,7 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
     match gate.ask(&[exec_request("/usr/bin/python3")]) {
         newt_core::PermissionDecision::Allow(c) => {
             assert!(
-                c.permits_exec("python3"),
+                c.permits_exec("/usr/bin/python3"),
                 "the carried grant widened the caveats so the retry runs"
             );
         }
@@ -2444,7 +2444,42 @@ fn exact_executable_grants_respect_existing_basename_denials() {
 }
 
 #[test]
-fn session_grant_exec_matches_by_basename() {
+fn session_grant_exec_requires_exact_target() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let targets = ["mytool", "/opt/bin/mytool", "/tools/bin/mytool"];
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowSession; targets.len()],
+        prompts.clone(),
+    );
+    for (index, target) in targets.iter().enumerate() {
+        let mut request = exec_request(target);
+        request.tool = "request_permissions".into();
+        let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
+            panic!("the operator approved {target}");
+        };
+        assert!(
+            granted.permits_exec(target),
+            "mint the approved exact target"
+        );
+        assert_eq!(prompts.get(), index + 1, "distinct targets need decisions");
+        for unapproved in &targets[index + 1..] {
+            assert!(!granted.permits_exec(unapproved));
+        }
+        let newt_core::PermissionDecision::Allow(reused) = gate.ask(&[exec_request(target)]) else {
+            panic!("the identical target must reuse its session approval");
+        };
+        assert_eq!(reused, granted);
+        assert_eq!(prompts.get(), index + 1, "exact reuse must not prompt");
+    }
+}
+
+#[test]
+fn bare_session_exec_grant_does_not_bypass_an_absolute_request_denial() {
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));
     let mut gate = scripted_gate(
@@ -2452,24 +2487,64 @@ fn session_grant_exec_matches_by_basename() {
         base_caveats("/ws"),
         None,
         None,
-        vec![PromptChoice::AllowSession, PromptChoice::AllowSession],
+        vec![PromptChoice::AllowSession, PromptChoice::Deny],
         prompts.clone(),
     );
     assert!(matches!(
         gate.ask(&[exec_request("mytool")]),
         newt_core::PermissionDecision::Allow(_)
     ));
-    assert_eq!(prompts.get(), 1);
     assert!(matches!(
         gate.ask(&[exec_request("/opt/bin/mytool")]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_core::PermissionDecision::Deny
     ));
-    assert_eq!(prompts.get(), 1, "basename covers the resolved path");
+    assert_eq!(prompts.get(), 2);
+}
+
+#[test]
+fn bare_pending_once_exec_grant_survives_an_absolute_request_denial() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![
+            PromptChoice::AllowOnce,
+            PromptChoice::Deny,
+            PromptChoice::Deny,
+        ],
+        prompts.clone(),
+    );
+    let mut request = exec_request("mytool");
+    request.tool = "request_permissions".into();
     assert!(matches!(
-        gate.ask(&[exec_request("othertool")]),
+        gate.ask(&[request]),
         newt_core::PermissionDecision::Allow(_)
     ));
-    assert_eq!(prompts.get(), 2, "a different program is not covered");
+    assert!(matches!(
+        gate.ask(&[exec_request("/opt/bin/mytool")]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(
+        prompts.get(),
+        2,
+        "a different target needs its own decision"
+    );
+    let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("mytool")]) else {
+        panic!("the exact pending grant must survive a different target");
+    };
+    assert!(granted.permits_exec("mytool"));
+    assert!(!granted.permits_exec("/opt/bin/mytool"));
+    assert_eq!(prompts.get(), 2, "exact retry consumes the pending grant");
+    assert!(matches!(
+        gate.ask(&[exec_request("mytool")]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 3, "the pending grant is consumed only once");
+    drop(gate);
+    assert!(state.pending_once_grants.is_empty());
 }
 
 #[test]
@@ -3599,9 +3674,37 @@ fn should_prompt_permissions_defaults_on_interactive_and_off_headless() {
 }
 
 /// Exhaust the boolean product: no headless/non-TTY case may open a prompt.
-#[serial_test::serial(prompt_stdin)]
-#[test]
-fn headless_and_piped_sessions_never_construct_a_prompt_window() {
+/// Re-execution grounds the negative counter assertion in its own process;
+/// sibling permission tests may construct real windows in the parent.
+#[tokio::test]
+async fn headless_and_piped_sessions_never_construct_a_prompt_window() {
+    const CHILD: &str = "NEWT_HEADLESS_PROMPT_COUNTER_CHILD";
+    const COMPLETE: &str = "HEADLESS_PROMPT_COUNTER_UNCHANGED";
+    if std::env::var_os(CHILD).is_none() {
+        // Same bounded, cross-platform re-execution as the settings fixture.
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "permissions::permission_prompt_tests::headless_and_piped_sessions_never_construct_a_prompt_window",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("headless counter watchdog expired; child is killed on drop")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated headless counter failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed") && stdout.contains(COMPLETE));
+        return;
+    }
     let before = newt_core::tty::prompt_windows_constructed();
 
     for configured_on in [false, true] {
@@ -3629,6 +3732,7 @@ fn headless_and_piped_sessions_never_construct_a_prompt_window() {
         "a default-denied session must reach its denial without the terminal \
              ever being suspended for a question"
     );
+    println!("{COMPLETE}");
 }
 
 #[test]
@@ -3931,3 +4035,7 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
 }
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:06 EDT | Date: 2026-09-17
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 05:48 EDT | Date: 2026-09-18
