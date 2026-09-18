@@ -864,14 +864,22 @@ obedience or proves external edits occurred.
 CLI executable-directory scanning, and their regression tests.
 **Implements:** preserve the requested executable path through approval and
 retry. A full-path grant must not authorize a different same-named executable.
+Session and pending one-shot caches require the identical approved target;
+a bare name cannot suppress a separate decision for an absolute path.
 Keep intentionally bare system-command grants and existing bare-name denials.
 `--venv` and `--exec-path` retain absolute executable paths for kernel projection.
 **Tests:** exact prompt and recovery targets, immediate and proactive allow-once,
 same-name negative controls, saved denials, executable scans and venv symlinks.
+Check exact minted authority, session reuse, and pending-grant preservation
+when a different target is denied.
 A real Seatbelt subprocess test grounds the permission-to-execution path with
 a harmless temporary executable outside trusted system directories.
 **Out of scope:** ambient PATH resolution, broader exec or filesystem presets,
 sticky interpreter approval, and changes to sandbox enforcement.
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:06 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 02:02 EDT | Date: 2026-09-18
 
 ---
 

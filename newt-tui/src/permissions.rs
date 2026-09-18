@@ -663,7 +663,7 @@ pub(crate) struct PermissionPromptState {
     pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
 }
 
-/// Normalize only prompt memos; the authority check itself stays exact.
+/// Normalize legacy denials only; executable approvals stay exact.
 pub(crate) fn exec_grant_basename(cmd: &str) -> &str {
     cmd.rsplit(['/', '\\'])
         .find(|p| !p.is_empty())
@@ -704,40 +704,20 @@ fn ceiling_permits(
     }
 }
 
-/// Match exact grants, plus a basename-normalized exec request.
+/// Match the exact approved target, without treating a basename as a path grant.
 pub(crate) fn session_grant_covers(
     grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
 ) -> bool {
-    if grants.contains(&(req.kind, req.target.clone())) {
-        return true;
-    }
-    req.kind == newt_core::DenialKind::Exec
-        && grants.contains(&(
-            newt_core::DenialKind::Exec,
-            exec_grant_basename(&req.target).to_string(),
-        ))
+    grants.contains(&(req.kind, req.target.clone()))
 }
 
-/// Consume an exact or basename-normalized one-shot grant.
+/// Consume only the exact pending target; other requests leave it available.
 pub(crate) fn take_pending_once(
     pending: &mut std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
 ) -> Option<(newt_core::DenialKind, String)> {
-    let exact = (req.kind, req.target.clone());
-    if pending.remove(&exact) {
-        return Some(exact);
-    }
-    if req.kind == newt_core::DenialKind::Exec {
-        let base = (
-            newt_core::DenialKind::Exec,
-            exec_grant_basename(&req.target).to_string(),
-        );
-        if pending.remove(&base) {
-            return Some(base);
-        }
-    }
-    None
+    pending.take(&(req.kind, req.target.clone()))
 }
 
 impl PermissionPromptState {
@@ -1984,3 +1964,5 @@ mod b0a;
 mod b0b;
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:06 EDT | Date: 2026-09-17

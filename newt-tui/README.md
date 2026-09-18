@@ -17,6 +17,9 @@ An exec permission prompt preserves the executable's full path. Allow once
 authorizes that executable for the retry; another executable with the same
 name remains outside the grant. A proactive `request_permissions` approval
 keeps the same exact target until the matching operation consumes it.
+Session and pending one-shot approvals match the exact requested token. A bare
+name does not pre-approve an absolute path with the same name; that path needs
+its own decision. A different request leaves a pending one-shot grant available.
 Previously saved bare-name denials still apply to matching executable names.
 
 `--venv` and `--exec-path` grant the absolute paths of executable files in the
@@ -25,6 +28,10 @@ exec authority, invoke non-system tools by those absolute paths. Deliberate
 bare-name system grants still resolve through the sandbox's trusted system
 directories. These grants do not add filesystem or network access, resolve
 arbitrary programs from ambient PATH, or make interpreter approval permanent.
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:06 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 02:02 EDT | Date: 2026-09-18
 
 ### One-shot native filesystem grants
 
