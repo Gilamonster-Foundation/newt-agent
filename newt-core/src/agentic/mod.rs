@@ -296,7 +296,7 @@ pub use permissions::{
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
 };
 pub use plan_mode::{
-    plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict,
+    plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;

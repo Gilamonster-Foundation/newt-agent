@@ -406,6 +406,143 @@ fn plan_approval_intake(
     )
 }
 
+/// #2424: the objective a turn's draft and approval bind to — the root of
+/// the operator lineage, shared by discussion continuations and harness
+/// retries of the same objective, and distinct for every fresh prompt.
+fn plan_objective(context: Option<&newt_core::TurnPromptContext>) -> Option<newt_core::PromptId> {
+    context.map(|c| c.active().root_prompt_id())
+}
+
+/// #2424: what the turn-end approval hook decided, as data. The loop applies
+/// the side effects this crate cannot test in isolation (the process-global
+/// session mode, printing); everything that decides WHETHER work proceeds
+/// lives in [`run_plan_approval`] so a scripted gate can drive it end to end.
+#[derive(Debug, Default)]
+struct PlanApprovalEffects {
+    /// The one turn that runs next without the operator typing — at most one,
+    /// only on approval or a discussion answer.
+    queued: Option<PendingPlanTurn>,
+    /// `/mode plan` was the operator's standing choice; approval leaves it.
+    switch_to_dev: bool,
+    notice: String,
+}
+
+/// #2424: ask the human and turn the verdict into effects. Approval lifts the
+/// clamp and seeds implementation from the snapshot that was PRESENTED under
+/// this objective (consumed, so one "yes" seeds one turn); a discussion
+/// answer queues as operator-authored text; everything else — reject, empty,
+/// cancel, no gate, no operator, closed input — leaves the clamp in place and
+/// queues nothing. No gate outcome other than an explicit answer can widen
+/// what the model may do.
+fn run_plan_approval(
+    gate: Option<&mut dyn newt_core::agentic::PermissionGate>,
+    entry: newt_core::agentic::PlanEntry,
+    plan_state: &PlanModeState,
+    plan_draft: &PlanDraftState,
+    parent: Option<&newt_core::TurnPromptContext>,
+    exit_guidance: &str,
+) -> PlanApprovalEffects {
+    use newt_core::agentic::{
+        plan_verdict, HumanQuestionOutcome, PlanEntry, PlanModeControl as _, PlanVerdict,
+    };
+    // `/mode plan` is the operator's own standing choice, so leaving it is
+    // their explicit act too: the question says so, and approval switches
+    // the mode (design row 3).
+    let question = match entry {
+        PlanEntry::OperatorSelected => "Approve this plan and switch to /mode dev? [y/N/discuss] ",
+        PlanEntry::ModelDuringAct | PlanEntry::IntakeInferred => {
+            "Approve this plan? [y/N/discuss] "
+        }
+    };
+    let outcome = match gate {
+        Some(gate) => gate.ask_question(question),
+        None => HumanQuestionOutcome::Unavailable,
+    };
+    let mut effects = PlanApprovalEffects::default();
+    match plan_verdict(entry, outcome) {
+        PlanVerdict::Approved => {
+            if let Err(error) = plan_state.set_plan_mode(false) {
+                effects.notice = format!("plan approval: {error}");
+                return effects;
+            }
+            effects.switch_to_dev = entry == PlanEntry::OperatorSelected;
+            // Seed the implementation turn: the operator types nothing.
+            // Harness-authored, so it carries its own origin, and the
+            // tenacity exit guidance (formerly exit_plan_mode's ack) rides
+            // inside it — never disguised as operator text.
+            let seeded = match parent {
+                Some(parent) => {
+                    let plan = plan_draft.take_approved(parent.active().root_prompt_id());
+                    effects.queued = Some(PendingPlanTurn {
+                        text: plan_approval_seed_text(
+                            plan.as_ref().map(|p| p.draft.markdown.as_str()),
+                            exit_guidance,
+                        ),
+                        parent: Box::new(parent.clone()),
+                        kind: PlanTurnKind::Approval,
+                    });
+                    true
+                }
+                // No receipt to parent to (should not happen for a turn that
+                // just ran, but fails safe): the operator's own next message
+                // starts implementation.
+                None => false,
+            };
+            effects.notice = match (entry, seeded) {
+                (PlanEntry::OperatorSelected, true) => {
+                    "▸  plan approved — switched to /mode dev; implementing."
+                }
+                (_, true) => "▸  plan approved — implementing.",
+                (PlanEntry::OperatorSelected, false) => {
+                    "▸  plan approved — switched to /mode dev. Send a message to begin \
+                     implementation."
+                }
+                (_, false) => {
+                    "▸  plan approved — clamp lifted. Send a message to begin implementation."
+                }
+            }
+            .to_string();
+        }
+        PlanVerdict::StayClamped {
+            feedback: Some(feedback),
+        } => {
+            // Genuine operator text (their own answer to the approval
+            // question) runs as the next turn's input — queued the same way a
+            // harness retry is, but tagged OperatorContinuation since it is
+            // honestly operator-authored.
+            effects.notice = format!("▸  staying in plan mode — you said: {feedback}");
+            if let Some(parent) = parent {
+                effects.queued = Some(PendingPlanTurn {
+                    text: feedback,
+                    parent: Box::new(parent.clone()),
+                    kind: PlanTurnKind::Feedback,
+                });
+            }
+        }
+        PlanVerdict::StayClamped { feedback: None } => {
+            effects.notice = "▸  plan not approved — staying in plan mode.".to_string();
+        }
+    }
+    effects
+}
+
+impl PendingPlanTurn {
+    /// The loop-head consumption: the queued text becomes this turn's input
+    /// under the origin its kind dictates — operator-authored discussion as
+    /// `OperatorContinuation`, the harness seed as `HarnessPlanApproval`.
+    fn into_input(self) -> (ReadOutcome, ModelInputOrigin) {
+        let origin = match self.kind {
+            PlanTurnKind::Feedback => ModelInputOrigin::OperatorContinuation {
+                parent: self.parent,
+            },
+            PlanTurnKind::Approval => ModelInputOrigin::HarnessPlanApproval {
+                parent: self.parent,
+            },
+        };
+        (ReadOutcome::Line(self.text), origin)
+    }
+}
+
 /// #2424: how the Plan clamp now governing this turn was reached, decided
 /// from facts the loop already has at turn end. `Act` disposition means the
 /// model called `enter_plan_mode` mid-turn (the clamp is local, layered on
@@ -2900,15 +3037,7 @@ fn session_body(
             // fresh turn: reset the re-prompt budget, matching the
             // web-inject and normal-turn branches below.
             retry_budget = retry_max;
-            let origin = match queued.kind {
-                PlanTurnKind::Feedback => ModelInputOrigin::OperatorContinuation {
-                    parent: queued.parent,
-                },
-                PlanTurnKind::Approval => ModelInputOrigin::HarnessPlanApproval {
-                    parent: queued.parent,
-                },
-            };
-            (ReadOutcome::Line(queued.text), origin)
+            queued.into_input()
         } else if let Some(injected) = pending_clarification
             .is_none()
             .then(|| {
@@ -7987,9 +8116,11 @@ fn session_body(
                         conversation_mode_states.auto.bind(&active_conversation_id);
                     // #2424: bound to this conversation so its draft persists
                     // to THIS conversation's plan.md, not a shared/global one.
-                    let turn_plan_draft_sink = conversation_mode_states
-                        .plan_draft
-                        .bind(&active_conversation_id);
+                    let turn_plan_draft_sink = conversation_mode_states.plan_draft.bind(
+                        &active_conversation_id,
+                        plan_objective(active_prompt_context.as_ref()),
+                        &persist_plan_to_disk,
+                    );
                     let operating_mode_control = (active_operating_mode == OperatingMode::Auto)
                         .then_some(
                             &turn_auto_mode_control
@@ -8481,25 +8612,45 @@ fn session_body(
                                 // once, whether the model called
                                 // `exit_plan_mode` or the turn simply ended.
                                 // One code path covers both.
-                                let presented_draft = if let Some(draft) =
-                                    conversation_mode_states.plan_draft.take_for_presentation()
-                                {
-                                    let cols = crossterm::terminal::size()
-                                        .map(|(c, _)| c as usize)
-                                        .unwrap_or(80)
-                                        .max(20);
-                                    print!("▸  ");
-                                    print!(
-                                        "{}",
-                                        newt_core::agentic::render_markdown(
-                                            &draft.markdown,
-                                            newt_core::agentic::RenderOpts { color, cols },
-                                        )
-                                    );
-                                    println!();
-                                    true
-                                } else {
-                                    false
+                                // #2424: present the Plan-phase draft exactly
+                                // once, whether the model called
+                                // `exit_plan_mode` or the turn simply ended.
+                                // Only a draft bound to THIS objective is shown.
+                                let presented_draft = match plan_objective(
+                                    active_prompt_context.as_ref(),
+                                )
+                                .and_then(|objective| {
+                                    conversation_mode_states
+                                        .plan_draft
+                                        .take_for_presentation(objective)
+                                }) {
+                                    Some(plan) => {
+                                        let cols = crossterm::terminal::size()
+                                            .map(|(c, _)| c as usize)
+                                            .unwrap_or(80)
+                                            .max(20);
+                                        print!("▸  ");
+                                        print!(
+                                            "{}",
+                                            newt_core::agentic::render_markdown(
+                                                &plan.draft.markdown,
+                                                newt_core::agentic::RenderOpts { color, cols },
+                                            )
+                                        );
+                                        println!();
+                                        if verbose {
+                                            print_newt(
+                                                &format!(
+                                                    "plan draft revision {} ({})",
+                                                    plan.draft.revision, plan.id
+                                                ),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                        true
+                                    }
+                                    None => false,
                                 };
                                 // #2424: ask for approval exactly once, at
                                 // turn end, whether the model called
@@ -8509,10 +8660,7 @@ fn session_body(
                                 // Never runs for an ordinary Act turn that
                                 // never touched Plan mode at all.
                                 {
-                                    use newt_core::agentic::{
-                                        plan_verdict, HumanQuestionOutcome, PermissionGate as _,
-                                        PlanEntry, PlanModeControl as _, PlanVerdict,
-                                    };
+                                    use newt_core::agentic::PlanModeControl as _;
                                     let plan_state = &conversation_mode_states.plan;
                                     let exit_requested = plan_state.take_exit_requested();
                                     if plan_approval_due(
@@ -8525,144 +8673,29 @@ fn session_body(
                                             turn_disposition,
                                             active_operating_mode,
                                         );
-                                        // `/mode plan` is the operator's own standing choice,
-                                        // so leaving it is their explicit act too: the question
-                                        // says so, and approval switches the mode (design row 3).
-                                        let question = match entry {
-                                            PlanEntry::OperatorSelected => {
-                                                "Approve this plan and switch to /mode dev? \
-                                                 [y/N/discuss] "
-                                            }
-                                            PlanEntry::ModelDuringAct
-                                            | PlanEntry::IntakeInferred => {
-                                                "Approve this plan? [y/N/discuss] "
-                                            }
-                                        };
-                                        let outcome = match permission_gate.as_mut() {
-                                            Some(gate) => gate.ask_question(question),
-                                            None => HumanQuestionOutcome::Unavailable,
-                                        };
-                                        match plan_verdict(entry, outcome) {
-                                            PlanVerdict::Approved => {
-                                                if let Err(error) = plan_state.set_plan_mode(false)
-                                                {
-                                                    print_newt(
-                                                        &format!("plan approval: {error}"),
-                                                        color,
-                                                        verbose,
-                                                    );
-                                                } else {
-                                                    if entry == PlanEntry::OperatorSelected {
-                                                        // Same two writes `/mode dev` performs:
-                                                        // the process-global session mode the
-                                                        // next turn's caveats derive from, and
-                                                        // the loop's own mirror of it.
-                                                        newt_core::operating_mode::set_session_operating_mode(
-                                                            OperatingMode::Dev,
-                                                        );
-                                                        active_operating_mode = OperatingMode::Dev;
-                                                    }
-                                                    // Seed the implementation turn: the operator
-                                                    // types nothing. Harness-authored, so it
-                                                    // carries its own origin, and the tenacity
-                                                    // exit guidance (formerly exit_plan_mode's
-                                                    // ack) rides inside it — a harness-origin
-                                                    // message, never disguised as operator text.
-                                                    let seeded = match active_prompt_context.clone()
-                                                    {
-                                                        Some(parent) => {
-                                                            let plan = conversation_mode_states
-                                                                .plan_draft
-                                                                .latest();
-                                                            pending_plan_turn =
-                                                                Some(PendingPlanTurn {
-                                                                    text: plan_approval_seed_text(
-                                                                        plan.as_ref().map(|d| {
-                                                                            d.markdown.as_str()
-                                                                        }),
-                                                                        &newt_core::agentic::exit_plan_mode_result(
-                                                                            newt_core::tenacity::effective_tenacity(),
-                                                                        ),
-                                                                    ),
-                                                                    parent: Box::new(parent),
-                                                                    kind: PlanTurnKind::Approval,
-                                                                });
-                                                            true
-                                                        }
-                                                        // No receipt to parent to (should not
-                                                        // happen for a turn that just ran, but
-                                                        // fails safe): the operator's own next
-                                                        // message starts implementation.
-                                                        None => false,
-                                                    };
-                                                    print_newt(
-                                                        match (entry, seeded) {
-                                                            (PlanEntry::OperatorSelected, true) => {
-                                                                "▸  plan approved — switched to \
-                                                                 /mode dev; implementing."
-                                                            }
-                                                            (_, true) => {
-                                                                "▸  plan approved — implementing."
-                                                            }
-                                                            (
-                                                                PlanEntry::OperatorSelected,
-                                                                false,
-                                                            ) => {
-                                                                "▸  plan approved — switched to \
-                                                                 /mode dev. Send a message to \
-                                                                 begin implementation."
-                                                            }
-                                                            (_, false) => {
-                                                                "▸  plan approved — clamp lifted. \
-                                                                 Send a message to begin \
-                                                                 implementation."
-                                                            }
-                                                        },
-                                                        color,
-                                                        verbose,
-                                                    );
-                                                }
-                                            }
-                                            PlanVerdict::StayClamped { feedback } => match feedback
-                                            {
-                                                Some(feedback) => {
-                                                    // #2424: genuine operator text (their own
-                                                    // answer to the approval question) runs as
-                                                    // the next turn's input automatically --
-                                                    // queued the same way a harness retry is,
-                                                    // but tagged OperatorContinuation since it
-                                                    // is honestly operator-authored, not
-                                                    // harness-authored.
-                                                    print_newt(
-                                                        &format!(
-                                                            "▸  staying in plan mode — you said: \
-                                                             {feedback}"
-                                                        ),
-                                                        color,
-                                                        verbose,
-                                                    );
-                                                    if let Some(parent) =
-                                                        active_prompt_context.clone()
-                                                    {
-                                                        pending_plan_turn = Some(PendingPlanTurn {
-                                                            text: feedback,
-                                                            parent: Box::new(parent),
-                                                            kind: PlanTurnKind::Feedback,
-                                                        });
-                                                    }
-                                                    // No active_prompt_context to parent to
-                                                    // (shouldn't happen for a turn that just
-                                                    // ran, but fails safe): the feedback is
-                                                    // still printed above; the operator can
-                                                    // repeat it themselves.
-                                                }
-                                                None => print_newt(
-                                                    "▸  plan not approved — staying in plan mode.",
-                                                    color,
-                                                    verbose,
-                                                ),
-                                            },
+                                        let effects = run_plan_approval(
+                                            permission_gate.as_mut().map(|g| {
+                                                g as &mut dyn newt_core::agentic::PermissionGate
+                                            }),
+                                            entry,
+                                            plan_state,
+                                            &conversation_mode_states.plan_draft,
+                                            active_prompt_context.as_ref(),
+                                            &newt_core::agentic::exit_plan_mode_result(
+                                                newt_core::tenacity::effective_tenacity(),
+                                            ),
+                                        );
+                                        if effects.switch_to_dev {
+                                            // Same two writes `/mode dev` performs: the process-global
+                                            // session mode the next turn's caveats derive from, and the
+                                            // loop's own mirror of it.
+                                            newt_core::operating_mode::set_session_operating_mode(
+                                                OperatingMode::Dev,
+                                            );
+                                            active_operating_mode = OperatingMode::Dev;
                                         }
+                                        pending_plan_turn = effects.queued;
+                                        print_newt(&effects.notice, color, verbose);
                                     }
                                 }
                                 // Profile techniques, post-turn (R2). `retry` supersedes

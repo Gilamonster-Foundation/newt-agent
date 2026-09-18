@@ -41,6 +41,25 @@ pub struct PlanDraft {
     pub markdown: String,
 }
 
+/// The exact draft the operator was shown, identified by its content — the
+/// snapshot an approval binds to. Approval seeds implementation from THIS,
+/// never from whatever the mutable draft slot holds later, so a draft saved
+/// after presentation (or under another objective) cannot ride an earlier
+/// "yes". The id is `RawContentId` over the Markdown bytes (a `PlanDraft` is
+/// an opaque byte payload here, not a structured record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedPlan {
+    pub draft: PlanDraft,
+    pub id: content_addressable::RawContentId,
+}
+
+impl PresentedPlan {
+    pub fn new(draft: PlanDraft) -> Self {
+        let id = content_addressable::RawContentId::from_content(draft.markdown.as_bytes());
+        Self { draft, id }
+    }
+}
+
 /// Session-local sink for the model's in-progress Plan-phase draft.
 ///
 /// Under the Plan disposition, `render_report` replaces this draft instead of
