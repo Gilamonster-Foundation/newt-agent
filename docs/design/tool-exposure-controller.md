@@ -1,6 +1,6 @@
 # Design: the tool-exposure controller
 
-Status: in progress (Pass 1 + budget-clip milestone). Supersedes the ad-hoc
+Status: in progress (budget clipping + explicit named activation). Supersedes the ad-hoc
 "progressive tool-schema disclosure" sketch. Related: #725 (tool_search;
 lazy-load was deferred there), #1387 (Code Navigator added 10 `Gate::Always`
 tools), #546 / #712 (progressive disclosure epics), the model self-tuning
@@ -96,16 +96,31 @@ projections of one source of truth:
 The harness still enforces the full policy regardless of which projection the
 schema carried.
 
-## Hidden-tool recovery (a later pass, outcome enum reserved now)
+## Named activation and hidden-tool recovery
 
 ```text
 enum ToolReach { Exposed, KnownHidden, KnownUnauthorized, Unknown }
 ```
 
-`KnownHidden` (a real, authorized, unexposed tool) returns a coaching message
-that activates the tool into the working set and asks for a retry against the
-now-visible contract — clearer audit semantics than silently executing
-arguments the model never saw a schema for.
+An exact-name `tool_search` query loads that admitted schema for the next
+provider request. It never executes the operation or grants permission.
+Keyword, empty, unknown, and already-loaded searches leave exposure unchanged.
+The hidden marker teaches this callable entry point, so a model need not emit
+a function call that its provider has not advertised.
+
+`KnownHidden` recovery also retains the earlier compatibility path: a call to
+a real, authorized, unexposed tool returns coaching and queues its schema
+without executing unseen arguments. Both paths share `HiddenTools` and the
+same four-loop update/repricing hooks.
+
+The OpenAI-compatible 128-function projection retains every omitted definition,
+including under `full`. Below the cap an activation appends. At the cap it
+moves the oldest optional schema back to the hidden set, then appends the
+requested schema. Kernel tools and activations queued for the next request
+are protected; if they occupy every slot, activation reports the limit.
+Evicted tools can be requested again, with their original narrowed schemas.
+This deterministic count-bound working set does not implement adaptive
+token-budget eviction or recent-execution scoring.
 
 ## Config
 
@@ -149,3 +164,5 @@ reserved (classes, config field `supports_dynamic_catalog`) but not wired.
 
 Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock |
 Time: 10:57 EDT | Date: 2026-08-13
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:45 EDT | Date: 2026-09-17
