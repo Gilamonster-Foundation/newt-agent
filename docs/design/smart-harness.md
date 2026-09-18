@@ -328,7 +328,7 @@ sequenceDiagram
     K->>K: Jaccard(reply, prototypes) ≥ 0.28, margin 0.03
     K-->>H: EITHER final_answer → Completed → Terminal::Completed
     K-->>H: OR narration → NarrationCapExhausted → Terminal::StoppedShort
-    Note over H,K: StoppedShort scores outcome "model_error" (solve_contract.rs:119, :191)
+    Note over H,K: StoppedShort scores outcome "model_error" (headless_contract.rs:119, :191)
     Note over H,K: REPORTING is honest now — but the loop still ACCEPTED the narration as the answer
     end
     rect rgba(15,124,138,0.10)
@@ -356,7 +356,7 @@ has since landed. When this section was first written, `terminal()` put
 classifier still yielded a scored success. **That is no longer the code.** PR
 **#2251** merged 2026-09-09 (`44ff61c8`) and moved `NarrationCapExhausted` in
 with `RoundCap` / `Empty` / `Cancelled` → `Terminal::StoppedShort`
-(`solve_contract.rs:119`), scored as `model_error` (`:191`). Reporting is honest
+(`headless_contract.rs:119`), scored as `model_error` (`:191`). Reporting is honest
 now.
 
 What #2251 did **not** do is the reason #2239 remains open, and it is the part
@@ -482,7 +482,7 @@ explicitly. No other row's evidence has changed.
 `44ff61c8`, verified present on `origin/main`. **Issue #2239 is still OPEN**, and
 this section is the accounting of why.
 
-What the code does **now**, `newt-cli/src/solve_contract.rs:106-119`:
+What the code does **now**, `newt-cli/src/headless_contract.rs:106-119`:
 
 ```rust
 match end_reason {
@@ -531,7 +531,7 @@ and none is closed by this design document either.
    is issue ask #4, a separate change in `newt-core`, and it is the half this
    frame would make auditable; fixing it does not require waiting for the frame.
 2. **`NarrationFinalRound` was deliberately not moved with it.** It still maps to
-   `Terminal::Completed` (`solve_contract.rs:126-127`). The comment at `:120-125`
+   `Terminal::Completed` (`headless_contract.rs:126-127`). The comment at `:120-125`
    states why: it is "a different exit — the round limit arrived while the model
    happened to be narrating — and no report stands behind reclassifying it… a
    separate decision with its own bench-row consequences, not a wildcard to sweep

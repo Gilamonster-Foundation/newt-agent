@@ -726,7 +726,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Closure criterion:** met — (a) `--non-interactive` cannot select the OCAP-off lane, only the
   explicit `--unsafe-host-exec`; (b) a frozen `LaunchAuthority`, resolved once, is the authority
   source, and a source-inventory gate proves no deep library reads the env twins directly.
-- **Ratchet guard:** `non_interactive_never_relaxes_authority` (`newt-cli/src/solve.rs`) — a plain
+- **Ratchet guard:** `non_interactive_never_relaxes_authority` (`newt-cli/src/headless.rs`) — a plain
   headless run resolves `Confined`, never `Yolo`; `frozen_authority_ignores_later_env_mutation`,
   `freeze_is_first_wins_a_second_freeze_cannot_widen`, `meet_can_only_attenuate_never_widen`,
   `from_env_reads_exactly_one_fail_closed` (`newt-core/src/launch_authority.rs`) — freeze a confined
