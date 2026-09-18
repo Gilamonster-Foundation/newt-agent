@@ -1728,7 +1728,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     for host in &hosts {
         doc = Config::with_net_host(&doc, host)?;
     }
-    if target_original.as_deref() != Some(doc.as_str()) {
+    if !adopted.is_empty() && target_original.as_deref() != Some(doc.as_str()) {
         atomic_import_commit(&target_destination, target_original.as_deref(), &doc)?;
     }
 

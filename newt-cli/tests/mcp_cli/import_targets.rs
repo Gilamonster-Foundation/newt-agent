@@ -438,9 +438,20 @@ fn uat_import_updates_once_resolved_authoritative_config_target() {
         .success();
 
     let updated = std::fs::read_to_string(&referent).unwrap();
-    assert!(updated.contains(original));
+    for line in original.lines() {
+        assert_eq!(
+            updated
+                .lines()
+                .filter(|updated_line| *updated_line == line)
+                .count(),
+            1,
+            "preserve each original line exactly once: {line:?}"
+        );
+    }
+    let config = load_config(&referent);
+    assert_eq!(config.default_tier_order, vec![newt_core::Tier::Fast]);
     assert_eq!(
-        load_config(&referent).tui.unwrap().permissions.net,
+        config.tui.unwrap().permissions.net,
         vec!["broker.example.test"]
     );
     assert!(!sb.config_dir.join("mcp.toml").exists());
@@ -490,3 +501,5 @@ fn uat_import_updates_once_resolved_windows_symlinked_config_target() {
         .file_type()
         .is_symlink());
 }
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 01:27 EDT | Date: 2026-09-18
