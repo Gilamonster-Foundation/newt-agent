@@ -21,7 +21,7 @@ mod context_errors;
 
 /// Set/unset an env var for the test's duration, restoring prior state on
 /// drop (env vars are process-global — hence the serial lane above).
-pub(super) struct EnvGuard {
+pub(crate) struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
 }
@@ -31,7 +31,7 @@ impl EnvGuard {
         std::env::set_var(key, value);
         Self { key, prev }
     }
-    fn unset(key: &'static str) -> Self {
+    pub(crate) fn unset(key: &'static str) -> Self {
         let prev = std::env::var(key).ok();
         std::env::remove_var(key);
         Self { key, prev }

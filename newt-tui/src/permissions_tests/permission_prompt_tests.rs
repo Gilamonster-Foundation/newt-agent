@@ -3674,9 +3674,37 @@ fn should_prompt_permissions_defaults_on_interactive_and_off_headless() {
 }
 
 /// Exhaust the boolean product: no headless/non-TTY case may open a prompt.
-#[serial_test::serial(prompt_stdin)]
-#[test]
-fn headless_and_piped_sessions_never_construct_a_prompt_window() {
+/// Re-execution grounds the negative counter assertion in its own process;
+/// sibling permission tests may construct real windows in the parent.
+#[tokio::test]
+async fn headless_and_piped_sessions_never_construct_a_prompt_window() {
+    const CHILD: &str = "NEWT_HEADLESS_PROMPT_COUNTER_CHILD";
+    const COMPLETE: &str = "HEADLESS_PROMPT_COUNTER_UNCHANGED";
+    if std::env::var_os(CHILD).is_none() {
+        // Same bounded, cross-platform re-execution as the settings fixture.
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "permissions::permission_prompt_tests::headless_and_piped_sessions_never_construct_a_prompt_window",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("headless counter watchdog expired; child is killed on drop")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated headless counter failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed") && stdout.contains(COMPLETE));
+        return;
+    }
     let before = newt_core::tty::prompt_windows_constructed();
 
     for configured_on in [false, true] {
@@ -3704,6 +3732,7 @@ fn headless_and_piped_sessions_never_construct_a_prompt_window() {
         "a default-denied session must reach its denial without the terminal \
              ever being suspended for a question"
     );
+    println!("{COMPLETE}");
 }
 
 #[test]
@@ -4008,3 +4037,5 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 17:30 EDT | Date: 2026-09-15
 
 // Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:06 EDT | Date: 2026-09-17
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 05:48 EDT | Date: 2026-09-18

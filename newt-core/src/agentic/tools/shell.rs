@@ -78,7 +78,7 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     // without this brush cannot expand `~` (it resolves `~` from its `HOME` shell
     // var, erroring "HOME not set") and the command silently used a literal
     // `~/…` path — leaving `<cwd>/~/…` debris on disk. Seed a minimal,
-    // operator-configurable allow-list from the process env (default HOME+USER;
+    // operator-configurable allow-list from the process env (default HOME+USER+TZ;
     // widened via `[shell] env_passthrough`, published as
     // NEWT_SHELL_ENV_PASSTHROUGH). Each var is set only when present, so nothing
     // is fabricated and the default stays narrow (the confined shell is a trust
@@ -142,7 +142,7 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
 
 /// The confined-shell env passthrough list: `NEWT_SHELL_ENV_PASSTHROUGH`
 /// (colon-separated, published from `[shell] env_passthrough`) or the minimal
-/// default (`HOME`, `USER`). Empty entries are dropped.
+/// default (`HOME`, `USER`, `TZ`). Empty names are dropped; empty values survive.
 fn shell_env_passthrough() -> Vec<String> {
     match std::env::var("NEWT_SHELL_ENV_PASSTHROUGH") {
         Ok(s) if !s.trim().is_empty() => s

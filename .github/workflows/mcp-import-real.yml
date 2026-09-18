@@ -67,6 +67,24 @@ jobs:
           -p newt-core atomic_fs::tests::
           -- --ignored --test-threads=1
 
+      - name: Run confined child timezone inheritance acceptance
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test confined_shell_parent_timezone_reaches_child_and_grandchild
+          -p newt-core --lib confined_shell_parent_timezone_reaches_child_and_grandchild
+          -- --ignored --test-threads=1
+
+      - name: Run stdio MCP timezone inheritance acceptance
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test stdio_timezone_preserves_parent_and_server_override
+          -p newt-mcp-client --lib stdio_timezone_preserves_parent_and_server_override
+          -- --ignored --test-threads=1
+
       - name: Run private-review MCP recovery acceptance test
         shell: bash
         run: >-

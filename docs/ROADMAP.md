@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (10 steps)
+# Phase 10 — newt-cli polish (11 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -904,6 +904,27 @@ acknowledgement and repeat-cache recognition.
 targets, command-history binding, lifecycle declarations, new persistent
 records or sandbox implementations, and rollback of consumed one-shot grants
 when a later operator decision refuses the invocation.
+
+---
+
+## Step 10.12 — Child timezone inheritance
+
+**Branch:** `step-10.12-child-timezone`
+**Touches:** existing shell and stdio MCP environment defaults and regression
+tests, with the real subprocess cases in the weekly/release integration lane.
+**Implements:** pass the parent's explicit `TZ` through the existing closed
+allowlists on every platform. Preserve absent versus empty values, shell
+allowlist customization, and MCP server overrides without granting file access.
+**Tests:** default membership, named/POSIX/empty/unset values, operator opt-out,
+secret isolation, real confined shell descendants, and real stdio MCP children.
+The composed CI gate also isolates the existing headless prompt-counter
+witness in a bounded subprocess, so unrelated permission tests cannot change
+its process-wide counter. Its policy and no-construction assertions remain.
+**Out of scope:** timezone parsing or normalization, OS timezone policy owned
+by Bridle, Windows AppContainer runtime proof (agent-bridle#387), and micro-VM
+timezone materialization (agent-bridle#388).
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 05:48 EDT | Date: 2026-09-18
 
 ---
 
@@ -2193,3 +2214,5 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 23
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
