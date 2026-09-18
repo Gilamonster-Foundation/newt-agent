@@ -22,6 +22,7 @@ pub mod dgx_vllm;
 mod dock_cmd;
 mod doctor;
 mod frame_cmd;
+mod headless;
 pub mod help_suite;
 mod identity_cmd;
 mod mcp_cmd;
@@ -32,10 +33,9 @@ mod ocap_cmd;
 mod providers_cmd;
 mod providers_import;
 mod skills;
-mod solve;
 // W0 (#1511): the pure emitter-side declaration of the observability
-// contract (`contract_version: "1"`) `newt solve` appends to `--events`.
-mod solve_contract;
+// contract (`contract_version: "1"`) `newt headless` appends to `--events`.
+mod headless_contract;
 pub mod stack;
 pub mod stdio_guard;
 mod summarizer_cmd;
@@ -169,7 +169,7 @@ pub struct Cli {
     /// forces an edit sooner (nudge after 6/3/2/1 read-only rounds) and makes
     /// plan-mode exit hand off to a mandatory edit. Default `standard`
     /// (behaviour-preserving). Small models that over-explore benefit from
-    /// `insistent`/`relentless`. In interactive code sessions and `solve`,
+    /// `insistent`/`relentless`. In interactive code sessions and `headless`,
     /// explicit `relentless` also makes the default tool-round budget effectively
     /// unlimited; an explicit round limit wins.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
@@ -179,7 +179,7 @@ pub struct Cli {
     /// `glancing` | `pondering` | `deliberating` | `contemplating`, mapping to the
     /// OpenAI `reasoning.effort` wire field (minimal … high) on the Responses API.
     /// A session-wide override that beats a persona's `cognition:`; applies to the
-    /// interactive TUI AND the headless `solve` / worker path. Unset ⇒ no
+    /// interactive TUI AND the `headless` / worker path. Unset ⇒ no
     /// `reasoning.effort` is sent (unless a persona sets one).
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_cognition)]
     pub cognition: Option<newt_core::role_profile::Cognition>,
@@ -188,7 +188,7 @@ pub struct Cli {
     /// launch act that moves three orthogonal dials at once: cognition to
     /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
     /// forcing), and the crew ON (as if `NEWT_TEAM` were set). For interactive
-    /// code sessions and `solve`, Relentless makes the default round budget
+    /// code sessions and `headless`, Relentless makes the default round budget
     /// effectively unlimited. An explicit
     /// `--tenacity` alongside still wins. In-session, `/psyche obsessive` engages
     /// the two live dials; crew needs a launch with this flag. Alias
@@ -632,7 +632,7 @@ pub enum Command {
     },
     /// Self-scheduled wake-up timers. `schedule` records a deferred prompt the
     /// agent re-enters with later; `fire --run` (from a cron/launchd job) drains
-    /// due timers and drives each prompt through the `newt solve` entry point;
+    /// due timers and drives each prompt through the `newt headless` entry point;
     /// bare `fire` prints `PROM\t…` lines for a host that pipes them onward;
     /// `list` / `dismiss` manage the queue. The host owns the clock.
     Timer {
@@ -789,12 +789,15 @@ pub enum Command {
         #[command(subcommand)]
         cmd: dock_cmd::DockCmd,
     },
-    /// Solve one task HEADLESS and emit a trace (Terminal-Bench / #1419). Drives
-    /// the same agentic loop the TUI runs, non-interactively, and exits. Reads
-    /// the task from `--instruction-file`, runs in `--cwd`, and appends a JSONL
-    /// trace to `--events`. Execution is confined by default; non-interactive
+    /// Drive one task through the agentic loop with no interactive prompts,
+    /// and exit. The same non-interactive entry Terminal-Bench uses (#1419),
+    /// but not specific to it — any caller wanting a single headless turn
+    /// (a cron-fired timer, a script, a bench harness) uses this. Drives the
+    /// same agentic loop the TUI runs — no second loop. Reads the task from
+    /// `--instruction-file`, runs in `--cwd`, and appends a JSONL trace to
+    /// `--events`. Execution is confined by default; non-interactive
     /// operation does not grant host access.
-    Solve {
+    Headless {
         /// Workspace directory the agent runs against (default: current dir).
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
@@ -803,7 +806,7 @@ pub enum Command {
         instruction_file: PathBuf,
         /// Run headless with no interactive prompts (default true). P3: this
         /// controls INTERACTION only — it does NOT disable OCAP or grant host
-        /// access. A plain `newt solve` is confined; unconfined execution needs
+        /// access. A plain `newt headless` is confined; unconfined execution needs
         /// the explicit `--unsafe-host-exec` below.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         non_interactive: bool,
@@ -828,7 +831,7 @@ pub enum Command {
         /// Private frame directory (default: user config/frame/<workspace CID>).
         #[arg(long, value_name = "DIR")]
         frame_dir: Option<PathBuf>,
-        /// Override the max tool-call rounds for this solve.
+        /// Override the max tool-call rounds for this headless.
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
         /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`,
@@ -851,19 +854,19 @@ pub enum Command {
         /// Refuse to start unless this feature can be supplied for the run
         /// (repeatable). Checked before any model request (#2314).
         #[arg(long, value_name = "FEATURE")]
-        require_feature: Vec<solve_contract::Feature>,
-        /// Output-token allowance for this solve; overrides
+        require_feature: Vec<headless_contract::Feature>,
+        /// Output-token allowance for this headless; overrides
         /// `[[model_tuning]] output_allowance` for the model (#2312).
         #[arg(long, value_name = "TOKENS")]
         output_allowance: Option<u32>,
-        /// Run-level call-count allowance for this solve; overrides
+        /// Run-level call-count allowance for this headless; overrides
         /// `[[model_tuning]] run_allowance` for the model (#2313). Further
         /// primary inference dispatch is refused once this many calls have
         /// been made.
         #[arg(long, value_name = "CALLS")]
         run_allowance: Option<u32>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
-        /// otherwise starts a resumable frame; legacy solve keeps its default.
+        /// otherwise starts a resumable frame; legacy headless keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
         /// transformations, and does not claim bit-for-bit inference replay.
         ///
@@ -1104,7 +1107,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         unsafe { std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir) };
     }
     // #1320: `--config <file>` is otherwise only forwarded to the path-taking
-    // subcommands (solve/config/mcp/doctor/…) via `Config::load`; it never reaches
+    // subcommands (headless/config/mcp/doctor/…) via `Config::load`; it never reaches
     // the arg-free `Config::resolve()` that chat/plan/worker use, so `newt --config
     // X` silently kept resolving `~/.newt` for the interactive session. Promote it
     // to the process-global `$NEWT_CONFIG` pin (`candidate_paths[0]`) — the same
@@ -1750,7 +1753,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Providers { cmd } => providers_cmd::run(cmd),
-        Command::Solve {
+        Command::Headless {
             cwd,
             instruction_file,
             non_interactive,
@@ -1776,7 +1779,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let launch =
                 newt_launch::LaunchConfig::from_flags(hermetic, cli.resume.is_some(), resume_from)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let code = solve::run(solve::SolveArgs {
+            let code = headless::run(headless::HeadlessArgs {
                 cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
                 instruction_file,
                 // The pinned benchmark profile is the global `--config <FILE>`.
@@ -2226,10 +2229,10 @@ mod tests {
     }
 
     #[test]
-    fn solve_context_window_rejects_values_that_cannot_enter_the_contract() {
+    fn headless_context_window_rejects_values_that_cannot_enter_the_contract() {
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "task.md",
             "--context-window",
@@ -2356,30 +2359,34 @@ mod tests {
         assert!(Cli::try_parse_from(["newt", "--resume", "x", "--ephemeral"]).is_err());
     }
 
-    /// The continuity flags share the ONE global `--resume`; `solve` must not
+    /// The continuity flags share the ONE global `--resume`; `headless` must not
     /// redeclare that id. A second definition under a different type does not
     /// fail to compile — it panics at parse time with "Mismatch between
-    /// definition and access of `resume`", so a plain `newt solve` dies before
-    /// doing any work. This pins that `solve` still parses bare, which is the
+    /// definition and access of `resume`", so a plain `newt headless` dies before
+    /// doing any work. This pins that `headless` still parses bare, which is the
     /// shape the panic broke.
     #[test]
-    fn solve_continuity_flags_share_the_one_global_resume() {
+    fn headless_continuity_flags_share_the_one_global_resume() {
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "x.md",
             "--max-rounds",
             "1"
         ])
         .is_ok());
-        assert!(
-            Cli::try_parse_from(["newt", "solve", "--instruction-file", "x.md", "--hermetic"])
-                .is_ok()
-        );
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
+            "--instruction-file",
+            "x.md",
+            "--hermetic"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "newt",
+            "headless",
             "--instruction-file",
             "x.md",
             "--resume",
@@ -2388,7 +2395,7 @@ mod tests {
         .is_ok());
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "x.md",
             "--resume-from",
@@ -2398,7 +2405,7 @@ mod tests {
         // Hermetic refuses either shape of continuity, not one of them.
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "x.md",
             "--hermetic",
@@ -2408,7 +2415,7 @@ mod tests {
         .is_err());
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "x.md",
             "--hermetic",
@@ -2458,7 +2465,7 @@ mod tests {
     fn smart_harness_flags_preserve_hermetic_resume_exclusion() {
         let cli = Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "task.md",
             "--smart-harness",
@@ -2468,7 +2475,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Solve {
+            Some(Command::Headless {
                 smart_harness: true,
                 frame_dir: Some(_),
                 ..
@@ -2476,7 +2483,7 @@ mod tests {
         ));
         assert!(Cli::try_parse_from([
             "newt",
-            "solve",
+            "headless",
             "--instruction-file",
             "task.md",
             "--smart-harness",

@@ -107,7 +107,7 @@ pub enum FrameCmd {
     },
     /// Explain a unit, causal event, request, projection, or session journal entry.
     Explain {
-        /// The addressed record's content id, including a solve's reported head.
+        /// The addressed record's content id, including a headless's reported head.
         cid: String,
         /// Frame store directory (default: `~/.newt/frame`).
         #[arg(long)]

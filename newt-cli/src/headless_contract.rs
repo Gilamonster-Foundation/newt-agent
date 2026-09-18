@@ -1,4 +1,4 @@
-//! The observability-contract record `newt solve` emits (W0 #1511, epic
+//! The observability-contract record `newt headless` emits (W0 #1511, epic
 //! #1506) — the wire format the EXTERNAL evaluator consumes.
 //!
 //! The contract (`gilamonster-bench/CONTRACT.md`, `contract_version: "1"`) is
@@ -8,9 +8,9 @@
 //! the circularity the versioned wire format exists to prevent.
 //!
 //! Everything here is pure (inputs → `serde_json::Value`) so the record
-//! shape is unit-tested without a run; `solve::run` supplies the inputs and
+//! shape is unit-tested without a run; `headless::run` supplies the inputs and
 //! appends the lines to `--events`. Exactly ONE contract record is emitted
-//! per solve — the bench keys on the presence of `contract_version` and
+//! per headless — the bench keys on the presence of `contract_version` and
 //! rejects ambiguous traces.
 
 use newt_core::agentic::InstantiatedFeatures;
@@ -36,7 +36,7 @@ pub struct ContractInputs<'a> {
     pub effective_model: &'a str,
     /// Operator-supplied sha256 of the served weights; `None` ⇒ omitted.
     pub model_digest: Option<&'a str>,
-    /// The resolved backend driven for this solve.
+    /// The resolved backend driven for this headless.
     pub backend_name: &'a str,
     /// Wire kind label (`openai` / `ollama` / `embedded`).
     pub backend_kind: &'a str,
@@ -56,7 +56,7 @@ pub struct ContractInputs<'a> {
     pub ocap: &'static str,
     /// The max tool-rounds cap the driver actually used.
     pub max_rounds: u32,
-    /// Wall-clock duration of the solve in milliseconds.
+    /// Wall-clock duration of the headless in milliseconds.
     pub wall_ms: u64,
     /// Generated (output) tokens, when the backend reported usage.
     pub gen_tokens: Option<u64>,
@@ -186,7 +186,7 @@ pub fn outcome_label(t: Terminal) -> &'static str {
             TurnEndReason::RepairExhausted | TurnEndReason::VerificationIncomplete,
         ) => "completed",
         // The model was exercised but did not deliver an answer. A question is
-        // a valid interactive pause, yet a headless solve still needs an answer.
+        // a valid interactive pause, yet a headless still needs an answer.
         // Smart final-round narration remains a scored attempt. The legacy
         // final-round classification is preserved by `terminal` above.
         Terminal::StoppedShort(
@@ -338,13 +338,13 @@ impl Feature {
         }
     }
 
-    /// THE absence table: why `newt solve` did not supply this feature, as the
+    /// THE absence table: why `newt headless` did not supply this feature, as the
     /// receipt's `(state, reason)`. Admission reads it too, so a refusal and
     /// the receipt cannot disagree.
     fn absence(self) -> (&'static str, &'static str) {
         match self {
             Self::Scratchpad => ("unavailable", "no --scratchpad-state was supplied"),
-            Self::CodeSearch => ("unsupported", "headless solve builds no retrieval index"),
+            Self::CodeSearch => ("unsupported", "headless builds no retrieval index"),
             Self::Crew => (
                 "unavailable",
                 "crew is not enabled for this run (NEWT_TEAM)",
@@ -372,15 +372,15 @@ pub fn admit_required(
 /// the turn, derived from its constructed context. Each entry's `state` is
 ///
 /// * `instantiated` — in the context: advertised and executable;
-/// * `unsupported` — `newt solve` has no way to supply it;
-/// * `unavailable` — `newt solve` can supply it, but did not for this run;
+/// * `unsupported` — `newt headless` has no way to supply it;
+/// * `unavailable` — `newt headless` can supply it, but did not for this run;
 /// * `requested` — required, but the turn did not confirm it was instantiated.
 ///
 /// A feature that did not participate carries a `reason`, and a required one
 /// says `required: true`. With no turn outcome (`f` is `None`) only the
 /// requirements are known, so only they are listed; with none, the section is
 /// omitted. An instantiated scratchpad also names its `scope` and `seed`:
-/// solve's only state source is the explicit seed, so the scope is `fresh`.
+/// headless's only state source is the explicit seed, so the scope is `fresh`.
 pub fn feature_receipt(
     f: Option<InstantiatedFeatures>,
     required: &[Feature],
@@ -750,12 +750,12 @@ mod tests {
     }
 
     /// #2315 (A14): the verification receipt entry rides the contract record
-    /// when solve supplies it, even with no features section, and is absent
+    /// when headless supplies it, even with no features section, and is absent
     /// otherwise (never invented).
     ///
     /// #2374 round three, item 8: a record with no turn outcome (`features` is
     /// `None`: the turn task failed to start, panicked or was cancelled) ran no
-    /// gate, so it claims no mode even when solve supplied one.
+    /// gate, so it claims no mode even when headless supplied one.
     #[test]
     fn the_verification_receipt_is_carried_only_when_supplied() {
         let entry = serde_json::json!({"mode": "result_aware", "repair_allowance": 3});
@@ -1063,7 +1063,7 @@ mod tests {
             parsed["receipt"],
             serde_json::json!({"features": {
                 "scratchpad": {"state": "unavailable", "reason": "no --scratchpad-state was supplied"},
-                "code_search": {"state": "unsupported", "reason": "headless solve builds no retrieval index"},
+                "code_search": {"state": "unsupported", "reason": "headless builds no retrieval index"},
                 "crew": {"state": "instantiated"},
             }})
         );
@@ -1125,7 +1125,7 @@ mod tests {
         .to_string();
         assert_eq!(
             refused,
-            "required feature `code_search` is unsupported: headless solve builds no retrieval index"
+            "required feature `code_search` is unsupported: headless builds no retrieval index"
         );
         assert!(admit_required(&[Feature::Crew], |f| f == Feature::Crew).is_ok());
     }
@@ -1180,5 +1180,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "solve_contract_context_tests.rs"]
+#[path = "headless_contract_context_tests.rs"]
 mod context_tests;

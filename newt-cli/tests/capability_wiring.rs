@@ -1,10 +1,10 @@
-//! **Headless `solve` consumes the capability sidecar, like every lane.**
+//! **`headless` consumes the capability sidecar, like every lane.**
 //!
-//! Independent review found (twice) that `solve` wired capabilities
+//! Independent review found (twice) that `headless` wired capabilities
 //! differently from the TUI: first a missing `emits_leading_reasoning`
 //! hand-off, then raw inline-only `BackendConfig` accessors after the
 //! sidecar landed. Divergence between lanes is silent precisely where nobody
-//! watches a stream, so the shape is asserted: `solve.rs` pairs the selected
+//! watches a stream, so the shape is asserted: `headless.rs` pairs the selected
 //! backend with ITS OWN provenance receipt, seeds `ResolvedCapabilities`
 //! from the receipt's binding (never a re-derived one), decides
 //! `for_route` against the typed route destination, renders prose through
@@ -29,7 +29,7 @@ const REQUIRED: &[&str] = &[
     "decision.emits_leading_reasoning()",
 ];
 
-/// Shapes that must NOT appear in solve: raw inline-only accessors (the
+/// Shapes that must NOT appear in headless: raw inline-only accessors (the
 /// decision owns them) and the pre-pivot capability/attribution APIs (a
 /// re-derived binding or a principal-only decision reintroduces the exact
 /// silent-rebind / lane-divergence classes the pivot closed).
@@ -49,18 +49,18 @@ const BANNED: &[&str] = &[
     // owns the no-name-inference guarantee at the source.)
 ];
 
-fn solve_source() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/solve.rs");
+fn headless_source() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/headless.rs");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 #[test]
-fn solve_takes_every_capability_from_the_decision() {
-    let src = solve_source();
+fn headless_takes_every_capability_from_the_decision() {
+    let src = headless_source();
     for needle in REQUIRED {
         assert!(
             src.contains(needle),
-            "newt-cli/src/solve.rs no longer contains `{needle}` — headless must \
+            "newt-cli/src/headless.rs no longer contains `{needle}` — headless must \
              consume the same sidecar decision as the TUI, or the two lanes drift \
              silently"
         );
@@ -68,7 +68,7 @@ fn solve_takes_every_capability_from_the_decision() {
     for needle in BANNED {
         assert!(
             !src.contains(needle),
-            "newt-cli/src/solve.rs reads `{needle}` — a raw inline-only accessor \
+            "newt-cli/src/headless.rs reads `{needle}` — a raw inline-only accessor \
              beside the sidecar decision reintroduces exactly the lane divergence \
              this guard exists to prevent"
         );
@@ -79,5 +79,5 @@ fn solve_takes_every_capability_from_the_decision() {
 /// success forever.
 #[test]
 fn the_guard_reads_the_real_solve_source() {
-    assert!(solve_source().contains("TurnDriverConfig::new"));
+    assert!(headless_source().contains("TurnDriverConfig::new"));
 }

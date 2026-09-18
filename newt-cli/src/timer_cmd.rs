@@ -8,9 +8,9 @@
 //! ## Wake-up path (the supported one)
 //!
 //! `newt timer fire --run` drains due timers and drives each prompt through
-//! the same [`crate::solve::run`] entry point `newt solve` uses — writing the
+//! the same [`crate::headless::run`] entry point `newt headless` uses — writing the
 //! prompt to a transient `--instruction-file` and running a real headless
-//! solve against the current workspace. A host scheduler (cron, launchd, a
+//! headless against the current workspace. A host scheduler (cron, launchd, a
 //! shell loop) only has to call this on a beat:
 //!
 //! ```sh
@@ -21,14 +21,14 @@
 //! per due timer as `PROM\t<id>\t<prompt>` for a host that wants to feed a
 //! different entry point. It does NOT consume the queue — a due timer is not
 //! removed merely for being emitted, so the host MUST `newt timer dismiss <id>`
-//! once its own solve succeeds, or every beat re-emits the same prompt. The id
+//! once its own headless succeeds, or every beat re-emits the same prompt. The id
 //! is in the record precisely so that dismiss is possible; the prompt field is
 //! escaped (`\\` `\n` `\r` `\t`) so one timer is always exactly one line:
 //!
 //! ```sh
 //! newt timer fire | while IFS=$'\t' read -r _ id prompt; do
 //!   f=$(mktemp); printf '%b' "$prompt" > "$f"
-//!   newt solve --instruction-file "$f" && newt timer dismiss "$id"; rm -f "$f"
+//!   newt headless --instruction-file "$f" && newt timer dismiss "$id"; rm -f "$f"
 //! done
 //! ```
 //!
@@ -70,18 +70,18 @@ pub enum TimerCmd {
     },
     /// Drain due timers. Without `--run` this is a NON-MUTATING emit: it
     /// prints each due timer as `PROM\t<id>\t<prompt>` and leaves the queue
-    /// alone, so the host must `newt timer dismiss <id>` once its own solve
+    /// alone, so the host must `newt timer dismiss <id>` once its own headless
     /// succeeds — otherwise every beat re-emits the same due prompt. With
     /// `--run` it re-enters the agent with each due prompt through the
-    /// `newt solve` entry point (in-process) and manages the queue for you
+    /// `newt headless` entry point (in-process) and manages the queue for you
     /// (claim → execute → acknowledge); that is the supported wake-up path.
     /// See the module docs.
     Fire {
-        /// Re-enter the agent with each due prompt via `newt solve` (in-process)
+        /// Re-enter the agent with each due prompt via `newt headless` (in-process)
         /// instead of printing `PROM\t…` lines. Runs the safe, confined lane a
-        /// plain `newt solve` defaults to. Uses select/claim → execute →
+        /// plain `newt headless` defaults to. Uses select/claim → execute →
         /// acknowledge semantics: a due timer is claimed, driven through
-        /// solve, and only removed/advanced on success; a failed solve leaves
+        /// headless, and only removed/advanced on success; a failed headless leaves
         /// the timer pending/retryable and stops the beat so later due timers
         /// are never silently lost.
         #[arg(long)]
@@ -99,7 +99,7 @@ pub enum TimerCmd {
 
 /// Dispatch `newt timer <cmd>`. `config` is the global `--config` file,
 /// threaded to `fire --run` so a host scheduler's backend selection reaches
-/// the solve run the same way `newt solve --config` would.
+/// the headless run the same way `newt headless --config` would.
 pub async fn run(cmd: TimerCmd, config: Option<&Path>) -> anyhow::Result<i32> {
     match cmd {
         TimerCmd::Schedule {
@@ -139,7 +139,7 @@ pub async fn run(cmd: TimerCmd, config: Option<&Path>) -> anyhow::Result<i32> {
             let store = TimerStore::open(dir.as_deref())?;
             let clock = SystemClock;
             if !run {
-                // Bare emit — non-mutating. The host owns the downstream solve
+                // Bare emit — non-mutating. The host owns the downstream headless
                 // and must `dismiss` after it succeeds (or use `--run` for the
                 // managed lifecycle). A due timer is NOT consumed merely for
                 // being emitted.
@@ -152,7 +152,7 @@ pub async fn run(cmd: TimerCmd, config: Option<&Path>) -> anyhow::Result<i32> {
                 return Ok(0);
             }
             // `--run`: select/claim → execute → acknowledge, one timer at a
-            // time. Stop at the first failed solve so later due timers are
+            // time. Stop at the first failed headless so later due timers are
             // never silently lost — they remain pending (unclaimed) for the
             // next beat. The failed timer's claim is released and it stays
             // pending/retryable.
@@ -167,7 +167,7 @@ pub async fn run(cmd: TimerCmd, config: Option<&Path>) -> anyhow::Result<i32> {
                 match store.acknowledge(&timer.id, &token, code == 0, &clock)? {
                     AckOutcome::Applied => {}
                     // Our claim went stale and another beat took the timer over
-                    // mid-solve. Do not retry it here — the owner will ack it.
+                    // mid-headless. Do not retry it here — the owner will ack it.
                     other => {
                         eprintln!(
                             "timer {}: claim no longer held ({other:?}); leaving it to its owner",
@@ -195,8 +195,8 @@ pub async fn run(cmd: TimerCmd, config: Option<&Path>) -> anyhow::Result<i32> {
 }
 
 /// Write `prompt` to a transient instruction file and drive one headless
-/// solve against the current workspace via [`crate::solve::run`] — the same
-/// entry point `newt solve --instruction-file` uses. The file is removed when
+/// headless against the current workspace via [`crate::headless::run`] — the same
+/// entry point `newt headless --instruction-file` uses. The file is removed when
 /// the guard drops, so the wake-up never leaves instruction litter behind.
 async fn fire_solve(
     prompt: &str,
@@ -210,7 +210,7 @@ async fn fire_solve(
     let path = std::env::temp_dir().join(format!("newt-timer-{}-{nonce}.txt", std::process::id()));
     std::fs::write(&path, prompt)?;
     let _remove = TempRemove(path.clone());
-    let args = crate::solve::SolveArgs {
+    let args = crate::headless::HeadlessArgs {
         // The timer's own workspace, not the beat process's CWD.
         cwd: workspace.map_or_else(|| PathBuf::from("."), Path::to_path_buf),
         instruction_file: path,
@@ -235,7 +235,7 @@ async fn fire_solve(
         output_allowance: None,
         run_allowance: None,
     };
-    crate::solve::run(args).await
+    crate::headless::run(args).await
 }
 
 /// Remove a transient instruction file when dropped.

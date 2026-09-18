@@ -61,7 +61,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   admission boundaries to Python. Contract:
   [`docs/design/smart-harness-implementation.md`](docs/design/smart-harness-implementation.md)
   (D1–D13, each mapped to code and a named test).
-- **`newt solve` classifies the final reply before it exits.** An answer is
+- **`newt headless` classifies the final reply before it exits.** An answer is
   `status: completed`; a question is `awaiting_operator`. An exhausted
   narration rescue is `incomplete` in every mode (#2251); with
   `--smart-harness`, a narration-only final round is too (#2260). Both keep

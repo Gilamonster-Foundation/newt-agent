@@ -1960,14 +1960,14 @@ them as a list, not a ranking.
   which is only the rationale issue named in a code comment; that conflation
   travelled through two lanes and an operator brief before anyone checked it.
 
-- **The `solve` path never had the plan/scratchpad ledger wired in at all.**
+- **The `headless` path never had the plan/scratchpad ledger wired in at all.**
   *(traced by reading, not executed.)* `TurnDriverConfig` carries no feature
-  field; `apply_context_config` (`newt-cli/src/solve.rs:147`) does not copy
-  `ContextConfig::features` — `features` appears zero times in `solve.rs`; and
+  field; `apply_context_config` (`newt-cli/src/headless.rs:147`) does not copy
+  `ContextConfig::features` — `features` appears zero times in `headless.rs`; and
   `driver.rs:583/584/604` hardcode `scratchpad: false`, `scratchpad_store:
   None`, `step_ledger: None`. This differs in kind from the rows around it:
   those are sentences that mislead a reader, this is an inactive feature set on
-  the path `newt solve`, the eval harness, `newt-acp-worker`, and
+  the path `newt headless`, the eval harness, `newt-acp-worker`, and
   newt-as-a-wyvern-worker all take.
   **The limit of this claim, stated in the same breath as the claim:** it
   establishes the ledger was never live on that path. It does **not** establish
