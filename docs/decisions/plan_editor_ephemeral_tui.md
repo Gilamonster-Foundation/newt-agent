@@ -158,6 +158,42 @@ parallel to how `--disable-ocap` is the human-only authority affordance.
   plain-scroller decision) — it now hosts splash + plan-editor, still not a
   general TUI.
 
+## Amendment 2026-09-18: draft slot, present once, approval, plan pane
+
+**Decided by:** Shawn Hartsock. **Design:**
+[`plan-mode-draft-present-approve.md`](../design/plan-mode-draft-present-approve.md).
+
+An interactive session showed a weak model printing four near-identical plans
+through `render_report`, then restating the plan in its reply, with no approval
+step. This amendment adds four rules. Everything above still stands.
+
+1. **One draft, presented once.** Under the Plan disposition a plan is a
+   revisable draft, not a display. `render_report` replaces the session draft
+   instead of printing it. The harness persists the draft to
+   `.scratch/sessions/<id>/plan.md`, and the latest revision is printed to the
+   scroller exactly once, at the end of the planning turn. Each revision prints
+   one status line, so drafting is visible without repeating the plan.
+2. **Approval is a human act, and it never mints authority.** The
+   `[y / N / discuss / edit]` prompt specified above is built as one routine.
+   A model that entered plan mode inside an Act turn may resume that turn on
+   approval. A Plan turn inferred by intake, or opened by `/mode plan`, ends
+   and hands off to a new Act turn, because its caveats were narrowed at turn
+   start. A missing or cancelled answer means "stay read-only".
+3. **A RichTUI plan-draft pane is permitted.** This narrows "what is still
+   forbidden" for one surface only: a non-modal region inside the mounted
+   RichTUI surface that shows the current draft. It must be compile-gated to
+   `rich-tui`, hidden by default, opened and closed by the operator, and must
+   only read the draft, never write it. It has no lean twin and is absent from
+   headless and wyvern builds. This follows the 2026-08-11 amendment to
+   `plain_scroller_tui.md`, which scopes the plain-scroller rule to the lean
+   surface.
+4. **Committed output is unchanged.** The scroller transcript and the headless
+   path still print the plan as plain lines, once, with the same renderer.
+   The pane is a projection of the draft file and never a second format.
+
+The alt-screen editor above is still the only permitted editing surface. The
+pane does not edit.
+
 ## Revisit trigger
 
 If the plan editor cannot express needed editing as a single ephemeral
