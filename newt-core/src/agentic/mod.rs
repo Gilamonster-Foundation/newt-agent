@@ -295,7 +295,9 @@ pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
 };
-pub use plan_mode::{PlanDraft, PlanDraftSink, PlanModeControl};
+pub use plan_mode::{
+    plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict,
+};
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};

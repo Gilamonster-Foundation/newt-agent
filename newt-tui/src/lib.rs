@@ -1312,6 +1312,10 @@ impl AutoModeState {
 #[derive(Debug, Default)]
 struct PlanModeState {
     active: std::sync::atomic::AtomicBool,
+    /// #2424: set by `exit_plan_mode`, cleared by the turn-end approval hook
+    /// taking it. Separate from `active` so the clamp itself is untouched
+    /// until approval — the whole point of the request/approve split.
+    exit_requested: std::sync::atomic::AtomicBool,
 }
 
 impl PlanModeState {
@@ -1321,6 +1325,8 @@ impl PlanModeState {
 
     fn clear(&self) {
         self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.exit_requested
             .store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1334,6 +1340,17 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
         self.active
             .store(active, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    fn request_exit(&self) -> Result<(), String> {
+        self.exit_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn take_exit_requested(&self) -> bool {
+        self.exit_requested
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 }
 
