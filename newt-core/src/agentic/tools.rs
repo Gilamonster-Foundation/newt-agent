@@ -2880,7 +2880,7 @@ async fn execute_authorized_tool(
         // successful enter clamps later calls in this model tool round.
         "enter_plan_mode" => match (plan_mode_control, step_ledger) {
             (Some(control), Some(_)) => match control.set_plan_mode(true) {
-                Ok(()) => "entered PLAN MODE (read-only): subsequent tool calls are immediately limited to Plan reads and the plan ledger until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute.".to_string(),
+                Ok(()) => "entered PLAN MODE (read-only): subsequent tool calls are immediately limited to Plan reads and the plan ledger until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to request approval — the operator decides whether execution proceeds.".to_string(),
                 Err(error) => format!("error: enter_plan_mode: {error}"),
             },
             _ => {
