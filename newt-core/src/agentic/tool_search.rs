@@ -12,8 +12,9 @@
 //!
 //! The catalog may be wider than the provider-wire projection: budget and
 //! provider-count clipping can hide schemas without changing authorization.
-//! `tool_search` can still list those known-hidden tools, but schema activation
-//! remains a later exposure-controller pass.
+//! `tool_search` lists those hidden tools. An exact-name query asks the existing
+//! exposure controller to load that schema for the next request; it never runs
+//! the named operation. Fuzzy and empty queries remain pure discovery.
 //!
 //! [`execute_tool_search`] is deliberately PURE — it takes the catalog as a
 //! `&serde_json::Value` (the same shape [`super::tools::merged_tool_definitions`]
@@ -27,7 +28,9 @@
 const TOOL_SEARCH_DESCRIPTION: &str =
     "Search newt's tools available to the current turn by intent/keyword — returns matching real \
      tool names + what they do. Use this when unsure of a tool's exact name \
-     instead of guessing.";
+     instead of guessing. To load a tool missing from your callable list, query its exact name; \
+     its schema will be included in the next request if a slot is available. Then call the tool \
+     normally. Search never executes the named tool or grants permission.";
 
 /// Max number of ranked matches returned for a query (keeps the payload compact
 /// for a small model's window; a too-broad query is told to refine).
@@ -58,7 +61,8 @@ pub fn tool_search_tool_definition() -> serde_json::Value {
                     "query": {
                         "type": "string",
                         "description": "Intent or keyword(s) to search the tool catalog by — \
-                                        e.g. \"read a file\", \"plan\", \"delegate\"."
+                                        e.g. \"read a file\", \"plan\", \"delegate\". \
+                                        An exact tool name also requests its schema for the next request."
                     }
                 },
                 "required": ["query"]
@@ -77,7 +81,7 @@ struct ToolRec<'a> {
     /// does not admit (#2332): it is found, named, and never offered a schema.
     callable: bool,
     /// `false` for an authorized tool whose schema is off the wire this turn
-    /// (#2331): described, marked, and loaded by its first call.
+    /// (#2331): described, marked, and loadable by an exact-name search.
     loaded: bool,
 }
 

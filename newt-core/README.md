@@ -74,6 +74,14 @@ paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
 `delete_file`, `list_dir`, and `find`, all mediated by the same caveat and
 prompted-permission checks.
 
+`tool_search` discovers tools by keyword and loads a hidden schema when queried
+with its exact name. The schema appears on the next provider request; search
+never executes the operation or grants permission. At the 128-function wire
+limit, the shared exposure controller replaces the oldest optional schema,
+preserving Kernel tools and queued activations. Evicted schemas stay searchable
+and can be loaded again. Fuzzy, unknown, and already-loaded searches do not
+change the tool list. Normal permission and context-budget checks still apply.
+
 File mutation results use NewtUI's shared diff model and Markdown projection
 for authorized UTF-8 changes observed around each operation. Verification runs
 before an optional build check, so its failure does not erase the tool's diff.
@@ -127,3 +135,5 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:45 EDT | Date: 2026-09-17
