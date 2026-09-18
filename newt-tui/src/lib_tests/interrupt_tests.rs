@@ -156,7 +156,7 @@ fn enter_mid_typing_is_a_newline_not_a_toggle() {
 /// The first Ctrl-C both trips the graceful cancel AND raises the
 /// process-wide acknowledgment flag the spinner reads — the press is
 /// visible on screen within a frame instead of feeling ignored.
-#[serial_test::serial(prompt_stdin, interrupt_pending)]
+#[serial_test::serial(prompt_stdin, interrupt_pending, type_ahead)]
 #[test]
 fn first_ctrl_c_raises_the_interrupt_acknowledgment() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -208,7 +208,7 @@ fn first_ctrl_c_raises_the_interrupt_acknowledgment() {
 /// bumps the process-wide press count the spinner renders, so a 2nd
 /// Ctrl-C changes the label within a tick instead of being absorbed into
 /// a flag nothing read until the turn returned.
-#[serial_test::serial(prompt_stdin, interrupt_pending)]
+#[serial_test::serial(prompt_stdin, interrupt_pending, type_ahead)]
 #[test]
 fn every_ctrl_c_press_is_counted_for_the_spinner() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -268,7 +268,7 @@ fn every_ctrl_c_press_is_counted_for_the_spinner() {
     newt_core::tty::set_interrupt_pending(false);
 }
 
-#[serial_test::serial(prompt_stdin)]
+#[serial_test::serial(prompt_stdin, type_ahead)]
 #[test]
 fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -373,7 +373,7 @@ fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
 /// #1704: while the spill viewport is in explore mode (scrolled back off the
 /// tail), a lone Esc must LEAVE explore mode — not cancel the turn. A second
 /// Esc, now that the view follows the tail again, is the real interrupt.
-#[serial_test::serial(prompt_stdin)]
+#[serial_test::serial(prompt_stdin, type_ahead)]
 #[test]
 fn watcher_esc_exits_explore_before_interrupting() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
