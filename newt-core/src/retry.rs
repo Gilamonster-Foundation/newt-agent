@@ -426,6 +426,20 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    // The HTTP-loop fixtures write these variables under anthropic_loop_env.
+    // Default-policy readers join that lane and restore any host overrides.
+    fn without_retry_overrides() -> Vec<crate::agentic::TestEnvGuard> {
+        [
+            "NEWT_HTTP_MAX_RETRIES",
+            "NEWT_HTTP_BACKOFF_BASE_MS",
+            "NEWT_HTTP_BACKOFF_MAX_MS",
+            "NEWT_HTTP_JITTER",
+        ]
+        .into_iter()
+        .map(crate::agentic::TestEnvGuard::unset)
+        .collect()
+    }
+
     fn err(msg: &str) -> anyhow::Error {
         anyhow::anyhow!("{msg}")
     }
@@ -771,7 +785,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(anthropic_loop_env)]
     fn for_local_inference_is_more_patient_than_default() {
+        let _env = without_retry_overrides();
         let local = RetryPolicy::for_local_inference();
         let default = RetryPolicy::default();
         assert!(
@@ -796,7 +812,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(anthropic_loop_env)]
     fn from_env_or_starts_from_provided_base() {
+        let _env = without_retry_overrides();
         // No env vars set — result must equal the base.
         let base = RetryPolicy {
             max_retries: 9,

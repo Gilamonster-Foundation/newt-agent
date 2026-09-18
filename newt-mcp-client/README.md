@@ -14,6 +14,11 @@ provider tool definitions and never authorize a tool call. The rich terminal's
 `/settings` → MCP manager can reconnect a server or refresh its tool list
 without calling any advertised tool.
 
+Stdio servers inherit the parent's explicit `TZ` through the existing closed
+environment allowlist. Absent and empty values remain distinct; a server's
+configured `env.TZ` takes precedence. The child runtime interprets the value,
+and the value grants no additional filesystem access.
+
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
 free, friendly, local agentic coder.
 
@@ -97,3 +102,5 @@ patient server still gives up on a genuinely wedged call.
 Apache-2.0
 
 Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 14:42 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17

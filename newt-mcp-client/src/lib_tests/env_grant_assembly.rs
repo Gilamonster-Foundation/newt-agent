@@ -61,3 +61,27 @@ fn empty_sources_yield_no_grants() {
         "a confined child with nothing granted starts env-EMPTY"
     );
 }
+
+#[test]
+fn timezone_passthrough_preserves_empty_and_server_override() {
+    assert!(newt_core::mcp_stdio_env_passthrough().contains(&"TZ"));
+    for timezone in ["America/New_York", "UTC-14", ""] {
+        assert_eq!(
+            assemble_env_grants(
+                &pairs(&[("TZ", timezone)]),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            ),
+            pairs(&[("TZ", timezone)])
+        );
+    }
+    assert_eq!(
+        assemble_env_grants(
+            &pairs(&[("TZ", "America/New_York")]),
+            &map(&[("TZ", "UTC-14")]),
+            &map(&[("TZ", "")]),
+        ),
+        pairs(&[("TZ", "")]),
+        "an explicit server UTC setting must override the parent"
+    );
+}

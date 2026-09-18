@@ -61,6 +61,14 @@ distinguish missing workspace files from unverified external references. The
 checker retains its lexical boundary and existing symlink behavior; it does not
 inspect lexically external paths or establish completion of external edits.
 
+Shell and lifecycle child environments include the parent's `TZ` by default,
+alongside `HOME` and `USER`. The value passes through unchanged: absent stays
+absent, and explicit empty stays empty. A custom `[shell] env_passthrough` list
+can omit `TZ`; unrelated environment variables remain excluded. The operating
+system/runtime interprets the timezone, and a `TZ` file path grants no filesystem
+access. Stdio MCP children use the same timezone default with per-server
+environment overrides retaining precedence.
+
 It also hosts the shared agentic tool executor used by the TUI and headless
 paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
 `delete_file`, `list_dir`, and `find`, all mediated by the same caveat and
@@ -117,3 +125,5 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17

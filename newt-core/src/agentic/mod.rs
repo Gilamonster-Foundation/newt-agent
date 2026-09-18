@@ -12820,6 +12820,8 @@ mod http_loop_tests;
 #[cfg(test)]
 #[path = "mod_tests/anthropic_loop.rs"]
 mod anthropic_loop_tests;
+#[cfg(test)]
+pub(crate) use anthropic_loop_tests::EnvGuard as TestEnvGuard;
 // The OpenAI-compatible final answer (#123, #2372): one generation, returned
 // as the gates accepted it, with no display reissue.
 #[cfg(test)]

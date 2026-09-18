@@ -76,6 +76,84 @@ async fn confined_shell_env_does_not_leak_a_parent_only_secret_1600() {
     );
 }
 
+/// The default host-env seam preserves both a named timezone and explicit
+/// empty TZ (UTC). An absent TZ must stay absent so libc uses the OS timezone.
+#[tokio::test]
+async fn confined_shell_env_preserves_parent_timezone() {
+    let _lock = env_lock().await;
+    let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", "/nonexistent-newt-timezone-test");
+    for timezone in ["America/New_York", "UTC-14", ""] {
+        let _tz = EnvVar::set("TZ", timezone);
+        assert_eq!(venv_env_map().get("TZ").map(String::as_str), Some(timezone));
+    }
+    let _tz = EnvVar::unset("TZ");
+    assert!(!venv_env_map().contains_key("TZ"));
+}
+
+#[tokio::test]
+async fn confined_shell_env_timezone_respects_operator_allowlist() {
+    let _lock = env_lock().await;
+    let _pt = EnvVar::set("NEWT_SHELL_ENV_PASSTHROUGH", "HOME:USER");
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", "/nonexistent-newt-timezone-test");
+    let _tz = EnvVar::set("TZ", "UTC-14");
+    assert!(!venv_env_map().contains_key("TZ"));
+}
+
+/// Grounds the mocked timezone env-seam contract above with the real confined
+/// safe-subset dispatch, a shell child, and its date grandchild. POSIX TZ avoids
+/// depending on the separately tested OS timezone database read policy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[ignore = "real confined child and grandchild; run serially in integration tier"]
+async fn confined_shell_parent_timezone_reaches_child_and_grandchild() {
+    let _lock = env_lock().await;
+    let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", "/nonexistent-newt-timezone-test");
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _venv = EnvVar::unset("NEWT_VENV");
+    let _virtual = EnvVar::unset("VIRTUAL_ENV");
+    let _paths = EnvVar::unset("NEWT_EXEC_PATHS");
+    #[cfg(target_os = "macos")]
+    let date_args = ["-r", "1705320000", "+%Y-%m-%dT%H:%M:%S%z"];
+    #[cfg(not(target_os = "macos"))]
+    let date_args = ["--date=@1705320000", "+%Y-%m-%dT%H:%M:%S%z"];
+    let command = format!(
+        "/bin/sh -c '/bin/date {}; status=$?; exit \"$status\"'",
+        date_args.join(" ")
+    );
+    let workspace = tempfile::tempdir().expect("timezone fixture workspace");
+    let cwd = workspace.path().to_str().unwrap();
+    for timezone in ["UTC-14", ""] {
+        let _tz = EnvVar::set("TZ", timezone);
+        let expected = std::process::Command::new("/bin/date")
+            .args(date_args)
+            .env_clear()
+            .env("TZ", timezone)
+            .output()
+            .expect("parent date");
+        assert!(expected.status.success());
+        let caveats = Caveats {
+            fs_read: Scope::only([cwd.to_string()]),
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        let result = super::shell::dispatch_bridled_shell(
+            confined_dispatch_args(&command, cwd),
+            &caveats,
+            None,
+        )
+        .await
+        .expect("confined dispatch");
+        assert_eq!(result["exit_code"], 0, "confined date must execute");
+        assert_eq!(
+            result["stdout"].as_str(),
+            Some(std::str::from_utf8(&expected.stdout).unwrap()),
+            "parent and grandchild must agree for TZ={timezone:?}"
+        );
+    }
+}
+
 /// Workspace-fenced fs, NO exec, NO net — the shape under which the
 /// confined shell denies (real build) or fails closed (stub build).
 fn caveats_no_exec(ws: &std::path::Path) -> Caveats {

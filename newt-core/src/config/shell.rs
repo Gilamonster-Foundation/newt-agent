@@ -172,7 +172,7 @@ pub struct ShellConfig {
     /// Env vars passed into the confined `run_command` shell. The confined shell
     /// gets no ambient shell variables, so without this `~` cannot expand (brush
     /// resolves `~` from its `HOME` shell var) — which silently produced literal
-    /// `~/…` paths. Minimal by default (`HOME`, `USER`) so a secret in the
+    /// `~/…` paths. Minimal by default (`HOME`, `USER`, `TZ`) so a secret in the
     /// process env (API keys, tokens) never leaks into a sandboxed command;
     /// widen it via config if a command genuinely needs more. `None` accepts the
     /// default; each named var is seeded only if present in the process env.
@@ -180,11 +180,12 @@ pub struct ShellConfig {
     pub env_passthrough: Option<Vec<String>>,
 }
 
-/// The default confined-shell env passthrough: `HOME` (so `~` expands) + `USER`.
+/// The default confined-shell env passthrough: home/user plus the parent's
+/// explicit timezone. An absent `TZ` stays absent; empty `TZ` stays empty.
 /// Deliberately minimal — the confined shell is a trust boundary.
 #[must_use]
 pub fn shell_env_passthrough_default() -> Vec<String> {
-    vec!["HOME".to_string(), "USER".to_string()]
+    vec!["HOME".to_string(), "USER".to_string(), "TZ".to_string()]
 }
 
 /// The env allow-list for a spawned **stdio MCP subprocess** (newt#1155).
@@ -203,6 +204,7 @@ pub fn mcp_stdio_env_passthrough() -> Vec<&'static str> {
     vec![
         "HOME",
         "USER",
+        "TZ",
         "PATH",
         "LANG",
         "LC_ALL",
@@ -358,11 +360,11 @@ mod shell_engine_tests {
     #[test]
     fn env_passthrough_default_is_minimal() {
         // Minimal by design — the confined shell is a trust boundary. HOME is the
-        // load-bearing one (brush needs it to expand `~`); USER is a nicety. A
-        // wider default would risk leaking secrets into a sandboxed command.
+        // load-bearing one (brush needs it to expand `~`); TZ preserves the
+        // parent's explicit timezone without copying unrelated environment.
         assert_eq!(
             shell_env_passthrough_default(),
-            vec!["HOME".to_string(), "USER".to_string()]
+            vec!["HOME".to_string(), "USER".to_string(), "TZ".to_string()]
         );
     }
 
