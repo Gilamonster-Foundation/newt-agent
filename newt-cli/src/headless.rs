@@ -1,6 +1,9 @@
-//! `newt solve` — the headless, non-interactive entry that drives the agentic
-//! loop to solve one task and emits a trace, for Terminal-Bench (epic #1419 /
-//! the release-champion ceremony, WS1).
+//! `newt headless` — the non-interactive entry that drives the agentic loop
+//! to complete one task and emit a trace. Originally built for Terminal-Bench
+//! (epic #1419 / the release-champion ceremony, WS1), but not specific to
+//! it — the timer/`fire` cron path and any script driving one headless turn
+//! use this same entry. Terminal-Bench-specific behavior belongs behind its
+//! own flag, never baked into this command's name or default behavior.
 //!
 //! It is a THIN wrapper over the same [`TurnDriver`] / `chat_complete` loop the
 //! interactive TUI runs — no second loop. Headless contract:
@@ -52,10 +55,10 @@ use newt_core::{
     TurnStatus,
 };
 
-use crate::solve_contract;
+use crate::headless_contract;
 
-/// Parsed `newt solve` arguments (mirrors the `Command::Solve` fields).
-pub struct SolveArgs {
+/// Parsed `newt headless` arguments (mirrors the `Command::Headless` fields).
+pub struct HeadlessArgs {
     pub cwd: PathBuf,
     pub instruction_file: PathBuf,
     pub profile: Option<PathBuf>,
@@ -94,13 +97,13 @@ pub struct SolveArgs {
     /// record — never fabricated (a name is not an identity, and a made-up
     /// digest would defeat the silent-re-upload detection the field exists
     /// for). Local-weights derivation would only apply to the embedded
-    /// backend, which `solve` cannot drive (it needs an HTTP endpoint).
+    /// backend, which `headless` cannot drive (it needs an HTTP endpoint).
     pub model_digest: Option<String>,
     /// `--scratchpad-state`: the explicit starting state that opts the run into
     /// the scratchpad (#2314). `None` keeps the headless baseline.
     pub scratchpad_state: Option<PathBuf>,
     /// `--require-feature`: features the run must be able to supply (#2314).
-    pub require_feature: Vec<solve_contract::Feature>,
+    pub require_feature: Vec<headless_contract::Feature>,
     /// `--output-allowance`: explicit output-token allowance (#2312).
     pub output_allowance: Option<u32>,
     /// `--run-allowance`: explicit run-level call-count allowance (#2313).
@@ -142,7 +145,7 @@ fn smart_launch(
     }
 }
 
-/// Which headless lane `newt solve` runs.
+/// Which headless lane `newt headless` runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadlessLane {
     /// OCAP on, workspace-fenced tool writes — the safe default and the
@@ -167,7 +170,7 @@ enum HeadlessLane {
 /// - else `--unsafe-host-exec` / `NEWT_UNSAFE_HOST_EXEC` → Yolo (OCAP off, host
 ///   shell) — the sole route to unconfined execution;
 /// - else → **Confined** (the safe default): OCAP stays on and writes are fenced
-///   to the workspace. A plain `newt solve` is confined, not full-access.
+///   to the workspace. A plain `newt headless` is confined, not full-access.
 fn resolve_lane(
     confined_flag: bool,
     ocap_env: Option<&str>,
@@ -227,31 +230,31 @@ fn resolve_runtime_posture(cfg: &Config, family: Option<&str>) -> RuntimeSetting
     RuntimeSettingsSnapshot::resolve(cfg, None, None)
 }
 
-fn solve_tool_round_limit(
+fn headless_tool_round_limit(
     configured: usize,
     explicit_tenacity: Option<newt_core::Tenacity>,
     explicit_rounds: Option<usize>,
 ) -> usize {
-    // Headless `solve` enforces the same effective cap the TUI would, but it
+    // `headless` enforces the same effective cap the TUI would, but it
     // does not persist per-turn records, so the derivation (`source`,
     // `configured`, `tenacity`) has nowhere durable to land here — an
-    // asymmetry #1982 documents rather than hides. If solve ever grows turn
+    // asymmetry #1982 documents rather than hides. If headless ever grows turn
     // persistence, record the full `ToolRoundLimit` there too.
     newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, explicit_rounds)
         .rounds
 }
 
-/// The serving principal headless `solve` decides capabilities for — the
+/// The serving principal `headless` decides capabilities for — the
 /// SAME mapping the TUI's `BackendChoice::principal()` uses, so one
 /// backend/card pair can never get exact capabilities + typed family in
-/// chat but Undecided/no-family in solve (or vice versa):
+/// chat but Undecided/no-family in headless (or vice versa):
 ///
 /// * Instance ⇒ artifact identity;
 /// * Multiplexer ⇒ the effective operator model is the pick;
-/// * **no serving axis ⇒ `SelectedModel`** — solve requires a nonempty
+/// * **no serving axis ⇒ `SelectedModel`** — headless requires a nonempty
 ///   effective operator model before this runs, and an operator-SELECTED
 ///   identity justifies exact association exactly as in chat.
-fn solve_principal(
+fn headless_principal(
     serving: Option<newt_core::Serving>,
     model: &str,
 ) -> newt_core::model_card::ServingPrincipal<'_> {
@@ -288,7 +291,7 @@ fn projected_cognition(
 /// `0` when the turn completed, `1` on an infrastructure/turn failure. (Task
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
 /// code is only "did the agent run cleanly".)
-pub async fn run(args: SolveArgs) -> Result<i32> {
+pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // 0. The explicit scratchpad seed is admitted before anything else runs.
     let scratchpad = match &args.scratchpad_state {
         Some(path) => Some(seed_scratchpad(
@@ -320,7 +323,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     //    then apply its process-env setup.
     //    SAFETY: single-threaded before the driver spawns its turn thread.
     // P3: `--non-interactive` is accepted for CLI back-compat and controls
-    // INTERACTION only. `newt solve` is always headless (there is no prompt gate
+    // INTERACTION only. `newt headless` is always headless (there is no prompt gate
     // to suppress), so the flag has no effect on authority — that is now solely
     // `--confined` / `--unsafe-host-exec` (the lane), never a side effect of it.
     let _non_interactive = args.non_interactive;
@@ -404,7 +407,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         card_source,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    let principal = solve_principal(backend.serving, &model);
+    let principal = headless_principal(backend.serving, &model);
     let destination = newt_core::BackendDestination::of(backend);
     let decision = caps.for_route(&destination, principal);
     if let Some(notice) = newt_tui::applicability_prose(decision.applicability()) {
@@ -429,10 +432,10 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let runtime = resolve_runtime_posture(&cfg, caps.family_for_route(&destination, principal));
     // #2314: a required feature this run cannot supply stops here, before the
     // instruction is read or anything reaches a backend.
-    solve_contract::admit_required(&args.require_feature, |feature| match feature {
-        solve_contract::Feature::Scratchpad => scratchpad.is_some(),
-        solve_contract::Feature::Crew => runtime.crew,
-        solve_contract::Feature::CodeSearch => false,
+    headless_contract::admit_required(&args.require_feature, |feature| match feature {
+        headless_contract::Feature::Scratchpad => scratchpad.is_some(),
+        headless_contract::Feature::Crew => runtime.crew,
+        headless_contract::Feature::CodeSearch => false,
     })?;
     // #2312: the flag, else the model's `[[model_tuning]]` entry — the lookup
     // the TUI uses — else the cognition table and wire defaults downstream. An
@@ -475,16 +478,16 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // no-op subscription and `emit` stays a single atomic load. The guard
     // releases pane authority on every exit path of this function.
     let _herdr = newt_tui::herdr::session_guard(&workspace);
-    let solve_session = newt_core::lifecycle::new_session_id();
-    newt_core::lifecycle::set_active_session(&solve_session);
+    let headless_session = newt_core::lifecycle::new_session_id();
+    newt_core::lifecycle::set_active_session(&headless_session);
     newt_core::lifecycle::emit_for(
-        Some(solve_session.as_str().to_string()),
+        Some(headless_session.as_str().to_string()),
         newt_core::lifecycle::LifecycleEvent::SessionStarted {
-            session_id: solve_session.as_str().to_string(),
+            session_id: headless_session.as_str().to_string(),
         },
     );
 
-    // 5. Drive one full turn (== a complete multi-round agentic solve).
+    // 5. Drive one full turn (== a complete multi-round agentic turn).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.output_allowance = output_allowance;
@@ -492,15 +495,15 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = decision.reasoning_replay_scope();
-    // Paired with the line above ON PURPOSE. Headless `solve` resolves the
+    // Paired with the line above ON PURPOSE. `headless` resolves the
     // model's capabilities from the same backend the TUI does; omitting this
-    // left `solve` on the `false` default, so a declared reasoning model had
+    // left `headless` on the `false` default, so a declared reasoning model had
     // its chain-of-thought printed into the answer in headless runs only —
     // the N-call-sites trap, in the one lane with no human watching the
-    // stream. `solve_takes_every_capability_from_the_decision`
+    // stream. `headless_takes_every_capability_from_the_decision`
     // (tests/capability_wiring.rs) pins the pair.
     dc.emits_leading_reasoning = decision.emits_leading_reasoning();
-    dc.max_tool_rounds = solve_tool_round_limit(
+    dc.max_tool_rounds = headless_tool_round_limit(
         dc.max_tool_rounds,
         newt_core::tenacity::cli_tenacity(),
         args.max_rounds,
@@ -624,7 +627,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     driver
         .submit(instruction.trim())
         .map_err(|e| anyhow::anyhow!("submit failed: {e:?}"))?;
-    // A `solve` run IS a real model turn — announce it through the seam so the
+    // A `headless` run IS a real model turn — announce it through the seam so the
     // pane shows Working for the duration of the driver loop.
     newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
 
@@ -671,7 +674,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // cannot disagree about whether the turn finished. They used to be
     // independent expressions over the same `o`, twenty-four lines apart, and
     // a round-cap exit satisfied one and not the other.
-    let terminal = solve_contract::terminal(
+    let terminal = headless_contract::terminal(
         clean,
         match &outcome {
             Ok(o) => o.error_class,
@@ -680,8 +683,8 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         o_opt.and_then(|o| o.end_reason),
         smart_harness.is_some(),
     );
-    let outcome_label = solve_contract::outcome_label(terminal);
-    let status = solve_contract::status_label(terminal);
+    let outcome_label = headless_contract::outcome_label(terminal);
+    let status = headless_contract::status_label(terminal);
     let error = match &outcome {
         Ok(o) => o.error.clone(),
         Err(e) => Some(e.clone()),
@@ -709,7 +712,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             (
                 o.tool_events.len(),
                 writes,
-                solve_contract::calls_after_last_write(&o.tool_events),
+                headless_contract::calls_after_last_write(&o.tool_events),
                 format!("{:?}", o.end_reason),
                 serde_json::to_value(&o.tool_events).unwrap_or(serde_json::Value::Null),
             )
@@ -763,7 +766,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         "trajectory": trajectory,
         "error": error,
     });
-    solve_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
+    headless_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
     // #2313: per-attempt usage, and the attempt ledger's chain lines ahead of
     // this line, but only into a trace that is kept (`--events`); the head is
     // reported only alongside them.
@@ -782,28 +785,28 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             .unwrap_or_default()
             .estimate_attempts_cost(&model, local, &totals);
         let head = attempt_lines.last().map(|line| line.id.as_str());
-        solve_contract::usage_stanza(&totals, cost, head)
+        headless_contract::usage_stanza(&totals, cost, head)
     });
-    solve_contract::conditional_stanza(&mut record, "usage", usage_stanza);
+    headless_contract::conditional_stanza(&mut record, "usage", usage_stanza);
     // 7. W0 (#1511): the per-round parse-signal trace events plus EXACTLY ONE
     //    contract record (the `contract_version` key marks it — the external
     //    evaluator rejects a trace with zero or several), appended alongside
     //    the solve_result line above, never replacing it.
     let mut trace_lines: Vec<serde_json::Value> = attempt_lines
         .iter()
-        .map(solve_contract::attempt_line)
+        .map(headless_contract::attempt_line)
         .collect();
     trace_lines.push(record);
     if let Some(o) = o_opt {
         trace_lines.extend(
             o.parse_signals
                 .iter()
-                .map(solve_contract::parse_signal_line),
+                .map(headless_contract::parse_signal_line),
         );
         trace_lines.extend(
             o.behavior_signals
                 .iter()
-                .map(solve_contract::behavior_signal_line),
+                .map(headless_contract::behavior_signal_line),
         );
     }
     // effective_model: the response body's `model` field when the backend
@@ -816,8 +819,8 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // absent ⇒ the field is omitted — never fabricated.
     let digest_env = std::env::var("NEWT_MODEL_DIGEST").ok();
     let model_digest = resolve_model_digest(args.model_digest.as_deref(), digest_env.as_deref());
-    trace_lines.push(solve_contract::contract_record(
-        &solve_contract::ContractInputs {
+    trace_lines.push(headless_contract::contract_record(
+        &headless_contract::ContractInputs {
             requested_model: &model,
             effective_model: &effective_model,
             model_digest: model_digest.as_deref(),
@@ -898,12 +901,12 @@ fn resolve_profile(path: &std::path::Path) -> Result<newt_core::ResolvedConfig> 
 }
 
 /// Pick the backend to drive. Delegates to the **shared, typed** selection
-/// contract (#1320, PR-3) so `solve` selects exactly as chat + the worker
+/// contract (#1320, PR-3) so `headless` selects exactly as chat + the worker
 /// do: `NEWT_PROVIDER` > `default_backend` > sole > prefer-OpenAI, else
 /// first routable — and FAILS, naming the selector, when the explicit
 /// selection cannot be honored. Headless must never silently run a
 /// fallback the operator did not select: an unknown name, a
-/// destination-less backend, and a provider (which `solve` cannot drive)
+/// destination-less backend, and a provider (which `headless` cannot drive)
 /// are each their own actionable error, not a cue to pick something else.
 fn pick_backend(
     resolved: &newt_core::ResolvedConfig,
@@ -912,12 +915,12 @@ fn pick_backend(
     match resolved.select_backend() {
         SelectionOutcome::Selected(SelectedBackend::Configured(backend)) => {
             // The shared contract treats an embedded (model_path) backend as
-            // fully routable — but `newt solve` only instantiates the HTTP
+            // fully routable — but `newt headless` only instantiates the HTTP
             // turn driver, and an empty endpoint would fall into the Ollama
             // loop against nothing. Refuse typed instead.
             if backend.endpoint.is_empty() || backend.kind == Some(BackendKind::Embedded) {
                 anyhow::bail!(
-                    "backend `{}` is an embedded (model_path) backend — `newt solve` \
+                    "backend `{}` is an embedded (model_path) backend — `newt headless` \
                      drives HTTP backends only; select an HTTP backend, or give this \
                      one an endpoint",
                     backend.name
@@ -930,18 +933,18 @@ fn pick_backend(
                 .expect("the shared index selector just picked a configured backend"))
         }
         SelectionOutcome::Selected(SelectedBackend::Provider(p)) => anyhow::bail!(
-            "the backend selection resolves to provider `{}` — `newt solve` drives \
+            "the backend selection resolves to provider `{}` — `newt headless` drives \
              configured [[backends]] only; point $NEWT_PROVIDER/default_backend at a \
              backend (or unset them)",
             p.name
         ),
         SelectionOutcome::UnknownNamed(name) => anyhow::bail!(
             "$NEWT_PROVIDER/default_backend names `{name}`, which matches nothing \
-             configured — fix the selector (solve will not silently run another backend)"
+             configured — fix the selector (headless will not silently run another backend)"
         ),
         SelectionOutcome::UnroutableNamed(name) => anyhow::bail!(
             "$NEWT_PROVIDER/default_backend names `{name}`, which has neither an \
-             endpoint nor a model_path — give it a destination (solve will not \
+             endpoint nor a model_path — give it a destination (headless will not \
              silently run another backend)"
         ),
         SelectionOutcome::Unset => anyhow::bail!(
@@ -1074,16 +1077,16 @@ mod tests {
     /// both lanes; a mismatched model stays typed-inactive with no family
     /// (the control proving no false activation).
     #[test]
-    fn solve_principal_parity_for_unset_serving() {
+    fn headless_principal_parity_for_unset_serving() {
         use newt_core::model_card::{
             CardApplicability, CardBindingSeed, ResolvedCapabilities, ServingPrincipal,
         };
         assert!(matches!(
-            solve_principal(None, "bound-model"),
+            headless_principal(None, "bound-model"),
             ServingPrincipal::SelectedModel("bound-model")
         ));
         assert!(matches!(
-            solve_principal(Some(newt_core::Serving::Instance), "m"),
+            headless_principal(Some(newt_core::Serving::Instance), "m"),
             ServingPrincipal::Instance
         ));
         // Behavioral: an exact card on a serving-less backend activates.
@@ -1113,21 +1116,21 @@ mod tests {
         let caps = ResolvedCapabilities::resolve(&b, &seed, Some(&profile)).expect("resolves");
         let destination = newt_core::BackendDestination::of(&b);
         // Exact effective model: capabilities + family both engage.
-        let d = caps.for_route(&destination, solve_principal(None, "bound-model"));
+        let d = caps.for_route(&destination, headless_principal(None, "bound-model"));
         assert!(d.emits_leading_reasoning(), "exact association activates");
         assert_eq!(
-            caps.family_for_route(&destination, solve_principal(None, "bound-model")),
+            caps.family_for_route(&destination, headless_principal(None, "bound-model")),
             Some("nemotron")
         );
         // Retarget control: a different effective model must NOT activate.
-        let d = caps.for_route(&destination, solve_principal(None, "other-model"));
+        let d = caps.for_route(&destination, headless_principal(None, "other-model"));
         assert!(!d.emits_leading_reasoning(), "no false activation");
         assert!(matches!(
             d.applicability(),
             CardApplicability::InactiveModel { .. }
         ));
         assert_eq!(
-            caps.family_for_route(&destination, solve_principal(None, "other-model")),
+            caps.family_for_route(&destination, headless_principal(None, "other-model")),
             None,
             "no family on a retargeted principal"
         );
@@ -1195,7 +1198,7 @@ mod tests {
 
     #[test]
     fn pick_backend_honors_default_backend_over_first_endpoint() {
-        // #1320: `--config X` sets `default_backend`; solve must route to it, not to
+        // #1320: `--config X` sets `default_backend`; headless must route to it, not to
         // the first endpoint-bearing entry (the coincidence that masked the bug).
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         // SAFETY: guard held; restored on drop.
@@ -1269,12 +1272,12 @@ mod tests {
             ..Default::default()
         };
         let cfg = newt_core::ResolvedConfig::unrequested(cfg);
-        let err = pick_backend(&cfg).expect_err("solve cannot drive a provider");
+        let err = pick_backend(&cfg).expect_err("headless cannot drive a provider");
         assert!(err.to_string().contains("provider `acme`"), "{err}");
     }
 
     /// G (#1819): the shared contract treats embedded (model_path) backends
-    /// as routable, but solve only drives HTTP — an embedded selection must
+    /// as routable, but headless only drives HTTP — an embedded selection must
     /// be a typed refusal, never an empty-endpoint fall into the Ollama
     /// loop. Covered for the sole, default-named, and env-named selections.
     #[test]
@@ -1415,15 +1418,15 @@ mod tests {
         use newt_core::Tenacity;
 
         assert_eq!(
-            solve_tool_round_limit(40, Some(Tenacity::Relentless), None),
+            headless_tool_round_limit(40, Some(Tenacity::Relentless), None),
             RELENTLESS_TOOL_ROUND_TARGET
         );
         assert_eq!(
-            solve_tool_round_limit(40, Some(Tenacity::Relentless), Some(2)),
+            headless_tool_round_limit(40, Some(Tenacity::Relentless), Some(2)),
             2
         );
         assert_eq!(
-            solve_tool_round_limit(40, None, None),
+            headless_tool_round_limit(40, None, None),
             40,
             "automatic family tenacity must not silently expand the safety cap"
         );
@@ -1498,7 +1501,7 @@ mod tests {
     /// P3 (`noninteractive-launch-policy`) regression: `--non-interactive` must
     /// change interaction only, never authority. Modelled at the lane-resolution
     /// choke: with no explicit unsafe/confined signal (a plain
-    /// `newt solve --non-interactive`), the lane is Confined (OCAP ON) — NEVER
+    /// `newt headless --non-interactive`), the lane is Confined (OCAP ON) — NEVER
     /// the OCAP-off Yolo lane. Only an INDEPENDENT explicit `--unsafe-host-exec`
     /// reaches Yolo. Before P3, `resolve_lane(false, None, /*non_interactive*/ true)`
     /// returned Yolo — the bug this closes.

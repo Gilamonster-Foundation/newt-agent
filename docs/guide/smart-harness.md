@@ -2,7 +2,7 @@
 
 Smart mode records a content-addressed session and uses auxiliary model calls
 to select retained context and classify tool-less replies. Enable it with
-`newt solve --smart-harness --instruction-file task.md` or workspace configuration:
+`newt headless --smart-harness --instruction-file task.md` or workspace configuration:
 
 ```toml
 [smart_harness]
@@ -196,7 +196,7 @@ creating an untracked summary. Each conversation owns its session; changing its
 authority or committed auxiliary settings requires a fresh conversation. On
 restart its stored run locator follows the latest verified checkpoint. An older
 conversation without an accounted frame is refused visibly; start a new
-conversation or resume an explicit frame CID through `newt solve`.
+conversation or resume an explicit frame CID through `newt headless`.
 
 Each live TUI conversation retains its embedded auxiliary and the exact model
 and tokenizer bytes pinned when it opened. Later turns reuse those assets after

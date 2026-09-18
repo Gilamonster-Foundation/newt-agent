@@ -6,14 +6,14 @@
 //! 1. `--every 0` must not create a repeating job. It would make
 //!    `advance_repeat` spin forever once the job is due. The CLI must reject
 //!    it cleanly with a non-zero exit and persist nothing.
-//! 2. The documented wake-up path must actually reach the Newt solve entry
+//! 2. The documented wake-up path must actually reach the Newt headless entry
 //!    point. `newt timer fire --run` drains a due timer and drives a real
-//!    headless `newt solve` (in-process) against a mocked backend; the
-//!    scheduled prompt must appear on the wire as the solve instruction.
+//!    headless `newt headless` (in-process) against a mocked backend; the
+//!    scheduled prompt must appear on the wire as the headless instruction.
 //!
 //! The inference backend is mocked with `wiremock` (the same tier
-//! `solve_cli.rs` uses) so a scheduled prompt can be proven to reach the
-//! solve entry point without a live model.
+//! `headless_cli.rs` uses) so a scheduled prompt can be proven to reach the
+//! headless entry point without a live model.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +24,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 const NEMOTRON_MODEL: &str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
 
 /// Capture the chat request body, then finish the turn with no tool calls so
-/// the headless solve completes in one round.
+/// the headless completes in one round.
 struct CaptureThenFinish {
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
 }
@@ -49,7 +49,7 @@ impl Respond for CaptureThenFinish {
     }
 }
 
-/// Write the solve config both `--run` tests share, pointing at `uri`.
+/// Write the headless config both `--run` tests share, pointing at `uri`.
 fn write_solve_config(dir: &std::path::Path, uri: &str) -> std::path::PathBuf {
     let config_path = dir.join("timer.toml");
     std::fs::write(
@@ -75,7 +75,7 @@ bounded_reasoning_continuation = true
 "#
         ),
     )
-    .expect("write explicit solve config");
+    .expect("write explicit headless config");
     config_path
 }
 
@@ -103,13 +103,13 @@ fn every_zero_is_rejected_cleanly() {
     assert!(timers.is_empty(), "no timer persisted for --every 0");
 }
 
-/// Regression (#1747 blocker 2): a scheduled prompt must reach the Newt solve
+/// Regression (#1747 blocker 2): a scheduled prompt must reach the Newt headless
 /// entry point. `newt timer fire --run` drains a due timer and drives a real
-/// headless `newt solve` (in-process) against a mocked backend; the scheduled
-/// prompt appears on the wire as the solve instruction. This is the supported
-/// wake-up path — `newt solve "$prompt"` does not work (it requires
-/// `--instruction-file`), so the scheduler invokes the solve entry point
-/// instead of changing `solve` semantics.
+/// headless `newt headless` (in-process) against a mocked backend; the scheduled
+/// prompt appears on the wire as the headless instruction. This is the supported
+/// wake-up path — `newt headless "$prompt"` does not work (it requires
+/// `--instruction-file`), so the scheduler invokes the headless entry point
+/// instead of changing `headless` semantics.
 #[tokio::test(flavor = "multi_thread")]
 async fn fire_run_reaches_solve_entry_point() {
     let server = MockServer::start().await;
@@ -122,7 +122,7 @@ async fn fire_run_reaches_solve_entry_point() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("timer + solve fixture");
+    let fixture = tempfile::tempdir().expect("timer + headless fixture");
     let config_path = write_solve_config(fixture.path(), &server.uri());
 
     let prompt = "check PR #1747 CI is green";
@@ -130,10 +130,10 @@ async fn fire_run_reaches_solve_entry_point() {
     // zero *repeat* is rejected.
     //
     // `current_dir` matters HERE, not on the fire below: `timer schedule`
-    // records `current_dir()` as the timer's workspace and `fire --run` solves
+    // records `current_dir()` as the timer's workspace and `fire --run` handles
     // against THAT ("the timer's own workspace, not the beat process's CWD"),
     // which is what makes a timer scheduled in project X fire against project
-    // X. Scheduling from the test process's cwd therefore pointed the solve at
+    // X. Scheduling from the test process's cwd therefore pointed the headless at
     // this crate's own directory — the fixture isolation was incomplete, and
     // nothing noticed while the self-verify gate was dark (#1943).
     Command::cargo_bin("newt")
@@ -148,7 +148,7 @@ async fn fire_run_reaches_solve_entry_point() {
         .assert()
         .success();
 
-    // Fire + run: the due prompt must drive a real solve against the mock.
+    // Fire + run: the due prompt must drive a real headless against the mock.
     Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
@@ -165,7 +165,7 @@ async fn fire_run_reaches_solve_entry_point() {
     assert_eq!(
         requests.len(),
         1,
-        "the scheduled prompt must reach the solve entry point (one chat turn)"
+        "the scheduled prompt must reach the headless entry point (one chat turn)"
     );
     let user_content: Vec<&str> = requests[0]["messages"]
         .as_array()
@@ -176,13 +176,13 @@ async fn fire_run_reaches_solve_entry_point() {
         .collect();
     assert!(
         user_content.iter().any(|c| c.contains(prompt)),
-        "scheduled prompt must reach the wire as the solve instruction: {user_content:?}"
+        "scheduled prompt must reach the wire as the headless instruction: {user_content:?}"
     );
 }
 
 /// Regression (#1747 req 7/12): `fire --run` must drain EVERY due timer — a
 /// failure earlier in the beat must not silently lose later due timers. On the
-/// success path each due prompt reaches the solve entry point, so the mock
+/// success path each due prompt reaches the headless entry point, so the mock
 /// backend sees one chat turn per scheduled timer. (The failure path — failed
 /// timer stays pending, later timers remain unclaimed — is covered by the
 /// pure-core `failed_execution_keeps_later_timers_pending` unit test.)
@@ -198,14 +198,14 @@ async fn fire_run_drains_all_due_timers() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("timer + solve fixture");
+    let fixture = tempfile::tempdir().expect("timer + headless fixture");
     let config_path = write_solve_config(fixture.path(), &server.uri());
 
     let prompts = ["check build A", "check build B", "check build C"];
     for p in &prompts {
         // `current_dir` on the SCHEDULE, per the note in
         // `fire_run_reaches_solve_entry_point`: the recorded workspace is what
-        // the solve runs against.
+        // the headless runs against.
         Command::cargo_bin("newt")
             .expect("newt binary")
             .env_remove("NEWT_TEAM")
@@ -235,7 +235,7 @@ async fn fire_run_drains_all_due_timers() {
     assert_eq!(
         requests.len(),
         prompts.len(),
-        "every due timer must reach the solve entry point — none silently lost"
+        "every due timer must reach the headless entry point — none silently lost"
     );
     let seen: Vec<String> = requests
         .iter()
@@ -278,7 +278,7 @@ async fn fire_run_drains_all_due_timers() {
 /// original consumer, so exempting headless would disable it exactly where it
 /// was built to work.
 ///
-/// So a scheduled solve pays the gate like any other turn, and the cost is
+/// So a scheduled headless pays the gate like any other turn, and the cost is
 /// pinned here as a NUMBER: a model that concludes without ever attempting the
 /// task's explicitly requested verification is nudged `SELF_VERIFY_CAP` (2) times and then
 /// accepted — 3 model calls, never more. The mock here is the worst case by
@@ -297,7 +297,7 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("timer + solve fixture");
+    let fixture = tempfile::tempdir().expect("timer + headless fixture");
     let config_path = write_solve_config(fixture.path(), &server.uri());
     // This workspace ships the check the scheduled task explicitly requests.
     // An unchanged workspace alone no longer makes an unrelated task coding work.

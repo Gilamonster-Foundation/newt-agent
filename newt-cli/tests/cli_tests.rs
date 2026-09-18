@@ -81,7 +81,7 @@ fn bench_subcommand_is_removed() {
 
     // The subcommand catalog lists each command name on its own indented line;
     // no such line may be `bench`. (The word "benchmark" legitimately appears
-    // in `solve`'s description — the lane the eval tooling drives.)
+    // in `headless`'s description — the lane the eval tooling drives.)
     common::newt()
         .arg("--help")
         .assert()

@@ -99,14 +99,14 @@ fn tenacity_has_no_model_name_inference_channel() {
 }
 
 /// The seam is only meaningful if the lanes actually feed it: both chat and
-/// headless solve must derive the family from the route-gated typed decision
+/// headless must derive the family from the route-gated typed decision
 /// and install it. An absence-only ratchet would stay green if the whole
 /// feature were deleted — this half keeps it honest.
 #[test]
 fn both_lanes_feed_the_typed_family_seam() {
     for (rel, lane) in [
         ("../newt-tui/src/chat.rs", "chat"),
-        ("../newt-cli/src/solve.rs", "solve"),
+        ("../newt-cli/src/headless.rs", "headless"),
     ] {
         let src = source(rel);
         for needle in [".family_for_route(", "set_active_model_family("] {
@@ -127,5 +127,5 @@ fn both_lanes_feed_the_typed_family_seam() {
 fn the_ratchet_reads_the_real_sources() {
     assert!(source("src/tenacity.rs").contains("TenacityRuntimeSnapshot"));
     assert!(source("../newt-tui/src/chat.rs").contains("fn run_chat"));
-    assert!(source("../newt-cli/src/solve.rs").contains("TurnDriverConfig::new"));
+    assert!(source("../newt-cli/src/headless.rs").contains("TurnDriverConfig::new"));
 }

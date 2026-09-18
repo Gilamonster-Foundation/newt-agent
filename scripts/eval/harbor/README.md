@@ -1,7 +1,7 @@
 # newt ↔ Harbor / Terminal-Bench adapter (WS3, #1419)
 
 [`newt_agent.py`](newt_agent.py) injects a branch-built `newt` binary and a local
-backend profile into each Harbor task container, then runs `newt solve`.
+backend profile into each Harbor task container, then runs `newt headless`.
 It uses Harbor's `task_env_config.workdir`, otherwise the container's `pwd`,
 falling back to `/app` if neither supplies a directory. The trace goes to
 `/logs/agent/newt-events.jsonl`; smart mode also stores its frame under
@@ -145,7 +145,7 @@ identity.
 
 *Required features.* A treatment may declare `requires = ["scratchpad", ...]`,
 using newt's receipt keys (`scratchpad`, `code_search`, `crew`). The adapter
-passes each one as `newt solve --require-feature`, so a feature the run cannot
+passes each one as `newt headless --require-feature`, so a feature the run cannot
 supply refuses before any inference. A cell whose trials all refuse is recorded
 as skipped with newt's refusal text. It is never graded, and no claim is counted
 for it. The baseline requires nothing.

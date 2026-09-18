@@ -1,4 +1,4 @@
-//! Process-level regressions for `newt solve`.
+//! Process-level regressions for `newt headless`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ mod common;
 
 const NEMOTRON_MODEL: &str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
 
-/// Grounds frame-directory admission with the real solve entrypoint. The
+/// Grounds frame-directory admission with the real headless entrypoint. The
 /// deliberately invalid auxiliary placement proves isolation is checked first,
 /// while an isolated store proceeds to the independent auxiliary validation.
 #[test]
@@ -51,7 +51,7 @@ device = "cuda"
         command
             .arg("--config")
             .arg(&config)
-            .args(["solve", "--smart-harness", "--cwd"])
+            .args(["headless", "--smart-harness", "--cwd"])
             .arg(&workspace)
             .arg("--instruction-file")
             .arg(&instruction)
@@ -135,15 +135,15 @@ impl Respond for CaptureThenFinish {
 
 fn contract_from(path: &std::path::Path) -> serde_json::Value {
     let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
-        .expect("read solve events")
+        .expect("read headless events")
         .lines()
         .map(|line| serde_json::from_str(line).expect("event line is JSON"))
         .collect();
     let mut contracts = records
         .into_iter()
         .filter(|record| record.get("contract_version").is_some());
-    let contract = contracts.next().expect("one solve contract");
-    assert!(contracts.next().is_none(), "exactly one solve contract");
+    let contract = contracts.next().expect("one headless contract");
+    assert!(contracts.next().is_none(), "exactly one headless contract");
     contract
 }
 
@@ -193,7 +193,7 @@ impl Respond for ReadThenFinishOnNudge {
     }
 }
 
-/// Grounds the in-process tenacity/unit-loop tests with a real `newt solve`
+/// Grounds the in-process tenacity/unit-loop tests with a real `newt headless`
 /// subprocess, an explicitly loaded TOML file, a real temporary workspace, and
 /// the real `list_dir` dispatch. The inference service alone is mocked so the
 /// test can inspect the second request and prove the TYPED card-family
@@ -213,7 +213,7 @@ async fn explicit_config_applies_nemotron_tenacity_to_runtime_and_contract() {
         .mount(&server)
         .await;
 
-    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let config_path = workspace.path().join("benchmark.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
@@ -252,12 +252,12 @@ nemotron = "relentless"
             server.uri()
         ),
     )
-    .expect("write explicit solve config");
+    .expect("write explicit headless config");
     std::fs::write(
         &instruction_path,
         "Inspect the workspace, then complete the task.\n",
     )
-    .expect("write solve instruction");
+    .expect("write headless instruction");
     std::fs::write(workspace.path().join("tool-ground-truth.txt"), "present\n")
         .expect("write list_dir ground-truth marker");
 
@@ -266,7 +266,7 @@ nemotron = "relentless"
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(workspace.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -305,7 +305,7 @@ nemotron = "relentless"
     drop(requests);
 
     let records: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
-        .expect("read solve events")
+        .expect("read headless events")
         .lines()
         .map(|line| serde_json::from_str(line).expect("event line is JSON"))
         .collect();
@@ -316,7 +316,7 @@ nemotron = "relentless"
     assert_eq!(
         contracts.len(),
         1,
-        "solve emits exactly one contract record"
+        "headless emits exactly one contract record"
     );
     assert_eq!(contracts[0]["effective_config"]["tenacity"], "relentless");
 }
@@ -338,7 +338,7 @@ async fn a_cardless_nemotron_looking_alias_gets_no_family_tenacity() {
         .mount(&server)
         .await;
 
-    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let config_path = workspace.path().join("benchmark.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
@@ -362,7 +362,7 @@ nemotron = "relentless"
             server.uri()
         ),
     )
-    .expect("write explicit solve config");
+    .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Complete the task.\n").expect("write instruction");
 
     Command::cargo_bin("newt")
@@ -370,7 +370,7 @@ nemotron = "relentless"
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(workspace.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -381,14 +381,14 @@ nemotron = "relentless"
         .success();
 
     let records: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
-        .expect("read solve events")
+        .expect("read headless events")
         .lines()
         .map(|line| serde_json::from_str(line).expect("event line is JSON"))
         .collect();
     let contract = records
         .iter()
         .find(|record| record.get("contract_version").is_some())
-        .expect("solve emits a contract record");
+        .expect("headless emits a contract record");
     assert_eq!(
         contract["effective_config"]["tenacity"], "relaxed",
         "a model-name alias is a LABEL — with no exact card family, the \
@@ -396,12 +396,12 @@ nemotron = "relentless"
     );
 }
 
-/// Grounds the headless crew gate with a real `newt solve` subprocess. The
+/// Grounds the headless crew gate with a real `newt headless` subprocess. The
 /// backend is mocked only to retain request #1; the CLI must construct the real
 /// `LocalCrewRunner`, the shared driver must advertise its tools, and the
 /// contract must report the same resolved posture that actually hit the wire.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_crew_and_obsessive_postures_reach_wire_and_contract() {
+async fn headless_crew_and_obsessive_postures_reach_wire_and_contract() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -412,7 +412,7 @@ async fn solve_crew_and_obsessive_postures_reach_wire_and_contract() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let config_path = fixture.path().join("benchmark.toml");
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(
@@ -439,9 +439,9 @@ bounded_reasoning_continuation = true
             server.uri()
         ),
     )
-    .expect("write explicit solve config");
+    .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
 
     let cases = [
         ("bare", false, "default", "standard"),
@@ -451,7 +451,7 @@ bounded_reasoning_continuation = true
     for (name, crew, cognition, tenacity) in cases {
         let obsessive = name == "obsessive";
         let workspace = fixture.path().join(format!("ws-{name}"));
-        std::fs::create_dir(&workspace).expect("create solve workspace");
+        std::fs::create_dir(&workspace).expect("create headless workspace");
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
         let mut command = Command::cargo_bin("newt").expect("newt binary");
         command.env_remove("NEWT_TEAM");
@@ -463,7 +463,7 @@ bounded_reasoning_continuation = true
         command
             .arg("--config")
             .arg(&config_path)
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(&workspace)
             .arg("--instruction-file")
             .arg(&instruction_path)
@@ -503,7 +503,7 @@ bounded_reasoning_continuation = true
         assert_eq!(contract["effective_config"]["tenacity"], tenacity);
 
         // #2314: the feature receipt agrees with the wire body above in BOTH
-        // arms. These runs supply no scratchpad seed and solve builds no
+        // arms. These runs supply no scratchpad seed and headless builds no
         // retrieval index, so both stay off the wire and are never reported active.
         let features = &contract["receipt"]["features"];
         let crew_state = if crew { "instantiated" } else { "unavailable" };
@@ -518,10 +518,10 @@ bounded_reasoning_continuation = true
     }
 }
 
-/// #2312: `newt solve` refuses an invalid output allowance at admission, like a
+/// #2312: `newt headless` refuses an invalid output allowance at admission, like a
 /// required feature it cannot supply: no model request, no events file.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_refuses_an_invalid_output_allowance_before_inference() {
+async fn headless_refuses_an_invalid_output_allowance_before_inference() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -531,11 +531,11 @@ async fn solve_refuses_an_invalid_output_allowance_before_inference() {
         })
         .mount(&server)
         .await;
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     let events_path = fixture.path().join("events.jsonl");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
     for (extra, expected) in [
         (vec!["--output-allowance", "0"], "output_allowance 0 permits no output"),
         (
@@ -549,7 +549,7 @@ async fn solve_refuses_an_invalid_output_allowance_before_inference() {
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
             .args(["--backend-kind", "openai"])
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(fixture.path())
             .arg("--instruction-file")
             .arg(&instruction_path)
@@ -572,7 +572,7 @@ async fn solve_refuses_an_invalid_output_allowance_before_inference() {
 /// it locally. Every contract read is paired with the captured bodies, so an
 /// `enforced` predicted from configuration rather than the request cannot pass.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_output_allowance_reports_server_or_local_enforcement_from_the_wire() {
+async fn headless_output_allowance_reports_server_or_local_enforcement_from_the_wire() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -582,10 +582,10 @@ async fn solve_output_allowance_reports_server_or_local_enforcement_from_the_wir
         })
         .mount(&server)
         .await;
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
 
     // A cognition-projecting endpoint takes the cap from the CLI flag; an
     // unknown compatible endpoint takes it from `[[model_tuning]]`.
@@ -626,13 +626,13 @@ output_allowance = 12000
     ] {
         let config_path = fixture.path().join(format!("{name}.toml"));
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        std::fs::write(&config_path, config).expect("write solve config");
+        std::fs::write(&config_path, config).expect("write headless config");
         let mut command = Command::cargo_bin("newt").expect("newt binary");
         command
             .env_remove("NEWT_TEAM")
             .arg("--config")
             .arg(&config_path)
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(fixture.path())
             .arg("--instruction-file")
             .arg(&instruction_path)
@@ -662,11 +662,11 @@ output_allowance = 12000
     }
 }
 
-/// #2313: `newt solve --run-allowance 0` configures an already-exhausted
+/// #2313: `newt headless --run-allowance 0` configures an already-exhausted
 /// budget, so the first (and only) dispatch attempt is refused before any
 /// wire bytes are sent — the model never sees a request.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_with_an_exhausted_run_allowance_refuses_dispatch_before_any_request() {
+async fn headless_with_an_exhausted_run_allowance_refuses_dispatch_before_any_request() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -676,11 +676,11 @@ async fn solve_with_an_exhausted_run_allowance_refuses_dispatch_before_any_reque
         })
         .mount(&server)
         .await;
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     let events_path = fixture.path().join("events.jsonl");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
 
     Command::cargo_bin("newt")
         .expect("newt binary")
@@ -688,7 +688,7 @@ async fn solve_with_an_exhausted_run_allowance_refuses_dispatch_before_any_reque
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
         .args(["--backend-kind", "openai"])
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(fixture.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -710,7 +710,7 @@ async fn solve_with_an_exhausted_run_allowance_refuses_dispatch_before_any_reque
 /// and a run with NO run allowance configured is completely unaffected: no
 /// key in effective_config, and the request still reaches the model.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_run_allowance_is_reported_when_set_and_absent_when_not() {
+async fn headless_run_allowance_is_reported_when_set_and_absent_when_not() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -720,10 +720,10 @@ async fn solve_run_allowance_is_reported_when_set_and_absent_when_not() {
         })
         .mount(&server)
         .await;
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
 
     for (name, extra, expect_key) in [
         (
@@ -740,7 +740,7 @@ async fn solve_run_allowance_is_reported_when_set_and_absent_when_not() {
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
             .args(["--backend-kind", "openai"])
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(fixture.path())
             .arg("--instruction-file")
             .arg(&instruction_path)
@@ -773,7 +773,7 @@ async fn solve_run_allowance_is_reported_when_set_and_absent_when_not() {
     }
 }
 
-/// #2314: a required feature this run cannot supply stops the solve before any
+/// #2314: a required feature this run cannot supply stops the headless before any
 /// model request, naming the feature and why. `.failure()` alone would also
 /// pass for an unknown flag, so each refusal asserts its stderr text; the twin
 /// shows the same guard admitting a requirement the run does supply.
@@ -789,21 +789,21 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     let seed_path = fixture.path().join("seed.json");
     let events_path = fixture.path().join("events.jsonl");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
-    let solve = |extra: &[&std::ffi::OsStr]| {
+    let headless = |extra: &[&std::ffi::OsStr]| {
         let mut command = Command::cargo_bin("newt").expect("newt binary");
         command
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
             .args(["--backend-kind", "openai"])
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(fixture.path())
             .arg("--instruction-file")
             .arg(&instruction_path)
@@ -819,7 +819,7 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
         ("crew", "unavailable"),
         ("scratchpad", "unavailable"),
     ] {
-        solve(&["--require-feature".as_ref(), feature.as_ref()])
+        headless(&["--require-feature".as_ref(), feature.as_ref()])
             .assert()
             .failure()
             .stderr(predicates::str::contains(format!(
@@ -832,7 +832,7 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
     );
     assert!(!events_path.exists(), "a refused run records no trace");
 
-    solve(&[
+    headless(&[
         "--require-feature".as_ref(),
         "scratchpad".as_ref(),
         "--scratchpad-state".as_ref(),
@@ -856,7 +856,7 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
 /// advertised, and the receipt must name the fresh scope and the seed it was
 /// built from — a seed of `{}` would inject no block, so it is never used here.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_scratchpad_state_reaches_wire_and_receipt() {
+async fn headless_scratchpad_state_reaches_wire_and_receipt() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -867,12 +867,12 @@ async fn solve_scratchpad_state_reaches_wire_and_receipt() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     let seed_path = fixture.path().join("seed.json");
     let events_path = fixture.path().join("events.jsonl");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
 
     Command::cargo_bin("newt")
@@ -881,7 +881,7 @@ async fn solve_scratchpad_state_reaches_wire_and_receipt() {
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
         .args(["--backend-kind", "openai"])
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(fixture.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -920,12 +920,12 @@ async fn solve_scratchpad_state_reaches_wire_and_receipt() {
     );
 }
 
-/// #2372: `newt solve` shows the model's final claim on stdout exactly once on
-/// every wire. Chat Completions returns its answer unprinted, so solve prints
-/// it; Anthropic streams it itself, so solve must not print it again. The
+/// #2372: `newt headless` shows the model's final claim on stdout exactly once on
+/// every wire. Chat Completions returns its answer unprinted, so headless prints
+/// it; Anthropic streams it itself, so headless must not print it again. The
 /// claim is what a transcript tail and false-completion forensics read.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
+async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
     const CLAIM: &str = "FINAL-CLAIM-2372 every check passed";
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -960,10 +960,10 @@ async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
     for kind in ["openai", "anthropic"] {
         let output = Command::cargo_bin("newt")
             .expect("newt binary")
@@ -972,13 +972,13 @@ async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", "m"])
             .args(["--backend-kind", kind])
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(fixture.path())
             .arg("--instruction-file")
             .arg(&instruction_path)
             .args(["--max-rounds", "1"])
             .output()
-            .expect("run newt solve");
+            .expect("run newt headless");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
@@ -996,7 +996,7 @@ async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
         .args(["--backend-kind", "openai"])
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(fixture.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -1004,7 +1004,7 @@ async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
         .arg(fixture.path())
         .args(["--max-rounds", "1"])
         .output()
-        .expect("run newt solve");
+        .expect("run newt headless");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),
@@ -1020,7 +1020,7 @@ async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
 /// #2372: `▸` marks the model's claim. A reply the harness wrote itself — here
 /// the empty-response note — is printed as a harness notice, never as a claim.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
+async fn headless_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1037,23 +1037,23 @@ async fn solve_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
         })
         .mount(&server)
         .await;
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
     let output = Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
         .args(["--backend-kind", "openai"])
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(fixture.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
         .args(["--max-rounds", "1"])
         .output()
-        .expect("run newt solve");
+        .expect("run newt headless");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("⚠  newt: (model returned an empty response"),
@@ -1090,7 +1090,7 @@ async fn explicit_config_still_honors_cli_backend_override() {
         .mount(&stale_server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let config_path = fixture.path().join("benchmark.toml");
     let instruction_path = fixture.path().join("instruction.md");
     let events_path = fixture.path().join("events.jsonl");
@@ -1108,9 +1108,9 @@ kind = "openai"
             stale_server.uri()
         ),
     )
-    .expect("write explicit solve config");
+    .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
 
     Command::cargo_bin("newt")
         .expect("newt binary")
@@ -1120,7 +1120,7 @@ kind = "openai"
         .args(["--backend-kind", "openai"])
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(fixture.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -1168,7 +1168,7 @@ async fn unsupported_chat_cognition_is_default_on_wire_and_contract() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
     let config_path = fixture.path().join("benchmark.toml");
     let instruction_path = fixture.path().join("instruction.md");
     let events_path = fixture.path().join("events.jsonl");
@@ -1187,9 +1187,9 @@ api = "chat_completions"
             server.uri()
         ),
     )
-    .expect("write explicit solve config");
+    .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-        .expect("write solve instruction");
+        .expect("write headless instruction");
 
     Command::cargo_bin("newt")
         .expect("newt binary")
@@ -1197,7 +1197,7 @@ api = "chat_completions"
         .args(["--cognition", "contemplating"])
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(fixture.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -1245,7 +1245,7 @@ api = "chat_completions"
 //
 // Deliberately ONE reason to be red. Naming the dominant failure mode
 // (write-complete-then-grind) needs a typed vocabulary that does not exist in
-// `TurnEndReason` or the solve contract today; asserting it as a substring of
+// `TurnEndReason` or the headless contract today; asserting it as a substring of
 // prose would be a gate the fix could satisfy without fixing anything. That is
 // specified as a follow-up against #2212, not smuggled in here.
 //
@@ -1262,7 +1262,7 @@ const EARLY_WRITES: usize = 3;
 /// Reads the ONE `solve_result` line. Sibling of [`contract_from`], which
 /// filters for the contract record; this filters for its complement.
 fn solve_result_from(path: &std::path::Path) -> serde_json::Value {
-    let raw = std::fs::read_to_string(path).expect("read solve events");
+    let raw = std::fs::read_to_string(path).expect("read headless events");
     let mut results = raw
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event line is JSON"))
@@ -1351,7 +1351,7 @@ async fn round_cap_exit_is_not_reported_as_a_completed_run() {
         .mount(&server)
         .await;
 
-    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let src = workspace.path().join("src");
     std::fs::create_dir_all(&src).expect("workspace src dir");
     // One readable seed per grinding round, so every read SUCCEEDS. A grind
@@ -1365,7 +1365,7 @@ async fn round_cap_exit_is_not_reported_as_a_completed_run() {
         .expect("write seed file");
     }
 
-    let config_path = workspace.path().join("solve.toml");
+    let config_path = workspace.path().join("headless.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
     std::fs::write(
@@ -1382,19 +1382,19 @@ kind = "openai"
             server.uri()
         ),
     )
-    .expect("write solve config");
+    .expect("write headless config");
     std::fs::write(
         &instruction_path,
         "Add the three produced constants, then verify them.\n",
     )
-    .expect("write solve instruction");
+    .expect("write headless instruction");
 
     Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(workspace.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -1426,7 +1426,7 @@ kind = "openai"
         "the early-write half of the shape must have happened — without it this \
          is a generic capped run, not the write-complete-then-grind case: {result}"
     );
-    // `write_calls` counts by NAME and ignores `ok` (solve.rs), so it would
+    // `write_calls` counts by NAME and ignores `ok` (headless.rs), so it would
     // still read 3 if every write had been DENIED — and then the ok-gated field
     // below would be `null`, failing for a permission reason unrelated to this
     // fix. Pin the writes as SUCCEEDING so the two cannot drift apart silently.
@@ -1470,7 +1470,7 @@ kind = "openai"
     );
 
     // ── the honesty clause (Phase 27.5) ───────────────────────────────────
-    // RED against current main: newt-cli/src/solve.rs derives `status` from
+    // RED against current main: newt-cli/src/headless.rs derives `status` from
     // `outcome.error.is_none()` alone and never consults `end_reason`.
     // #2215 landed the typed vocabulary, so this binds the VALUE now rather
     // than only the relationship: `status_label` maps round_cap/empty/cancelled
@@ -1511,7 +1511,7 @@ kind = "openai"
 }
 
 /// #2318: a 2xx OpenAI stream that strict decoding rejects (a tool call without
-/// an id) is the model's answer, so the solve contract files it `model_error`.
+/// an id) is the model's answer, so the headless contract files it `model_error`.
 /// Its class used to be lost and the run filed as `harness_error`, which the
 /// bench excludes from capability scoring as the harness's fault.
 #[tokio::test(flavor = "multi_thread")]
@@ -1531,8 +1531,8 @@ async fn a_strictly_rejected_stream_files_as_model_error() {
         .mount(&server)
         .await;
 
-    let workspace = tempfile::tempdir().expect("temporary solve workspace");
-    let config_path = workspace.path().join("solve.toml");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    let config_path = workspace.path().join("headless.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
     std::fs::write(
@@ -1549,15 +1549,15 @@ kind = "openai"
             server.uri()
         ),
     )
-    .expect("write solve config");
-    std::fs::write(&instruction_path, "Read the seed file.\n").expect("write solve instruction");
+    .expect("write headless config");
+    std::fs::write(&instruction_path, "Read the seed file.\n").expect("write headless instruction");
 
     let _ = Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(workspace.path())
         .arg("--instruction-file")
         .arg(&instruction_path)
@@ -1587,9 +1587,9 @@ kind = "openai"
 /// #2374: the receipt's verification mode comes from the loop the run actually
 /// has. With both switches on, the Chat Completions loop runs the result-aware
 /// gate, and the Responses loop without SmartHarness has no gate, so it reports
-/// `off`. Reverting solve to an unconditional receipt fails the second case.
+/// `off`. Reverting headless to an unconditional receipt fails the second case.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_reports_verification_off_where_the_loop_has_no_gate() {
+async fn headless_reports_verification_off_where_the_loop_has_no_gate() {
     for (api, expected) in [("chat", "result_aware"), ("responses", "off")] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1609,11 +1609,11 @@ async fn solve_reports_verification_off_where_the_loop_has_no_gate() {
             })))
             .mount(&server)
             .await;
-        let fixture = tempfile::tempdir().expect("temporary solve fixture");
+        let fixture = tempfile::tempdir().expect("temporary headless fixture");
         let instruction_path = fixture.path().join("instruction.md");
         let events_path = fixture.path().join("events.jsonl");
         std::fs::write(&instruction_path, "Finish without calling a tool.\n")
-            .expect("write solve instruction");
+            .expect("write headless instruction");
         Command::cargo_bin("newt")
             .expect("newt binary")
             .env_remove("NEWT_TEAM")
@@ -1623,7 +1623,7 @@ async fn solve_reports_verification_off_where_the_loop_has_no_gate() {
             .args(["--backend-model", NEMOTRON_MODEL])
             .args(["--backend-kind", "openai"])
             .args(["--backend-api", api])
-            .args(["solve", "--cwd"])
+            .args(["headless", "--cwd"])
             .arg(fixture.path())
             .arg("--instruction-file")
             .arg(&instruction_path)
@@ -1658,7 +1658,7 @@ fn usage_sse_reply(measured: bool) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
 }
 
-/// Run one `newt solve` against `server`, with `--events` into `workspace` when
+/// Run one `newt headless` against `server`, with `--events` into `workspace` when
 /// asked, and return the process's stdout.
 fn run_usage_solve(
     server: &MockServer,
@@ -1666,7 +1666,7 @@ fn run_usage_solve(
     pricing: bool,
     events: bool,
 ) -> String {
-    let config_path = workspace.join("solve.toml");
+    let config_path = workspace.join("headless.toml");
     let instruction_path = workspace.join("instruction.md");
     let mut config = format!(
         r#"default_backend = "usage"
@@ -1684,21 +1684,21 @@ kind = "openai"
             "\n[pricing.overrides.\"{NEMOTRON_MODEL}\"]\ninput_usd_per_1k = 1.0\noutput_usd_per_1k = 1.0\n"
         ));
     }
-    std::fs::write(&config_path, config).expect("write solve config");
-    std::fs::write(&instruction_path, "Say done.\n").expect("write solve instruction");
+    std::fs::write(&config_path, config).expect("write headless config");
+    std::fs::write(&instruction_path, "Say done.\n").expect("write headless instruction");
     let mut command = Command::cargo_bin("newt").expect("newt binary");
     command
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
-        .args(["solve", "--cwd"])
+        .args(["headless", "--cwd"])
         .arg(workspace)
         .arg("--instruction-file")
         .arg(&instruction_path);
     if events {
         command.arg("--events").arg(workspace.join("events.jsonl"));
     }
-    let output = command.output().expect("newt solve runs");
+    let output = command.output().expect("newt headless runs");
     String::from_utf8(output.stdout).expect("stdout is UTF-8")
 }
 
@@ -1716,7 +1716,7 @@ kind = "openai"
 /// Counts are relative to the POSTs the server received, so the display
 /// reissue (#2372) changes nothing here.
 #[tokio::test(flavor = "multi_thread")]
-async fn solve_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
+async fn headless_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
     use newt_core::attempts::AttemptRecord;
     use newt_core::event_journal::{verify_chain, JournalLine};
 
@@ -1727,7 +1727,7 @@ async fn solve_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
             .respond_with(usage_sse_reply(measured))
             .mount(&server)
             .await;
-        let workspace = tempfile::tempdir().expect("temporary solve workspace");
+        let workspace = tempfile::tempdir().expect("temporary headless workspace");
         run_usage_solve(&server, workspace.path(), measured, true);
 
         let posts = server.received_requests().await.expect("journal").len() as u64;
@@ -1756,7 +1756,7 @@ async fn solve_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
         }
 
         let lines: Vec<JournalLine<AttemptRecord>> = std::fs::read_to_string(&events_path)
-            .expect("read solve events")
+            .expect("read headless events")
             .lines()
             .map(|line| {
                 serde_json::from_str::<serde_json::Value>(line).expect("event line is JSON")
@@ -1785,7 +1785,7 @@ async fn solve_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
         .respond_with(usage_sse_reply(true))
         .mount(&server)
         .await;
-    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let stdout = run_usage_solve(&server, workspace.path(), false, false);
     let records: Vec<serde_json::Value> = stdout
         .lines()

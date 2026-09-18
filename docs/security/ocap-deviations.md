@@ -702,13 +702,13 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   ambient signal after the fact. `--non-interactive` changes INTERACTION only; OCAP-off ambient host
   execution is an unmistakable explicit opt-in; authority may attenuate but never widen because an
   environment variable later appears; child processes never inherit the authority switches.
-- **Practical caveat (now):** the sharpest vector is closed. `newt solve` previously defaulted to the
+- **Practical caveat (now):** the sharpest vector is closed. `newt headless` previously defaulted to the
   OCAP-**off** full-access Yolo lane purely because `--non-interactive` defaults to true
   (`resolve_lane(false, None, /*non_interactive*/ true) == Yolo`, which set `NEWT_FULL_ACCESS=1` +
   `NEWT_DISABLE_OCAP=1`). **step-3.1** decoupled them: the lane no longer consults `--non-interactive`
   at all; OCAP-off requires the explicit `--unsafe-host-exec` flag (or the `NEWT_UNSAFE_HOST_EXEC` env
   twin), `--confined` still wins, and the **default lane is now `Confined`** (OCAP on, workspace-
-  fenced). A plain `newt solve --non-interactive` is confined.
+  fenced). A plain `newt headless --non-interactive` is confined.
 - **Residual:** 🟢 closed. The two halves are now both done: (i) the `--non-interactive` decouple
   (step-3.1) means interaction never selects the OCAP-off lane; (ii) authority is a **typed, immutable
   value** resolved ONCE near startup — `newt_core::launch_authority::LaunchAuthority`. Its

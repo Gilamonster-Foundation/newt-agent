@@ -10,7 +10,7 @@
 ## Terminal-Bench
 
 Measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
-via `newt solve` and the Harbor adapter, confined (**OCAP on**) and unconfined
+via `newt headless` and the Harbor adapter, confined (**OCAP on**) and unconfined
 (**OCAP off**). Each lane is a per-model monotonic ratchet: a score never goes
 down across releases.
 

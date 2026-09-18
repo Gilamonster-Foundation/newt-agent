@@ -235,7 +235,7 @@ a compatibility arm. Fix the mess by ratchet, never by rewrite.
   which newt-agent is **RichTUI-only for interactive use**. Lean/rich feature
   parity is therefore **not** required, and rich-only panel work needs no lean
   twin. This does NOT retire the plain-scroller *output* contract: committed
-  output and the piped/headless path still obey it, because `newt solve` when
+  output and the piped/headless path still obey it, because `newt headless` when
   piped, `newt-acp-worker`, the eval harness, and newt-as-a-wyvern-worker all
   depend on running off a TTY.
 
