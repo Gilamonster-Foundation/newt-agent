@@ -97,6 +97,68 @@ impl PermissionGate for WidenAll {
     }
 }
 
+/// Grounds declaration preflight with a real workspace canary: a request to
+/// expose private frame storage must not consult the operator or start a child.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial_test::serial]
+async fn native_once_filesystem_frame_preflight_precedes_consumption_and_spawn() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = super::disable_ocap_tests::EnvVar::unset("NEWT_FULL_ACCESS");
+    struct CountingGate(usize);
+    impl PermissionGate for CountingGate {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            self.0 += 1;
+            PermissionDecision::Allow(Caveats::top())
+        }
+        fn ask_with_caveats(
+            &mut self,
+            _: &Caveats,
+            requests: &[PermissionRequest],
+        ) -> PermissionDecision {
+            self.ask(requests)
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    let (harness, _) = harness(directory.path());
+    let marker = workspace.path().join("must-not-run");
+    let baseline = Caveats {
+        exec: crate::caveats::Scope::only(["/usr/bin/touch".into()]),
+        ..crate::confined_exec::workspace_confined_caveats(workspace.path())
+    };
+    let mut gate = CountingGate(0);
+    for (target, expected_calls) in [(directory.path(), 0), (unrelated.path(), 1)] {
+        let output = dispatch(
+            &harness,
+            workspace.path(),
+            &baseline,
+            "run_command",
+            serde_json::json!({
+                "command": format!("/usr/bin/touch '{}'", marker.display()),
+                "fs_read": [target.canonicalize().unwrap()],
+            }),
+            Some(&mut gate),
+        )
+        .await;
+        assert!(output.contains("frame isolation"), "{output}");
+        assert_eq!(
+            gate.0, expected_calls,
+            "preflight avoids consumption; a broader actual decision is validated afterwards"
+        );
+        assert!(
+            !marker.exists(),
+            "the rejected declaration must not spawn a child"
+        );
+    }
+}
+
 /// Grounds passive-refresh rejection in an actual child side effect: a gate's
 /// newly recalled authority cannot expose a private frame, even when the
 /// requested command itself would fit the old workspace-only policy.

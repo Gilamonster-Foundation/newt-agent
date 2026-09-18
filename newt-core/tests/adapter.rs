@@ -155,6 +155,11 @@ mod b0a {
         // and its ordinary-deny branch must reach the shared builder.
         Link {
             caller: "ask",
+            needle: "self.ask_with_caveats(",
+            why: "the ordinary terminal entry must reach the baseline-aware permission path",
+        },
+        Link {
+            caller: "ask_with_caveats",
             needle: "permission_interaction(",
             why: "the terminal answer reader must receive the semantic interaction",
         },
@@ -251,7 +256,7 @@ mod b0a {
         // ...and the surfaces must each name their OWN audience, so a
         // switch that routed both through one hard-coded audience is a
         // failure rather than a pass.
-        for caller in ["ask", "permission_interaction"] {
+        for caller in ["ask_with_caveats", "permission_interaction"] {
             let terminal = function_body(&lines, caller).expect("terminal path");
             assert!(
                 terminal.contains("Audience::Terminal"),
@@ -301,7 +306,7 @@ mod b0a {
             &gate,
             &[
                 Link {
-                    caller: "ask",
+                    caller: "ask_with_caveats",
                     needle: "self.authorize(",
                     why: "the TERMINAL surface must authorize its decoded answer",
                 },
@@ -363,9 +368,12 @@ mod b0a {
     #[test]
     fn a_one_surface_switch_does_not_satisfy_the_guard() {
         let half_switched: Vec<String> = [
-            // The TERMINAL surface never switched: `ask` still builds its
-            // own Question instead of the one definition.
+            // The entry forwards correctly, but the TERMINAL surface still
+            // builds its own Question instead of the one definition.
             "fn ask(&mut self, requests: &[R]) -> Decision {",
+            "    self.ask_with_caveats(&self.base.clone(), requests)",
+            "}",
+            "fn ask_with_caveats(&mut self, baseline: &C, requests: &[R]) -> Decision {",
             "    let q = Question {",
             "        markdown: format!(\"{} wants\", req.tool),",
             "        actions: vec![],",
@@ -404,7 +412,8 @@ mod b0a {
         assert!(
             missing
                 .iter()
-                .any(|m| m.contains("`fn ask`") && m.contains("permission_interaction(")),
+                .any(|m| m.contains("`fn ask_with_caveats`")
+                    && m.contains("permission_interaction(")),
             "the guard did not notice that the TERMINAL surface never switched: {missing:#?}"
         );
         assert_eq!(missing.len(), 1, "only the terminal entry is disconnected");
@@ -417,7 +426,7 @@ mod b0a {
         // And the old builder survives in the unswitched function, which
         // the brace-depth body extraction must attribute to the right
         // function rather than to its neighbour.
-        let terminal = function_body(&half_switched, "ask").expect("body");
+        let terminal = function_body(&half_switched, "ask_with_caveats").expect("body");
         assert!(terminal.contains("Question {"));
         let web = function_body(&half_switched, "await_web_decision").expect("body");
         assert!(

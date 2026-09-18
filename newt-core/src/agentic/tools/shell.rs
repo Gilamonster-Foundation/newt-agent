@@ -476,6 +476,59 @@ pub(super) async fn dispatch_bridled_shell(
     result
 }
 
+/// Parse the entire invocation manifest before any approval can be consumed.
+pub(super) fn declared_filesystem_requests(
+    args: &serde_json::Value,
+    cmd: &str,
+    cwd: &str,
+) -> Result<Vec<PermissionRequest>, String> {
+    let mut requests = Vec::new();
+    for (field, kind) in [
+        ("fs_read", DenialKind::FsRead),
+        ("fs_write", DenialKind::FsWrite),
+    ] {
+        let Some(value) = args.get(field) else {
+            continue;
+        };
+        let invalid = || {
+            format!("error: run_command {field} must be an array of nonempty absolute paths without NUL bytes")
+        };
+        for value in value.as_array().ok_or_else(invalid)? {
+            let target = value.as_str().ok_or_else(invalid)?;
+            if target.is_empty()
+                || target.contains('\0')
+                || !std::path::Path::new(target).is_absolute()
+            {
+                return Err(invalid());
+            }
+            if !requests
+                .iter()
+                .any(|request: &PermissionRequest| request.kind == kind && request.target == target)
+            {
+                requests.push(PermissionRequest {
+                    tool: "run_command".into(),
+                    kind,
+                    target: target.into(),
+                    reason: format!("declared {field} for command {cmd:?} in {cwd:?}"),
+                });
+            }
+        }
+    }
+    Ok(requests)
+}
+
+fn permits_filesystem_request(
+    caveats: &crate::caveats::Caveats,
+    request: &PermissionRequest,
+) -> bool {
+    let scope = match request.kind {
+        DenialKind::FsRead => &caveats.fs_read,
+        DenialKind::FsWrite => &caveats.fs_write,
+        _ => return false,
+    };
+    crate::caveats::permits_path(scope, &request.target)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exec_confined_command(
     cmd: &str,
@@ -485,6 +538,7 @@ pub(super) async fn exec_confined_command(
     color: bool,
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
+    filesystem_requests: &[PermissionRequest],
     exec_floor: Option<&crate::caveats::Scope<String>>,
     mut permission_gate: Option<&mut dyn PermissionGate>,
     tool_offload: bool,
@@ -568,6 +622,34 @@ pub(super) async fn exec_confined_command(
     };
     let caveats = refreshed.as_ref().unwrap_or(caveats);
 
+    let missing: Vec<_> = filesystem_requests
+        .iter()
+        .filter(|request| !permits_filesystem_request(caveats, request))
+        .cloned()
+        .collect();
+    let admitted = if missing.is_empty() {
+        None
+    } else {
+        let decision = permission_gate
+            .as_deref_mut()
+            .map(|gate| gate.ask_with_caveats(caveats, &missing));
+        match decision {
+            Some(PermissionDecision::Allow(allowed))
+                if filesystem_requests
+                    .iter()
+                    .all(|request| permits_filesystem_request(&allowed, request)) =>
+            {
+                Some(allowed)
+            }
+            _ => return (
+                "capability denied: declared filesystem authority was not granted for this command"
+                    .into(),
+                ExecOutcome::Denied,
+            ),
+        }
+    };
+    let caveats = admitted.as_ref().unwrap_or(caveats);
+
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let dispatch_args = confined_dispatch_args(cmd, cwd);
@@ -604,7 +686,18 @@ pub(super) async fn exec_confined_command(
                     if let Some(requests) =
                         exec_denial_requests(&envelope).or_else(|| net_denial_requests(&envelope))
                     {
-                        if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
+                        if let PermissionDecision::Allow(widened) =
+                            gate.ask_with_caveats(caveats, &requests)
+                        {
+                            if !filesystem_requests
+                                .iter()
+                                .all(|request| permits_filesystem_request(&widened, request))
+                            {
+                                return (
+                                    "capability denied: declared filesystem authority was not retained for this command".into(),
+                                    ExecOutcome::Denied,
+                                );
+                            }
                             return match dispatch_bridled_shell(
                                 dispatch_args,
                                 &widened,

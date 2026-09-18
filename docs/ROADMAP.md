@@ -650,7 +650,7 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 ---
 
-# Phase 10 — newt-cli polish (9 steps)
+# Phase 10 — newt-cli polish (10 steps)
 
 ## Step 10.1 — newt doctor
 
@@ -862,6 +862,30 @@ A real Seatbelt subprocess test grounds the permission-to-execution path with
 a harmless temporary executable outside trusted system directories.
 **Out of scope:** ambient PATH resolution, broader exec or filesystem presets,
 sticky interpreter approval, and changes to sandbox enforcement.
+
+---
+
+## Step 10.11 — One-shot native filesystem declarations
+
+**Branch:** `step-10.11-native-once-filesystem`
+**Touches:** existing command schema, permission gate, confined dispatch,
+Frame wrapper, terminal permission state, and their tests.
+**Implements:** optional absolute-path `fs_read` and `fs_write` declarations on
+`run_command`. Validate the whole declaration before consuming approvals.
+Reuse exact pending one-shot filesystem grants only for declared targets,
+or prompt with command context for missing authority. Keep additions local to
+one invocation through later executable and network decisions, preserving the
+caller baseline, existing denial/preset/delegation checks, and Frame validation.
+Refuse incomplete returned authority before starting or retrying a child.
+**Tests:** real confined read/write copies, unrelated-call retention, exact
+targets and sibling refusal, later loss of one-shot authority, malformed
+declarations, baseline and ceiling controls, and real no-spawn canaries for
+Frame exposure and incomplete returned authority. Retain shared permission
+acknowledgement and repeat-cache recognition.
+**Out of scope:** automatic native-denial observation, inferred filesystem
+targets, command-history binding, lifecycle declarations, new persistent
+records or sandbox implementations, and rollback of consumed one-shot grants
+when a later operator decision refuses the invocation.
 
 ---
 
@@ -2149,3 +2173,5 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 23:19 EDT | Date: 2026-09-16
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17

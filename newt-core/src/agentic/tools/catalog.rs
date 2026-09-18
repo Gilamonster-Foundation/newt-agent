@@ -19,12 +19,18 @@ pub fn tool_definitions() -> serde_json::Value {
                                 `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` over raw \
                                 build/test/lint commands. Do NOT pass `git` (or another tool's name) as \
                                 the command here — `git` is a separate tool; invoke it directly. Shelling \
-                                out to a name that has a dedicated tool is rejected.",
+                                out to a name that has a dedicated tool is rejected. Declare needed \
+                                filesystem additions with fs_read/fs_write absolute-path arrays; \
+                                missing authority is approved before this invocation starts. After \
+                                request_permissions grants filesystem access, retry the same command \
+                                with those paths declared so matching allow-once grants can be used.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to run" },
-                        "cwd": { "type": "string", "description": "Optional working directory for this command, relative to the workspace root (e.g. \"crates/foo\") or an absolute path inside it. Confined to the workspace. Prefer this over `cd` (which the confined shell rejects)." }
+                        "cwd": { "type": "string", "description": "Optional working directory for this command, relative to the workspace root (e.g. \"crates/foo\") or an absolute path inside it. Confined to the workspace. Prefer this over `cd` (which the confined shell rejects)." },
+                        "fs_read": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for reading by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." },
+                        "fs_write": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for writing by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." }
                     },
                     "required": ["command"]
                 }
@@ -183,7 +189,9 @@ pub fn tool_definitions() -> serde_json::Value {
                 "description": "Ask the operator to GRANT a capability you were denied — the \
                                 capability-grant path (#721). Call this AFTER a `capability denied` \
                                 result to request authority you don't currently have. If an operator \
-                                is present they may allow it; then retry the original operation. In a \
+                                is present they may allow it; then retry the original operation. For \
+                                native run_command filesystem retries, retain the command and add \
+                                fs_read/fs_write arrays containing the approved absolute paths. In a \
                                 headless session (no operator) you'll be told the capability must be \
                                 configured by the owner — change approach. This requests AUTHORITY \
                                 (it mints a capability grant); it is NOT a way to ask the user a \

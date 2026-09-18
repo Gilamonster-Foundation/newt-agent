@@ -646,6 +646,7 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
         false,
         20,
         &denied,
+        &[],
         None,
         Some(&mut gate),
         false,
@@ -804,6 +805,241 @@ fn live_permission_refresh_defaults_to_the_supplied_baseline() {
     };
     assert_eq!(current, baseline);
     assert!(gate.asks.is_empty(), "refresh must not ask the operator");
+}
+
+#[test]
+fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let absolute = directory
+        .path()
+        .join("quoted \"file\"")
+        .to_string_lossy()
+        .into_owned();
+    let nul = format!("{absolute}\0");
+    let definitions = tool_definitions();
+    let command = definitions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|definition| definition["function"]["name"] == "run_command")
+        .unwrap();
+    for axis in ["fs_read", "fs_write"] {
+        let property = &command["function"]["parameters"]["properties"][axis];
+        assert_eq!(property["type"], "array", "{axis}: {property}");
+        assert_eq!(property["items"]["type"], "string");
+        for capability in [axis, if axis == "fs_read" { "read" } else { "write" }] {
+            for (target, native_hint) in
+                [(&*absolute, true), ("relative.txt", false), (&*nul, false)]
+            {
+                let args = serde_json::json!({"capability": capability, "target": target});
+                let mut gate = MockGate::new(true, &Caveats::top());
+                let result = execute_request_permissions(&args, Some(&mut gate), false, 20);
+                assert!(permission_grant_succeeded(
+                    "request_permissions",
+                    &args,
+                    true,
+                    &result
+                ));
+                assert_eq!(result.contains("run_command"), native_hint, "{result:?}");
+                if native_hint {
+                    assert!(
+                        result.contains(&format!("{axis}={}", serde_json::json!([target]))),
+                        "{result}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_once_filesystem_rejects_the_whole_invalid_declaration_before_prompting() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let workspace = tempfile::tempdir().unwrap();
+    let baseline = caveats_rw(workspace.path());
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!("/approved/file"),
+        serde_json::json!(["/approved/file", 7]),
+        serde_json::json!(["/approved/file", ""]),
+        serde_json::json!(["/approved/file", "relative/file"]),
+        serde_json::json!(["/approved/file", "bad\u{0}path"]),
+    ] {
+        let mut gate = MockGate::new(false, &baseline);
+        let result = run_tool_gated(
+            "run_command",
+            serde_json::json!({
+                "command": "/bin/echo MUST_NOT_RUN",
+                "fs_read": [workspace.path().join("input")],
+                "fs_write": invalid,
+            }),
+            workspace.path(),
+            &baseline,
+            &mut gate,
+        )
+        .await;
+        assert!(
+            gate.asks.is_empty(),
+            "invalid declarations must not consume or prompt any grant: {:?}",
+            gate.asks
+        );
+        assert!(
+            result.starts_with("error: run_command fs_write"),
+            "{result}"
+        );
+        assert!(!result.lines().any(|line| line == "MUST_NOT_RUN"));
+    }
+}
+
+/// Grounds complete-declaration admission with a real workspace side effect
+/// that must not occur when either grant decision drops a declared path.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn native_once_filesystem_incomplete_decisions_never_start_the_child() {
+    use crate::caveats::Scope;
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = super::disable_ocap_tests::EnvVar::unset("NEWT_FULL_ACCESS");
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let covered = outside.path().canonicalize().unwrap().join("covered.txt");
+    let added = covered.with_file_name("added.txt");
+    std::fs::write(&covered, "covered").unwrap();
+    std::fs::write(&added, "added").unwrap();
+    for stage in ["initial", "retry"] {
+        let marker = root.join(stage);
+        let mut baseline = crate::confined_exec::workspace_confined_caveats(&root);
+        baseline.fs_read = Scope::only([
+            root.to_string_lossy().into_owned(),
+            covered.to_string_lossy().into_owned(),
+        ]);
+        baseline.exec = if stage == "initial" {
+            Scope::only(["/usr/bin/touch".into()])
+        } else {
+            Scope::none()
+        };
+        let mut gate_base = baseline.clone();
+        if stage == "initial" {
+            gate_base.fs_read = Scope::only([root.to_string_lossy().into_owned()]);
+        }
+        let mut gate = MockGate::new(true, &gate_base);
+        // Grounds the whole-manifest check with a real side effect: this child
+        // could touch the workspace even after a gate drops declared FS reads.
+        let result = run_tool_gated(
+            "run_command",
+            serde_json::json!({
+                "command": format!("/usr/bin/touch '{}'", marker.display()),
+                "fs_read": [covered, added],
+            }),
+            &root,
+            &baseline,
+            &mut gate,
+        )
+        .await;
+        assert!(
+            !marker.exists(),
+            "{stage}: incomplete declaration reached child: {result}"
+        );
+        assert!(result.starts_with("capability denied:"), "{result}");
+        assert_eq!(gate.asks.len(), if stage == "initial" { 1 } else { 2 });
+    }
+}
+
+/// Grounds declared one-shot policy with a real Seatbelt child that must read
+/// one external file and write another, without granting their parent directory.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn native_once_filesystem_declarations_reach_only_the_admitted_child() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = super::disable_ocap_tests::EnvVar::unset("NEWT_FULL_ACCESS");
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let private = outside.path().canonicalize().unwrap();
+    let input = private.join("input.txt");
+    let output = private.join("output.txt");
+    let sibling = private.join("sibling.txt");
+    std::fs::write(&input, "ONE_SHOT_COPY\n").unwrap();
+    std::fs::write(&output, "BEFORE\n").unwrap();
+    std::fs::write(&sibling, "SIBLING_UNCHANGED\n").unwrap();
+    let baseline = Caveats {
+        exec: Scope::only(["/bin/cp".into()]),
+        ..crate::confined_exec::workspace_confined_caveats(&root)
+    };
+    let command = format!("/bin/cp '{}' '{}'", input.display(), output.display());
+    let declared = serde_json::json!({
+        "command": command,
+        "fs_read": [input],
+        "fs_write": [output],
+    });
+    let mut gate = MockGate::new(true, &baseline);
+    let result = run_tool_gated("run_command", declared.clone(), &root, &baseline, &mut gate).await;
+    assert!(
+        tool_result_ok(&result),
+        "the declared child must run: {result}"
+    );
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "ONE_SHOT_COPY\n");
+    assert_eq!(
+        gate.asks,
+        vec![
+            ("run_command".into(), format!("fs_read:{}", input.display())),
+            (
+                "run_command".into(),
+                format!("fs_write:{}", output.display())
+            ),
+        ],
+    );
+    std::fs::write(&output, "RESET\n").unwrap();
+    let undeclared = run_tool_gated(
+        "run_command",
+        serde_json::json!({"command": command}),
+        &root,
+        &baseline,
+        &mut gate,
+    )
+    .await;
+    assert!(!tool_result_ok(&undeclared), "{undeclared}");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "RESET\n");
+    assert_eq!(
+        gate.asks.len(),
+        2,
+        "an undeclared invocation consumes nothing"
+    );
+    let wrong_target = run_tool_gated(
+        "run_command",
+        serde_json::json!({
+            "command": format!("/bin/cp '{}' '{}'", input.display(), sibling.display()),
+            "fs_read": [input],
+            "fs_write": [output],
+        }),
+        &root,
+        &baseline,
+        &mut gate,
+    )
+    .await;
+    assert!(!tool_result_ok(&wrong_target), "{wrong_target}");
+    assert_eq!(
+        std::fs::read_to_string(&sibling).unwrap(),
+        "SIBLING_UNCHANGED\n"
+    );
+    gate.allow = false;
+    let second = run_tool_gated("run_command", declared, &root, &baseline, &mut gate).await;
+    assert!(second.starts_with("capability denied:"), "{second}");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "RESET\n");
+    assert_eq!(
+        std::fs::read_to_string(&sibling).unwrap(),
+        "SIBLING_UNCHANGED\n"
+    );
+    assert_eq!(
+        gate.asks.len(),
+        6,
+        "the next declaration needs a new decision"
+    );
 }
 
 /// Grounds the live-policy seam and exact session-grant tests in a real native

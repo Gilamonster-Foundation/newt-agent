@@ -36,9 +36,17 @@ Confined shell and lifecycle calls refresh standing session and verified durable
 grants before starting a child, so a grant applies to the next call in the same
 turn. Refresh starts from the caller's baseline before adding standing grants
 and retains preset, delegation, denial, and private-frame boundaries;
-it never consumes or publishes pending allow-once grants. Native child filesystem
-errors still require an explicit permission request, and an allow-once filesystem
-grant has no new consumption path here.
+it never consumes or publishes pending allow-once grants.
+
+For native filesystem access, `run_command` accepts optional `fs_read` and
+`fs_write` arrays of absolute paths. These request additions for that invocation
+and can consume matching pending allow-once approvals from `request_permissions`.
+Unrelated calls leave those approvals pending. All paths are validated before
+approval; call-local authority survives later executable or network approval,
+while incomplete returned authority prevents the child from starting. Existing
+directory containment, caller bounds, and permission ceilings still apply.
+An invocation can consume approvals even if a later approval is refused; it
+never publishes them for later calls. Native stderr does not infer authority.
 
 Verification uses the existing bounded workspace snapshot to avoid requiring
 unrelated code suites for an unchanged workspace, such as a permission-only
@@ -107,3 +115,5 @@ Apache-2.0
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 21:03 EDT | Date: 2026-09-16
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17

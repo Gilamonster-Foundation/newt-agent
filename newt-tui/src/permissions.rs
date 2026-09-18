@@ -1583,9 +1583,40 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
     }
 
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+        self.ask_with_caveats(&self.base.clone(), requests)
+    }
+
+    fn ask_with_caveats(
+        &mut self,
+        baseline: &newt_core::Caveats,
+        requests: &[newt_core::PermissionRequest],
+    ) -> newt_core::PermissionDecision {
         use newt_core::PermissionDecision::{Allow, Deny};
         if requests.is_empty() {
             return Deny;
+        }
+        // A filesystem manifest must not consume lawful pending siblings
+        // before discovering that another target cannot survive the preset.
+        let filesystem_batch = requests.iter().any(|request| {
+            matches!(
+                request.kind,
+                newt_core::DenialKind::FsRead | newt_core::DenialKind::FsWrite
+            )
+        });
+        if let Some(clamp) = &self.preset_clamp {
+            if filesystem_batch
+                && requests.iter().any(|request| {
+                    matches!(
+                        request.kind,
+                        newt_core::DenialKind::FsRead
+                            | newt_core::DenialKind::FsWrite
+                            | newt_core::DenialKind::Exec
+                            | newt_core::DenialKind::Net
+                    ) && !ceiling_permits(clamp, request.kind, &request.target)
+                })
+            {
+                return Deny;
+            }
         }
         // A delegated session's inherited ceiling is preflighted over the WHOLE
         // batch, before any prompt is opened, any cache is consulted, and any
@@ -1841,7 +1872,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
         }
-        Allow(self.mint(&self.base, &once_grants))
+        Allow(self.mint(baseline, &once_grants))
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {

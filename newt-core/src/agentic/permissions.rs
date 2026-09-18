@@ -290,6 +290,26 @@ pub trait PermissionGate {
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
 
+    /// Ask for additions to this invocation's authority, retaining its caller
+    /// bounds and prior one-shot grants. Legacy gates may conservatively drop
+    /// prior call-only authority, but cannot restore unrelated broader authority.
+    fn ask_with_caveats(
+        &mut self,
+        baseline: &Caveats,
+        requests: &[PermissionRequest],
+    ) -> PermissionDecision {
+        match self.ask(requests) {
+            PermissionDecision::Allow(allowed) => {
+                let grants: Vec<_> = requests
+                    .iter()
+                    .map(|request| (request.kind, request.target.clone()))
+                    .collect();
+                PermissionDecision::Allow(allowed.meet(&widen_caveats(baseline, &grants)))
+            }
+            PermissionDecision::Deny => PermissionDecision::Deny,
+        }
+    }
+
     /// #728: ask the human a free-text `question` and return a typed
     /// [`HumanQuestionOutcome`] — the GENERIC ask-the-human primitive behind the
     /// `request_user_input` tool. Distinct from [`PermissionGate::ask`], which
