@@ -26,6 +26,17 @@ bare-name system grants still resolve through the sandbox's trusted system
 directories. These grants do not add filesystem or network access, resolve
 arbitrary programs from ambient PATH, or make interpreter approval permanent.
 
+### One-shot native filesystem grants
+
+For a native command that needs filesystem access, declare the exact absolute
+paths in `run_command.fs_read` or `run_command.fs_write`. Newt asks before
+starting that invocation, or consumes a matching pending allow-once approval
+from `request_permissions`. An unrelated command leaves the approval pending.
+The prompt shows the command context; a later executable or network prompt
+retains already-approved filesystem authority for this invocation only.
+Existing danger rules, preset and delegation ceilings, and frame isolation
+still apply. Later calls need standing authority or a fresh approval.
+
 ### Panels
 
 `/settings` is the primary entry point for harness controls: Session,
@@ -229,3 +240,5 @@ free, friendly, local agentic coder.
 Apache-2.0
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: Shawn Hartsock | Time: 22:51 EDT | Date: 2026-09-16
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17

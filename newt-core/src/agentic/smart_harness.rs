@@ -186,6 +186,28 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
     fn ask_question(&mut self, question: &str) -> super::permissions::HumanQuestionOutcome {
         self.inner.ask_question(question)
     }
+
+    fn ask_with_caveats(
+        &mut self,
+        baseline: &crate::caveats::Caveats,
+        requests: &[super::permissions::PermissionRequest],
+    ) -> super::permissions::PermissionDecision {
+        use super::permissions::{widen_caveats, PermissionDecision};
+        let grants: Vec<_> = requests
+            .iter()
+            .map(|request| (request.kind, request.target.clone()))
+            .collect();
+        // Refuse known frame exposure before consuming a pending grant or
+        // asking the operator. Validate the actual returned decision as well.
+        if matches!(
+            self.validate_decision(PermissionDecision::Allow(widen_caveats(baseline, &grants))),
+            PermissionDecision::Deny
+        ) {
+            return PermissionDecision::Deny;
+        }
+        let decision = self.inner.ask_with_caveats(baseline, requests);
+        self.validate_decision(decision)
+    }
 }
 
 /// Transport-free session plus a bounded, tool-less inference callback.

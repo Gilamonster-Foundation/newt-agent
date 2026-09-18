@@ -3212,6 +3212,311 @@ async fn execute_tool_with_tui_gate_allow_once_then_reprompt() {
     assert_eq!(state.decisions.len(), 2);
 }
 
+/// Grounds pending-token matching and call-local re-minting in a real confined
+/// copy, including an unrelated command and a subsequent executable approval.
+#[cfg(target_os = "macos")]
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn native_once_filesystem_pending_grants_survive_until_the_declared_retry() {
+    use crate::disable_ocap_session_tests::EnvVar;
+
+    async fn dispatch(
+        name: &str,
+        args: serde_json::Value,
+        root: &std::path::Path,
+        base: &Caveats,
+        gate: &mut dyn newt_core::PermissionGate,
+    ) -> String {
+        newt_core::execute_tool(
+            name,
+            &args,
+            &root.to_string_lossy(),
+            false,
+            20,
+            base,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            None,
+            Some(gate),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    let _env = crate::test_env_guard::env_write_guard_async().await;
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    let private = outside.path().canonicalize().unwrap();
+    let input = private.join("input.txt");
+    let output = private.join("output.txt");
+    std::fs::write(&input, "QUEUED_ONCE_CONTENT\n").unwrap();
+    std::fs::write(&output, "BEFORE\n").unwrap();
+    let baseline = Caveats {
+        exec: Scope::only(["/bin/echo".into()]),
+        ..newt_core::confined_exec::workspace_confined_caveats(&root)
+    };
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        baseline.clone(),
+        None,
+        None,
+        vec![
+            PromptChoice::AllowOnce,
+            PromptChoice::AllowOnce,
+            PromptChoice::AllowOnce,
+            PromptChoice::AllowOnce,
+            PromptChoice::AllowOnce,
+            PromptChoice::Deny,
+            PromptChoice::Deny,
+        ],
+        prompts.clone(),
+    );
+    for (capability, target) in [("fs_read", &input), ("fs_write", &output)] {
+        let result = dispatch(
+            "request_permissions",
+            serde_json::json!({"capability": capability, "target": target}),
+            &root,
+            &baseline,
+            &mut gate,
+        )
+        .await;
+        assert!(result.starts_with("granted:"), "{result}");
+    }
+    let pending = gate.state.pending_once_grants.clone();
+    assert_eq!(pending.len(), 2);
+    let unrelated = dispatch(
+        "run_command",
+        serde_json::json!({"command": "/bin/echo unrelated", "fs_read": [root.join("already-covered.txt")]}),
+        &root,
+        &baseline,
+        &mut gate,
+    )
+    .await;
+    assert!(
+        unrelated.lines().any(|line| line == "unrelated"),
+        "{unrelated}"
+    );
+    assert_eq!(gate.state.pending_once_grants, pending);
+    let invalid = dispatch(
+        "run_command",
+        serde_json::json!({"command": "/bin/echo invalid", "fs_read": [input], "fs_write": [output, 7]}),
+        &root, &baseline, &mut gate,
+    ).await;
+    assert!(
+        invalid.starts_with("error: run_command fs_write"),
+        "{invalid}"
+    );
+    assert_eq!(gate.state.pending_once_grants, pending);
+    assert_eq!(prompts.get(), 2);
+    let command = format!("/bin/cp '{}' '{}'", input.display(), output.display());
+    let declared =
+        serde_json::json!({"command": command, "fs_read": [input], "fs_write": [output]});
+    let result = dispatch("run_command", declared.clone(), &root, &baseline, &mut gate).await;
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        "QUEUED_ONCE_CONTENT\n",
+        "{result}"
+    );
+    assert!(gate.state.pending_once_grants.is_empty());
+    assert!(gate.state.session_grants.is_empty());
+    assert_eq!(
+        prompts.get(),
+        3,
+        "only the missing executable prompts on retry"
+    );
+    assert_eq!(gate.state.decisions.last().unwrap().kind, "exec");
+    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
+        panic!("baseline refresh refused")
+    };
+    assert_eq!(
+        refreshed, baseline,
+        "no one-shot authority may become standing authority"
+    );
+    std::fs::write(&output, "RESET\n").unwrap();
+    // A refused later executable approval must leave the file untouched and
+    // must not publish the consumed filesystem grants as standing authority.
+    for (capability, target) in [("fs_read", &input), ("fs_write", &output)] {
+        let result = dispatch(
+            "request_permissions",
+            serde_json::json!({"capability": capability, "target": target}),
+            &root,
+            &baseline,
+            &mut gate,
+        )
+        .await;
+        assert!(result.starts_with("granted:"), "{result}");
+    }
+    let denied_exec = dispatch("run_command", declared.clone(), &root, &baseline, &mut gate).await;
+    assert!(
+        denied_exec.starts_with("capability denied:"),
+        "{denied_exec}"
+    );
+    assert_eq!(prompts.get(), 6);
+    assert!(gate.state.pending_once_grants.is_empty());
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "RESET\n");
+    let denied = dispatch("run_command", declared, &root, &baseline, &mut gate).await;
+    assert!(denied.starts_with("capability denied:"), "{denied}");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "RESET\n");
+    assert_eq!(prompts.get(), 7, "consumed grants require a new decision");
+}
+
+#[test]
+fn native_once_filesystem_baseline_survives_later_exec_and_net_approvals() {
+    let baseline = Caveats {
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::AtMost(2),
+        valid_for_generation: Scope::only([7]),
+        ..base_caveats("/ws")
+    };
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        Caveats::top(),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce; 4],
+        prompts.clone(),
+    );
+    let mut current = baseline.clone();
+    let mut expected = baseline.clone();
+    for (kind, target) in [
+        (DenialKind::FsRead, "/approved/input"),
+        (DenialKind::FsWrite, "/approved/output"),
+        (DenialKind::Exec, "/opt/tool/bin/copy"),
+        (DenialKind::Net, "approved.test"),
+    ] {
+        let request = PermissionRequest {
+            tool: "run_command".into(),
+            kind,
+            target: target.into(),
+            reason: "one declared invocation".into(),
+        };
+        let newt_core::PermissionDecision::Allow(allowed) =
+            gate.ask_with_caveats(&current, &[request])
+        else {
+            panic!("approved request denied")
+        };
+        expected = newt_core::widen_caveats(&expected, &[(kind, target.into())]);
+        assert_eq!(allowed, expected, "only the requested axis may widen");
+        current = allowed;
+    }
+    assert_eq!(prompts.get(), 4);
+    assert!(gate.state.pending_once_grants.is_empty());
+    assert!(gate.state.session_grants.is_empty());
+    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
+        panic!("baseline refresh refused")
+    };
+    assert_eq!(refreshed, baseline);
+}
+
+#[test]
+fn native_once_filesystem_known_refusals_precede_pending_consumption() {
+    use crate::caveat_policy_tests::verified_delegation;
+
+    let ceiling = Caveats {
+        fs_read: Scope::only(["/ws".into(), "/approved/input".into()]),
+        fs_write: Scope::none(),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    for refusal in [
+        "denial",
+        "preset",
+        "delegation",
+        "preset-exec",
+        "preset-net",
+    ] {
+        let mut state = PermissionPromptState::default();
+        state.pending_once_grants.extend([
+            (DenialKind::FsRead, "/approved/input".into()),
+            (DenialKind::FsWrite, "/approved/output".into()),
+        ]);
+        if refusal == "denial" {
+            state
+                .session_denials
+                .insert((DenialKind::FsWrite, "/approved/output".into()));
+        }
+        let pending = state.pending_once_grants.clone();
+        let prompts = Rc::new(Cell::new(0));
+        let baseline = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            baseline.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        if refusal == "preset" {
+            gate.preset_clamp = Some(ceiling.clone());
+        }
+        if refusal == "delegation" {
+            gate.delegation = Some(&delegation);
+        }
+        let mixed = match refusal {
+            "preset-exec" => Some(DenialKind::Exec),
+            "preset-net" => Some(DenialKind::Net),
+            _ => None,
+        };
+        if mixed.is_some() {
+            gate.preset_clamp = Some(Caveats {
+                exec: Scope::none(),
+                net: Scope::none(),
+                ..Caveats::top()
+            });
+        }
+        let mut requests: Vec<_> = pending
+            .iter()
+            .map(|(kind, target)| PermissionRequest {
+                tool: "run_command".into(),
+                kind: *kind,
+                target: target.clone(),
+                reason: "declared invocation".into(),
+            })
+            .collect();
+        if let Some(kind) = mixed {
+            requests.push(PermissionRequest {
+                tool: "run_command".into(),
+                kind,
+                target: if kind == DenialKind::Exec {
+                    "/opt/tool/bin/copy"
+                } else {
+                    "approved.test"
+                }
+                .into(),
+                reason: "same batch as the pending filesystem requests".into(),
+            });
+        }
+        assert!(
+            matches!(
+                gate.ask_with_caveats(&baseline, &requests),
+                newt_core::PermissionDecision::Deny
+            ),
+            "{refusal}"
+        );
+        assert_eq!(gate.state.pending_once_grants, pending, "{refusal}");
+        assert_eq!(prompts.get(), 0, "{refusal}");
+    }
+}
+
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn execute_tool_with_tui_gate_session_allow_holds_across_turns() {

@@ -64,7 +64,9 @@ use shell::{
     net_denial_requests, pr_creation_url, shadow_records, shell_engine, shell_envelope_output,
     venv_env_map,
 };
-use shell::{exec_confined_command, resolve_exec_cwd, split_leading_cd};
+use shell::{
+    declared_filesystem_requests, exec_confined_command, resolve_exec_cwd, split_leading_cd,
+};
 #[cfg(all(test, not(windows)))]
 use shell::{
     host_shell_command, host_shell_output, host_shell_output_with_timeout,
@@ -1075,10 +1077,25 @@ fn parse_capability(s: &str) -> Option<DenialKind> {
 }
 
 fn permission_granted_result(capability: &str, target: &str) -> String {
-    format!(
+    let mut result = format!(
         "granted: the operator allowed {capability} for '{target}'. \
          Retry the original operation now."
-    )
+    );
+    let field = match parse_capability(capability) {
+        Some(DenialKind::FsRead) => Some("fs_read"),
+        Some(DenialKind::FsWrite) => Some("fs_write"),
+        _ => None,
+    };
+    if let Some(field) =
+        field.filter(|_| std::path::Path::new(target).is_absolute() && !target.contains('\0'))
+    {
+        result.push_str(&format!(
+            " For a native run_command retry, keep the command and add {field}={}; \
+             one-shot filesystem grants apply only to the declared invocation.",
+            serde_json::json!([target])
+        ));
+    }
+    result
 }
 
 /// Recognize only the built-in's actual grant response, never arbitrary tool
@@ -3118,6 +3135,10 @@ async fn execute_authorized_tool(
                 workspace,
                 cd_path.as_deref().or_else(|| args["cwd"].as_str()),
             );
+            let filesystem_requests = match declared_filesystem_requests(args, cmd, &run_cwd) {
+                Ok(requests) => requests,
+                Err(error) => return host_return(error),
+            };
             executed(
                 exec_confined_command(
                     cmd,
@@ -3125,6 +3146,7 @@ async fn execute_authorized_tool(
                     color,
                     tool_output_lines,
                     caveats,
+                    &filesystem_requests,
                     exec_floor,
                     permission_gate,
                     tool_offload,
@@ -3217,6 +3239,7 @@ async fn execute_authorized_tool(
                         color,
                         tool_output_lines,
                         caveats,
+                        &[],
                         exec_floor,
                         permission_gate,
                         tool_offload,

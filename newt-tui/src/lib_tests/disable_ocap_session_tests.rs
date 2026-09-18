@@ -52,19 +52,19 @@ fn exec_floor_none_only_when_unrestricted_and_no_posture_floor() {
 /// value on drop, including on a failed assertion, so yolo/full-access
 /// never leaks into a neighboring test. Used only under the exclusive
 /// env write guard (`env_write_guard` / `env_write_guard_async`).
-struct EnvVar {
+pub(crate) struct EnvVar {
     key: &'static str,
     saved: Option<String>,
 }
 
 impl EnvVar {
-    fn set(key: &'static str, value: &str) -> Self {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
         let saved = std::env::var(key).ok();
         std::env::set_var(key, value);
         Self { key, saved }
     }
 
-    fn unset(key: &'static str) -> Self {
+    pub(crate) fn unset(key: &'static str) -> Self {
         let saved = std::env::var(key).ok();
         std::env::remove_var(key);
         Self { key, saved }
