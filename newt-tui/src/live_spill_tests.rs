@@ -345,7 +345,7 @@ impl Write for BlockingWriter {
 }
 
 #[cfg(unix)]
-#[serial_test::serial(prompt_stdin)]
+#[serial_test::serial(prompt_stdin, type_ahead)]
 #[test]
 fn blocked_terminal_write_does_not_block_interrupt_or_watcher_shutdown() {
     use std::sync::atomic::{AtomicBool, Ordering};
