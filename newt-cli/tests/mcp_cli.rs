@@ -100,6 +100,32 @@ mod composed_private_mcp_uat {
     const REVIEW_TOOL: &str = "review_source__get_review";
     const MCP_RESULT: &str = "authenticated review 42 loaded from imported MCP";
 
+    struct ReviewPermission {
+        caveats: newt_core::Caveats,
+        approvals: usize,
+    }
+
+    impl newt_core::PermissionGate for ReviewPermission {
+        fn ask_question(&mut self, _question: &str) -> newt_core::HumanQuestionOutcome {
+            newt_core::HumanQuestionOutcome::Unavailable
+        }
+
+        fn ask(
+            &mut self,
+            requests: &[newt_core::PermissionRequest],
+        ) -> newt_core::PermissionDecision {
+            if requests.len() == 1
+                && requests[0].kind == newt_core::DenialKind::RemoteTool
+                && requests[0].target == REVIEW_TOOL
+            {
+                self.approvals += 1;
+                newt_core::PermissionDecision::Allow(self.caveats.clone())
+            } else {
+                newt_core::PermissionDecision::Deny
+            }
+        }
+    }
+
     /// Restore process-global discovery inputs after the acceptance scenario.
     /// The test is ignored and serialized because it intentionally grounds the
     /// environment and real-filesystem seams used by production discovery.
@@ -415,6 +441,10 @@ mod composed_private_mcp_uat {
             REVIEW_TOOL.to_string(),
         ];
         let mut events: Vec<ToolEvent> = Vec::new();
+        let mut permission = ReviewPermission {
+            caveats: caveats.clone(),
+            approvals: 0,
+        };
 
         let (reply, _, _, hallucinations) = newt_core::chat_complete(
             ChatCtx {
@@ -483,7 +513,7 @@ mod composed_private_mcp_uat {
                 phantom_reaches: None,
                 end_reason: None,
                 solve_obs: None,
-                permission_gate: None,
+                permission_gate: Some(&mut permission),
                 on_round_usage: None,
                 estimate_ratio: None,
                 estimation: newt_core::tokens::TokenEstimation::default(),
@@ -516,6 +546,7 @@ mod composed_private_mcp_uat {
             "recovery must not fall back to shell or operator setup: {events:?}"
         );
         assert_eq!(hallucinations, 0, "all three called tools are real");
+        assert_eq!(permission.approvals, 1, "one exact MCP call approval");
         assert!(
             reply.contains("imported connector"),
             "final answer: {reply}"
@@ -570,3 +601,5 @@ mod composed_private_mcp_uat {
         assert_eq!(call["params"]["arguments"]["url"], review_url);
     }
 }
+
+// Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 01:27 EDT | Date: 2026-09-18
