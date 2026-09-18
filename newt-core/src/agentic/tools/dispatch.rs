@@ -58,6 +58,11 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     pub(crate) step_ledger: Option<&'a dyn agentic::scheduled::StepLedger>,
     pub(crate) operating_mode_control: Option<&'a dyn agentic::OperatingModeControl>,
     pub(crate) plan_mode_control: Option<&'a dyn agentic::PlanModeControl>,
+    /// #2424: where `render_report` stores its draft instead of printing it
+    /// while the Plan disposition is active. `None` behaves as the plain
+    /// `render_report` path always has (e.g. eval/headless callers that don't
+    /// wire plan mode at all).
+    pub(crate) plan_draft_sink: Option<&'a dyn agentic::PlanDraftSink>,
     pub(crate) spill_store: Option<&'a dyn SpillStore>,
     pub(crate) persona_tools: Option<&'a [String]>,
     /// #2331: the turn's authorized tools whose schemas are off the wire.

@@ -2508,6 +2508,7 @@ async fn execute_authorized_tool(
         step_ledger,
         operating_mode_control,
         plan_mode_control,
+        plan_draft_sink,
         spill_store,
         persona_tools,
         hidden_tools,
@@ -3176,7 +3177,17 @@ async fn execute_authorized_tool(
         // the plain scroller. Always-on (no injected capability); hands the
         // rendered block to the presenter and returns a short ack to the model.
         "render_report" => {
-            let (result, document) = execute_render_report(args, color, tool_evidence);
+            // #2424: under the Plan disposition, a report is a revisable
+            // draft, not a display — see docs/design/plan-mode-draft-present-approve.md.
+            // `render_report` replaces the session's one draft slot instead of
+            // printing it; the latest revision is presented exactly once, at
+            // the end of the planning turn, by the caller that owns that
+            // boundary (not here — this arm never double-presents).
+            let plan_draft_sink = (disposition == PromptDisposition::Plan)
+                .then_some(())
+                .and(plan_draft_sink);
+            let (result, document) =
+                execute_render_report(args, color, tool_evidence, plan_draft_sink);
             if let Some(document) = document {
                 presentation.document(&document);
             }

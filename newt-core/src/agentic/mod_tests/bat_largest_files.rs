@@ -247,6 +247,7 @@ pub(super) async fn run_scenario_for(
         crew_runner: None,
         operating_mode_control: None,
         plan_mode_control: None,
+        plan_draft_sink: None,
         steering: None,
         completed_spill_renderer: None,
     };

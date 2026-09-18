@@ -7825,6 +7825,11 @@ fn session_body(
                     // selection takes effect on a later outer turn.
                     let turn_auto_mode_control =
                         conversation_mode_states.auto.bind(&active_conversation_id);
+                    // #2424: bound to this conversation so its draft persists
+                    // to THIS conversation's plan.md, not a shared/global one.
+                    let turn_plan_draft_sink = conversation_mode_states
+                        .plan_draft
+                        .bind(&active_conversation_id);
                     let operating_mode_control = (active_operating_mode == OperatingMode::Auto)
                         .then_some(
                             &turn_auto_mode_control
@@ -8113,6 +8118,10 @@ fn session_body(
                                             &conversation_mode_states.plan
                                                 as &dyn newt_core::agentic::PlanModeControl,
                                         ),
+                                        plan_draft_sink: Some(
+                                            &turn_plan_draft_sink
+                                                as &dyn newt_core::agentic::PlanDraftSink,
+                                        ),
                                         // #952/#1669: the loop-side seam is in
                                         // place, but this surface cannot yet
                                         // SUBMIT mid-turn — `read_line` does not
@@ -8307,6 +8316,27 @@ fn session_body(
                                     } else {
                                         print_newt(&reply, color, verbose);
                                     }
+                                }
+                                // #2424: present the Plan-phase draft exactly
+                                // once, whether the model called
+                                // `exit_plan_mode` or the turn simply ended.
+                                // One code path covers both.
+                                if let Some(draft) =
+                                    conversation_mode_states.plan_draft.take_for_presentation()
+                                {
+                                    let cols = crossterm::terminal::size()
+                                        .map(|(c, _)| c as usize)
+                                        .unwrap_or(80)
+                                        .max(20);
+                                    print!("▸  ");
+                                    print!(
+                                        "{}",
+                                        newt_core::agentic::render_markdown(
+                                            &draft.markdown,
+                                            newt_core::agentic::RenderOpts { color, cols },
+                                        )
+                                    );
+                                    println!();
                                 }
                                 // Profile techniques, post-turn (R2). `retry` supersedes
                                 // `verify_gate`: it runs the same gate but *acts* —

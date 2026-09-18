@@ -481,3 +481,89 @@ async fn non_act_read_tools_do_not_consult_permission_gate() {
         "a non-Act web read may be caveat-denied but must never mint net authority"
     );
 }
+
+/// #2424: the dispatch arm itself must route `render_report` to the wired
+/// draft sink under Plan, and back to the ordinary rendered-document path
+/// under Act with the exact same sink still wired (i.e. it's Plan disposition
+/// that gates the behavior, not merely whether a sink exists).
+#[tokio::test]
+async fn render_report_dispatch_drafts_under_plan_and_renders_under_act() {
+    use crate::agentic::PlanDraftSink as _;
+
+    #[derive(Default)]
+    struct FakeSink(std::sync::Mutex<Option<crate::agentic::PlanDraft>>);
+    impl crate::agentic::PlanDraftSink for FakeSink {
+        fn save_draft(&self, markdown: String) -> Result<u32, String> {
+            let mut slot = self.0.lock().unwrap();
+            let revision = slot.as_ref().map_or(1, |d| d.revision + 1);
+            *slot = Some(crate::agentic::PlanDraft { revision, markdown });
+            Ok(revision)
+        }
+
+        fn latest_draft(&self) -> Option<crate::agentic::PlanDraft> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let sink = FakeSink::default();
+
+    let plan_result = execute_tool_with_collaborators(
+        "render_report",
+        &serde_json::json!({"title": "Draft under Plan"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats_rw(ws.path()),
+        &mut NoMcp,
+        ToolCollaborators {
+            plan_draft_sink: Some(&sink as &dyn crate::agentic::PlanDraftSink),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Plan,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        plan_result.contains("revision 1"),
+        "Plan disposition must route to the draft slot: {plan_result}"
+    );
+    assert!(
+        sink.latest_draft().is_some(),
+        "the sink must have received the draft"
+    );
+
+    let act_result = execute_tool_with_collaborators(
+        "render_report",
+        &serde_json::json!({"title": "Rendered under Act"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats_rw(ws.path()),
+        &mut NoMcp,
+        ToolCollaborators {
+            plan_draft_sink: Some(&sink as &dyn crate::agentic::PlanDraftSink),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        act_result.contains("report rendered"),
+        "Act disposition must render as before, even with a draft sink wired: {act_result}"
+    );
+    assert_eq!(
+        sink.latest_draft().unwrap().revision,
+        1,
+        "an Act-disposition report must never touch the draft slot"
+    );
+}

@@ -283,10 +283,18 @@ fn compose_document(args: &serde_json::Value) -> Result<(String, String), String
 /// the headless / `NO_COLOR` degrade). Errors are returned verbatim, prefixed
 /// `error: ` like every tool error — an empty title or unknown status is
 /// actionable coaching, not a failure to hide.
+///
+/// `plan_draft` is `Some` exactly when the Plan disposition is active and a
+/// draft sink is wired (design: `docs/design/plan-mode-draft-present-approve.md`,
+/// #2424). In that case the composed Markdown replaces the session's one
+/// draft slot instead of being rendered for immediate display — the returned
+/// `Option<String>` document is `None`, and the caller's own turn-end hook
+/// (not this function) presents the latest revision exactly once.
 pub(crate) fn execute_render_report(
     args: &serde_json::Value,
     color: bool,
     evidence: Option<&super::capability_check::Evidence>,
+    plan_draft: Option<&dyn super::PlanDraftSink>,
 ) -> (String, Option<String>) {
     match compose_document(args) {
         Ok((markdown, ack)) => {
@@ -301,6 +309,18 @@ pub(crate) fn execute_render_report(
                 Some(evidence) => super::capability_check::annotate_unsupported(markdown, evidence),
                 None => markdown,
             };
+            if let Some(sink) = plan_draft {
+                return match sink.save_draft(markdown) {
+                    Ok(revision) => (
+                        format!(
+                            "plan draft saved as revision {revision}; not yet shown to the \
+                             operator. Finish the plan, then call exit_plan_mode."
+                        ),
+                        None,
+                    ),
+                    Err(error) => (format!("error: saving plan draft: {error}"), None),
+                };
+            }
             let rendered = render_markdown(
                 &markdown,
                 RenderOpts {
@@ -337,6 +357,7 @@ mod tests {
                 &json!({"title": "Voice stack", "body": CLAIM}),
                 false,
                 evidence,
+                None,
             );
             doc.expect("a composed report always renders a document")
         }
@@ -394,9 +415,14 @@ mod tests {
                 &json!({"title": "Voice stack", "body": CLAIM}),
                 false,
                 Some(&silent),
+                None,
             );
-            let (plain, _) =
-                execute_render_report(&json!({"title": "Voice stack", "body": CLAIM}), false, None);
+            let (plain, _) = execute_render_report(
+                &json!({"title": "Voice stack", "body": CLAIM}),
+                false,
+                None,
+                None,
+            );
             assert_eq!(annotated, plain);
         }
     }
@@ -495,5 +521,62 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("non-empty `heading`"), "{err}");
+    }
+
+    /// #2424: under the Plan disposition, `render_report` replaces the
+    /// session's one draft slot instead of rendering — four calls leave ONE
+    /// stored draft at revision 4, and never a document to display.
+    #[test]
+    fn plan_disposition_stores_a_revision_instead_of_rendering() {
+        use crate::agentic::PlanDraftSink as _;
+
+        #[derive(Default)]
+        struct FakeSink(std::sync::Mutex<Option<crate::agentic::PlanDraft>>);
+        impl crate::agentic::PlanDraftSink for FakeSink {
+            fn save_draft(&self, markdown: String) -> Result<u32, String> {
+                let mut slot = self.0.lock().unwrap();
+                let revision = slot.as_ref().map_or(1, |d| d.revision + 1);
+                *slot = Some(crate::agentic::PlanDraft { revision, markdown });
+                Ok(revision)
+            }
+
+            fn latest_draft(&self) -> Option<crate::agentic::PlanDraft> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        let sink = FakeSink::default();
+        for n in 1..=4 {
+            let (ack, doc) = execute_render_report(
+                &json!({"title": format!("Refactor plan v{n}"), "body": "steps..."}),
+                false,
+                None,
+                Some(&sink),
+            );
+            assert!(
+                doc.is_none(),
+                "a Plan-disposition report must never render for display: {ack}"
+            );
+            assert!(
+                ack.contains(&format!("revision {n}")),
+                "ack must name the revision it just saved: {ack}"
+            );
+            assert!(
+                ack.contains("not yet shown"),
+                "ack must say the draft has not been presented: {ack}"
+            );
+        }
+
+        let latest = sink.latest_draft().expect("four saves left a draft");
+        assert_eq!(
+            latest.revision, 4,
+            "the fourth save replaces the slot, never appends"
+        );
+        assert!(latest.markdown.contains("Refactor plan v4"));
+        assert!(
+            !latest.markdown.contains("Refactor plan v1"),
+            "the draft slot holds ONE revision, not a history: {}",
+            latest.markdown
+        );
     }
 }

@@ -528,6 +528,7 @@ mod composed_private_mcp_uat {
                 crew_runner: None,
                 operating_mode_control: None,
                 plan_mode_control: None,
+                plan_draft_sink: None,
                 steering: None,
             },
             &mut mcp,
