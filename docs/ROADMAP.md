@@ -728,6 +728,16 @@ prompt seams. Real-resource checks ground persistence and HTTP behavior.
 changed DNS/TLS/redirect/metadata checks, OAuth registration repair, separate
 authentication-host prompts, and blanket approval of runtime tool calls.
 
+**Import acceptance follow-up:** `--merge --grant-net` with every selected
+server skipped leaves an absent authoritative config absent. Preserve the
+existing compare-before-replace transaction when a server is adopted. The
+composed import/recovery fixture approves only its exact remote tool under
+unchanged baseline caveats, asserts one approval, and retains its three-tool,
+zero-shell sequence. The symlink fixture checks each original line exactly
+once while allowing the TOML editor to keep a trailing comment at EOF.
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 01:24 EDT | Date: 2026-09-18
+
 ## Step 10.5 — Settings-led themes and responsive cockpit input
 
 **Branch:** `step-10.5-settings-thinking-input`
