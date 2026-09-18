@@ -1312,6 +1312,10 @@ impl AutoModeState {
 #[derive(Debug, Default)]
 struct PlanModeState {
     active: std::sync::atomic::AtomicBool,
+    /// #2424: set by `exit_plan_mode`, cleared by the turn-end approval hook
+    /// taking it. Separate from `active` so the clamp itself is untouched
+    /// until approval — the whole point of the request/approve split.
+    exit_requested: std::sync::atomic::AtomicBool,
 }
 
 impl PlanModeState {
@@ -1321,6 +1325,8 @@ impl PlanModeState {
 
     fn clear(&self) {
         self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.exit_requested
             .store(false, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1335,6 +1341,17 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
             .store(active, std::sync::atomic::Ordering::Release);
         Ok(())
     }
+
+    fn request_exit(&self) -> Result<(), String> {
+        self.exit_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn take_exit_requested(&self) -> bool {
+        self.exit_requested
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 /// Per-conversation state for the Plan phase's one draft slot (design:
@@ -1343,14 +1360,45 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
 /// write this seam performs; the model's own clamp never touches the
 /// filesystem directly. Cleared alongside `PlanModeState` on `/new`, restore,
 /// or persona rotation, so a fresh conversation never inherits a stale draft.
+///
+/// Every entry is bound to the OBJECTIVE it was drafted under — the root
+/// prompt id of the operator lineage (`TurnPromptContext::active()
+/// .root_prompt_id()`), which a discussion continuation shares and a fresh
+/// operator prompt does not. A draft from objective A is invisible to
+/// objective B: it is neither presented nor seeded there, so an approval
+/// under B can never execute A's plan.
 #[derive(Debug, Default)]
 struct PlanDraftState {
-    latest: std::sync::Mutex<Option<newt_core::agentic::PlanDraft>>,
-    /// The revision last handed out by [`Self::take_for_presentation`], so a
-    /// turn that saved no NEW revision (or none at all) presents nothing —
-    /// the "present exactly once" half of the design, independent of whether
-    /// the model called `exit_plan_mode` or the turn simply ended.
-    presented_revision: std::sync::Mutex<Option<u32>>,
+    latest: std::sync::Mutex<Option<ObjectiveDraft>>,
+    /// The exact snapshot last shown to the operator, so a turn that saved no
+    /// NEW revision (or none at all) presents nothing — the "present exactly
+    /// once" half of the design — and so approval seeds implementation from
+    /// what was shown, never from the mutable slot. Consumed by approval.
+    presented: std::sync::Mutex<Option<ObjectivePresented>>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectiveDraft {
+    objective: newt_core::PromptId,
+    draft: newt_core::agentic::PlanDraft,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectivePresented {
+    objective: newt_core::PromptId,
+    plan: newt_core::agentic::PresentedPlan,
+}
+
+/// The one filesystem write the draft seam performs. Injected into
+/// [`TurnPlanDraftSink`] so the unit tier records writes in memory and the
+/// real-resource tier grounds this exact function.
+type PlanDraftPersist<'a> = &'a (dyn Fn(&std::path::Path, &str) -> std::io::Result<()> + Sync);
+
+fn persist_plan_to_disk(path: &std::path::Path, markdown: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, markdown)
 }
 
 impl PlanDraftState {
@@ -1358,30 +1406,64 @@ impl PlanDraftState {
         if let Ok(mut latest) = self.latest.lock() {
             *latest = None;
         }
-        if let Ok(mut presented) = self.presented_revision.lock() {
+        if let Ok(mut presented) = self.presented.lock() {
             *presented = None;
         }
     }
 
-    fn bind<'a>(&'a self, conversation_id: &'a str) -> TurnPlanDraftSink<'a> {
+    fn bind<'a>(
+        &'a self,
+        conversation_id: &'a str,
+        objective: Option<newt_core::PromptId>,
+        persist: PlanDraftPersist<'a>,
+    ) -> TurnPlanDraftSink<'a> {
         TurnPlanDraftSink {
             state: self,
             conversation_id,
+            objective,
+            persist,
         }
     }
 
-    /// The latest draft, if its revision has not already been presented.
-    /// Marks that revision presented as a side effect — call this exactly
-    /// once, at the end of a turn, never mid-turn to steer model-facing
-    /// behavior.
-    fn take_for_presentation(&self) -> Option<newt_core::agentic::PlanDraft> {
-        let draft = self.latest.lock().ok()?.clone()?;
-        let mut presented = self.presented_revision.lock().ok()?;
-        if *presented == Some(draft.revision) {
+    /// The latest draft for `objective`, if it has not already been
+    /// presented. Records the presented snapshot as a side effect — call
+    /// this exactly once, at the end of a turn, never mid-turn to steer
+    /// model-facing behavior.
+    fn take_for_presentation(
+        &self,
+        objective: newt_core::PromptId,
+    ) -> Option<newt_core::agentic::PresentedPlan> {
+        let held = self.latest.lock().ok()?.clone()?;
+        if held.objective != objective {
             return None;
         }
-        *presented = Some(draft.revision);
-        Some(draft)
+        let mut presented = self.presented.lock().ok()?;
+        if presented.as_ref().is_some_and(|p| {
+            p.objective == objective && p.plan.draft.revision == held.draft.revision
+        }) {
+            return None;
+        }
+        let plan = newt_core::agentic::PresentedPlan::new(held.draft);
+        *presented = Some(ObjectivePresented {
+            objective,
+            plan: plan.clone(),
+        });
+        Some(plan)
+    }
+
+    /// Consume the presented snapshot for `objective` on approval. `None`
+    /// when nothing was presented under this objective — including when the
+    /// only presented plan belongs to another objective — or when an earlier
+    /// approval already consumed it, so one "yes" seeds at most one turn.
+    fn take_approved(
+        &self,
+        objective: newt_core::PromptId,
+    ) -> Option<newt_core::agentic::PresentedPlan> {
+        let mut presented = self.presented.lock().ok()?;
+        if presented.as_ref()?.objective != objective {
+            return None;
+        }
+        presented.take().map(|p| p.plan)
     }
 }
 
@@ -1389,39 +1471,47 @@ impl PlanDraftState {
 struct TurnPlanDraftSink<'a> {
     state: &'a PlanDraftState,
     conversation_id: &'a str,
+    /// The objective this turn runs under; `None` (no receipt for the turn)
+    /// refuses to save rather than bind a draft to nothing.
+    objective: Option<newt_core::PromptId>,
+    persist: PlanDraftPersist<'a>,
 }
 
-/// Pure: the next revision after `current`, starting at 1. Split out of
-/// [`TurnPlanDraftSink::save_draft`] so the counting logic is unit-testable
-/// without touching the filesystem (this crate's fully-mocked unit tier never
-/// does real fs I/O; the write below is exercised at the integration tier).
-fn next_plan_draft_revision(current: Option<&newt_core::agentic::PlanDraft>) -> u32 {
-    current.map_or(1, |draft| draft.revision + 1)
+/// Pure: the next revision after `current`, starting at 1 — and restarting
+/// at 1 when the objective changes, since the slot is per objective.
+fn next_plan_draft_revision(
+    current: Option<&ObjectiveDraft>,
+    objective: newt_core::PromptId,
+) -> u32 {
+    match current {
+        Some(held) if held.objective == objective => held.draft.revision + 1,
+        _ => 1,
+    }
 }
 
 impl newt_core::agentic::PlanDraftSink for TurnPlanDraftSink<'_> {
     fn save_draft(&self, markdown: String) -> Result<u32, String> {
+        let objective = self
+            .objective
+            .ok_or_else(|| "plan draft: no active objective to bind to".to_string())?;
         let mut latest = self
             .state
             .latest
             .lock()
             .map_err(|_| "plan draft lock poisoned".to_string())?;
-        let revision = next_plan_draft_revision(latest.as_ref());
+        let revision = next_plan_draft_revision(latest.as_ref(), objective);
         let path = newt_core::session_plan_path(self.conversation_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| format!("plan draft dir: {error}"))?;
-        }
-        std::fs::write(&path, &markdown).map_err(|error| format!("plan draft write: {error}"))?;
-        *latest = Some(newt_core::agentic::PlanDraft { revision, markdown });
+        (self.persist)(&path, &markdown).map_err(|error| format!("plan draft write: {error}"))?;
+        *latest = Some(ObjectiveDraft {
+            objective,
+            draft: newt_core::agentic::PlanDraft { revision, markdown },
+        });
         Ok(revision)
     }
 
     fn latest_draft(&self) -> Option<newt_core::agentic::PlanDraft> {
-        self.state
-            .latest
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+        let held = self.state.latest.lock().ok()?.clone()?;
+        (Some(held.objective) == self.objective).then_some(held.draft)
     }
 }
 

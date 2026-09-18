@@ -116,8 +116,30 @@ pub(crate) fn is_compaction_message(m: &Value) -> bool {
         c.starts_with(SUMMARY_PREFIX)
             || c.starts_with(CONTINUATION_PREFIX)
             || c.starts_with(LOOP_GUIDANCE_PREFIX)
+            || c.starts_with(PLAN_APPROVAL_PREFIX)
     })
 }
+
+/// #2424: prefix on the harness-authored turn that seeds implementation
+/// after the operator approves a plan. It is the prose's **coordinate**:
+/// the marker names its source (`newt_tui::chat::plan_approval_seed_text`,
+/// which composes it from the approved `render_report` draft plus
+/// `agentic::exit_plan_mode_result`'s tenacity guidance) so a transcript or
+/// trace line can be traced back to the code and the knobs that shaped it —
+/// the `[y/N/discuss]` approval answer, `/mode plan` vs an inferred Plan
+/// turn, and the session tenacity level (`--tenacity` / `[tenacity]`).
+///
+/// Classification: it IS a harness-owned user-role message, so it joins
+/// [`is_compaction_message`] and can never anchor the tail boundary (that
+/// would demote the operator's real ask — the parent plan prompt — into the
+/// summarizable middle, the F1 bug class). It is deliberately NOT in the
+/// summary-hygiene demotion, because unlike loop guidance it carries task
+/// state: the approved plan itself.
+///
+/// Three-Cs note: the prose behind this prefix is still code, not data. The
+/// prefix is the coordinate that makes moving it into the prompt-template /
+/// lexicon layer a mechanical follow-up rather than a search.
+pub const PLAN_APPROVAL_PREFIX: &str = "[plan-mode/approval]";
 
 /// True when `m` is specifically the loop's post-compaction continuation
 /// directive — used by the loop to keep at most one alive across repeated

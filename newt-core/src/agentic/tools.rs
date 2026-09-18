@@ -2364,14 +2364,31 @@ fn record_governed_file_change(
     }
 }
 
-/// The `exit_plan_mode` tool result. Under a tenacity level that
-/// [`requires an edit`](crate::tenacity::Tenacity::exit_plan_requires_edit) on
-/// plan exit (Insistent / Relentless), it appends a MANDATORY-EDIT directive so
-/// the model executes the first step instead of sliding back into more reading
+/// #2424: the `exit_plan_mode` tool result now that exiting is a REQUEST, not
+/// an immediate lift. The turn-end approval hook decides whether the clamp
+/// actually lifts; on approval it delivers [`exit_plan_mode_result`]'s own
+/// mandatory-edit guidance (when the tenacity level requires one) to the
+/// turn that follows, not to this ack.
+const EXIT_PLAN_MODE_REQUESTED: &str = "exit requested. Awaiting operator approval — tool calls \
+     remain clamped to Plan reads and the plan ledger until approved. If asked, continue drafting \
+     with update_plan / render_report; do not assume approval.";
+
+/// The exit-approved guidance. Under a tenacity level that [`requires an
+/// edit`](crate::tenacity::Tenacity::exit_plan_requires_edit) on plan exit
+/// (Insistent / Relentless), it appends a MANDATORY-EDIT directive so the
+/// model executes the first step instead of sliding back into more reading
 /// (#tenacity / #11). Lower levels leave plan exit advisory. The tenacity
 /// action-forcing loop (#10) then enforces it: a subsequent read-only round
 /// trips the forcing nudge within the level's (small) budget.
-fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
+///
+/// #2424: pre-approval this WAS the `exit_plan_mode` tool's own ack (the
+/// clamp lifted unconditionally). Now that lifting requires operator
+/// approval (see [`EXIT_PLAN_MODE_REQUESTED`]), this text belongs on the
+/// turn that FOLLOWS approval: the TUI's turn-end hook seeds that turn with a
+/// harness-authored prompt (its own `ModelInputOrigin`, persisted under the
+/// harness-retry provenance class — never disguised as operator input,
+/// invariant 2.4) and this guidance rides inside it.
+pub fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
     let base = "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.";
     if tenacity.exit_plan_requires_edit() {
         format!(
@@ -2857,16 +2874,20 @@ async fn execute_authorized_tool(
         // successful enter clamps later calls in this model tool round.
         "enter_plan_mode" => match (plan_mode_control, step_ledger) {
             (Some(control), Some(_)) => match control.set_plan_mode(true) {
-                Ok(()) => "entered PLAN MODE (read-only): subsequent tool calls are immediately limited to Plan reads and the plan ledger until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute.".to_string(),
+                Ok(()) => "entered PLAN MODE (read-only): subsequent tool calls are immediately limited to Plan reads and the plan ledger until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to request approval — the operator decides whether execution proceeds.".to_string(),
                 Err(error) => format!("error: enter_plan_mode: {error}"),
             },
             _ => {
                 "unknown tool: enter_plan_mode (scheduled planning and a session Plan-mode control are both required)".to_string()
             }
         },
+        // #2424: this no longer lifts the clamp itself — that was the second
+        // root cause the design fixes (the model exiting its own clamp with
+        // no human in the loop). It only RECORDS the request; the turn-end
+        // approval hook decides whether `set_plan_mode(false)` actually runs.
         "exit_plan_mode" => match plan_mode_control {
-            Some(control) => match control.set_plan_mode(false) {
-                Ok(()) => exit_plan_mode_result(crate::tenacity::effective_tenacity()),
+            Some(control) => match control.request_exit() {
+                Ok(()) => EXIT_PLAN_MODE_REQUESTED.to_string(),
                 Err(error) => format!("error: exit_plan_mode: {error}"),
             },
             None => {

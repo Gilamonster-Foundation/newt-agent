@@ -197,7 +197,7 @@ pub use artifact_read::{
 pub use compress::{
     compress_user_initiated, compress_user_initiated_for_task, CompressCounters, CompressState,
     FloorTrend, ManualCompressOutcome, ManualCompressPolicy, SummarizeFn, SummarizeFuture,
-    Summarizer, CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    Summarizer, CONTINUATION_PREFIX, PLAN_APPROVAL_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use content_spill::{
     SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
@@ -295,17 +295,20 @@ pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
 };
-pub use plan_mode::{PlanDraft, PlanDraftSink, PlanModeControl};
+pub use plan_mode::{
+    plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
+};
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
 pub use steering::{ReplaceRejected, Rev, SessionSteeringInbox, SteeringInbox};
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
-    filter_advertised_tools, filter_tools_for_disposition, full_access_requested, ocap_disabled,
-    persona_tool_allowed, plan_phase_clamp, preserve_mcp_resource_url_affinity,
-    set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens, tool_allowed,
-    tool_definitions, venv_cmd_prefix, ExposureSettings, MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    exit_plan_mode_result, filter_advertised_tools, filter_tools_for_disposition,
+    full_access_requested, ocap_disabled, persona_tool_allowed, plan_phase_clamp,
+    preserve_mcp_resource_url_affinity, set_max_output_tokens, set_output_cap_chars_per_token,
+    set_output_head_tokens, tool_allowed, tool_definitions, venv_cmd_prefix, ExposureSettings,
+    MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,

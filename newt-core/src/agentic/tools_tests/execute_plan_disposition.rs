@@ -57,7 +57,7 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
     use crate::agentic::PlanModeControl as _;
 
     #[derive(Default)]
-    struct TestPlanModeControl(std::sync::atomic::AtomicBool);
+    struct TestPlanModeControl(std::sync::atomic::AtomicBool, std::sync::atomic::AtomicBool);
 
     impl crate::agentic::PlanModeControl for TestPlanModeControl {
         fn is_plan_mode(&self) -> bool {
@@ -67,6 +67,15 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         fn set_plan_mode(&self, active: bool) -> Result<(), String> {
             self.0.store(active, std::sync::atomic::Ordering::Release);
             Ok(())
+        }
+
+        fn request_exit(&self) -> Result<(), String> {
+            self.1.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+
+        fn take_exit_requested(&self) -> bool {
+            self.1.swap(false, std::sync::atomic::Ordering::AcqRel)
         }
     }
 
@@ -123,8 +132,10 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
     .await
     .expect("legacy fixture has no durable writer")
     .expect("test dispatch is not cancellable");
+    // #2424: exit_plan_mode now REQUESTS the clamp lift; it never lifts it
+    // itself. Only the turn-end approval hook may call set_plan_mode(false).
     assert!(
-        control_only_exit.contains("exited the model-entered PLAN PHASE"),
+        control_only_exit.contains("exit requested"),
         "exit must remain available when scheduled planning is off: {control_only_exit}"
     );
     let enter = run_scheduled_tool(
@@ -168,11 +179,16 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         &control,
     )
     .await;
+    assert!(exit.contains("exit requested"), "{exit}");
     assert!(
-        exit.contains("exited the model-entered PLAN PHASE"),
-        "{exit}"
+        control.is_plan_mode(),
+        "exit_plan_mode must NOT clear the clamp itself — only a turn-end \
+         approval may (#2424, the second root cause this design fixes)"
     );
-    assert!(!control.is_plan_mode(), "exit_plan_mode cleared the phase");
+    assert!(
+        control.take_exit_requested(),
+        "the request must be recorded for the turn-end hook to see"
+    );
 }
 
 /// A non-Act disposition is an executor boundary, not just a reduced tool
