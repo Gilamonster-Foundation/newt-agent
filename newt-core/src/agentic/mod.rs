@@ -1303,6 +1303,11 @@ pub struct ChatCtx<'a> {
     /// entering Plan immediately clamps subsequent calls in the same model
     /// round. `None` means the model-entered Plan phase is unavailable.
     pub plan_mode_control: Option<&'a dyn PlanModeControl>,
+    /// #2424: where `render_report` stores its draft instead of printing it
+    /// while the Plan disposition is active. `None` behaves as the plain
+    /// `render_report` path always has (no plan mode wired at all, e.g.
+    /// eval/headless).
+    pub plan_draft_sink: Option<&'a dyn PlanDraftSink>,
     /// #952/#1669: operator steering submitted while this turn is running.
     ///
     /// Drained at the TOP of each tool round — before the next model call, and
@@ -1964,6 +1969,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        plan_draft_sink,
         steering,
         emits_leading_reasoning,
     } = ctx;
@@ -3883,7 +3889,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
-                        plan_draft_sink: None,
+                        plan_draft_sink,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
@@ -6505,6 +6511,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        plan_draft_sink,
         steering,
         completed_spill_renderer,
         // #2372: the primary content is filtered with the stream filter's
@@ -8345,7 +8352,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
-                        plan_draft_sink: None,
+                        plan_draft_sink,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
@@ -8995,6 +9002,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        plan_draft_sink,
         steering,
         completed_spill_renderer,
         // Anthropic streams reasoning in its own wire fields, not as a lone
@@ -10655,7 +10663,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
-                        plan_draft_sink: None,
+                        plan_draft_sink,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
@@ -11214,6 +11222,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        plan_draft_sink,
         steering,
         completed_spill_renderer,
         // The Responses wire carries reasoning in its own items, never as a
@@ -12194,7 +12203,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
-                        plan_draft_sink: None,
+                        plan_draft_sink,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),

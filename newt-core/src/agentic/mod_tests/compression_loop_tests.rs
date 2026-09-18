@@ -103,6 +103,7 @@ fn ctx<'a>(
         crew_runner: None,
         operating_mode_control: None,
         plan_mode_control: None,
+        plan_draft_sink: None,
         steering: None,
         completed_spill_renderer: None,
     }

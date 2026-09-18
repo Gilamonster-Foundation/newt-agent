@@ -1337,6 +1337,94 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
     }
 }
 
+/// Per-conversation state for the Plan phase's one draft slot (design:
+/// `docs/design/plan-mode-draft-present-approve.md`, #2424). Persists the
+/// latest revision to `session_plan_path` on every save — the one filesystem
+/// write this seam performs; the model's own clamp never touches the
+/// filesystem directly. Cleared alongside `PlanModeState` on `/new`, restore,
+/// or persona rotation, so a fresh conversation never inherits a stale draft.
+#[derive(Debug, Default)]
+struct PlanDraftState {
+    latest: std::sync::Mutex<Option<newt_core::agentic::PlanDraft>>,
+    /// The revision last handed out by [`Self::take_for_presentation`], so a
+    /// turn that saved no NEW revision (or none at all) presents nothing —
+    /// the "present exactly once" half of the design, independent of whether
+    /// the model called `exit_plan_mode` or the turn simply ended.
+    presented_revision: std::sync::Mutex<Option<u32>>,
+}
+
+impl PlanDraftState {
+    fn clear(&self) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = None;
+        }
+        if let Ok(mut presented) = self.presented_revision.lock() {
+            *presented = None;
+        }
+    }
+
+    fn bind<'a>(&'a self, conversation_id: &'a str) -> TurnPlanDraftSink<'a> {
+        TurnPlanDraftSink {
+            state: self,
+            conversation_id,
+        }
+    }
+
+    /// The latest draft, if its revision has not already been presented.
+    /// Marks that revision presented as a side effect — call this exactly
+    /// once, at the end of a turn, never mid-turn to steer model-facing
+    /// behavior.
+    fn take_for_presentation(&self) -> Option<newt_core::agentic::PlanDraft> {
+        let draft = self.latest.lock().ok()?.clone()?;
+        let mut presented = self.presented_revision.lock().ok()?;
+        if *presented == Some(draft.revision) {
+            return None;
+        }
+        *presented = Some(draft.revision);
+        Some(draft)
+    }
+}
+
+/// Turn-bound adapter that persists to one conversation's `plan.md`.
+struct TurnPlanDraftSink<'a> {
+    state: &'a PlanDraftState,
+    conversation_id: &'a str,
+}
+
+/// Pure: the next revision after `current`, starting at 1. Split out of
+/// [`TurnPlanDraftSink::save_draft`] so the counting logic is unit-testable
+/// without touching the filesystem (this crate's fully-mocked unit tier never
+/// does real fs I/O; the write below is exercised at the integration tier).
+fn next_plan_draft_revision(current: Option<&newt_core::agentic::PlanDraft>) -> u32 {
+    current.map_or(1, |draft| draft.revision + 1)
+}
+
+impl newt_core::agentic::PlanDraftSink for TurnPlanDraftSink<'_> {
+    fn save_draft(&self, markdown: String) -> Result<u32, String> {
+        let mut latest = self
+            .state
+            .latest
+            .lock()
+            .map_err(|_| "plan draft lock poisoned".to_string())?;
+        let revision = next_plan_draft_revision(latest.as_ref());
+        let path = newt_core::session_plan_path(self.conversation_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| format!("plan draft dir: {error}"))?;
+        }
+        std::fs::write(&path, &markdown).map_err(|error| format!("plan draft write: {error}"))?;
+        *latest = Some(newt_core::agentic::PlanDraft { revision, markdown });
+        Ok(revision)
+    }
+
+    fn latest_draft(&self) -> Option<newt_core::agentic::PlanDraft> {
+        self.state
+            .latest
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+}
+
 /// Conversation-scoped operating state with one boundary-clear operation.
 ///
 /// Keeping these together makes it impossible for `/new`, persona rotation,
@@ -1346,12 +1434,14 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
 struct ConversationModeStates {
     auto: AutoModeState,
     plan: PlanModeState,
+    plan_draft: PlanDraftState,
 }
 
 impl ConversationModeStates {
     fn clear(&self) {
         self.auto.clear();
         self.plan.clear();
+        self.plan_draft.clear();
     }
 }
 
@@ -9351,6 +9441,10 @@ mod skills_integration_tests;
 #[cfg(test)]
 #[path = "lib_tests/operating_mode_tests.rs"]
 mod operating_mode_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/plan_draft_state_tests.rs"]
+mod plan_draft_state_tests;
 
 // ---------------------------------------------------------------------------
 // Named permission presets + `/posture` (issue #307). The `build_posture` core is

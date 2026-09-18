@@ -459,6 +459,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            plan_draft_sink: None,
             steering: None,
             completed_spill_renderer: None,
         },

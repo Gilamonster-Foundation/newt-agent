@@ -763,6 +763,7 @@ async fn run_one_turn(
         crew_runner: runtime.crew_runner.as_deref(),
         operating_mode_control: None,
         plan_mode_control: None,
+        plan_draft_sink: None,
         steering: None,
     };
     let features = InstantiatedFeatures::of(&ctx);

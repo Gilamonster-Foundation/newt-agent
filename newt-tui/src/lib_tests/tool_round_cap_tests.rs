@@ -205,6 +205,7 @@ fn openai_loop_recovers_from_context_window_400() {
                     crew_runner: None,
                     operating_mode_control: None,
                     plan_mode_control: None,
+                    plan_draft_sink: None,
                     steering: None,
                     completed_spill_renderer: None,
                 },
