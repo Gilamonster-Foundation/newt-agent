@@ -582,6 +582,16 @@ second concrete backend exists).
 **Mocks:** existing `wiremock` HTTP mocks travel with the tests unchanged.
 **Estimated diff:** ~400 lines moved, ~50 lines new glue.
 
+**Shared-loop follow-up — named tool activation:** complete the explicit-search
+part of the [tool-exposure design](design/tool-exposure-controller.md).
+An exact-name `tool_search` loads a retained schema for the next request;
+keyword discovery stays pure and execution keeps its separate permission gate.
+Provider-count clipping retains omitted definitions. At the count limit, the
+existing controller replaces the oldest optional schema, preserving Kernel
+tools and queued activations. Four-wire tests cover loading, refusal, caps,
+and reactivation. Adaptive token-budget eviction and persistent use history
+remain outside this follow-up.
+
 ## Step 9.8 — `agentic_prompt` ACP method + per-session config
 
 **Branch:** `step-9.8-acp-agentic-prompt`
@@ -2216,3 +2226,5 @@ Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 15:24 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 19:26 EDT | Date: 2026-09-17
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 21:43 EDT | Date: 2026-09-17
+
+Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:47 EDT | Date: 2026-09-17

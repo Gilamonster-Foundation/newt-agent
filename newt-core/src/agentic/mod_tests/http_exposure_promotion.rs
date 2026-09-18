@@ -261,7 +261,7 @@ async fn an_exposure_hidden_tool_is_found_then_promoted(wire: Wire) {
     );
     assert_eq!(
         names[3], expected,
-        "{wire:?}: promotion is sticky for the turn"
+        "{wire:?}: the schema remains loaded without another activation"
     );
     drop(requests);
     assert_eq!(
@@ -283,7 +283,7 @@ async fn full_exposure_sends_one_tool_list(wire: Wire) {
     let (server, requests) = scripted(
         wire,
         vec![
-            ("tool_search", serde_json::json!({"query": "save note"})),
+            ("tool_search", serde_json::json!({"query": "save_note"})),
             (
                 "save_note",
                 serde_json::json!({"action": "add", "text": "note"}),
@@ -310,6 +310,7 @@ async fn full_exposure_sends_one_tool_list(wire: Wire) {
     for request in requests.iter() {
         assert_eq!(wire.tool_names(request), first, "{wire:?}");
         assert!(!wire.last_tool_result(request).contains("schema not loaded"));
+        assert!(!wire.last_tool_result(request).contains("did not run"));
     }
     drop(requests);
     assert_eq!(sink.calls, vec!["add:note".to_string()], "{wire:?}");
@@ -320,6 +321,67 @@ per_wire!(full_exposure_sends_one_tool_list:
     chat_completions_full_exposure_is_unchanged,
     responses_full_exposure_is_unchanged,
     anthropic_full_exposure_is_unchanged);
+
+/// Ground named activation in every provider's actual request body: the model
+/// can use the already-exposed search tool, then call the newly visible schema.
+/// Search itself never executes the remote operation or replaces its gate.
+async fn exact_search_loads_a_schema_without_granting_or_executing_it(wire: Wire) {
+    use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
+
+    for allowed in [Some("review__fetch"), Some("another__tool"), None] {
+        let (server, requests) = scripted(
+            wire,
+            vec![
+                ("tool_search", serde_json::json!({"query": "missing__tool"})),
+                ("tool_search", serde_json::json!({"query": "review__fetch"})),
+                ("review__fetch", serde_json::json!({})),
+            ],
+        )
+        .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut permission = FixtureMcpPermission::new(allowed.unwrap_or(""), &caveats);
+        let mut context = ctx(&uri, &messages, &caveats);
+        context.action_nudges = false;
+        context.exposure.profile = crate::config::ExposureProfile::Minimal;
+        if allowed.is_some() {
+            context.permission_gate = Some(&mut permission);
+        }
+        let mut mcp = RefusedRemote { calls: 0 };
+        wire.run(context, &mut mcp).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4, "{wire:?}: {allowed:?}");
+        let mut expected = wire.tool_names(&requests[0]);
+        assert!(!expected.iter().any(|name| name == "review__fetch"));
+        assert!(expected.iter().any(|name| name == "tool_search"));
+        assert_eq!(
+            wire.tool_names(&requests[1]),
+            expected,
+            "{wire:?}: unknown search"
+        );
+        assert!(!wire.last_tool_result(&requests[1]).contains("did not run"));
+        expected.push("review__fetch".to_string());
+        assert_eq!(wire.tool_names(&requests[2]), expected, "{wire:?}");
+        assert_eq!(wire.tool_names(&requests[3]), expected, "{wire:?}");
+        assert!(
+            wire.last_tool_result(&requests[2]).contains("did not run"),
+            "{wire:?}: activation must describe schema loading, not execution"
+        );
+        assert_eq!(
+            mcp.calls,
+            usize::from(allowed == Some("review__fetch")),
+            "{wire:?}: only the subsequent, separately approved call may execute"
+        );
+    }
+}
+
+per_wire!(exact_search_loads_a_schema_without_granting_or_executing_it:
+    exact_search_loads_a_schema_for_ollama,
+    exact_search_loads_a_schema_for_chat_completions,
+    exact_search_loads_a_schema_for_responses,
+    exact_search_loads_a_schema_for_anthropic);
 
 /// A generic MCP tool the session connected but this request's disposition
 /// refuses.
@@ -354,7 +416,7 @@ async fn a_refused_capability_is_never_marked_hidden_or_promoted() {
     let (server, requests) = scripted(
         wire,
         vec![
-            ("tool_search", serde_json::json!({"query": "review fetch"})),
+            ("tool_search", serde_json::json!({"query": "review__fetch"})),
             ("review__fetch", serde_json::json!({})),
         ],
     )
@@ -445,19 +507,28 @@ async fn promote_with_exposed(wire: Wire, exposed: usize) -> (Vec<String>, Vec<S
 }
 
 /// #2331 review: an OpenAI-compatible request already at the 128-function
-/// wire cap cannot take a promoted schema — a 129-tool request is rejected
-/// whole, which would turn a relevance miss into a failed turn. The call is
-/// not promoted, says the list is at its limit, and the next request stays at
-/// the cap.
+/// wire cap replaces the oldest optional schema. Kernel tools remain present,
+/// and a relevance miss never produces a rejected 129-tool request.
 #[tokio::test]
 async fn a_promotion_never_pushes_an_openai_compatible_request_past_its_tool_cap() {
     for wire in [Wire::ChatCompletions, Wire::Responses] {
         let (first, next, result) = promote_with_exposed(wire, 128).await;
-        assert_eq!(next, first, "{wire:?}: the request must stay at the cap");
-        assert!(
-            result.contains("could not be loaded") && result.contains("128"),
-            "{wire:?}: the call must name the limit: {result}"
+        assert_eq!(next.len(), 128, "{wire:?}");
+        let removed = first
+            .iter()
+            .position(|name| {
+                crate::agentic::tools::exposure::classify(name)
+                    != crate::agentic::tools::exposure::ExposureClass::Kernel
+            })
+            .unwrap();
+        let mut expected = first;
+        expected.remove(removed);
+        expected.push("bulk__t199".to_string());
+        assert_eq!(
+            next, expected,
+            "{wire:?}: deterministic optional replacement"
         );
+        assert!(result.contains("did not run"), "{wire:?}: {result}");
     }
 }
 
@@ -469,5 +540,40 @@ async fn below_the_tool_cap_a_promotion_still_appends() {
         assert!(result.contains("schema not loaded"), "{wire:?}: {result}");
         first.push("bulk__t199".to_string());
         assert_eq!(next, first, "{wire:?}");
+    }
+}
+
+/// Full exposure can still be clipped by the final provider envelope. Those
+/// omitted schemas must remain available for explicit named activation too.
+#[tokio::test]
+async fn exact_search_recovers_a_full_profile_tool_clipped_only_by_the_wire() {
+    for wire in [Wire::ChatCompletions, Wire::Responses] {
+        let (server, requests) = scripted(
+            wire,
+            vec![("tool_search", serde_json::json!({"query": "bulk__t199"}))],
+        )
+        .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut context = ctx(&uri, &messages, &caveats);
+        context.action_nudges = false;
+        context.safe_context = Some(100_000_000);
+        wire.run(context, &mut BulkRemote { count: 200 }).await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{wire:?}");
+        let first = wire.tool_names(&requests[0]);
+        let next = wire.tool_names(&requests[1]);
+        assert_eq!(first.len(), 128, "{wire:?}");
+        assert_eq!(next.len(), 128, "{wire:?}");
+        assert!(!first.iter().any(|name| name == "bulk__t199"));
+        assert!(next.iter().any(|name| name == "bulk__t199"), "{wire:?}");
+        for kernel in first.iter().filter(|name| {
+            crate::agentic::tools::exposure::classify(name)
+                == crate::agentic::tools::exposure::ExposureClass::Kernel
+        }) {
+            assert!(next.contains(kernel), "{wire:?}: retained {kernel}");
+        }
+        assert!(wire.last_tool_result(&requests[1]).contains("did not run"));
     }
 }
