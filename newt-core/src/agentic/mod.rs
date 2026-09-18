@@ -295,7 +295,7 @@ pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
 };
-pub use plan_mode::PlanModeControl;
+pub use plan_mode::{PlanDraft, PlanDraftSink, PlanModeControl};
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
@@ -3883,6 +3883,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        plan_draft_sink: None,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
@@ -8344,6 +8345,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        plan_draft_sink: None,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
@@ -10653,6 +10655,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        plan_draft_sink: None,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
@@ -12191,6 +12194,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        plan_draft_sink: None,
                         spill_store,
                         persona_tools,
                         hidden_tools: Some(&hidden_tools),
