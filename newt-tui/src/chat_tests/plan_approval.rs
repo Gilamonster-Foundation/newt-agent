@@ -160,3 +160,42 @@ fn a_non_plan_disposition_is_not_asked_without_an_exit_request() {
         );
     }
 }
+
+/// #2424: the seeded implementation turn carries the approved draft when
+/// there is one, and ALWAYS carries the tenacity exit guidance — that
+/// guidance used to be `exit_plan_mode`'s own ack; this is the turn it now
+/// belongs to.
+#[test]
+fn approval_seed_text_carries_the_plan_when_present_and_the_guidance_always() {
+    let with_plan = plan_approval_seed_text(Some("# Refactor\n1. step"), "GUIDANCE");
+    // The coordinate: every seeded turn starts with the registered prefix,
+    // so the compaction boundary classifier recognizes it as harness-owned.
+    assert!(
+        with_plan.starts_with(newt_core::agentic::PLAN_APPROVAL_PREFIX),
+        "{with_plan}"
+    );
+    assert!(with_plan.contains("Implement it now"), "{with_plan}");
+    assert!(with_plan.contains("# Refactor\n1. step"), "{with_plan}");
+    assert!(with_plan.contains("GUIDANCE"), "{with_plan}");
+
+    let without = plan_approval_seed_text(None, "GUIDANCE");
+    assert!(without.contains("Continue the task"), "{without}");
+    assert!(!without.contains("Implement it now"), "{without}");
+    assert!(without.contains("GUIDANCE"), "{without}");
+}
+
+/// The seeded turn resumes as Act by the operator's decision — even though
+/// its text quotes a plan, which a fresh intake analysis could read as Plan
+/// and re-clamp the very turn that was just approved.
+#[test]
+fn approval_intake_resumes_as_act_even_when_the_text_quotes_a_plan() {
+    let lexicon = newt_core::agentic::DispositionLexicon::default();
+    let text = plan_approval_seed_text(
+        Some("# Plan\n1. Plan the refactor of the parser\n2. Outline the steps"),
+        "guidance",
+    );
+    assert_eq!(
+        plan_approval_intake(&text, &lexicon).disposition(),
+        PromptDisposition::Act
+    );
+}

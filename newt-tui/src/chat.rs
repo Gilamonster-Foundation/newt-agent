@@ -117,6 +117,17 @@ enum ModelInputOrigin {
     HarnessRetry {
         parent: Box<newt_core::TurnPromptContext>,
     },
+    /// #2424: the harness-authored turn seeded after the operator approved a
+    /// plan ("implement it now" + the approved draft + the tenacity exit
+    /// guidance). Like `HarnessRetry` it is NOT operator input — inert for
+    /// slash commands and history — and it is persisted under the same
+    /// harness-retry provenance class (harness-generated, descended from the
+    /// operator's plan prompt, never the active operator prompt), because a
+    /// new durable origin would trip the prompt_receipts CHECK on every
+    /// existing db, exactly the constraint `WebInjected` records below.
+    HarnessPlanApproval {
+        parent: Box<newt_core::TurnPromptContext>,
+    },
     /// A prompt injected from an ATTACH surface (newt-web, A3/W6): the operator
     /// typed it into a web/phone tab attached to this running session. Like
     /// `HarnessRetry`, it is deliberately NOT operator input to the TUI — see
@@ -337,15 +348,62 @@ struct PendingRetry {
     parent: Box<newt_core::TurnPromptContext>,
 }
 
-/// #2424: a Plan-mode approval question answered "discuss" (or anything else
-/// that isn't an unambiguous yes/no) runs as the NEXT turn's input, rather
-/// than making the operator retype what they just said. Genuinely operator
-/// text — unlike [`PendingRetry`], which is harness-authored — so it is
-/// tagged [`ModelInputOrigin::OperatorContinuation`], never `HarnessRetry`.
+/// #2424: what kind of turn the plan-mode approval hook queued to run next,
+/// which decides its [`ModelInputOrigin`] — the two are different authors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanTurnKind {
+    /// The operator answered "discuss" (or anything but an unambiguous
+    /// yes/no): their own words run as the next turn, so the operator does
+    /// not retype them. Genuinely operator text → `OperatorContinuation`.
+    Feedback,
+    /// The operator approved: a harness-authored "implement it now" turn
+    /// carrying the approved draft and the tenacity exit guidance →
+    /// `HarnessPlanApproval`, never an operator origin.
+    Approval,
+}
+
+/// #2424: a turn the plan-mode approval hook queued to run next instead of
+/// reading from the operator (the same shape as [`PendingRetry`]).
 #[derive(Debug, Clone)]
-struct PendingPlanFeedback {
+struct PendingPlanTurn {
     text: String,
     parent: Box<newt_core::TurnPromptContext>,
+    kind: PlanTurnKind,
+}
+
+/// #2424: the harness-authored prompt that seeds the implementation turn
+/// after approval. Pure, so the shape is testable: the approved draft rides
+/// inside when there is one (a `render_report` draft), and the tenacity exit
+/// guidance always does — that guidance used to be `exit_plan_mode`'s own
+/// ack, and this is the turn it now belongs to.
+fn plan_approval_seed_text(approved_plan: Option<&str>, exit_guidance: &str) -> String {
+    // The prefix is this prose's coordinate — see its doc in `compress.rs`.
+    let prefix = newt_core::agentic::PLAN_APPROVAL_PREFIX;
+    match approved_plan {
+        Some(plan) => format!(
+            "{prefix} The operator approved the plan below. Implement it now.\n\n{plan}\n\n{exit_guidance}"
+        ),
+        None => format!(
+            "{prefix} The operator approved leaving plan mode. Continue the task.\n\n{exit_guidance}"
+        ),
+    }
+}
+
+/// #2424: comprehension for the seeded implementation turn. Approval IS the
+/// operator's decision that implementation may proceed, so the turn resumes
+/// as `Act` rather than letting intake re-guess from text that quotes a plan
+/// (which could read as Plan again and re-clamp the very turn that was just
+/// approved). `resume_with` still yields to an `Ask` analysis, as it does for
+/// every other continuation.
+fn plan_approval_intake(
+    task: &str,
+    lexicon: &newt_core::agentic::DispositionLexicon,
+) -> newt_core::agentic::PromptIntake {
+    newt_core::agentic::PromptIntake::resume_with(
+        task,
+        newt_core::agentic::PromptDisposition::Act,
+        lexicon,
+    )
 }
 
 /// #2424: how the Plan clamp now governing this turn was reached, decided
@@ -453,6 +511,9 @@ fn intake_for_accepted_prompt(
                 }
             }
         }
+        // #2424: the approved-plan implementation turn is Act by the
+        // operator's own decision; see `plan_approval_intake`.
+        (ModelInputOrigin::HarnessPlanApproval { .. }, _) => plan_approval_intake(task, lexicon),
         _ => PromptIntake::analyze_with(task, lexicon),
     }
 }
@@ -665,6 +726,30 @@ fn begin_model_prompt(
             )
         }
         (None, ModelInputOrigin::HarnessRetry { parent }) => ingress.ephemeral.begin_prompt(
+            conversation_id,
+            newt_core::NewPrompt::harness_retry(
+                raw.to_vec(),
+                model.to_vec(),
+                parent.submitted_prompt().id(),
+            ),
+        ),
+        // #2424: the seeded implementation turn is persisted under the
+        // existing `harness_retry` origin ON PURPOSE — same provenance class
+        // (harness-generated, descended from the operator's plan prompt,
+        // never the active operator prompt), and a first-class new origin
+        // would trip the prompt_receipts CHECK on every existing db, the
+        // same constraint the web-injected arms below record.
+        (Some(store), ModelInputOrigin::HarnessPlanApproval { parent }) => store.begin_prompt(
+            conversation_id,
+            title,
+            persona,
+            newt_core::NewPrompt::harness_retry(
+                raw.to_vec(),
+                model.to_vec(),
+                parent.submitted_prompt().id(),
+            ),
+        ),
+        (None, ModelInputOrigin::HarnessPlanApproval { parent }) => ingress.ephemeral.begin_prompt(
             conversation_id,
             newt_core::NewPrompt::harness_retry(
                 raw.to_vec(),
@@ -2614,7 +2699,7 @@ fn session_body(
         .unwrap_or(0);
     let mut pending_retry: Option<PendingRetry> = None;
     let mut retry_budget: u32 = 0;
-    let mut pending_plan_feedback: Option<PendingPlanFeedback> = None;
+    let mut pending_plan_turn: Option<PendingPlanTurn> = None;
 
     // PR4 (#461): the embedded `git` tool. Built once per session and injected
     // into every turn's ChatCtx. It is now ALWAYS advertised — previously it was
@@ -2808,18 +2893,22 @@ fn session_body(
                     parent: retry.parent,
                 },
             )
-        } else if let Some(feedback) = pending_plan_feedback.take() {
-            // #2424: run the operator's own "discuss" answer as this turn's
-            // input instead of making them retype it. A fresh turn — reset
-            // the re-prompt budget, matching the web-inject and normal-turn
-            // branches below.
+        } else if let Some(queued) = pending_plan_turn.take() {
+            // #2424: run the turn the approval hook queued — the operator's
+            // own "discuss" answer, or the harness-authored implementation
+            // turn after approval — instead of reading from the operator. A
+            // fresh turn: reset the re-prompt budget, matching the
+            // web-inject and normal-turn branches below.
             retry_budget = retry_max;
-            (
-                ReadOutcome::Line(feedback.text),
-                ModelInputOrigin::OperatorContinuation {
-                    parent: feedback.parent,
+            let origin = match queued.kind {
+                PlanTurnKind::Feedback => ModelInputOrigin::OperatorContinuation {
+                    parent: queued.parent,
                 },
-            )
+                PlanTurnKind::Approval => ModelInputOrigin::HarnessPlanApproval {
+                    parent: queued.parent,
+                },
+            };
+            (ReadOutcome::Line(queued.text), origin)
         } else if let Some(injected) = pending_clarification
             .is_none()
             .then(|| {
@@ -8473,20 +8562,57 @@ fn session_body(
                                                         );
                                                         active_operating_mode = OperatingMode::Dev;
                                                     }
-                                                    // #2424 follow-up (not yet built): auto-seed
-                                                    // a fresh Act turn from the approved plan so
-                                                    // the operator truly types nothing here. For
-                                                    // now the operator's own next message starts
-                                                    // implementation, unclamped.
+                                                    // Seed the implementation turn: the operator
+                                                    // types nothing. Harness-authored, so it
+                                                    // carries its own origin, and the tenacity
+                                                    // exit guidance (formerly exit_plan_mode's
+                                                    // ack) rides inside it — a harness-origin
+                                                    // message, never disguised as operator text.
+                                                    let seeded = match active_prompt_context.clone()
+                                                    {
+                                                        Some(parent) => {
+                                                            let plan = conversation_mode_states
+                                                                .plan_draft
+                                                                .latest();
+                                                            pending_plan_turn =
+                                                                Some(PendingPlanTurn {
+                                                                    text: plan_approval_seed_text(
+                                                                        plan.as_ref().map(|d| {
+                                                                            d.markdown.as_str()
+                                                                        }),
+                                                                        &newt_core::agentic::exit_plan_mode_result(
+                                                                            newt_core::tenacity::effective_tenacity(),
+                                                                        ),
+                                                                    ),
+                                                                    parent: Box::new(parent),
+                                                                    kind: PlanTurnKind::Approval,
+                                                                });
+                                                            true
+                                                        }
+                                                        // No receipt to parent to (should not
+                                                        // happen for a turn that just ran, but
+                                                        // fails safe): the operator's own next
+                                                        // message starts implementation.
+                                                        None => false,
+                                                    };
                                                     print_newt(
-                                                        match entry {
-                                                            PlanEntry::OperatorSelected => {
+                                                        match (entry, seeded) {
+                                                            (PlanEntry::OperatorSelected, true) => {
+                                                                "▸  plan approved — switched to \
+                                                                 /mode dev; implementing."
+                                                            }
+                                                            (_, true) => {
+                                                                "▸  plan approved — implementing."
+                                                            }
+                                                            (
+                                                                PlanEntry::OperatorSelected,
+                                                                false,
+                                                            ) => {
                                                                 "▸  plan approved — switched to \
                                                                  /mode dev. Send a message to \
                                                                  begin implementation."
                                                             }
-                                                            PlanEntry::ModelDuringAct
-                                                            | PlanEntry::IntakeInferred => {
+                                                            (_, false) => {
                                                                 "▸  plan approved — clamp lifted. \
                                                                  Send a message to begin \
                                                                  implementation."
@@ -8518,11 +8644,11 @@ fn session_body(
                                                     if let Some(parent) =
                                                         active_prompt_context.clone()
                                                     {
-                                                        pending_plan_feedback =
-                                                            Some(PendingPlanFeedback {
-                                                                text: feedback,
-                                                                parent: Box::new(parent),
-                                                            });
+                                                        pending_plan_turn = Some(PendingPlanTurn {
+                                                            text: feedback,
+                                                            parent: Box::new(parent),
+                                                            kind: PlanTurnKind::Feedback,
+                                                        });
                                                     }
                                                     // No active_prompt_context to parent to
                                                     // (shouldn't happen for a turn that just

@@ -264,3 +264,41 @@ async fn compress_output_has_no_orphan_tool_pairs() {
         }
     }
 }
+
+/// #2424: the harness-authored approval seed ([`PLAN_APPROVAL_PREFIX`]) is a
+/// harness-owned user-role message like a nudge, so the boundary must skip
+/// it and keep protecting the operator's real ask — the parent plan prompt
+/// it descends from. Otherwise the tail would pin to the seed and demote
+/// that ask into the summarizable middle (the F1 class).
+#[test]
+fn boundary_anchor_skips_the_plan_approval_seed() {
+    let mut msgs = vec![sys("you are newt"), user("plan the parser refactor")];
+    let operator_ask = msgs.len() - 1;
+    for i in 0..3 {
+        msgs.push(assistant_call(
+            "read_file",
+            json!({"path": format!("f{i}")}),
+        ));
+        msgs.push(tool_result(&"q".repeat(4_000)));
+    }
+    msgs.push(user(&format!(
+        "{PLAN_APPROVAL_PREFIX} The operator approved the plan below. \
+             Implement it now.\n\n# Plan\n1. split the lexer"
+    )));
+    let seed = msgs.len() - 1;
+    for i in 0..4 {
+        msgs.push(assistant_call(
+            "edit_file",
+            json!({"path": format!("g{i}")}),
+        ));
+        msgs.push(tool_result(&"q".repeat(4_000)));
+    }
+    assert!(is_compaction_message(&msgs[seed]));
+    let b = compute_boundary(&msgs, 2_000, None, EST);
+    assert!(
+        b.tail_start <= operator_ask,
+        "the anchor must skip the approval seed at {seed} and protect the \
+             operator's ask at {operator_ask} (tail_start {})",
+        b.tail_start
+    );
+}

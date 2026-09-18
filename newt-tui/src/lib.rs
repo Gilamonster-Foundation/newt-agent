@@ -1387,6 +1387,14 @@ impl PlanDraftState {
         }
     }
 
+    /// The latest saved draft, whether or not it has been presented — the
+    /// approval hook seeds the implementation turn with it AFTER
+    /// [`Self::take_for_presentation`] has already consumed the "not yet
+    /// shown" signal.
+    fn latest(&self) -> Option<newt_core::agentic::PlanDraft> {
+        self.latest.lock().ok().and_then(|guard| guard.clone())
+    }
+
     /// The latest draft, if its revision has not already been presented.
     /// Marks that revision presented as a side effect — call this exactly
     /// once, at the end of a turn, never mid-turn to steer model-facing

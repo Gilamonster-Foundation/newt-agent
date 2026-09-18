@@ -2384,17 +2384,11 @@ const EXIT_PLAN_MODE_REQUESTED: &str = "exit requested. Awaiting operator approv
 /// #2424: pre-approval this WAS the `exit_plan_mode` tool's own ack (the
 /// clamp lifted unconditionally). Now that lifting requires operator
 /// approval (see [`EXIT_PLAN_MODE_REQUESTED`]), this text belongs on the
-/// turn that FOLLOWS approval, not on the request. **Not yet wired**: the
-/// turn-end approval hook (`newt-tui`) lifts the clamp on approval but does
-/// not yet deliver this guidance into the model's next turn, because doing
-/// so honestly needs a harness-origin message injection (invariant 2.4 —
-/// never disguised as operator input) that does not exist at the turn-end
-/// boundary yet. Tracked as a known, deliberate gap for a follow-up slice,
-/// not a silent regression: the approval gate itself (this slice's actual
-/// fix) works today without it; only the post-approval forcing nudge is
-/// missing. `#[allow(dead_code)]` until that follow-up lands.
-#[allow(dead_code)]
-fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
+/// turn that FOLLOWS approval: the TUI's turn-end hook seeds that turn with a
+/// harness-authored prompt (its own `ModelInputOrigin`, persisted under the
+/// harness-retry provenance class — never disguised as operator input,
+/// invariant 2.4) and this guidance rides inside it.
+pub fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
     let base = "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.";
     if tenacity.exit_plan_requires_edit() {
         format!(
