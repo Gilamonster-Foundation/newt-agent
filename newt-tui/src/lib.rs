@@ -401,8 +401,8 @@ pub(crate) fn run_psyche_panel(
         // rich-tui compiled but stdout is not a TTY (piped / headless): no overlay.
         print_newt(
             "the psyche panel needs an interactive rich terminal — use /psyche status \
-             for the text view, or /psyche cognition / /psyche tenacity <level> to \
-             change the dials.",
+             for the text view, or /psyche cognition / tenacity / initiative <level> \
+             to change the dials.",
             color,
             verbose,
         );
@@ -3624,12 +3624,12 @@ fn ready_line(version: &str, model: &str, url: &str, kind: newt_core::BackendKin
     )
 }
 
-/// The preamble tenacity indicator (#12): shown only when tenacity is ELEVATED
-/// above the behaviour-preserving `Standard`, so an operator sees at a glance
-/// that action-forcing is dialled up (`· tenacity: relentless`). Empty at
-/// `Standard` to keep the default line clean. Pure — unit-tested directly.
+/// The preamble tenacity indicator (#12): shown only when tenacity is raised
+/// above `Normal`, so an operator sees at a glance that the round limit is
+/// lifted (`· tenacity: relentless`). Empty at `Normal` to keep the default
+/// line clean. Pure — unit-tested directly.
 fn tenacity_indicator(t: newt_core::Tenacity) -> String {
-    if t == newt_core::Tenacity::Standard {
+    if t == newt_core::Tenacity::Normal {
         String::new()
     } else {
         format!(" · tenacity: {}", t.label())
@@ -4427,8 +4427,8 @@ pub(crate) fn refresh_backend(
     // the resolved card's declared metadata, under the same association gates as
     // the capability decision — never inferred from the model name (the
     // anti-substring law). No associated card family ⇒ no family (the
-    // per-family default simply does not engage).
-    newt_core::tenacity::set_active_model_family(
+    // per-family initiative default simply does not engage).
+    newt_core::initiative::set_active_model_family(
         choice
             .capabilities
             .family_for_route(&choice.route_destination(), choice.principal())
@@ -4554,6 +4554,17 @@ mod resumed_preference_tests;
 #[allow(dead_code)]
 fn build_system_prompt(workspace: &str, plan_path: &str) -> String {
     build_system_prompt_with_soul(workspace, None, plan_path)
+}
+
+/// Seat `persona`'s declared dials (cognition and initiative) as the persona
+/// resolution layers, or clear them for `None`. Every persona activation site
+/// calls this one function: startup, `/persona set|clear`, a conversation
+/// restore and a fresh tab. Re-seating the dials one at a time is how the
+/// outgoing persona's tenacity once leaked into restored conversations.
+pub(crate) fn seat_persona_dials(persona: Option<&Persona>) {
+    let profile = persona.map(|p| &p.profile);
+    newt_core::cognition::set_persona_cognition(profile.and_then(|p| p.cognition));
+    newt_core::initiative::set_persona_initiative(profile.and_then(|p| p.initiative));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5519,17 +5530,17 @@ fn persona_status(active: Option<&Persona>) -> String {
         (None, Some(t)) => out.push_str(&format!("\n  router: tier={t:?}")),
         (None, None) => {}
     }
-    // The psyche dials (backend + cognition/tenacity/crew), shown only when set.
+    // The psyche dials (backend + cognition/initiative/crew), shown only when set.
     if let Some(b) = &profile.backend {
         out.push_str(&format!("\n  backend: {b}"));
     }
     if let Some(c) = profile.cognition {
         out.push_str(&format!("\n  cognition: {}", c.label()));
     }
-    if let Some(t) = profile.tenacity {
-        // P1#3: this is now an APPLIED resolution layer (set_persona_tenacity),
-        // not just rendered — it agrees with /psyche's effective_tenacity.
-        out.push_str(&format!("\n  tenacity: {}", t.label()));
+    if let Some(i) = profile.initiative {
+        // An APPLIED resolution layer (set_persona_initiative), not just
+        // rendered — it agrees with /psyche's effective_initiative.
+        out.push_str(&format!("\n  initiative: {}", i.label()));
     }
     if profile.crew == Some(true) {
         // P1#3: crew is a startup gate (NEWT_TEAM builds the crew runner once at
@@ -6464,21 +6475,17 @@ fn commit_prepared(
     // Resolved during PREPARE — no fallible read on the apply path.
     *ctx.active_persona = prepared_persona;
     // #1668 review-2 finding 5: `active_persona` is only half of activating a
-    // persona — `handle_persona_command` also re-seats the PERSONA COGNITION
-    // LAYER that `effective_cognition` ranks beneath the CLI layer. A restore
-    // that swapped the struct but left that layer alone carried the OUTGOING
-    // conversation's persona cognition into the incoming one, so resuming a
-    // plain conversation from a `meticulous` persona kept meticulous with
-    // nothing on screen naming a persona to explain it.
+    // persona — `handle_persona_command` also re-seats the PERSONA DIAL
+    // LAYERS that `effective_*` rank beneath the CLI layer. A restore that
+    // swapped the struct but left those layers alone carried the OUTGOING
+    // conversation's persona dials into the incoming one, so resuming a plain
+    // conversation from a `meticulous` persona kept meticulous with nothing on
+    // screen naming a persona to explain it.
     //
     // Derived from the persona now installed rather than from `record.persona`,
-    // so the load-failure arm (persona named but unavailable) clears the layer
-    // instead of leaving a stale one behind a persona that is not active.
-    newt_core::cognition::set_persona_cognition(
-        ctx.active_persona
-            .as_ref()
-            .and_then(|p| p.profile.cognition),
-    );
+    // so the load-failure arm (persona named but unavailable) clears the layers
+    // instead of leaving stale ones behind a persona that is not active.
+    seat_persona_dials(ctx.active_persona.as_ref());
     ctx.compress_state.reset();
     *ctx.active_conversation_id = record.id.clone();
     *ctx.system = rebuild_system_prompt(
@@ -7093,9 +7100,8 @@ fn handle_persona_command(
         PersonaCommand::Show => Ok(persona_status(active_persona.as_ref())),
         PersonaCommand::Clear => {
             *active_persona = None;
-            // P1#3: no persona → no persona-declared tenacity / cognition layer.
-            newt_core::tenacity::set_persona_tenacity(None);
-            newt_core::cognition::set_persona_cognition(None);
+            // P1#3: no persona → no persona-declared dial layers.
+            seat_persona_dials(None);
             // Clearing the persona starts a new conversation → fresh id + plan.
             *ctx.conversation_id = newt_core::new_conversation_id();
             reset_conversation(workspace, active_persona.as_ref(), ctx);
@@ -7103,11 +7109,10 @@ fn handle_persona_command(
         }
         PersonaCommand::Set { name, keep_context } => {
             let persona = store.load(&name)?;
-            // P1#3 / review-2: install the persona's declared tenacity + cognition
-            // as real resolution layers, so `/persona show`, `/psyche`, and the
-            // panel all agree and the loop obeys them.
-            newt_core::tenacity::set_persona_tenacity(persona.profile.tenacity);
-            newt_core::cognition::set_persona_cognition(persona.profile.cognition);
+            // P1#3 / review-2: install the persona's declared dials as real
+            // resolution layers, so `/persona show`, `/psyche`, and the panel
+            // all agree and the loop obeys them.
+            seat_persona_dials(Some(&persona));
             *active_persona = Some(persona);
             if keep_context {
                 // Persistent-actor swap: rebuild the system prompt for the new

@@ -1,7 +1,7 @@
 //! The observability-contract record `newt headless` emits (W0 #1511, epic
 //! #1506) — the wire format the EXTERNAL evaluator consumes.
 //!
-//! The contract (`gilamonster-bench/CONTRACT.md`, `contract_version: "1"`) is
+//! The contract (`gilamonster-bench/CONTRACT.md`, `contract_version: "2"`) is
 //! **data, deliberately re-declared per consumer**: this module is newt's
 //! emitter-side declaration, and the bench keeps its own consumer-side
 //! structs. Do NOT extract a shared `-contract` crate — that re-introduces
@@ -18,7 +18,13 @@ use newt_core::{BehaviorSignal, ErrorClass, ParseSignal, TurnEndReason};
 
 /// The contract version this emitter declares. Bumped only on a breaking
 /// change to field names/semantics; adding an optional field is not breaking.
-pub const CONTRACT_VERSION: &str = "1";
+///
+/// `"2"` (psyche slice 1b): `effective_config.tenacity` changed meaning and
+/// vocabulary (`normal` | `relentless`: pursuit only), and the
+/// read-before-acting level it used to carry is the new
+/// `effective_config.initiative` (`patient` | `measured` | `decisive` |
+/// `eager`). A v1 row's `tenacity` is not comparable with a v2 row's.
+pub const CONTRACT_VERSION: &str = "2";
 
 /// Provenance: which family member emitted the record.
 pub const AGENT: &str = "newt-agent";
@@ -45,8 +51,11 @@ pub struct ContractInputs<'a> {
     /// The `--context-window` pin the agent ran with; `None` ⇒ omitted (the
     /// agent used its defaults — nothing authoritative to report).
     pub context_window: Option<u32>,
-    /// The tenacity level the run resolved (family override / default).
+    /// The tenacity level the run resolved (the explicit choice, else `normal`).
     pub tenacity: &'a str,
+    /// The initiative level the run resolved (explicit / persona / family
+    /// default / config default).
+    pub initiative: &'a str,
     /// Effective cognition label (`default` when Newt sends no selection, or
     /// one of the explicit cognition levels).
     pub cognition: &'a str,
@@ -412,7 +421,7 @@ pub fn feature_receipt(
     (!features.is_empty()).then(|| serde_json::json!({ "features": features }))
 }
 
-/// Build THE contract record — exactly the `contract_version: "1"` fields.
+/// Build THE contract record — exactly the `contract_version: "2"` fields.
 /// Optional fields go through [`conditional_stanza`].
 pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     let mut timing = serde_json::json!({ "wall_ms": i.wall_ms });
@@ -425,6 +434,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     conditional_stanza(&mut timing, "tok_s", tok_s);
     let mut effective_config = serde_json::json!({
         "tenacity": i.tenacity,
+        "initiative": i.initiative,
         "cognition": i.cognition,
         "crew": i.crew,
         "ocap": i.ocap,
@@ -809,7 +819,7 @@ mod tests {
     /// #2268 authorizes `context_exceeded` explicitly; the file documents the
     /// still-required matching consumer update rather than claiming it ran.
     #[test]
-    fn the_checked_in_permitted_set_matches_contract_version_one() {
+    fn the_checked_in_permitted_set_matches_the_contract() {
         assert_eq!(
             permitted_outcomes(),
             vec![
@@ -836,7 +846,8 @@ mod tests {
             backend_kind: "openai",
             outcome: "completed",
             context_window: Some(32768),
-            tenacity: "standard",
+            tenacity: "normal",
+            initiative: "measured",
             cognition: "default",
             crew: "off",
             ocap: "off",
@@ -1008,7 +1019,7 @@ mod tests {
 
     // --- the record itself ---
 
-    /// The record round-trips as valid JSON with EXACTLY the contract-v1
+    /// The record round-trips as valid JSON with EXACTLY the contract-v2
     /// fields — no extras for the bench to trip on, none of ours missing.
     #[test]
     fn record_round_trips_with_exactly_the_contract_fields() {
@@ -1037,7 +1048,7 @@ mod tests {
             ],
             "exactly the contract fields (model_digest absent: not supplied)"
         );
-        assert_eq!(parsed["contract_version"], "1");
+        assert_eq!(parsed["contract_version"], "2");
         assert_eq!(parsed["agent"], "newt-agent");
         assert_eq!(parsed["agent_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
@@ -1047,7 +1058,8 @@ mod tests {
         assert_eq!(
             parsed["effective_config"],
             serde_json::json!({
-                "context_window": 32768, "tenacity": "standard",
+                "context_window": 32768, "tenacity": "normal",
+                "initiative": "measured",
                 "cognition": "default", "crew": "off", "ocap": "off",
                 "max_rounds": 40
             })
@@ -1147,7 +1159,7 @@ mod tests {
         inputs.smart_harness = Some(&manifest);
         let record = contract_record(&inputs);
         assert_eq!(record["effective_config"]["smart_harness"], manifest);
-        assert_eq!(record["contract_version"], "1");
+        assert_eq!(record["contract_version"], "2");
         assert!(permitted_outcomes().contains(&record["outcome"].as_str().unwrap()));
     }
 

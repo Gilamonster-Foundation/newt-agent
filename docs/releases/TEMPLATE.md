@@ -10,7 +10,7 @@
 
 ## Benchmark ceremony
 
-**Suite:** tb-30 · **Context window:** `<N>` · **Tenacity:** `<default | …>` · **Lane:** confined (OCAP-on) · **Honesty floor:** ≥25/30 real attempts (else quarantined)
+**Suite:** tb-30 · **Context window:** `<N>` · **Tenacity:** `<normal | relentless>` · **Initiative:** `<default | patient | measured | decisive | eager>` · **Lane:** confined (OCAP-on) · **Honesty floor:** ≥25/30 real attempts (else quarantined)
 
 ### Confined (OCAP-on) champions
 

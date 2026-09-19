@@ -1,22 +1,17 @@
-//! Tenacity — how hard the harness pushes the model from exploration to action.
+//! Tenacity — how long and hard the agent pursues the task.
 //!
-//! The measured failure this answers (2026-07-28, steering-regressions): even a
-//! capable coding model, given valid context and a full time budget, will read /
-//! search / plan indefinitely and never emit an edit. A clean 25-minute drive on
-//! `qwen3-coder_30b` produced 41 read/inspect/plan tool calls and **zero**
-//! mutations. Context fixes (objective spine, working-set pin) were necessary but
-//! not sufficient: the model *had* the context and still would not act. The
-//! bottleneck is action *initiation*, and tenacity is the dial for it — our
-//! answer to little-coder's tight action loop.
+//! Two levels today: [`Tenacity::Normal`] stops at the first plausible finish
+//! within the configured tool-round limit, and [`Tenacity::Relentless`] also
+//! lifts that limit. `grit` and `resolute` arrive in later slices of
+//! `docs/design/psyche-effort-dials.md`.
 //!
-//! Tenacity is a single operator-facing LEVEL that maps to concrete
-//! action-forcing knobs, so a per-model-family default can pick one level rather
-//! than tune raw numbers. Higher tenacity forces the edit sooner and makes plan
-//! mode hand off to a mandatory action. An explicitly selected
-//! [`Tenacity::Relentless`] posture also raises the default tool-round budget;
-//! automatic family defaults do not. [`Tenacity::Standard`] reproduces the
-//! historical hardcoded behaviour (`READ_ONLY_NUDGE_AFTER = 3`), so it is a
-//! behaviour-preserving default.
+//! Until the initiative split (slice 1b) this dial also carried the
+//! read-before-acting nudge and the plan-exit edit. Those moved unchanged to
+//! [`crate::initiative`], together with the per-family defaults. Tenacity is
+//! set only explicitly: `--tenacity`, `/psyche tenacity`, a conversation's
+//! preference pin, or the obsessive posture. The lift is explicit-only for a
+//! reason: small loop-prone families must never silently receive 10,000
+//! rounds, so no persona, config or family layer feeds it.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -26,56 +21,24 @@ use std::str::FromStr;
 /// enough to behave as "finish the objective" while remaining finite.
 pub const RELENTLESS_TOOL_ROUND_TARGET: usize = 10_000;
 
-/// How insistently the harness drives the model from reading to acting.
-///
-/// Ordered from most patient to most forcing. Small / over-exploring model
-/// families default to a higher tenacity; frontier models that explore with
-/// purpose can sit at [`Tenacity::Standard`] or [`Tenacity::Relaxed`].
+/// How long the harness keeps the model pursuing the task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Tenacity {
-    /// Most patient: tolerate a long look-around before a forcing nudge, and
-    /// leave plan-mode exit advisory. For models whose exploration is
-    /// purposeful and who edit on their own.
-    Relaxed,
-    /// The historical default: nudge toward action after 3 read-only rounds;
-    /// plan-mode exit is advisory. Behaviour-preserving.
+    /// Stop at the first plausible finish, within the configured round limit.
     #[default]
-    Standard,
-    /// Force sooner (2 read-only rounds) and make `exit_plan_mode` hand off to a
-    /// mandatory edit. For families that tend to over-explore.
-    Insistent,
-    /// Most forcing: nudge after a single read-only round and require an edit on
-    /// plan-mode exit. For small models that otherwise never act.
+    Normal,
+    /// Also lift the tool-round limit, when chosen explicitly.
     Relentless,
 }
 
 impl Tenacity {
-    /// Number of consecutive read-only rounds tolerated before the harness
-    /// injects an action-forcing nudge. Lower = more tenacious. `Standard` = 3,
-    /// the historical `READ_ONLY_NUDGE_AFTER`.
-    pub fn read_only_nudge_after(self) -> usize {
-        match self {
-            Self::Relaxed => 6,
-            Self::Standard => 3,
-            Self::Insistent => 2,
-            Self::Relentless => 1,
-        }
-    }
-
-    /// Whether leaving plan mode (`exit_plan_mode`) must hand off to a concrete
-    /// edit — the harness steers the very next turn toward a mutation rather than
-    /// letting the model slide back into more reading.
-    pub fn exit_plan_requires_edit(self) -> bool {
-        matches!(self, Self::Insistent | Self::Relentless)
-    }
-
     /// Project the default tool-round budget when this level was selected by
     /// the operator. Relentless is the only level that changes the cap: it uses
     /// the shared effectively-unlimited target without lowering a larger
     /// configured value. Callers retain explicit round overrides as the final
-    /// precedence layer, and should not apply this to automatic family defaults
-    /// (small loop-prone models often resolve to relentless there).
+    /// precedence layer.
+    #[must_use]
     pub fn project_tool_round_limit(self, configured: usize) -> usize {
         if self == Self::Relentless {
             configured.max(RELENTLESS_TOOL_ROUND_TARGET)
@@ -84,38 +47,74 @@ impl Tenacity {
         }
     }
 
-    /// Stable lowercase label — the wire/config/`/tenacity` spelling.
+    /// Stable lowercase label — the wire/config/`/psyche tenacity` spelling.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Relaxed => "relaxed",
-            Self::Standard => "standard",
-            Self::Insistent => "insistent",
+            Self::Normal => "normal",
             Self::Relentless => "relentless",
         }
     }
 
-    /// One-line description of what this level does, for `/tenacity` and the
-    /// footer indicator.
+    /// One-line description of what this level does.
+    #[must_use]
     pub fn describe(self) -> String {
-        let edit = if self.exit_plan_requires_edit() {
-            "exit_plan_mode requires an edit"
-        } else {
-            "exit_plan_mode is advisory"
-        };
-        format!(
-            "force an edit after {} read-only round(s); {edit}",
-            self.read_only_nudge_after()
-        )
+        match self {
+            Self::Normal => {
+                "stop at the first plausible finish, within the configured round limit".to_string()
+            }
+            Self::Relentless => format!(
+                "lift the tool-round limit to at least {RELENTLESS_TOOL_ROUND_TARGET} \
+                 (an explicit round limit still wins)"
+            ),
+        }
     }
 
-    /// All levels, patient → forcing (for `/tenacity` listings and menus).
-    pub fn all() -> [Self; 4] {
-        [
-            Self::Relaxed,
-            Self::Standard,
-            Self::Insistent,
-            Self::Relentless,
-        ]
+    /// All levels, normal → relentless.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Normal, Self::Relentless]
+    }
+}
+
+/// The tenacity level a [`ToolRoundLimit`] recorded, exactly as written.
+///
+/// Settings receipts embed [`ToolRoundLimit`] and are content-addressed, so a
+/// line minted before the initiative split, carrying `relaxed`, `standard` or
+/// `insistent`, must still decode AND re-encode to the same bytes, or
+/// `is_intact` reports it as tampered. `untagged` keeps both arms a bare label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RecordedTenacity {
+    Current(Tenacity),
+    Legacy(LegacyTenacity),
+}
+
+/// Tenacity labels from before the initiative split; decode-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LegacyTenacity {
+    Relaxed,
+    Standard,
+    Insistent,
+}
+
+impl RecordedTenacity {
+    /// The label as recorded.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current(t) => t.label(),
+            Self::Legacy(LegacyTenacity::Relaxed) => "relaxed",
+            Self::Legacy(LegacyTenacity::Standard) => "standard",
+            Self::Legacy(LegacyTenacity::Insistent) => "insistent",
+        }
+    }
+}
+
+impl From<Tenacity> for RecordedTenacity {
+    fn from(t: Tenacity) -> Self {
+        Self::Current(t)
     }
 }
 
@@ -166,8 +165,8 @@ pub struct ToolRoundLimit {
     /// ESCALATION, not merely the result. "320 rounds" is a number; "320,
     /// from an override, over a configured 40" is an explanation.
     pub configured: usize,
-    /// The operator-selected level, when one was in play.
-    pub tenacity: Option<Tenacity>,
+    /// The operator-selected level, when one was in play, as recorded.
+    pub tenacity: Option<RecordedTenacity>,
 }
 
 impl ToolRoundLimit {
@@ -179,11 +178,10 @@ impl ToolRoundLimit {
     }
 }
 
-/// Compose the tool-round safety valve without losing provenance. Automatic
-/// persona/config/family tenacity is intentionally not accepted here: callers
-/// pass only a direct operator choice, because small loop-prone families often
-/// default to relentless and must not silently receive 10,000 rounds. An
-/// explicit `/rounds`/`--max-rounds` value remains the outermost override.
+/// Compose the tool-round safety valve without losing provenance. Callers pass
+/// only a direct operator choice ([`cli_tenacity`]), never a resolved default,
+/// so no automatic layer can silently grant 10,000 rounds. An explicit
+/// `/rounds`/`--max-rounds` value remains the outermost override.
 ///
 /// Returns a [`ToolRoundLimit`] rather than a number, so the derivation cannot
 /// be dropped on the way to a durable record — see that type's docs (#1965).
@@ -198,7 +196,7 @@ pub fn resolve_tool_round_limit(
             rounds,
             source: ToolRoundLimitSource::Override,
             configured,
-            tenacity: explicit_tenacity,
+            tenacity: explicit_tenacity.map(RecordedTenacity::from),
         };
     }
     // A tenacity level that does not RAISE the limit did not decide it — the
@@ -211,7 +209,7 @@ pub fn resolve_tool_round_limit(
                 rounds: projected,
                 source: ToolRoundLimitSource::Tenacity,
                 configured,
-                tenacity: Some(level),
+                tenacity: Some(level.into()),
             };
         }
     }
@@ -219,7 +217,7 @@ pub fn resolve_tool_round_limit(
         rounds: configured,
         source: ToolRoundLimitSource::Config,
         configured,
-        tenacity: explicit_tenacity,
+        tenacity: explicit_tenacity.map(RecordedTenacity::from),
     }
 }
 
@@ -233,93 +231,30 @@ impl FromStr for Tenacity {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "relaxed" => Ok(Self::Relaxed),
-            "standard" | "default" => Ok(Self::Standard),
-            "insistent" => Ok(Self::Insistent),
-            "relentless" => Ok(Self::Relentless),
-            other => Err(format!(
-                "unknown tenacity '{other}' (relaxed|standard|insistent|relentless)"
-            )),
+        let s = s.trim().to_ascii_lowercase();
+        if s == "default" {
+            return Ok(Self::default());
         }
+        if let Some(level) = Self::all().into_iter().find(|l| l.label() == s) {
+            return Ok(level);
+        }
+        if let Some(new) = crate::psyche_import::split_tenacity(&s) {
+            return Err(format!(
+                "tenacity '{s}' was split: its read-before-acting half is now \
+                 `--initiative {new}`; tenacity is normal|relentless"
+            ));
+        }
+        Err(format!("unknown tenacity '{s}' (normal|relentless)"))
     }
 }
 
-/// The `[tenacity]` config section: a baseline level plus per-model-family
-/// overrides. Pure data (the three-Cs "knowledge in data" rule) — a new family's
-/// default is one map entry, not a new branch, mirroring the model-card
-/// [`crate::model_card::family_defaults`] pattern.
-///
-/// ```toml
-/// [tenacity]
-/// default = "standard"
-/// [tenacity.families]
-/// nemotron = "relentless"   # small/over-exploring family → force sooner
-/// qwen3    = "standard"
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TenacityConfig {
-    /// Baseline level when no per-family override matches. `None` ⇒ [`Tenacity`]'s
-    /// `Default` (`Standard`), so an empty `[tenacity]` changes nothing.
-    pub default: Option<Tenacity>,
-    /// Per-model-family overrides, keyed by the card's `family` label (e.g.
-    /// `"qwen3"`, `"nemotron"`). Matched case-insensitively. Supersedes
-    /// [`default`](Self::default); an explicit CLI `--tenacity` supersedes this.
-    pub families: std::collections::BTreeMap<String, Tenacity>,
-}
-
-impl TenacityConfig {
-    /// The configured level for a model `family` (case-insensitive): a per-family
-    /// override if one matches, else [`default`](Self::default), else `Standard`.
-    /// `family == None` (unknown/unresolved) skips straight to the default.
-    pub fn resolve(&self, family: Option<&str>) -> Tenacity {
-        family
-            .and_then(|f| {
-                self.families
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(f.trim()))
-                    .map(|(_, v)| *v)
-            })
-            .or(self.default)
-            .unwrap_or_default()
-    }
-}
-
-/// Full resolution order, most-specific first: an explicit operator choice
-/// (`--tenacity`) wins over the active `persona` declaration, which wins over
-/// config per-family, which wins over the config default; `Standard` is the
-/// floor. `config == None` ⇒ CLI-or-persona-or-`Standard`.
-pub fn resolve_tenacity(
-    cli: Option<Tenacity>,
-    persona: Option<Tenacity>,
-    config: Option<&TenacityConfig>,
-    family: Option<&str>,
-) -> Tenacity {
-    cli.or(persona)
-        .unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
-}
-
-// The three tenacity inputs, each stashed by the one site that knows it — the
-// operator dial can't be threaded through every loop construction site. They are
-// combined lazily by [`effective_tenacity`] via [`resolve_tenacity`], so each
-// setter is independent and order-free:
-//   - CLI `--tenacity` flag (highest), set in the CLI dispatch,
-//   - the `[tenacity]` config, stashed by `Config::apply_runtime_settings`,
-//   - the active model's family, set at model selection.
-// All absent ⇒ [`Tenacity`]'s `Default` (`Standard`) — behaviour-preserving.
+// The explicit operator choice (`--tenacity`, `/psyche tenacity`, a pin, the
+// obsessive posture). It is the only tenacity input: there is no persona,
+// config or family layer, because the round-cap lift must stay explicit.
 static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
-static TENACITY_CONFIG: std::sync::Mutex<Option<TenacityConfig>> = std::sync::Mutex::new(None);
-static ACTIVE_FAMILY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-// The active persona's declared `tenacity:` — a resolution layer BELOW the CLI
-// override and ABOVE the config/family default, set when a persona activates
-// (review P1#3: a declared persona tenacity is now actually applied, not just
-// rendered). `None` when no persona / the persona declares none.
-static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
 // #1998: the two inputs to `resolve_tool_round_limit` that were NOT here.
 //
-// Three of its four inputs have always been process globals in this module.
-// The fourth — the `/rounds` session override — was a local variable inside
+// Its other inputs have always been process globals in this module. The last — the `/rounds` session override — was a local variable inside
 // `run_chat`, which is exactly what #1965's evidence complains about: "the
 // effective limit is recomputed per dispatch … and a session-local
 // `max_tool_rounds_override` echoed only to the truncated alternate-screen
@@ -329,7 +264,7 @@ static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::
 //
 // `CONFIGURED_TOOL_ROUNDS` is the config/model-tuned baseline the override is
 // derived AGAINST, installed by the session when the active model settles —
-// the same shape and the same reason as `ACTIVE_FAMILY` above. With both here,
+// the same shape and the same reason as `initiative`'s active family. With both here,
 // the whole derivation is computable from anywhere.
 static SESSION_TOOL_ROUNDS: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 static CONFIGURED_TOOL_ROUNDS: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
@@ -364,7 +299,7 @@ impl Drop for ScopedEffectiveTenacity {
 /// `pub` since #1669: a session that runs its turn on its own thread captures
 /// this dial there, so the embedding crate needs it. Prefer
 /// [`crate::psyche::capture_turn_psyche`] at a turn boundary, so tenacity is
-/// never pinned without cognition.
+/// never pinned without the other dials.
 pub fn scoped_effective_tenacity(level: Tenacity) -> ScopedEffectiveTenacity {
     let previous = EFFECTIVE_TENACITY_OVERRIDE.with(|slot| slot.replace(Some(level)));
     ScopedEffectiveTenacity {
@@ -381,8 +316,8 @@ pub fn set_cli_tenacity(level: Tenacity) {
     }
 }
 
-/// Clear the explicit CLI `--tenacity` override, so tenacity resolves from config
-/// / family again. The complement of [`set_cli_tenacity`]: it lets a surface
+/// Clear the explicit CLI `--tenacity` override, so tenacity is `Normal` again.
+/// The complement of [`set_cli_tenacity`]: it lets a surface
 /// express "inherit" (no override) rather than pinning the currently-resolved
 /// value — e.g. the config panel must not persist an untouched dial.
 pub fn clear_cli_tenacity() {
@@ -391,106 +326,30 @@ pub fn clear_cli_tenacity() {
     }
 }
 
-/// The raw CLI `--tenacity` override, if one is installed (`None` = inherit from
-/// config / family). Distinct from [`effective_tenacity`], which resolves the
-/// full precedence ladder to a concrete level.
+/// The raw CLI `--tenacity` override, if one is installed (`None` = `Normal`).
+/// Distinct from [`effective_tenacity`], which also honours a turn's capture.
 #[must_use]
 pub fn cli_tenacity() -> Option<Tenacity> {
     CLI_TENACITY.lock().ok().and_then(|s| *s)
 }
 
-/// Install the resolved `[tenacity]` config (per-family + default). Called by
-/// `Config::apply_runtime_settings`, the canonical runtime-application entry.
-pub fn set_tenacity_config(config: TenacityConfig) {
-    if let Ok(mut slot) = TENACITY_CONFIG.lock() {
-        *slot = Some(config);
-    }
-}
-
-/// Install the active model's family so per-family config defaults apply;
-/// `None` clears it. This is the ONLY attribution path (#1820): callers derive
-/// the family from typed resolved-card metadata
-/// (`ResolvedCapabilities::family_for_route`) at every point a session settles
-/// on a model — chat AND solve (#1139). Deliberately, nothing infers a family
-/// from the model NAME anymore: a cardless model whose name merely contains a
-/// configured `[tenacity.families]` key gets NO family and falls to the
-/// configured default (names are labels, never evidence — #1818/#1819). Opt
-/// back in by writing a drop-in model card that names the family.
-pub fn set_active_model_family(family: Option<String>) {
-    if let Ok(mut slot) = ACTIVE_FAMILY.lock() {
-        *slot = family;
-    }
-}
-
-/// Install the active persona's declared `tenacity:` (review P1#3). Called when a
-/// persona activates (its declared level) or clears (`None`), so the declaration
-/// is actually applied — below the CLI override, above the config/family default.
-pub fn set_persona_tenacity(level: Option<Tenacity>) {
-    if let Ok(mut slot) = PERSONA_TENACITY.lock() {
-        *slot = level;
-    }
-}
-
-/// The active persona's declared tenacity, if any (for status rendering).
+/// The tenacity in effect: a turn's captured value, else the explicit
+/// operator choice, else `Normal`.
 #[must_use]
-pub fn persona_tenacity() -> Option<Tenacity> {
-    PERSONA_TENACITY.lock().ok().and_then(|s| *s)
-}
-
-/// The tenacity in effect, resolved most-specific first: the CLI `--tenacity`
-/// flag, then the active persona's declared `tenacity:`, then the `[tenacity]`
-/// config's per-family override for the active family, then the config default,
-/// then `Standard`.
 pub fn effective_tenacity() -> Tenacity {
     if let Some(level) = EFFECTIVE_TENACITY_OVERRIDE.with(std::cell::Cell::get) {
         return level;
     }
-    let cli = CLI_TENACITY.lock().ok().and_then(|s| *s);
-    let persona = PERSONA_TENACITY.lock().ok().and_then(|s| *s);
-    let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
-    let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
-    resolve_tenacity(cli, persona, config.as_ref(), family.as_deref())
+    cli_tenacity().unwrap_or_default()
 }
 
-/// The installed `[tenacity]` config, if any (for status rendering + the snapshot
-/// used by the test guard). Read accessor for the otherwise write-only
-/// [`TENACITY_CONFIG`].
-#[must_use]
-pub fn tenacity_config() -> Option<TenacityConfig> {
-    TENACITY_CONFIG.lock().ok().and_then(|s| s.clone())
-}
-
-/// The active model family, if any (for the config-panel projection + the test
-/// guard snapshot). Read accessor for the otherwise write-only [`ACTIVE_FAMILY`].
-#[must_use]
-pub fn active_model_family() -> Option<String> {
-    ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone())
-}
-
-/// Tenacity with **no CLI override and no persona layer** — just the config
-/// per-family override for the active family, the config default, then `Standard`.
-/// This is the value a persona that declares no `tenacity:` inherits, so the
-/// config panel projects a selected persona's effective tenacity as
-/// `persona.tenacity.unwrap_or(base_tenacity())`.
-#[must_use]
-pub fn base_tenacity() -> Tenacity {
-    let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
-    let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
-    resolve_tenacity(None, None, config.as_ref(), family.as_deref())
-}
-
-/// A complete snapshot of **every** mutable global that feeds
-/// [`effective_tenacity`] — the CLI override, the persona layer, the `[tenacity]`
-/// config, and the active model family. The test guard snapshots and restores
-/// this as one unit so no tenacity-resolution input can leak between tests (the
-/// earlier piecemeal guard missed `TENACITY_CONFIG` + `ACTIVE_FAMILY`, which
-/// `Config::resolve` and the `solve` model-selection path mutate process-wide).
+/// A complete snapshot of **every** mutable global in this module — the CLI
+/// override and the two round-cap inputs. The test guard snapshots and
+/// restores this as one unit (with [`crate::initiative`]'s sibling snapshot)
+/// so no input can leak between tests.
 #[doc(hidden)]
 pub struct TenacityRuntimeSnapshot {
     cli: Option<Tenacity>,
-    persona: Option<Tenacity>,
-    config: Option<TenacityConfig>,
-    active_family: Option<String>,
     session_rounds: Option<usize>,
     configured_rounds: Option<usize>,
 }
@@ -561,10 +420,7 @@ pub fn session_tool_round_limit() -> Option<ToolRoundLimit> {
 #[must_use]
 pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
     TenacityRuntimeSnapshot {
-        cli: CLI_TENACITY.lock().ok().and_then(|s| *s),
-        persona: PERSONA_TENACITY.lock().ok().and_then(|s| *s),
-        config: TENACITY_CONFIG.lock().ok().and_then(|s| s.clone()),
-        active_family: ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone()),
+        cli: cli_tenacity(),
         session_rounds: session_tool_rounds(),
         configured_rounds: configured_tool_rounds(),
     }
@@ -572,20 +428,11 @@ pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
 
 /// Restore every tenacity-resolution global from a snapshot (see
 /// [`TenacityRuntimeSnapshot`]). Total: every input is overwritten, so a test
-/// that installed a config / family / override is fully undone.
+/// that installed an override is fully undone.
 #[doc(hidden)]
 pub fn restore_runtime_state(snapshot: TenacityRuntimeSnapshot) {
     if let Ok(mut s) = CLI_TENACITY.lock() {
         *s = snapshot.cli;
-    }
-    if let Ok(mut s) = PERSONA_TENACITY.lock() {
-        *s = snapshot.persona;
-    }
-    if let Ok(mut s) = TENACITY_CONFIG.lock() {
-        *s = snapshot.config;
-    }
-    if let Ok(mut s) = ACTIVE_FAMILY.lock() {
-        *s = snapshot.active_family;
     }
     if let Ok(mut s) = SESSION_TOOL_ROUNDS.lock() {
         *s = snapshot.session_rounds;
@@ -633,7 +480,7 @@ mod tests {
         assert_eq!(limit.rounds, 320);
         assert_eq!(limit.source, ToolRoundLimitSource::Override);
         assert_eq!(limit.configured, 40);
-        assert_eq!(limit.tenacity, Some(Tenacity::Relentless));
+        assert_eq!(limit.tenacity, Some(Tenacity::Relentless.into()));
         assert!(limit.is_escalated(), "320 over a configured 40");
 
         // Releasing the override changes which input won — the field that
@@ -661,34 +508,24 @@ mod tests {
     }
 
     #[test]
-    fn standard_is_the_behaviour_preserving_default() {
-        // Standard must reproduce the historical hardcoded READ_ONLY_NUDGE_AFTER
-        // so adopting tenacity changes nothing until an operator/family opts in.
-        assert_eq!(Tenacity::default(), Tenacity::Standard);
-        assert_eq!(Tenacity::Standard.read_only_nudge_after(), 3);
-        assert!(!Tenacity::Standard.exit_plan_requires_edit());
+    fn normal_is_the_default_and_leaves_the_cap_alone() {
+        assert_eq!(Tenacity::default(), Tenacity::Normal);
+        assert_eq!(Tenacity::Normal.project_tool_round_limit(40), 40);
     }
 
     #[test]
     fn scoped_override_is_nested_thread_local_and_restores_the_global_resolution() {
         use crate::test_guard::GlobalSettingsGuard;
         let _settings = GlobalSettingsGuard::acquire();
-        set_cli_tenacity(Tenacity::Relaxed);
-        assert_eq!(effective_tenacity(), Tenacity::Relaxed);
+        clear_cli_tenacity();
+        assert_eq!(effective_tenacity(), Tenacity::Normal);
 
         let outer = scoped_effective_tenacity(Tenacity::Relentless);
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
 
-        set_cli_tenacity(Tenacity::Insistent);
-        assert_eq!(
-            effective_tenacity(),
-            Tenacity::Relentless,
-            "a concurrent global change cannot alter a captured turn posture"
-        );
-
         {
-            let _inner = scoped_effective_tenacity(Tenacity::Standard);
-            assert_eq!(effective_tenacity(), Tenacity::Standard);
+            let _inner = scoped_effective_tenacity(Tenacity::Normal);
+            assert_eq!(effective_tenacity(), Tenacity::Normal);
         }
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
 
@@ -697,40 +534,18 @@ mod tests {
             .expect("tenacity probe thread");
         assert_eq!(
             other_thread,
-            Tenacity::Insistent,
+            Tenacity::Normal,
             "the override must stay local to the driven turn thread"
         );
 
         drop(outer);
-        assert_eq!(effective_tenacity(), Tenacity::Insistent);
-    }
-
-    #[test]
-    fn higher_tenacity_forces_action_sooner() {
-        // The budget is monotonically non-increasing as tenacity rises.
-        let budgets: Vec<usize> = Tenacity::all()
-            .iter()
-            .map(|t| t.read_only_nudge_after())
-            .collect();
-        assert_eq!(budgets, vec![6, 3, 2, 1]);
-        for pair in budgets.windows(2) {
-            assert!(pair[0] > pair[1], "budget must strictly drop with tenacity");
-        }
-    }
-
-    #[test]
-    fn only_the_two_most_forcing_levels_require_an_edit_on_plan_exit() {
-        assert!(!Tenacity::Relaxed.exit_plan_requires_edit());
-        assert!(!Tenacity::Standard.exit_plan_requires_edit());
-        assert!(Tenacity::Insistent.exit_plan_requires_edit());
-        assert!(Tenacity::Relentless.exit_plan_requires_edit());
+        set_cli_tenacity(Tenacity::Relentless);
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
     }
 
     #[test]
     fn relentless_can_project_an_operator_selected_round_target() {
-        for level in [Tenacity::Relaxed, Tenacity::Standard, Tenacity::Insistent] {
-            assert_eq!(level.project_tool_round_limit(40), 40);
-        }
+        assert_eq!(Tenacity::Normal.project_tool_round_limit(40), 40);
         assert_eq!(
             Tenacity::Relentless.project_tool_round_limit(40),
             RELENTLESS_TOOL_ROUND_TARGET
@@ -758,243 +573,92 @@ mod tests {
             "  RELENTLESS ".parse::<Tenacity>().unwrap(),
             Tenacity::Relentless
         );
-        assert_eq!("default".parse::<Tenacity>().unwrap(), Tenacity::Standard);
+        assert_eq!("default".parse::<Tenacity>().unwrap(), Tenacity::Normal);
         assert!("banana".parse::<Tenacity>().is_err());
     }
 
+    /// Regression (slice 1b): an old tenacity label is refused with the
+    /// initiative flag that replaces it. Before the split `insistent` parsed.
     #[test]
-    fn ordering_runs_patient_to_forcing() {
-        assert!(Tenacity::Relaxed < Tenacity::Standard);
-        assert!(Tenacity::Standard < Tenacity::Insistent);
-        assert!(Tenacity::Insistent < Tenacity::Relentless);
-    }
-
-    #[test]
-    fn serde_uses_the_lowercase_label() {
-        let json = serde_json::to_string(&Tenacity::Insistent).unwrap();
-        assert_eq!(json, "\"insistent\"");
-        let back: Tenacity = serde_json::from_str("\"relentless\"").unwrap();
-        assert_eq!(back, Tenacity::Relentless);
-    }
-
-    fn cfg(default: Option<Tenacity>, fams: &[(&str, Tenacity)]) -> TenacityConfig {
-        TenacityConfig {
-            default,
-            families: fams.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+    fn an_old_level_is_refused_with_its_initiative_replacement() {
+        for (old, new) in [
+            ("relaxed", "patient"),
+            ("standard", "measured"),
+            ("insistent", "decisive"),
+        ] {
+            let err = old.parse::<Tenacity>().unwrap_err();
+            assert!(err.contains(&format!("--initiative {new}")), "{err}");
         }
     }
 
     #[test]
-    fn config_resolve_prefers_family_then_default_then_standard() {
-        let c = cfg(
-            Some(Tenacity::Relaxed),
-            &[("nemotron", Tenacity::Relentless)],
-        );
-        // Known family → its override.
-        assert_eq!(c.resolve(Some("nemotron")), Tenacity::Relentless);
-        // Case-insensitive + trimmed.
-        assert_eq!(c.resolve(Some("  NEMOTRON ")), Tenacity::Relentless);
-        // Unknown family → the config default.
-        assert_eq!(c.resolve(Some("qwen3")), Tenacity::Relaxed);
-        // No family → the config default.
-        assert_eq!(c.resolve(None), Tenacity::Relaxed);
-        // Empty config → Standard.
-        assert_eq!(
-            TenacityConfig::default().resolve(Some("qwen3")),
-            Tenacity::Standard
-        );
-        assert_eq!(cfg(None, &[]).resolve(None), Tenacity::Standard);
+    fn serde_uses_the_lowercase_label() {
+        let json = serde_json::to_string(&Tenacity::Relentless).unwrap();
+        assert_eq!(json, "\"relentless\"");
+        let back: Tenacity = serde_json::from_str("\"normal\"").unwrap();
+        assert_eq!(back, Tenacity::Normal);
+        assert!(serde_json::from_str::<Tenacity>("\"standard\"").is_err());
     }
 
-    /// Companion to the exact-family migration (#1820). The red/green
-    /// regression for the removal itself is
-    /// `tests/tenacity_exact_family_ratchet.rs` (red on the pre-migration
-    /// source); THESE assertions pin the surviving semantics: family reaches
-    /// tenacity only through the typed seam, the label match is equality, and
-    /// a session with no typed evidence gets the configured default — where
-    /// before, a cardless model named like `my-nemotron-alias` picked up the
-    /// `nemotron` level by name containment. The end-to-end solve negative
-    /// lives in newt-cli/tests/solve_cli.rs
-    /// (`a_cardless_nemotron_looking_alias_gets_no_family_tenacity`).
+    /// A recorded level keeps its exact label through a decode/encode round
+    /// trip, old vocabulary included: receipts are content-addressed.
     #[test]
-    fn family_arrives_only_through_the_typed_seam() {
+    fn a_recorded_level_round_trips_old_and_new_labels_verbatim() {
+        for label in ["relaxed", "standard", "insistent", "normal", "relentless"] {
+            let json = format!("\"{label}\"");
+            let r: RecordedTenacity = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&r).unwrap(), json);
+            assert_eq!(r.label(), label);
+        }
+        assert_eq!(
+            serde_json::from_str::<RecordedTenacity>("\"relentless\"").unwrap(),
+            RecordedTenacity::Current(Tenacity::Relentless)
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_every_tenacity_global() {
+        // The guard must isolate every input in this module: the CLI override
+        // and, since #1998, the two round-cap globals.
         use crate::test_guard::GlobalSettingsGuard;
         let _g = GlobalSettingsGuard::acquire();
 
-        set_tenacity_config(cfg(None, &[("nemotron", Tenacity::Relentless)]));
-
-        // Typed evidence — a resolved card's family — installs and resolves.
-        set_active_model_family(Some("nemotron".to_string()));
-        assert_eq!(effective_tenacity(), Tenacity::Relentless);
-
-        // The label match is equality (case-insensitive), never containment:
-        // a family label that merely CONTAINS a configured key is not it.
-        set_active_model_family(Some("nemotron-super".to_string()));
-        assert_eq!(effective_tenacity(), Tenacity::Standard);
-
-        // No typed evidence => no family. Tenacity never sees a model name,
-        // so there is nothing to infer from — the deliberate behavior loss.
-        set_active_model_family(None);
-        assert_eq!(effective_tenacity(), Tenacity::Standard);
-    }
-
-    #[test]
-    fn resolve_tenacity_precedence_cli_over_persona_over_config() {
-        let c = cfg(
-            Some(Tenacity::Relaxed),
-            &[("nemotron", Tenacity::Relentless)],
-        );
-        // CLI override beats even a matching per-family default AND a persona.
-        assert_eq!(
-            resolve_tenacity(
-                Some(Tenacity::Standard),
-                Some(Tenacity::Insistent),
-                Some(&c),
-                Some("nemotron")
-            ),
-            Tenacity::Standard
-        );
-        // No CLI → the persona declaration wins over config per-family (P1#3).
-        assert_eq!(
-            resolve_tenacity(None, Some(Tenacity::Insistent), Some(&c), Some("nemotron")),
-            Tenacity::Insistent,
-            "an active persona's declared tenacity is applied, not just rendered"
-        );
-        // No CLI, no persona → config per-family.
-        assert_eq!(
-            resolve_tenacity(None, None, Some(&c), Some("nemotron")),
-            Tenacity::Relentless
-        );
-        // No CLI, no persona, unknown family → config default.
-        assert_eq!(
-            resolve_tenacity(None, None, Some(&c), Some("kimi")),
-            Tenacity::Relaxed
-        );
-        // No config at all → CLI-or-persona-or-Standard.
-        assert_eq!(
-            resolve_tenacity(None, None, None, Some("nemotron")),
-            Tenacity::Standard
-        );
-        assert_eq!(
-            resolve_tenacity(None, Some(Tenacity::Insistent), None, None),
-            Tenacity::Insistent
-        );
-        assert_eq!(
-            resolve_tenacity(Some(Tenacity::Insistent), None, None, None),
-            Tenacity::Insistent
-        );
-    }
-
-    #[test]
-    fn snapshot_restore_round_trips_every_tenacity_resolution_global() {
-        // CR3 area 4: the guard must isolate every input to effective_tenacity —
-        // CLI override, persona layer, TENACITY_CONFIG, ACTIVE_FAMILY — and, since
-        // #1998, the two round-cap globals as well. Exercise the exact
-        // snapshot/restore the guard's Drop runs.
-        use crate::test_guard::GlobalSettingsGuard;
-        let _g = GlobalSettingsGuard::acquire(); // serialize + final cleanup
-
-        // Known-empty baseline → snapshot it.
         clear_cli_tenacity();
-        set_persona_tenacity(None);
-        set_tenacity_config(TenacityConfig::default());
-        set_active_model_family(None);
         set_session_tool_rounds(None);
+        set_configured_tool_rounds(None);
         let snap = snapshot_runtime_state();
 
-        // Mutate every axis.
         set_cli_tenacity(Tenacity::Relentless);
-        set_persona_tenacity(Some(Tenacity::Insistent));
-        set_tenacity_config(cfg(
-            Some(Tenacity::Relaxed),
-            &[("nemotron", Tenacity::Relentless)],
-        ));
-        set_active_model_family(Some("nemotron".to_string()));
         set_session_tool_rounds(Some(320));
         set_configured_tool_rounds(Some(40));
         assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
-        assert_eq!(persona_tenacity(), Some(Tenacity::Insistent));
-        assert!(tenacity_config().is_some_and(|c| !c.families.is_empty()));
-        assert_eq!(active_model_family().as_deref(), Some("nemotron"));
 
-        // Restore — exactly what GlobalSettingsGuard::drop does — undoes all four.
         restore_runtime_state(snap);
         assert_eq!(cli_tenacity(), None, "CLI tenacity restored");
-        assert_eq!(persona_tenacity(), None, "persona tenacity restored");
-        assert_eq!(
-            tenacity_config(),
-            Some(TenacityConfig::default()),
-            "TENACITY_CONFIG restored (the gap the piecemeal guard missed)"
-        );
-        assert_eq!(active_model_family(), None, "ACTIVE_FAMILY restored");
         assert_eq!(
             session_tool_rounds(),
             None,
             "the /rounds override restored — a leaked 320 would escalate the next test"
         );
-    }
-
-    #[test]
-    fn base_tenacity_ignores_cli_and_persona_overrides() {
-        // The config-panel projection uses base_tenacity() as the value a persona
-        // inherits when it declares none: it must strip the CLI + persona layers.
-        use crate::test_guard::GlobalSettingsGuard;
-        let _g = GlobalSettingsGuard::acquire();
-        set_tenacity_config(cfg(
-            Some(Tenacity::Relaxed),
-            &[("nemotron", Tenacity::Relentless)],
-        ));
-        set_active_model_family(Some("nemotron".to_string()));
-        set_cli_tenacity(Tenacity::Standard); // present…
-        set_persona_tenacity(Some(Tenacity::Insistent)); // …present…
-        assert_eq!(
-            base_tenacity(),
-            Tenacity::Relentless,
-            "base strips CLI + persona, leaving the per-family override"
-        );
-        set_active_model_family(None);
-        assert_eq!(
-            base_tenacity(),
-            Tenacity::Relaxed,
-            "no family → the config default"
-        );
+        assert_eq!(configured_tool_rounds(), None);
     }
 
     #[test]
     fn guarded_state_is_restored_even_when_a_test_panics() {
         // CR3 area 4: restoration must survive a panic (Drop runs during unwind).
         use crate::test_guard::GlobalSettingsGuard;
-        let sentinel = "panic-family-sentinel";
         let result = std::panic::catch_unwind(|| {
             let _g = GlobalSettingsGuard::acquire();
-            set_active_model_family(Some(sentinel.to_string()));
-            set_cli_tenacity(Tenacity::Relentless);
-            assert_eq!(active_model_family().as_deref(), Some(sentinel));
+            clear_cli_tenacity();
+            set_session_tool_rounds(Some(4242));
             panic!("intentional panic inside a guarded test");
         });
         assert!(result.is_err(), "the guarded closure panicked as intended");
         let _g = GlobalSettingsGuard::acquire();
         assert_ne!(
-            active_model_family().as_deref(),
-            Some(sentinel),
-            "GlobalSettingsGuard::drop restored ACTIVE_FAMILY during unwind"
+            session_tool_rounds(),
+            Some(4242),
+            "GlobalSettingsGuard::drop restored the round override during unwind"
         );
-    }
-
-    #[test]
-    fn tenacity_config_parses_from_toml() {
-        let c: TenacityConfig = toml::from_str(
-            r#"
-            default = "insistent"
-            [families]
-            nemotron = "relentless"
-            qwen3 = "standard"
-        "#,
-        )
-        .unwrap();
-        assert_eq!(c.default, Some(Tenacity::Insistent));
-        assert_eq!(c.resolve(Some("nemotron")), Tenacity::Relentless);
-        assert_eq!(c.resolve(Some("qwen3")), Tenacity::Standard);
-        assert_eq!(c.resolve(Some("gemma")), Tenacity::Insistent);
     }
 }

@@ -356,22 +356,22 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
 }
 
 #[test]
-fn tenacity_action_forcing_nudge_fires_at_the_budget_and_resets_on_a_write() {
-    // #tenacity: the action-forcing nudge fires once the model has spent the
-    // tenacity level's budget of consecutive read-only rounds, and a
+fn initiative_action_forcing_nudge_fires_at_the_budget_and_resets_on_a_write() {
+    // The action-forcing nudge fires once the model has spent the
+    // initiative level's budget of consecutive read-only rounds, and a
     // workspace write resets the counter. This is what gives the OpenAI-chat
     // loop (which had no read-only nudge) a push from reading to acting.
     let mut state = WorkflowRuntimeState {
-        tenacity: crate::tenacity::Tenacity::Relentless, // budget 1
+        initiative: crate::initiative::Initiative::Eager, // budget 1
         ..Default::default()
     };
     // Nothing spent yet → no nudge.
     assert!(state.action_forcing_nudge(5, None, None).is_none());
-    // One read-only round → at the Relentless budget → fires.
+    // One read-only round → at the Eager budget → fires.
     state.record_round_outcome(false, false);
     let nudge = state
         .action_forcing_nudge(5, None, None)
-        .expect("relentless tenacity must force action after one read-only round");
+        .expect("eager initiative must force action after one read-only round");
     assert!(nudge.contains("edit_file or write_file"), "{nudge}");
     // Firing resets the counter; a follow-up read-only round re-accumulates.
     assert!(state.action_forcing_nudge(5, None, None).is_none());
@@ -384,14 +384,14 @@ fn tenacity_action_forcing_nudge_fires_at_the_budget_and_resets_on_a_write() {
         "a write must reset the read-only streak"
     );
 
-    // Standard tenacity preserves the historical budget of 3.
+    // Measured initiative (the default) preserves the historical budget of 3.
     let mut standard = WorkflowRuntimeState::default();
     for _ in 0..2 {
         standard.record_round_outcome(false, false);
     }
     assert!(
         standard.action_forcing_nudge(5, None, None).is_none(),
-        "standard must not fire before 3 read-only rounds"
+        "measured must not fire before 3 read-only rounds"
     );
     standard.record_round_outcome(false, false);
     assert!(standard.action_forcing_nudge(5, None, None).is_some());
@@ -757,7 +757,7 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
         "a repairable error must NOT be offered the blocked exit: {nudge}"
     );
 
-    // And the tenacity path — narration with no evidence at all — is untouched.
+    // And the initiative path — narration with no evidence at all — is untouched.
     let mut narrating = WorkflowRuntimeState::default();
     for _ in 0..3 {
         narrating.record_round_outcome(false, false);

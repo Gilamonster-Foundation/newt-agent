@@ -543,7 +543,7 @@ pub struct ResolvedCapabilities {
     inline: Option<Capability>,
     /// ONE association per resolved card: capability AND family ride the
     /// same binding (both optional), so the typed applicability the display
-    /// owner renders and the family policy the tenacity seam consumes can
+    /// owner renders and the family policy the initiative seam consumes can
     /// never diverge — a family-only card's transitions are exactly as
     /// VISIBLE as a capability card's. A card carrying NEITHER contributes
     /// nothing and mints no binding (serving/tuning-only cards stay

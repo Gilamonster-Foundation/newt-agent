@@ -74,10 +74,10 @@ fn read_only_git_catalog_exposes_only_read_operations() {
 }
 
 #[test]
-fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it() {
-    use crate::tenacity::Tenacity;
+fn exit_plan_mode_result_appends_mandatory_edit_only_when_initiative_requires_it() {
+    use crate::initiative::Initiative;
     // Advisory levels: plain result, no forcing directive.
-    for t in [Tenacity::Relaxed, Tenacity::Standard] {
+    for t in [Initiative::Patient, Initiative::Measured] {
         let out = exit_plan_mode_result(t);
         assert!(out.starts_with("exited the model-entered PLAN PHASE"));
         assert!(
@@ -86,14 +86,14 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it()
         );
     }
     // Forcing levels: the mandatory-edit directive is appended.
-    for t in [Tenacity::Insistent, Tenacity::Relentless] {
+    for t in [Initiative::Decisive, Initiative::Eager] {
         let out = exit_plan_mode_result(t);
         assert!(out.contains("now EXECUTE it"), "{t}: {out}");
         assert!(out.contains("must be a concrete"), "{t}: {out}");
         assert!(out.contains("edit_file or write_file"), "{t}: {out}");
     }
     // The two sets agree with the level's own predicate.
-    for t in Tenacity::all() {
+    for t in Initiative::all() {
         assert_eq!(
             exit_plan_mode_result(t).contains("now EXECUTE it"),
             t.exit_plan_requires_edit()

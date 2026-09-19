@@ -362,7 +362,8 @@ REQUIRABLE = {"scratchpad", "code_search", "crew"}
 REFUSAL = re.compile(r"required feature `[a-z_]+` is [a-z_]+: [^\n]*")
 TREATMENT_ENV = {
     "NEWT_BENCH_SMART", "NEWT_BENCH_SELF_VERIFY", "NEWT_BENCH_MAX_ROUNDS",
-    "NEWT_BENCH_TENACITY", "NEWT_BENCH_CONTEXT_WINDOW", "NEWT_BENCH_OCAP",
+    "NEWT_BENCH_TENACITY", "NEWT_BENCH_INITIATIVE", "NEWT_BENCH_CONTEXT_WINDOW",
+    "NEWT_BENCH_OCAP",
     "NEWT_BENCH_VERIFY_OUTCOMES",
 }
 # none is newt's shipped defaults, whose self-verify gate is on (#1961): a newt

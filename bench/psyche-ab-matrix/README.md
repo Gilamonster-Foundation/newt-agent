@@ -193,13 +193,21 @@ locally reconstructed template. For example, after retaining `/props`, hash
 
 | Posture | How it is set | Effective intent |
 |---|---|---|
-| `baseline` | no override | cognition default, tenacity standard, no crew |
-| `tenacity` | `--tenacity relentless` | cognition default, relentless, crew off |
-| `crew` | `NEWT_TEAM=1` | cognition default, standard, crew on |
-| `obsessive` | `--obsessive` | meticulous + relentless + crew |
+| `baseline` | no override | cognition default, tenacity normal, initiative measured, no crew |
+| `tenacity` | `--tenacity relentless --initiative eager` | cognition default, relentless, eager, crew off |
+| `crew` | `NEWT_TEAM=1` | cognition default, normal, measured, crew on |
+| `obsessive` | `--obsessive` | meticulous + relentless + crew; initiative measured |
 
 `default` means Newt sends no cognition selection. The inference server retains
-its own default behavior, which may include reasoning for Nemotron.
+its own default behavior, which may include reasoning for Nemotron. The
+generated config sets no `[initiative]`, so the unset initiative is `measured`.
+
+Since the tenacity/initiative split (contract v2), `--tenacity relentless` only
+lifts the round cap; the nudge after one read-only round is `--initiative
+eager`. The `tenacity` posture passes both, so it stays comparable with runs
+from before the split. The `obsessive` posture does not: it leaves initiative
+alone by design, where before the split its relentless tenacity also nudged
+after one round.
 
 | OCAP | How it is set | Lane |
 |---|---|---|
@@ -222,13 +230,15 @@ required cell:
 
 - failed its task verifier or returned a nonzero solve code;
 - did not report `completed`;
-- lacked exactly one contract-v1 record;
+- lacked exactly one contract-v2 record;
 - did not point to its exact runner-owned event path
   `events/{posture}-{ocap}-{task}.jsonl`, or reused another cell's evidence;
 - reported a requested/effective model mismatch;
 - disagreed on digest, context window, max rounds, backend, or OCAP lane;
-- reported a tenacity other than `standard` for baseline/crew or `relentless`
+- reported a tenacity other than `normal` for baseline/crew or `relentless`
   for tenacity/obsessive;
+- reported an initiative other than `eager` for tenacity or `measured` for
+  baseline/crew/obsessive;
 - reported cognition other than `default` for baseline/tenacity/crew or
   `meticulous` for obsessive;
 - reported crew other than `off` for baseline/tenacity or `on` for

@@ -77,10 +77,10 @@ tmx new-session -d -s "$SES" -x 120 -y 32 \
 # ── S1: the TUI comes up on the seeded config and offers a prompt ──────────
 expect "S1 ready line + prompt" 45 "ready — " "INSERT"
 
-# ── S2: bare /settings renders the six-field form ──────────────────────────
+# ── S2: bare /settings renders the seven-field form ────────────────────────
 type_cmd "/settings"
-expect "S2 /settings form: all six fields render" 15 \
-  "line-editor key bindings" "tenacity" "cognition" \
+expect "S2 /settings form: all seven fields render" 15 \
+  "line-editor key bindings" "tenacity" "initiative" "cognition" \
   "thinking spinner" "action-pressure nudges" "tool-call round limit"
 
 # ── S3: apply a value through the form; the receipt lands on disk ──────────

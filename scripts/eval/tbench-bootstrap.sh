@@ -20,11 +20,14 @@
 # Usage:
 #   tbench-bootstrap.sh --profile <backend.toml> [--tasks <dir>] [--out <dir>]
 #                       [--max-rounds N] [--timeout SECS] [--tenacity LEVEL]
+#                       [--initiative LEVEL]
+#   --tenacity   normal|relentless (relentless lifts the round cap)
+#   --initiative patient|measured|decisive|eager (how soon to nudge an edit)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="" ; TASKS="$HERE/tbench-tasks" ; OUT="/var/tmp/tbench"
-MAX_ROUNDS=40 ; TIMEOUT=600 ; TENACITY=""
+MAX_ROUNDS=40 ; TIMEOUT=600 ; TENACITY="" ; INITIATIVE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,6 +37,7 @@ while [ $# -gt 0 ]; do
     --max-rounds) MAX_ROUNDS="$2"; shift 2;;
     --timeout)    TIMEOUT="$2"; shift 2;;
     --tenacity)   TENACITY="$2"; shift 2;;
+    --initiative) INITIATIVE="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -58,6 +62,7 @@ for task_dir in "$TASKS"/*/; do
 
   # Drive newt solve headless (--non-interactive default: OCAP off + full access).
   ten_arg=(); [ -n "$TENACITY" ] && ten_arg=(--tenacity "$TENACITY")
+  [ -n "$INITIATIVE" ] && ten_arg+=(--initiative "$INITIATIVE")
   timeout "$TIMEOUT" newt solve \
     --cwd "$ws" \
     --instruction-file "$task_dir/instruction.md" \

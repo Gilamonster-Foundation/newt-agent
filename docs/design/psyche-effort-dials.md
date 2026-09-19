@@ -79,6 +79,9 @@ supplies the starting point.
 
 All three dials keep today's precedence: CLI flag, then persona, then the
 config's per-family value, then the config default, then the built-in default.
+Slice 1b removes the persona and config layers of tenacity, which never lifted
+the round cap and would be inert until `resolute` returns them in slice 2, so
+until then tenacity is set only explicitly (flag, `/psyche`, a pin, obsessive).
 
 ### Tunable numbers
 

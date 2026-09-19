@@ -1,6 +1,6 @@
 //! The single resolved snapshot of the runtime operator posture (#1139 / #1320).
 //!
-//! Cognition, tenacity, crew, the active persona, and the backend axis are each
+//! Cognition, tenacity, initiative, crew, the active persona, and the backend axis are each
 //! resolved in their own module (over process-global dials + the `Config`); this
 //! bundles them into ONE query — [`RuntimeSettingsSnapshot::resolve`] — so every
 //! status surface (chat's `/psyche`, the `/psyche edit` summary, `solve`'s trace)
@@ -15,6 +15,7 @@
 
 use crate::cognition::CognitionOverride;
 use crate::config::Config;
+use crate::initiative::{effective_initiative, Initiative};
 use crate::role_profile::Cognition;
 use crate::tenacity::{effective_tenacity, Tenacity};
 use serde::{Deserialize, Serialize};
@@ -49,8 +50,10 @@ pub struct RuntimeSettingsSnapshot {
     /// Effective cognition (override > persona > off). `None` means no
     /// backend-specific reasoning controls are requested.
     pub cognition: Option<Cognition>,
-    /// Effective tenacity (CLI > persona > config/family > Standard).
+    /// Effective tenacity (the explicit choice, else Normal).
     pub tenacity: Tenacity,
+    /// Effective initiative (CLI > persona > config/family > Measured).
+    pub initiative: Initiative,
     /// Crew launch gate (`NEWT_TEAM`).
     pub crew: bool,
     /// The active persona name, if any (session state — supplied by the caller).
@@ -88,6 +91,7 @@ impl RuntimeSettingsSnapshot {
         Self {
             cognition: crate::cognition::effective_cognition(),
             tenacity: effective_tenacity(),
+            initiative: effective_initiative(),
             crew: std::env::var_os("NEWT_TEAM").is_some(),
             persona: persona.map(str::to_string),
             backend: BackendState {
@@ -107,10 +111,11 @@ impl RuntimeSettingsSnapshot {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "psyche · persona {} · cognition {} · tenacity {} · crew {}",
+            "psyche · persona {} · cognition {} · tenacity {} · initiative {} · crew {}",
             self.persona.as_deref().unwrap_or("none"),
             self.cognition.map_or("off", Cognition::label),
             self.tenacity.label(),
+            self.initiative.label(),
             if self.crew { "on" } else { "off" },
         )
     }
@@ -123,7 +128,7 @@ impl RuntimeSettingsSnapshot {
 /// Every field records an *operator ACTION*, NEVER a resolved effective value
 /// and never ambient session state: `backend` is the name a successful
 /// `/backends <name>` picked, `model` the name a successful `/model <name>` /
-/// psyche-panel spinner picked, `cognition` / `tenacity` the levels a
+/// psyche-panel spinner picked, `cognition` / `tenacity` / `initiative` the levels a
 /// `/psyche` setter (or the panel's dirty dial) installed. A `None` field
 /// means the operator never acted on that axis, so a session that only ever
 /// *looks* — a bare `/backends` listing, a persona switch, a refused pick —
@@ -144,7 +149,7 @@ impl RuntimeSettingsSnapshot {
 ///
 /// **Precedence on resume** (highest first):
 /// 1. this invocation's EXPLICIT inputs — `--backend-*`/`--model`-equivalent
-///    env, `--cognition`, `--tenacity`, `--obsessive`, a `--loadout` axis
+///    env, `--cognition`, `--tenacity`, `--initiative`, `--obsessive`, a `--loadout` axis
 ///    ([`PreferenceAxes`], recorded at launch): the pin never overrides an axis
 ///    the operator just typed;
 /// 2. this conversation's pinned axes;
@@ -188,7 +193,7 @@ impl RuntimeSettingsSnapshot {
 /// capability / OCAP layer, which re-derives grants per session from config +
 /// live consent. Do not add a field here for it. This is a CLOSED set of
 /// concrete fields — no maps, no extension bag, no generic blob:
-/// `pin_serializes_exactly_the_four_preference_axes` pins the serialized key
+/// `pin_serializes_exactly_the_five_preference_axes` pins the serialized key
 /// set so a new field cannot land without confronting this section, and
 /// `deny_unknown_fields` makes a row carrying anything else a hard decode
 /// error (the caller degrades it to a one-line notice + the baseline) rather
@@ -212,9 +217,12 @@ pub struct OperatorPreferencePin {
     /// ([`CognitionOverride::Unset`] — deliberately distinct from `"off"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cognition: Option<String>,
-    /// The `/tenacity` session override, if any.
+    /// The `/psyche tenacity` session override, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenacity: Option<Tenacity>,
+    /// The `/psyche initiative` session override, if any (slice 1b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiative: Option<Initiative>,
 }
 
 /// What applying a [`OperatorPreferencePin`] on resume should DO — resolved purely (no
@@ -226,6 +234,8 @@ pub struct PreferenceApplyPlan {
     pub cognition: Option<CognitionOverride>,
     /// Install this `/tenacity` override; `None` ⇒ leave the dial alone.
     pub tenacity: Option<Tenacity>,
+    /// Install this `/psyche initiative` override; `None` ⇒ leave the dial alone.
+    pub initiative: Option<Initiative>,
     /// What to do with the backend axis (`NEWT_PROVIDER`/`NEWT_DGX_MODEL`).
     pub backend_axis: BackendAxisAction,
     /// One-line fail-open notices (unknown pinned backend, unparseable
@@ -272,7 +282,7 @@ pub enum BackendAxisAction {
 /// (#1668). Recorded at launch for THIS invocation's explicit inputs — an
 /// `NEWT_PROVIDER`/`NEWT_DGX_MODEL` the operator exported or a `--backend-*`
 /// with a destination, a `--loadout` axis, `--cognition`, `--tenacity`,
-/// `--obsessive` — and consulted by [`OperatorPreferencePin::apply_plan`], which refuses
+/// `--initiative`, `--obsessive` — and consulted by [`OperatorPreferencePin::apply_plan`], which refuses
 /// to overwrite an axis the operator just typed with a stored pin.
 ///
 /// Deliberately NOT recorded: the #545 sticky `~/.newt/settings.toml` restore,
@@ -288,6 +298,8 @@ pub struct PreferenceAxes {
     pub cognition: bool,
     /// The `/tenacity` dial.
     pub tenacity: bool,
+    /// The `/psyche initiative` dial.
+    pub initiative: bool,
 }
 
 impl PreferenceAxes {
@@ -297,6 +309,7 @@ impl PreferenceAxes {
         self.model |= other.model;
         self.cognition |= other.cognition;
         self.tenacity |= other.tenacity;
+        self.initiative |= other.initiative;
     }
 
     /// `true` when no axis is in the set.
@@ -313,6 +326,7 @@ impl PreferenceAxes {
             (self.model, "model"),
             (self.cognition, "cognition"),
             (self.tenacity, "tenacity"),
+            (self.initiative, "initiative"),
         ]
         .into_iter()
         .filter_map(|(on, label)| on.then_some(label))
@@ -339,6 +353,8 @@ pub struct PreferenceActions {
     pub cognition: Option<CognitionOverride>,
     /// The `/tenacity` override the operator chose (`Some(None)` = `auto`).
     pub tenacity: Option<Option<Tenacity>>,
+    /// The `/psyche initiative` override the operator chose (`Some(None)` = `auto`).
+    pub initiative: Option<Option<Initiative>>,
 }
 
 impl PreferenceActions {
@@ -364,6 +380,9 @@ impl PreferenceActions {
         if other.tenacity.is_some() {
             self.tenacity = other.tenacity;
         }
+        if other.initiative.is_some() {
+            self.initiative = other.initiative;
+        }
     }
 }
 
@@ -378,6 +397,7 @@ static PREFERENCE_ACTIONS: Mutex<PreferenceActions> = Mutex::new(PreferenceActio
     model: None,
     cognition: None,
     tenacity: None,
+    initiative: None,
 });
 
 // #1668: the axes THIS INVOCATION's explicit inputs own (see [`PreferenceAxes`]).
@@ -387,6 +407,7 @@ static CLI_PREFERENCE_AXES: Mutex<PreferenceAxes> = Mutex::new(PreferenceAxes {
     model: false,
     cognition: false,
     tenacity: false,
+    initiative: false,
 });
 
 /// Record a SUCCESSFUL `/backends <name>` (or an equivalent named-backend
@@ -422,6 +443,13 @@ pub fn mark_cognition_choice(o: CognitionOverride) {
 pub fn mark_tenacity_choice(t: Option<Tenacity>) {
     if let Ok(mut slot) = PREFERENCE_ACTIONS.lock() {
         slot.tenacity = Some(t);
+    }
+}
+
+/// Record an operator `/psyche initiative` choice — `None` is `auto` (override cleared).
+pub fn mark_initiative_choice(i: Option<Initiative>) {
+    if let Ok(mut slot) = PREFERENCE_ACTIONS.lock() {
+        slot.initiative = Some(i);
     }
 }
 
@@ -507,6 +535,9 @@ impl OperatorPreferencePin {
         }
         if let Some(tenacity) = actions.tenacity {
             next.tenacity = tenacity;
+        }
+        if let Some(initiative) = actions.initiative {
+            next.initiative = initiative;
         }
         next
     }
@@ -606,6 +637,7 @@ impl OperatorPreferencePin {
         PreferenceApplyPlan {
             cognition,
             tenacity: self.tenacity.filter(|_| !owned.tenacity),
+            initiative: self.initiative.filter(|_| !owned.initiative),
             backend_axis,
             notices,
         }
@@ -676,8 +708,9 @@ mod tests {
     #[test]
     fn resolve_reads_effective_dials_and_the_selected_backend() {
         let _g = GlobalSettingsGuard::acquire();
-        crate::tenacity::clear_cli_tenacity();
-        crate::tenacity::set_persona_tenacity(Some(Tenacity::Relentless));
+        crate::tenacity::set_cli_tenacity(Tenacity::Relentless);
+        crate::initiative::clear_cli_initiative();
+        crate::initiative::set_persona_initiative(Some(Initiative::Decisive));
         crate::cognition::set_cli_cognition(crate::cognition::CognitionOverride::Set(
             Cognition::Meticulous,
         ));
@@ -701,6 +734,7 @@ mod tests {
 
         assert_eq!(snap.cognition, Some(Cognition::Meticulous));
         assert_eq!(snap.tenacity, Tenacity::Relentless);
+        assert_eq!(snap.initiative, Initiative::Decisive);
         assert!(!snap.crew);
         assert_eq!(snap.persona.as_deref(), Some("bob"));
         // default_backend precedence beats first-listed `other`.
@@ -711,6 +745,7 @@ mod tests {
         assert_eq!(snap.backend.persona.as_deref(), Some("sol"));
         assert!(snap.summary().contains("persona bob"));
         assert!(snap.summary().contains("tenacity relentless"));
+        assert!(snap.summary().contains("initiative decisive"));
     }
 
     #[test]
@@ -751,7 +786,7 @@ mod tests {
         crate::cognition::set_cli_cognition(CognitionOverride::Off);
         crate::tenacity::set_cli_tenacity(Tenacity::Relentless);
         crate::cognition::set_persona_cognition(Some(Cognition::Meticulous));
-        crate::tenacity::set_persona_tenacity(Some(Tenacity::Insistent));
+        crate::initiative::set_persona_initiative(Some(Initiative::Decisive));
 
         let actions = drain_preference_actions();
         assert!(actions.is_empty(), "no action marked: {actions:?}");
@@ -787,13 +822,16 @@ mod tests {
         // The dial setters, including their `auto` (clear) forms.
         mark_cognition_choice(CognitionOverride::Off);
         mark_tenacity_choice(Some(Tenacity::Relentless));
+        mark_initiative_choice(Some(Initiative::Eager));
         let a = drain_preference_actions();
         assert_eq!(a.cognition, Some(CognitionOverride::Off));
         assert_eq!(a.tenacity, Some(Some(Tenacity::Relentless)));
+        assert_eq!(a.initiative, Some(Some(Initiative::Eager)));
         assert_eq!((a.backend, a.model), (None, None));
 
         mark_cognition_choice(CognitionOverride::Unset);
         mark_tenacity_choice(None);
+        mark_initiative_choice(None);
         let a = drain_preference_actions();
         assert_eq!(
             a.cognition,
@@ -801,6 +839,7 @@ mod tests {
             "`auto` is an action too — it UNPINS the axis"
         );
         assert_eq!(a.tenacity, Some(None));
+        assert_eq!(a.initiative, Some(None));
 
         // Drain is destructive: the same action is never written twice.
         assert!(drain_preference_actions().is_empty());
@@ -815,6 +854,7 @@ mod tests {
             model: Some("nemotron-340b".into()),
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
+            initiative: Some(Initiative::Patient),
         };
         let dial_only = PreferenceActions {
             cognition: Some(CognitionOverride::Set(Cognition::Zen)),
@@ -824,12 +864,14 @@ mod tests {
         assert_eq!(merged.backend.as_deref(), Some("retired-dgx"), "kept");
         assert_eq!(merged.model.as_deref(), Some("nemotron-340b"), "kept");
         assert_eq!(merged.tenacity, Some(Tenacity::Relentless), "kept");
+        assert_eq!(merged.initiative, Some(Initiative::Patient), "kept");
         assert_eq!(merged.cognition.as_deref(), Some("zen"));
 
         // A cleared axis UNPINS it (back to the invocation baseline), and is
         // distinguishable from "not acted on".
         let cleared = OperatorPreferencePin::default().merged(&PreferenceActions {
             tenacity: Some(None),
+            initiative: Some(None),
             cognition: Some(CognitionOverride::Unset),
             model: Some(None),
             backend: None,
@@ -867,18 +909,19 @@ mod tests {
         };
         pending.merge(PreferenceActions {
             model: Some(Some("m2".into())),
-            tenacity: Some(Some(Tenacity::Relaxed)),
+            initiative: Some(Some(Initiative::Patient)),
             ..Default::default()
         });
         assert_eq!(pending.backend, Some(Some("sol".to_string())), "kept");
         assert_eq!(pending.model, Some(Some("m2".to_string())), "latest wins");
-        assert_eq!(pending.tenacity, Some(Some(Tenacity::Relaxed)));
+        assert_eq!(pending.initiative, Some(Some(Initiative::Patient)));
         assert_eq!(
             OperatorPreferencePin::default().merged(&pending),
             OperatorPreferencePin {
                 backend: Some("sol".into()),
                 model: Some("m2".into()),
-                tenacity: Some(Tenacity::Relaxed),
+                initiative: Some(Initiative::Patient),
+                tenacity: None,
                 cognition: None,
             }
         );
@@ -934,14 +977,14 @@ mod tests {
     fn unparseable_pinned_cognition_fails_open_with_a_notice() {
         let pin = OperatorPreferencePin {
             cognition: Some("transcending".into()),
-            tenacity: Some(Tenacity::Insistent),
+            initiative: Some(Initiative::Decisive),
             ..Default::default()
         };
         let plan = pin.apply_plan(&[], PreferenceAxes::default());
         assert_eq!(plan.cognition, None, "bad string must leave the dial alone");
         assert_eq!(
-            plan.tenacity,
-            Some(Tenacity::Insistent),
+            plan.initiative,
+            Some(Initiative::Decisive),
             "other dials still apply"
         );
         assert_eq!(plan.notices.len(), 1);
@@ -1075,12 +1118,14 @@ mod tests {
             model: Some("m1".into()),
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
+            initiative: Some(Initiative::Eager),
         };
         let plan = pin.apply_plan(
             &["sol"],
             PreferenceAxes {
                 cognition: true,
                 backend: true,
+                initiative: true,
                 ..Default::default()
             },
         );
@@ -1091,6 +1136,10 @@ mod tests {
             "the flag owns the provider; the unowned model axis still applies"
         );
         assert_eq!(plan.tenacity, Some(Tenacity::Relentless), "unowned applies");
+        assert_eq!(
+            plan.initiative, None,
+            "--initiative wins for the invocation"
+        );
         assert!(plan.notices.is_empty());
 
         // A pin whose backend is gone but whose axis the flags own must not
@@ -1123,7 +1172,10 @@ mod tests {
         });
         let axes = cli_preference_axes();
         assert!(axes.cognition && axes.backend);
-        assert!(!axes.model && !axes.tenacity, "recording is per-axis");
+        assert!(
+            !axes.model && !axes.tenacity && !axes.initiative,
+            "recording is per-axis"
+        );
         assert_eq!(axes.labels(), vec!["backend", "cognition"]);
         assert!(!axes.is_empty());
         assert!(PreferenceAxes::default().is_empty());
@@ -1134,7 +1186,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn pin_serializes_exactly_the_four_preference_axes() {
+    fn pin_serializes_exactly_the_five_preference_axes() {
         // The extension guard. A pin is safe to restore FAIL-OPEN only because
         // every field is convenience state; authority must fail CLOSED and
         // belongs in the capability / OCAP layer. Adding a field here breaks
@@ -1145,6 +1197,7 @@ mod tests {
             model: Some("m1".into()),
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
+            initiative: Some(Initiative::Eager),
         };
         let value: serde_json::Value = serde_json::to_value(&full).unwrap();
         let mut keys: Vec<&str> = value
@@ -1156,8 +1209,8 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["backend", "cognition", "model", "tenacity"],
-            "a pin may carry ONLY these four preference axes; it is operator preference, never authority — audit any new field against the type doc first"
+            vec!["backend", "cognition", "initiative", "model", "tenacity"],
+            "a pin may carry ONLY these five preference axes; it is operator preference, never authority — audit any new field against the type doc first"
         );
     }
 
@@ -1186,6 +1239,9 @@ mod tests {
         for malformed in [
             r#"{"backend":42}"#,
             r#"{"tenacity":"nonsense"}"#,
+            r#"{"initiative":"nonsense"}"#,
+            // A pre-split label the store migration did not rewrite.
+            r#"{"tenacity":"insistent"}"#,
             "not json",
         ] {
             assert!(
@@ -1198,24 +1254,27 @@ mod tests {
     #[test]
     fn a_pin_plan_never_yields_anything_but_the_preference_axes() {
         // The apply side of the same invariant: whatever a row contains, the
-        // PLAN a caller can act on is only ever the two dials plus the
+        // PLAN a caller can act on is only ever the three dials plus the
         // backend/model axis — there is no channel here to widen authority.
         let pin = OperatorPreferencePin {
             backend: Some("sol".into()),
             model: Some("m1".into()),
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
+            initiative: Some(Initiative::Eager),
         };
         // Exhaustive destructure: a new PreferenceApplyPlan field fails to compile
         // here, forcing the next author past the invariant above.
         let PreferenceApplyPlan {
             cognition,
             tenacity,
+            initiative,
             backend_axis,
             notices,
         } = pin.apply_plan(&["sol"], PreferenceAxes::default());
         assert_eq!(cognition, Some(CognitionOverride::Off));
         assert_eq!(tenacity, Some(Tenacity::Relentless));
+        assert_eq!(initiative, Some(Initiative::Eager));
         assert!(matches!(backend_axis, BackendAxisAction::Route { .. }));
         assert!(notices.is_empty());
     }

@@ -1,9 +1,9 @@
 //! A shared RAII guard that serializes tests touching the **process-global
-//! operator settings** — cognition, tenacity, and the env vars the psyche /
+//! operator settings** — cognition, tenacity, initiative, and the env vars the psyche /
 //! backend-routing paths read — and restores them on drop.
 //!
 //! These settings are process-wide (`set_cli_cognition` / `set_cli_tenacity` /
-//! `set_tenacity_config` / `set_active_model_family` / `NEWT_PROVIDER` / …), so
+//! `set_initiative_config` / `set_active_model_family` / `NEWT_PROVIDER` / …), so
 //! tests in *different modules* that mutate them will interleave under the test
 //! runner's threads, and manual end-of-test restoration does not survive a panic,
 //! an early return, or an assertion failure. One shared lock + a Drop-restored
@@ -31,19 +31,22 @@
 //! ## What the snapshot covers, and why (audited 2026-07-31)
 //!
 //! The guard must snapshot **exactly** the mutable state that can change what
-//! `effective_tenacity()` / `effective_cognition()` return between tests. Rather
-//! than reach into each global piecemeal, it composes the two crate-owned runtime
-//! snapshots, which together cover all six resolution globals:
+//! `effective_tenacity()` / `effective_initiative()` / `effective_cognition()`
+//! return between tests. Rather than reach into each global piecemeal, it
+//! composes the crate-owned runtime snapshots, which together cover every
+//! resolution global:
 //!
 //! - [`cognition::CognitionRuntimeSnapshot`]: `CLI_COGNITION`, `PERSONA_COGNITION`
 //!   (the only two globals read by `effective_cognition`).
-//! - [`tenacity::TenacityRuntimeSnapshot`]: `CLI_TENACITY`, `PERSONA_TENACITY`,
-//!   **`TENACITY_CONFIG`**, **`ACTIVE_FAMILY`** (all four read by
-//!   `effective_tenacity`). The last two were the gap the piecemeal guard missed:
-//!   `Config::apply_runtime_settings` installs the `[tenacity]` config and the `solve`
-//!   model-selection path installs the active family, both process-wide, so a
-//!   test exercising either leaked a per-family default / active family into a
-//!   sibling test's `effective_tenacity()`.
+//! - [`tenacity::TenacityRuntimeSnapshot`]: `CLI_TENACITY` (the only input to
+//!   `effective_tenacity`) and the two round-cap globals.
+//! - [`initiative::InitiativeRuntimeSnapshot`]: `CLI_INITIATIVE`,
+//!   `PERSONA_INITIATIVE`, **`INITIATIVE_CONFIG`**, **`ACTIVE_FAMILY`** (all four
+//!   read by `effective_initiative`). The last two were the gap the old
+//!   piecemeal guard missed: `Config::publish_runtime_settings` installs the
+//!   config and the `solve` model-selection path installs the active family,
+//!   both process-wide, so a test exercising either leaked a per-family default
+//!   into a sibling test.
 //! - [`crate::runtime::PreferenceRuntimeSnapshot`] (#1668): the posture-ACTION
 //!   accumulator and the recorded CLI posture axes. Neither feeds
 //!   `effective_*`, but both are process-global operator state written by the
@@ -57,12 +60,13 @@
 //! Plus the env vars below, which are *upstream* (model / backend selection →
 //! `ACTIVE_FAMILY`) or *downstream* (cognition wire emission) of the resolutions
 //! — not read inside them, but mutated by backend / psyche / crew routing tests.
-//! (There is no `NEWT_TENACITY` / `NEWT_COGNITION` env var — tenacity and
-//! cognition are only ever sourced from CLI flags into the globals above.)
+//! (There is no `NEWT_TENACITY` / `NEWT_INITIATIVE` / `NEWT_COGNITION` env var —
+//! the dials are only ever sourced from CLI flags into the globals above.)
 //! `CLI_BACKEND_OVERRIDE` (config.rs) is on the backend axis, not read by either
 //! resolution fn, so it is intentionally out of scope here.
 
 use crate::cognition::CognitionRuntimeSnapshot;
+use crate::initiative::InitiativeRuntimeSnapshot;
 use crate::process_env::EnvGuard;
 use crate::runtime::PreferenceRuntimeSnapshot;
 use crate::tenacity::TenacityRuntimeSnapshot;
@@ -95,7 +99,7 @@ const ENV_KEYS: &[&str] = &[
 ];
 
 /// Exclusive access to the process-global operator settings for the duration of a
-/// test. Snapshots cognition + tenacity + the relevant env on `acquire`, restores
+/// test. Snapshots cognition + tenacity + initiative + the relevant env on `acquire`, restores
 /// them on `drop` — even through a panic or assertion failure.
 #[doc(hidden)]
 pub struct GlobalSettingsGuard {
@@ -106,6 +110,7 @@ pub struct GlobalSettingsGuard {
     // `Option` only so `Drop` can move the snapshot out into the restore fns.
     cognition: Option<CognitionRuntimeSnapshot>,
     tenacity: Option<TenacityRuntimeSnapshot>,
+    initiative: Option<InitiativeRuntimeSnapshot>,
     posture: Option<PreferenceRuntimeSnapshot>,
     permission_posture: Option<crate::posture::ActivePosture>,
     env: Vec<(&'static str, Option<String>)>,
@@ -136,6 +141,7 @@ impl GlobalSettingsGuard {
             _lock: lock,
             cognition: Some(crate::cognition::snapshot_runtime_state()),
             tenacity: Some(crate::tenacity::snapshot_runtime_state()),
+            initiative: Some(crate::initiative::snapshot_runtime_state()),
             posture: Some(crate::runtime::snapshot_runtime_state()),
             permission_posture: crate::posture::active_posture(),
             env,
@@ -150,6 +156,9 @@ impl Drop for GlobalSettingsGuard {
         }
         if let Some(snap) = self.tenacity.take() {
             crate::tenacity::restore_runtime_state(snap);
+        }
+        if let Some(snap) = self.initiative.take() {
+            crate::initiative::restore_runtime_state(snap);
         }
         if let Some(snap) = self.posture.take() {
             crate::runtime::restore_runtime_state(snap);

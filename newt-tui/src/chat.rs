@@ -118,7 +118,7 @@ enum ModelInputOrigin {
         parent: Box<newt_core::TurnPromptContext>,
     },
     /// #2424: the harness-authored turn seeded after the operator approved a
-    /// plan ("implement it now" + the approved draft + the tenacity exit
+    /// plan ("implement it now" + the approved draft + the initiative exit
     /// guidance). Like `HarnessRetry` it is NOT operator input — inert for
     /// slash commands and history — and it is persisted under the same
     /// harness-retry provenance class (harness-generated, descended from the
@@ -357,7 +357,7 @@ enum PlanTurnKind {
     /// not retype them. Genuinely operator text → `OperatorContinuation`.
     Feedback,
     /// The operator approved: a harness-authored "implement it now" turn
-    /// carrying the approved draft and the tenacity exit guidance →
+    /// carrying the approved draft and the initiative exit guidance →
     /// `HarnessPlanApproval`, never an operator origin.
     Approval,
 }
@@ -373,7 +373,7 @@ struct PendingPlanTurn {
 
 /// #2424: the harness-authored prompt that seeds the implementation turn
 /// after approval. Pure, so the shape is testable: the approved draft rides
-/// inside when there is one (a `render_report` draft), and the tenacity exit
+/// inside when there is one (a `render_report` draft), and the initiative exit
 /// guidance always does — that guidance used to be `exit_plan_mode`'s own
 /// ack, and this is the turn it now belongs to.
 fn plan_approval_seed_text(approved_plan: Option<&str>, exit_guidance: &str) -> String {
@@ -468,7 +468,7 @@ fn run_plan_approval(
             effects.switch_to_dev = entry == PlanEntry::OperatorSelected;
             // Seed the implementation turn: the operator types nothing.
             // Harness-authored, so it carries its own origin, and the
-            // tenacity exit guidance (formerly exit_plan_mode's ack) rides
+            // initiative exit guidance (formerly exit_plan_mode's ack) rides
             // inside it — never disguised as operator text.
             let seeded = match parent {
                 Some(parent) => {
@@ -1732,12 +1732,12 @@ fn session_body(
     // under the same association gates as the capability decision, never
     // inferred from the model name (the anti-substring law). No associated
     // card family ⇒ no family. ONE derivation feeds both the per-family
-    // `[tenacity]` default and the automatic bundle/profile pick below.
+    // `[initiative]` default and the automatic bundle/profile pick below.
     let session_family = choice
         .capabilities
         .family_for_route(&choice.route_destination(), choice.principal())
         .map(str::to_string);
-    newt_core::tenacity::set_active_model_family(session_family.clone());
+    newt_core::initiative::set_active_model_family(session_family.clone());
     // #1199: the server-declared window from adopt, fresh per session — feeds
     // the budget without the persisted cache.
     let mut inf_context_window: Option<u32> = choice.context_window;
@@ -2186,15 +2186,10 @@ fn session_body(
         }
     }
 
-    // P1#3 / review-2: install a `--persona`'s declared tenacity + cognition as
-    // real resolution layers at startup too (below any `--tenacity` / `--cognition`,
+    // P1#3 / review-2: install a `--persona`'s declared initiative + cognition as
+    // real resolution layers at startup too (below any `--initiative` / `--cognition`,
     // above config/family), so the loop obeys them and status surfaces agree.
-    newt_core::tenacity::set_persona_tenacity(
-        active_persona.as_ref().and_then(|p| p.profile.tenacity),
-    );
-    newt_core::cognition::set_persona_cognition(
-        active_persona.as_ref().and_then(|p| p.profile.cognition),
-    );
+    crate::seat_persona_dials(active_persona.as_ref());
 
     // Persona backend auto-route (startup): if `--persona` named a persona that
     // declares a `backend:`, repoint the session to it now — before the memory /
@@ -6061,7 +6056,7 @@ fn session_body(
                             // the incoming row. Without this the outgoing
                             // conversation's pinned dials stayed installed and
                             // silently outranked the incoming persona's own
-                            // declared cognition/tenacity (the CLI layer sits
+                            // declared cognition/initiative (the CLI layer sits
                             // above the persona layer in `effective_*`).
                             //
                             // The freshly-minted conversation has no stored
@@ -6379,7 +6374,7 @@ fn session_body(
                             use config_panel::{PanelOutcome, PersonaAction, PersonaChoice};
                             // review-3 §3: hand the panel each persona's declarations
                             // so it can PROJECT the selected persona's effective
-                            // posture, plus the config/family tenacity base.
+                            // posture, plus the config/family initiative base.
                             let personas = PersonaChoice::for_panel(
                                 persona_store
                                     .list()
@@ -6397,7 +6392,9 @@ fn session_body(
                             // persona's current backend.
                             let backend = base_provider.clone();
                             let current_persona = active_persona.as_ref().map(|p| p.name.clone());
-                            let base_tenacity = newt_core::tenacity::base_tenacity();
+                            let base_initiative = newt_core::initiative::base_initiative();
+                            let initiative_from_family =
+                                newt_core::initiative::model_default_initiative().is_some();
                             // review-3 §1: the ONLY filesystem I/O, injected so a failed
                             // write keeps the panel open and mutates nothing. Report the
                             // store's NORMALIZED (on-disk) name so the confirmation
@@ -6442,7 +6439,8 @@ fn session_body(
                                     personas,
                                     current_persona,
                                     backend,
-                                    base_tenacity,
+                                    base_initiative,
+                                    initiative_from_family,
                                     personality: tabs.active().sidecar.personality,
                                     models: served_models,
                                     current_model: panel_choice
@@ -6658,7 +6656,7 @@ fn session_body(
                         print_newt(
                             "the psyche panel needs the rich TUI build with an interactive \
                              terminal — use /psyche status for the text view, or /psyche \
-                             cognition / /psyche tenacity <level> to change the dials.",
+                             cognition / tenacity / initiative <level> to change the dials.",
                             color,
                             verbose,
                         );
@@ -8681,8 +8679,11 @@ fn session_body(
                                             plan_state,
                                             &conversation_mode_states.plan_draft,
                                             active_prompt_context.as_ref(),
+                                            // `_turn_binding` is still held here, so
+                                            // this reads the initiative the turn
+                                            // captured, not a dial moved since.
                                             &newt_core::agentic::exit_plan_mode_result(
-                                                newt_core::tenacity::effective_tenacity(),
+                                                newt_core::initiative::effective_initiative(),
                                             ),
                                         );
                                         if effects.switch_to_dev {

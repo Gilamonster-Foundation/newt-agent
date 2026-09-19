@@ -78,7 +78,7 @@ pub(super) fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              plan               TEXT NOT NULL DEFAULT '{}', -- JSON plan-ledger snapshot (#715); working memory, NOT hashed (§6 chain unchanged)
              roadmap_id         TEXT,                      -- #1030: roadmap this conv's Plan node belongs to (NULL = ad-hoc chat); thin pointer, tree lives in `roadmaps`
              node_id            TEXT,                      -- #1030: the `roadmaps` tree Subtask id this conversation realizes (NULL = ad-hoc chat)
-             preference_pin     TEXT NOT NULL DEFAULT '{}' -- JSON OperatorPreferencePin (#1668): operator-pinned backend/model/cognition/tenacity; metadata, NOT hashed (§6 chain unchanged)
+             preference_pin     TEXT NOT NULL DEFAULT '{}' -- JSON OperatorPreferencePin (#1668): operator-pinned backend/model/cognition/tenacity/initiative; metadata, NOT hashed (§6 chain unchanged)
          );
          CREATE TABLE IF NOT EXISTS turns (
              conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -321,7 +321,12 @@ pub(super) fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              created_tick    INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_enrollment_requests_pending
-             ON enrollment_requests (conversation_id, workspace_key, resolved);",
+             ON enrollment_requests (conversation_id, workspace_key, resolved);
+         -- One row per one-time data migration that has run, for a step that
+         -- is not idempotent (the psyche split's `relentless` pin rewrite).
+         CREATE TABLE IF NOT EXISTS store_migrations (
+             name TEXT PRIMARY KEY
+         );",
     )?;
     Ok(())
 }

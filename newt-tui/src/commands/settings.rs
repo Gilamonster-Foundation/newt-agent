@@ -3,7 +3,7 @@
 //! `NEWT_*` env var a later step in `run_chat` picks up; `/psyche` owns every
 //! effort dial (#1665): bare `/psyche` opens the panel (intercepted in
 //! `chat.rs` on a rich TTY; here it renders the text status view for the
-//! piped/lean path), and `/psyche cognition|tenacity <level>` are the text
+//! piped/lean path), and `/psyche cognition|tenacity|initiative <level>` are the text
 //! setters that mutate the process-globals. The retired top-level
 //! `/cognition` + `/tenacity` print a redirect and mutate NOTHING. Moved from
 //! the `dispatch_slash` match in `lib.rs`.
@@ -218,7 +218,7 @@ pub(crate) fn dispatch(
 
         // /psyche owns the dials (#1665): bare = panel (intercepted in chat.rs
         // on a rich TTY; HERE bare renders the text status for piped/lean),
-        // `status` = text view, `cognition`/`tenacity` = text setters,
+        // `status` = text view, `cognition`/`tenacity`/`initiative` = text setters,
         // `obsessive` = max the live dials. Subcommand args live past arg1, so
         // re-derive the full remainder from the raw input.
         "psyche" => {
@@ -250,12 +250,25 @@ fn explicit_relentless_round_note() -> Option<&'static str> {
     )
 }
 
-/// Build the `/tenacity` response and, when `arg` names a level, install it as an
-/// explicit override (the highest-priority input in
-/// [`newt_core::tenacity::effective_tenacity`]). Pure for the show/list/error
-/// paths; the set path mutates the process-global via `set_cli_tenacity`.
+/// The `<auto|level…>` usage fragment for a dial, built from its `all()` so a
+/// level added to the enum cannot be missing from the help.
+fn level_usage<'a>(labels: impl IntoIterator<Item = &'a str>) -> String {
+    std::iter::once("auto")
+        .chain(labels)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Build the `/psyche tenacity` response and, when `arg` names a level,
+/// install it as the explicit override (tenacity's only input). Pure for the
+/// show/list/error paths; the set path mutates the process-global via
+/// `set_cli_tenacity`.
 fn tenacity_command(arg: &str) -> String {
     use newt_core::tenacity::{effective_tenacity, Tenacity};
+    let usage = format!(
+        "(/psyche tenacity <{}>|list)",
+        level_usage(Tenacity::all().map(Tenacity::label))
+    );
     match arg.trim() {
         "" | "status" | "show" => {
             let t = effective_tenacity();
@@ -263,19 +276,16 @@ fn tenacity_command(arg: &str) -> String {
                 .map(|note| format!("  {note}."))
                 .unwrap_or_default();
             format!(
-                "tenacity: {} — {}{rounds}  (/psyche tenacity <auto|relaxed|standard|insistent|relentless>|list)",
+                "tenacity: {} — {}{rounds}  {usage}",
                 t.label(),
                 t.describe()
             )
         }
         "list" => {
-            let mut out = String::from("tenacity levels (patient → forcing):");
-            out.push_str("\n  auto       inherit from the persona / config / model family");
-            // Snapshot the active level ONCE. Re-reading `effective_tenacity()`
-            // inside the loop let a concurrent override change (another thread /
-            // test mutating the process-global) slip the "← active" marker off
-            // every row — zero levels marked — because the compared value moved
-            // between iterations. One read keeps the render internally consistent.
+            let mut out = String::from("tenacity levels (normal → relentless):");
+            out.push_str("\n  auto       normal, unless set explicitly");
+            // Snapshot the active level ONCE, so a concurrent override change
+            // cannot slip the "← active" marker off every row.
             let active_level = effective_tenacity();
             for t in Tenacity::all() {
                 let active = if t == active_level { " ← active" } else { "" };
@@ -286,16 +296,14 @@ fn tenacity_command(arg: &str) -> String {
             }
             out
         }
-        // review-2 #2: clear the `--tenacity`/`/tenacity` override so tenacity
-        // resolves from the persona / config / family again — the undo `/tenacity`
-        // previously lacked (a session override could not be released).
+        // review-2 #2: clear the override so tenacity is `normal` again.
         "auto" | "inherit" | "reset" => {
             // #1981: the clear AND the #1668 unpin both live in
             // `settings_form::apply` now — releasing the dial is an operator
             // action, and an action that leaves no record is the #1965 defect.
             apply_setting(Field::Tenacity, "auto", "/psyche tenacity");
             format!(
-                "tenacity → auto (override cleared) — now {} (from persona / config / family)",
+                "tenacity → auto (override cleared) — now {}",
                 effective_tenacity().label()
             )
         }
@@ -315,9 +323,49 @@ fn tenacity_command(arg: &str) -> String {
                     level.describe()
                 )
             }
-            Err(e) => {
-                format!("{e}  (/psyche tenacity <auto|level>|list|status)")
+            Err(e) => format!("{e}  {usage}"),
+        },
+    }
+}
+
+/// Build the `/psyche initiative` response and, when `arg` names a level,
+/// install it as the explicit override (the highest-priority input in
+/// [`newt_core::initiative::effective_initiative`]). Pure for the
+/// show/list/error paths.
+fn initiative_command(arg: &str) -> String {
+    use newt_core::initiative::{effective_initiative, Initiative};
+    let usage = format!(
+        "(/psyche initiative <{}>|list)",
+        level_usage(Initiative::all().map(Initiative::label))
+    );
+    match arg.trim() {
+        "" | "status" | "show" => {
+            let i = effective_initiative();
+            format!("initiative: {} — {}  {usage}", i.label(), i.describe())
+        }
+        "list" => {
+            let mut out = String::from("initiative levels (patient → eager):");
+            out.push_str("\n  auto       inherit from the persona / config / model family");
+            let active_level = effective_initiative();
+            for i in Initiative::all() {
+                let active = if i == active_level { " ← active" } else { "" };
+                out.push_str(&format!("\n  {:<10} {}{active}", i.label(), i.describe()));
             }
+            out
+        }
+        "auto" | "inherit" | "reset" => {
+            apply_setting(Field::Initiative, "auto", "/psyche initiative");
+            format!(
+                "initiative → auto (override cleared) — now {} (from persona / config / model family)",
+                effective_initiative().label()
+            )
+        }
+        other => match other.parse::<Initiative>() {
+            Ok(level) => {
+                apply_setting(Field::Initiative, level.label(), "/psyche initiative");
+                format!("initiative → {} — {}", level.label(), level.describe())
+            }
+            Err(e) => format!("{e}  {usage}"),
         },
     }
 }
@@ -398,17 +446,21 @@ fn retired_dial_redirect(cmd: &str) -> String {
 /// remainder after "psyche": empty / `status` renders the text posture view
 /// (bare `/psyche` only reaches here on the piped/lean path — a rich TTY
 /// intercepts it in `chat.rs` and opens the panel), `cognition …` /
-/// `tenacity …` delegate to the text setters, `obsessive` maxes the live
-/// dials, and `edit` points at the panel's TTY requirement.
+/// `tenacity …` / `initiative …` delegate to the text setters, `obsessive`
+/// engages the max-effort posture, and `edit` points at the panel's TTY
+/// requirement.
 fn psyche_command(rest: &str) -> String {
     use newt_core::cognition::{cli_cognition, CognitionOverride};
+    use newt_core::initiative::effective_initiative;
     use newt_core::tenacity::effective_tenacity;
     let rest = rest.trim();
     let (sub, arg) = match rest.split_once(char::is_whitespace) {
         Some((s, a)) => (s, a.trim()),
         None => (rest, ""),
     };
-    // `/psyche obsessive` — engage the max-everything posture's two LIVE dials.
+    // `/psyche obsessive` — engage the max-effort posture's two dials.
+    // Initiative is left alone, by design: the deepest thinking and acting
+    // after one round pull against each other.
     // Crew is a startup gate (crew_runner is built once at launch), so it can't
     // be turned on mid-session; say so honestly and point at the launch flag.
     if sub.eq_ignore_ascii_case("obsessive") || sub.eq_ignore_ascii_case("obsessive-relentless") {
@@ -425,16 +477,18 @@ fn psyche_command(rest: &str) -> String {
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}, \
              default tool-round budget → effectively unlimited (an explicit \
-             `/rounds` override still wins).\n\
+             `/rounds` override still wins); initiative stays {}.\n\
              crew is a launch gate — relaunch with `newt --obsessive` (or set \
              NEWT_TEAM) to add the crew this session.",
             cog.label(),
-            ten.label()
+            ten.label(),
+            effective_initiative().label()
         );
     }
     match sub {
         "cognition" => return cognition_command(arg),
         "tenacity" => return tenacity_command(arg),
+        "initiative" => return initiative_command(arg),
         // Reached only where chat.rs did NOT open the panel (piped / lean).
         // Reached only when chat.rs did NOT open the panel: a lean build, a
         // piped session, or a malformed alias (extra arguments) — so the
@@ -445,8 +499,8 @@ fn psyche_command(rest: &str) -> String {
             return if arg.is_empty() {
                 "/psyche opens the dial panel on the rich TUI with an \
                  interactive terminal; here, /psyche status shows the text \
-                 view and /psyche cognition / /psyche tenacity <level> change \
-                 the dials."
+                 view and /psyche cognition / tenacity / initiative <level> \
+                 change the dials."
                     .to_string()
             } else {
                 format!(
@@ -459,7 +513,7 @@ fn psyche_command(rest: &str) -> String {
         other => {
             return format!(
                 "unknown /psyche subcommand `{other}` — usage: /psyche \
-                 [status|cognition <level>|tenacity <level>|obsessive]"
+                 [status|cognition <level>|tenacity <level>|initiative <level>|obsessive]"
             )
         }
     }
@@ -476,13 +530,23 @@ fn psyche_command(rest: &str) -> String {
         },
     };
     let ten = effective_tenacity();
+    let init = effective_initiative();
+    let init_from = if newt_core::initiative::cli_initiative().is_some() {
+        "session override"
+    } else if newt_core::initiative::persona_initiative().is_some() {
+        "from the active persona"
+    } else if newt_core::initiative::model_default_initiative().is_some() {
+        "model default"
+    } else {
+        "config default"
+    };
     // Mirror newt-cli's startup gate: the crew runner is built iff NEWT_TEAM is set.
     let crew = if std::env::var("NEWT_TEAM").is_ok() {
         "on"
     } else {
         "off"
     };
-    let mut out = String::from("psyche — how hard the agent works (three orthogonal dials):");
+    let mut out = String::from("psyche — how hard the agent works (orthogonal dials):");
     out.push_str(&format!("\n  cognition   {cog}"));
     out.push_str(
         "\n              backend-specific reasoning depth             (/psyche cognition)",
@@ -492,22 +556,28 @@ fn psyche_command(rest: &str) -> String {
         ten.label(),
         ten.describe()
     ));
-    out.push_str("\n              how hard the loop pushes read → act     (/psyche tenacity)");
+    out.push_str("\n              how long it pursues the task            (/psyche tenacity)");
     if let Some(note) = explicit_relentless_round_note() {
         out.push_str(&format!("\n              {note}."));
     }
+    out.push_str(&format!(
+        "\n  initiative  {} — {} ({init_from})",
+        init.label(),
+        init.describe()
+    ));
+    out.push_str("\n              how much it looks before acting         (/psyche initiative)");
     out.push_str(&format!("\n  crew        {crew}"));
     out.push_str(
         "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
     );
     out.push_str(&format!(
-        "\nobsessive = the max-everything posture: {} + {} + crew on.",
+        "\nobsessive = cognition {} + tenacity {} + crew on; initiative is left alone.",
         newt_core::psyche::OBSESSIVE_COGNITION.label(),
         newt_core::psyche::OBSESSIVE_TENACITY.label()
     ));
     out.push_str(
         "\n/psyche — open the dial panel (rich TUI build + interactive terminal) · \
-         /psyche cognition|tenacity <level> — text setters.",
+         /psyche cognition|tenacity|initiative <level> — text setters.",
     );
     out
 }
@@ -604,13 +674,15 @@ mod tests {
     }
 
     #[test]
-    fn psyche_panel_shows_all_three_dials_and_how_to_change_them() {
+    fn psyche_panel_shows_all_the_dials_and_how_to_change_them() {
         let out = super::psyche_command("");
-        for k in ["cognition", "tenacity", "crew", "obsessive"] {
+        for k in ["cognition", "tenacity", "initiative", "crew", "obsessive"] {
             assert!(out.contains(k), "psyche panel missing '{k}': {out}");
         }
         assert!(
-            out.contains("/psyche cognition") && out.contains("/psyche tenacity"),
+            out.contains("/psyche cognition")
+                && out.contains("/psyche tenacity")
+                && out.contains("/psyche initiative"),
             "status view points at the /psyche subcommand setters: {out}"
         );
         assert!(
@@ -623,28 +695,31 @@ mod tests {
     #[test]
     fn psyche_obsessive_engages_the_max_live_dials_and_notes_crew() {
         use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::initiative::{cli_initiative, set_cli_initiative, Initiative};
         use newt_core::role_profile::Cognition;
         use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         // Reset to a non-obsessive baseline so the assertions are meaningful.
         set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
+        set_cli_tenacity(Tenacity::Normal);
+        set_cli_initiative(Initiative::Patient);
 
         let out = super::psyche_command("obsessive");
-        // The two live dials are actually maxed.
+        // The two dials it owns are actually set.
         assert_eq!(
             cli_cognition(),
             CognitionOverride::Set(Cognition::Meticulous)
         );
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        // Slice 1b: initiative is left exactly where it was, and the message
+        // says so rather than implying the posture still forces edits.
+        assert_eq!(cli_initiative(), Some(Initiative::Patient));
+        assert!(out.contains("initiative stays patient"), "{out}");
         // The message is honest about crew being a launch gate.
         assert!(out.to_lowercase().contains("crew"), "{out}");
         assert!(out.contains("--obsessive"), "{out}");
         assert!(out.contains("round"), "{out}");
         assert!(out.contains("/rounds"), "{out}");
-
-        set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
     }
 
     #[test]
@@ -656,14 +731,17 @@ mod tests {
         // the "← active" marker intermittently vanished once the hosted runners
         // upped test parallelism (the CPU-capped self-hosted pods never hit it).
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        set_cli_tenacity(Tenacity::Standard);
+        set_cli_tenacity(Tenacity::Normal);
         // Status names the active level and the usage hint (no mutation).
         let status = tenacity_command("");
         assert!(status.starts_with("tenacity: "), "{status}");
-        assert!(status.contains("/psyche tenacity"), "{status}");
-        // List enumerates every level, patient → forcing, marking the active one.
+        assert!(
+            status.contains("/psyche tenacity <auto|normal|relentless>"),
+            "{status}"
+        );
+        // List enumerates every level, marking the active one.
         let list = tenacity_command("list");
-        for label in ["relaxed", "standard", "insistent", "relentless"] {
+        for label in ["normal", "relentless"] {
             assert!(list.contains(label), "list missing {label}: {list}");
         }
         assert!(
@@ -673,6 +751,31 @@ mod tests {
         // An unknown level explains itself rather than silently doing nothing.
         let err = tenacity_command("banana");
         assert!(err.contains("unknown tenacity"), "{err}");
+        // A pre-split level names the initiative that replaced it.
+        let err = tenacity_command("insistent");
+        assert!(err.contains("--initiative decisive"), "{err}");
+    }
+
+    #[test]
+    fn initiative_status_and_list_and_error_are_informative() {
+        use newt_core::initiative::{set_cli_initiative, Initiative};
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        newt_core::initiative::set_initiative_config(Default::default());
+        set_cli_initiative(Initiative::Measured);
+        let status = super::initiative_command("");
+        assert!(status.starts_with("initiative: measured"), "{status}");
+        assert!(
+            status.contains("/psyche initiative <auto|patient|measured|decisive|eager>"),
+            "{status}"
+        );
+        let list = super::initiative_command("list");
+        for label in ["patient", "measured", "decisive", "eager", "auto"] {
+            assert!(list.contains(label), "list missing {label}: {list}");
+        }
+        assert!(list.contains("after 12 read-only"), "rounds shown: {list}");
+        assert!(list.contains("← active"), "{list}");
+        let err = super::initiative_command("banana");
+        assert!(err.contains("unknown initiative"), "{err}");
     }
 
     #[test]
@@ -697,11 +800,12 @@ mod tests {
         // #1665: /psyche cognition|tenacity <level> are the text setters — the
         // same functions the retired top-levels used, reached through /psyche.
         use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+        use newt_core::initiative::{effective_initiative, Initiative};
         use newt_core::role_profile::Cognition;
         use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
+        set_cli_tenacity(Tenacity::Normal);
 
         let msg = super::psyche_command("cognition thoughtful");
         assert!(msg.contains("thoughtful"), "{msg}");
@@ -712,6 +816,9 @@ mod tests {
         let msg = super::psyche_command("tenacity relentless");
         assert!(msg.contains("relentless"), "{msg}");
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
+        let msg = super::psyche_command("initiative eager");
+        assert!(msg.contains("eager"), "{msg}");
+        assert_eq!(effective_initiative(), Initiative::Eager);
         // Bare subcommand = that dial's status view, no mutation.
         let status = super::psyche_command("cognition");
         assert!(status.starts_with("cognition:"), "{status}");
@@ -734,9 +841,6 @@ mod tests {
         // An unknown subcommand explains itself.
         let err = super::psyche_command("banana");
         assert!(err.contains("unknown /psyche subcommand"), "{err}");
-
-        set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
     }
 
     /// #1668: the dial setters mark a posture ACTION on exactly the axis they
@@ -746,6 +850,7 @@ mod tests {
     #[test]
     fn psyche_setters_mark_exactly_the_axis_they_change() {
         use newt_core::cognition::CognitionOverride;
+        use newt_core::initiative::Initiative;
         use newt_core::role_profile::Cognition;
         use newt_core::runtime::drain_preference_actions;
         use newt_core::tenacity::Tenacity;
@@ -762,6 +867,9 @@ mod tests {
             "tenacity",
             "tenacity list",
             "tenacity nonsense",
+            "initiative",
+            "initiative list",
+            "initiative relaxed",
             "banana",
             "edit",
         ] {
@@ -786,6 +894,11 @@ mod tests {
         assert_eq!(a.tenacity, Some(Some(Tenacity::Relentless)));
         assert_eq!(a.cognition, None);
 
+        let _ = super::psyche_command("initiative decisive");
+        let a = drain_preference_actions();
+        assert_eq!(a.initiative, Some(Some(Initiative::Decisive)));
+        assert_eq!((a.cognition, a.tenacity), (None, None));
+
         // `off` and `auto` are actions too — `auto` UNPINS the axis.
         let _ = super::psyche_command("cognition off");
         assert_eq!(
@@ -800,10 +913,15 @@ mod tests {
         let _ = super::psyche_command("tenacity auto");
         assert_eq!(drain_preference_actions().tenacity, Some(None));
 
-        // `obsessive` sets BOTH live dials, so it pins both.
+        let _ = super::psyche_command("initiative auto");
+        assert_eq!(drain_preference_actions().initiative, Some(None));
+
+        // `obsessive` sets its two dials, so it pins both — and never
+        // initiative, which it leaves alone.
         let _ = super::psyche_command("obsessive");
         let a = drain_preference_actions();
         assert!(a.cognition.is_some() && a.tenacity.is_some(), "{a:?}");
+        assert_eq!(a.initiative, None, "obsessive does not pin initiative");
         assert_eq!((a.backend, a.model), (None, None), "crew/backend untouched");
     }
 
@@ -830,7 +948,7 @@ mod tests {
         use newt_core::tenacity::{cli_tenacity, set_cli_tenacity, Tenacity};
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
+        set_cli_tenacity(Tenacity::Normal);
 
         super::dispatch(
             "tenacity",
@@ -843,7 +961,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cli_tenacity(),
-            Some(Tenacity::Standard),
+            Some(Tenacity::Normal),
             "retired /tenacity must not mutate the override"
         );
         super::dispatch(
@@ -860,8 +978,6 @@ mod tests {
             CognitionOverride::Unset,
             "retired /cognition must not mutate the override"
         );
-
-        set_cli_tenacity(Tenacity::Standard);
     }
 
     #[test]
@@ -883,7 +999,7 @@ mod tests {
             "/tenacity auto clears the session override"
         );
         // `inherit` / `reset` are aliases for the same clear.
-        set_cli_tenacity(Tenacity::Insistent);
+        set_cli_tenacity(Tenacity::Relentless);
         tenacity_command("reset");
         assert_eq!(newt_core::tenacity::cli_tenacity(), None);
         // Restore so the process-global doesn't leak into sibling tests.

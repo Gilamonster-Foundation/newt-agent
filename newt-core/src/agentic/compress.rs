@@ -124,10 +124,10 @@ pub(crate) fn is_compaction_message(m: &Value) -> bool {
 /// after the operator approves a plan. It is the prose's **coordinate**:
 /// the marker names its source (`newt_tui::chat::plan_approval_seed_text`,
 /// which composes it from the approved `render_report` draft plus
-/// `agentic::exit_plan_mode_result`'s tenacity guidance) so a transcript or
+/// `agentic::exit_plan_mode_result`'s initiative guidance) so a transcript or
 /// trace line can be traced back to the code and the knobs that shaped it —
 /// the `[y/N/discuss]` approval answer, `/mode plan` vs an inferred Plan
-/// turn, and the session tenacity level (`--tenacity` / `[tenacity]`).
+/// turn, and the session initiative level (`--initiative` / `[initiative]`).
 ///
 /// Classification: it IS a harness-owned user-role message, so it joins
 /// [`is_compaction_message`] and can never anchor the tail boundary (that

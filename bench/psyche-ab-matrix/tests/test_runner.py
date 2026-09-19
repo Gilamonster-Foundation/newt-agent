@@ -82,7 +82,8 @@ else:
         manifest["mode"] = os.environ["FAKE_MANIFEST_MODE"]
         manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 effective_model = model if endpoint.startswith("http://127.0.0.1:") else os.environ.get("FAKE_EFFECTIVE_MODEL", model)
-tenacity = "relentless" if "--tenacity" in args or "--obsessive" in args else "standard"
+tenacity = "relentless" if "--tenacity" in args or "--obsessive" in args else "normal"
+initiative = option("--initiative", "measured")
 cognition = option("--cognition", "meticulous" if "--obsessive" in args else "default")
 crew = "on" if os.environ.get("NEWT_TEAM") is not None or "--obsessive" in args else "off"
 records = [
@@ -90,10 +91,11 @@ records = [
      "cwd": str(cwd.resolve()), "model": model, "backend_kind": "openai",
      "status": "completed", "tool_calls": 1,
      "write_calls": 1, "usage_total_tokens": 10, "wall_secs": 0.1},
-    {"contract_version": "1", "requested_model": model, "effective_model": effective_model,
+    {"contract_version": "2", "requested_model": model, "effective_model": effective_model,
      "model_digest": digest, "outcome": "completed", "backend": {"name": backend, "kind": "openai"},
      "agent": "newt-agent", "agent_version": "0.7.6",
      "effective_config": {"context_window": context, "tenacity": tenacity,
+                          "initiative": initiative,
                           "cognition": cognition, "crew": crew,
                           "ocap": "on" if "--confined" in args else "off", "max_rounds": rounds},
      "timing": {"wall_ms": 100}},
