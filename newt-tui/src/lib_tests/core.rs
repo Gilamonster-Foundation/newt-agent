@@ -569,7 +569,7 @@ fn tool_round_limit_override_resolves_and_reports() {
     );
     assert!(!plain.is_escalated());
 
-    let standard = effective_tool_round_limit(25, Some(Tenacity::Standard), None);
+    let standard = effective_tool_round_limit(25, Some(Tenacity::Normal), None);
     assert_eq!(
         (standard.rounds, standard.source),
         (25, ToolRoundLimitSource::Config),
@@ -587,7 +587,7 @@ fn tool_round_limit_override_resolves_and_reports() {
         "an explicitly selected relentless posture should not hit the ordinary safety cap"
     );
     assert!(relentless.is_escalated());
-    assert_eq!(relentless.tenacity, Some(Tenacity::Relentless));
+    assert_eq!(relentless.tenacity, Some(Tenacity::Relentless.into()));
 
     let overridden = effective_tool_round_limit(25, Some(Tenacity::Relentless), Some(7));
     assert_eq!(
@@ -1412,6 +1412,13 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
         tenacity_page.contains("/psyche tenacity"),
         "{tenacity_page}"
     );
+    let initiative_page = command_help_page("initiative").expect("initiative help page");
+    for level in newt_core::Initiative::all() {
+        assert!(
+            initiative_page.contains(level.label()),
+            "the page lists every level from Initiative::all(): {initiative_page}"
+        );
+    }
     let cognition_page = command_help_page("cognition").expect("cognition redirect page");
     assert!(
         cognition_page.contains("/psyche cognition"),
@@ -1667,16 +1674,15 @@ fn retired_dials_through_the_real_router_mutate_nothing() {
     use newt_core::tenacity::{cli_tenacity, set_cli_tenacity, Tenacity};
     let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
     set_cli_cognition(CognitionOverride::Unset);
-    set_cli_tenacity(Tenacity::Standard);
+    set_cli_tenacity(Tenacity::Normal);
     assert!(dispatch_slash("/tenacity relentless", "/ws", false, false, false).unwrap());
     assert!(dispatch_slash("/cognition meticulous", "/ws", false, false, false).unwrap());
-    assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
+    assert_eq!(cli_tenacity(), Some(Tenacity::Normal));
     assert_eq!(cli_cognition(), CognitionOverride::Unset);
     // And the surviving /psyche text setters DO mutate through the router —
     // proving the routing distinction, not just shared inertness.
     assert!(dispatch_slash("/psyche tenacity relentless", "/ws", false, false, false).unwrap());
     assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
-    set_cli_tenacity(Tenacity::Standard);
 }
 
 #[test]

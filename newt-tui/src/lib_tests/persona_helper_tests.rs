@@ -61,7 +61,7 @@ fn named_personality_presets_have_five_traits_without_adding_authority() {
         assert!(profile.role.is_none() && profile.skills.is_none() && profile.altitude.is_none());
         assert!(profile.backend.is_none() && profile.model.is_none() && profile.tier.is_none());
         assert!(
-            profile.cognition.is_none() && profile.tenacity.is_none() && profile.crew.is_none()
+            profile.cognition.is_none() && profile.initiative.is_none() && profile.crew.is_none()
         );
         profiles.push(traits);
     }
@@ -594,6 +594,12 @@ fn shipped_role_templates_parse() {
         let rp = newt_core::RoleProfile::parse(&raw)
             .unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
         assert!(rp.cognition.is_some(), "{name} pins cognition");
+        // Slice 1b: persona tenacity no longer exists, and the parser ignores
+        // an unknown key, so a leftover `tenacity` line would be inert.
+        assert!(
+            !raw.lines().any(|l| l.trim_start().starts_with("tenacity")),
+            "{name} still declares a persona tenacity"
+        );
     }
 }
 

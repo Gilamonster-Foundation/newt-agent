@@ -46,6 +46,52 @@ persona sets its own default via `cognition:`.",
     )
 });
 
+static TENACITY_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let levels: Vec<&str> = newt_core::Tenacity::all()
+        .into_iter()
+        .map(newt_core::Tenacity::label)
+        .collect();
+    format!(
+        "\
+/tenacity — folded into /psyche (#1665)
+
+  /psyche                open the dial panel (TTY); ←/→ dials tenacity
+  /psyche tenacity <level>   set {levels}
+  /psyche tenacity auto      clear the override (back to normal)
+  /psyche tenacity list      list every level
+
+Tenacity is how long the agent pursues the task. `relentless` lifts the
+tool-round limit; an explicit `/rounds` still wins. It is set only
+explicitly (flag, /psyche, a conversation's pin, obsessive), never by a
+persona or config. How soon the agent acts is initiative: /help initiative.",
+        levels = levels.join(" | "),
+    )
+});
+
+static INITIATIVE_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let levels: Vec<&str> = newt_core::Initiative::all()
+        .into_iter()
+        .map(newt_core::Initiative::label)
+        .collect();
+    format!(
+        "\
+/psyche initiative — how much the agent looks before acting
+
+  /psyche                open the dial panel (TTY); ←/→ dials initiative
+  /psyche initiative <level>   set {levels}
+  /psyche initiative auto      clear the override; inherit persona / config / family
+  /psyche initiative list      list every level with its round count
+
+Higher initiative nudges the model to edit after fewer read-only rounds, and
+decisive / eager make exit_plan_mode require a concrete edit. The session
+override wins over the persona's `initiative` and the [initiative] config;
+`auto` (aliases `inherit` / `reset`) releases it. The model family supplies
+the default ([initiative.families]); the rounds per level are
+[initiative.rounds].",
+        levels = levels.join(" | "),
+    )
+});
+
 /// A single-page `--help` for one command — usage, what it does, and a couple of
 /// examples. `None` for an unknown topic. Kept terse on purpose: newt's help is
 /// a one-screen reference (the man-page-style browser is gilamonster's job).
@@ -159,43 +205,35 @@ optional field. Same form as `newt crew --edit`.
 `on` is an alias for `fold`. Reasoning is dimmed and sits above the answer
 either way; TTY only. Persist with [tui] thinking in config."
         }
-        "tenacity" => {
-            "\
-/tenacity — folded into /psyche (#1665)
-
-  /psyche                open the dial panel (TTY); ←/→ dials tenacity
-  /psyche tenacity <level>   set relaxed | standard | insistent | relentless
-  /psyche tenacity auto      clear the override; inherit persona / config / family
-  /psyche tenacity list      list every level, patient → forcing
-
-Higher tenacity forces an edit after fewer read-only rounds and makes
-exit_plan_mode require a concrete edit. The session-scoped override wins over
-the persona declaration and [tenacity] config; `auto` (aliases `inherit` /
-`reset`) releases it. Persist per-family in [tenacity]."
-        }
+        "tenacity" => TENACITY_PAGE.as_str(),
+        "initiative" => INITIATIVE_PAGE.as_str(),
         "cognition" => COGNITION_PAGE.as_str(),
         "psyche" => {
             "\
-/psyche — the agent's effort posture: cognition, tenacity, crew
+/psyche — the agent's effort posture: cognition, tenacity, initiative, crew
 
   /psyche                open the dial panel (TTY): ↑↓ select, ←→ dial,
                          Enter apply, Esc leave (nothing changed → just exits)
                          rows: persona · model (spins the backend's served
                          models, applied via the /model path) · cognition ·
-                         tenacity
+                         tenacity · initiative
   /psyche status         the read-only text view (also what piped/lean gets)
   /psyche cognition <level|off|auto|list>   text setter for the cognition dial
   /psyche tenacity <level|auto|list>        text setter for the tenacity dial
-  /psyche obsessive      engage the max-everything posture's live dials
+  /psyche initiative <level|auto|list>      text setter for the initiative dial
+  /psyche obsessive      engage the max-effort posture's live dials
 
-The three orthogonal psyche dials:
+The orthogonal psyche dials:
   cognition   backend-specific reasoning depth per call
-  tenacity    how hard the loop pushes read → act
+  tenacity    how long it pursues the task (relentless lifts the round limit)
+  initiative  how much it looks before acting (the read → act nudge)
   crew        how many minds work the task    (NEWT_TEAM / newt crew)
 
-obsessive = meticulous + relentless + crew on — newt's 'ultra'. In-session
-/psyche obsessive sets cognition + tenacity live; crew is a launch gate, so
-start with `newt --obsessive` to include the crew this session."
+obsessive = cognition meticulous + tenacity relentless + crew on — newt's
+'ultra'. Initiative is left alone: the deepest thinking and acting after one
+round pull against each other. In-session /psyche obsessive sets cognition +
+tenacity live; crew is a launch gate, so start with `newt --obsessive` to
+include the crew this session."
         }
         "probe" => {
             "\
@@ -789,7 +827,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
-        "  /psyche                  - effort dial panel: cognition, tenacity, persona (Esc exits; /psyche obsessive = max)",
+        "  /psyche                  - effort dial panel: cognition, tenacity, initiative, persona (Esc exits; /psyche obsessive = max)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP manager; session mute (on/off) or durable config (enable/disable)",
         "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",

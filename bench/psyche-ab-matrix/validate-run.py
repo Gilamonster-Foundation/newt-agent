@@ -44,10 +44,19 @@ MODEL_DIGEST_RE = re.compile(
 QUALIFICATION_POSTURES = {"baseline", "tenacity", "crew", "obsessive"}
 QUALIFICATION_OCAPS = {"off", "on"}
 POSTURE_TENACITY = {
-    "baseline": "standard",
+    "baseline": "normal",
     "tenacity": "relentless",
-    "crew": "standard",
+    "crew": "normal",
     "obsessive": "relentless",
+}
+# The `tenacity` posture passes `--initiative eager` beside `--tenacity
+# relentless`, so it keeps the pre-split meaning (nudge after one read-only
+# round). Obsessive leaves initiative alone by design.
+POSTURE_INITIATIVE = {
+    "baseline": "measured",
+    "tenacity": "eager",
+    "crew": "measured",
+    "obsessive": "measured",
 }
 POSTURE_COGNITION = {
     "baseline": "default",
@@ -390,6 +399,7 @@ class RunValidator:
             backend_name,
             max_rounds,
             POSTURE_TENACITY.get(posture),
+            POSTURE_INITIATIVE.get(posture),
             POSTURE_COGNITION.get(posture),
             POSTURE_CREW.get(posture),
             ocap,
@@ -511,9 +521,9 @@ class RunValidator:
             )
             return None
         contract = contracts[0]
-        if contract.get("contract_version") != "1":
+        if contract.get("contract_version") != "2":
             self.error(
-                f"{label}: contract_version={contract.get('contract_version')!r}, expected '1'"
+                f"{label}: contract_version={contract.get('contract_version')!r}, expected '2'"
             )
             return None
         return contract
@@ -528,6 +538,7 @@ class RunValidator:
         backend_name: Any,
         max_rounds: Any,
         tenacity: Any,
+        initiative: Any,
         cognition: Any,
         crew: Any,
         ocap: Any,
@@ -569,6 +580,11 @@ class RunValidator:
             self.error(
                 f"{label}: contract tenacity={effective.get('tenacity')!r}, "
                 f"expected {tenacity!r}"
+            )
+        if initiative is not None and effective.get("initiative") != initiative:
+            self.error(
+                f"{label}: contract initiative={effective.get('initiative')!r}, "
+                f"expected {initiative!r}"
             )
         if cognition is not None and effective.get("cognition") != cognition:
             self.error(
@@ -943,7 +959,8 @@ class RunValidator:
                 model.get("context_window"),
                 backend.get("name"),
                 2,
-                "standard",
+                "normal",
+                "measured",
                 "meticulous",
                 "off",
                 "off",

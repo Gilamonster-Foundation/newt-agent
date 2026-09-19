@@ -193,15 +193,22 @@ impl Respond for ReadThenFinishOnNudge {
     }
 }
 
-/// Grounds the in-process tenacity/unit-loop tests with a real `newt headless`
+/// Grounds the in-process initiative/unit-loop tests with a real `newt headless`
 /// subprocess, an explicitly loaded TOML file, a real temporary workspace, and
 /// the real `list_dir` dispatch. The inference service alone is mocked so the
 /// test can inspect the second request and prove the TYPED card-family
 /// attribution (#1819: an exact catalog card declaring `family = "nemotron"`,
 /// associated through the SelectedModel principal — never a model-name
 /// substring) changed runtime behavior as well as the emitted contract.
+///
+/// The config is deliberately in the PRE-SPLIT shape (`[tenacity]` default
+/// and families): this is the importer's end-to-end regression (slice 1b).
+/// Without the importer on the load path the table is ignored, the family
+/// default never engages, and no nudge fires within two rounds. An explicit
+/// `--config` is not the operator's own config, so it is translated in memory
+/// with a warning and left unchanged on disk.
 #[tokio::test(flavor = "multi_thread")]
-async fn explicit_config_applies_nemotron_tenacity_to_runtime_and_contract() {
+async fn a_pre_split_config_applies_nemotron_initiative_to_runtime_and_contract() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -253,6 +260,7 @@ nemotron = "relentless"
         ),
     )
     .expect("write explicit headless config");
+    let config_before = std::fs::read_to_string(&config_path).expect("read config back");
     std::fs::write(
         &instruction_path,
         "Inspect the workspace, then complete the task.\n",
@@ -274,7 +282,13 @@ nemotron = "relentless"
         .arg(&events_path)
         .args(["--max-rounds", "2"])
         .assert()
-        .success();
+        .success()
+        .stderr(predicates::str::contains("uses old psyche labels"));
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config back"),
+        config_before,
+        "an explicit config is migrated in memory, never rewritten"
+    );
 
     let requests = requests.lock().expect("request capture lock");
     assert!(requests.len() >= 2, "expected at least two chat requests");
@@ -288,7 +302,7 @@ nemotron = "relentless"
         .collect();
     assert!(
         has_one_round_action_nudge(&requests[1]),
-        "relentless must inject its action nudge after the first read-only round: \
+        "eager must inject its action nudge after the first read-only round: \
          {second_user_messages:?}"
     );
     let tool_results: Vec<&str> = second_messages
@@ -318,15 +332,20 @@ nemotron = "relentless"
         1,
         "headless emits exactly one contract record"
     );
-    assert_eq!(contracts[0]["effective_config"]["tenacity"], "relentless");
+    assert_eq!(contracts[0]["contract_version"], "2");
+    assert_eq!(contracts[0]["effective_config"]["initiative"], "eager");
+    assert_eq!(
+        contracts[0]["effective_config"]["tenacity"], "normal",
+        "a family sets initiative, never tenacity"
+    );
 }
 
 /// The anti-substring negative: the SAME nemotron-looking model alias with
-/// NO card gets NO family attribution — the `[tenacity.families]` default
+/// NO card gets NO family attribution — the `[initiative.families]` default
 /// must not engage from the model NAME, so the contract records the
 /// config default.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cardless_nemotron_looking_alias_gets_no_family_tenacity() {
+async fn a_cardless_nemotron_looking_alias_gets_no_family_initiative() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -353,11 +372,11 @@ endpoint = "{}"
 model = "{NEMOTRON_MODEL}"
 kind = "openai"
 
-[tenacity]
-default = "relaxed"
+[initiative]
+default = "patient"
 
-[tenacity.families]
-nemotron = "relentless"
+[initiative.families]
+nemotron = "eager"
 "#,
             server.uri()
         ),
@@ -390,10 +409,11 @@ nemotron = "relentless"
         .find(|record| record.get("contract_version").is_some())
         .expect("headless emits a contract record");
     assert_eq!(
-        contract["effective_config"]["tenacity"], "relaxed",
+        contract["effective_config"]["initiative"], "patient",
         "a model-name alias is a LABEL — with no exact card family, the \
          per-family default must not engage"
     );
+    assert_eq!(contract["effective_config"]["tenacity"], "normal");
 }
 
 /// Grounds the headless crew gate with a real `newt headless` subprocess. The
@@ -443,9 +463,12 @@ bounded_reasoning_continuation = true
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
+    // Slice 1b: obsessive leaves initiative alone, so every case reports
+    // the default `measured` (before the split obsessive's relentless
+    // tenacity also meant nudge-after-one).
     let cases = [
-        ("bare", false, "default", "standard"),
-        ("crew", true, "default", "standard"),
+        ("bare", false, "default", "normal"),
+        ("crew", true, "default", "normal"),
         ("obsessive", true, "meticulous", "relentless"),
     ];
     for (name, crew, cognition, tenacity) in cases {
@@ -501,6 +524,10 @@ bounded_reasoning_continuation = true
             if crew { "on" } else { "off" }
         );
         assert_eq!(contract["effective_config"]["tenacity"], tenacity);
+        assert_eq!(
+            contract["effective_config"]["initiative"], "measured",
+            "{name}: obsessive leaves initiative alone"
+        );
 
         // #2314: the feature receipt agrees with the wire body above in BOTH
         // arms. These runs supply no scratchpad seed and headless builds no

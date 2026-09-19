@@ -26,7 +26,7 @@ Run it:
 
     NEWT_BENCH_BIN=~/bin/newt \\
     NEWT_BENCH_PROFILE=/path/to/bench.toml \\
-    NEWT_BENCH_TENACITY=insistent \\
+    NEWT_BENCH_INITIATIVE=decisive \\
     NEWT_BENCH_OCAP=on \\        # omit / off for the --unsafe-host-exec lane
     NEWT_BENCH_SELF_VERIFY=0 \\  # ablation: the self-verify gate is on by default
     PYTHONPATH=scripts/eval/harbor \\
@@ -61,8 +61,11 @@ _NEWT_PROFILE = os.environ.get("NEWT_BENCH_PROFILE", "")
 # `api_key_file = "/etc/newt/api-key"`. Host-secret: the key stays in a local
 # file (never an env value or a committed literal). Empty = local endpoint, no key.
 _API_KEY_FILE = os.environ.get("NEWT_BENCH_API_KEY_FILE", "")
-# Optional tenacity dial (relaxed|standard|insistent|relentless) and round cap.
+# Optional psyche dials and round cap: initiative (patient|measured|decisive|eager)
+# sets how soon the model is nudged to act; tenacity (normal|relentless) lifts
+# the round cap. Pre-split `insistent` is `NEWT_BENCH_INITIATIVE=decisive` now.
 _TENACITY = os.environ.get("NEWT_BENCH_TENACITY", "")
+_INITIATIVE = os.environ.get("NEWT_BENCH_INITIATIVE", "")
 _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
 # The served model's FULL context window (dgx1 serves qwen3-coder at
 # --ctx-size 65536 as of 2026-07-28; the router's global `-c` is the ctx knob —
@@ -143,6 +146,7 @@ def _container_env_prefix() -> str:
 def _solve_command(workdir: str) -> str:
     """The `newt solve` invocation for one trial, from this module's knobs."""
     tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
+    tenacity += f" --initiative {shlex.quote(_INITIATIVE)}" if _INITIATIVE else ""
     ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
     smart = " --smart-harness --frame-dir /logs/agent/frame" if _SMART.strip() in ("1", "on", "true") else ""
     required = "".join(

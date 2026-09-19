@@ -2367,19 +2367,19 @@ fn record_governed_file_change(
 /// #2424: the `exit_plan_mode` tool result now that exiting is a REQUEST, not
 /// an immediate lift. The turn-end approval hook decides whether the clamp
 /// actually lifts; on approval it delivers [`exit_plan_mode_result`]'s own
-/// mandatory-edit guidance (when the tenacity level requires one) to the
+/// mandatory-edit guidance (when the initiative level requires one) to the
 /// turn that follows, not to this ack.
 const EXIT_PLAN_MODE_REQUESTED: &str = "exit requested. Awaiting operator approval — tool calls \
      remain clamped to Plan reads and the plan ledger until approved. If asked, continue drafting \
      with update_plan / render_report; do not assume approval.";
 
-/// The exit-approved guidance. Under a tenacity level that [`requires an
-/// edit`](crate::tenacity::Tenacity::exit_plan_requires_edit) on plan exit
-/// (Insistent / Relentless), it appends a MANDATORY-EDIT directive so the
-/// model executes the first step instead of sliding back into more reading
-/// (#tenacity / #11). Lower levels leave plan exit advisory. The tenacity
-/// action-forcing loop (#10) then enforces it: a subsequent read-only round
-/// trips the forcing nudge within the level's (small) budget.
+/// The exit-approved guidance. Under an initiative level that [`requires an
+/// edit`](crate::initiative::Initiative::exit_plan_requires_edit) on plan exit
+/// (Decisive / Eager), it appends a MANDATORY-EDIT directive so the model
+/// executes the first step instead of sliding back into more reading (#11).
+/// Lower levels leave plan exit advisory. The initiative action-forcing loop
+/// (#10) then enforces it: a subsequent read-only round trips the forcing
+/// nudge within the level's (small) budget.
 ///
 /// #2424: pre-approval this WAS the `exit_plan_mode` tool's own ack (the
 /// clamp lifted unconditionally). Now that lifting requires operator
@@ -2388,9 +2388,9 @@ const EXIT_PLAN_MODE_REQUESTED: &str = "exit requested. Awaiting operator approv
 /// harness-authored prompt (its own `ModelInputOrigin`, persisted under the
 /// harness-retry provenance class — never disguised as operator input,
 /// invariant 2.4) and this guidance rides inside it.
-pub fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
+pub fn exit_plan_mode_result(initiative: crate::initiative::Initiative) -> String {
     let base = "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.";
-    if tenacity.exit_plan_requires_edit() {
+    if initiative.exit_plan_requires_edit() {
         format!(
             "{base}\n\nThe plan is set — now EXECUTE it. Your NEXT action must be a concrete \
              change (edit_file or write_file) that begins the first step — not another \

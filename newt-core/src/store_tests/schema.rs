@@ -51,6 +51,7 @@ fn preference_pin_round_trips_defaults_empty_and_is_workspace_fenced() {
         model: Some("gpt-5.6-sol".into()),
         cognition: Some("off".into()),
         tenacity: Some(crate::Tenacity::Relentless),
+        initiative: Some(crate::Initiative::Decisive),
     };
     store_a.update_preference_pin(&id, &pin).unwrap();
     assert_eq!(store_a.preference_pin(&id).unwrap(), Some(pin.clone()));
@@ -129,6 +130,117 @@ fn open_rewrites_an_old_pin_cognition_label_on_every_open() {
     assert_eq!(raw_pin(&open(), &old), r#"{"cognition":"rational"}"#);
 }
 
+/// Psyche split (slice 1b), regression: a pin with a pre-split tenacity label
+/// loads as the mapped pin. Before the migration `standard`, `relaxed` and
+/// `insistent` failed the strict decode, which dropped the whole pin, backend
+/// and model included.
+#[test]
+fn open_splits_an_old_pin_tenacity_label_on_every_open() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let open = || ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let (standard, kept, garbled) = {
+        let store = open();
+        let ids: Vec<String> = ["standard", "kept", "garbled"]
+            .iter()
+            .map(|t| store.create(t, None).unwrap())
+            .collect();
+        store
+            .set_raw_preference_pin_for_test(&ids[2], "not json")
+            .unwrap();
+        (ids[0].clone(), ids[1].clone(), ids[2].clone())
+    };
+    // Written after the first open, as a pre-split binary on the same
+    // database would: the every-open step still catches them.
+    {
+        let store = open();
+        store
+            .set_raw_preference_pin_for_test(
+                &standard,
+                r#"{"backend":"sol","tenacity":"standard"}"#,
+            )
+            .unwrap();
+        store
+            .set_raw_preference_pin_for_test(
+                &kept,
+                r#"{"tenacity":"insistent","initiative":"patient"}"#,
+            )
+            .unwrap();
+    }
+
+    let store = open();
+    let pin = store.preference_pin(&standard).unwrap().unwrap();
+    assert_eq!(
+        pin.backend.as_deref(),
+        Some("sol"),
+        "the rest of the pin survives"
+    );
+    assert_eq!(pin.tenacity, Some(crate::Tenacity::Normal));
+    assert_eq!(pin.initiative, Some(crate::Initiative::Measured));
+    let pin = store.preference_pin(&kept).unwrap().unwrap();
+    assert_eq!(
+        (pin.tenacity, pin.initiative),
+        (
+            Some(crate::Tenacity::Normal),
+            Some(crate::Initiative::Patient)
+        ),
+        "an initiative the row already carries wins"
+    );
+    assert!(
+        store.preference_pin(&garbled).is_err(),
+        "left for the strict decode"
+    );
+}
+
+/// Psyche split (slice 1b), regression: an old `relentless` pin also gains
+/// initiative `eager` (the old label nudged after one round), but only on the
+/// first open after the split: `relentless` is a current tenacity label too,
+/// so a pin set after the split must not gain `eager` on every open.
+#[test]
+fn open_gives_an_old_relentless_pin_eager_initiative_once() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let open = || ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let raw = r#"{"tenacity":"relentless"}"#;
+    let (old, with_initiative) = {
+        let store = open();
+        let old = store.create("old relentless", None).unwrap();
+        let with_initiative = store.create("already split", None).unwrap();
+        store.set_raw_preference_pin_for_test(&old, raw).unwrap();
+        store
+            .set_raw_preference_pin_for_test(
+                &with_initiative,
+                r#"{"tenacity":"relentless","initiative":"patient"}"#,
+            )
+            .unwrap();
+        // A database from before the split: the marker was never written.
+        store
+            .lock_conn()
+            .execute("DELETE FROM store_migrations", [])
+            .unwrap();
+        (old, with_initiative)
+    };
+
+    let store = open();
+    let pin = store.preference_pin(&old).unwrap().unwrap();
+    assert_eq!(pin.tenacity, Some(crate::Tenacity::Relentless));
+    assert_eq!(pin.initiative, Some(crate::Initiative::Eager));
+    assert_eq!(
+        store
+            .preference_pin(&with_initiative)
+            .unwrap()
+            .unwrap()
+            .initiative,
+        Some(crate::Initiative::Patient)
+    );
+
+    // After the split, `/psyche tenacity relentless` alone is tenacity only.
+    store.set_raw_preference_pin_for_test(&old, raw).unwrap();
+    drop(store);
+    let pin = open().preference_pin(&old).unwrap().unwrap();
+    assert_eq!(pin.initiative, None, "the once-step does not run again");
+}
+
 /// #1668: posture writes are metadata — they must not tick the §6
 /// activity clock, so pinning posture can never perturb MRU ordering
 /// (same contract as `rename` / `update_scratchpad`).
@@ -157,7 +269,7 @@ fn update_preference_pin_does_not_tick_activity() {
         .update_preference_pin(
             &older,
             &crate::OperatorPreferencePin {
-                tenacity: Some(crate::Tenacity::Relaxed),
+                initiative: Some(crate::Initiative::Patient),
                 ..Default::default()
             },
         )

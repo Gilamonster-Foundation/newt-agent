@@ -22,9 +22,10 @@ An omitted value is unspecified, not an implicit midpoint.
 Every setting remains civil and honest. Agreeableness is not factual agreement,
 and warmth is not flattery. Extraversion does not authorize unsolicited actions.
 Applying edits to only the five personality rows does not change OCAP grants,
-tool restrictions, model routing, cognition, or tenacity. Tenacity governs how
-the agent approaches completing work; personality governs its communication
-style. Selecting or saving a whole persona is a separate operation.
+tool restrictions, model routing, cognition, tenacity, or initiative. Tenacity
+governs how long the agent pursues the work and initiative how much it looks
+before acting; personality governs its communication style. Selecting or saving
+a whole persona is a separate operation.
 
 ## Edit, apply, cancel, save
 
@@ -45,7 +46,10 @@ Starting a new conversation resets the tab's unsaved overrides. Named persona
 files survive restarts; unsaved session edits do not.
 
 Saving with `:w` or `:wq` snapshots the panel's full projected posture, not only
-the edited style axes: personality, cognition, tenacity, backend, and crew.
+the edited style axes: personality, cognition, initiative, backend, and crew.
+Initiative is written only when it was chosen (moved in the panel, or declared
+by the persona); a model-family default is never baked into the file. Tenacity
+is not a persona setting and is not saved.
 Inherited values and existing session overrides can become explicit settings
 in the saved file, even when their rows were untouched. Reselecting that saved
 persona can therefore affect more than communication style; inspect the full

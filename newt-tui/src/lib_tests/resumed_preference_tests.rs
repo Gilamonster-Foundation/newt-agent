@@ -1,5 +1,6 @@
 use super::*;
 use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+use newt_core::initiative::{clear_cli_initiative, cli_initiative, set_cli_initiative, Initiative};
 use newt_core::role_profile::Cognition;
 use newt_core::runtime::{
     cli_preference_axes, mark_backend_pick, mark_cognition_choice, mark_model_pick,
@@ -163,8 +164,9 @@ fn reset_globals() {
     let _ = newt_core::runtime::drain_preference_actions();
     set_cli_cognition(CognitionOverride::Unset);
     clear_cli_tenacity();
+    clear_cli_initiative();
     newt_core::cognition::set_persona_cognition(None);
-    newt_core::tenacity::set_persona_tenacity(None);
+    newt_core::initiative::set_persona_initiative(None);
     // SAFETY: guarded single-threaded test (env restored on drop).
     unsafe {
         std::env::remove_var("NEWT_PROVIDER");
@@ -192,7 +194,7 @@ fn a_persona_routed_session_with_no_operator_action_stays_unpinned() {
     // SAFETY: guarded single-threaded test.
     unsafe { std::env::set_var("NEWT_PROVIDER", "muse") };
     newt_core::cognition::set_persona_cognition(Some(Cognition::Meticulous));
-    newt_core::tenacity::set_persona_tenacity(Some(Tenacity::Relentless));
+    newt_core::initiative::set_persona_initiative(Some(Initiative::Eager));
 
     let mut session = Session::new(&cfg);
     // A bare `/backends` listing marks nothing (commands::model's listing
@@ -407,26 +409,34 @@ fn a_dials_pin_applies_and_an_empty_one_restores_the_baseline() {
             &OperatorPreferencePin {
                 cognition: Some("off".into()),
                 tenacity: Some(Tenacity::Relentless),
+                initiative: Some(Initiative::Eager),
                 ..Default::default()
             },
         )
         .unwrap();
-    // The invocation launched with its own dial (a --tenacity flag).
-    set_cli_tenacity(Tenacity::Insistent);
+    // The invocation launched with its own dials (--tenacity / --initiative).
+    set_cli_tenacity(Tenacity::Normal);
+    set_cli_initiative(Initiative::Decisive);
     let baseline = PreferenceBaseline::snapshot(None, None);
     let mut session = Session::new(&cfg);
 
     session.switch_to(Some(&store), &dialed, &baseline, &cfg);
     assert_eq!(cli_cognition(), CognitionOverride::Off, "'off' round-trips");
     assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+    assert_eq!(cli_initiative(), Some(Initiative::Eager));
     assert!(std::env::var("NEWT_PROVIDER").is_err(), "axis untouched");
 
     session.switch_to(Some(&store), &plain, &baseline, &cfg);
     assert_eq!(cli_cognition(), CognitionOverride::Unset);
     assert_eq!(
         cli_tenacity(),
-        Some(Tenacity::Insistent),
+        Some(Tenacity::Normal),
         "an unpinned axis returns to the INVOCATION baseline"
+    );
+    assert_eq!(
+        cli_initiative(),
+        Some(Initiative::Decisive),
+        "the initiative axis too"
     );
 }
 
@@ -447,6 +457,7 @@ fn a_failed_open_pin_survives_verbatim_in_the_row() {
         model: Some("nemotron-340b".into()),
         cognition: Some("transcending".into()),
         tenacity: Some(Tenacity::Relentless),
+        initiative: Some(Initiative::Patient),
     };
     store.update_preference_pin(&id, &stale).unwrap();
 
@@ -498,7 +509,7 @@ fn this_runs_explicit_flags_beat_the_pin_for_the_whole_invocation() {
     let pin = OperatorPreferencePin {
         backend: Some("other".into()),
         cognition: Some("off".into()),
-        tenacity: Some(Tenacity::Relaxed),
+        initiative: Some(Initiative::Patient),
         ..Default::default()
     };
     store.update_preference_pin(&id, &pin).unwrap();
@@ -520,7 +531,11 @@ fn this_runs_explicit_flags_beat_the_pin_for_the_whole_invocation() {
         CognitionOverride::Set(Cognition::Meticulous),
         "the just-typed flag must beat the stored pin"
     );
-    assert_eq!(cli_tenacity(), Some(Tenacity::Relaxed), "unowned applies");
+    assert_eq!(
+        cli_initiative(),
+        Some(Initiative::Patient),
+        "unowned applies"
+    );
     assert_eq!(
         std::env::var("NEWT_PROVIDER").as_deref(),
         Ok("other"),

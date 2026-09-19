@@ -9,6 +9,34 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — tenacity split into tenacity and initiative (psyche effort dials, slice 1b)
+
+- **Initiative (`patient` / `measured` (default) / `decisive` / `eager`) is
+  the read-before-acting dial**: the read-only rounds before the nudge to
+  edit, and whether `exit_plan_mode` must hand off to an edit
+  (`decisive`/`eager`). It carries the per-model-family default
+  (`[initiative.families]`) and takes `--initiative`, `/psyche initiative`,
+  a persona's `initiative`, and a conversation pin. The rounds are config:
+  `[initiative.rounds]`, built-in 12/3/2/1.
+- **Tenacity is now `normal` (default) / `relentless`**: pursuit only.
+  Explicit `relentless` still lifts the tool-round cap. Persona and config
+  tenacity are gone; tenacity is set only by `--tenacity`, `/psyche tenacity`,
+  a pin, or obsessive. `--tenacity relaxed|standard|insistent` is refused
+  with the `--initiative` level that replaces it.
+- **Behaviour changes.** The bottom level nudges after 12 read-only rounds
+  (old `relaxed`: 6). `--obsessive` and `/psyche obsessive` no longer move
+  initiative, leaving its nudge and plan-exit edit rule unchanged. The bundled
+  `obsessive` persona retains its explicit `eager` initiative. The headless
+  contract is `contract_version: "2"`: `effective_config`
+  gains `initiative`, and `tenacity` reads `normal`/`relentless`.
+- **Existing state migrates.** Persona files and the operator's own config
+  are rewritten once on load (`tenacity` → `initiative`; relaxed → patient,
+  standard → measured, insistent → decisive, relentless → eager; `[tenacity]`
+  default/families → `[initiative]`); project, ambient, `/etc` and explicitly
+  named configs are translated in memory with a warning. Conversation pins
+  are rewritten when the store opens (an old `relentless` pin gains `eager`
+  once). Old settings receipts still decode and verify.
+
 ### Changed — cognition levels renamed (psyche effort dials, slice 1a)
 
 - **Cognition is now `zen` / `rational` / `thoughtful` (default) /

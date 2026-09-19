@@ -97,6 +97,7 @@ pub(crate) enum ValueSpace {
 pub(crate) enum Field {
     EditMode,
     Tenacity,
+    Initiative,
     Cognition,
     Thinking,
     Nudge,
@@ -114,6 +115,7 @@ impl Field {
     pub(crate) const ALL: &'static [Self] = &[
         Self::EditMode,
         Self::Tenacity,
+        Self::Initiative,
         Self::Cognition,
         Self::Thinking,
         Self::Nudge,
@@ -133,6 +135,7 @@ impl Field {
         match self {
             Self::EditMode => "edit-mode",
             Self::Tenacity => "tenacity",
+            Self::Initiative => "initiative",
             Self::Cognition => "cognition",
             Self::Thinking => "thinking",
             Self::Nudge => "nudge",
@@ -150,6 +153,7 @@ impl Field {
         match self {
             Self::EditMode => "line-editor key bindings",
             Self::Tenacity => "tenacity",
+            Self::Initiative => "initiative",
             Self::Cognition => "cognition",
             Self::Thinking => "reasoning display",
             Self::Nudge => "action-pressure nudges",
@@ -166,12 +170,13 @@ impl Field {
     /// The allowed values, as `(value, what it means)`.
     ///
     /// The dial levels and their descriptions come from `Tenacity::all()` /
-    /// `Cognition::all()` — the same lists `/psyche … list` renders. A second
+    /// `Initiative::all()` / `Cognition::all()` — the same lists `/psyche …
+    /// list` renders. A second
     /// hand-written copy here is how the form and the dial would drift apart
     /// the first time a level is added.
     pub(crate) fn value_space(self) -> ValueSpace {
         use newt_core::role_profile::Cognition;
-        use newt_core::Tenacity;
+        use newt_core::{Initiative, Tenacity};
         let owned = |pairs: &[(&'static str, &str)]| -> ValueSpace {
             ValueSpace::Choice(pairs.iter().map(|(v, d)| (*v, (*d).to_string())).collect())
         };
@@ -182,14 +187,23 @@ impl Field {
                 ("nano", "nano-style editing"),
             ]),
             Self::Tenacity => ValueSpace::Choice(
+                std::iter::once(("auto", "normal, unless set explicitly".to_string()))
+                    .chain(
+                        Tenacity::all()
+                            .into_iter()
+                            .map(|t| (t.label(), t.describe())),
+                    )
+                    .collect(),
+            ),
+            Self::Initiative => ValueSpace::Choice(
                 std::iter::once((
                     "auto",
                     "inherit from the persona / config / model family".to_string(),
                 ))
                 .chain(
-                    Tenacity::all()
+                    Initiative::all()
                         .into_iter()
-                        .map(|t| (t.label(), t.describe())),
+                        .map(|i| (i.label(), i.describe())),
                 )
                 .collect(),
             ),
@@ -321,6 +335,7 @@ impl Field {
             // Through the one dial→token mapping, which the typed doors also
             // use to report what they changed.
             Self::Tenacity => tenacity_token(newt_core::tenacity::cli_tenacity()),
+            Self::Initiative => initiative_token(newt_core::initiative::cli_initiative()),
             Self::Cognition => cognition_token(cli_cognition()),
             // Three states now, so this reports the mode rather than
             // collapsing `fold` and `stream` into one "on".
@@ -412,7 +427,7 @@ impl Field {
             // `/edit-mode vim`
             (Self::EditMode, "vim") => "vi",
             // `/psyche tenacity inherit|reset`
-            (Self::Tenacity, "inherit" | "reset") => "auto",
+            (Self::Tenacity | Self::Initiative, "inherit" | "reset") => "auto",
             // `/thinking on` predates the three-way vocabulary and meant
             // "show me the reasoning". It still does; that is now `fold`.
             (Self::Thinking, "on") => "fold",
@@ -563,7 +578,7 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
 fn apply(field: Field, value: &str) -> Result<String, String> {
     use newt_core::cognition::CognitionOverride;
     use newt_core::role_profile::Cognition;
-    use newt_core::Tenacity;
+    use newt_core::{Initiative, Tenacity};
 
     let Some(value) = field.accepts(value) else {
         return Err(format!(
@@ -582,6 +597,7 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // token and hand it to the SAME writer the typed door uses, so the two
         // routes cannot drift in what they set or what they pin.
         Field::Tenacity => write_tenacity(value.parse::<Tenacity>().ok()),
+        Field::Initiative => write_initiative(value.parse::<Initiative>().ok()),
         Field::Cognition => write_cognition(match value {
             "auto" => CognitionOverride::Unset,
             "off" => CognitionOverride::Off,
@@ -826,8 +842,32 @@ fn journalled_tenacity(
     .unwrap_or_else(|never| (never, None))
 }
 
+/// The typed door for initiative. `None` releases the override — `auto`.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn apply_initiative(level: Option<newt_core::Initiative>, via: &str) -> String {
+    journalled_initiative(level, via).0
+}
+
+/// [`apply_initiative`], also handing back the change it journalled — see
+/// [`journalled_cognition`] for why that is returned rather than inferred.
+#[cfg(feature = "rich-tui")]
+fn journalled_initiative(
+    level: Option<newt_core::Initiative>,
+    via: &str,
+) -> (String, Option<SettingChange>) {
+    recorded(Field::Initiative, via, || {
+        write_initiative(level);
+        Ok(format!(
+            "{}: {}",
+            Field::Initiative.label(),
+            Field::Initiative.current()
+        ))
+    })
+    .unwrap_or_else(|never| (never, None))
+}
+
 /// Apply only to the caller's active tab. Style cannot mark cognition,
-/// tenacity, model preferences or change capability-bearing persona metadata.
+/// tenacity, initiative, model preferences or change capability-bearing persona metadata.
 #[cfg(feature = "rich-tui")]
 pub(crate) fn apply_personality(
     current: &mut newt_core::role_profile::PersonalityTraits,
@@ -867,6 +907,14 @@ fn write_tenacity(level: Option<newt_core::Tenacity>) {
     newt_core::runtime::mark_tenacity_choice(level);
 }
 
+fn write_initiative(level: Option<newt_core::Initiative>) {
+    match level {
+        Some(level) => newt_core::initiative::set_cli_initiative(level),
+        None => newt_core::initiative::clear_cli_initiative(),
+    }
+    newt_core::runtime::mark_initiative_choice(level);
+}
+
 /// The vocabulary token for a dial position — the same string the menu offers
 /// and `accepts` takes.
 ///
@@ -884,6 +932,10 @@ fn cognition_token(choice: newt_core::cognition::CognitionOverride) -> String {
 }
 
 fn tenacity_token(level: Option<newt_core::Tenacity>) -> String {
+    level.map_or_else(|| "auto".to_string(), |l| l.label().to_string())
+}
+
+fn initiative_token(level: Option<newt_core::Initiative>) -> String {
     level.map_or_else(|| "auto".to_string(), |l| l.label().to_string())
 }
 
@@ -1161,7 +1213,8 @@ mod tests {
         let _g = settings_guard();
         for (field, value) in [
             (Field::EditMode, "nano"),
-            (Field::Tenacity, "insistent"),
+            (Field::Tenacity, "relentless"),
+            (Field::Initiative, "decisive"),
             (Field::Cognition, "thoughtful"),
             (Field::Thinking, "off"),
             (Field::Nudge, "off"),
@@ -1173,6 +1226,7 @@ mod tests {
         // not manage.
         for (field, value) in [
             (Field::Tenacity, "auto"),
+            (Field::Initiative, "auto"),
             (Field::Cognition, "auto"),
             (Field::Thinking, "fold"),
             (Field::Nudge, "on"),
@@ -1195,6 +1249,12 @@ mod tests {
         }
         assert!(offered.contains(&"auto"), "the release value is missing");
         assert_eq!(offered.len(), newt_core::Tenacity::all().len() + 1);
+
+        let offered = Field::Initiative.offered();
+        for level in newt_core::Initiative::all() {
+            assert!(offered.contains(&level.label()), "{level:?} not offered");
+        }
+        assert_eq!(offered.len(), newt_core::Initiative::all().len() + 1);
 
         let offered = Field::Cognition.offered();
         for level in newt_core::role_profile::Cognition::all() {
@@ -1595,6 +1655,8 @@ mod tests {
             (Field::EditMode, "vim", "vi"),
             (Field::Tenacity, "inherit", "auto"),
             (Field::Tenacity, "reset", "auto"),
+            (Field::Initiative, "inherit", "auto"),
+            (Field::Initiative, "reset", "auto"),
             (Field::Cognition, "none", "off"),
             (Field::Cognition, "reset", "auto"),
             (Field::Cognition, "persona", "auto"),
@@ -1608,6 +1670,7 @@ mod tests {
         }
         // Anti-vacuous: `accepts` is not "yes to everything".
         assert_eq!(Field::Tenacity.accepts("obsessive"), None);
+        assert_eq!(Field::Initiative.accepts("relentless"), None);
         assert_eq!(Field::Cognition.accepts("hard"), None);
         assert_eq!(Field::Thinking.accepts("maybe"), None);
     }
@@ -1617,10 +1680,13 @@ mod tests {
     #[test]
     fn a_refused_dial_value_changes_nothing() {
         let _g = settings_guard();
-        apply(Field::Tenacity, "insistent").expect("a level applies");
+        apply(Field::Tenacity, "relentless").expect("a level applies");
         let err = apply(Field::Tenacity, "obsessive").expect_err("not a level");
         assert!(err.contains("relentless"), "{err}");
-        assert_eq!(Field::Tenacity.current(), "insistent", "a refusal wrote");
+        assert_eq!(Field::Tenacity.current(), "relentless", "a refusal wrote");
+        // A pre-split level is not a tenacity level any more.
+        assert!(apply(Field::Tenacity, "insistent").is_err());
+        assert_eq!(Field::Tenacity.current(), "relentless", "a refusal wrote");
     }
 
     /// **The receipt destination is read from the registry, not assumed.**
@@ -1870,6 +1936,16 @@ mod tests {
                 "tenacity dial position {level:?} renders {token:?}, which the form refuses"
             );
         }
+
+        let mut initiative: Vec<Option<newt_core::Initiative>> = vec![None];
+        initiative.extend(newt_core::Initiative::all().iter().copied().map(Some));
+        for level in initiative {
+            let token = initiative_token(level);
+            assert!(
+                Field::Initiative.accepts(&token).is_some(),
+                "initiative dial position {level:?} renders {token:?}, which the form refuses"
+            );
+        }
     }
 
     /// **The receipt names the setting the door was asked to change, and the
@@ -1909,13 +1985,24 @@ mod tests {
         assert_eq!(change.from.to_string(), "off");
         assert_eq!(change.to.to_string(), Cognition::all()[0].label());
 
-        apply(Field::Tenacity, "standard").expect("arrange");
+        apply(Field::Tenacity, "normal").expect("arrange");
         let (_, change) = journalled_tenacity(None, "/psyche");
         let change = change.expect("tenacity declares a journal destination");
         assert_eq!(change.setting, "tenacity");
         assert_eq!(change.via, "/psyche");
-        assert_eq!(change.from.to_string(), "standard");
+        assert_eq!(change.from.to_string(), "normal");
         assert_eq!(change.to.to_string(), "auto", "None releases the override");
+
+        apply(Field::Initiative, "patient").expect("arrange");
+        let (_, change) = journalled_initiative(Some(newt_core::Initiative::Eager), "/psyche");
+        let change = change.expect("initiative declares a journal destination");
+        assert_eq!(
+            change.setting, "initiative",
+            "the door journals ITS setting"
+        );
+        assert_eq!(change.via, "/psyche");
+        assert_eq!(change.from.to_string(), "patient");
+        assert_eq!(change.to.to_string(), "eager");
     }
 
     /// **The two doors apply the same thing.**
@@ -1971,14 +2058,37 @@ mod tests {
         );
         for (level, token) in tenacity {
             let token = token.as_str();
-            apply(Field::Tenacity, "standard").expect("arrange");
+            apply(Field::Tenacity, "normal").expect("arrange");
             let typed = apply_tenacity(level, "/psyche");
             let after_typed = Field::Tenacity.current();
 
-            apply(Field::Tenacity, "standard").expect("arrange");
+            apply(Field::Tenacity, "normal").expect("arrange");
             let by_token =
                 apply_and_record(Field::Tenacity, token, "/settings").expect("offered token");
             assert_eq!(Field::Tenacity.current(), after_typed, "same runtime state");
+            assert_eq!(typed, by_token, "same reported change");
+        }
+
+        let mut initiative = vec![(None, "auto".to_string())];
+        initiative.extend(
+            newt_core::Initiative::all()
+                .iter()
+                .map(|i| (Some(*i), i.label().to_string())),
+        );
+        for (level, token) in initiative {
+            let token = token.as_str();
+            apply(Field::Initiative, "measured").expect("arrange");
+            let typed = apply_initiative(level, "/psyche");
+            let after_typed = Field::Initiative.current();
+
+            apply(Field::Initiative, "measured").expect("arrange");
+            let by_token =
+                apply_and_record(Field::Initiative, token, "/settings").expect("offered token");
+            assert_eq!(
+                Field::Initiative.current(),
+                after_typed,
+                "same runtime state"
+            );
             assert_eq!(typed, by_token, "same reported change");
         }
     }
@@ -2001,6 +2111,7 @@ mod tests {
         let _ = newt_core::runtime::drain_preference_actions();
         let before_cognition = newt_core::cognition::cli_cognition();
         let before_tenacity = newt_core::tenacity::cli_tenacity();
+        let before_initiative = newt_core::initiative::cli_initiative();
         let mut current = PersonalityTraits::default();
         let next = PersonalityTraits {
             warmth: Some(PersonalityLevel::try_from(0).unwrap()),
@@ -2024,6 +2135,7 @@ mod tests {
         assert_eq!(current, PersonalityTraits::default());
         assert_eq!(newt_core::cognition::cli_cognition(), before_cognition);
         assert_eq!(newt_core::tenacity::cli_tenacity(), before_tenacity);
+        assert_eq!(newt_core::initiative::cli_initiative(), before_initiative);
         assert!(newt_core::runtime::drain_preference_actions().is_empty());
     }
 }

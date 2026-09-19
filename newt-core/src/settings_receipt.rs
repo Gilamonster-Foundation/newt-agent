@@ -361,7 +361,7 @@ mod tests {
             rounds,
             source,
             configured,
-            tenacity: Some(crate::Tenacity::Relentless),
+            tenacity: Some(crate::Tenacity::Relentless.into()),
         }
     }
 
@@ -412,7 +412,7 @@ mod tests {
         // Which input won: an override the operator typed, or a tenacity level.
         let source = vary(&|l| l.source = FromTenacity);
         // The level in play when it happened.
-        let level = vary(&|l| l.tenacity = Some(crate::Tenacity::Standard));
+        let level = vary(&|l| l.tenacity = Some(crate::Tenacity::Normal.into()));
         // …and the number itself, obviously.
         let number = vary(&|l| l.rounds = 321);
 
@@ -561,6 +561,12 @@ mod tests {
                 serde_json::json!({"rounds":320,"source":"override","configured":40,"tenacity":"relentless"}),
                 "/rounds",
             ),
+            (
+                "rounds",
+                serde_json::json!({"rounds":40,"source":"config","configured":40,"tenacity":"relaxed"}),
+                serde_json::json!({"rounds":320,"source":"override","configured":40,"tenacity":"relaxed"}),
+                "/rounds",
+            ),
         ];
         for (setting, from, to, via) in fixtures {
             let wire = serde_json::json!({
@@ -586,6 +592,26 @@ mod tests {
                 vec![receipt.clone()]
             );
             assert!(receipt.is_intact());
+        }
+    }
+
+    /// Regression (slice 1b): receipt lines minted by the pre-split binary
+    /// (captured from it, ids included) still decode and still verify. Before
+    /// `RecordedTenacity`, removing the old tenacity variants made
+    /// `read_jsonl` drop the `insistent`/`standard` lines, and a decoding
+    /// alias would have re-encoded them to new bytes: shown as TAMPERED.
+    #[test]
+    fn a_pre_split_rounds_receipt_still_decodes_and_is_intact() {
+        let journal = [
+            r#"{"id":"bafyr4iaj2g7fq3w6jcbijhwo2pkawxjtlas4mwpizdxi32qeumsuvmdjae","change":{"schema":"newt.setting-change/v1","setting":"rounds","from":{"rounds":40,"source":"config","configured":40,"tenacity":"insistent"},"to":{"rounds":320,"source":"override","configured":40,"tenacity":"insistent"},"via":"/rounds","ts_claim":"2026-09-01T12:00:00+00:00"}}"#,
+            r#"{"id":"bafyr4ida5pdlxit3d4m3hleowirh4mued7vksgycum2x2lik2scoc6a65q","change":{"schema":"newt.setting-change/v1","setting":"rounds","from":{"rounds":40,"source":"config","configured":40,"tenacity":"standard"},"to":{"rounds":320,"source":"override","configured":40,"tenacity":"standard"},"via":"/rounds","ts_claim":"2026-09-01T12:00:00+00:00"}}"#,
+            r#"{"id":"bafyr4if7jhgfnqb4fwxc7w3ymt74y2fjwxp4ehbh2qq2zkwiisz54m7yem","change":{"schema":"newt.setting-change/v1","setting":"rounds","from":{"rounds":40,"source":"config","configured":40,"tenacity":"relentless"},"to":{"rounds":320,"source":"override","configured":40,"tenacity":"relentless"},"via":"/rounds","ts_claim":"2026-09-01T12:00:00+00:00"}}"#,
+        ];
+        let read = read_jsonl(&journal.join("\n"));
+        assert_eq!(read.len(), 3, "no pre-split line is dropped");
+        for (receipt, line) in read.iter().zip(journal) {
+            assert!(receipt.is_intact(), "re-derives its own id: {line}");
+            assert_eq!(receipt.render_line().unwrap(), line, "byte-for-byte");
         }
     }
 

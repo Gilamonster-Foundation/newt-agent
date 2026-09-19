@@ -177,7 +177,10 @@ use fts::create_fts_index;
 pub use fts::sanitize_fts5_query;
 
 mod legacy_import;
-use legacy_import::{import_legacy_json, migrate_pin_cognition_labels, migrate_workspace_key};
+use legacy_import::{
+    import_legacy_json, migrate_pin_cognition_labels, migrate_pin_tenacity_split,
+    migrate_workspace_key,
+};
 
 mod liveness;
 pub(crate) use liveness::pid_is_alive;
@@ -318,6 +321,7 @@ impl ConversationStore {
         // THIS workspace's rows from the retired UUIDv5 derivation to v2.
         migrate_workspace_key(&conn, &workspace, &workspace_id)?;
         migrate_pin_cognition_labels(&conn)?;
+        migrate_pin_tenacity_split(&conn)?;
 
         let (host, boot_id) = current_host_boot();
         Ok(Self {
@@ -1663,7 +1667,7 @@ impl ConversationStore {
     /// Persist a conversation's operator preference pin (#1668) — the
     /// [`crate::OperatorPreferencePin`] is serialized to JSON and written to the
     /// conversation row's `preference_pin` column so resuming the conversation
-    /// can re-apply the operator's pinned backend/model/cognition/tenacity.
+    /// can re-apply the operator's pinned backend/model/cognition/tenacity/initiative.
     ///
     /// Like [`update_scratchpad`](Self::update_scratchpad) /
     /// [`update_plan_snapshot`](Self::update_plan_snapshot) this is metadata,

@@ -164,16 +164,24 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = ["doer", "coach", "advise"])]
     pub altitude: Option<String>,
 
-    /// Tenacity (#tenacity): how hard the harness pushes the model from reading
-    /// to ACTING — `relaxed` | `standard` | `insistent` | `relentless`. Higher
-    /// forces an edit sooner (nudge after 6/3/2/1 read-only rounds) and makes
-    /// plan-mode exit hand off to a mandatory edit. Default `standard`
-    /// (behaviour-preserving). Small models that over-explore benefit from
-    /// `insistent`/`relentless`. In interactive code sessions and `headless`,
-    /// explicit `relentless` also makes the default tool-round budget effectively
-    /// unlimited; an explicit round limit wins.
+    /// Tenacity (#psyche): how long the agent pursues the task — `normal` |
+    /// `relentless`. Default `normal`. In interactive code sessions and
+    /// `headless`, `relentless` makes the default tool-round budget effectively
+    /// unlimited; an explicit round limit wins. The pre-split levels
+    /// (`relaxed` / `standard` / `insistent`) are refused with their
+    /// `--initiative` replacement.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
     pub tenacity: Option<newt_core::Tenacity>,
+
+    /// Initiative (#psyche): how much the agent looks before acting —
+    /// `patient` | `measured` | `decisive` | `eager`. Higher nudges the model to
+    /// edit after fewer read-only rounds (12/3/2/1 by default, from
+    /// `[initiative.rounds]`), and `decisive`/`eager` make plan-mode exit hand
+    /// off to a mandatory edit. Unset ⇒ the persona's, else the model family's
+    /// `[initiative.families]` default, else `[initiative] default`, else
+    /// `measured`.
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_initiative)]
+    pub initiative: Option<newt_core::Initiative>,
 
     /// Cognition (#psyche): how much reasoning to spend per call —
     /// `zen` | `rational` | `thoughtful` | `meticulous`, mapping to the
@@ -184,15 +192,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_cognition)]
     pub cognition: Option<newt_core::role_profile::Cognition>,
 
-    /// Obsessive (#psyche): the max-everything posture — newt's "ultra". A named
+    /// Obsessive (#psyche): the max-effort posture — newt's "ultra". A named
     /// launch act that moves three orthogonal dials at once: cognition to
-    /// `meticulous` (deepest reasoning.effort), tenacity to `relentless` (most
-    /// forcing), and the crew ON (as if `NEWT_TEAM` were set). For interactive
-    /// code sessions and `headless`, Relentless makes the default round budget
-    /// effectively unlimited. An explicit
-    /// `--tenacity` alongside still wins. In-session, `/psyche obsessive` engages
-    /// the two live dials; crew needs a launch with this flag. Alias
-    /// `--obsessive-relentless` names the tenacity axis explicitly.
+    /// `meticulous` (deepest reasoning.effort), tenacity to `relentless`, and
+    /// the crew ON (as if `NEWT_TEAM` were set). For interactive code sessions
+    /// and `headless`, Relentless makes the default round budget effectively
+    /// unlimited. Initiative is left alone (`--initiative` is independent). An
+    /// explicit `--tenacity` alongside still wins. In-session, `/psyche
+    /// obsessive` engages the two live dials; crew needs a launch with this
+    /// flag. Alias `--obsessive-relentless` names the tenacity axis explicitly.
     #[arg(
         long,
         visible_alias = "obsessive-relentless",
@@ -563,6 +571,10 @@ fn parse_tier(s: &str) -> Result<newt_core::Tier, String> {
 }
 
 fn parse_tenacity(s: &str) -> Result<newt_core::Tenacity, String> {
+    s.parse()
+}
+
+fn parse_initiative(s: &str) -> Result<newt_core::Initiative, String> {
     s.parse()
 }
 
@@ -1247,8 +1259,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // #psyche `--obsessive`: the max-everything launch posture (newt's "ultra").
     // Applied BEFORE the explicit `--tenacity` below so a simultaneous
     // `--tenacity <level>` still wins. Engages the two LIVE dials via the single
-    // posture owner; crew is a startup gate, so we also set `NEWT_TEAM` here —
-    // the same var the crew-runner build below reads — for full effect.
+    // posture owner and leaves initiative alone (`--initiative` is independent);
+    // crew is a startup gate, so we also set `NEWT_TEAM` here — the same var the
+    // crew-runner build below reads — for full effect.
     if cli.obsessive {
         let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
         // #1668: both dials were set explicitly this run — a stored pin must
@@ -1267,13 +1280,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // CLI `--tenacity`: install the process-global action-forcing level the
-    // agentic loop reads when it builds each turn's WorkflowRuntimeState.
+    // CLI `--tenacity`: the explicit pursuit level (tenacity's only input);
+    // explicit `relentless` lifts the default tool-round budget.
     if let Some(level) = cli.tenacity {
         newt_core::tenacity::set_cli_tenacity(level);
         // #1668: explicit this run — beats a resumed conversation's pin.
         newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
             tenacity: true,
+            ..Default::default()
+        });
+    }
+
+    // CLI `--initiative`: install the process-global read-before-acting level
+    // the agentic loop reads when it builds each turn's WorkflowRuntimeState.
+    if let Some(level) = cli.initiative {
+        newt_core::initiative::set_cli_initiative(level);
+        // #1668: explicit this run — beats a resumed conversation's pin.
+        newt_core::runtime::record_cli_preference_axes(newt_core::PreferenceAxes {
+            initiative: true,
             ..Default::default()
         });
     }
@@ -2220,6 +2244,29 @@ mod tests {
             err.contains("cognition 'contemplating' was renamed to 'meticulous'"),
             "{err}"
         );
+    }
+
+    /// Regression (slice 1b): `--tenacity insistent` used to parse. The
+    /// pre-split levels are now refused with the `--initiative` flag that
+    /// replaces them, and `--initiative` takes the new levels.
+    #[test]
+    fn tenacity_flag_refuses_a_pre_split_level_with_its_initiative_replacement() {
+        for (old, new) in [
+            ("relaxed", "patient"),
+            ("standard", "measured"),
+            ("insistent", "decisive"),
+        ] {
+            let err = Cli::try_parse_from(["newt", "--tenacity", old])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("--initiative {new}")), "{err}");
+        }
+        let cli =
+            Cli::try_parse_from(["newt", "--tenacity", "relentless", "--initiative", "eager"])
+                .unwrap();
+        assert_eq!(cli.tenacity, Some(newt_core::Tenacity::Relentless));
+        assert_eq!(cli.initiative, Some(newt_core::Initiative::Eager));
+        assert!(Cli::try_parse_from(["newt", "--initiative", "insistent"]).is_err());
     }
 
     #[test]

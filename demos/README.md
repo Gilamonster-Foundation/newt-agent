@@ -64,10 +64,10 @@ Read more: [setup and backend configuration](../docs/guide/setup.md).
 
 ## Psyche and personas
 
-Open `/psyche` to preview a persona and its cognition and tenacity dials. Cancel
-the draft and check that the active values are unchanged. Reopen, edit, and
-save under a disposable name using `:w <name>`; saving a persona file does not
-by itself apply the draft. `:wq <name>` saves and applies. An existing name is
+Open `/psyche` to preview a persona and its cognition, tenacity, and initiative
+dials. Cancel the draft and check that the active values are unchanged. Reopen,
+edit, and save under a disposable name using `:w <name>`; saving a persona file
+does not by itself apply the draft. `:wq <name>` saves and applies. An existing name is
 refused unless overwrite is explicitly requested.
 
 List saved choices with `/persona list`. Select a saved persona with
@@ -78,8 +78,9 @@ display name.
 Use newly named disposable personas in this save walkthrough. After saving,
 reload the file and check the persona's prose, tool list, skills, and caveats
 as well as the full projected posture. `:w` and `:wq` snapshot personality,
-cognition, tenacity, backend, and crew, including inherited values and existing
-session overrides even when those rows were untouched. The saver preserves
+cognition, initiative, backend, and crew, including inherited values and existing
+session overrides even when those rows were untouched (initiative only when
+chosen, never a model-family default). The saver preserves
 other parsed metadata and prose, not the original TOML comments or formatting.
 An unavailable persona refuses saving instead of replacing a profile whose
 restrictions are unknown.

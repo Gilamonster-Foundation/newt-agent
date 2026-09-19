@@ -1,7 +1,7 @@
 +++
 role      = "obsessive"
 cognition = "meticulous"
-tenacity  = "relentless"
+initiative = "eager"
 crew      = true
 +++
 

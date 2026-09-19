@@ -2,7 +2,7 @@
 role      = "researcher"
 backend   = "sol"
 cognition = "meticulous"
-tenacity  = "relentless"
+initiative = "eager"
 crew      = false
 tools     = ["read_file", "list_dir", "find", "web_fetch", "use_skill"]
 altitude  = "doer"
