@@ -746,6 +746,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Journal,
         Surface::Retired("/settings cognition"),
     ),
+    cmd_on(
+        // Split from tenacity (psyche slice 1b). Never a top-level verb: it
+        // is a `/settings` field and a `/psyche initiative` subcommand, so it
+        // is a field row — see `Surface::Native`.
+        "initiative",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
     cmd(
         "psyche",
         &[],

@@ -1,10 +1,10 @@
 //! The cognition **session dial** — the operator's live `/cognition` override,
 //! layered over the active persona's `cognition:` front-matter.
 //!
-//! This is the cognition analogue of [`crate::tenacity`]'s override, kept as a
-//! separate, deliberately tiny module because the two psyche dials act in
-//! different places: **tenacity steers the harness LOOP** (nudge timing, read at
-//! decision points via [`crate::tenacity::effective_tenacity`]), while
+//! This is the cognition analogue of [`crate::initiative`]'s override, kept as a
+//! separate, deliberately tiny module because the psyche dials act in
+//! different places: **initiative steers the harness LOOP** (nudge timing, read at
+//! decision points via [`crate::initiative::effective_initiative`]), while
 //! **cognition rides the wire REQUEST** (projected to `reasoning.effort` at the
 //! Responses `build_body` via `agentic::responses_reasoning_field`). So cognition
 //! resolves to a value carried on `ChatCtx.cognition`, not read from a global at
@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 /// A session `/cognition` override, layered over the persona's `cognition:`.
 ///
-/// Three states because, unlike tenacity, cognition can be genuinely *absent*
+/// Three states because, unlike the other dials, cognition can be genuinely *absent*
 /// (no `reasoning.effort` field at all): the operator must be able to force it
 /// off even when a persona sets a level, and to step back to following the
 /// persona.
@@ -33,12 +33,12 @@ pub enum CognitionOverride {
 }
 
 // The operator dial can't be threaded through every ChatCtx construction site,
-// so — exactly like `tenacity`'s `CLI_TENACITY` — it is stashed process-global
+// so — exactly like `initiative`'s `CLI_INITIATIVE` — it is stashed process-global
 // and combined lazily by [`effective_cognition`] with the persona layer below.
 static CLI_COGNITION: Mutex<CognitionOverride> = Mutex::new(CognitionOverride::Unset);
 // The active persona's declared `cognition:` — the layer BELOW the `/cognition`
-// override, set when a persona activates (symmetric with `tenacity`'s
-// `PERSONA_TENACITY`). `None` when no persona / the persona declares none. Having
+// override, set when a persona activates (symmetric with `initiative`'s
+// `PERSONA_INITIATIVE`). `None` when no persona / the persona declares none. Having
 // it as a global means status surfaces (`/psyche`, the config panel) can report
 // the EFFECTIVE cognition without threading the persona to every call site.
 static PERSONA_COGNITION: Mutex<Option<Cognition>> = Mutex::new(None);
@@ -59,7 +59,7 @@ pub fn cli_cognition() -> CognitionOverride {
 }
 
 /// Install the active persona's declared `cognition:` (call on persona activation
-/// / clear, alongside `tenacity::set_persona_tenacity`). `None` clears it.
+/// / clear, alongside `initiative::set_persona_initiative`). `None` clears it.
 pub fn set_persona_cognition(level: Option<Cognition>) {
     if let Ok(mut slot) = PERSONA_COGNITION.lock() {
         *slot = level;

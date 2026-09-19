@@ -625,7 +625,10 @@ for posture in "${POSTURE_LIST[@]}"; do
         # from an explicit absence, then enable only the two crew postures.
         env_args=(-u NEWT_TEAM -u NEWT_BENCH_OCAP NEWT_NO_MODEL_PULL=1)
         case "$posture" in
-          tenacity) cmd+=(--tenacity relentless) ;;
+          # `--initiative eager` keeps the posture comparable with runs from
+          # before the tenacity/initiative split, when relentless also nudged
+          # after one read-only round.
+          tenacity) cmd+=(--tenacity relentless --initiative eager) ;;
           crew) env_args+=(NEWT_TEAM=1) ;;
           obsessive) cmd+=(--obsessive) ;;
         esac

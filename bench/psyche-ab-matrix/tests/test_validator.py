@@ -25,10 +25,16 @@ SOURCE_DIGEST = "e" * 64
 POSTURES = ["baseline", "tenacity", "crew", "obsessive"]
 OCAPS = ["off", "on"]
 TENACITY = {
-    "baseline": "standard",
+    "baseline": "normal",
     "tenacity": "relentless",
-    "crew": "standard",
+    "crew": "normal",
     "obsessive": "relentless",
+}
+INITIATIVE = {
+    "baseline": "measured",
+    "tenacity": "eager",
+    "crew": "measured",
+    "obsessive": "measured",
 }
 COGNITION = {
     "baseline": "default",
@@ -293,7 +299,7 @@ def make_valid_fixture(root: Path) -> None:
             "status": "completed",
         },
         {
-            "contract_version": "1",
+            "contract_version": "2",
             "requested_model": MODEL,
             "effective_model": MODEL,
             "model_digest": DIGEST,
@@ -303,7 +309,8 @@ def make_valid_fixture(root: Path) -> None:
             "agent_version": "0.7.6",
             "effective_config": {
                 "context_window": 65536,
-                "tenacity": "standard",
+                "tenacity": "normal",
+                "initiative": "measured",
                 "cognition": "meticulous",
                 "crew": "off",
                 "ocap": "off",
@@ -344,7 +351,7 @@ def make_valid_fixture(root: Path) -> None:
                     "status": "completed",
                 },
                 {
-                    "contract_version": "1",
+                    "contract_version": "2",
                     "requested_model": MODEL,
                     "effective_model": MODEL,
                     "model_digest": DIGEST,
@@ -355,6 +362,7 @@ def make_valid_fixture(root: Path) -> None:
                     "effective_config": {
                         "context_window": 65536,
                         "tenacity": TENACITY[posture],
+                        "initiative": INITIATIVE[posture],
                         "cognition": COGNITION[posture],
                         "crew": CREW[posture],
                         "ocap": ocap,
@@ -576,8 +584,20 @@ class ValidatorFixtureTests(unittest.TestCase):
         self.assert_rejected("complete posture set")
 
     def test_contract_tenacity_must_match_posture(self) -> None:
-        self._edit_contract(("effective_config", "tenacity"), "standard", "tenacity", "off")
+        self._edit_contract(("effective_config", "tenacity"), "normal", "tenacity", "off")
         self.assert_rejected("tenacity")
+
+    def test_contract_initiative_must_match_posture(self) -> None:
+        # The tenacity posture passes --initiative eager; a run that did not
+        # is not comparable with the pre-split runs.
+        self._edit_contract(
+            ("effective_config", "initiative"), "measured", "tenacity", "off"
+        )
+        self.assert_rejected("initiative")
+
+    def test_a_contract_v1_record_is_rejected(self) -> None:
+        self._edit_contract(("contract_version",), "1", "baseline", "off")
+        self.assert_rejected("contract_version")
 
     def test_contract_cognition_and_crew_must_match_posture(self) -> None:
         self._edit_contract(

@@ -226,7 +226,7 @@ fn apply_context_window(driver: &mut TurnDriverConfig, context_window: u32) {
 /// under the same association gates as the capability decision — never
 /// model-name substring inference) and resolve the posture snapshot.
 fn resolve_runtime_posture(cfg: &Config, family: Option<&str>) -> RuntimeSettingsSnapshot {
-    newt_core::tenacity::set_active_model_family(family.map(str::to_string));
+    newt_core::initiative::set_active_model_family(family.map(str::to_string));
     RuntimeSettingsSnapshot::resolve(cfg, None, None)
 }
 
@@ -422,8 +422,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // gpt-5.6-sol is driven over /v1/chat/completions and 400s on function tools.
     newt_tui::apply_openai_api_env(api);
 
-    // #tenacity: attribute the model's family so a per-family `[tenacity]` config
-    // default applies to this run (an explicit `--tenacity` still supersedes it).
+    // Attribute the model's family so a per-family `[initiative]` config
+    // default applies to this run (an explicit `--initiative` still supersedes it).
     // The family comes ONLY from the route-gated typed card decision (#1820) —
     // a cardless model gets no family regardless of what its name resembles.
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
@@ -451,6 +451,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         .run_allowance
         .or_else(|| cfg.find_model_tuning(&model)?.run_allowance);
     let tenacity_level = runtime.tenacity.label();
+    let initiative_level = runtime.initiative.label();
     let cognition = projected_cognition(runtime.cognition, kind, api, chat_capability);
     // `None` means Newt projects no cognition controls. Call that `default`
     // rather than `off`: a capable server may enable reasoning by default.
@@ -605,7 +606,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let max_rounds = dc.max_tool_rounds as u32;
     let mut driver = TurnDriver::new(dc)
         .with_cognition(cognition)
-        .with_tenacity(runtime.tenacity);
+        .with_tenacity(runtime.tenacity)
+        .with_initiative(runtime.initiative);
     if runtime.crew {
         driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
             // The crew runner needs an owned flattened Config; the
@@ -697,7 +699,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     }
     // The per-tool trajectory — the material for the failure taxonomy. The
     // single highest-signal field is `write_calls`: a failed task with 0 writes
-    // never ACTED (the tenacity target); with writes it acted but wrong. Only
+    // never ACTED (the initiative target); with writes it acted but wrong. Only
     // newt's real workspace-write tools count, via `is_workspace_write_call`
     // itself rather than a second copy of its literal set — aliases like
     // `create_file`/`str_replace`/`apply_patch` get a coaching reply and never
@@ -829,6 +831,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             outcome: outcome_label,
             context_window: args.context_window,
             tenacity: tenacity_level,
+            initiative: initiative_level,
             cognition: cognition_level,
             crew: crew_level,
             ocap: if lane == HeadlessLane::Yolo {
@@ -1401,15 +1404,15 @@ mod tests {
     }
 
     #[test]
-    fn contract_tenacity_records_the_effective_cli_override() {
+    fn contract_dials_record_the_effective_cli_overrides() {
         let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-        newt_core::tenacity::set_tenacity_config(Default::default());
-        newt_core::tenacity::set_cli_tenacity(newt_core::Tenacity::Insistent);
+        newt_core::initiative::set_initiative_config(Default::default());
+        newt_core::initiative::set_cli_initiative(newt_core::Initiative::Decisive);
+        newt_core::tenacity::set_cli_tenacity(newt_core::Tenacity::Relentless);
 
-        assert_eq!(
-            resolve_runtime_posture(&Config::default(), None).tenacity,
-            newt_core::Tenacity::Insistent
-        );
+        let runtime = resolve_runtime_posture(&Config::default(), None);
+        assert_eq!(runtime.initiative, newt_core::Initiative::Decisive);
+        assert_eq!(runtime.tenacity, newt_core::Tenacity::Relentless);
     }
 
     #[test]

@@ -541,7 +541,7 @@ pub(crate) struct TurnBinding {
 ///   to the tab that is actually active *for this turn* (#1714) — which is why
 ///   the caller passes the ACTIVE tab's id, not the one the process started
 ///   with;
-/// - the **psyche capture** pins cognition and tenacity for the turn's
+/// - the **psyche capture** pins cognition, tenacity and initiative for the turn's
 ///   duration (#1715), so a dial moved mid-turn cannot change what this turn
 ///   resolves on a later round — while still taking effect on the next turn,
 ///   because the binding is dropped in between.
@@ -1170,12 +1170,12 @@ mod tests {
     /// so it cannot flake into a pass on a loaded machine.
     #[test]
     fn a_session_serves_two_turns_and_shuts_down_without_leaking() {
-        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        use newt_core::initiative::{effective_initiative, set_cli_initiative, Initiative};
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
 
         let a = newt_core::lifecycle::new_session_id();
         let b = newt_core::lifecycle::new_session_id();
-        set_cli_tenacity(Tenacity::Relaxed); // P1
+        set_cli_initiative(Initiative::Patient); // P1
 
         let (to_ui, from_session) = std::sync::mpsc::sync_channel(16);
         // Rendezvous: the terminal releases turn 1 only after it has proven
@@ -1196,9 +1196,10 @@ mod tests {
                     {
                         let _turn = bind_turn(&a);
                         surface.set_runtime_context("m1", "http://h", None, "s");
-                        seen.lock()
-                            .unwrap()
-                            .push((newt_core::lifecycle::active_session(), effective_tenacity()));
+                        seen.lock().unwrap().push((
+                            newt_core::lifecycle::active_session(),
+                            effective_initiative(),
+                        ));
                         // Park until the terminal says it has served something
                         // else. If execution were back on the terminal thread,
                         // nothing could ever send this.
@@ -1209,9 +1210,10 @@ mod tests {
                     // (5) turn 2 — a different tab, and the dial has moved.
                     {
                         let _turn = bind_turn(&b);
-                        seen.lock()
-                            .unwrap()
-                            .push((newt_core::lifecycle::active_session(), effective_tenacity()));
+                        seen.lock().unwrap().push((
+                            newt_core::lifecycle::active_session(),
+                            effective_initiative(),
+                        ));
                     }
                     // (6) session ends; dropping `surface` closes the channel.
                 })
@@ -1231,8 +1233,8 @@ mod tests {
             }
 
             // The operator moves a dial between turns.
-            set_cli_tenacity(Tenacity::Relentless); // P2
-                                                    // (4) let turn 1 finish.
+            set_cli_initiative(Initiative::Eager); // P2
+                                                   // (4) let turn 1 finish.
             release_tx.send(()).expect("session still listening");
 
             // (7) drain to channel close — the pump's real exit condition —
@@ -1246,7 +1248,7 @@ mod tests {
         let seen = observed.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "two turns ran");
         assert_eq!(seen[0].0.as_deref(), Some(a.as_str()), "turn 1 is A's");
-        assert_eq!(seen[0].1, Tenacity::Relaxed, "turn 1 held P1");
+        assert_eq!(seen[0].1, Initiative::Patient, "turn 1 held P1");
         assert_eq!(
             seen[1].0.as_deref(),
             Some(b.as_str()),
@@ -1254,7 +1256,7 @@ mod tests {
         );
         assert_eq!(
             seen[1].1,
-            Tenacity::Relentless,
+            Initiative::Eager,
             "turn 2 sees P2 — a session-long capture answers P1 here"
         );
 
@@ -1265,7 +1267,6 @@ mod tests {
         // matching proof for the channel: its loop ends only when every sender
         // is dropped. A leaked worker or a pump still parked on `recv` hangs
         // here instead of passing.
-        set_cli_tenacity(Tenacity::Standard);
     }
 
     /// A surface that records what the terminal was asked to do.
@@ -1359,19 +1360,23 @@ mod tests {
     /// necessarily answers `P1` there.
     #[test]
     fn a_dial_moved_between_turns_lands_on_the_next_turn() {
-        use newt_core::tenacity::{effective_tenacity, set_cli_tenacity, Tenacity};
+        use newt_core::initiative::{effective_initiative, set_cli_initiative, Initiative};
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
 
         // P1 for turn 1.
-        set_cli_tenacity(Tenacity::Relaxed);
+        set_cli_initiative(Initiative::Patient);
         {
             let _turn = bind_turn(&newt_core::lifecycle::new_session_id());
-            assert_eq!(effective_tenacity(), Tenacity::Relaxed, "turn 1 sees P1");
-            // The operator moves the dial DURING turn 1.
-            set_cli_tenacity(Tenacity::Relentless);
             assert_eq!(
-                effective_tenacity(),
-                Tenacity::Relaxed,
+                effective_initiative(),
+                Initiative::Patient,
+                "turn 1 sees P1"
+            );
+            // The operator moves the dial DURING turn 1.
+            set_cli_initiative(Initiative::Eager);
+            assert_eq!(
+                effective_initiative(),
+                Initiative::Patient,
                 "…and turn 1 stays internally stable despite it"
             );
         }
@@ -1379,16 +1384,15 @@ mod tests {
         {
             let _turn = bind_turn(&newt_core::lifecycle::new_session_id());
             assert_eq!(
-                effective_tenacity(),
-                Tenacity::Relentless,
+                effective_initiative(),
+                Initiative::Eager,
                 "turn 2 sees P2 — a session-long capture would still answer P1"
             );
         }
-        set_cli_tenacity(Tenacity::Standard);
     }
 
     /// Cognition rides the same binding, so `/cognition` between turns lands
-    /// on the next one too. Separate from tenacity because they are separate
+    /// on the next one too. Separate from initiative because they are separate
     /// globals and a capture that pinned only one would pass the test above.
     #[test]
     fn a_cognition_change_between_turns_also_lands_on_the_next_turn() {

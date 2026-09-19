@@ -1,7 +1,8 @@
 //! The harness **config panel** (issue #14) — behind the `rich-tui` feature.
 //!
 //! A deliberately-opened, transient ratatui `Viewport::Inline` overlay to adjust
-//! the psyche **operator dials** — the active persona, cognition, and tenacity —
+//! the psyche **operator dials** — the active persona, cognition, tenacity and
+//! initiative —
 //! and to SAVE the current posture as a named persona. **Config only** (renders
 //! no agent output); applying a dial writes through the same setters the flags /
 //! slash commands use, so there is no panel-only state. Per
@@ -25,7 +26,7 @@
 //!   The panel shows a status from the returned [`SaveResult`] and only records
 //!   success once the write actually succeeded.
 //! - **`:wq` commit order** — validate → persist the persona file → apply
-//!   cognition/tenacity → (caller) apply persona + reroute backend → (caller)
+//!   cognition/tenacity/initiative → (caller) apply persona + reroute backend → (caller)
 //!   recompute + report. A failed persist returns `None` from the command, so the
 //!   loop never breaks and [`PanelState::apply`] never runs: no dial, persona, or
 //!   backend change happens.
@@ -34,10 +35,13 @@
 //!   from the abandoned working copy. After an apply the caller builds the summary
 //!   from freshly-resolved runtime state, not from panel-local values.
 //! - **Persona preview is projected, not stale** (review-3 §3). Selecting a
-//!   persona recomputes the projected effective cognition / tenacity / backend /
+//!   persona recomputes the projected effective cognition / initiative / backend /
 //!   crew from *that* persona's declarations (over the config/family base), with a
-//!   provenance label distinguishing an explicit override from an inherited value.
-//!   Save serializes exactly this projected posture.
+//!   provenance label distinguishing an explicit override from an inherited value
+//!   (initiative's family base reads `model default`). Save serializes the
+//!   projected posture, except that initiative is written only when it was
+//!   chosen (an override or the persona's own declaration): baking a family
+//!   default into a persona would pin it on every other model.
 //!
 //! ## Keys (vi-flavoured; save is explicit, Esc always cancels)
 //! - `↑`/`↓` select a dial, `←`/`→` change it (incl. `auto`/`inherit`).
@@ -62,6 +66,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use newt_core::cognition::{cli_cognition, CognitionOverride};
+use newt_core::initiative::{cli_initiative, Initiative};
 use newt_core::role_profile::{Cognition, PersonalityLevel, PersonalityTrait, PersonalityTraits};
 use newt_core::tenacity::{cli_tenacity, Tenacity};
 
@@ -74,12 +79,12 @@ fn cognition_ladder() -> Vec<CognitionOverride> {
     v
 }
 
-/// The tenacity dial's ladder: `None` = auto/inherit (clear the override), then
-/// the concrete levels.
-fn tenacity_ladder() -> Vec<Option<Tenacity>> {
-    let mut v = vec![None];
-    v.extend(Tenacity::all().into_iter().map(Some));
-    v
+/// A dial's ladder: `None` = auto/inherit (clear the override), then the
+/// concrete levels, derived from the enum's `all()`.
+fn ladder<T: Copy>(levels: impl IntoIterator<Item = T>) -> Vec<Option<T>> {
+    std::iter::once(None)
+        .chain(levels.into_iter().map(Some))
+        .collect()
 }
 
 /// The "no persona" option shown at index 0 of the persona selector.
@@ -92,14 +97,16 @@ enum Row {
     Model,
     Cognition,
     Tenacity,
+    Initiative,
     Personality(PersonalityTrait),
 }
 
-const ROWS: [Row; 9] = [
+const ROWS: [Row; 10] = [
     Row::Persona,
     Row::Model,
     Row::Cognition,
     Row::Tenacity,
+    Row::Initiative,
     Row::Personality(PersonalityTrait::Agreeableness),
     Row::Personality(PersonalityTrait::Extraversion),
     Row::Personality(PersonalityTrait::Warmth),
@@ -120,7 +127,7 @@ pub(crate) struct ModelChoice {
 /// record (one struct rather than a positional list that outgrew clippy's
 /// argument limit when #1666 added the model spinner): the selectable
 /// personas + the active one, the operator baseline backend, the
-/// config/family tenacity base, and the served-model list + active model.
+/// config/family initiative base, and the served-model list + active model.
 pub(crate) struct PanelSeed {
     /// The route the operator actually typed — `/psyche` or `/psyche edit`,
     /// both of which open this panel (see `chat.rs`'s `wants_psyche_panel`).
@@ -134,7 +141,13 @@ pub(crate) struct PanelSeed {
     pub personas: Vec<PersonaChoice>,
     pub current_persona: Option<String>,
     pub backend: Option<String>,
-    pub base_tenacity: Tenacity,
+    /// Initiative with no operator choice and no persona layer
+    /// ([`newt_core::initiative::base_initiative`]).
+    pub base_initiative: Initiative,
+    /// Whether that base is the active model family's entry
+    /// ([`newt_core::initiative::model_default_initiative`]), shown as
+    /// `model default`.
+    pub initiative_from_family: bool,
     pub models: Option<Vec<ModelChoice>>,
     pub current_model: String,
     /// Raw overrides owned by the active tab, not a cached persona profile.
@@ -282,6 +295,7 @@ pub(crate) struct PanelState {
     current_persona: Option<String>,
     cognition: Dial<CognitionOverride>,
     tenacity: Dial<Option<Tenacity>>,
+    initiative: Dial<Option<Initiative>>,
     personality: [Dial<Option<PersonalityLevel>>; 5],
     /// The active backend's served models (#1666); `None` = the backend could
     /// not be listed when the panel opened — the row renders but won't dial.
@@ -292,9 +306,10 @@ pub(crate) struct PanelState {
     /// The model the session resolved when the panel opened — the "(active)"
     /// marker + the value a no-op visit leaves untouched.
     current_model: String,
-    /// Tenacity with no CLI override and no persona layer (config per-family /
-    /// default / `Standard`) — the value a persona that declares none inherits.
-    base_tenacity: Tenacity,
+    /// Initiative with no CLI override and no persona layer (config per-family /
+    /// default / `Measured`) — the value a persona that declares none inherits.
+    base_initiative: Initiative,
+    initiative_from_family: bool,
     /// The crew launch gate at open (`NEWT_TEAM`) — the base a persona's `crew:`
     /// declaration projects over.
     base_crew: bool,
@@ -318,7 +333,8 @@ impl PanelState {
             mut personas,
             current_persona,
             backend,
-            base_tenacity,
+            base_initiative,
+            initiative_from_family,
             models,
             current_model,
             personality,
@@ -372,11 +388,13 @@ impl PanelState {
             current_persona,
             cognition: Dial::Inherit(cli_cognition()),
             tenacity: Dial::Inherit(cli_tenacity()),
+            initiative: Dial::Inherit(cli_initiative()),
             personality: PersonalityTrait::ALL.map(|kind| Dial::Inherit(personality.get(kind))),
             model_opts,
             model: Dial::Inherit(model_idx),
             current_model: current_model.to_string(),
-            base_tenacity,
+            base_initiative,
+            initiative_from_family,
             base_crew: std::env::var("NEWT_TEAM").is_ok(),
             backend,
             mode: Mode::Normal,
@@ -420,12 +438,21 @@ impl PanelState {
                 self.cognition.set(ladder[clamp_step(i, dir, ladder.len())]);
             }
             Row::Tenacity => {
-                let ladder = tenacity_ladder();
+                let ladder = ladder(Tenacity::all());
                 let i = ladder
                     .iter()
                     .position(|t| *t == self.tenacity.value())
                     .unwrap_or(0);
                 self.tenacity.set(ladder[clamp_step(i, dir, ladder.len())]);
+            }
+            Row::Initiative => {
+                let ladder = ladder(Initiative::all());
+                let i = ladder
+                    .iter()
+                    .position(|t| *t == self.initiative.value())
+                    .unwrap_or(0);
+                self.initiative
+                    .set(ladder[clamp_step(i, dir, ladder.len())]);
             }
             Row::Personality(kind) => {
                 let (_, dial) = PersonalityTrait::ALL
@@ -478,6 +505,9 @@ impl PanelState {
         if self.tenacity.is_dirty() {
             let _ = crate::settings_form::apply_tenacity(self.tenacity.value(), self.via);
         }
+        if self.initiative.is_dirty() {
+            let _ = crate::settings_form::apply_initiative(self.initiative.value(), self.via);
+        }
     }
 
     /// The persona action the operator chose (Keep / Clear / Switch).
@@ -504,6 +534,7 @@ impl PanelState {
     pub(crate) fn is_noop(&self) -> bool {
         !self.cognition.is_dirty()
             && !self.tenacity.is_dirty()
+            && !self.initiative.is_dirty()
             && !self.model.is_dirty()
             && !self.personality.iter().any(|dial| dial.is_dirty())
             && self.persona_action() == PersonaAction::Keep
@@ -577,17 +608,24 @@ impl PanelState {
         }
     }
 
-    /// The tenacity that WILL be in effect for the selected persona after Apply: an
-    /// explicit override wins, else the selected persona's declared level, else the
-    /// config/family base.
+    /// The tenacity that WILL be in effect after Apply: an explicit override,
+    /// else `Normal` (no persona or config layer feeds tenacity).
     fn projected_tenacity(&self) -> Tenacity {
-        match self.tenacity.value() {
-            Some(t) => t,
-            None => self
-                .selected_profile()
-                .and_then(|p| p.tenacity)
-                .unwrap_or(self.base_tenacity),
-        }
+        self.tenacity.value().unwrap_or_default()
+    }
+
+    /// The initiative the operator CHOSE for the selected persona: an explicit
+    /// override, else the persona's own declaration. `None` = the base applies.
+    fn chosen_initiative(&self) -> Option<Initiative> {
+        self.initiative
+            .value()
+            .or_else(|| self.selected_profile().and_then(|p| p.initiative))
+    }
+
+    /// The initiative that WILL be in effect for the selected persona after
+    /// Apply: [`Self::chosen_initiative`], else the config/family base.
+    fn projected_initiative(&self) -> Initiative {
+        self.chosen_initiative().unwrap_or(self.base_initiative)
     }
 
     fn personality_overrides(&self) -> PersonalityTraits {
@@ -729,12 +767,6 @@ impl PanelState {
         self.projected_cognition()
     }
 
-    /// The EFFECTIVE tenacity to serialize on save — the PROJECTED value for the
-    /// selected persona (auto → the persona's declared level, or the base).
-    fn tenacity_for_save(&self) -> Tenacity {
-        self.projected_tenacity()
-    }
-
     fn persona_content(&self, name: &str) -> anyhow::Result<String> {
         let mut profile = match self.selected_persona() {
             Some(persona) => persona.profile.clone().ok_or_else(|| {
@@ -753,7 +785,9 @@ impl PanelState {
         };
         profile.backend = self.projected_backend();
         profile.cognition = self.cognition_for_save();
-        profile.tenacity = Some(self.tenacity_for_save());
+        // Only a chosen initiative: the base is a family/config default, and
+        // baking it in would pin it for every model this persona runs on.
+        profile.initiative = self.chosen_initiative();
         profile.crew = profile.crew.or_else(|| self.base_crew.then_some(true));
         let personality = self.projected_personality();
         if personality != PersonalityTraits::default() || profile.personality.is_some() {
@@ -779,10 +813,24 @@ impl PanelState {
     fn tenacity_cell(&self) -> (String, String) {
         match self.tenacity.value() {
             Some(t) => (t.label().to_string(), "override".to_string()),
+            None => (
+                format!("auto → {}", self.projected_tenacity().label()),
+                "base".to_string(),
+            ),
+        }
+    }
+    fn initiative_cell(&self) -> (String, String) {
+        match self.initiative.value() {
+            Some(i) => (i.label().to_string(), "override".to_string()),
             None => {
-                let val = format!("auto → {}", self.projected_tenacity().label());
-                let from_persona = self.selected_profile().and_then(|p| p.tenacity).is_some();
-                (val, self.inherit_provenance(from_persona))
+                let val = format!("auto → {}", self.projected_initiative().label());
+                let from_persona = self.chosen_initiative().is_some();
+                let provenance = if !from_persona && self.initiative_from_family {
+                    "model default".to_string()
+                } else {
+                    self.inherit_provenance(from_persona)
+                };
+                (val, provenance)
             }
         }
     }
@@ -812,6 +860,7 @@ impl PanelState {
     fn view_rows(&self) -> Vec<RowView> {
         let (cog_val, cog_prov) = self.cognition_cell();
         let (ten_val, ten_prov) = self.tenacity_cell();
+        let (ini_val, ini_prov) = self.initiative_cell();
         let mut rows = vec![
             RowView {
                 label: "persona",
@@ -843,6 +892,13 @@ impl PanelState {
                 value: ten_val,
                 provenance: ten_prov,
                 selected: ROWS[self.sel] == Row::Tenacity,
+                editable: true,
+            },
+            RowView {
+                label: "initiative",
+                value: ini_val,
+                provenance: ini_prov,
+                selected: ROWS[self.sel] == Row::Initiative,
                 editable: true,
             },
             RowView {
@@ -887,7 +943,12 @@ impl PanelState {
                 editable: true,
             }
         });
-        rows.splice(4..4, traits);
+        // The style rows follow the dials, just before `provider`.
+        let at = rows
+            .iter()
+            .position(|r| r.label == "provider")
+            .unwrap_or(rows.len());
+        rows.splice(at..at, traits);
         rows
     }
 
@@ -1418,14 +1479,14 @@ mod tests {
     fn choice(
         name: &str,
         cognition: Option<Cognition>,
-        tenacity: Option<Tenacity>,
+        initiative: Option<Initiative>,
     ) -> PersonaChoice {
         PersonaChoice {
             name: name.to_string(),
             profile: Some(newt_core::RoleProfile {
                 prompt: format!("# {name}"),
                 cognition,
-                tenacity,
+                initiative,
                 backend: Some("sol".to_string()),
                 ..Default::default()
             }),
@@ -1445,7 +1506,7 @@ mod tests {
     fn seed(
         current: Option<&str>,
         personas: Vec<PersonaChoice>,
-        base_ten: Tenacity,
+        base_ini: Initiative,
         models: Option<Vec<ModelChoice>>,
         current_model: &str,
     ) -> PanelSeed {
@@ -1454,7 +1515,8 @@ mod tests {
             personas,
             current_persona: current.map(str::to_string),
             backend: Some("sol".to_string()),
-            base_tenacity: base_ten,
+            base_initiative: base_ini,
+            initiative_from_family: false,
             models,
             current_model: current_model.to_string(),
             personality: PersonalityTraits::default(),
@@ -1464,12 +1526,12 @@ mod tests {
     fn panel(
         current: Option<&str>,
         personas: Vec<PersonaChoice>,
-        base_ten: Tenacity,
+        base_ini: Initiative,
     ) -> PanelState {
         PanelState::new(seed(
             current,
             personas,
-            base_ten,
+            base_ini,
             Some(model_choices(&["m1", "m2", "m3"])),
             "m2",
         ))
@@ -1491,7 +1553,7 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Unset);
         clear_cli_tenacity();
-        let s = panel(None, two_personas(), Tenacity::Standard);
+        let s = panel(None, two_personas(), Initiative::Measured);
         s.apply();
         assert_eq!(
             cli_tenacity(),
@@ -1556,19 +1618,23 @@ mod tests {
             "set_cli_cognition(",
             "set_cli_tenacity(",
             "clear_cli_tenacity(",
+            "set_cli_initiative(",
+            "clear_cli_initiative(",
             "mark_cognition_choice(",
             "mark_tenacity_choice(",
+            "mark_initiative_choice(",
         ] {
             assert_eq!(
                 source.matches(setter).count(),
                 0,
                 "`{setter}` writes a setting with no receipt; go through \
-                 settings_form::apply_cognition / apply_tenacity"
+                 settings_form::apply_cognition / apply_tenacity / apply_initiative"
             );
         }
         assert!(
             source.contains("settings_form::apply_cognition")
-                && source.contains("settings_form::apply_tenacity"),
+                && source.contains("settings_form::apply_tenacity")
+                && source.contains("settings_form::apply_initiative"),
             "the panel must apply its dials through the recording path"
         );
     }
@@ -1582,7 +1648,7 @@ mod tests {
         let _ = drain_preference_actions();
 
         // A browse-and-apply with nothing touched marks nothing.
-        let s = panel(None, two_personas(), Tenacity::Standard);
+        let s = panel(None, two_personas(), Initiative::Measured);
         s.apply();
         assert!(
             drain_preference_actions().is_empty(),
@@ -1590,7 +1656,7 @@ mod tests {
         );
 
         // Touch ONLY cognition → only the cognition axis is marked.
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         s.down(); // → model
         s.down(); // → cognition
         s.cycle(1);
@@ -1602,11 +1668,11 @@ mod tests {
         assert_eq!((a.backend, a.model), (None, None), "panel owns dials only");
 
         // Touch ONLY tenacity, to its `auto` position → the axis is UNPINNED.
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         s.down();
         s.down();
         s.down(); // → tenacity
-        for _ in 0..tenacity_ladder().len() {
+        for _ in 0..ladder(Tenacity::all()).len() {
             s.cycle(-1);
         }
         assert_eq!(s.tenacity.value(), None, "reached auto");
@@ -1614,18 +1680,31 @@ mod tests {
         let a = drain_preference_actions();
         assert_eq!(a.tenacity, Some(None), "auto unpins the axis");
         assert_eq!(a.cognition, None);
+        assert_eq!(a.initiative, None, "an untouched initiative is not pinned");
+
+        // Touch ONLY initiative → only its axis is marked.
+        let mut s = panel(None, two_personas(), Initiative::Measured);
+        for _ in 0..4 {
+            s.down(); // → initiative
+        }
+        s.cycle(1);
+        assert!(s.initiative.is_dirty() && !s.tenacity.is_dirty());
+        s.apply();
+        let a = drain_preference_actions();
+        assert_eq!(a.initiative, Some(s.initiative.value()));
+        assert_eq!(a.tenacity, None);
     }
 
     #[test]
     fn auto_position_clears_the_tenacity_override() {
         let _g = GlobalSettingsGuard::acquire();
         set_cli_tenacity(Tenacity::Relentless);
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         s.down(); // → model
         s.down(); // → cognition
         s.down(); // → tenacity (currently Some(relentless) via cli_tenacity seed)
                   // Cycle left to the `auto` (None) position, then apply → override cleared.
-        for _ in 0..tenacity_ladder().len() {
+        for _ in 0..ladder(Tenacity::all()).len() {
             s.cycle(-1);
         }
         assert_eq!(s.tenacity.value(), None, "reached auto");
@@ -1641,38 +1720,52 @@ mod tests {
         set_cli_cognition(CognitionOverride::Unset);
         clear_cli_tenacity();
         let personas = vec![
-            choice("bob", Some(Cognition::Rational), Some(Tenacity::Standard)),
+            choice("bob", Some(Cognition::Rational), Some(Initiative::Measured)),
             choice(
                 "obsessive",
                 Some(Cognition::Meticulous),
-                Some(Tenacity::Relentless),
+                Some(Initiative::Eager),
             ),
         ];
-        let mut s = panel(Some("bob"), personas, Tenacity::Standard);
+        let mut s = panel(Some("bob"), personas, Initiative::Patient);
         // Opens on bob → projects bob's declarations.
         assert_eq!(s.projected_cognition(), Some(Cognition::Rational));
-        assert_eq!(s.projected_tenacity(), Tenacity::Standard);
+        assert_eq!(s.projected_initiative(), Initiative::Measured);
         // Select obsessive → projection switches to obsessive's, not bob's.
         s.cycle(1); // bob
         s.cycle(1); // obsessive
         assert_eq!(s.projected_cognition(), Some(Cognition::Meticulous));
-        assert_eq!(s.projected_tenacity(), Tenacity::Relentless);
-        let (ten_val, ten_prov) = s.tenacity_cell();
-        assert!(ten_val.contains("relentless"), "shows projected level");
-        assert_eq!(ten_prov, "persona: obsessive", "attributes it to obsessive");
+        assert_eq!(s.projected_initiative(), Initiative::Eager);
+        let (ini_val, ini_prov) = s.initiative_cell();
+        assert!(ini_val.contains("eager"), "shows projected level");
+        assert_eq!(ini_prov, "persona: obsessive", "attributes it to obsessive");
+        // Tenacity has no persona layer: it projects `normal`.
+        assert_eq!(s.projected_tenacity(), Tenacity::Normal);
     }
 
     #[test]
     fn projection_base_shows_when_the_persona_declares_nothing() {
         let _g = GlobalSettingsGuard::acquire();
-        clear_cli_tenacity();
-        // obsessive declares no tenacity → inherits the config/family base.
+        newt_core::initiative::clear_cli_initiative();
+        // obsessive declares no initiative → inherits the config/family base.
         let personas = vec![choice("obsessive", None, None)];
-        let mut s = panel(None, personas, Tenacity::Insistent);
+        let mut s = panel(None, personas.clone(), Initiative::Decisive);
         s.cycle(1); // NONE → obsessive
-        assert_eq!(s.projected_tenacity(), Tenacity::Insistent, "inherits base");
-        let (_, prov) = s.tenacity_cell();
-        assert_eq!(prov, "base");
+        assert_eq!(
+            s.projected_initiative(),
+            Initiative::Decisive,
+            "inherits base"
+        );
+        assert_eq!(s.initiative_cell().1, "base");
+        // A base that is the model family's entry says so (the design's
+        // `initiative: decisive (model default)`).
+        let mut family = seed(None, personas, Initiative::Decisive, None, "");
+        family.initiative_from_family = true;
+        let s = PanelState::new(family);
+        assert_eq!(
+            s.initiative_cell(),
+            ("auto → decisive".to_string(), "model default".to_string())
+        );
     }
 
     #[test]
@@ -1685,9 +1778,9 @@ mod tests {
         let personas = vec![choice(
             "bob",
             Some(Cognition::Meticulous),
-            Some(Tenacity::Relentless),
+            Some(Initiative::Eager),
         )];
-        let mut s = panel(Some("bob"), personas, Tenacity::Standard);
+        let mut s = panel(Some("bob"), personas, Initiative::Measured);
         let mut persist = ok_persist();
         s.begin_command("w clone");
         assert_eq!(s.run_command(&mut persist), None);
@@ -1696,7 +1789,33 @@ mod tests {
         let content = s.persona_content("clone").unwrap();
         let rp = newt_core::RoleProfile::parse(&content).unwrap();
         assert_eq!(rp.cognition, Some(Cognition::Meticulous));
-        assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
+        assert_eq!(rp.initiative, Some(Initiative::Eager));
+    }
+
+    /// Regression (slice 1b): a panel save writes initiative only when it was
+    /// chosen. The old save always wrote the projected tenacity, baking the
+    /// model family's default (e.g. nemotron's) into the persona, where it
+    /// then pinned every other model the persona ran on.
+    #[test]
+    fn save_never_bakes_in_the_model_default_initiative() {
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        newt_core::initiative::clear_cli_initiative();
+        let mut family = seed(None, two_personas(), Initiative::Eager, None, "");
+        family.initiative_from_family = true;
+        let s = PanelState::new(family);
+        assert_eq!(s.projected_initiative(), Initiative::Eager, "shown");
+        let rp = newt_core::RoleProfile::parse(&s.persona_content("fresh").unwrap()).unwrap();
+        assert_eq!(rp.initiative, None, "a family default is not a choice");
+
+        // Moving the dial IS a choice, and is saved.
+        let mut s = panel(None, two_personas(), Initiative::Eager);
+        for _ in 0..4 {
+            s.down(); // → initiative
+        }
+        s.cycle(1); // auto → patient
+        let rp = newt_core::RoleProfile::parse(&s.persona_content("fresh").unwrap()).unwrap();
+        assert_eq!(rp.initiative, Some(Initiative::Patient));
     }
 
     #[test]
@@ -1705,7 +1824,7 @@ mod tests {
         // (e.g. its file failed to load), it must still show "(active)" and Enter
         // must map to Keep — never a silent Clear at index 0.
         let _g = GlobalSettingsGuard::acquire();
-        let s = panel(Some("ghost"), two_personas(), Tenacity::Standard);
+        let s = panel(Some("ghost"), two_personas(), Initiative::Measured);
         assert!(s.persona_label().contains("ghost"));
         assert!(s.persona_label().contains("(active)"));
         assert_eq!(s.persona_action(), PersonaAction::Keep);
@@ -1714,7 +1833,7 @@ mod tests {
     #[test]
     fn saving_an_unavailable_persona_refuses_instead_of_replacing_its_unknown_profile() {
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(Some("unavailable"), two_personas(), Tenacity::Standard);
+        let mut s = panel(Some("unavailable"), two_personas(), Initiative::Measured);
         let mut writes = 0;
         let mut persist = |name: &str, _content: &str, _overwrite: bool| {
             writes += 1;
@@ -1745,7 +1864,7 @@ mod tests {
                 ..Default::default()
             }),
         }];
-        let s = panel(Some("quiet"), personas, Tenacity::Standard);
+        let s = panel(Some("quiet"), personas, Initiative::Measured);
         let saved = newt_core::RoleProfile::parse(&s.persona_content("quiet-copy").unwrap())
             .expect("the panel must serialize valid TOML, including quoted values");
         assert_eq!(saved.backend.as_deref(), Some(backend));
@@ -1787,7 +1906,7 @@ mod tests {
                         ..Default::default()
                     }),
                 }],
-                Tenacity::Standard,
+                Initiative::Measured,
             );
             let mut writes = 0;
             let mut persist = |name: &str, content: &str, overwrite: bool| {
@@ -1859,7 +1978,7 @@ Read the code and explain findings. Do not edit files or run commands.
         let mut s = panel(
             Some("restricted"),
             vec![PersonaChoice::from(original.clone())],
-            Tenacity::Standard,
+            Initiative::Measured,
         );
         let mut persist = |name: &str, content: &str, overwrite: bool| match store
             .save(name, content, overwrite)
@@ -1889,6 +2008,7 @@ Read the code and explain findings. Do not edit files or run commands.
         let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
         set_cli_tenacity(Tenacity::Relentless);
+        newt_core::initiative::set_cli_initiative(Initiative::Decisive);
         newt_core::process_env::set_var("NEWT_TEAM", "1");
         let _ = newt_core::runtime::drain_preference_actions();
         let tmp = tempfile::tempdir().unwrap();
@@ -1901,13 +2021,13 @@ Read the code and explain findings. Do not edit files or run commands.
         let original_path = store.save("sparse", document, false).unwrap();
         let original = store.load("sparse").unwrap();
         assert!(original.profile.backend.is_none() && original.profile.crew.is_none());
-        assert!(original.profile.cognition.is_none() && original.profile.tenacity.is_none());
+        assert!(original.profile.cognition.is_none() && original.profile.initiative.is_none());
         let mut s = panel(
             Some("sparse"),
             vec![PersonaChoice::from(original.clone())],
-            Tenacity::Standard,
+            Initiative::Measured,
         );
-        for _ in 0..6 {
+        for _ in 0..7 {
             s.down(); // warmth: leave cognition, tenacity and model untouched
         }
         s.cycle(1); // auto -> explicit zero
@@ -1929,7 +2049,8 @@ Read the code and explain findings. Do not edit files or run commands.
         let mut expected = original.profile.clone();
         expected.backend = Some("sol".into()); // the fixture's operator baseline
         expected.cognition = Some(Cognition::Meticulous);
-        expected.tenacity = Some(Tenacity::Relentless);
+        // Tenacity is not a persona dial; a set initiative is snapshotted.
+        expected.initiative = Some(Initiative::Decisive);
         expected.crew = Some(true);
         expected.personality = Some(PersonalityTraits {
             warmth: Some(PersonalityLevel::try_from(0).unwrap()),
@@ -1954,7 +2075,7 @@ Read the code and explain findings. Do not edit files or run commands.
     #[test]
     fn personality_controls_are_independent_named_rows() {
         let _g = GlobalSettingsGuard::acquire();
-        let s = panel(None, two_personas(), Tenacity::Standard);
+        let s = panel(None, two_personas(), Initiative::Measured);
         let rows = s.view_rows();
         for label in [
             "agreeableness",
@@ -1973,8 +2094,8 @@ Read the code and explain findings. Do not edit files or run commands.
     fn personality_panel_keeps_the_selected_dial_and_exit_hint_visible_when_short() {
         use ratatui::{backend::TestBackend, Terminal};
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
-        for _ in 0..8 {
+        let mut s = panel(None, two_personas(), Initiative::Measured);
+        for _ in 0..9 {
             s.down();
         }
         let mut term = Terminal::new(TestBackend::new(100, 7)).unwrap();
@@ -1989,14 +2110,14 @@ Read the code and explain findings. Do not edit files or run commands.
     fn personality_apply_returns_only_edited_axes_after_an_explicit_apply() {
         use newt_core::role_profile::{PersonalityLevel, PersonalityTrait, PersonalityTraits};
         let _g = GlobalSettingsGuard::acquire();
-        let mut initial = seed(None, two_personas(), Tenacity::Standard, None, "");
+        let mut initial = seed(None, two_personas(), Initiative::Measured, None, "");
         initial.personality = PersonalityTraits {
             warmth: Some(PersonalityLevel::try_from(73).unwrap()),
             ..Default::default()
         };
         let mut s = PanelState::new(initial);
         assert_eq!(close_outcome(true, &s), PanelOutcome::Cancelled);
-        for _ in 0..4 {
+        for _ in 0..5 {
             s.down();
         }
         s.cycle(1);
@@ -2018,14 +2139,14 @@ Read the code and explain findings. Do not edit files or run commands.
     fn personality_clear_does_not_reapply_untouched_overrides_to_the_new_conversation() {
         use newt_core::role_profile::{PersonalityLevel, PersonalityTrait, PersonalityTraits};
         let _g = GlobalSettingsGuard::acquire();
-        let mut initial = seed(Some("bob"), two_personas(), Tenacity::Standard, None, "");
+        let mut initial = seed(Some("bob"), two_personas(), Initiative::Measured, None, "");
         initial.personality = PersonalityTraits {
             warmth: Some(PersonalityLevel::try_from(73).unwrap()),
             ..Default::default()
         };
         let mut s = PanelState::new(initial);
         s.cycle(-1); // clear persona, which starts a new conversation
-        for _ in 0..4 {
+        for _ in 0..5 {
             s.down();
         }
         s.cycle(1);
@@ -2058,9 +2179,9 @@ Read the code and explain findings. Do not edit files or run commands.
             let mut s = panel(
                 Some("base"),
                 vec![choice("base", None, None)],
-                Tenacity::Standard,
+                Initiative::Measured,
             );
-            for _ in 0..4 + index {
+            for _ in 0..5 + index {
                 s.down();
             }
             s.cycle(1); // inherit -> explicit 0, never an implicit midpoint
@@ -2097,7 +2218,7 @@ Read the code and explain findings. Do not edit files or run commands.
                 name: "reviewer".into(),
                 profile: Some(profile.clone()),
             }],
-            Tenacity::Standard,
+            Initiative::Measured,
         );
         let saved = |s: &PanelState| {
             newt_core::RoleProfile::parse(&s.persona_content("copy").unwrap()).unwrap()
@@ -2107,7 +2228,7 @@ Read the code and explain findings. Do not edit files or run commands.
             profile.personality,
             "untouched inherits"
         );
-        for _ in 0..4 {
+        for _ in 0..5 {
             s.down();
         }
         s.cycle(1);
@@ -2149,7 +2270,7 @@ Read the code and explain findings. Do not edit files or run commands.
         // no-op — nothing applied, nothing reported. Moving the selection is
         // not a change; touching a dial (even back to its original value) is.
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        let mut s = panel(Some("bob"), two_personas(), Initiative::Measured);
         assert!(s.is_noop(), "fresh panel: nothing to apply");
         s.down();
         s.up();
@@ -2163,13 +2284,13 @@ Read the code and explain findings. Do not edit files or run commands.
         s.cycle(-1);
         assert!(!s.is_noop(), "cycled back is still dirty (re-apply)");
         // A persona switch is a change too.
-        let mut p = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        let mut p = panel(Some("bob"), two_personas(), Initiative::Measured);
         while p.persona_idx != 0 {
             p.cycle(-1);
         }
         assert!(!p.is_noop(), "persona Clear is a change");
         // A touched model spinner is a change too (#1666).
-        let mut m = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        let mut m = panel(Some("bob"), two_personas(), Initiative::Measured);
         m.down(); // persona → model
         m.cycle(1);
         assert!(!m.is_noop(), "a touched model spinner is a change");
@@ -2180,7 +2301,7 @@ Read the code and explain findings. Do not edit files or run commands.
         // #1666: the spinner opens ON the active model, ←/→ moves through the
         // served list, and chosen_model() reports None until touched.
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         assert_eq!(s.chosen_model(), None, "untouched spinner picks nothing");
         assert!(
             s.model_label().contains("m2") && s.model_label().contains("(active)"),
@@ -2222,7 +2343,7 @@ Read the code and explain findings. Do not edit files or run commands.
         let s = PanelState::new(seed(
             None,
             two_personas(),
-            Tenacity::Standard,
+            Initiative::Measured,
             Some(model_choices(&["m1", "m2"])),
             "ghost-model",
         ));
@@ -2240,7 +2361,7 @@ Read the code and explain findings. Do not edit files or run commands.
     fn an_unreachable_backend_disables_the_model_dial() {
         // #1666: no served list → the row says why, won't dial, never picks.
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = PanelState::new(seed(None, two_personas(), Tenacity::Standard, None, "m2"));
+        let mut s = PanelState::new(seed(None, two_personas(), Initiative::Measured, None, "m2"));
         assert!(
             s.model_label().contains("unreachable"),
             "{}",
@@ -2264,7 +2385,7 @@ Read the code and explain findings. Do not edit files or run commands.
                 ..Default::default()
             }),
         }];
-        let mut s = PanelState::new(seed(None, personas, Tenacity::Standard, None, ""));
+        let mut s = PanelState::new(seed(None, personas, Initiative::Measured, None, ""));
         s.cycle(1); // none → alice
         assert_eq!(
             s.projected_backend().as_deref(),
@@ -2277,7 +2398,7 @@ Read the code and explain findings. Do not edit files or run commands.
     #[test]
     fn persona_row_shows_active_and_maps_none_to_clear() {
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(Some("bob"), two_personas(), Tenacity::Standard);
+        let mut s = panel(Some("bob"), two_personas(), Initiative::Measured);
         assert_eq!(
             s.persona_action(),
             PersonaAction::Keep,
@@ -2304,7 +2425,7 @@ Read the code and explain findings. Do not edit files or run commands.
     fn wq_success_saves_then_signals_apply() {
         // review-3 §1: :wq whose save lands → close-with-apply, and `saved` records.
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         let mut persist = ok_persist();
         s.begin_command("wq alice");
         assert_eq!(
@@ -2320,7 +2441,7 @@ Read the code and explain findings. Do not edit files or run commands.
         // review-3 §1: a failed persist must NOT close/apply; the panel stays open
         // with a visible error and records nothing as saved.
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         // change a dial so we can prove it was NOT applied
         s.down(); // model
         s.down(); // cognition
@@ -2346,7 +2467,7 @@ Read the code and explain findings. Do not edit files or run commands.
     #[test]
     fn wq_exists_without_bang_is_refused_visibly() {
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         let mut persist = |name: &str, _c: &str, overwrite: bool| {
             if overwrite {
                 SaveResult::Saved {
@@ -2371,7 +2492,7 @@ Read the code and explain findings. Do not edit files or run commands.
     #[test]
     fn ex_commands_validate_visibly() {
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         let mut persist = ok_persist();
         // :wq with no name → refuse, stay open, visible status.
         s.begin_command("wq");
@@ -2397,7 +2518,7 @@ Read the code and explain findings. Do not edit files or run commands.
         // happened (`saved` set) but the loop was cancelled (applied = false) →
         // PanelOutcome::Saved, never a posture summary from the working copy.
         let _g = GlobalSettingsGuard::acquire();
-        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        let mut s = panel(None, two_personas(), Initiative::Measured);
         let mut persist = ok_persist();
         s.begin_command("w keep");
         s.run_command(&mut persist);
@@ -2425,49 +2546,52 @@ Read the code and explain findings. Do not edit files or run commands.
     fn close_outcome_downgrades_a_noop_enter_and_applies_a_real_one() {
         // Adversarial-review findings on #1665: (1) the Enter downgrade
         // `applied && !is_noop()` must be exercised through the REAL exit path;
-        // (2) the tenacity term of is_noop needs a tenacity-ONLY dirty case —
+        // (2) each dial term of is_noop needs a dial-ONLY dirty case —
         // dropping `!self.tenacity.is_dirty()` from is_noop silently discarded
         // a tenacity-only edit (apply() skipped, Cancelled returned).
         use newt_core::cognition::{set_cli_cognition, CognitionOverride};
+        use newt_core::initiative::{cli_initiative, set_cli_initiative};
         let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
+        set_cli_tenacity(Tenacity::Normal);
+        set_cli_initiative(Initiative::Measured);
 
         // Noop visit: Enter and Esc are indistinguishable — both Cancelled.
-        let s = panel(None, two_personas(), Tenacity::Standard);
+        let s = panel(None, two_personas(), Initiative::Measured);
         assert_eq!(close_outcome(true, &s), PanelOutcome::Cancelled);
         assert_eq!(close_outcome(false, &s), PanelOutcome::Cancelled);
-        assert_eq!(cli_tenacity(), Some(Tenacity::Standard), "nothing applied");
+        assert_eq!(cli_tenacity(), Some(Tenacity::Normal), "nothing applied");
 
+        let applied = PanelOutcome::Applied {
+            persona: PersonaAction::Keep,
+            model: None,
+            personality: vec![],
+        };
         // Tenacity-ONLY dirty + Enter → a real Applied, and the override is
         // actually written through apply().
-        let mut t = panel(None, two_personas(), Tenacity::Standard);
+        let mut t = panel(None, two_personas(), Initiative::Measured);
         t.down(); // persona → model
         t.down(); // model → cognition
         t.down(); // cognition → tenacity
-        t.cycle(1); // standard → insistent (dirty)
-        let out = close_outcome(true, &t);
-        assert_eq!(
-            out,
-            PanelOutcome::Applied {
-                persona: PersonaAction::Keep,
-                model: None,
-                personality: vec![],
-            }
-        );
+        t.cycle(1); // normal → relentless (dirty)
+        assert_eq!(close_outcome(true, &t), applied);
         assert_eq!(
             cli_tenacity(),
-            Some(Tenacity::Insistent),
+            Some(Tenacity::Relentless),
             "the tenacity-only edit was applied, not silently discarded"
         );
-        // The same dirty state WITHOUT the explicit apply stays Cancelled and
-        // writes nothing further.
-        set_cli_tenacity(Tenacity::Standard);
+        set_cli_tenacity(Tenacity::Normal);
         assert_eq!(close_outcome(false, &t), PanelOutcome::Cancelled);
-        assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
+        assert_eq!(cli_tenacity(), Some(Tenacity::Normal));
 
-        set_cli_cognition(CognitionOverride::Unset);
-        set_cli_tenacity(Tenacity::Standard);
+        // Initiative-ONLY dirty: the same, for the dial the split added.
+        let mut i = panel(None, two_personas(), Initiative::Measured);
+        for _ in 0..4 {
+            i.down(); // → initiative
+        }
+        i.cycle(1); // measured → decisive (dirty)
+        assert_eq!(close_outcome(true, &i), applied);
+        assert_eq!(cli_initiative(), Some(Initiative::Decisive));
     }
 
     #[test]
@@ -2530,7 +2654,7 @@ Keep this loaded prompt and its restrictions.
         assert!(store.load("reviewer").is_err(), "the source is absent");
         let choices = PersonaChoice::for_panel(Vec::new(), Some(&active));
         assert_eq!(choices, vec![PersonaChoice::from(active.clone())]);
-        let mut s = panel(Some("reviewer"), choices, Tenacity::Standard);
+        let mut s = panel(Some("reviewer"), choices, Initiative::Measured);
         let mut persist = |name: &str, content: &str, overwrite: bool| match store
             .save(name, content, overwrite)
         {

@@ -52,8 +52,8 @@
 use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
 
+use crate::initiative::Initiative;
 use crate::router::Tier;
-use crate::Tenacity;
 use crate::{Caveats, CountBound, Scope};
 
 /// A parsed role profile: a system-prompt overlay plus the optional toolset /
@@ -101,9 +101,10 @@ pub struct RoleProfile {
     /// default. The backend projects this semantic level onto its own request
     /// controls.
     pub cognition: Option<Cognition>,
-    /// TENACITY — how hard the harness pushes the read→act loop for this
-    /// persona. `None` = the session/global tenacity (`/tenacity`).
-    pub tenacity: Option<Tenacity>,
+    /// INITIATIVE — how much this persona looks before acting. `None` = the
+    /// model-family / config default. (Persona tenacity no longer exists:
+    /// tenacity is set only explicitly.)
+    pub initiative: Option<Initiative>,
     /// CREW — when `true`, this persona runs with the multi-agent crew (`/team`)
     /// on by default. `None`/`false` = single-agent. Enforcement is a follow-up.
     pub crew: Option<bool>,
@@ -296,7 +297,7 @@ pub enum Altitude {
 /// it onto a local generation policy.
 ///
 /// The ladder runs from the least reasoning the endpoint allows to the most
-/// (paired with [`Tenacity`] and crew under the `obsessive` persona). The
+/// (paired with tenacity and crew under the `obsessive` posture). The
 /// pre-rename labels (`glancing` … `contemplating`) are the one-time
 /// importer's job ([`crate::psyche_import`]), never accepted here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -412,7 +413,7 @@ struct FrontMatter {
     #[serde(default)]
     cognition: Option<Cognition>,
     #[serde(default)]
-    tenacity: Option<Tenacity>,
+    initiative: Option<Initiative>,
     #[serde(default)]
     crew: Option<bool>,
     #[serde(default)]
@@ -766,7 +767,7 @@ impl RoleProfile {
             altitude: fm.altitude,
             backend: fm.backend,
             cognition: fm.cognition,
-            tenacity: fm.tenacity,
+            initiative: fm.initiative,
             crew: fm.crew,
             personality: fm.personality,
         })
@@ -791,7 +792,7 @@ impl RoleProfile {
             altitude: self.altitude,
             backend: self.backend.clone(),
             cognition: self.cognition,
-            tenacity: self.tenacity,
+            initiative: self.initiative,
             crew: self.crew,
             personality: self.personality,
         };
@@ -816,7 +817,7 @@ impl RoleProfile {
             || self.altitude.is_some()
             || self.backend.is_some()
             || self.cognition.is_some()
-            || self.tenacity.is_some()
+            || self.initiative.is_some()
             || self.crew.is_some()
             || self.personality.is_some()
     }
@@ -931,7 +932,7 @@ You edit files and run builds.
 role = \"researcher\"
 backend = \"sol\"
 cognition = \"meticulous\"
-tenacity = \"relentless\"
+initiative = \"eager\"
 crew = true
 +++
 
@@ -943,7 +944,7 @@ You are Bob, a researcher.
         assert_eq!(rp.role.as_deref(), Some("researcher"));
         assert_eq!(rp.backend.as_deref(), Some("sol"));
         assert_eq!(rp.cognition, Some(Cognition::Meticulous));
-        assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
+        assert_eq!(rp.initiative, Some(Initiative::Eager));
         assert_eq!(rp.crew, Some(true));
         assert!(rp.is_role_bound());
         // The dial maps onto the OpenAI reasoning-effort wire value.
@@ -1046,7 +1047,7 @@ model = "local-test-model"
 backend = "local"
 tier = "REVIEW"
 cognition = "rational"
-tenacity = "relaxed"
+initiative = "patient"
 crew = false
 
 [caveats]
@@ -1072,7 +1073,7 @@ max_calls = 7
         assert_eq!(styled.backend, baseline.backend);
         assert_eq!(styled.tier, baseline.tier);
         assert_eq!(styled.cognition, baseline.cognition);
-        assert_eq!(styled.tenacity, baseline.tenacity);
+        assert_eq!(styled.initiative, baseline.initiative);
         assert_eq!(styled.crew, baseline.crew);
         assert_eq!(styled.caveats, baseline.caveats);
         let mut escaped = styled.clone();

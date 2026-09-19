@@ -188,7 +188,9 @@ impl Harness {
             model: std::env::var("NEWT_DGX_MODEL").ok(),
             cognition: newt_core::cognition::cli_cognition(),
             tenacity: newt_core::tenacity::cli_tenacity(),
+            initiative: newt_core::initiative::cli_initiative(),
             persona_cognition: newt_core::cognition::persona_cognition(),
+            persona_initiative: newt_core::initiative::persona_initiative(),
             persona: self.active_persona.as_ref().map(|p| p.name.clone()),
             scratchpad,
             plan_steps: self.step_ledger.steps(),
@@ -225,7 +227,9 @@ struct Snapshot {
     model: Option<String>,
     cognition: newt_core::cognition::CognitionOverride,
     tenacity: Option<newt_core::Tenacity>,
+    initiative: Option<newt_core::Initiative>,
     persona_cognition: Option<newt_core::role_profile::Cognition>,
+    persona_initiative: Option<newt_core::Initiative>,
     // conversation-owned live state
     persona: Option<String>,
     scratchpad: Vec<(String, String)>,
@@ -402,6 +406,70 @@ fn a_rowless_tab_keeps_its_own_persona_across_a_visit_to_another() {
     assert!(
         !h.store.exists(&b).unwrap(),
         "and visiting a tab still creates no ghost /resume row"
+    );
+}
+
+/// Regression (slice 1b): a fresh tab re-seats its persona's INITIATIVE, not
+/// only its cognition. The Fresh arm re-seated persona cognition alone, so
+/// the outgoing tab's persona tenacity (now initiative) stayed installed in
+/// the incoming tab.
+#[test]
+fn a_fresh_tab_reseats_its_personas_initiative() {
+    let _g = guard();
+    let (mut h, mut tabs) = Harness::new(&["sol"]);
+    let dir = h._root.path().join("personas");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("eager.md"),
+        "+++\ninitiative = \"eager\"\n+++\n\nAct early.",
+    )
+    .unwrap();
+    std::fs::write(dir.join("calm.md"), "Take your time.").unwrap();
+    h.persona_store = crate::PersonaStore::new(dir);
+    let eager = h.persona_store.load("eager").unwrap();
+    let calm = h.persona_store.load("calm").unwrap();
+    assert_eq!(eager.profile.initiative, Some(newt_core::Initiative::Eager));
+    let a = h.active_conversation_id.clone();
+    h.store.create_with_id(&a, "A", None).unwrap();
+
+    // B opens under `eager`.
+    h.active_persona = Some(eager.clone());
+    crate::seat_persona_dials(Some(&eager));
+    {
+        let mut ctx = h.ctx();
+        let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
+    }
+    // Back in A, the operator activates `calm`, which declares no initiative.
+    {
+        let mut ctx = h.ctx();
+        activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+    }
+    h.active_persona = Some(calm.clone());
+    crate::seat_persona_dials(Some(&calm));
+    assert_eq!(newt_core::initiative::persona_initiative(), None);
+
+    // Returning to rowless B re-seats B's persona and its initiative.
+    {
+        let mut ctx = h.ctx();
+        activate_tab(&mut ctx, &mut tabs, 1).unwrap();
+    }
+    assert_eq!(
+        h.active_persona.as_ref().map(|p| p.name.as_str()),
+        Some("eager")
+    );
+    assert_eq!(
+        newt_core::initiative::persona_initiative(),
+        Some(newt_core::Initiative::Eager),
+        "the fresh tab's persona initiative is back in force"
+    );
+    {
+        let mut ctx = h.ctx();
+        activate_tab(&mut ctx, &mut tabs, 0).unwrap();
+    }
+    assert_eq!(
+        newt_core::initiative::persona_initiative(),
+        None,
+        "and does not leak into a tab without it"
     );
 }
 
@@ -1630,6 +1698,7 @@ fn activation_is_history_independent_over_the_full_projected_state() {
                 &newt_core::OperatorPreferencePin {
                     backend: Some("other".into()),
                     tenacity: Some(newt_core::Tenacity::Relentless),
+                    initiative: Some(newt_core::Initiative::Eager),
                     ..Default::default()
                 },
             )
@@ -1675,7 +1744,9 @@ fn activation_is_history_independent_over_the_full_projected_state() {
     assert_eq!(via_a.model, via_c.model);
     assert_eq!(via_a.cognition, via_c.cognition);
     assert_eq!(via_a.tenacity, via_c.tenacity);
+    assert_eq!(via_a.initiative, via_c.initiative);
     assert_eq!(via_a.persona_cognition, via_c.persona_cognition);
+    assert_eq!(via_a.persona_initiative, via_c.persona_initiative);
     assert_eq!(via_a.inf_url, via_c.inf_url);
     assert_eq!(via_a.inf_model, via_c.inf_model);
     assert_eq!(via_a.inf_kind, via_c.inf_kind);
@@ -1699,6 +1770,7 @@ fn activation_is_history_independent_over_the_full_projected_state() {
         via_a.tenacity, None,
         "and A's tenacity never survives into B, from either predecessor"
     );
+    assert_eq!(via_a.initiative, None, "nor A's initiative");
 }
 
 // ── 13. authority/security state is untouched by tab machinery ────────
@@ -1726,6 +1798,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
                 backend: Some("other".into()),
                 cognition: Some("meticulous".into()),
                 tenacity: Some(newt_core::Tenacity::Relentless),
+                initiative: Some(newt_core::Initiative::Eager),
                 model: Some("m0".into()),
             },
         )
@@ -1775,13 +1848,14 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
     }
 
     // And the pin itself cannot carry authority: its axes are exactly the
-    // four preference axes, so there is nothing security-shaped to migrate.
+    // five preference axes, so there is nothing security-shaped to migrate.
     let pin = h.store.preference_pin(&b).unwrap().unwrap();
     let newt_core::OperatorPreferencePin {
         backend: _,
         model: _,
         cognition: _,
         tenacity: _,
+        initiative: _,
     } = pin;
 }
 
@@ -1843,6 +1917,37 @@ fn materialized_tab_restores_its_later_selected_persona() {
         Some("birth"),
         "session selection must not rewrite historical birth metadata"
     );
+}
+
+/// Regression (slice 1b): a conversation restore re-seats the restored
+/// persona's INITIATIVE. `commit_conversation_restore` re-seated persona
+/// cognition alone, so the outgoing persona's tenacity (now initiative)
+/// carried into the restored conversation.
+#[test]
+fn a_restored_conversation_reseats_its_personas_initiative() {
+    let _g = guard();
+    let (mut h, mut tabs) = materialized_persona_fixture();
+    std::fs::write(
+        &h.active_persona.as_ref().unwrap().path,
+        "+++\ninitiative = \"eager\"\n+++\n\nThe persona selected later in this tab.",
+    )
+    .unwrap();
+    let b = h.durable("B");
+    h.open_tab_on(&mut tabs, &b);
+    assert_eq!(
+        newt_core::initiative::persona_initiative(),
+        None,
+        "B has none"
+    );
+
+    activate_tab(&mut h.ctx(), &mut tabs, 0).unwrap();
+    assert_eq!(
+        newt_core::initiative::persona_initiative(),
+        Some(newt_core::Initiative::Eager),
+        "the restored persona's initiative is in force"
+    );
+    activate_tab(&mut h.ctx(), &mut tabs, 1).unwrap();
+    assert_eq!(newt_core::initiative::persona_initiative(), None);
 }
 
 /// Grounds the name-only snapshot with a real file replacement: switching back

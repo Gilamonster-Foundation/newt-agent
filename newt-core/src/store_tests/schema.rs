@@ -51,6 +51,7 @@ fn preference_pin_round_trips_defaults_empty_and_is_workspace_fenced() {
         model: Some("gpt-5.6-sol".into()),
         cognition: Some("off".into()),
         tenacity: Some(crate::Tenacity::Relentless),
+        initiative: Some(crate::Initiative::Decisive),
     };
     store_a.update_preference_pin(&id, &pin).unwrap();
     assert_eq!(store_a.preference_pin(&id).unwrap(), Some(pin.clone()));
@@ -157,7 +158,7 @@ fn update_preference_pin_does_not_tick_activity() {
         .update_preference_pin(
             &older,
             &crate::OperatorPreferencePin {
-                tenacity: Some(crate::Tenacity::Relaxed),
+                initiative: Some(crate::Initiative::Patient),
                 ..Default::default()
             },
         )

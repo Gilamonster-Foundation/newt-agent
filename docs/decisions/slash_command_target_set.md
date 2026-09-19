@@ -218,6 +218,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/undo-lock` | — | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/cognition` | — | retired → `/settings cognition` | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
 | `/detail` | — | `/` command | Tuning | absorb → `/settings detail` | `~/.newt/receipts.jsonl` |
+| `/settings initiative` | — | field of `/settings` | Tuning | absorb → `/settings initiative` | `~/.newt/receipts.jsonl` |
 | `/loadout` | — | retired → `/status loadout` | Tuning | keep — it performs | — read-only |
 | `/markdown` | — | `/` command | Tuning | absorb → `/settings markdown` | `~/.newt/receipts.jsonl` |
 | `/mode` | — | `/` command | Tuning | absorb → `/settings mode` | `~/.newt/receipts.jsonl` |
@@ -232,6 +233,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**74 registered, 43 of them typed as `/` commands (53 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: settings 14 · events 6 · read-only 36 · **missing 18**.
+**75 registered, 43 of them typed as `/` commands (53 tokens).** Absorb 16 · keep 56 · panel 3. Receipts: settings 15 · events 6 · read-only 36 · **missing 18**.
 
 <!-- END GENERATED -->

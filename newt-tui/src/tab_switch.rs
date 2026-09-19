@@ -344,11 +344,7 @@ impl TabSwitchCtx<'_> {
                     .as_ref()
                     .and_then(|s| s.persona.clone());
                 *self.active_persona = seeded;
-                newt_core::cognition::set_persona_cognition(
-                    self.active_persona
-                        .as_ref()
-                        .and_then(|p| p.profile.cognition),
-                );
+                crate::seat_persona_dials(self.active_persona.as_ref());
                 *self.system = crate::rebuild_system_prompt(
                     self.workspace,
                     self.memory,

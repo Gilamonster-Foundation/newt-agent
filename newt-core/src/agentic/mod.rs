@@ -2226,7 +2226,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
-        tenacity: crate::tenacity::effective_tenacity(),
+        initiative: crate::initiative::effective_initiative(),
         ..Default::default()
     };
     // The matching workflow's round-cap grace horizon override, resolved once
@@ -2353,11 +2353,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // stop exploring and call edit_file or write_file.  This breaks the
         // "endless exploration → empty response" failure mode seen with some
         // local models (e.g. nemotron3:33b).
-        // The action-forcing threshold is now a `Tenacity` level rather than a
-        // magic constant (#tenacity). `Standard` preserves the historical value
-        // of 3; config + per-family wiring that lets an operator raise it lands
-        // in a follow-up, plugging into exactly this seam.
-        let read_only_nudge_after = crate::tenacity::Tenacity::Standard.read_only_nudge_after();
+        // The action-forcing threshold is an initiative level rather than a
+        // magic constant. This loop keeps `Measured` (built-in 3, or its
+        // `[initiative.rounds]` value) whatever the dial says; honouring the
+        // dial here is a separate change, plugging into exactly this seam.
+        let read_only_nudge_after = crate::initiative::Initiative::Measured.read_only_nudge_after();
         if action_nudges && read_only_rounds >= read_only_nudge_after {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
@@ -4371,12 +4371,12 @@ struct WorkflowRuntimeState {
     progress_horizon_rounds: Option<usize>,
     step_lock_nudges: usize,
     rediscovery_nudges: usize,
-    /// How hard to push the model from reading to acting (#tenacity). Set once
-    /// per turn from [`crate::tenacity::effective_tenacity`]; `Default` is
-    /// `Standard`, the behaviour-preserving level.
-    tenacity: crate::tenacity::Tenacity,
+    /// How much to let the model look before pushing it to act. Set once per
+    /// turn from [`crate::initiative::effective_initiative`]; `Default` is
+    /// `Measured`, the behaviour-preserving level.
+    initiative: crate::initiative::Initiative,
     /// Consecutive tool rounds this turn that modified nothing in the workspace.
-    /// Reset on any workspace-write round; drives the tenacity action-forcing
+    /// Reset on any workspace-write round; drives the initiative action-forcing
     /// nudge.
     consecutive_read_only_rounds: usize,
 }
@@ -4427,7 +4427,7 @@ impl WorkflowRuntimeState {
     }
 
     fn record_round_outcome(&mut self, round_wrote: bool, round_progress: bool) {
-        // Tenacity counter (#tenacity): consecutive rounds that changed nothing
+        // Initiative counter: consecutive rounds that changed nothing
         // in the workspace. Unconditional — independent of the error-evidence
         // workflow below — so it drives action-forcing on ANY task, not only
         // diagnosed failures.
@@ -4479,20 +4479,20 @@ impl WorkflowRuntimeState {
         ))
     }
 
-    /// Tenacity action-forcing nudge (#tenacity): once the model has spent the
-    /// tenacity level's budget of consecutive read-only rounds without touching
-    /// the workspace, inject the standard "stop exploring, make the change" nudge
+    /// Initiative action-forcing nudge: once the model has spent the initiative
+    /// level's budget of consecutive read-only rounds without touching the
+    /// workspace, inject the standard "stop exploring, make the change" nudge
     /// and reset the counter so it re-accumulates before firing again. This is
     /// the answer to the measured ceiling where a capable model reads/plans for
-    /// its whole budget and never edits. `Standard` (budget 3) reproduces the
-    /// historical Ollama-loop threshold; higher tenacity forces sooner.
+    /// its whole budget and never edits. `Measured` (budget 3 by default)
+    /// reproduces the historical Ollama-loop threshold; higher levels force sooner.
     fn action_forcing_nudge(
         &mut self,
         remaining_rounds: usize,
         step_ledger: Option<&dyn scheduled::StepLedger>,
         delegate_hint: Option<&str>,
     ) -> Option<String> {
-        if self.consecutive_read_only_rounds < self.tenacity.read_only_nudge_after() {
+        if self.consecutive_read_only_rounds < self.initiative.read_only_nudge_after() {
             return None;
         }
         let nudge = read_only_action_nudge(
@@ -6771,7 +6771,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
-        tenacity: crate::tenacity::effective_tenacity(),
+        initiative: crate::initiative::effective_initiative(),
         ..Default::default()
     };
     // See the Ollama path: a matching workflow's grace-horizon override.
@@ -6869,18 +6869,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
-            // Tenacity action-forcing (#tenacity): the OpenAI-chat loop had no
-            // read-only action nudge (only the Ollama loop did), so a model
-            // driven here could read/plan its whole budget without ever editing.
-            // Fire the tenacity nudge once the read-only budget is spent.
+            // Initiative action-forcing: the OpenAI-chat loop had no read-only
+            // action nudge (only the Ollama loop did), so a model driven here
+            // could read/plan its whole budget without ever editing. Fire the
+            // nudge once the initiative level's read-only budget is spent.
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
             {
                 if debug {
                     print_debug(
                         &format!(
-                            "tenacity[{}]: forcing action, read-only budget spent (round {round})",
-                            workflow_runtime.tenacity
+                            "initiative[{}]: forcing action, read-only budget spent (round {round})",
+                            workflow_runtime.initiative
                         ),
                         color,
                     );
@@ -9273,7 +9273,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
-        tenacity: crate::tenacity::effective_tenacity(),
+        initiative: crate::initiative::effective_initiative(),
         ..Default::default()
     };
     // See the OpenAI path: a matching workflow's grace-horizon override.
@@ -9368,15 +9368,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
-            // Tenacity action-forcing — mirrors the OpenAI path.
+            // Initiative action-forcing — mirrors the OpenAI path.
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
             {
                 if debug {
                     print_debug(
                         &format!(
-                            "tenacity[{}]: forcing action, read-only budget spent (round {round})",
-                            workflow_runtime.tenacity
+                            "initiative[{}]: forcing action, read-only budget spent (round {round})",
+                            workflow_runtime.initiative
                         ),
                         color,
                     );

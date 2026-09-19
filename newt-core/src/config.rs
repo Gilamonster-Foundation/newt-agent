@@ -211,12 +211,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
 
-    /// `[tenacity]` — how hard the harness pushes the model from reading to
-    /// acting: a baseline level plus per-model-family overrides. `None` → the
-    /// behaviour-preserving `Standard`. An explicit `--tenacity` supersedes it.
-    /// See [`crate::tenacity::TenacityConfig`].
+    /// `[initiative]` — how much the model looks before acting: a baseline
+    /// level, per-model-family defaults, and the read-only rounds behind each
+    /// level. `None` → `Measured` with the built-in rounds. An explicit
+    /// `--initiative` or a persona's `initiative` supersedes it. See
+    /// [`crate::initiative::InitiativeConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenacity: Option<crate::tenacity::TenacityConfig>,
+    pub initiative: Option<crate::initiative::InitiativeConfig>,
 
     /// `[tool_exposure]` — the progressive tool-schema controller (Pass 1).
     /// `None` → [`ExposureProfile::Full`] (identity; advertise the full
@@ -1335,7 +1336,7 @@ impl Default for Config {
             smart_harness: None,
             context: None,
             tools: None,
-            tenacity: None,
+            initiative: None,
             tool_exposure: None,
             pricing: None,
             memory: None,
@@ -1677,10 +1678,11 @@ impl Config {
         crate::agentic::set_max_output_tokens(self.max_output_tokens());
         crate::agentic::set_output_head_tokens(self.output_head_tokens());
         crate::agentic::set_output_cap_chars_per_token(self.output_cap_chars_per_token());
-        // #tenacity: publish the resolved `[tenacity]` config so
-        // `effective_tenacity` can pick the per-family default for the active
-        // model. An explicit `--tenacity` still supersedes it.
-        crate::tenacity::set_tenacity_config(self.tenacity.clone().unwrap_or_default());
+        // Publish the resolved `[initiative]` config so `effective_initiative`
+        // can pick the per-family default for the active model and every
+        // level reads its configured round count. An explicit `--initiative`
+        // or persona still supersedes the level.
+        crate::initiative::set_initiative_config(self.initiative.clone().unwrap_or_default());
         // #880: publish the repo `[lifecycle]` overrides so the crew's normalize
         // (and future phase consumers) honor them.
         if let Some(lc) = &self.lifecycle {

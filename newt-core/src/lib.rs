@@ -18,7 +18,7 @@ pub mod card_catalog;
 pub mod caveats;
 pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a
-/// persona's `cognition:` (psyche sibling of [`tenacity`]).
+/// persona's `cognition:` (psyche sibling of [`tenacity`] and [`initiative`]).
 pub mod cognition;
 pub mod config;
 pub mod confined_exec;
@@ -45,6 +45,9 @@ pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
 pub mod grounding;
+/// The initiative dial: how much the agent looks before acting (split from
+/// [`tenacity`]), with the per-model-family defaults.
+pub mod initiative;
 pub mod interaction_adapter;
 pub mod interaction_form;
 pub mod interaction_gate;
@@ -109,7 +112,8 @@ pub mod prompt;
 pub mod provider_preset;
 pub mod prune;
 /// Psyche posture macros (e.g. `obsessive`) — named acts that move several
-/// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once.
+/// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once,
+/// and the per-turn capture of all three dials.
 pub mod psyche;
 /// One-time importer for the psyche vocabulary rename (deletable after one release).
 pub mod psyche_import;
@@ -139,7 +143,7 @@ pub mod symbols;
 pub mod templates;
 pub mod tenacity;
 /// A shared RAII guard for tests that touch the process-global operator settings
-/// (cognition / tenacity / `NEWT_*`) — one lock + Drop-restored snapshot.
+/// (cognition / tenacity / initiative / `NEWT_*`) — one lock + Drop-restored snapshot.
 pub mod test_guard;
 /// Self-scheduled wake-up timers — see `timer` module docs.
 pub mod timer;
@@ -238,6 +242,7 @@ pub use conversation::{
     ConversationSummary, ConversationTurn, ExecOutcome, PhantomReach, PhantomResolution, ToolEvent,
 };
 pub use ffi_surface::FfiSurfaceProvider;
+pub use initiative::Initiative;
 pub use navigator::{
     compare_ledgers, compare_semantic_lexical, execute_nav_tool, export_ledger_json,
     export_ledger_markdown, find_callees, find_callers, find_hierarchy, find_implementations,

@@ -162,7 +162,7 @@ fn a_non_plan_disposition_is_not_asked_without_an_exit_request() {
 }
 
 /// #2424: the seeded implementation turn carries the approved draft when
-/// there is one, and ALWAYS carries the tenacity exit guidance — that
+/// there is one, and ALWAYS carries the initiative exit guidance — that
 /// guidance used to be `exit_plan_mode`'s own ack; this is the turn it now
 /// belongs to.
 #[test]

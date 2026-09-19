@@ -356,6 +356,7 @@ struct InFlight {
 struct HeadlessRuntimePosture {
     cognition: Option<crate::role_profile::Cognition>,
     tenacity: crate::tenacity::Tenacity,
+    initiative: crate::initiative::Initiative,
     crew_runner: Option<Arc<dyn CrewRunner>>,
     scratchpad: Option<Arc<dyn ScratchpadStore>>,
     compress_state: Arc<tokio::sync::Mutex<super::CompressState>>,
@@ -366,6 +367,7 @@ impl HeadlessRuntimePosture {
         Self {
             cognition: crate::cognition::effective_cognition(),
             tenacity: crate::tenacity::effective_tenacity(),
+            initiative: crate::initiative::effective_initiative(),
             crew_runner: None,
             scratchpad: None,
             compress_state: Arc::new(tokio::sync::Mutex::new(super::CompressState::new())),
@@ -436,6 +438,15 @@ impl TurnDriver {
     #[must_use]
     pub fn with_tenacity(mut self, tenacity: crate::tenacity::Tenacity) -> Self {
         self.runtime.tenacity = tenacity;
+        self
+    }
+
+    /// Pin the initiative (the read-only nudge and the plan-exit edit) used by
+    /// every resolver read in this driver's turns. The default is captured
+    /// from the process posture at construction.
+    #[must_use]
+    pub fn with_initiative(mut self, initiative: crate::initiative::Initiative) -> Self {
+        self.runtime.initiative = initiative;
         self
     }
 
@@ -597,11 +608,12 @@ async fn run_one_turn(
     messages: &[MemMessage],
     task: &str,
 ) -> Result<TurnOutcome, String> {
-    // Freeze every lazy `effective_tenacity()` read beneath `chat_complete`
-    // (workflow state and exit_plan_mode included) to the posture captured by
-    // this driver. The current-thread runtime keeps this RAII TLS guard on the
-    // dedicated turn thread for the entire future.
+    // Freeze every lazy `effective_tenacity()` / `effective_initiative()` read
+    // beneath `chat_complete` (workflow state and exit_plan_mode included) to
+    // the posture captured by this driver. The current-thread runtime keeps
+    // these RAII TLS guards on the dedicated turn thread for the entire future.
     let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
+    let _initiative = crate::initiative::scoped_effective_initiative(runtime.initiative);
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
     // borrows these mutably; the borrows release when `ctx` is consumed by the
     // await below, after which they move into the TurnOutcome.
@@ -885,26 +897,31 @@ mod tests {
     #[test]
     fn constructors_capture_the_current_runtime_posture() {
         use crate::cognition::{set_cli_cognition, CognitionOverride};
+        use crate::initiative::{set_cli_initiative, Initiative};
         use crate::role_profile::Cognition;
         use crate::tenacity::{set_cli_tenacity, Tenacity};
         use crate::test_guard::GlobalSettingsGuard;
 
         let _settings = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Set(Cognition::Rational));
-        set_cli_tenacity(Tenacity::Insistent);
+        set_cli_tenacity(Tenacity::Relentless);
+        set_cli_initiative(Initiative::Decisive);
         let empty = TurnDriver::new(cfg("http://placeholder"));
 
         set_cli_cognition(CognitionOverride::Off);
-        set_cli_tenacity(Tenacity::Relaxed);
+        set_cli_tenacity(Tenacity::Normal);
+        set_cli_initiative(Initiative::Patient);
         let seeded = TurnDriver::with_transcript(
             cfg("http://placeholder"),
             vec![MemMessage::user("already started")],
         );
 
         assert_eq!(empty.runtime.cognition, Some(Cognition::Rational));
-        assert_eq!(empty.runtime.tenacity, Tenacity::Insistent);
+        assert_eq!(empty.runtime.tenacity, Tenacity::Relentless);
+        assert_eq!(empty.runtime.initiative, Initiative::Decisive);
         assert_eq!(seeded.runtime.cognition, None);
-        assert_eq!(seeded.runtime.tenacity, Tenacity::Relaxed);
+        assert_eq!(seeded.runtime.tenacity, Tenacity::Normal);
+        assert_eq!(seeded.runtime.initiative, Initiative::Patient);
     }
 
     /// Pump the driver to completion the way a crossterm loop would: poll on an
@@ -1416,6 +1433,7 @@ mod tests {
         args: serde_json::Value,
         caveats: Caveats,
         tenacity: crate::tenacity::Tenacity,
+        initiative: crate::initiative::Initiative,
     }
 
     struct RecordingCrewRunner {
@@ -1442,6 +1460,7 @@ mod tests {
                 args: args.clone(),
                 caveats: caveats.clone(),
                 tenacity: crate::tenacity::effective_tenacity(),
+                initiative: crate::initiative::effective_initiative(),
             });
             Ok("crew ran: diff +3/-1; just check PASS".to_string())
         }
@@ -1491,15 +1510,18 @@ mod tests {
         let weak_runner = Arc::downgrade(&runner);
 
         let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
-        crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Standard);
+        crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Normal);
+        crate::initiative::set_cli_initiative(crate::initiative::Initiative::Measured);
 
         let mut config = cfg(&server.uri());
         config.caveats = expected_caveats.clone();
         let mut driver = TurnDriver::new(config)
             .with_cognition(Some(crate::role_profile::Cognition::Rational))
             .with_tenacity(crate::tenacity::Tenacity::Relentless)
+            .with_initiative(crate::initiative::Initiative::Eager)
             .with_crew_runner(runner.clone());
-        crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Relaxed);
+        crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Normal);
+        crate::initiative::set_cli_initiative(crate::initiative::Initiative::Patient);
         drop(runner);
         assert!(
             weak_runner.upgrade().is_some(),
@@ -1519,6 +1541,7 @@ mod tests {
                 args: expected_args,
                 caveats: expected_caveats,
                 tenacity: crate::tenacity::Tenacity::Relentless,
+                initiative: crate::initiative::Initiative::Eager,
             }]
         );
 

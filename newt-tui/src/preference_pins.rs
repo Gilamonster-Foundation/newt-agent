@@ -38,6 +38,8 @@ pub(crate) struct PreferenceBaseline {
     pub cognition: newt_core::cognition::CognitionOverride,
     /// The `/tenacity` override the invocation started with.
     pub tenacity: Option<newt_core::Tenacity>,
+    /// The `/psyche initiative` override the invocation started with.
+    pub initiative: Option<newt_core::Initiative>,
 }
 
 impl PreferenceBaseline {
@@ -49,6 +51,7 @@ impl PreferenceBaseline {
             model,
             cognition: newt_core::cognition::cli_cognition(),
             tenacity: newt_core::tenacity::cli_tenacity(),
+            initiative: newt_core::initiative::cli_initiative(),
         }
     }
 }
@@ -181,7 +184,8 @@ pub(crate) fn apply_startup_preference_pin(
 ///    switch (review finding 2). A persona's declared `backend:` still routes:
 ///    it is session state, not the outgoing conversation's.
 /// 2. **Apply the incoming conversation's own pin** through the SAME setters
-///    the live commands use — `set_cli_cognition` / `set_cli_tenacity`, and the
+///    the live commands use — `set_cli_cognition` / `set_cli_tenacity` /
+///    `set_cli_initiative`, and the
 ///    `NEWT_PROVIDER` / `NEWT_DGX_MODEL` env pair + [`refresh_backend`] with
 ///    `/backends`' clear-the-model-override semantics — validated against
 ///    `cfg.backends` first, and skipping any axis this invocation's explicit
@@ -266,6 +270,10 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
         Some(t) => newt_core::tenacity::set_cli_tenacity(t),
         None => newt_core::tenacity::clear_cli_tenacity(),
     }
+    match baseline.initiative {
+        Some(i) => newt_core::initiative::set_cli_initiative(i),
+        None => newt_core::initiative::clear_cli_initiative(),
+    }
     *base_provider = baseline.provider.clone();
     *base_model = baseline.model.clone();
 
@@ -281,6 +289,10 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
     if let Some(t) = plan.tenacity {
         newt_core::tenacity::set_cli_tenacity(t);
         applied.push(format!("tenacity {}", t.label()));
+    }
+    if let Some(i) = plan.initiative {
+        newt_core::initiative::set_cli_initiative(i);
+        applied.push(format!("initiative {}", i.label()));
     }
     // The backend axis the session should route on once the switch settles:
     // the pin if it names one, else the active persona's declared route, else
@@ -367,6 +379,7 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
         model: owned.model && pin.model.is_some(),
         cognition: owned.cognition && pin.cognition.is_some(),
         tenacity: owned.tenacity && pin.tenacity.is_some(),
+        initiative: owned.initiative && pin.initiative.is_some(),
     };
     if !suppressed.is_empty() {
         print_newt(

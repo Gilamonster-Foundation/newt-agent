@@ -8,7 +8,8 @@
 //!
 //! **Deletable after one release.** [`Cognition`](crate::role_profile::Cognition)
 //! accepts only the new labels; its `FromStr` reads [`renamed_cognition`] only
-//! to word its error.
+//! to word its error, as the tenacity and initiative parsers read
+//! [`split_tenacity`].
 
 use std::path::Path;
 
@@ -21,13 +22,34 @@ pub const LEGACY_COGNITION: [(&str, &str); 4] = [
     ("contemplating", "meticulous"),
 ];
 
-/// The new label for a pre-rename cognition label, if `old` is one.
-#[must_use]
-pub fn renamed_cognition(old: &str) -> Option<&'static str> {
-    LEGACY_COGNITION
+/// Old tenacity label → the initiative level that inherits its
+/// read-before-acting half. `relentless` also kept tenacity's round-cap lift,
+/// but only an explicit operator choice ever used that, and the importer only
+/// sees persona, config and pinned values.
+pub const LEGACY_TENACITY: [(&str, &str); 4] = [
+    ("relaxed", "patient"),
+    ("standard", "measured"),
+    ("insistent", "decisive"),
+    ("relentless", "eager"),
+];
+
+fn lookup(table: &[(&str, &'static str)], old: &str) -> Option<&'static str> {
+    table
         .iter()
         .find(|(legacy, _)| *legacy == old)
         .map(|(_, new)| *new)
+}
+
+/// The new label for a pre-rename cognition label, if `old` is one.
+#[must_use]
+pub fn renamed_cognition(old: &str) -> Option<&'static str> {
+    lookup(&LEGACY_COGNITION, old)
+}
+
+/// The initiative level for a pre-split tenacity label, if `old` is one.
+#[must_use]
+pub fn split_tenacity(old: &str) -> Option<&'static str> {
+    lookup(&LEGACY_TENACITY, old)
 }
 
 /// A persona file's text after migration, with one line per change made.
