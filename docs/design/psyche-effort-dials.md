@@ -28,7 +28,7 @@ harness can be held to.
 ```
 cognition:  zen — rational — thoughtful — meticulous — exhaustive
 tenacity:   normal — grit — resolute — relentless
-initiative: survey — measured — decisive — eager
+initiative: patient — measured — decisive — eager
 ```
 
 ### Cognition — how deeply it thinks at each step
@@ -66,7 +66,7 @@ are visible while they are tuned, and easy to hide later.
 
 | Level | Behaviour |
 |---|---|
-| survey | Nudge to act after 6 read-only rounds |
+| patient | Nudge to act after 12 read-only rounds — for models that explore with purpose, and tasks that must read a large file in pieces |
 | measured | After 3 — today's historical default |
 | decisive | After 2; `exit_plan_mode` must hand off to an edit |
 | eager | After 1; `exit_plan_mode` must hand off to an edit |
@@ -114,12 +114,15 @@ already have:
 | Today | Becomes |
 |---|---|
 | cognition `glancing` / `pondering` / `deliberating` / `contemplating` | `zen` / `rational` / `thoughtful` / `meticulous` |
-| tenacity `relaxed` / `standard` / `insistent` | initiative `survey` / `measured` / `decisive`; tenacity `normal` |
+| tenacity `relaxed` / `standard` / `insistent` | initiative `patient` / `measured` / `decisive`; tenacity `normal` |
 | tenacity `relentless` | initiative `eager` **and** tenacity `relentless` |
 | config `[tenacity]` per-family table | `[initiative]` per-family table |
 
 The importer rewrites persona front-matter and config keys once, on load, and
-reports what it changed. `exhaustive`, `grit`, and `resolute` have no old name.
+reports what it changed. One behaviour change rides the rename: the bottom
+initiative level moves from 6 read-only rounds (`relaxed`) to 12 (`patient`).
+No bundled persona, family default, or shipped config selects `relaxed` today;
+only test fixtures do. `exhaustive`, `grit`, and `resolute` have no old name.
 
 ## Out of scope
 
