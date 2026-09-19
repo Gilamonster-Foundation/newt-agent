@@ -607,11 +607,20 @@ pub(crate) fn cockpit_acceptance_case() {
         let mut enable_wrap = Vec::new();
         queue!(enable_wrap, EnableLineWrap).expect("enable-wrap bytes");
         let enable_wrap = String::from_utf8(enable_wrap).expect("wrap bytes are UTF-8");
+        // Held off from the modal's erase until it is answered: `modal_delta`
+        // is the snapshot taken just before the answer is typed.
         assert!(
-                !painted[before_modal_round..].contains(&enable_wrap),
-                "a modal must keep terminal autowrap disabled so a long answer cannot spill into chat: {:?}",
-                &painted[before_modal_round..]
-            );
+            !modal_delta[erased_at..].contains(&enable_wrap),
+            "a modal must keep terminal autowrap disabled so a long answer cannot spill into chat: {:?}",
+            &modal_delta[erased_at..]
+        );
+        // At rest the terminal must have wrap on again, or its next resize
+        // truncates the transcript instead of reflowing it.
+        assert!(
+            painted[prompt_at..].contains(&enable_wrap),
+            "autowrap must be restored once the modal closes: {:?}",
+            &painted[prompt_at..]
+        );
 
         // A slash command entered in a modal backs out to chat and leaves
         // corrective guidance in durable transcript space. The old path
