@@ -522,12 +522,7 @@ pub fn commands_from_messages(messages: &[serde_json::Value]) -> Vec<String> {
 /// Kept an env toggle to match the session-scoped `NEWT_NUDGE` /
 /// `NEWT_FULL_ACCESS` pattern.
 pub fn enabled() -> bool {
-    !std::env::var("NEWT_SELF_VERIFY").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false"
-        )
-    })
+    VerificationSettings::capture().enabled
 }
 
 /// How many directory levels below the workspace root the scan descends
@@ -621,19 +616,34 @@ fn collect_entry_names(
 /// a dependency's test suite. A symlink is still reported as a NAME, because a
 /// symlinked `Cargo.toml` is a real manifest.
 pub fn workspace_entries(dir: &std::path::Path) -> Vec<String> {
-    collect_entry_names(dir, MAX_DEPTH, MAX_ENTRIES, &|d| {
-        std::fs::read_dir(d)
-            .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter_map(|e| {
-                        let name = e.file_name().into_string().ok()?;
-                        let ft = e.file_type().ok()?;
-                        Some((name, ft.is_dir() && !ft.is_symlink()))
-                    })
-                    .collect()
+    workspace_entries_with_status(dir).0
+}
+
+/// Preserve the optional gate's partial scan while letting required pursuit
+/// distinguish an empty workspace from a directory it could not inspect.
+fn workspace_entries_with_status(dir: &std::path::Path) -> (Vec<String>, bool) {
+    let failed = std::cell::Cell::new(false);
+    let names = collect_entry_names(dir, MAX_DEPTH, MAX_ENTRIES, &|d| {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            failed.set(true);
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| {
+                let Ok(entry) = entry else {
+                    failed.set(true);
+                    return None;
+                };
+                let Ok(kind) = entry.file_type() else {
+                    failed.set(true);
+                    return None;
+                };
+                let name = entry.file_name().into_string().ok()?;
+                Some((name, kind.is_dir() && !kind.is_symlink()))
             })
-            .unwrap_or_default()
-    })
+            .collect()
+    });
+    (names, !failed.get())
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +652,13 @@ pub fn workspace_entries(dir: &std::path::Path) -> Vec<String> {
 // and whether a pass is still about the current workspace.
 // ---------------------------------------------------------------------------
 
+#[path = "self_verify_policy.rs"]
+mod policy;
+pub(crate) use policy::{
+    scoped_verification_settings, ScopedVerificationSettings, VerificationPolicy,
+    VerificationSettings,
+};
+
 use crate::ExecOutcome;
 use content_addressable::{ContentAddressable, ContentId, RawContentId};
 
@@ -649,7 +666,7 @@ use content_addressable::{ContentAddressable, ContentId, RawContentId};
 /// once per turn into `ChatCtx`. It is a mode of the gate, so it also needs
 /// [`enabled`].
 pub fn outcomes_enabled() -> bool {
-    outcomes_switch(std::env::var("NEWT_VERIFY_OUTCOMES").ok().as_deref())
+    VerificationSettings::capture().outcomes
 }
 
 /// How a `NEWT_VERIFY_OUTCOMES` value reads. **OFF by default**: only `1`,
@@ -740,6 +757,7 @@ pub struct VerificationLedger {
     ///
     /// [`ChatCtx::verify_outcomes`]: super::ChatCtx::verify_outcomes
     result_aware: bool,
+    policy: VerificationPolicy,
     /// The workspace's detected checks, scanned (off the async worker) when a
     /// pass needs them and dropped whenever a call may have created a check.
     checks: Option<Vec<VerifyCheck>>,
@@ -754,18 +772,24 @@ impl VerificationLedger {
             initial_tree: None,
             task: task.to_string(),
             result_aware,
+            policy: VerificationPolicy {
+                enabled: true,
+                result_aware,
+                required: false,
+            },
             checks: None,
         }
     }
 
     pub(crate) async fn for_workspace(
         task: &str,
-        result_aware: bool,
+        policy: VerificationPolicy,
         workspace: &str,
         gate_on: bool,
     ) -> Self {
-        let mut ledger = Self::for_turn(task, result_aware);
-        if gate_on && enabled() {
+        let mut ledger = Self::for_turn(task, policy.result_aware);
+        ledger.policy = policy;
+        if gate_on && policy.enabled {
             ledger.initial_tree = tree_state_off_worker(workspace).await;
         }
         ledger
@@ -781,8 +805,9 @@ impl VerificationLedger {
         task: &str,
         requested: &[String],
     ) -> Option<Vec<VerifyCheck>> {
-        let mut checks = detect_off_worker(workspace, task).await?;
-        if !checks.is_empty()
+        let mut checks = detect_off_worker(workspace, task, self.required()).await?;
+        if !self.policy.required
+            && !checks.is_empty()
             && self.initial_tree.is_some()
             && tree_state_off_worker(workspace).await == self.initial_tree
         {
@@ -805,9 +830,18 @@ impl VerificationLedger {
     /// created one. A failed scan is not cached.
     async fn checks(&mut self, workspace: &str) -> &[VerifyCheck] {
         if self.checks.is_none() {
-            self.checks = detect_off_worker(workspace, &self.task).await;
+            self.checks = detect_off_worker(workspace, &self.task, self.required()).await;
         }
         self.checks.as_deref().unwrap_or_default()
+    }
+
+    /// The turn's captured obligation, independent of advisory nudge settings.
+    pub(crate) fn required(&self) -> bool {
+        self.policy.required
+    }
+
+    pub(crate) fn gate_enabled(&self) -> bool {
+        self.policy.enabled
     }
 
     /// Whether this turn runs the result-aware gate.
@@ -896,9 +930,9 @@ impl VerificationLedger {
         gate_on: bool,
         round: usize,
         solve_obs: Option<&mut super::observability::SolveObservation>,
-    ) -> crate::TurnEndReason {
-        if !(self.result_aware && gate_on) {
-            return crate::TurnEndReason::RoundCap;
+    ) -> (crate::TurnEndReason, Option<VerificationReport>) {
+        if !(self.result_aware && self.policy.gate_on(gate_on)) {
+            return (crate::TurnEndReason::RoundCap, None);
         }
         let scanned = self.applicable_checks(workspace, &self.task, &[]).await;
         let (decision, report) = conclude(&Conclusion {
@@ -910,26 +944,33 @@ impl VerificationLedger {
             rounds_left: false,
         });
         let exhausted = decision == Decision::Stop(crate::TurnEndReason::RepairExhausted);
-        if let Some(obs) = solve_obs.filter(|_| exhausted || scanned.is_none()) {
+        let reason = match decision {
+            Decision::Stop(crate::TurnEndReason::VerificationIncomplete) if self.required() => {
+                crate::TurnEndReason::VerificationIncomplete
+            }
+            _ if exhausted => crate::TurnEndReason::RepairExhausted,
+            _ => crate::TurnEndReason::RoundCap,
+        };
+        if let Some(obs) = solve_obs.filter(|_| self.required() || exhausted || scanned.is_none()) {
             obs.behavior_signals
                 .push(super::observability::BehaviorSignal::Verification {
                     round,
                     decision: if exhausted {
                         "repair_exhausted"
-                    } else {
+                    } else if scanned.is_none() {
                         SCAN_FAILED
+                    } else if reason == crate::TurnEndReason::VerificationIncomplete {
+                        "verification_incomplete"
+                    } else {
+                        "round_cap"
                     }
                     .to_string(),
                     repairs_used: VERIFY_REPAIR_ALLOWANCE,
                     allowance: VERIFY_REPAIR_ALLOWANCE,
-                    report,
+                    report: report.clone(),
                 });
         }
-        if exhausted {
-            crate::TurnEndReason::RepairExhausted
-        } else {
-            crate::TurnEndReason::RoundCap
-        }
+        (reason, self.required().then_some(report))
     }
 
     /// The current tree state, computed (off the async worker) only when some
@@ -957,11 +998,23 @@ const NO_CHECKS: &str = "no_checks";
 
 /// [`detect_checks`] over a fresh [`workspace_entries`] scan, on the blocking
 /// pool. `None` when the scan task failed.
-async fn detect_off_worker(workspace: &str, task: &str) -> Option<Vec<VerifyCheck>> {
+async fn detect_off_worker(
+    workspace: &str,
+    task: &str,
+    required: bool,
+) -> Option<Vec<VerifyCheck>> {
     let (root, task) = (std::path::PathBuf::from(workspace), task.to_string());
-    tokio::task::spawn_blocking(move || detect_checks(&workspace_entries(&root), &task))
-        .await
-        .ok()
+    tokio::task::spawn_blocking(move || {
+        if required {
+            let (entries, complete) = workspace_entries_with_status(&root);
+            complete.then(|| detect_checks(&entries, &task))
+        } else {
+            Some(detect_checks(&workspace_entries(&root), &task))
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// [`workspace_tree_state`] on the blocking pool: it reads and hashes up to
@@ -977,6 +1030,7 @@ async fn tree_state_off_worker(workspace: &str) -> Option<ContentId> {
 /// A concluding answer as a loop sees it: what [`conclude_turn`] needs to
 /// detect the checks, read the requests, decide, and record the evidence.
 pub(crate) struct Concluding<'a> {
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
     pub messages: &'a [serde_json::Value],
     pub workspace: &'a str,
     /// The instruction the checks are detected against.
@@ -993,14 +1047,44 @@ pub(crate) struct Concluding<'a> {
 /// whose gate was never reached. The scan and the tree
 /// state run here, off the async worker, so only a real conclusion pays for
 /// them.
-pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> Decision {
+pub(crate) async fn conclude_turn(
+    turn: Concluding<'_>,
+    repairs_used: usize,
+) -> (Decision, VerificationReport) {
+    conclude_with_terminal(turn, repairs_used, None).await
+}
+
+/// Provider refusal is terminal; it never consumes a repair attempt or nudges
+/// the model to override the refusal. The same evidence engine records it.
+pub(crate) async fn refusal_answer(
+    turn: Concluding<'_>,
+    answer: &str,
+) -> (String, crate::TurnEndReason) {
+    let (decision, report) = conclude_with_terminal(turn, 0, Some("provider_refusal")).await;
+    let reason = match decision {
+        Decision::Stop(reason) => reason,
+        _ => unreachable!("a terminal refusal never continues"),
+    };
+    let text = if reason == crate::TurnEndReason::Cancelled {
+        String::new()
+    } else {
+        incomplete_answer(answer, &report)
+    };
+    (text, reason)
+}
+
+async fn conclude_with_terminal(
+    turn: Concluding<'_>,
+    repairs_used: usize,
+    terminal: Option<&str>,
+) -> (Decision, VerificationReport) {
     let requested = commands_from_messages(turn.messages);
     let scanned = turn
         .ledger
         .applicable_checks(turn.workspace, turn.task, &requested)
         .await;
     let checks = scanned.as_deref().unwrap_or_default();
-    let (decision, report) = conclude(&Conclusion {
+    let (mut decision, report) = conclude(&Conclusion {
         checks,
         requested: &requested,
         ledger: turn.ledger,
@@ -1008,11 +1092,21 @@ pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> 
         repairs_used,
         rounds_left: turn.rounds_left,
     });
+    if terminal.is_some() {
+        decision = Decision::Stop(crate::TurnEndReason::VerificationIncomplete);
+    }
+    // Scanning/tree hashing yield to other tasks; cancellation may arrive while
+    // those jobs run. Recheck before any caller can accept or spend a nudge.
+    if super::is_cancelled(turn.cancel) {
+        decision = Decision::Stop(crate::TurnEndReason::Cancelled);
+    }
     if let Some(obs) = turn.solve_obs {
         obs.behavior_signals
             .push(super::observability::BehaviorSignal::Verification {
                 round: turn.round,
                 decision: match &decision {
+                    Decision::Stop(crate::TurnEndReason::Cancelled) => "cancelled".to_string(),
+                    _ if terminal.is_some() => terminal.unwrap().to_string(),
                     _ if scanned.is_none() => SCAN_FAILED.to_string(),
                     _ if checks.is_empty() => NO_CHECKS.to_string(),
                     Decision::Accept => "accept".to_string(),
@@ -1024,10 +1118,10 @@ pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> 
                 },
                 repairs_used,
                 allowance: VERIFY_REPAIR_ALLOWANCE,
-                report,
+                report: report.clone(),
             });
     }
-    decision
+    (decision, report)
 }
 
 /// Everything one conclusion decision reads.
@@ -1099,6 +1193,37 @@ pub struct VerificationReport {
     pub checks: Vec<CheckReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_now: Option<String>,
+}
+
+/// Preserve the model's answer while clearly qualifying an incomplete finish.
+pub(crate) fn incomplete_answer(answer: &str, report: &VerificationReport) -> String {
+    let details = if report.checks.is_empty() {
+        "no usable verification check was found; provide a check or clarify the task".to_string()
+    } else {
+        report
+            .checks
+            .iter()
+            .filter(|check| check.status != CheckStatus::Passed)
+            .map(|check| format!("{}: {:?}", check.label, check.status))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let details = if details.is_empty() {
+        "checks passed, but task completion was not established".to_string()
+    } else {
+        details
+    };
+    format!("{answer}\n\n[Harness: verification incomplete — {details}. Task completion remains unverified; operator steering is available.]")
+}
+
+/// Qualify every strict cap summary, including provider/fallback summaries.
+pub(crate) fn cap_answer(answer: String, report: Option<&VerificationReport>) -> String {
+    match report {
+        None => answer,
+        Some(report) if !report.checks.is_empty() && report.checks.iter().all(|check| check.status == CheckStatus::Passed) =>
+            format!("{answer}\n\n[Harness: task incomplete — the round limit was reached. Verification passed, but task completion was not established.]"),
+        Some(report) => incomplete_answer(&answer, report),
+    }
 }
 
 /// One entry of the fallback chain: a mutation, addressed through the existing
@@ -1270,6 +1395,10 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
 }
 
 fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
+    if reports.is_empty() && c.ledger.required() {
+        return Decision::Stop(crate::TurnEndReason::VerificationIncomplete);
+    }
+
     let with = |wanted: &[CheckStatus]| {
         reports
             .iter()
@@ -1914,3 +2043,7 @@ mod tests {
         assert_eq!(verify_gate_nudge(&checks, &cmds), None);
     }
 }
+
+#[cfg(test)]
+#[path = "self_verify_resolute_tests.rs"]
+mod resolute_tests;
