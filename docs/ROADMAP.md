@@ -1158,6 +1158,21 @@ completed-view resize and cleanup, and the existing terminal acceptance tier.
 export, permission previews, shell/Git change discovery, and Mermaid renderer
 or settings state-machine adoption. Those remain subsequent functional slices.
 
+## Step 13.4 — Operator inspection of retained output and pending requests
+
+**Branch:** `step-13.4-spill-inspection` · **Issue:** #2444.
+
+**What:** F4 opens the existing bounded session archive from the rich cockpit,
+including during a turn. A shared read-only text viewer supports search and
+horizontal scrolling. Pending interactions expose their original prompt text
+through the same viewer without answering the request or losing the draft.
+
+**Tests:** archive snapshots and eviction, key dispatch and search, plus real
+terminal checks for input ownership, draft preservation and non-approval.
+
+**Out of scope:** mouse activation of native scrollback, immutable interpreter
+payloads bound to OCAP grants, expired-output recovery and exact patch export.
+
 ---
 
 # Phase 14 - `newt dgx` command suite (9 steps)

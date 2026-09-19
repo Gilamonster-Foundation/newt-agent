@@ -97,6 +97,8 @@ pub(crate) enum SurfaceRequest {
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
     SetTabs(Vec<crate::tab_bar::TabCell>),
+    #[cfg(feature = "live-spill")]
+    SetSpillArchive(std::sync::Arc<crate::completed_spill::CompletedSpillArchive>),
     /// #1669 cockpit: a turn is starting; this is the flag the session
     /// races its work against, so the terminal can trip it from Ctrl-C.
     /// A surface that does not read keys during a turn ignores this.
@@ -386,6 +388,14 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.notify(SurfaceRequest::SetTabs(tabs));
     }
 
+    #[cfg(feature = "live-spill")]
+    fn set_spill_archive(
+        &mut self,
+        archive: std::sync::Arc<crate::completed_spill::CompletedSpillArchive>,
+    ) {
+        self.notify(SurfaceRequest::SetSpillArchive(archive));
+    }
+
     fn turn_started(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.notify(SurfaceRequest::TurnStarted { cancel });
     }
@@ -490,6 +500,8 @@ pub(crate) fn pump_surface(
             } => surface.set_runtime_context(&model, &endpoint, gauge, &session),
             SurfaceRequest::SetBackgroundJobs(jobs) => surface.set_background_jobs(jobs),
             SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
+            #[cfg(feature = "live-spill")]
+            SurfaceRequest::SetSpillArchive(archive) => surface.set_spill_archive(archive),
             SurfaceRequest::TurnStarted { cancel } => surface.turn_started(cancel),
             SurfaceRequest::TurnEnded => surface.turn_ended(),
             SurfaceRequest::RunBang {
@@ -847,6 +859,10 @@ mod tests {
             surface.set_runtime_context("m", "http://h", Some((1, 2)), "s");
             surface.set_background_jobs(Vec::new());
             surface.set_tabs(vec![a_cell(1, true)]);
+            #[cfg(feature = "live-spill")]
+            surface.set_spill_archive(Arc::new(
+                crate::completed_spill::CompletedSpillArchive::default(),
+            ));
             surface.add_history("entry");
             surface.save_history();
             surface.reload().expect("served");
@@ -1019,6 +1035,8 @@ mod tests {
         runtime_context: usize,
         background_jobs: usize,
         tabs: usize,
+        #[cfg(feature = "live-spill")]
+        spill_archive: usize,
         turn_started: usize,
         turn_ended: usize,
         run_bang_escape: usize,
@@ -1033,7 +1051,8 @@ mod tests {
         /// forward. The count follows the BUILD rather than being relaxed to
         /// the smaller number for both — a rich build that dropped a
         /// forwarding impl must still fail here.
-        const METHODS: usize = if cfg!(feature = "rich-tui") { 13 } else { 12 };
+        const METHODS: usize =
+            12 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
 
         fn each(&self) -> Vec<(&'static str, usize)> {
             [
@@ -1044,6 +1063,8 @@ mod tests {
                 ("set_runtime_context", self.runtime_context),
                 ("set_background_jobs", self.background_jobs),
                 ("set_tabs", self.tabs),
+                #[cfg(feature = "live-spill")]
+                ("set_spill_archive", self.spill_archive),
                 ("turn_started", self.turn_started),
                 ("turn_ended", self.turn_ended),
                 ("run_bang_escape", self.run_bang_escape),
@@ -1124,6 +1145,13 @@ mod tests {
         }
         fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {
             self.background_jobs += 1;
+        }
+        #[cfg(feature = "live-spill")]
+        fn set_spill_archive(
+            &mut self,
+            _archive: Arc<crate::completed_spill::CompletedSpillArchive>,
+        ) {
+            self.spill_archive += 1;
         }
         fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {
             self.tabs += 1;

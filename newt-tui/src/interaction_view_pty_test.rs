@@ -898,6 +898,21 @@ fn a_resize_reflows_the_frame_and_still_restores_the_terminal() {
     );
 }
 
+/// Grounds the mocked inspection state machine: F4 and Enter must not answer
+/// the pending interpreter grant, and returning from inspection must leave the
+/// original decision usable on the same real terminal.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn inspect_pending_grant_returns_without_answering() {
+    let f = drive_present(24, 100, None, "\x1bOS\r\x1bOSd\r");
+    assert!(f.raw_during);
+    assert!(!f.raw_after);
+    assert!(f.tail.contains("inspect pending request"), "{:?}", f.tail);
+    assert!(f.tail.contains("Answer(\"deny\")"), "{:?}", f.tail);
+    assert!(!f.tail.contains("Answer(\"allow_once\")"));
+}
+
 /// **Narrow width: content degrades legibly rather than corrupting the frame.**
 ///
 /// Asserted on the GRID — cursor positioning applied — because `ratatui`

@@ -561,6 +561,8 @@ was launched in unless overridden."
   /spill excerpt         restore the multi-row excerpt for spilled results
   /spill last            open the newest retained result (rich, this session)
   /spill open <ID>       open the retained result named by a collapse marker
+  F4 (cockpit)           choose retained output without submitting a prompt
+  F4 (decision prompt)   inspect the pending request; Esc returns without answering
 
 While a tool is active, Up/Down scroll retained output. Space or Enter toggles
 the boundary: ⧉ expands up to the terminal's safe capacity; ▣ collapses it.

@@ -1385,7 +1385,9 @@ impl<W: Write> ToolDisplay<W> {
             .and_then(|renderer| renderer.retain_completed(output));
         // Just the command — it lands inside the fold marker's `[...]`, which
         // already frames it as the handle to reach for.
-        let recovery_hint = retained_id.map(|id| format!("/spill open {id}"));
+        let recovery_hint = retained_id
+            .zip(self.completed_spill_renderer.as_ref())
+            .map(|(id, renderer)| renderer.recovery_hint(id));
 
         if let Some((change, prefix, suffix)) = change {
             let rows = change.display_rows(&prefix, &suffix, self.cols.saturating_sub(2).max(1));

@@ -1243,6 +1243,13 @@ pub(crate) trait InputSurface {
     /// still compiling. `session_worker::tests::the_proxy_forwards_every_
     /// surface_method` exists to make that fail loudly instead.
     fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {}
+    /// Share the bounded retained-output archive with the terminal owner.
+    #[cfg(feature = "live-spill")]
+    fn set_spill_archive(
+        &mut self,
+        _archive: std::sync::Arc<crate::completed_spill::CompletedSpillArchive>,
+    ) {
+    }
     /// #1669 cockpit: a turn is starting, and this is the flag it races its
     /// work against. A surface that reads the keyboard WHILE a turn runs
     /// (the cockpit) trips it from Ctrl-C; every other surface leaves the
@@ -1866,6 +1873,8 @@ fn session_body(
     #[cfg(feature = "live-spill")]
     let completed_spills =
         std::sync::Arc::new(crate::completed_spill::CompletedSpillArchive::default());
+    #[cfg(feature = "live-spill")]
+    surface.set_spill_archive(completed_spills.clone());
     // #1998: the human-only per-session tool-round override used to be a local
     // right here, which is why the escalation #1965 documents was unrecoverable
     // — nothing outside this function could read it. It now lives in

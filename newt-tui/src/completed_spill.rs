@@ -10,7 +10,7 @@ const MAX_ENTRIES: usize = 64;
 const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct CompletedSpill {
     id: u64,
     lines: Arc<[String]>,
@@ -39,14 +39,17 @@ impl CompletedSpill {
     }
 }
 
+#[derive(Debug)]
 struct ArchiveState {
     next_id: u64,
+    inspection_available: bool,
     bytes: usize,
     entries: VecDeque<CompletedSpill>,
 }
 
 /// Session-owned archive. It never touches the conversation store or disk;
 /// oldest bodies are evicted when either the entry or byte budget is reached.
+#[derive(Debug)]
 pub(crate) struct CompletedSpillArchive {
     state: Mutex<ArchiveState>,
     max_entries: usize,
@@ -65,6 +68,7 @@ impl CompletedSpillArchive {
         Self {
             state: Mutex::new(ArchiveState {
                 next_id: 1,
+                inspection_available: false,
                 bytes: 0,
                 entries: VecDeque::new(),
             }),
@@ -125,6 +129,28 @@ impl CompletedSpillArchive {
             .cloned()
     }
 
+    /// Called only once the cockpit has installed its operator action.
+    #[cfg(all(unix, feature = "rich-tui"))]
+    pub(crate) fn enable_inspection(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inspection_available = true;
+    }
+
+    /// A bounded, stable inspection snapshot, newest first. Clones share bodies.
+    #[cfg(any(test, all(unix, feature = "rich-tui")))]
+    pub(crate) fn snapshot(&self) -> Vec<CompletedSpill> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn latest(&self) -> Option<CompletedSpill> {
         self.state
             .lock()
@@ -155,6 +181,19 @@ impl CompletedSpillArchive {
 /// `render_completed` returns 0, which the trait already defines as "the
 /// viewport could not take the screen". That is the truth here, not a stub.
 impl newt_core::agentic::CompletedSpillRenderer for CompletedSpillArchive {
+    fn recovery_hint(&self, id: u64) -> String {
+        let available = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inspection_available;
+        if available {
+            format!("F4 inspect · /spill open {id}")
+        } else {
+            format!("/spill open {id}")
+        }
+    }
+
     fn retain_completed(&self, output: &str) -> Option<u64> {
         Some(self.retain(output))
     }
@@ -175,6 +214,33 @@ impl newt_core::agentic::CompletedSpillRenderer for CompletedSpillArchive {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, feature = "rich-tui"))]
+    #[test]
+    fn markers_advertise_inspection_only_after_the_host_installs_it() {
+        use newt_core::agentic::CompletedSpillRenderer;
+        let archive = super::CompletedSpillArchive::default();
+        assert_eq!(archive.recovery_hint(7), "/spill open 7");
+        archive.enable_inspection();
+        assert_eq!(archive.recovery_hint(7), "F4 inspect · /spill open 7");
+    }
+
+    #[test]
+    fn inspection_snapshot_is_newest_first_and_survives_eviction() {
+        let archive = super::CompletedSpillArchive::with_limits(2, 1000, 500);
+        let first = archive.retain("first");
+        let second = archive.retain("second");
+        let snapshot = archive.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(super::CompletedSpill::id)
+                .collect::<Vec<_>>(),
+            [second, first]
+        );
+        archive.retain("third");
+        assert!(archive.get(first).is_none());
+        assert_eq!(snapshot[1].lines(), ["first"]);
+    }
     use super::*;
 
     /// The cockpit regression: an archive alone must mint ids, so a committed

@@ -196,7 +196,19 @@ mod terminal {
         u16::try_from(body + 3 + usize::from(input.options.is_none())).unwrap_or(u16::MAX)
     }
 
-    fn draw(frame: &mut ratatui::Frame, input: &ModalInput) {
+    fn draw(frame: &mut ratatui::Frame, input: &mut ModalInput) {
+        if let Some(inspection) = &mut input.inspection {
+            let body = crate::modal::frame(
+                frame,
+                frame.area(),
+                &crate::modal::Chrome {
+                    title: "inspect pending request — no decision submitted",
+                    ..Default::default()
+                },
+            );
+            inspection.draw(frame, body);
+            return;
+        }
         let view = &input.view;
         let lines: Vec<Line<'static>> = view
             .rows()
@@ -222,7 +234,9 @@ mod terminal {
                 } else {
                     "input required"
                 },
-                hint: Some("Esc cancel · ↑↓ select · Enter confirm · PgUp/PgDn scroll"),
+                hint: Some(
+                    "F4 inspect · Esc cancel · ↑↓ select · Enter confirm · PgUp/PgDn scroll",
+                ),
                 ..crate::modal::Chrome::default()
             },
         );
@@ -301,6 +315,8 @@ mod terminal {
         echo: Echo,
         scroll: u16,
         armed: bool,
+        inspection: Option<crate::transcript_pager::OutputView>,
+        inspection_text: String,
     }
 
     impl ModalInput {
@@ -318,6 +334,12 @@ mod terminal {
                 echo: newt_core::interaction_terminal::echo_for(&interaction.definition),
                 scroll: 0,
                 armed: true,
+                inspection: None,
+                inspection_text: format!(
+                    "{}\n\n{}",
+                    interaction.definition.markdown,
+                    interaction.definition.note.as_deref().unwrap_or_default()
+                ),
             }
         }
 
@@ -338,6 +360,21 @@ mod terminal {
         }
 
         fn event(&mut self, event: Event, area: Rect) -> Option<PromptLine> {
+            if let Some(inspection) = &mut self.inspection {
+                if let Event::Key(key) = event {
+                    if inspection.key(key, usize::from(area.height.saturating_sub(3))) {
+                        self.inspection = None;
+                    }
+                }
+                return None;
+            }
+            if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::F(4))
+            {
+                self.inspection = Some(crate::transcript_pager::OutputView::new(
+                    self.inspection_text.lines(),
+                ));
+                return None;
+            }
             if let Event::Paste(text) = event {
                 self.answer
                     .extend(text.chars().filter(|ch| !ch.is_control()));
@@ -483,7 +520,7 @@ mod terminal {
 
     impl ControlReader for ModalReader {
         fn poll(&mut self, timeout: Duration) -> io::Result<Option<PromptLine>> {
-            let input = &self.input;
+            let input = &mut self.input;
             self.terminal.draw(|f| draw(f, input))?;
             if !event::poll(timeout)? {
                 return Ok(None);
@@ -578,6 +615,31 @@ mod terminal {
                     Rect::new(0, 0, 80, 24)
                 ),
                 Some(newt_core::tty::PromptLine::Line("deny".into()))
+            );
+        }
+
+        #[test]
+        fn inspecting_a_pending_decision_never_answers_or_changes_it() {
+            let mut input = ModalInput::new(&interaction());
+            let area = Rect::new(0, 0, 40, 10);
+            input.event(key(KeyCode::Char('a'), KeyModifiers::NONE), area);
+            assert_eq!(
+                input.event(key(KeyCode::F(4), KeyModifiers::NONE), area),
+                None
+            );
+            assert!(input.inspection.is_some());
+            for code in [KeyCode::Enter, KeyCode::Char('d'), KeyCode::Down] {
+                assert_eq!(input.event(key(code, KeyModifiers::NONE), area), None);
+            }
+            assert_eq!(
+                input.event(key(KeyCode::Esc, KeyModifiers::NONE), area),
+                None
+            );
+            assert!(input.inspection.is_none());
+            assert_eq!(input.answer, "a");
+            assert_eq!(
+                input.event(key(KeyCode::Enter, KeyModifiers::NONE), area),
+                Some(PromptLine::Line("once".into()))
             );
         }
 
@@ -779,7 +841,7 @@ mod terminal {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
-            terminal.draw(|frame| draw(frame, &input)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut input)).unwrap();
             let visible: String = terminal
                 .backend()
                 .buffer()
