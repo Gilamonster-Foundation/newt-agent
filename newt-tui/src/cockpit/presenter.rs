@@ -49,7 +49,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Write as _};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -60,7 +60,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::style::{
     Attribute, Color as CColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
-use crossterm::terminal::{Clear, ClearType, DisableLineWrap, EnableLineWrap};
+use crossterm::terminal::{Clear, ClearType, EnableLineWrap};
 use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -68,7 +68,7 @@ use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use super::ansi::{clip_to_width, wrap_row, Row, TranscriptStream};
+use super::ansi::{clip_to_width, visible_width, wrap_row, Row, TranscriptStream};
 use super::pty::PtyCapture;
 use crate::rich_input::{Chrome, EditorOutcome, MountedEditor, RichSurface, ScrollbackSink};
 use crate::session_worker::{PanelMode, SurfaceRequest};
@@ -83,13 +83,101 @@ const CLOCK_TICK: Duration = Duration::from_millis(250);
 /// quiet this long — the last lines it printed may still be in flight.
 const DRAIN_QUIET: Duration = Duration::from_millis(120);
 
+/// The real terminal, with autowrap switched off only while the cockpit writes.
+///
+/// A terminal decides whether to reflow its screen from the autowrap mode in
+/// force *at the moment it resizes*. Left off at rest, every shrink truncates
+/// the transcript for good (alacritty_terminal-based hosts such as herdr drop
+/// the clipped cells), so the view crops smaller with each resize. Off during a
+/// write keeps a miscounted glyph from wrapping the bottom-row footer and
+/// scrolling the screen. Every write batch here ends in a flush, so fencing on
+/// write/flush covers all of them without a per-site toggle.
+struct WrapFence<W = File> {
+    file: W,
+    /// Shared by every clone: the mode belongs to the terminal, not a handle.
+    state: Arc<FenceState>,
+}
+
+#[derive(Default)]
+struct FenceState {
+    wrap_off: AtomicBool,
+    /// A lent-out modal or panel is writing; keep autowrap off until released.
+    held: AtomicBool,
+}
+
+const WRAP_OFF: &[u8] = b"\x1b[?7l";
+const WRAP_ON: &[u8] = b"\x1b[?7h";
+
+impl<W: Write> WrapFence<W> {
+    fn new(file: W) -> Self {
+        Self {
+            file,
+            state: Arc::default(),
+        }
+    }
+
+    fn turn_off(&mut self) -> io::Result<()> {
+        if !self.state.wrap_off.swap(true, Ordering::Relaxed) {
+            self.file.write_all(WRAP_OFF)?;
+        }
+        Ok(())
+    }
+
+    fn hold(&mut self) -> io::Result<()> {
+        self.state.held.store(true, Ordering::Relaxed);
+        self.turn_off()?;
+        self.file.flush()
+    }
+
+    fn release(&mut self) -> io::Result<()> {
+        self.state.held.store(false, Ordering::Relaxed);
+        self.flush()
+    }
+}
+
+impl WrapFence {
+    /// A plain handle for another surface. It writes outside this fence.
+    fn try_clone(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
+    fn fenced_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+impl<W: Write> Write for WrapFence<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.turn_off()?;
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.state.held.load(Ordering::Relaxed)
+            && self.state.wrap_off.swap(false, Ordering::Relaxed)
+        {
+            self.file.write_all(WRAP_ON)?;
+        }
+        self.file.flush()
+    }
+}
+
+impl std::os::fd::AsRawFd for WrapFence {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
 /// The screen: the real terminal, and where the block is on it.
 ///
 /// Split from [`Presenter`] so the editor can be handed `&mut Screen` as its
 /// [`ScrollbackSink`] while the presenter still borrows the editor.
 struct Screen {
-    tty: File,
-    term: Terminal<CrosstermBackend<File>>,
+    tty: WrapFence,
+    term: Terminal<CrosstermBackend<WrapFence>>,
     cols: u16,
     rows: u16,
     /// First row of the block (0-based).
@@ -108,6 +196,10 @@ struct Screen {
     /// — but they are no longer PRIVATE bookkeeping: every move is reported to
     /// the arbiter, so another surface can no longer be handed these rows.
     region: newt_core::tty::RegionLease,
+    /// Painted width of each block row in the last draw, top to bottom. A
+    /// resize that narrows the terminal reflows any row wider than the new
+    /// width onto extra rows, lifting the old block's top above `top`.
+    painted_widths: Vec<usize>,
 }
 
 /// The block's rows, as the arbiter names them.
@@ -163,7 +255,7 @@ impl Screen {
     }
 
     fn rebuild_term(&mut self) -> io::Result<()> {
-        let backend = CrosstermBackend::new(self.tty.try_clone()?);
+        let backend = CrosstermBackend::new(self.tty.fenced_clone()?);
         self.term = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -178,6 +270,7 @@ impl Screen {
     /// memory and is painted again only after this window releases input.
     fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
         let plan = plan_modal_reservation(self.top, self.rows, requested);
+        self.tty.hold()?;
         let mut buf = Vec::new();
         queue!(
             buf,
@@ -280,6 +373,13 @@ impl Screen {
         status_rows: u16,
     ) -> io::Result<()> {
         let old_top = self.top;
+        // Narrowing reflows any old block row wider than the new terminal onto
+        // extra rows, lifting the stale block above `old_top`.
+        let lifted = if cols.max(1) < self.cols {
+            reflow_growth(&self.painted_widths, cols.max(1))
+        } else {
+            0
+        };
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
@@ -293,13 +393,11 @@ impl Screen {
             newt_core::tty::OnCollision::SuspendHolder,
         );
         // Erase from the topmost of the OLD and new block tops, not just the new
-        // one (#4). Both blocks are bottom-anchored — each occupies
-        // `[top, rows)` — so clearing from `min(old_top, new_top)` down wipes the
-        // old cockpit region too. Without it a grown terminal (new top below the
-        // old) leaves the previous status/editor/tab-bar rows stranded above the
-        // new block. Nothing but block chrome ever sits below that row, so no
-        // transcript is lost.
-        let erase_from = resize_erase_from(old_top, self.top, self.rows);
+        // one (#4), raised by the rows the old block reflowed onto. Both blocks
+        // are bottom-anchored, so this wipes every stale status/editor row;
+        // nothing but block chrome sits below that row, so no transcript is
+        // lost.
+        let erase_from = resize_erase_from(old_top, self.top, self.rows).saturating_sub(lifted);
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, erase_from), Clear(ClearType::FromCursorDown))?;
         self.tty.write_all(&buf)?;
@@ -315,6 +413,7 @@ impl Screen {
         chrome: Chrome<'_>,
         chat_inactive: bool,
     ) -> io::Result<()> {
+        let mut widths = Vec::with_capacity(self.block_h as usize);
         if self.status_rows == 1 {
             let cols = self.cols as usize;
             let chip = if self.queued > 0 {
@@ -325,6 +424,11 @@ impl Screen {
             let chip_w = newt_core::tty::str_width(&chip);
             let avail = cols.saturating_sub(chip_w + 1);
             let status = clip_to_width(&self.status, avail);
+            widths.push(if chip.is_empty() {
+                visible_width(&status)
+            } else {
+                cols
+            });
             let mut buf = Vec::new();
             // Hidden across the two writes; ratatui's own draw shows it again
             // at the editor's caret, so it never flickers to the status row.
@@ -349,7 +453,15 @@ impl Screen {
             self.tty.write_all(&buf)?;
             self.tty.flush()?;
         }
-        self.term.draw(|f| editor.draw(f, chrome, chat_inactive))?;
+        let frame = self.term.draw(|f| editor.draw(f, chrome, chat_inactive))?;
+        let area = frame.area;
+        widths.extend((area.top()..area.bottom()).map(|y| {
+            (area.left()..area.right())
+                .rev()
+                .find(|&x| frame.buffer[(x, y)].symbol() != " ")
+                .map_or(0, |x| usize::from(x - area.left()) + 1)
+        }));
+        self.painted_widths = widths;
         Ok(())
     }
 
@@ -471,6 +583,17 @@ fn restore_terminal_modes() {
 /// smaller) new screen.
 fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
     old_top.min(new_top).min(rows.saturating_sub(1))
+}
+
+/// How many rows the old block grows by when a terminal reflows it at `cols`:
+/// each row `w` wide now takes `ceil(w / cols)` rows instead of one.
+fn reflow_growth(widths: &[usize], cols: u16) -> u16 {
+    let cols = usize::from(cols.max(1));
+    let extra: usize = widths
+        .iter()
+        .map(|w| w.div_ceil(cols).saturating_sub(1))
+        .sum();
+    u16::try_from(extra).unwrap_or(u16::MAX)
 }
 
 /// Pure geometry — the part of `insert_rows` that must be exactly right and
@@ -651,11 +774,7 @@ impl Presenter {
             y
         };
         let raw = newt_core::tty::raw_mode::RawModeGuard::enter()?;
-        execute!(
-            stdout,
-            crossterm::event::EnableBracketedPaste,
-            DisableLineWrap
-        )?;
+        execute!(stdout, crossterm::event::EnableBracketedPaste)?;
         // The terminal's modes are now taken. Bind their restore the instant
         // after — and crucially BEFORE the fallible capture install below — so
         // that no `?`, error, or panic between here and a clean `shutdown` can
@@ -670,8 +789,8 @@ impl Presenter {
             restore: restore_terminal_modes,
         };
         let capture = PtyCapture::install(cols, rows)?;
-        let tty = capture.tty().try_clone()?;
-        let backend = CrosstermBackend::new(tty.try_clone()?);
+        let tty = WrapFence::new(capture.tty().try_clone()?);
+        let backend = CrosstermBackend::new(tty.fenced_clone()?);
         let term = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -699,6 +818,7 @@ impl Presenter {
             status: Vec::new(),
             queued: 0,
             region,
+            painted_widths: Vec::new(),
         };
         screen.term.clear()?;
         let ephemeral: Arc<dyn newt_core::tty::Ephemeral> = Arc::new(NoOpEphemeral);
@@ -1111,6 +1231,12 @@ impl Presenter {
     /// A blocking dialog may have consumed every resize event while this
     /// presenter was parked. Read the real tty before restoring its draft.
     fn finish_modal(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
+        let cleanup = self.finish_modal_rows(reservation);
+        let released = self.screen.tty.release();
+        cleanup.and(released)
+    }
+
+    fn finish_modal_rows(&mut self, reservation: Option<&ModalReservation>) -> io::Result<()> {
         let (cols, rows) = self.screen.terminal_size()?;
         if (cols, rows) != (self.screen.cols, self.screen.rows) {
             // A narrower inline dialog may have expanded above its old top.
@@ -1150,11 +1276,7 @@ impl Presenter {
             let mut modes_output = self.screen.tty.try_clone()?;
             let _modes = crate::RestoreOnDrop {
                 restore: move || {
-                    let _ = execute!(
-                        modes_output,
-                        crossterm::event::EnableBracketedPaste,
-                        DisableLineWrap
-                    );
+                    let _ = execute!(modes_output, crossterm::event::EnableBracketedPaste);
                 },
             };
             self.screen.shutdown(&[])?;
@@ -1540,6 +1662,47 @@ mod tests {
     /// the crate's `splash_guard_tests`, which drive this same `RestoreOnDrop`;
     /// this pins the bytes the cockpit's guard emits. Asserted against a buffer
     /// because `io::stdout` is captured by the harness.
+    /// Autowrap is off only between a write and its flush, so a resize that
+    /// lands while the cockpit is idle finds wrap on and reflows the transcript.
+    #[test]
+    fn the_fence_turns_wrap_off_for_a_write_and_back_on_at_flush() {
+        let mut fence = WrapFence::new(Vec::new());
+        fence.write_all(b"a").unwrap();
+        fence.write_all(b"b").unwrap();
+        fence.flush().unwrap();
+        fence.flush().unwrap();
+        assert_eq!(fence.file, b"\x1b[?7lab\x1b[?7h");
+    }
+
+    #[test]
+    fn a_held_fence_keeps_wrap_off_across_flushes_until_released() {
+        let mut fence = WrapFence::new(Vec::new());
+        fence.hold().unwrap();
+        fence.write_all(b"modal").unwrap();
+        fence.flush().unwrap();
+        assert_eq!(fence.file, b"\x1b[?7lmodal");
+        fence.release().unwrap();
+        assert_eq!(fence.file, b"\x1b[?7lmodal\x1b[?7h");
+    }
+
+    /// The ratatui backend writes through its own clone. A hold taken on the
+    /// screen's handle must bind it too, or a modal's `term.clear()` turns
+    /// wrap back on underneath the dialog.
+    #[test]
+    fn a_hold_binds_every_clone_of_the_fence() {
+        let mut screen = WrapFence::new(Vec::new());
+        let mut backend = WrapFence {
+            file: Vec::new(),
+            state: Arc::clone(&screen.state),
+        };
+        screen.hold().unwrap();
+        backend.write_all(b"clear").unwrap();
+        backend.flush().unwrap();
+        assert_eq!(backend.file, b"clear", "wrap is already off, and stays off");
+        screen.release().unwrap();
+        assert_eq!(screen.file, b"\x1b[?7l\x1b[?7h");
+    }
+
     #[test]
     fn the_mode_restores_re_enable_wrap_disable_paste_and_show_the_cursor() {
         let mut buf = Vec::new();
@@ -1552,6 +1715,23 @@ mod tests {
 
     /// #4: `resize` clears from the higher of the old and new block tops, so the
     /// old cockpit region can't be stranded above a lower new block.
+    #[test]
+    fn a_narrower_terminal_lifts_the_old_block_by_its_wrapped_rows() {
+        // 80-wide footer and 70-wide hint each take two rows at 47 columns.
+        assert_eq!(reflow_growth(&[23, 70, 80], 47), 2);
+        assert_eq!(
+            reflow_growth(&[23, 70, 80], 120),
+            0,
+            "a wider terminal wraps nothing"
+        );
+        assert_eq!(
+            reflow_growth(&[95], 47),
+            2,
+            "three rows for one 95-wide row"
+        );
+        assert_eq!(reflow_growth(&[47], 47), 0, "an exact fit does not wrap");
+    }
+
     #[test]
     fn resize_erases_from_the_higher_of_the_old_and_new_block_tops() {
         // Terminal grew 24->30, block 4: old top 20, new top 26 — clear from 20.
