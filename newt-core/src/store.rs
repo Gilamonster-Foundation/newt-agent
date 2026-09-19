@@ -177,7 +177,7 @@ use fts::create_fts_index;
 pub use fts::sanitize_fts5_query;
 
 mod legacy_import;
-use legacy_import::{import_legacy_json, migrate_workspace_key};
+use legacy_import::{import_legacy_json, migrate_pin_cognition_labels, migrate_workspace_key};
 
 mod liveness;
 pub(crate) use liveness::pid_is_alive;
@@ -317,6 +317,7 @@ impl ConversationStore {
         // 17.2: after the import (whose records carry UUIDv5 keys), re-key
         // THIS workspace's rows from the retired UUIDv5 derivation to v2.
         migrate_workspace_key(&conn, &workspace, &workspace_id)?;
+        migrate_pin_cognition_labels(&conn)?;
 
         let (host, boot_id) = current_host_boot();
         Ok(Self {
