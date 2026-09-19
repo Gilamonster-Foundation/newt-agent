@@ -516,6 +516,7 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
         workspace.path().to_str().unwrap(),
         &crate::Scope::All,
         None,
+        &capability_check::Evidence::default(),
         Some(&filter),
     );
     assert!(reply.contains("Let me check the current implementation"));

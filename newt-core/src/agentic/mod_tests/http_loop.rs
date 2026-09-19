@@ -494,3 +494,6 @@ mod exposure_promotion;
 #[cfg(test)]
 #[path = "http_smart_harness.rs"]
 mod smart_harness;
+
+#[path = "http_capability_grounding.rs"]
+mod capability_grounding;

@@ -559,6 +559,18 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_discovery_exposes_build_authority_in_short_description() {
+        let out = execute_tool_search("lifecycle", &full_catalog());
+        let lifecycle = out
+            .lines()
+            .find(|line| line.starts_with("- lifecycle —"))
+            .unwrap();
+        assert!(lifecycle.contains("action=build"), "{lifecycle}");
+        assert!(lifecycle.contains("explicit"), "{lifecycle}");
+        assert!(lifecycle.contains("offline"), "{lifecycle}");
+    }
+
+    #[test]
     fn one_line_collapses_whitespace_and_truncates() {
         let collapsed = one_line("a\n   b\t c", 100);
         assert_eq!(collapsed, "a b c");

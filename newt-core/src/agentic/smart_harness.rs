@@ -846,6 +846,19 @@ impl SmartHarness {
         Ok(())
     }
 
+    /// A deterministic evidence check can correct an answer before auxiliary
+    /// adjudication. Keep its actual reply and intervention in the same ledger.
+    pub(crate) fn correct_answer(&self, answer: &str, nudge: &str) -> anyhow::Result<()> {
+        {
+            let mut s = self.state()?;
+            let reply = s
+                .reply
+                .ok_or_else(|| anyhow::anyhow!("correction has no reply parent"))?;
+            s.session.record_model_message(reply, answer)?;
+        }
+        self.intervention(nudge)
+    }
+
     /// The auxiliary classification never replaces workspace verification.
     /// `gate_on` is the turn's action-nudge and disposition switch; the
     /// attempted-check path also needs a round left, the result-aware path

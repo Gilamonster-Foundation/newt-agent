@@ -1,4 +1,4 @@
-//! #1947: capability-claim verification for `render_report`.
+//! Capability-claim verification for reports (#1947) and fresh probes (#2454).
 //!
 //! [`claim_check`](super::claim_check) verifies *path* claims and appends a
 //! visible refutation for anything that does not resolve. This is its sibling
@@ -16,11 +16,11 @@
 //! # What counts as evidence
 //!
 //! The turn's [`ToolEvent`](crate::ToolEvent) ledger, and only that. It
-//! records `{tool, args_digest, ok}` — and `args_digest` is deliberately
+//! records `{tool, args_digest, ok, execution}` — and `args_digest` is deliberately
 //! **key names plus a hash, never values**, because args carry file contents
 //! and secrets. So "was `cargo test` run?" is *not* answerable here: the
-//! ledger knows `run_command` was called with a `command` key and nothing
-//! more. Designing against what the ledger can actually prove rather than
+//! ledger knows `run_command` was called with a `command` key and its typed
+//! execution outcome, but not which command ran. Designing against what the ledger can actually prove rather than
 //! what would be convenient is the whole discipline; a check that pretended
 //! to know the command would be the false claim it exists to catch.
 //!
@@ -75,6 +75,9 @@ pub(crate) struct Evidence {
     ok: usize,
     /// Calls whose result read as failure.
     failed: usize,
+    /// A returned execution attempt (including denial/unavailability), or a
+    /// Git capability query. History and catalog reads are not execution probes.
+    execution_observed: bool,
 }
 
 impl Evidence {
@@ -84,16 +87,48 @@ impl Evidence {
     pub(crate) fn from_events(events: &[ToolEvent]) -> Self {
         let mut out = Self::default();
         for event in events {
-            if !out.invoked.iter().any(|t| t == &event.tool) {
-                out.invoked.push(event.tool.clone());
-            }
-            if event.ok {
-                out.ok += 1;
-            } else {
-                out.failed += 1;
-            }
+            out.record(&event.tool, event.ok, event.execution);
         }
         out
+    }
+
+    /// Fed at the same completed-dispatch seam as ToolEvent, even when the
+    /// caller did not request persisted telemetry. Never inferred from prose.
+    pub(crate) fn record(&mut self, tool: &str, ok: bool, execution: Option<crate::ExecOutcome>) {
+        if !self.invoked.iter().any(|name| name == tool) {
+            self.invoked.push(tool.to_string());
+        }
+        if ok {
+            self.ok += 1;
+        } else {
+            self.failed += 1;
+        }
+        self.execution_observed |= execution.is_some() || tool == "git";
+    }
+
+    pub(crate) fn unsupported_probe_claim(&self, text: &str) -> bool {
+        !self.execution_observed
+            && claims_fresh_execution_probe(
+                text,
+                self.invoked
+                    .iter()
+                    .any(|tool| tool == "request_permissions"),
+            )
+    }
+
+    pub(crate) fn correction(
+        &self,
+        text: &str,
+        tools: &serde_json::Value,
+        used: &mut bool,
+        allowed: bool,
+    ) -> Option<String> {
+        if !allowed || *used || !self.unsupported_probe_claim(text) {
+            return None;
+        }
+        let nudge = probe_correction(tools)?;
+        *used = true;
+        Some(nudge)
     }
 
     /// Nothing ran at all. The strongest refutation available: a report
@@ -120,6 +155,147 @@ impl Evidence {
             have == want || segment_contains(&have, &want) || segment_contains(&want, &have)
         })
     }
+}
+
+/// Deliberately narrow: completed execution probes, including negative results.
+/// This is not a truth classifier for arbitrary prose. Quoted examples, saved
+/// history, future intent and explicit nonverification must remain ordinary text.
+fn claims_fresh_execution_probe(text: &str, permission_requested: bool) -> bool {
+    let lower = text.to_lowercase().replace('’', "'");
+    if ![
+        "cargo",
+        "rustc",
+        "git",
+        "toolchain",
+        "shell",
+        "command",
+        "executable",
+        "lifecycle",
+    ]
+    .iter()
+    .any(|name| lower.contains(name))
+    {
+        return false;
+    }
+    let mut fenced = false;
+    lower.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            fenced = !fenced;
+            return false;
+        }
+        if fenced
+            || line.starts_with(['>', '"'])
+            || line
+                .trim_start_matches(['-', '*', '•', ' '])
+                .starts_with("if ")
+            || [
+                "not re-probed",
+                "not reprobed",
+                "haven't re-probed",
+                "haven't reprobed",
+                "not probed",
+                "haven't probed",
+                "not checked",
+                "haven't checked",
+                "not attempted",
+                "haven't attempted",
+                "before execution",
+                "no command ran",
+                "would be denied",
+                "might be denied",
+                "could be denied",
+                "did not",
+                "didn't",
+                "previous",
+                "earlier",
+                "last session",
+                "saved state",
+                "history says",
+                "you said",
+                "user said",
+                "for example",
+                "example:",
+            ]
+            .iter()
+            .any(|phrase| line.contains(phrase))
+        {
+            return false;
+        }
+        [
+            "probes came back",
+            "probes reported",
+            "re-probed directly",
+            "reprobed directly",
+            "direct re-probe returned",
+            "direct reprobe returned",
+            "i ran the probes",
+            "i checked again",
+            "i've checked again",
+            "i re-probed",
+            "i reprobed",
+        ]
+        .iter()
+        .any(|phrase| line.contains(phrase))
+            || ["i've attempted ", "i have attempted ", "i attempted "]
+                .iter()
+                .filter_map(|phrase| line.split_once(phrase))
+                .any(|(_, subject)| {
+                    ["cargo", "rustc", "git", "the ci gate", "the command"]
+                        .iter()
+                        .any(|target| {
+                            subject
+                                .trim_start_matches('`')
+                                .strip_prefix(target)
+                                .is_some_and(|rest| !rest.starts_with(char::is_alphanumeric))
+                        })
+                })
+            // A receipt-shaped denial is an assertion too. A real permission
+            // request can ground an approval attempt without proving execution.
+            || (!permission_requested
+                && ["lifecycle", "run_command", "request_permissions"]
+                    .iter()
+                    .any(|tool| line.contains(tool))
+                && (line.contains('→') || line.contains("->"))
+                && line.contains("denied"))
+    })
+}
+
+/// Ordinary answers use this narrow check, not the success-report heuristics:
+/// an earlier failed call must not refute a subsequently repaired test run.
+pub(crate) fn annotate_unobserved_probe(text: String, evidence: &Evidence) -> String {
+    if !evidence.unsupported_probe_claim(&text) {
+        return text;
+    }
+    format!(
+        "{text}\n\n⚠ Harness evidence: No fresh capability checks were performed this turn. \
+        No returned execution attempt supports the claimed probes; recalled history and tool \
+        discovery do not establish these results. Tool availability remains unverified."
+    )
+}
+
+/// Show only current advertised schemas, never resurrecting a remembered tool
+/// or operation. A schema describes a route, not permission to execute it.
+pub(crate) fn probe_correction(tools: &serde_json::Value) -> Option<String> {
+    let schemas = tools
+        .as_array()?
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            let name = function.get("name")?.as_str()?;
+            matches!(name, "run_command" | "lifecycle" | "git" | "tool_search").then_some(function)
+        })
+        .collect::<Vec<_>>();
+    if schemas.is_empty() {
+        return None;
+    }
+    Some(format!("{} Your answer claims freshly completed capability probes, but this turn \
+        has no returned execution evidence for them. Do not treat saved statements as fresh \
+        observations or invent exit codes or operator decisions. Issue a real tool call for \
+        the necessary check, or say explicitly that you have not checked. For build/test validation, \
+        prefer lifecycle action=build only if its current schema offers it. Existing permissions \
+        and approvals still apply; discovery grants no authority. Current relevant tool schemas: {}",
+        super::compress::LOOP_GUIDANCE_PREFIX, serde_json::to_string(&schemas).unwrap()))
 }
 
 /// Lowercase, and every run of non-alphanumerics collapsed to one `_`, with
@@ -223,6 +399,9 @@ const LISTED_SUBJECTS: usize = 8;
 /// The original document is always preserved as an exact prefix. This
 /// labels; it never rewrites.
 pub(crate) fn annotate_unsupported(text: String, evidence: &Evidence) -> String {
+    if evidence.unsupported_probe_claim(&text) {
+        return annotate_unobserved_probe(text, evidence);
+    }
     let unsupported = unsupported_subjects(&text, evidence);
     let prose = has_verification_prose(&text);
     let claims_anything = prose || !claimed_subjects(&text).is_empty();
@@ -279,6 +458,121 @@ pub(crate) fn annotate_unsupported(text: String, evidence: &Evidence) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_negative_probe_claims_need_execution_evidence() {
+        for claim in [
+            "The capability probes came back. cargo --version: command not found (exit 127).",
+            "I've re-probed directly this round — the toolchain is still absent.",
+            "I've attempted the CI gate (cargo check) and hit a hard blocker.",
+            "I attempted cargo check and it failed.",
+            "• lifecycle phase=check, action=build → denied by the operator (exit 40032).",
+        ] {
+            let out = annotate_unsupported(claim.into(), &Evidence::default());
+            assert!(out.starts_with(claim), "preserve the model's words");
+            assert!(
+                out.contains("No fresh capability checks were performed this turn."),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_future_negated_and_quoted_probes_are_not_fresh_claims() {
+        for text in [
+            "Previously, the capability probes reported cargo absent.",
+            "In the previous turn, I re-probed cargo directly.",
+            "I have not re-probed cargo directly this round.",
+            "I haven't checked cargo again.",
+            "I will probe cargo now.",
+            "I will do a direct re-probe of cargo next.",
+            "A direct re-probe of cargo would establish availability.",
+            "I have not attempted cargo check this turn.",
+            "I haven't attempted cargo check this turn.",
+            "I attempted cargo check, but permission was denied before execution.",
+            "I will attempt cargo check after approval.",
+            "I attempted to repair the cargo configuration, but have not run it.",
+            "I attempted GitHub login to inspect the cargo configuration.",
+            "Earlier I attempted cargo check and it failed.",
+            "Previously: lifecycle phase=check, action=build → denied by the operator.",
+            "> lifecycle phase=check, action=build → denied by the operator.",
+            "```text\nlifecycle phase=check, action=build → denied by the operator.\n```",
+            "If approved, lifecycle phase=check, action=build → cargo check.",
+            "If lifecycle phase=check, action=build → denied, stop and ask the operator.",
+            "- If lifecycle phase=check, action=build → denied, stop.",
+            "lifecycle phase=check, action=build → might be denied by the operator.",
+            "\"lifecycle phase=check, action=build → denied by the operator.\"",
+            "> I've re-probed directly this round — the toolchain is still absent.",
+            "You said: The capability probes came back. cargo was missing.",
+            "```text\nThe capability probes came back. cargo was missing.\n```",
+        ] {
+            assert_eq!(
+                annotate_unsupported(text.into(), &Evidence::default()),
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn actual_execution_attempts_ground_probe_claims_even_when_denied() {
+        let text = "I've re-probed directly this round — the toolchain is still absent.";
+        for outcome in [
+            crate::ExecOutcome::Passed,
+            crate::ExecOutcome::Failed,
+            crate::ExecOutcome::Denied,
+            crate::ExecOutcome::Unavailable,
+            crate::ExecOutcome::TimedOut,
+        ] {
+            let mut call = event("run_command", false);
+            call.execution = Some(outcome);
+            assert_eq!(
+                annotate_unsupported(text.into(), &Evidence::from_events(&[call])),
+                text
+            );
+        }
+        let history = Evidence::from_events(&[event("resume_context", true)]);
+        assert!(annotate_unsupported(text.into(), &history)
+            .contains("No fresh capability checks were performed this turn."));
+    }
+
+    #[test]
+    fn a_real_permission_request_grounds_denial_but_not_a_claimed_execution() {
+        let evidence = Evidence::from_events(&[event("request_permissions", true)]);
+        let denied = "lifecycle phase=check, action=build → denied by the operator.";
+        assert_eq!(annotate_unobserved_probe(denied.into(), &evidence), denied);
+        let claim = "I've attempted the CI gate (cargo check) and hit a hard blocker.";
+        assert!(annotate_unobserved_probe(claim.into(), &evidence)
+            .contains("No fresh capability checks were performed this turn."));
+    }
+
+    #[test]
+    fn correction_preserves_current_scoped_schema_and_is_bounded() {
+        let evidence = Evidence::default();
+        let claim = "I've re-probed directly this round — the toolchain is still absent.";
+        let tools = serde_json::json!([super::super::git_tool::definition_for_read_scope(
+            &crate::Scope::none()
+        )]);
+        let mut used = false;
+        assert!(evidence
+            .correction(claim, &tools, &mut used, false)
+            .is_none());
+        assert!(!used, "a cancelled/exhausted turn consumes no correction");
+        let nudge = evidence.correction(claim, &tools, &mut used, true).unwrap();
+        assert!(nudge.contains("branch-list"));
+        assert!(
+            !nudge.contains("\"commit\""),
+            "never restore a hidden operation"
+        );
+        assert!(nudge.contains("discovery grants no authority"));
+        assert!(evidence
+            .correction(claim, &tools, &mut used, true)
+            .is_none());
+        used = false;
+        assert!(evidence
+            .correction(claim, &serde_json::json!([]), &mut used, true)
+            .is_none());
+        assert!(!used, "no correction can advertise an absent tool");
+    }
 
     fn event(tool: &str, ok: bool) -> ToolEvent {
         ToolEvent::from_call(tool, &serde_json::json!({"k": "v"}), ok, Some(1))

@@ -544,7 +544,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(real_fs)]
     fn frame_storage_excludes_implicit_sandbox_and_executable_roots() {
+        // Windows root-relative policy paths depend on the current drive.
+        // Share the cwd-mutating config tests' lane so both resolutions below
+        // observe one environment instead of racing process-global chdir.
         let workspace = tempfile::tempdir().unwrap();
         let private = tempfile::tempdir().unwrap();
         let mut caveats = crate::confined_exec::build_tool_caveats(workspace.path());
@@ -552,12 +556,16 @@ mod tests {
             .base_read_paths
             .resolve()
         {
-            assert!(SmartHarnessConfig::validate_frame_directory(
+            let cwd = std::env::current_dir();
+            let result = SmartHarnessConfig::validate_frame_directory(
                 Path::new(&root),
                 &caveats,
-                workspace.path()
-            )
-            .is_err());
+                workspace.path(),
+            );
+            assert!(
+                result.is_err(),
+                "root={root:?}, cwd={cwd:?}, result={result:?}"
+            );
         }
         let executable = private.path().join("tool");
         std::fs::write(&executable, "fixture").unwrap();

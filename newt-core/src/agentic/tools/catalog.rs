@@ -270,7 +270,8 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "lifecycle",
-            "description": "Run a named project lifecycle phase using THIS repo's \
+            "description": "Run project phases: action=build requests explicit offline build authority; \
+                run uses current grants; list previews commands. Use THIS repo's \
                 configured command instead of guessing a raw shell command. \
                 Phases: setup (resolve deps / prepare a checkout), format \
                 (auto-format the tree), lint (static analysis), test (run the \
