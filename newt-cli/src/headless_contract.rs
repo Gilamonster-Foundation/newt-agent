@@ -59,6 +59,12 @@ pub struct ContractInputs<'a> {
     /// Effective cognition label (`default` when Newt sends no selection, or
     /// one of the explicit cognition levels).
     pub cognition: &'a str,
+    /// Semantic selection captured by the instantiated core turn, even when
+    /// the backend has no supported cognition projection. Absent without a turn.
+    pub semantic_cognition: Option<Option<newt_core::role_profile::Cognition>>,
+    /// The declaration and effort the Responses loop actually admitted.
+    pub responses_capability: Option<&'a newt_core::model_card::ResponsesCapability>,
+    pub reasoning_effort: Option<newt_core::model_card::ReasoningEffort>,
     /// `on` / `off` — whether a real crew runner was installed for the turn.
     pub crew: &'static str,
     /// `"on"` / `"off"` — whether OCAP enforcement was live for the run.
@@ -440,6 +446,23 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "ocap": i.ocap,
         "max_rounds": i.max_rounds,
     });
+    conditional_stanza(
+        &mut effective_config,
+        "semantic_cognition",
+        i.semantic_cognition.map(|value| serde_json::json!(value)),
+    );
+    if let Some(capability) = i.responses_capability {
+        conditional_stanza(
+            &mut effective_config,
+            "responses_capability",
+            Some(serde_json::json!(capability)),
+        );
+        conditional_stanza(
+            &mut effective_config,
+            "reasoning_effort",
+            Some(serde_json::json!(i.reasoning_effort)),
+        );
+    }
     conditional_stanza(&mut effective_config, "context_window", i.context_window);
     let output_allowance = i
         .output_allowance
@@ -496,6 +519,7 @@ fn permitted_outcomes() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    include!("headless_contract_cognition_tests.rs");
     use super::*;
     use newt_core::{BehaviorSignal, ToolCallDialect};
 
@@ -849,6 +873,9 @@ mod tests {
             tenacity: "normal",
             initiative: "measured",
             cognition: "default",
+            semantic_cognition: None,
+            responses_capability: None,
+            reasoning_effort: None,
             crew: "off",
             ocap: "off",
             max_rounds: 40,
