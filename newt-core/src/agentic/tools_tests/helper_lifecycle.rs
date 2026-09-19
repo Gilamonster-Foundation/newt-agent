@@ -1,5 +1,53 @@
 use super::*;
 
+#[test]
+fn lifecycle_unavailable_run_suggests_explicit_build_with_same_phase_and_dir() {
+    for dir in [None, Some("nested project")] {
+        let mut args = serde_json::json!({"phase": "check", "action": "run"});
+        let mut expected = serde_json::json!({"phase": "check", "action": "build"});
+        if let Some(dir) = dir {
+            args["dir"] = dir.into();
+            expected["dir"] = dir.into();
+        }
+        let original = "error: cargo not in this profile's carried userland";
+        let (text, outcome) =
+            lifecycle_run_result(&args, (original.into(), crate::ExecOutcome::Unavailable));
+        assert_eq!(outcome, crate::ExecOutcome::Unavailable);
+        assert!(text.starts_with(original), "{text}");
+        let suggestion = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Suggested lifecycle call: "))
+            .expect("unavailable run should expose the explicit build request");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(suggestion).unwrap(),
+            expected
+        );
+        assert!(text.contains("explicit approval"), "{text}");
+        assert!(text.contains("network denied"), "{text}");
+        assert!(text.contains("denials remain binding"), "{text}");
+        assert!(
+            !text.contains("no command ran"),
+            "a prior compound-command stage may have run"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_run_coaching_preserves_denials_and_executed_outcomes() {
+    for outcome in [
+        crate::ExecOutcome::Denied,
+        crate::ExecOutcome::Failed,
+        crate::ExecOutcome::TimedOut,
+        crate::ExecOutcome::Passed,
+    ] {
+        let original = ("original tool result".to_string(), outcome);
+        assert_eq!(
+            lifecycle_run_result(&serde_json::json!({"phase":"check"}), original.clone()),
+            original,
+        );
+    }
+}
+
 /// #894 regression for the concrete drift that motivated the registry: the
 /// `lifecycle` tool (#891) is advertised + dispatched, so it MUST be a real
 /// name — otherwise every legitimate `lifecycle` call is miscounted as a

@@ -5628,10 +5628,15 @@ fn pending_plan_completion_nudge(
     let active = snapshot
         .steps
         .iter()
-        .find(|s| s.status == StepStatus::Active)
-        .or_else(|| snapshot.steps.iter().find(|s| s.status != StepStatus::Done));
+        .position(|s| s.status == StepStatus::Active)
+        .or_else(|| {
+            snapshot
+                .steps
+                .iter()
+                .position(|s| s.status != StepStatus::Done)
+        });
     let active_clause = active
-        .map(|s| format!(" Active step: '{}'.", s.description))
+        .map(|index| format!(" Active step {}.", index + 1))
         .unwrap_or_default();
     let step_word = if unfinished == 1 { "step" } else { "steps" };
     let workflow_clause = workflow_hint
@@ -5641,7 +5646,7 @@ fn pending_plan_completion_nudge(
         .unwrap_or_default();
     if needs_plan_update {
         Some(workflow_guidance(format!(
-            "You ended with a findings/next-steps summary while the active plan still has \
+            "You ended with a findings/next-steps summary while the agent-maintained, advisory plan still has \
              {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
              immediate prerequisite repair work now blocks the active step. Call update_plan now \
              with the full ordered plan: mark completed steps completed, make the immediate \
@@ -5651,7 +5656,7 @@ fn pending_plan_completion_nudge(
         )))
     } else {
         Some(workflow_guidance(format!(
-            "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
+            "You ended the turn while the agent-maintained, advisory plan still has {unfinished}/{total} unfinished \
              {step_word}.{active_clause} Either call update_plan with completed steps marked \
              completed, call the next tool for the active step, or state the concrete blocker. \
              Do not hand off by only describing remaining work."

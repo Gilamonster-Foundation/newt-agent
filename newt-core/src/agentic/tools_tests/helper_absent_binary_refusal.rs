@@ -12,7 +12,7 @@
 //! | state | envelope | next move |
 //! |---|---|---|
 //! | denied by a grant | `denied:true`, `denials[kind=exec]`, exit 126 | ask for the grant |
-//! | not carried, on host | exit 127, no denials, host PATH resolves | ask for `exec:<abs path>` |
+//! | not carried, on host | exit 127, no denials, host PATH resolves | build authority for project validation, or direct `exec:<abs path>` |
 //! | not on this host | exit 127, no denials, host PATH misses | no grant helps |
 //!
 //! The discriminator is STRUCTURED (exit code + the `denials` array), never a
@@ -107,6 +107,19 @@ fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
         !msg.contains("not installed on this host"),
         "the host HAS this binary; must not claim otherwise: {msg}"
     );
+    for guidance in [
+        "project compiler/test validation",
+        "if lifecycle is advertised",
+        "prefer lifecycle action=build",
+        "explicit offline build authority",
+        "does not grant compiler descendants",
+        "do not retry a declined grant",
+    ] {
+        assert!(
+            msg.contains(guidance),
+            "host-present absence must explain the build route ({guidance}): {msg}"
+        );
+    }
 }
 
 /// ABSENT FROM THE HOST: no grant can conjure a binary that is not installed,
@@ -126,6 +139,10 @@ fn absent_from_host_says_so_and_does_not_coach_a_useless_grant() {
     assert!(
         !msg.contains("exec:/"),
         "must NOT ask for a grant that cannot help, got: {msg}"
+    );
+    assert!(
+        !msg.contains("lifecycle"),
+        "build authority cannot supply a missing host binary: {msg}"
     );
 }
 

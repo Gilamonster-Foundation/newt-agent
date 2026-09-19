@@ -372,3 +372,41 @@ async fn responses_smart_refusal_is_annotated_without_action_pressure() {
         assert!(events.is_empty());
     }
 }
+
+/// The live resumed session fabricated an operator denial without emitting any
+/// tool call or opening a Build permission request. Keep its precise prose so
+/// synonyms for "probe" cannot silently restore the unsupported-completion path.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn invented_ci_attempt_and_operator_denial_get_one_correction_then_a_visible_notice() {
+    let claim = "I've attempted the CI gate (cargo check) and hit a hard blocker. \
+        No workspace edit or permission retry can clear it.\n\n\
+        • lifecycle phase=check, action=build → denied by the operator (exit 40032).";
+    for wire in WIRES {
+        for smart in [false, true] {
+            for cap in [1, 4] {
+                let mut scenario = Scenario::new(wire, claim);
+                scenario.smart = smart;
+                scenario.cap = cap;
+                let (reply, requests, events) = run(scenario).await;
+                assert!(
+                    reply.contains(claim),
+                    "preserve the model's report: {reply}"
+                );
+                assert!(
+                    reply.contains(NO_PROBES),
+                    "{wire} smart={smart} cap={cap}: {reply}"
+                );
+                assert_eq!(
+                    requests.len(),
+                    if cap == 1 { 1 } else { 2 },
+                    "one correction only when a round remains: {wire} smart={smart} cap={cap}"
+                );
+                assert!(
+                    events.is_empty(),
+                    "model prose cannot mint an execution or denial receipt"
+                );
+            }
+        }
+    }
+}

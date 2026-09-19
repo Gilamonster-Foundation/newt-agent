@@ -107,7 +107,13 @@ impl Evidence {
     }
 
     pub(crate) fn unsupported_probe_claim(&self, text: &str) -> bool {
-        !self.execution_observed && claims_fresh_execution_probe(text)
+        !self.execution_observed
+            && claims_fresh_execution_probe(
+                text,
+                self.invoked
+                    .iter()
+                    .any(|tool| tool == "request_permissions"),
+            )
     }
 
     pub(crate) fn correction(
@@ -154,7 +160,7 @@ impl Evidence {
 /// Deliberately narrow: completed execution probes, including negative results.
 /// This is not a truth classifier for arbitrary prose. Quoted examples, saved
 /// history, future intent and explicit nonverification must remain ordinary text.
-fn claims_fresh_execution_probe(text: &str) -> bool {
+fn claims_fresh_execution_probe(text: &str, permission_requested: bool) -> bool {
     let lower = text.to_lowercase().replace('’', "'");
     if ![
         "cargo",
@@ -164,6 +170,7 @@ fn claims_fresh_execution_probe(text: &str) -> bool {
         "shell",
         "command",
         "executable",
+        "lifecycle",
     ]
     .iter()
     .any(|name| lower.contains(name))
@@ -179,6 +186,9 @@ fn claims_fresh_execution_probe(text: &str) -> bool {
         }
         if fenced
             || line.starts_with(['>', '"'])
+            || line
+                .trim_start_matches(['-', '*', '•', ' '])
+                .starts_with("if ")
             || [
                 "not re-probed",
                 "not reprobed",
@@ -188,6 +198,13 @@ fn claims_fresh_execution_probe(text: &str) -> bool {
                 "haven't probed",
                 "not checked",
                 "haven't checked",
+                "not attempted",
+                "haven't attempted",
+                "before execution",
+                "no command ran",
+                "would be denied",
+                "might be denied",
+                "could be denied",
                 "did not",
                 "didn't",
                 "previous",
@@ -220,6 +237,27 @@ fn claims_fresh_execution_probe(text: &str) -> bool {
         ]
         .iter()
         .any(|phrase| line.contains(phrase))
+            || ["i've attempted ", "i have attempted ", "i attempted "]
+                .iter()
+                .filter_map(|phrase| line.split_once(phrase))
+                .any(|(_, subject)| {
+                    ["cargo", "rustc", "git", "the ci gate", "the command"]
+                        .iter()
+                        .any(|target| {
+                            subject
+                                .trim_start_matches('`')
+                                .strip_prefix(target)
+                                .is_some_and(|rest| !rest.starts_with(char::is_alphanumeric))
+                        })
+                })
+            // A receipt-shaped denial is an assertion too. A real permission
+            // request can ground an approval attempt without proving execution.
+            || (!permission_requested
+                && ["lifecycle", "run_command", "request_permissions"]
+                    .iter()
+                    .any(|tool| line.contains(tool))
+                && (line.contains('→') || line.contains("->"))
+                && line.contains("denied"))
     })
 }
 
@@ -253,8 +291,8 @@ pub(crate) fn probe_correction(tools: &serde_json::Value) -> Option<String> {
     }
     Some(format!("{} Your answer claims freshly completed capability probes, but this turn \
         has no returned execution evidence for them. Do not treat saved statements as fresh \
-        observations or invent exit codes. Perform the necessary check using a currently \
-        available tool, or say explicitly that you have not checked. For build/test validation, \
+        observations or invent exit codes or operator decisions. Issue a real tool call for \
+        the necessary check, or say explicitly that you have not checked. For build/test validation, \
         prefer lifecycle action=build only if its current schema offers it. Existing permissions \
         and approvals still apply; discovery grants no authority. Current relevant tool schemas: {}",
         super::compress::LOOP_GUIDANCE_PREFIX, serde_json::to_string(&schemas).unwrap()))
@@ -426,6 +464,9 @@ mod tests {
         for claim in [
             "The capability probes came back. cargo --version: command not found (exit 127).",
             "I've re-probed directly this round — the toolchain is still absent.",
+            "I've attempted the CI gate (cargo check) and hit a hard blocker.",
+            "I attempted cargo check and it failed.",
+            "• lifecycle phase=check, action=build → denied by the operator (exit 40032).",
         ] {
             let out = annotate_unsupported(claim.into(), &Evidence::default());
             assert!(out.starts_with(claim), "preserve the model's words");
@@ -446,6 +487,21 @@ mod tests {
             "I will probe cargo now.",
             "I will do a direct re-probe of cargo next.",
             "A direct re-probe of cargo would establish availability.",
+            "I have not attempted cargo check this turn.",
+            "I haven't attempted cargo check this turn.",
+            "I attempted cargo check, but permission was denied before execution.",
+            "I will attempt cargo check after approval.",
+            "I attempted to repair the cargo configuration, but have not run it.",
+            "I attempted GitHub login to inspect the cargo configuration.",
+            "Earlier I attempted cargo check and it failed.",
+            "Previously: lifecycle phase=check, action=build → denied by the operator.",
+            "> lifecycle phase=check, action=build → denied by the operator.",
+            "```text\nlifecycle phase=check, action=build → denied by the operator.\n```",
+            "If approved, lifecycle phase=check, action=build → cargo check.",
+            "If lifecycle phase=check, action=build → denied, stop and ask the operator.",
+            "- If lifecycle phase=check, action=build → denied, stop.",
+            "lifecycle phase=check, action=build → might be denied by the operator.",
+            "\"lifecycle phase=check, action=build → denied by the operator.\"",
             "> I've re-probed directly this round — the toolchain is still absent.",
             "You said: The capability probes came back. cargo was missing.",
             "```text\nThe capability probes came back. cargo was missing.\n```",
@@ -476,6 +532,16 @@ mod tests {
         }
         let history = Evidence::from_events(&[event("resume_context", true)]);
         assert!(annotate_unsupported(text.into(), &history)
+            .contains("No fresh capability checks were performed this turn."));
+    }
+
+    #[test]
+    fn a_real_permission_request_grounds_denial_but_not_a_claimed_execution() {
+        let evidence = Evidence::from_events(&[event("request_permissions", true)]);
+        let denied = "lifecycle phase=check, action=build → denied by the operator.";
+        assert_eq!(annotate_unobserved_probe(denied.into(), &evidence), denied);
+        let claim = "I've attempted the CI gate (cargo check) and hit a hard blocker.";
+        assert!(annotate_unobserved_probe(claim.into(), &evidence)
             .contains("No fresh capability checks were performed this turn."));
     }
 

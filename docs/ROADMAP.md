@@ -1966,12 +1966,24 @@ fresh-probe claim, offer one correction using the currently advertised tool
 schemas. Record that intervention through Agent Frame when Smart Harness is
 active. Preserve the answer and append an evidence notice if it remains
 unsupported, including streaming and round-limit exits.
+Cover the observed invented CI-attempt and operator-denial wording too. Make the
+explicit offline build action visible in compact discovery and unavailable-run
+guidance, without retrying or changing authority. Host-present shell absence
+guidance distinguishes explicit confined Build for project validation from
+per-binary direct execution grants, which do not grant compiler descendants.
+Recurring plan reminders carry
+only numeric progress and step indexes, labeled agent-maintained and advisory;
+agent-authored descriptions remain in the source plan, not fresh host guidance.
 
 **Acceptance:** the observed fabricated-probe answers are corrected or visibly
 qualified on all four provider wires; history retrieval alone is not execution
 evidence; returned failures and denials count as attempts; future intent and
 quoted history remain unchanged. Refusals, cancellation, tool support, round
 limits and permission boundaries remain effective.
+Genuine permission requests can ground denial claims without establishing that
+a command ran; lifecycle denials and completed execution outcomes get no build
+recovery suggestion. Plan reminders preserve action guidance and the full source
+plan without repeating fabricated capability or operator-denial claims.
 
 **Out of scope:** verifying arbitrary natural-language claims or exact command
 results, expanding Git authority, and changing the confinement policy.

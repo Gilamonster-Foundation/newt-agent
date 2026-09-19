@@ -863,6 +863,26 @@ pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
     }
 }
 
+/// Preserve execution evidence while coaching an unavailable lifecycle run.
+fn lifecycle_run_result(
+    args: &serde_json::Value,
+    mut result: (String, crate::ExecOutcome),
+) -> (String, crate::ExecOutcome) {
+    if result.1 == crate::ExecOutcome::Unavailable {
+        let mut suggestion = serde_json::json!({"phase": args["phase"], "action": "build"});
+        if let Some(dir) = args.get("dir").and_then(serde_json::Value::as_str) {
+            suggestion["dir"] = dir.into();
+        }
+        result.0.push_str(&format!(
+            "\nThis was lifecycle action=run. For compiler/test validation, action=build \
+             requests explicit approval for toolchain/cache reads and workspace writes, \
+             with network denied. Existing permission requirements and denials remain binding; \
+             do not retry a declined grant.\nSuggested lifecycle call: {suggestion}"
+        ));
+    }
+    result
+}
+
 /// A call-scoped grant for the existing lifecycle surface, not an exec-axis
 /// wildcard. The command stays visible at the decision point; no shell grant
 /// (including exec:cargo) silently acquires compiler/test descendant authority.
@@ -3310,7 +3330,7 @@ async fn execute_authorized_tool(
                         Err(error) => executed((format!("error: {error}"), crate::ExecOutcome::Unavailable)),
                     }
                 }
-                "run" => executed(
+                "run" => executed(lifecycle_run_result(args,
                     exec_confined_command(
                         &joined,
                         &effective_dir,
@@ -3326,7 +3346,7 @@ async fn execute_authorized_tool(
                         presentation,
                     )
                     .await,
-                ),
+                )),
                 other => format!(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default), 'list', or 'build'."
                 ),

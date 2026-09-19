@@ -22,15 +22,24 @@ can correct the plan or request a stop or report-only response. Recovery guidanc
 allows an exact permission request when the operator has not declined it and a
 grant is available, or an alternative within existing authority. An unresolved
 blocker remains incomplete work. These reminders neither grant permissions nor
-replace the tool gates or cancellation and round-budget limits.
+replace the tool gates or cancellation and round-budget limits. Recurring plan
+reminders show progress and step indexes as agent-maintained, advisory state.
+Step descriptions remain in the source plan rather than being repeated as host
+claims about tool availability or operator decisions.
 
 Recovered capability claims are historical context, not current observations.
-Explicit claims of freshly completed toolchain probes receive one bounded
-correction when this turn has no returned execution attempt. The correction
+Explicit claims of freshly completed toolchain probes or CI attempts receive one
+bounded correction when this turn has no returned execution attempt. The correction
 uses current tool schemas and preserves permission gates; an unsupported final
 claim carries a visible harness evidence notice. Failed and denied attempts
 count as attempts, but do not prove availability or the claimed command result.
 This narrow check covers the observed probe wording, not arbitrary prose.
+Receipt-shaped lifecycle denials also require an observed execution or permission
+request. Lifecycle discovery and unavailable-run results advertise the explicit
+offline build action. Host-present shell absence guidance distinguishes this
+project-validation route from per-binary direct execution grants, which do not
+grant compiler descendants or their filesystem access. This guidance never
+retries or grants authority itself.
 
 A successful built-in permission grant releases cached capability failures and
 typed failed native shell/lifecycle executions so the original operation can be
