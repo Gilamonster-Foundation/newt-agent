@@ -968,6 +968,7 @@ pub(crate) fn advertise(mut tools: Value, harness: Option<&SmartHarness>) -> Val
                     tool["function"]["description"] = Value::String(
                         "Run a command in the confined workspace shell. File access must remain \
                          within fs_read/fs_write grants. Prefer dedicated file and lifecycle tools. \
+                         Use lifecycle action=build for explicit offline Cargo/compiler validation. \
                          Use shell find for recursive searches. \
                          Scoped shell Git reads and staging are supported; shell Git commits are \
                          refused to preserve harness attribution. Other commands with advertised \
@@ -1329,6 +1330,7 @@ mod tests {
         assert_eq!(definition(&smart, "git"), definition(&legacy, "git"));
         let command = definition(&smart, "run_command").unwrap();
         let description = command["function"]["description"].as_str().unwrap();
+        assert!(description.contains("lifecycle action=build"));
         assert!(description.contains("Scoped shell Git reads and staging"));
         assert!(description.contains("Git commits are refused"));
         assert_eq!(advertise(legacy.clone(), None), legacy);

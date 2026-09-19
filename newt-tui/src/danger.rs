@@ -107,6 +107,7 @@ impl DangerTable {
     pub fn classify(&self, kind: DenialKind, target: &str) -> DangerTier {
         let high = match kind {
             DenialKind::Exec => self.is_interpreter(target),
+            DenialKind::Build => true,
             DenialKind::FsRead | DenialKind::FsWrite => self.is_broad_path(target),
             // A net allowlist entry is a single host — narrow by construction.
             // No net target is danger-tiered today; net is always Low.
@@ -162,6 +163,7 @@ impl DangerTable {
             }
             // Net, RemoteTool, and GitWrite are never high-danger (guarded by
             // `classify` above); unreachable in practice, but keep the match total.
+            DenialKind::Build => Some("Build scripts and tests may execute arbitrary code inside the workspace fence; toolchain/cache reads are allowed, network is denied.".into()),
             DenialKind::Net | DenialKind::RemoteTool | DenialKind::GitWrite => None,
         }
     }

@@ -663,3 +663,93 @@ fn seatbelt_generated_profile_pins_the_boundary() {
         "net:none unexpectedly re-allows a network scope — egress widened. profile:\n{profile}",
     );
 }
+
+/// Grounds the calibrated build request's environment/fence unit tests with the
+/// installed launcher (including Homebrew wrappers and Rustup), compiler, build
+/// script, and test executable. The build script must not read a sibling secret.
+#[test]
+#[ignore = "real installed Rust toolchain and Seatbelt"]
+#[serial]
+fn seatbelt_build_request_runs_cargo_and_denies_sibling_secret() {
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let secret = outside.path().join("secret");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    std::fs::write(&secret, "sentinel").unwrap();
+    std::fs::create_dir(ws.path().join("src")).unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"confined-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlibc = \"=0.2.186\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.path().join("src/lib.rs"),
+        "#[test] fn built_test_runs() { assert_eq!(libc::EXIT_SUCCESS, 0); }",
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("build.rs"), format!(
+        "fn main() {{ assert!(std::fs::read({:?}).is_err()); assert!(std::fs::write({:?}, b\"poison\").is_err()); assert!(std::net::TcpStream::connect({:?}).is_err()); assert!(std::net::UdpSocket::bind(\"127.0.0.1:0\").is_err()); }}",
+        secret, outside.path().join("write"), address)).unwrap();
+    let request = newt_core::confined_exec::build_tool_request(
+        ws.path(),
+        ws.path(),
+        "/bin/sh",
+        ["-c", "cargo --version && cargo test"],
+    )
+    .timeout(std::time::Duration::from_secs(60));
+    let out = ConstrainedExecutor::run(&request).unwrap();
+    assert_seatbelt(&out);
+    assert!(
+        out.success,
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    assert!(!outside.path().join("write").exists());
+}
+
+/// Grounds cancellation's pre-spawn unit check in a real started subprocess:
+/// dropping a model tool future must kill/reap it, not detach spawn_blocking.
+#[tokio::test]
+#[ignore = "real subprocess and Seatbelt"]
+#[serial]
+async fn seatbelt_async_build_cancellation_reaps_child() {
+    use std::time::{Duration, Instant};
+    let ws = tempdir().unwrap();
+    let pidfile = ws.path().join("pid");
+    let request = newt_core::confined_exec::build_tool_request(
+        ws.path(),
+        ws.path(),
+        "/bin/sh",
+        ["-c", "echo $$ > pid; /bin/sleep 60"],
+    )
+    .timeout(Duration::from_secs(10));
+    let child = tokio::spawn(ConstrainedExecutor::run_async(request));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pidfile.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("confined child started")
+        .trim()
+        .parse()
+        .unwrap();
+    child.abort();
+    assert!(child.await.unwrap_err().is_cancelled());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    // SAFETY: signal zero only queries the known child pid; it sends no signal.
+    while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // SAFETY: same signal-zero liveness query.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        newt_core::confined_exec::kill_process_group(pid as u32);
+    }
+    assert!(
+        !alive,
+        "cancelled build kept running after the tool future was dropped"
+    );
+}

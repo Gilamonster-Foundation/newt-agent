@@ -104,6 +104,11 @@ pub enum DenialKind {
     /// deferred / shell-net-gated. A readonly `/posture` still denies it (the gate
     /// refuses the grant when the preset floor projects no git write).
     GitWrite,
+    /// Explicit execution of a resolved lifecycle command under the calibrated
+    /// build fence. Like GitWrite this is a call grant, never an expansion of
+    /// standing shell caveats. Target is the workspace; the prompt names the
+    /// command. Compiler/build-script/test descendants remain kernel-confined.
+    Build,
 }
 
 impl DenialKind {
@@ -116,6 +121,7 @@ impl DenialKind {
             Self::Net => "net",
             Self::RemoteTool => "remote_tool",
             Self::GitWrite => "git_write",
+            Self::Build => "build",
         }
     }
 }
@@ -135,6 +141,7 @@ impl std::str::FromStr for DenialKind {
             "net" => Ok(Self::Net),
             "remote_tool" => Ok(Self::RemoteTool),
             "git_write" => Ok(Self::GitWrite),
+            "build" => Ok(Self::Build),
             _ => Err(()),
         }
     }
@@ -343,7 +350,7 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
             // #1056: a git-write grant maps to no caveat axis either — the git
             // tool's authority is projected separately (GitCaveats); the git arm
             // re-dispatches under a local-write surface on Allow. Widen nothing.
-            DenialKind::GitWrite => continue,
+            DenialKind::GitWrite | DenialKind::Build => continue,
         };
         if let Scope::Only(set) = scope {
             set.insert(target.clone());
