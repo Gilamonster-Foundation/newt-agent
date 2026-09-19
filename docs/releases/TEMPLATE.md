@@ -14,7 +14,7 @@
 
 ### Confined (OCAP-on) champions
 
-Snapshot of the README scoreboard at release time (`just bench-publish` renders the live one). Same 3-column shape; metadata folds under the model name.
+Snapshot of the scoreboard (`docs/terminal-bench.md`) at release time (`just bench-publish` renders the live one). Same 3-column shape; metadata folds under the model name.
 
 | Model | OCAP off | OCAP on |
 |-------|----------|---------|
@@ -49,7 +49,7 @@ a capability score, so deferred rather than banked.
 ## Release checklist
 
 - [ ] Confined runs ingested + digest-pinned (`scripts/eval/bench-results.jsonl`)
-- [ ] `just bench-publish` (README scoreboard rendered)
+- [ ] `just bench-publish` (docs/terminal-bench.md scoreboard rendered)
 - [ ] Version bumped: workspace package **+** internal `=x.y.z` pins **+** `Cargo.lock`
 - [ ] `CHANGELOG` cut `[Unreleased] → [<VERSION>]`
 - [ ] Release PR green + merged to `main`
