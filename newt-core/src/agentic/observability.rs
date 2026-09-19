@@ -158,6 +158,8 @@ impl BehaviorSignal {
 /// [`TurnOutcome`](super::TurnOutcome), `newt solve` serializes it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SolveObservation {
+    /// Verification policy instantiated at turn entry, never recomputed after it.
+    pub verification: Option<serde_json::Value>,
     /// The `model` field of the last chat response body, when the backend
     /// reported one — what the backend says it actually served, feeding the
     /// contract's `effective_model`. `None` when no response carried it.
