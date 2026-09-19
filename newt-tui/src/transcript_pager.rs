@@ -22,6 +22,153 @@
 
 use newt_core::ConversationTurn;
 
+/// Read-only navigation shared by retained output and pending-request inspection.
+/// No key can produce an interaction answer or model input.
+#[cfg(feature = "rich-tui")]
+pub(crate) struct OutputView {
+    lines: Vec<String>,
+    scroll: usize,
+    horizontal: u16,
+    query: Option<String>,
+    search: String,
+    search_match: Option<usize>,
+}
+
+#[cfg(feature = "rich-tui")]
+impl OutputView {
+    pub(crate) fn new(lines: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        Self {
+            lines: lines
+                .into_iter()
+                .map(|line| {
+                    line.as_ref()
+                        .chars()
+                        .flat_map(|c| {
+                            if c.is_control() {
+                                c.escape_default().collect::<Vec<_>>()
+                            } else {
+                                vec![c]
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+            scroll: 0,
+            horizontal: 0,
+            query: None,
+            search: String::new(),
+            search_match: None,
+        }
+    }
+
+    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let rows = usize::from(area.height.saturating_sub(1));
+        self.scroll = self
+            .scroll
+            .min(self.lines.len().saturating_sub(rows.max(1)));
+        let visible = self
+            .lines
+            .iter()
+            .skip(self.scroll)
+            .take(rows)
+            .map(|line| ratatui::text::Line::raw(line.clone()))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(visible).scroll((0, self.horizontal)),
+            ratatui::layout::Rect::new(area.x, area.y, area.width, rows as u16),
+        );
+        let hint = self.query.as_ref().map_or_else(
+            || "Esc back · arrows scroll · / search · n next".to_string(),
+            |query| format!("/{query} · Enter search · Esc cancel search"),
+        );
+        if area.height > 0 {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(hint),
+                ratatui::layout::Rect::new(area.x, area.bottom() - 1, area.width, 1),
+            );
+        }
+    }
+
+    /// Returns true only to close the inspector, never to approve its contents.
+    pub(crate) fn key(&mut self, key: crossterm::event::KeyEvent, rows: usize) -> bool {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return true;
+        }
+        if let Some(query) = &mut self.query {
+            match key.code {
+                KeyCode::Esc => self.query = None,
+                KeyCode::Enter => {
+                    self.search = self.query.take().unwrap_or_default();
+                    self.search_match = None;
+                    self.find(false);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+        let rows = rows.max(1);
+        let max = self.lines.len().saturating_sub(rows);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(4) => return true,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll = (self.scroll + 1).min(max),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll = self.scroll.saturating_sub((rows / 2).max(1));
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll = self.scroll.saturating_add((rows / 2).max(1)).min(max);
+            }
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(rows),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(rows).min(max),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.scroll = max,
+            KeyCode::Left => self.horizontal = self.horizontal.saturating_sub(8),
+            KeyCode::Right => self.horizontal = self.horizontal.saturating_add(8),
+            KeyCode::Char('/') => self.query = Some(String::new()),
+            KeyCode::Char('n') => self.find(true),
+            _ => {}
+        }
+        false
+    }
+
+    fn find(&mut self, next: bool) {
+        if self.search.is_empty() || self.lines.is_empty() {
+            return;
+        }
+        let start = if next {
+            self.search_match.unwrap_or(self.scroll) + 1
+        } else {
+            self.scroll
+        };
+        if let Some(index) = (0..self.lines.len())
+            .map(|i| (start + i) % self.lines.len())
+            .find(|&i| self.lines[i].contains(&self.search))
+        {
+            self.search_match = Some(index);
+            self.scroll = index;
+            if let Some(byte) = self.lines[index].find(&self.search) {
+                self.horizontal =
+                    u16::try_from(newt_core::tty::str_width(&self.lines[index][..byte]))
+                        .unwrap_or(u16::MAX);
+            }
+        }
+    }
+}
+
 /// What a flattened pager row is, for styling and for jump targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowKind {
@@ -304,6 +451,8 @@ impl TurnRows {
 pub(crate) use terminal::run_output_pager;
 #[cfg(feature = "rich-tui")]
 pub(crate) use terminal::run_pager;
+#[cfg(all(unix, feature = "rich-tui", feature = "live-spill"))]
+pub(crate) use terminal::run_spill_picker;
 /// Re-exported for the real-PTY acceptance test only (#1677): it drops the
 /// guard mid-unwind in a child process to prove the restoration claim against
 /// an actual terminal. Nothing in the shipping path constructs it directly —
@@ -382,6 +531,10 @@ mod terminal {
                 Some(window) => PanelOut::Tty(window.output()?),
                 None => PanelOut::Stdout(io::stdout()),
             };
+            Self::enter_on(out, window)
+        }
+
+        fn enter_on(out: PanelOut, window: Option<PanelWindow>) -> io::Result<Self> {
             let raw = RawModeGuard::enter()?;
             // `SuspendHolder`, and it is the honest policy rather than the
             // convenient one: the alternate screen genuinely DOES suspend
@@ -523,69 +676,124 @@ mod terminal {
         terminal_owns_turn: bool,
     ) -> io::Result<()> {
         let mut guard = AltScreenGuard::for_surface(surface, terminal_owns_turn)?;
+        run_spills(&mut guard, std::slice::from_ref(spill), false)
+    }
+
+    /// Called by the presenter itself: no RemoteSurface round trip or second
+    /// stdin owner. The alternate-screen guard restores its saved real tty.
+    #[cfg(all(unix, feature = "live-spill"))]
+    pub(crate) fn run_spill_picker(
+        spills: &[CompletedSpill],
+        output: std::fs::File,
+    ) -> io::Result<()> {
+        let mut guard = AltScreenGuard::enter_on(PanelOut::Tty(output), None)?;
+        run_spills(&mut guard, spills, true)
+    }
+
+    #[cfg(feature = "live-spill")]
+    fn run_spills(
+        guard: &mut AltScreenGuard,
+        spills: &[CompletedSpill],
+        picker: bool,
+    ) -> io::Result<()> {
         let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(&mut guard.out))?;
         terminal.clear()?;
-        let mut scroll = 0usize;
+        let mut selected = 0usize;
+        let mut view = if picker {
+            None
+        } else {
+            spills.first().map(|s| super::OutputView::new(s.lines()))
+        };
         loop {
             let mut page_rows = 1usize;
             terminal.draw(|f| {
-                let retention = if spill.dropped_lines() == 0 {
-                    format!("{} lines", spill.total_lines())
+                let title = if view.is_some() {
+                    format!("spill {}", spills[selected].id())
                 } else {
-                    format!(
-                        "{} of {} lines retained (oldest dropped)",
-                        spill.lines().len(),
-                        spill.total_lines()
-                    )
+                    "inspect retained output".into()
                 };
+                let subtitle = view.as_ref().map(|_| {
+                    let s = &spills[selected];
+                    format!(
+                        "{} of {} lines retained · sanitized display, not an authorization payload",
+                        s.lines().len(),
+                        s.lines().len() + s.dropped_lines()
+                    )
+                });
                 let body = crate::modal::frame(
                     f,
                     f.area(),
                     &crate::modal::Chrome {
-                        title: &format!("spill {}", spill.id()),
-                        subtitle: Some(format!("· {retention}")),
-                        hint: Some("q quit · ↑↓ scroll · PgUp/PgDn page · g/G top/bottom"),
+                        title: &title,
+                        subtitle,
+                        hint: Some("Esc back · ↑↓ select · Enter inspect"),
                     },
                 );
-                page_rows = body.height.max(1) as usize;
-                let max_scroll = spill.lines().len().saturating_sub(page_rows);
-                scroll = scroll.min(max_scroll);
-
-                let visible = spill
-                    .lines()
-                    .iter()
-                    .skip(scroll)
-                    .take(page_rows)
-                    .map(|line| {
-                        Line::from(Span::styled(
-                            line.clone(),
-                            crate::theme::style(crate::theme::Role::Dim),
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                f.render_widget(Paragraph::new(visible), body);
+                page_rows = usize::from(body.height.saturating_sub(1)).max(1);
+                if let Some(view) = &mut view {
+                    view.draw(f, body);
+                } else {
+                    let rows = if spills.is_empty() {
+                        vec![Line::raw(
+                            "No output retained in this session. Older entries may have expired.",
+                        )]
+                    } else {
+                        let top = selected.saturating_sub(page_rows - 1);
+                        spills
+                            .iter()
+                            .enumerate()
+                            .skip(top)
+                            .take(page_rows)
+                            .map(|(i, s)| {
+                                let preview =
+                                    s.lines().first().map(String::as_str).unwrap_or("(empty)");
+                                Line::styled(
+                                    format!(
+                                        "{} spill {} · {} lines · {}",
+                                        if i == selected { ">" } else { " " },
+                                        s.id(),
+                                        s.total_lines(),
+                                        preview
+                                    ),
+                                    if i == selected {
+                                        Style::default().add_modifier(Modifier::REVERSED)
+                                    } else {
+                                        Style::default()
+                                    },
+                                )
+                            })
+                            .collect()
+                    };
+                    f.render_widget(Paragraph::new(rows), body);
+                }
             })?;
-
             let Event::Key(key) = event::read()? else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            let half = (page_rows / 2).max(1);
-            let max_scroll = spill.lines().len().saturating_sub(page_rows);
+            if let Some(current) = &mut view {
+                if current.key(key, page_rows) {
+                    if !picker {
+                        return Ok(());
+                    }
+                    view = None;
+                }
+                continue;
+            }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('c') if ctrl => return Ok(()),
-                KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => scroll = (scroll + 1).min(max_scroll),
-                KeyCode::PageUp => scroll = scroll.saturating_sub(page_rows),
-                KeyCode::PageDown => scroll = (scroll + page_rows).min(max_scroll),
-                KeyCode::Char('u') if ctrl => scroll = scroll.saturating_sub(half),
-                KeyCode::Char('d') if ctrl => scroll = (scroll + half).min(max_scroll),
-                KeyCode::Char('g') | KeyCode::Home => scroll = 0,
-                KeyCode::Char('G') | KeyCode::End => scroll = max_scroll,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(4) => return Ok(()),
+                KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(())
+                }
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => selected = (selected + 1).min(spills.len().saturating_sub(1)),
+                KeyCode::Enter => {
+                    view = spills
+                        .get(selected)
+                        .map(|s| super::OutputView::new(s.lines()));
+                }
                 _ => {}
             }
         }
@@ -595,6 +803,50 @@ mod terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn inspection_search_reaches_hidden_text_and_enter_is_not_an_answer() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut view = OutputView::new(["first", "payload needle", "last"]);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(!view.key(key(KeyCode::Char('/')), 1));
+        for c in "needle".chars() {
+            view.key(key(KeyCode::Char(c)), 1);
+        }
+        assert!(!view.key(key(KeyCode::Enter), 1));
+        assert_eq!(view.scroll, 1);
+        assert!(!view.key(key(KeyCode::Enter), 1));
+        assert!(!view.key(key(KeyCode::Right), 1));
+        assert!(view.horizontal > 0);
+        assert!(view.key(key(KeyCode::Esc), 1));
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn inspection_renders_controls_as_text_and_keeps_long_lines() {
+        let long = format!("{}END", "x".repeat(10_000));
+        let view = OutputView::new(["\x1b[2J", long.as_str()]);
+        assert!(!view.lines[0].contains('\x1b'));
+        assert!(view.lines[1].ends_with("END"));
+        assert_eq!(view.lines[1].len(), long.len());
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn inspection_next_match_advances_after_render_clamps_the_last_page() {
+        let mut view = OutputView::new(["first", "needle one", "needle two"]);
+        view.search = "needle".into();
+        view.find(false);
+        assert_eq!(view.scroll, 1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5)).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, frame.area()))
+            .unwrap();
+        view.find(true);
+        assert_eq!(view.scroll, 2);
+    }
 
     #[cfg(feature = "rich-tui")]
     #[test]

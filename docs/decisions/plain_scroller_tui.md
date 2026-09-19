@@ -355,3 +355,12 @@ The practical wins compound with the architectural one:
 - Revisit trigger: if newt genuinely cannot express a needed interaction as
   scrolled lines, write a new decision doc that supersedes this one — do
   not land the surface change first.
+
+## Amendment: operator-invoked inspection during a turn (#2444)
+
+The rich cockpit may open its existing alternate-screen output pager on an
+explicit F4 press during a turn. This is a read-only operator action: it neither
+submits a prompt nor answers an authorization request. The presenter remains
+the sole terminal owner and restores the mounted draft on dismissal. Native
+scrollback stays native; its old rows are not screen-coordinate click targets.
+Pending interaction inspection remains inside the existing inline modal.

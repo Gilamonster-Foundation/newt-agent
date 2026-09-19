@@ -360,6 +360,7 @@ fn session_contract_in_separately_built_consumer() {
         .args(["build", "--offline", "--quiet", "--bin", "app"])
         .env_clear()
         .env("RUSTC_WRAPPER", "")
+        .env("CARGO_TARGET_DIR", dir.join("target"))
         .current_dir(&dir);
     for k in ["PATH", "HOME", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN"] {
         if let Ok(v) = std::env::var(k) {

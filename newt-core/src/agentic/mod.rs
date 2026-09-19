@@ -857,6 +857,11 @@ pub trait CompletedSpillRenderer: Send + Sync {
         None
     }
 
+    /// Host-supported inspection affordance, with the command fallback.
+    fn recovery_hint(&self, id: u64) -> String {
+        format!("/spill open {id}")
+    }
+
     /// Render a completed tool result as an interactive spill viewport.
     ///
     /// `output` is the complete (stdout+stderr) tool output. `width` is the
@@ -12627,7 +12632,9 @@ fn commit_reasoning_fold(
     // Retain BEFORE printing the handle, so the id names a body that is already
     // there rather than one that is about to be.
     let retained = retain.and_then(|r| r.retain_completed(fold.body()));
-    let hint = retained.map(|id| format!("/spill open {id}"));
+    let hint = retained
+        .zip(retain)
+        .map(|(id, renderer)| renderer.recovery_hint(id));
     let recovery = hint
         .as_deref()
         .map_or_else(display::Recovery::default, display::Recovery::Command);
@@ -12700,7 +12707,9 @@ impl ReasoningTrickle {
         // Retain FIRST: the handle the line prints has to name a body that is
         // already there, or the offer is a lie for as long as the race lasts.
         let retained = retain.and_then(|r| r.retain_completed(self.fold.body()));
-        let hint = retained.map(|id| format!("/spill open {id}"));
+        let hint = retained
+            .zip(retain)
+            .map(|(id, renderer)| renderer.recovery_hint(id));
         let recovery = hint
             .as_deref()
             .map_or_else(display::Recovery::default, display::Recovery::Command);
