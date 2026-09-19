@@ -165,9 +165,10 @@ pub struct Cli {
     pub altitude: Option<String>,
 
     /// Tenacity (#psyche): how long the agent pursues the task — `normal` |
-    /// `relentless`. Default `normal`. In interactive code sessions and
-    /// `headless`, `relentless` makes the default tool-round budget effectively
-    /// unlimited; an explicit round limit wins. The pre-split levels
+    /// `resolute` | `relentless`. Resolute requires fresh successful verification
+    /// before an Act task can finish. Explicit relentless also lifts the default
+    /// tool-round limit; an explicit round limit wins. Unset inherits persona,
+    /// exact model-family config, config default, then normal. The pre-split levels
     /// (`relaxed` / `standard` / `insistent`) are refused with their
     /// `--initiative` replacement.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
