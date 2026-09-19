@@ -102,9 +102,10 @@ pub struct RoleProfile {
     /// controls.
     pub cognition: Option<Cognition>,
     /// INITIATIVE — how much this persona looks before acting. `None` = the
-    /// model-family / config default. (Persona tenacity no longer exists:
-    /// tenacity is set only explicitly.)
+    /// model-family / config default.
     pub initiative: Option<Initiative>,
+    /// Pursuit policy; inherited defaults never lift the tool-round cap.
+    pub tenacity: Option<crate::Tenacity>,
     /// CREW — when `true`, this persona runs with the multi-agent crew (`/team`)
     /// on by default. `None`/`false` = single-agent. Enforcement is a follow-up.
     pub crew: Option<bool>,
@@ -394,6 +395,10 @@ impl std::str::FromStr for Cognition {
 /// `prompt` (markdown body) is never part of the serde surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 struct FrontMatter {
+    #[serde(default)]
+    psyche_version: Option<u32>,
+    #[serde(default)]
+    tenacity: Option<crate::Tenacity>,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -756,6 +761,12 @@ impl RoleProfile {
         };
         let fm: FrontMatter = toml::from_str(fm_text)
             .map_err(|e| anyhow::anyhow!("invalid role-profile front-matter: {e}"))?;
+        match fm.psyche_version {
+            Some(2) => {},
+            Some(version) => anyhow::bail!("unsupported persona psyche_version {version}; supported version is 2"),
+            None if fm.tenacity.is_some() => anyhow::bail!("current persona tenacity requires psyche_version = 2; load legacy labels through the one-time importer"),
+            None => {},
+        }
         Ok(Self {
             prompt: body,
             role: fm.role,
@@ -768,6 +779,7 @@ impl RoleProfile {
             backend: fm.backend,
             cognition: fm.cognition,
             initiative: fm.initiative,
+            tenacity: fm.tenacity,
             crew: fm.crew,
             personality: fm.personality,
         })
@@ -783,6 +795,8 @@ impl RoleProfile {
     /// would exceed the envelope limit or contain a closing-fence line.
     pub fn to_markdown(&self) -> anyhow::Result<String> {
         let front_matter = FrontMatter {
+            psyche_version: Some(2),
+            tenacity: self.tenacity,
             role: self.role.clone(),
             tools: self.tools.clone(),
             skills: self.skills.clone(),
@@ -818,6 +832,7 @@ impl RoleProfile {
             || self.backend.is_some()
             || self.cognition.is_some()
             || self.initiative.is_some()
+            || self.tenacity.is_some()
             || self.crew.is_some()
             || self.personality.is_some()
     }
@@ -1140,7 +1155,11 @@ max_calls = 7
     #[test]
     fn to_markdown_refuses_a_style_edit_that_outgrows_a_valid_envelope() {
         let limit = crate::markup::MAX_ENVELOPE_BYTES;
-        let metadata = format!("role = \"{}\"\n", "r".repeat(limit - "role = \"\"\n".len()));
+        let stamp = "psyche_version = 2\n";
+        let metadata = format!(
+            "role = \"{}\"\n{stamp}",
+            "r".repeat(limit - "role = \"\"\n".len() - stamp.len())
+        );
         assert_eq!(metadata.len(), limit);
         let mut profile = RoleProfile::parse(&format!("+++\n{metadata}+++\n\n# Reviewer\n"))
             .expect("the source metadata fits exactly within the envelope limit");
@@ -1159,6 +1178,25 @@ max_calls = 7
             error.downcast_ref::<crate::markup::EnvelopeError>(),
             Some(crate::markup::EnvelopeError::Oversized { bytes }) if *bytes > limit
         ));
+    }
+
+    /// #2451: the mandatory format stamp cannot silently exceed the envelope
+    /// bound. The writer refuses bytes before any caller can replace its source.
+    #[test]
+    fn resolute_2451_unversioned_limit_refuses_oversized_stamped_save() {
+        let limit = crate::markup::MAX_ENVELOPE_BYTES;
+        let metadata = format!("role = \"{}\"\n", "r".repeat(limit - "role = \"\"\n".len()));
+        assert_eq!(metadata.len(), limit);
+        let source = format!("+++\n{metadata}+++\n\n# Reviewer\n");
+        let profile = RoleProfile::parse(&source).expect("legacy source fits exactly");
+        let error = profile
+            .to_markdown()
+            .expect_err("version stamp must fit too");
+        assert!(matches!(
+            error.downcast_ref::<crate::markup::EnvelopeError>(),
+            Some(crate::markup::EnvelopeError::Oversized { bytes }) if *bytes > limit
+        ));
+        assert_eq!(RoleProfile::parse(&source).unwrap(), profile);
     }
 
     #[test]
