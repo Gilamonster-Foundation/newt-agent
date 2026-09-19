@@ -497,3 +497,6 @@ mod smart_harness;
 
 #[path = "http_capability_grounding.rs"]
 mod capability_grounding;
+
+#[path = "http_ollama_initiative.rs"]
+mod ollama_initiative;
