@@ -496,3 +496,6 @@ mod exposure_promotion;
 #[cfg(test)]
 #[path = "http_smart_harness.rs"]
 mod smart_harness;
+
+#[path = "http_ollama_initiative.rs"]
+mod ollama_initiative;
