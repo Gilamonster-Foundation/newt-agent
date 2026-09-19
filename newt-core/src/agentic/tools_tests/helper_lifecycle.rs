@@ -279,3 +279,21 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     let err = run_build_check(passing_build_check_cmd(), "/definitely/not/a/dir");
     assert!(err.contains("⚠ build check could not run"), "got: {err}");
 }
+
+#[test]
+fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
+    let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));
+    let request = lifecycle_build_request("/ws", "cargo test --offline", &base);
+    assert_eq!(request.kind, DenialKind::Build);
+    assert_eq!(request.target, "/ws");
+    assert!(request.reason.contains("cargo test --offline"));
+    assert!(request.reason.contains("network denied"));
+    assert_eq!(
+        crate::agentic::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
+        base
+    );
+    assert_eq!(
+        lifecycle_tool_definition()["function"]["parameters"]["properties"]["action"]["enum"],
+        serde_json::json!(["run", "list", "build"])
+    );
+}

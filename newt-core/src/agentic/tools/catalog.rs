@@ -17,7 +17,8 @@ pub fn tool_definitions() -> serde_json::Value {
                                 the redirect and read stdout/stderr from the result instead. Prefer the \
                                 dedicated tools over shelling out: `find`/`read_file`/`list_dir` over \
                                 `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` over raw \
-                                build/test/lint commands. Do NOT pass `git` (or another tool's name) as \
+                                build/test/lint commands (use lifecycle action=build for explicitly \
+                                authorized offline compiler/test subprocesses). Do NOT pass `git` (or another tool's name) as \
                                 the command here — `git` is a separate tool; invoke it directly. Shelling \
                                 out to a name that has a dedicated tool is rejected. Declare needed \
                                 filesystem additions with fs_read/fs_write absolute-path arrays; \
@@ -281,6 +282,9 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
                 test / format / lint / check work so the project's own \
                 conventions are honored uniformly across build systems. Use \
                 action=list to see the resolved command without running it. \
+                If Cargo or its compiler is blocked by a narrow exec grant, use \
+                action=build: explicitly request confined build authority, with \
+                toolchain/cache reads, workspace writes and network denied. \
                 In a polyglot/monorepo workspace, pass `dir` to target a \
                 nested project directly — if you omit it and nothing is \
                 configured at the workspace root, the response names any \
@@ -295,9 +299,10 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["run", "list"],
+                        "enum": ["run", "list", "build"],
                         "description": "run (default) executes the phase's resolved command; \
-                                        list returns the command without running it."
+                                        list returns the command without running it; build requests \
+                                        the calibrated offline build fence for compiler/test subprocesses."
                     },
                     "dir": {
                         "type": "string",

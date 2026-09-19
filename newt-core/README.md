@@ -32,6 +32,20 @@ requests leave the cache unchanged. Untyped native error text and ordinary
 failures from other tools remain cached; every retry still passes through the
 normal tool gate, and executed-failure history is retained.
 
+For compiler/test subprocesses that cannot run under a literal executable grant,
+call `lifecycle` with `{"phase":"test","action":"build"}` (or `check`, `lint`,
+`format`). This requests explicit, once-only confined build authority. The
+resolved command and calibrated read roots are shown before approval. Build
+scripts and tests inherit workspace-only writes and denied network access;
+Cargo uses installed toolchains, cached dependencies and a workspace-local
+`target`. The ordinary `run` action and raw shell grants remain unchanged.
+Restricted preset/delegated ceilings and Smart Harness frame isolation still
+apply. Dependencies must already be cached; this action does not authorize
+network installation or shared-cache writes. Network denial includes loopback:
+tests that start localhost servers need a separately authorized execution
+policy. This action does not promise that a project's entire test suite can
+run offline.
+
 Confined shell and lifecycle calls refresh standing session and verified durable
 grants before starting a child, so a grant applies to the next call in the same
 turn. Refresh starts from the caller's baseline before adding standing grants

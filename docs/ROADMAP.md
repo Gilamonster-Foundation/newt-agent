@@ -1936,6 +1936,25 @@ fully-mocked unit tier, coverage ratchet.
   ledger into the final summary; when rounds were hallucination/dead-tool
   dominated, say so rather than advising "raise max_tool_rounds".
 
+## Step 27.6 — Explicit confined lifecycle builds (#2446)
+
+**Branch:** `step-27.6-confined-lifecycle-builds`
+
+Restore a usable validation route when an installed compiler is unreachable
+under literal executable grants. Extend the existing `lifecycle` tool with
+`action=build`, an explicit once-only build permission and the existing
+calibrated `ConstrainedExecutor` fence. Resolve Cargo/Rustup and the macOS SDK
+before replacing the child's home; keep target/scratch writes in the workspace.
+
+**Acceptance:** actual Cargo compilation, build scripts and tests run under
+Seatbelt; declined authority launches nothing; toolchain reads do not grant the
+whole home directory; unrelated reads/writes and network remain denied. Preset,
+delegation and frame-isolation boundaries still apply.
+
+**Out of scope:** changing generic `exec:cargo` into unrestricted shell authority,
+network-enabled dependency installation, mutable shared cache/target writes,
+and expanding the embedded Git write surface.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool
