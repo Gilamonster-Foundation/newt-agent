@@ -155,7 +155,9 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
         "anthropic" => BackendKind::Anthropic,
         _ => BackendKind::Openai,
     };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // This timeout only converts a hang into a test failure. It is not a latency
+    // assertion; HTTP and durable storage can be slow under full-crate load.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
         let run = async {
             if wire == "responses" {
                 openai_responses_complete(context, &mut mcp).await
@@ -175,7 +177,7 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
         Some(run.await)
     })
     .await
-    .expect("the deterministic second-call barrier must be reached");
+    .expect("completion scenario exceeded its hang guard");
     if let Some(result) = result {
         assert!(result
             .expect("cancellation is a reported terminal outcome")
