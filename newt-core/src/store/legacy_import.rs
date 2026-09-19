@@ -135,6 +135,71 @@ pub(super) fn migrate_pin_cognition_labels(conn: &Connection) -> anyhow::Result<
     Ok(())
 }
 
+/// Psyche split (slice 1b), every open: a pin's pre-split tenacity label that
+/// can only be old (`relaxed`/`standard`/`insistent`) becomes the initiative
+/// level that inherited it, with tenacity `normal`. The old label pinned both
+/// halves, so both are pinned. An initiative the row already carries is kept.
+/// Idempotent (only old labels match), so it also catches a label a pre-split
+/// binary sharing the database writes later. Without it the strict decode
+/// refuses the whole pin, backend and model included, and resume degrades the
+/// tab. A row that is not valid JSON is left for that decode to refuse.
+///
+/// Once per database, behind a `store_migrations` row: `relentless` with no
+/// initiative gains initiative `eager`. `relentless` is also a current label
+/// (tenacity only), so this cannot run every open without re-adding `eager`
+/// to a pin an operator set after the split. Deletable with
+/// [`crate::psyche_import`].
+pub(super) fn migrate_pin_tenacity_split(conn: &Connection) -> anyhow::Result<()> {
+    let (ambiguous, unambiguous): (Vec<_>, Vec<_>) = crate::psyche_import::LEGACY_TENACITY
+        .iter()
+        .partition(|(old, _)| *old == crate::Tenacity::Relentless.label());
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let values = vec!["(?, ?)"; unambiguous.len()].join(", ");
+    let mut migrated = tx.execute(
+        &format!(
+            "WITH legacy(old, new) AS (VALUES {values})
+             UPDATE conversations SET preference_pin = json_set(preference_pin,
+                 '$.initiative', COALESCE(json_extract(preference_pin, '$.initiative'),
+                     (SELECT new FROM legacy
+                      WHERE old = json_extract(preference_pin, '$.tenacity'))),
+                 '$.tenacity', ?)
+             WHERE CASE WHEN json_valid(preference_pin)
+                        THEN json_extract(preference_pin, '$.tenacity') END
+                   IN (SELECT old FROM legacy)"
+        ),
+        rusqlite::params_from_iter(
+            unambiguous
+                .iter()
+                .flat_map(|(old, new)| [*old, *new])
+                .chain([crate::Tenacity::Normal.label()]),
+        ),
+    )?;
+    let first_run = tx.execute(
+        "INSERT OR IGNORE INTO store_migrations (name) VALUES ('psyche-initiative-split')",
+        [],
+    )? == 1;
+    if first_run {
+        for (old, new) in ambiguous {
+            migrated += tx.execute(
+                "UPDATE conversations SET preference_pin =
+                     json_set(preference_pin, '$.initiative', ?2)
+                 WHERE CASE WHEN json_valid(preference_pin)
+                            THEN json_extract(preference_pin, '$.tenacity') END = ?1
+                   AND json_type(preference_pin, '$.initiative') IS NULL",
+                rusqlite::params![old, new],
+            )?;
+        }
+    }
+    tx.commit()?;
+    if migrated > 0 {
+        tracing::info!(
+            migrated,
+            "split pre-split tenacity labels in preference pins into initiative"
+        );
+    }
+    Ok(())
+}
+
 /// Walk `<legacy_root>/<workspace-uuid>/<id>.json` and parse every readable
 /// record — all workspaces, not just the opening store's. Corrupt or
 /// unreadable records are skipped with a warning (the legacy store's own
