@@ -84,8 +84,8 @@ config's per-family value, then the config default, then the built-in default.
 
 A level is a name for a number, and the numbers are config, not code. Today
 the level *choice* is configurable (`[tenacity.families]`) but the numbers
-behind each level are hard-coded in `tenacity.rs`. They move to config, with
-today's values as the built-in defaults:
+behind each level are hard-coded in `tenacity.rs`. They move to config. The built-in
+defaults are today's values, except `patient`'s 12 (today's lowest level is 6):
 
 ```toml
 [initiative.rounds]      # read-only rounds before the nudge to act
@@ -152,7 +152,7 @@ only test fixtures do. `exhaustive`, `grit`, and `resolute` have no old name.
 ## Out of scope
 
 - The five communication-style sliders in `/psyche`; they are unchanged.
-- Choosing the final numbers. The defaults above are today's values; the
+- Choosing the final numbers. The defaults above are starting points; the
   tuned values come from measured runs.
 
 ## Decisions (2026-09-18)
