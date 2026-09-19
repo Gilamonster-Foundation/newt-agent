@@ -166,6 +166,15 @@ these expects:
   or with the smart harness on. On the Responses wire without it newt has no
   gate and reports `off`.
 
+These optional-gate treatment assumptions apply to `tenacity: normal`.
+Resolute and relentless Act turns require `result_aware` verification on all
+four wires even with SmartHarness off or the self-verify ablation enabled. Their
+captured receipt adds `required_by_tenacity: true`; the existing repair allowance
+remains three. The receipt comes from the policy instantiated by the turn, so a
+later environment or settings change cannot relabel the completed run. A normal
+baseline expectation must not be used to label this stricter treatment observed.
+This does not change grading or rewrite historical receipts.
+
 A turn that never ran (outcome `harness_error` with no verification receipt, as
 a spawn or thread failure writes) is not counted as not observed.
 
