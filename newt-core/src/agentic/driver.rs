@@ -890,7 +890,7 @@ mod tests {
         use crate::test_guard::GlobalSettingsGuard;
 
         let _settings = GlobalSettingsGuard::acquire();
-        set_cli_cognition(CognitionOverride::Set(Cognition::Pondering));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Rational));
         set_cli_tenacity(Tenacity::Insistent);
         let empty = TurnDriver::new(cfg("http://placeholder"));
 
@@ -901,7 +901,7 @@ mod tests {
             vec![MemMessage::user("already started")],
         );
 
-        assert_eq!(empty.runtime.cognition, Some(Cognition::Pondering));
+        assert_eq!(empty.runtime.cognition, Some(Cognition::Rational));
         assert_eq!(empty.runtime.tenacity, Tenacity::Insistent);
         assert_eq!(seeded.runtime.cognition, None);
         assert_eq!(seeded.runtime.tenacity, Tenacity::Relaxed);
@@ -1496,7 +1496,7 @@ mod tests {
         let mut config = cfg(&server.uri());
         config.caveats = expected_caveats.clone();
         let mut driver = TurnDriver::new(config)
-            .with_cognition(Some(crate::role_profile::Cognition::Pondering))
+            .with_cognition(Some(crate::role_profile::Cognition::Rational))
             .with_tenacity(crate::tenacity::Tenacity::Relentless)
             .with_crew_runner(runner.clone());
         crate::tenacity::set_cli_tenacity(crate::tenacity::Tenacity::Relaxed);
@@ -1529,7 +1529,7 @@ mod tests {
 
     /// Integrated regression for headless numbered recovery: the declared 65K
     /// window is stale, vLLM reports its actual 32K full window, and
-    /// contemplating reserves 16K output. The parser must therefore compact
+    /// meticulous reserves 16K output. The parser must therefore compact
     /// toward 16,768 input tokens; the old numberless fallback (80% of the
     /// current cap twice) leaves this
     /// fixture above the server threshold and cannot succeed.
@@ -1615,7 +1615,7 @@ mod tests {
         );
 
         let mut driver = TurnDriver::with_transcript(config, transcript)
-            .with_cognition(Some(crate::role_profile::Cognition::Contemplating));
+            .with_cognition(Some(crate::role_profile::Cognition::Meticulous));
         driver.submit("finish the current task").expect("submit");
         let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
             panic!("headless turn did not complete after numbered recovery")

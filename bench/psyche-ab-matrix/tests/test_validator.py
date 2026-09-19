@@ -34,7 +34,7 @@ COGNITION = {
     "baseline": "default",
     "tenacity": "default",
     "crew": "default",
-    "obsessive": "contemplating",
+    "obsessive": "meticulous",
 }
 CREW = {
     "baseline": "off",
@@ -304,7 +304,7 @@ def make_valid_fixture(root: Path) -> None:
             "effective_config": {
                 "context_window": 65536,
                 "tenacity": "standard",
-                "cognition": "contemplating",
+                "cognition": "meticulous",
                 "crew": "off",
                 "ocap": "off",
                 "max_rounds": 2,

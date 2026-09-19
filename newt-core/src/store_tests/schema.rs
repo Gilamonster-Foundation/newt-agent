@@ -69,6 +69,66 @@ fn preference_pin_round_trips_defaults_empty_and_is_workspace_fenced() {
     assert_eq!(store_a.preference_pin(&id).unwrap(), Some(pin));
 }
 
+/// Psyche rename (slice 1a): a pin written with an old cognition label is
+/// rewritten to the new label on open, every other key untouched. Before the
+/// migration the old label failed to parse, so resume degraded the tab.
+///
+/// Regression (review of slice 1a): the rewrite was once gated by a run-once
+/// marker, so an old label written after the first open (by a pre-rename
+/// binary sharing the database) was never migrated. It now runs every open.
+#[test]
+fn open_rewrites_an_old_pin_cognition_label_on_every_open() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let open = || ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let raw_pin = |store: &ConversationStore, id: &str| -> String {
+        store
+            .lock_conn()
+            .query_row(
+                "SELECT preference_pin FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let (old, garbled) = {
+        let store = open();
+        let old = store.create("old vocabulary", None).unwrap();
+        let garbled = store.create("garbled", None).unwrap();
+        store
+            .set_raw_preference_pin_for_test(
+                &old,
+                r#"{"backend":"sol","cognition":"contemplating","tenacity":"relentless"}"#,
+            )
+            .unwrap();
+        store
+            .set_raw_preference_pin_for_test(&garbled, "not json")
+            .unwrap();
+        (old, garbled)
+    };
+
+    let store = open();
+    assert_eq!(
+        raw_pin(&store, &old),
+        r#"{"backend":"sol","cognition":"meticulous","tenacity":"relentless"}"#
+    );
+    let pin = store.preference_pin(&old).unwrap().unwrap();
+    assert_eq!(pin.cognition.as_deref(), Some("meticulous"));
+    assert_eq!(
+        raw_pin(&store, &garbled),
+        "not json",
+        "left for the strict decode"
+    );
+
+    // An old label written after an earlier open (a pre-rename binary on the
+    // same database) is migrated by the next open too.
+    store
+        .set_raw_preference_pin_for_test(&old, r#"{"cognition":"pondering"}"#)
+        .unwrap();
+    drop(store);
+    assert_eq!(raw_pin(&open(), &old), r#"{"cognition":"rational"}"#);
+}
+
 /// #1668: posture writes are metadata — they must not tick the §6
 /// activity clock, so pinning posture can never perturb MRU ordering
 /// (same contract as `rename` / `update_scratchpad`).

@@ -446,7 +446,7 @@ bounded_reasoning_continuation = true
     let cases = [
         ("bare", false, "default", "standard"),
         ("crew", true, "default", "standard"),
-        ("obsessive", true, "contemplating", "relentless"),
+        ("obsessive", true, "meticulous", "relentless"),
     ];
     for (name, crew, cognition, tenacity) in cases {
         let obsessive = name == "obsessive";
@@ -1194,7 +1194,7 @@ api = "chat_completions"
     Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
-        .args(["--cognition", "contemplating"])
+        .args(["--cognition", "meticulous"])
         .arg("--config")
         .arg(&config_path)
         .args(["headless", "--cwd"])

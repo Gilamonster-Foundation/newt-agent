@@ -191,7 +191,7 @@ fn a_persona_routed_session_with_no_operator_action_stays_unpinned() {
     // per-turn snapshot would have swept up.
     // SAFETY: guarded single-threaded test.
     unsafe { std::env::set_var("NEWT_PROVIDER", "muse") };
-    newt_core::cognition::set_persona_cognition(Some(Cognition::Contemplating));
+    newt_core::cognition::set_persona_cognition(Some(Cognition::Meticulous));
     newt_core::tenacity::set_persona_tenacity(Some(Tenacity::Relentless));
 
     let mut session = Session::new(&cfg);
@@ -503,9 +503,9 @@ fn this_runs_explicit_flags_beat_the_pin_for_the_whole_invocation() {
     };
     store.update_preference_pin(&id, &pin).unwrap();
 
-    // `newt --cognition contemplating` this run: the flag installs the dial
+    // `newt --cognition meticulous` this run: the flag installs the dial
     // and records that it owns the axis.
-    set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+    set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
     record_cli_preference_axes(PreferenceAxes {
         cognition: true,
         ..Default::default()
@@ -517,7 +517,7 @@ fn this_runs_explicit_flags_beat_the_pin_for_the_whole_invocation() {
     session.switch_to(Some(&store), &id, &baseline, &cfg);
     assert_eq!(
         cli_cognition(),
-        CognitionOverride::Set(Cognition::Contemplating),
+        CognitionOverride::Set(Cognition::Meticulous),
         "the just-typed flag must beat the stored pin"
     );
     assert_eq!(cli_tenacity(), Some(Tenacity::Relaxed), "unowned applies");
@@ -530,7 +530,7 @@ fn this_runs_explicit_flags_beat_the_pin_for_the_whole_invocation() {
     session.switch_to(Some(&store), &id, &baseline, &cfg);
     assert_eq!(
         cli_cognition(),
-        CognitionOverride::Set(Cognition::Contemplating)
+        CognitionOverride::Set(Cognition::Meticulous)
     );
     // The row is untouched — the flag wins this run, not forever.
     assert_eq!(store.preference_pin(&id).unwrap(), Some(pin));

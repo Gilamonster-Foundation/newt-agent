@@ -83,7 +83,7 @@ else:
         manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 effective_model = model if endpoint.startswith("http://127.0.0.1:") else os.environ.get("FAKE_EFFECTIVE_MODEL", model)
 tenacity = "relentless" if "--tenacity" in args or "--obsessive" in args else "standard"
-cognition = option("--cognition", "contemplating" if "--obsessive" in args else "default")
+cognition = option("--cognition", "meticulous" if "--obsessive" in args else "default")
 crew = "on" if os.environ.get("NEWT_TEAM") is not None or "--obsessive" in args else "off"
 records = [
     {"kind": "solve_result", "task_file": str(pathlib.Path(option("--instruction-file")).resolve()),

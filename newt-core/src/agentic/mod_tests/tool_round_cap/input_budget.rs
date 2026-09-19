@@ -214,7 +214,7 @@ async fn openai_chat_output_reserve_tightens_declared_window_before_dispatch() {
     let uri = server.uri();
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, BackendKind::Openai);
     ctx.safe_context = None;
-    ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+    ctx.cognition = Some(crate::role_profile::Cognition::Meticulous);
     ctx.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
         cognition: Some(true),
         ..Default::default()
@@ -545,7 +545,7 @@ async fn refused_budget_message(path_str: &str, output_allowance: Option<u32>) -
     ctx.safe_context = None;
     ctx.max_ok_input = None;
     ctx.num_ctx = Some(32_768);
-    ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+    ctx.cognition = Some(crate::role_profile::Cognition::Meticulous);
     ctx.output_allowance = output_allowance;
     ctx.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
         cognition: Some(true),
@@ -568,7 +568,7 @@ async fn refused_budget_message(path_str: &str, output_allowance: Option<u32>) -
 /// against. Guards the #1534 class: threading an override into the policy
 /// alone leaves admission on the cognition table while the wire changes.
 /// The `None` row is the twin: without an override every surface falls back
-/// to the Contemplating table's 16,000 (16,768 input).
+/// to the Meticulous table's 16,000 (16,768 input).
 ///
 /// The Anthropic loop reserves the `max_tokens` it sends, default included; its
 /// surfaces are pinned by `a_declared_window_reserves_the_max_tokens_anthropic_sends`
@@ -589,7 +589,7 @@ async fn output_allowance_resolves_once_across_every_budget_surface() {
         (None, 16_000, 16_768, 26_214),
     ] {
         let policy =
-            GenerationPolicy::resolve(Some(Cognition::Contemplating), explicit, capability, scope);
+            GenerationPolicy::resolve(Some(Cognition::Meticulous), explicit, capability, scope);
         assert_eq!(policy.output_allowance, Some(resolved), "{explicit:?}");
         assert_eq!(policy.max_output_tokens, Some(resolved), "{explicit:?}");
         assert_eq!(
@@ -604,7 +604,7 @@ async fn output_allowance_resolves_once_across_every_budget_surface() {
                 None,
                 None,
                 80,
-                Some(Cognition::Contemplating),
+                Some(Cognition::Meticulous),
                 explicit
             )
             .actionable_input_budget(),
@@ -621,7 +621,7 @@ async fn output_allowance_resolves_once_across_every_budget_surface() {
                     api,
                     Some(32_768),
                     80,
-                    Some(Cognition::Contemplating),
+                    Some(Cognition::Meticulous),
                     explicit,
                     capability,
                     scope,

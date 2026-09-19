@@ -19,7 +19,7 @@ fn persona_provider_env_maps_backend_and_optional_model() {
         Some(("sol".to_string(), None))
     );
     // No backend declared → no routing (leave the session backend untouched).
-    let p3 = newt_core::RoleProfile::parse("+++\ncognition = \"pondering\"\n+++\n\n# T\n").unwrap();
+    let p3 = newt_core::RoleProfile::parse("+++\ncognition = \"rational\"\n+++\n\n# T\n").unwrap();
     assert_eq!(persona_provider_env(Some(&p3)), None);
     assert_eq!(persona_provider_env(None), None);
 }
@@ -50,7 +50,7 @@ fn persona_backend_route_validates_known_reverts_none_and_refuses_unknown() {
         Err("ghost".to_string())
     );
     // No backend (or a cleared persona) → Ok(None) = revert to the baseline.
-    let p4 = newt_core::RoleProfile::parse("+++\ncognition = \"pondering\"\n+++\n\n# T\n").unwrap();
+    let p4 = newt_core::RoleProfile::parse("+++\ncognition = \"rational\"\n+++\n\n# T\n").unwrap();
     assert_eq!(persona_backend_route(Some(&p4), &configured), Ok(None));
     assert_eq!(persona_backend_route(None, &configured), Ok(None));
 }

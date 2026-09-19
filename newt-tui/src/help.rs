@@ -2,6 +2,7 @@
 //! Command recognition and dispatch remain with the session.
 
 use newt_core::agentic::newt_line;
+use newt_core::role_profile::Cognition;
 
 /// Map a typed command (incl. aliases) to its help topic. Several commands
 /// share one page (the editor modes; the conversation-end trio).
@@ -17,6 +18,33 @@ pub(super) fn canonical_help_topic(cmd: &str) -> &str {
         _ => cmd,
     }
 }
+
+/// The `/cognition` page, with its level list and wire mapping derived from
+/// [`Cognition::all`] so a renamed or added level cannot leave it stale.
+static COGNITION_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let all = Cognition::all();
+    let levels: Vec<&str> = all.into_iter().map(Cognition::label).collect();
+    let (light, deep) = (all[0], all[all.len() - 1]);
+    format!(
+        "\
+/cognition — folded into /psyche (#1665)
+
+  /psyche                open the dial panel (TTY); ←/→ dials cognition
+  /psyche cognition <level>  set {levels}
+  /psyche cognition off      send no reasoning controls (override any persona)
+  /psyche cognition auto     follow the active persona's cognition (default)
+  /psyche cognition list     list every level, light → deep
+
+Responses maps the level to OpenAI reasoning.effort ({light}={} …
+{deep}={}). Chat Completions maps it to local generation controls only
+when the endpoint explicitly advertises that capability; unknown endpoints are
+unchanged. The session override beats the active persona's cognition; a
+persona sets its own default via `cognition:`.",
+        light.reasoning_effort(),
+        deep.reasoning_effort(),
+        levels = levels.join(" | "),
+    )
+});
 
 /// A single-page `--help` for one command — usage, what it does, and a couple of
 /// examples. `None` for an unknown topic. Kept terse on purpose: newt's help is
@@ -145,22 +173,7 @@ exit_plan_mode require a concrete edit. The session-scoped override wins over
 the persona declaration and [tenacity] config; `auto` (aliases `inherit` /
 `reset`) releases it. Persist per-family in [tenacity]."
         }
-        "cognition" => {
-            "\
-/cognition — folded into /psyche (#1665)
-
-  /psyche                open the dial panel (TTY); ←/→ dials cognition
-  /psyche cognition <level>  set glancing | pondering | deliberating | contemplating
-  /psyche cognition off      send no reasoning controls (override any persona)
-  /psyche cognition auto     follow the active persona's cognition (default)
-  /psyche cognition list     list every level, light → deep
-
-Responses maps the level to OpenAI reasoning.effort (glancing=minimal …
-contemplating=high). Chat Completions maps it to local generation controls only
-when the endpoint explicitly advertises that capability; unknown endpoints are
-unchanged. The session override beats the active persona's cognition; a
-persona sets its own default via `cognition:`."
-        }
+        "cognition" => COGNITION_PAGE.as_str(),
         "psyche" => {
             "\
 /psyche — the agent's effort posture: cognition, tenacity, crew
@@ -180,7 +193,7 @@ The three orthogonal psyche dials:
   tenacity    how hard the loop pushes read → act
   crew        how many minds work the task    (NEWT_TEAM / newt crew)
 
-obsessive = contemplating + relentless + crew on — newt's 'ultra'. In-session
+obsessive = meticulous + relentless + crew on — newt's 'ultra'. In-session
 /psyche obsessive sets cognition + tenacity live; crew is a launch gate, so
 start with `newt --obsessive` to include the crew this session."
         }

@@ -187,18 +187,18 @@ mod tests {
         // No persona → no field; persona level → that level.
         assert_eq!(resolve_cognition(None), None);
         assert_eq!(
-            resolve_cognition(Some(Cognition::Pondering)),
-            Some(Cognition::Pondering)
+            resolve_cognition(Some(Cognition::Rational)),
+            Some(Cognition::Rational)
         );
     }
 
     #[test]
     fn set_override_wins_over_the_persona() {
         let _g = GlobalSettingsGuard::acquire();
-        set_cli_cognition(CognitionOverride::Set(Cognition::Glancing));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Zen));
         assert_eq!(
-            resolve_cognition(Some(Cognition::Contemplating)),
-            Some(Cognition::Glancing),
+            resolve_cognition(Some(Cognition::Meticulous)),
+            Some(Cognition::Zen),
             "the session /cognition override must beat the persona"
         );
         set_cli_cognition(CognitionOverride::Unset); // restore for other tests
@@ -209,7 +209,7 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         set_cli_cognition(CognitionOverride::Off);
         assert_eq!(
-            resolve_cognition(Some(Cognition::Contemplating)),
+            resolve_cognition(Some(Cognition::Meticulous)),
             None,
             "/cognition off must suppress reasoning.effort despite the persona"
         );
@@ -229,10 +229,10 @@ mod tests {
             None,
             "no override ⇒ no effort headless"
         );
-        set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
         assert_eq!(
             resolve_cognition(None),
-            Some(Cognition::Contemplating),
+            Some(Cognition::Meticulous),
             "--cognition must reach the persona-less headless driver"
         );
         set_cli_cognition(CognitionOverride::Unset); // restore
@@ -250,16 +250,16 @@ mod tests {
             None,
             "no override, no persona ⇒ none"
         );
-        set_persona_cognition(Some(Cognition::Contemplating));
+        set_persona_cognition(Some(Cognition::Meticulous));
         assert_eq!(
             effective_cognition(),
-            Some(Cognition::Contemplating),
+            Some(Cognition::Meticulous),
             "persona cognition applies when no override"
         );
-        set_cli_cognition(CognitionOverride::Set(Cognition::Glancing));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Zen));
         assert_eq!(
             effective_cognition(),
-            Some(Cognition::Glancing),
+            Some(Cognition::Zen),
             "the /cognition override beats the persona"
         );
         set_cli_cognition(CognitionOverride::Off);

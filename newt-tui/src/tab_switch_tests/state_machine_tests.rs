@@ -756,7 +756,7 @@ fn two_tabs_with_different_pins_swap_cleanly_in_both_directions() {
             &b,
             &newt_core::OperatorPreferencePin {
                 backend: Some("other".into()),
-                cognition: Some("contemplating".into()),
+                cognition: Some("meticulous".into()),
                 ..Default::default()
             },
         )
@@ -1640,7 +1640,7 @@ fn activation_is_history_independent_over_the_full_projected_state() {
                 &b,
                 &newt_core::OperatorPreferencePin {
                     backend: Some("sol".into()),
-                    cognition: Some("contemplating".into()),
+                    cognition: Some("meticulous".into()),
                     ..Default::default()
                 },
             )
@@ -1691,7 +1691,7 @@ fn activation_is_history_independent_over_the_full_projected_state() {
     assert_eq!(
         via_a.cognition,
         newt_core::cognition::CognitionOverride::Set(
-            newt_core::role_profile::Cognition::Contemplating
+            newt_core::role_profile::Cognition::Meticulous
         ),
         "B's own pin is in force either way"
     );
@@ -1724,7 +1724,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
             &b,
             &newt_core::OperatorPreferencePin {
                 backend: Some("other".into()),
-                cognition: Some("contemplating".into()),
+                cognition: Some("meticulous".into()),
                 tenacity: Some(newt_core::Tenacity::Relentless),
                 model: Some("m0".into()),
             },

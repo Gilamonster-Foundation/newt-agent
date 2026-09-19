@@ -100,6 +100,41 @@ pub(super) fn migrate_workspace_key(
     Ok(())
 }
 
+/// Psyche rename (slice 1a): rewrite a pre-rename cognition label in each
+/// conversation's `preference_pin` to its new label. An unmigrated pin fails
+/// `parse_cognition`, so resume ignores the pinned cognition and marks the tab
+/// degraded: it refuses turns until the operator repins with `/psyche`.
+///
+/// Runs on every open, in one UPDATE over the legacy table. It is idempotent
+/// (only old labels match), and running it every time also catches an old
+/// label written after the first open, by a pre-rename newt binary sharing
+/// the same `conversations.db`. `json_set` rewrites only the `cognition` key;
+/// a row that is not valid JSON is left for the strict decode to refuse.
+/// Deletable with [`crate::psyche_import`].
+pub(super) fn migrate_pin_cognition_labels(conn: &Connection) -> anyhow::Result<()> {
+    let legacy = crate::psyche_import::LEGACY_COGNITION;
+    let values = vec!["(?, ?)"; legacy.len()].join(", ");
+    let migrated = conn.execute(
+        &format!(
+            "WITH legacy(old, new) AS (VALUES {values})
+             UPDATE conversations SET preference_pin = json_set(preference_pin, '$.cognition',
+                 (SELECT new FROM legacy
+                  WHERE old = json_extract(preference_pin, '$.cognition')))
+             WHERE CASE WHEN json_valid(preference_pin)
+                        THEN json_extract(preference_pin, '$.cognition') END
+                   IN (SELECT old FROM legacy)"
+        ),
+        rusqlite::params_from_iter(legacy.iter().flat_map(|(old, new)| [old, new])),
+    )?;
+    if migrated > 0 {
+        tracing::info!(
+            migrated,
+            "renamed pre-rename cognition labels in preference pins"
+        );
+    }
+    Ok(())
+}
+
 /// Walk `<legacy_root>/<workspace-uuid>/<id>.json` and parse every readable
 /// record — all workspaces, not just the opening store's. Corrupt or
 /// unreadable records are skipped with a warning (the legacy store's own

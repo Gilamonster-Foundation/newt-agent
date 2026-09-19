@@ -254,7 +254,7 @@ async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
     context.safe_context = None;
     context.max_tool_rounds = 4;
     context.reasoning_replay_scope = crate::model_card::ReasoningReplayScope::CurrentUserTurn;
-    context.cognition = Some(crate::role_profile::Cognition::Deliberating);
+    context.cognition = Some(crate::role_profile::Cognition::Thoughtful);
     context.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
         cognition: Some(true),
         chat_template_kwargs: Some(true),

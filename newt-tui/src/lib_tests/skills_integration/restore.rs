@@ -257,7 +257,7 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
     fs::create_dir_all(&persona_dir).unwrap();
     fs::write(
         persona_dir.join("thinker.md"),
-        "+++\ncognition = \"contemplating\"\n+++\nThink hard.\n",
+        "+++\ncognition = \"meticulous\"\n+++\nThink hard.\n",
     )
     .unwrap();
     fs::write(persona_dir.join("plain.md"), "No front-matter here.\n").unwrap();
@@ -303,12 +303,12 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
     restore_conversation_into_session(&mut ctx, &thinking).unwrap();
     assert_eq!(
         newt_core::cognition::persona_cognition(),
-        Some(newt_core::role_profile::Cognition::Contemplating),
+        Some(newt_core::role_profile::Cognition::Meticulous),
         "restoring a conversation whose persona declares cognition seats that layer"
     );
 
     // 2. Restoring a persona that declares NONE clears it. This is the bug:
-    //    the struct swapped to `plain` while the layer stayed contemplating.
+    //    the struct swapped to `plain` while the layer stayed meticulous.
     restore_conversation_into_session(&mut ctx, &plain).unwrap();
     assert_eq!(
         ctx.active_persona.as_ref().map(|p| p.name.as_str()),
@@ -324,7 +324,7 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
     restore_conversation_into_session(&mut ctx, &thinking).unwrap();
     assert_eq!(
         newt_core::cognition::persona_cognition(),
-        Some(newt_core::role_profile::Cognition::Contemplating)
+        Some(newt_core::role_profile::Cognition::Meticulous)
     );
     restore_conversation_into_session(&mut ctx, &personaless).unwrap();
     assert!(ctx.active_persona.is_none());

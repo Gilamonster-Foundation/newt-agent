@@ -330,7 +330,8 @@ fn tenacity_command(arg: &str) -> String {
 fn cognition_command(arg: &str) -> String {
     use newt_core::cognition::{cli_cognition, CognitionOverride};
     use newt_core::role_profile::Cognition;
-    let usage = "(/psyche cognition <glancing|pondering|deliberating|contemplating>|off|auto|list)";
+    let levels: Vec<&str> = Cognition::all().into_iter().map(Cognition::label).collect();
+    let usage = format!("(/psyche cognition <{}>|off|auto|list)", levels.join("|"));
     match arg.trim() {
         "" | "status" | "show" => {
             match cli_cognition() {
@@ -414,7 +415,7 @@ fn psyche_command(rest: &str) -> String {
         // #1981: the posture still means what `psyche` says it means — the
         // constants are that module's to own — but engaging it is two ordinary
         // setting changes, so it takes the same path, the same #1668 pins and
-        // the same record as `/settings cognition contemplating` would.
+        // the same record as `/settings cognition meticulous` would.
         let (cog, ten) = (
             newt_core::psyche::OBSESSIVE_COGNITION,
             newt_core::psyche::OBSESSIVE_TENACITY,
@@ -499,7 +500,11 @@ fn psyche_command(rest: &str) -> String {
     out.push_str(
         "\n              how many minds work the task                   (NEWT_TEAM / newt crew)",
     );
-    out.push_str("\nobsessive = the max-everything posture: contemplating + relentless + crew on.");
+    out.push_str(&format!(
+        "\nobsessive = the max-everything posture: {} + {} + crew on.",
+        newt_core::psyche::OBSESSIVE_COGNITION.label(),
+        newt_core::psyche::OBSESSIVE_TENACITY.label()
+    ));
     out.push_str(
         "\n/psyche — open the dial panel (rich TUI build + interactive terminal) · \
          /psyche cognition|tenacity <level> — text setters.",
@@ -576,22 +581,15 @@ mod tests {
         assert!(status.contains("/psyche cognition"), "{status}");
         // List enumerates every level plus off/auto.
         let list = cognition_command("list");
-        for label in [
-            "glancing",
-            "pondering",
-            "deliberating",
-            "contemplating",
-            "off",
-            "auto",
-        ] {
+        for label in ["zen", "rational", "thoughtful", "meticulous", "off", "auto"] {
             assert!(list.contains(label), "list missing {label}: {list}");
         }
         // Setting a level installs the override live.
-        let msg = cognition_command("contemplating");
-        assert!(msg.contains("contemplating"), "{msg}");
+        let msg = cognition_command("meticulous");
+        assert!(msg.contains("meticulous"), "{msg}");
         assert_eq!(
             cli_cognition(),
-            CognitionOverride::Set(Cognition::Contemplating)
+            CognitionOverride::Set(Cognition::Meticulous)
         );
         // `off` forces the off state; `auto` returns to following the persona.
         cognition_command("off");
@@ -636,7 +634,7 @@ mod tests {
         // The two live dials are actually maxed.
         assert_eq!(
             cli_cognition(),
-            CognitionOverride::Set(Cognition::Contemplating)
+            CognitionOverride::Set(Cognition::Meticulous)
         );
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
         // The message is honest about crew being a launch gate.
@@ -705,11 +703,11 @@ mod tests {
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
 
-        let msg = super::psyche_command("cognition deliberating");
-        assert!(msg.contains("deliberating"), "{msg}");
+        let msg = super::psyche_command("cognition thoughtful");
+        assert!(msg.contains("thoughtful"), "{msg}");
         assert_eq!(
             cli_cognition(),
-            CognitionOverride::Set(Cognition::Deliberating)
+            CognitionOverride::Set(Cognition::Thoughtful)
         );
         let msg = super::psyche_command("tenacity relentless");
         assert!(msg.contains("relentless"), "{msg}");
@@ -775,11 +773,11 @@ mod tests {
         }
 
         // A level sets exactly its own axis.
-        let _ = super::psyche_command("cognition deliberating");
+        let _ = super::psyche_command("cognition thoughtful");
         let a = drain_preference_actions();
         assert_eq!(
             a.cognition,
-            Some(CognitionOverride::Set(Cognition::Deliberating))
+            Some(CognitionOverride::Set(Cognition::Thoughtful))
         );
         assert_eq!((a.tenacity, a.backend, a.model), (None, None, None));
 
@@ -826,7 +824,7 @@ mod tests {
 
     #[test]
     fn retired_top_level_dials_redirect_without_mutating() {
-        // #1665: `/tenacity relentless` and `/cognition contemplating` must NOT
+        // #1665: `/tenacity relentless` and `/cognition meticulous` must NOT
         // half-work through the deprecation shim — redirect only, zero writes.
         use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
         use newt_core::tenacity::{cli_tenacity, set_cli_tenacity, Tenacity};
@@ -850,8 +848,8 @@ mod tests {
         );
         super::dispatch(
             "cognition",
-            "contemplating",
-            "/cognition contemplating",
+            "meticulous",
+            "/cognition meticulous",
             ".",
             false,
             false,

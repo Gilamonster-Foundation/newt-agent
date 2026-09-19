@@ -4686,7 +4686,7 @@ impl PersonaStore {
         self.ensure_defaults()?;
         let name = normalize_persona_name(name)?;
         let path = self.dir.join(format!("{name}.md"));
-        let raw = match std::fs::read_to_string(&path) {
+        let raw = match newt_core::psyche_import::read_persona_file(&path) {
             Ok(raw) => raw,
             Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
         };
@@ -4719,7 +4719,7 @@ impl PersonaStore {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let raw = newt_core::psyche_import::read_persona_file(&path).unwrap_or_default();
             if raw.trim().is_empty() {
                 continue;
             }
@@ -6468,7 +6468,7 @@ fn commit_prepared(
     // LAYER that `effective_cognition` ranks beneath the CLI layer. A restore
     // that swapped the struct but left that layer alone carried the OUTGOING
     // conversation's persona cognition into the incoming one, so resuming a
-    // plain conversation from a `contemplating` persona kept contemplating with
+    // plain conversation from a `meticulous` persona kept meticulous with
     // nothing on screen naming a persona to explain it.
     //
     // Derived from the persona now installed rather than from `record.persona`,

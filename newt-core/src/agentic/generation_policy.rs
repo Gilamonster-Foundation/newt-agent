@@ -15,10 +15,10 @@ pub(crate) fn resolve_output_allowance(
 ) -> Option<u32> {
     explicit.or_else(|| {
         cognition.map(|c| match c {
-            Cognition::Glancing => 2_048,
-            Cognition::Pondering => 4_096,
-            Cognition::Deliberating => 10_000,
-            Cognition::Contemplating => 16_000,
+            Cognition::Zen => 2_048,
+            Cognition::Rational => 4_096,
+            Cognition::Thoughtful => 10_000,
+            Cognition::Meticulous => 16_000,
         })
     })
 }
@@ -96,10 +96,10 @@ impl GenerationPolicy {
         };
 
         let (thinking, temperature, top_p) = match cognition {
-            Cognition::Glancing => (false, 0.0, 1.0),
-            Cognition::Pondering => (true, 0.6, 0.95),
-            Cognition::Deliberating => (true, 0.6, 0.95),
-            Cognition::Contemplating => (true, 0.6, 0.95),
+            Cognition::Zen => (false, 0.0, 1.0),
+            Cognition::Rational => (true, 0.6, 0.95),
+            Cognition::Thoughtful => (true, 0.6, 0.95),
+            Cognition::Meticulous => (true, 0.6, 0.95),
         };
         policy.thinking = Some(thinking);
         policy.max_output_tokens = resolve_output_allowance(output_allowance, Some(cognition));
@@ -194,10 +194,10 @@ mod tests {
         // Default: the cognition table, the one number both wires use (Chat
         // sends it, Responses reserves it locally).
         for (cognition, allowance) in [
-            (Cognition::Glancing, 2_048),
-            (Cognition::Pondering, 4_096),
-            (Cognition::Deliberating, 10_000),
-            (Cognition::Contemplating, 16_000),
+            (Cognition::Zen, 2_048),
+            (Cognition::Rational, 4_096),
+            (Cognition::Thoughtful, 10_000),
+            (Cognition::Meticulous, 16_000),
         ] {
             assert_eq!(
                 resolve_output_allowance(None, Some(cognition)),
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(resolve_output_allowance(None, None), None);
         // An explicit allowance wins, with or without a cognition dial.
         assert_eq!(
-            resolve_output_allowance(Some(3_000), Some(Cognition::Contemplating)),
+            resolve_output_allowance(Some(3_000), Some(Cognition::Meticulous)),
             Some(3_000)
         );
         assert_eq!(resolve_output_allowance(Some(3_000), None), Some(3_000));
@@ -217,7 +217,7 @@ mod tests {
         // moves ONLY the allowance: thinking and sampling are unchanged.
         let resolve = |explicit| {
             GenerationPolicy::resolve(
-                Some(Cognition::Contemplating),
+                Some(Cognition::Meticulous),
                 explicit,
                 local_capability(),
                 ReasoningReplayScope::Never,
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn unknown_endpoint_keeps_the_chat_request_policy_empty() {
         let policy = GenerationPolicy::resolve(
-            Some(Cognition::Deliberating),
+            Some(Cognition::Thoughtful),
             None,
             ChatCompletionsCapability::default(),
             ReasoningReplayScope::Never,
@@ -270,10 +270,10 @@ mod tests {
     #[test]
     fn cognition_levels_resolve_to_the_initial_local_generation_table() {
         let cases = [
-            (Cognition::Glancing, false, 2_048, 0.0, 1.0),
-            (Cognition::Pondering, true, 4_096, 0.6, 0.95),
-            (Cognition::Deliberating, true, 10_000, 0.6, 0.95),
-            (Cognition::Contemplating, true, 16_000, 0.6, 0.95),
+            (Cognition::Zen, false, 2_048, 0.0, 1.0),
+            (Cognition::Rational, true, 4_096, 0.6, 0.95),
+            (Cognition::Thoughtful, true, 10_000, 0.6, 0.95),
+            (Cognition::Meticulous, true, 16_000, 0.6, 0.95),
         ];
 
         for (cognition, thinking, max_tokens, temperature, top_p) in cases {
@@ -303,7 +303,7 @@ mod tests {
         // #2312: an explicit allowance is reserved locally, but this endpoint
         // declared no cap projection, so no `max_tokens` is sent.
         let policy = GenerationPolicy::resolve(
-            Some(Cognition::Contemplating),
+            Some(Cognition::Meticulous),
             Some(12_000),
             ChatCompletionsCapability {
                 cognition: Some(false),
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn opted_in_policy_projects_to_chat_completions_fields() {
         let policy = GenerationPolicy::resolve(
-            Some(Cognition::Deliberating),
+            Some(Cognition::Thoughtful),
             None,
             local_capability(),
             ReasoningReplayScope::CurrentUserTurn,
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn tools_disabled_completion_omits_parallel_tool_calls() {
         let policy = GenerationPolicy::resolve(
-            Some(Cognition::Pondering),
+            Some(Cognition::Rational),
             None,
             local_capability(),
             ReasoningReplayScope::CurrentUserTurn,

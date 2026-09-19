@@ -1,6 +1,6 @@
 +++
 role      = "obsessive"
-cognition = "contemplating"
+cognition = "meticulous"
 tenacity  = "relentless"
 crew      = true
 +++

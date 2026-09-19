@@ -290,26 +290,27 @@ pub enum Altitude {
 }
 
 /// COGNITION — the psyche's reasoning-depth dial: how hard the model thinks
-/// per call. Declared in front-matter as `cognition = "deliberating"`; an
+/// per call. Declared in front-matter as `cognition = "thoughtful"`; an
 /// absent field leaves the backend default. Responses projects it onto
 /// `reasoning.effort`; an explicitly capable Chat Completions endpoint projects
 /// it onto a local generation policy.
 ///
-/// The ladder is deliberately a personality arc, not a clinical scale — light
-/// and careful through to compulsive at the top (paired with [`Tenacity`] and
-/// crew under the `obsessive` persona).
+/// The ladder runs from the least reasoning the endpoint allows to the most
+/// (paired with [`Tenacity`] and crew under the `obsessive` persona). The
+/// pre-rename labels (`glancing` … `contemplating`) are the one-time
+/// importer's job ([`crate::psyche_import`]), never accepted here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Cognition {
-    /// Snap judgement — barely deliberate. Wire: `reasoning.effort = minimal`.
-    Glancing,
-    /// Think it through before answering. Wire: `low`.
-    Pondering,
-    /// Weigh the options carefully — the default. Wire: `medium`.
+    /// The least reasoning the endpoint allows. Wire: `reasoning.effort = minimal`.
+    Zen,
+    /// Short reasoning before acting. Wire: `low`.
+    Rational,
+    /// Weighs the options — the default. Wire: `medium`.
     #[default]
-    Deliberating,
-    /// Long, deep, quiet consideration. Wire: `high`.
-    Contemplating,
+    Thoughtful,
+    /// The deepest reasoning. Wire: `high`.
+    Meticulous,
 }
 
 impl Cognition {
@@ -320,10 +321,10 @@ impl Cognition {
     #[must_use]
     pub fn reasoning_effort(self) -> &'static str {
         match self {
-            Self::Glancing => "minimal",
-            Self::Pondering => "low",
-            Self::Deliberating => "medium",
-            Self::Contemplating => "high",
+            Self::Zen => "minimal",
+            Self::Rational => "low",
+            Self::Thoughtful => "medium",
+            Self::Meticulous => "high",
         }
     }
 
@@ -331,10 +332,10 @@ impl Cognition {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Glancing => "glancing",
-            Self::Pondering => "pondering",
-            Self::Deliberating => "deliberating",
-            Self::Contemplating => "contemplating",
+            Self::Zen => "zen",
+            Self::Rational => "rational",
+            Self::Thoughtful => "thoughtful",
+            Self::Meticulous => "meticulous",
         }
     }
 
@@ -342,10 +343,10 @@ impl Cognition {
     #[must_use]
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Glancing => "minimal reasoning",
-            Self::Pondering => "low reasoning",
-            Self::Deliberating => "medium reasoning",
-            Self::Contemplating => "high reasoning",
+            Self::Zen => "least reasoning the endpoint allows (minimal)",
+            Self::Rational => "short reasoning before acting (low)",
+            Self::Thoughtful => "weighs the options (medium)",
+            Self::Meticulous => "deepest reasoning (high)",
         }
     }
 
@@ -353,10 +354,10 @@ impl Cognition {
     #[must_use]
     pub fn all() -> [Self; 4] {
         [
-            Self::Glancing,
-            Self::Pondering,
-            Self::Deliberating,
-            Self::Contemplating,
+            Self::Zen,
+            Self::Rational,
+            Self::Thoughtful,
+            Self::Meticulous,
         ]
     }
 }
@@ -370,16 +371,21 @@ impl std::fmt::Display for Cognition {
 impl std::str::FromStr for Cognition {
     type Err = String;
 
+    /// Accepts the current labels and `default`. A pre-rename label is an
+    /// error that names its replacement — never silently accepted.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "glancing" => Ok(Self::Glancing),
-            "pondering" => Ok(Self::Pondering),
-            "deliberating" | "default" => Ok(Self::Deliberating),
-            "contemplating" => Ok(Self::Contemplating),
-            other => Err(format!(
-                "unknown cognition '{other}' (glancing|pondering|deliberating|contemplating)"
-            )),
+        let s = s.trim().to_ascii_lowercase();
+        if s == "default" {
+            return Ok(Self::default());
         }
+        if let Some(level) = Self::all().into_iter().find(|c| c.label() == s) {
+            return Ok(level);
+        }
+        if let Some(new) = crate::psyche_import::renamed_cognition(&s) {
+            return Err(format!("cognition '{s}' was renamed to '{new}'"));
+        }
+        let levels: Vec<&str> = Self::all().into_iter().map(Self::label).collect();
+        Err(format!("unknown cognition '{s}' ({})", levels.join("|")))
     }
 }
 
@@ -823,7 +829,9 @@ impl RoleProfile {
     /// is correct first-run UX for an interactive session, but a stdio
     /// server silently writing files into `~/.newt/personas/` on every
     /// startup is a footgun under CI/systemd. A headless caller with an
-    /// unresolvable `--persona <name>` should fail loudly instead.
+    /// unresolvable `--persona <name>` should fail loudly instead. An existing
+    /// file with pre-rename labels is rewritten once by
+    /// [`crate::psyche_import::read_persona_file`], like every persona read.
     ///
     /// # Errors
     ///
@@ -842,7 +850,7 @@ impl RoleProfile {
             anyhow::bail!("persona names may only contain letters, numbers, '-' and '_'");
         }
         let path = dir.join(format!("{name}.md"));
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
+        let raw = crate::psyche_import::read_persona_file(&path).map_err(|e| {
             anyhow::anyhow!("persona `{name}` not found at {}: {e}", path.display())
         })?;
         let profile = Self::parse(&raw).map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
@@ -922,7 +930,7 @@ You edit files and run builds.
 +++
 role = \"researcher\"
 backend = \"sol\"
-cognition = \"contemplating\"
+cognition = \"meticulous\"
 tenacity = \"relentless\"
 crew = true
 +++
@@ -934,23 +942,45 @@ You are Bob, a researcher.
         let rp = RoleProfile::parse(text).unwrap();
         assert_eq!(rp.role.as_deref(), Some("researcher"));
         assert_eq!(rp.backend.as_deref(), Some("sol"));
-        assert_eq!(rp.cognition, Some(Cognition::Contemplating));
+        assert_eq!(rp.cognition, Some(Cognition::Meticulous));
         assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
         assert_eq!(rp.crew, Some(true));
         assert!(rp.is_role_bound());
         // The dial maps onto the OpenAI reasoning-effort wire value.
         assert_eq!(rp.cognition.unwrap().reasoning_effort(), "high");
-        assert_eq!(rp.cognition.unwrap().label(), "contemplating");
+        assert_eq!(rp.cognition.unwrap().label(), "meticulous");
     }
 
     #[test]
     fn cognition_alone_is_role_bound() {
         // Even a single psyche dial promotes a persona past prompt-only.
-        let text = "+++\ncognition = \"pondering\"\n+++\n\n# Thinker\n";
+        let text = "+++\ncognition = \"rational\"\n+++\n\n# Thinker\n";
         let rp = RoleProfile::parse(text).unwrap();
-        assert_eq!(rp.cognition, Some(Cognition::Pondering));
+        assert_eq!(rp.cognition, Some(Cognition::Rational));
         assert!(rp.is_role_bound());
-        assert_eq!(Cognition::default(), Cognition::Deliberating);
+        assert_eq!(Cognition::default(), Cognition::Thoughtful);
+    }
+
+    /// Slice 1a rename: an old label is refused with its replacement named,
+    /// never silently accepted; persona files reach the strict parser only
+    /// after `psyche_import` has rewritten them.
+    #[test]
+    fn old_cognition_labels_are_refused_with_the_rename() {
+        for (old, new) in crate::psyche_import::LEGACY_COGNITION {
+            let err = old.parse::<Cognition>().unwrap_err();
+            assert_eq!(err, format!("cognition '{old}' was renamed to '{new}'"));
+            let text = format!("+++\ncognition = \"{old}\"\n+++\nBody\n");
+            assert!(RoleProfile::parse(&text).is_err(), "{old} must stay strict");
+        }
+        assert_eq!("default".parse::<Cognition>(), Ok(Cognition::Thoughtful));
+        assert_eq!(
+            " Meticulous ".parse::<Cognition>(),
+            Ok(Cognition::Meticulous)
+        );
+        assert_eq!(
+            "telepathic".parse::<Cognition>().unwrap_err(),
+            "unknown cognition 'telepathic' (zen|rational|thoughtful|meticulous)"
+        );
     }
 
     const PERSONALITY_TRAITS: [&str; 5] = [
@@ -1015,7 +1045,7 @@ altitude = "coach"
 model = "local-test-model"
 backend = "local"
 tier = "REVIEW"
-cognition = "pondering"
+cognition = "rational"
 tenacity = "relaxed"
 crew = false
 
@@ -1660,6 +1690,24 @@ fs_read = [\"src/\", \"docs/\"]
             .unwrap_err()
             .to_string();
         assert!(err.contains("is empty"), "got: {err}");
+    }
+
+    /// Slice 1a rename: the headless `--persona` path migrates an old
+    /// cognition label instead of failing the strict parse. Grounds the
+    /// mocked `psyche_import` seam test: this real read reaches the importer.
+    #[test]
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    fn load_from_dir_migrates_an_old_cognition_label() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("deep.md");
+        std::fs::write(&path, "+++\ncognition = \"contemplating\"\n+++\n# Deep\n").unwrap();
+        let rp = RoleProfile::load_from_dir("deep", tmp.path()).unwrap();
+        assert_eq!(rp.cognition, Some(Cognition::Meticulous));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "+++\ncognition = \"meticulous\"\n+++\n# Deep\n"
+        );
     }
 
     #[test]

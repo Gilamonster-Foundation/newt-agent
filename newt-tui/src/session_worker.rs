@@ -1396,14 +1396,14 @@ mod tests {
         use newt_core::role_profile::Cognition;
         let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
 
-        set_cli_cognition(CognitionOverride::Set(Cognition::Pondering));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Rational));
         {
             let _turn = bind_turn(&newt_core::lifecycle::new_session_id());
-            assert_eq!(effective_cognition(), Some(Cognition::Pondering));
-            set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+            assert_eq!(effective_cognition(), Some(Cognition::Rational));
+            set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
             assert_eq!(
                 effective_cognition(),
-                Some(Cognition::Pondering),
+                Some(Cognition::Rational),
                 "the running turn is stable"
             );
         }
@@ -1411,7 +1411,7 @@ mod tests {
             let _turn = bind_turn(&newt_core::lifecycle::new_session_id());
             assert_eq!(
                 effective_cognition(),
-                Some(Cognition::Contemplating),
+                Some(Cognition::Meticulous),
                 "the next turn sees the new dial"
             );
         }

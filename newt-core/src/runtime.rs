@@ -679,7 +679,7 @@ mod tests {
         crate::tenacity::clear_cli_tenacity();
         crate::tenacity::set_persona_tenacity(Some(Tenacity::Relentless));
         crate::cognition::set_cli_cognition(crate::cognition::CognitionOverride::Set(
-            Cognition::Contemplating,
+            Cognition::Meticulous,
         ));
         // SAFETY: single-threaded guarded test.
         unsafe {
@@ -699,7 +699,7 @@ mod tests {
             .model = Some("sol-large".to_string());
         let snap = RuntimeSettingsSnapshot::resolve(&cfg, Some("bob"), Some("sol"));
 
-        assert_eq!(snap.cognition, Some(Cognition::Contemplating));
+        assert_eq!(snap.cognition, Some(Cognition::Meticulous));
         assert_eq!(snap.tenacity, Tenacity::Relentless);
         assert!(!snap.crew);
         assert_eq!(snap.persona.as_deref(), Some("bob"));
@@ -750,7 +750,7 @@ mod tests {
         // Ambient state a per-turn snapshot would have swept up:
         crate::cognition::set_cli_cognition(CognitionOverride::Off);
         crate::tenacity::set_cli_tenacity(Tenacity::Relentless);
-        crate::cognition::set_persona_cognition(Some(Cognition::Contemplating));
+        crate::cognition::set_persona_cognition(Some(Cognition::Meticulous));
         crate::tenacity::set_persona_tenacity(Some(Tenacity::Insistent));
 
         let actions = drain_preference_actions();
@@ -817,14 +817,14 @@ mod tests {
             tenacity: Some(Tenacity::Relentless),
         };
         let dial_only = PreferenceActions {
-            cognition: Some(CognitionOverride::Set(Cognition::Glancing)),
+            cognition: Some(CognitionOverride::Set(Cognition::Zen)),
             ..Default::default()
         };
         let merged = stored.merged(&dial_only);
         assert_eq!(merged.backend.as_deref(), Some("retired-dgx"), "kept");
         assert_eq!(merged.model.as_deref(), Some("nemotron-340b"), "kept");
         assert_eq!(merged.tenacity, Some(Tenacity::Relentless), "kept");
-        assert_eq!(merged.cognition.as_deref(), Some("glancing"));
+        assert_eq!(merged.cognition.as_deref(), Some("zen"));
 
         // A cleared axis UNPINS it (back to the invocation baseline), and is
         // distinguishable from "not acted on".
@@ -906,9 +906,9 @@ mod tests {
             Some("off")
         );
         assert_eq!(
-            OperatorPreferencePin::cognition_field(CognitionOverride::Set(Cognition::Glancing))
+            OperatorPreferencePin::cognition_field(CognitionOverride::Set(Cognition::Zen))
                 .as_deref(),
-            Some("glancing")
+            Some("zen")
         );
         // And back through apply_plan: "off" ⇒ Off, a label ⇒ Set(level).
         let off = OperatorPreferencePin {
@@ -921,12 +921,12 @@ mod tests {
             "'off' must restore the explicit Off override, not Unset"
         );
         let set = OperatorPreferencePin {
-            cognition: Some("contemplating".into()),
+            cognition: Some("meticulous".into()),
             ..Default::default()
         };
         assert_eq!(
             set.apply_plan(&[], PreferenceAxes::default()).cognition,
-            Some(CognitionOverride::Set(Cognition::Contemplating))
+            Some(CognitionOverride::Set(Cognition::Meticulous))
         );
     }
 

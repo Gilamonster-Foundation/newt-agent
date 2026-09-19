@@ -65,15 +65,14 @@ use newt_core::cognition::{cli_cognition, CognitionOverride};
 use newt_core::role_profile::{Cognition, PersonalityLevel, PersonalityTrait, PersonalityTraits};
 use newt_core::tenacity::{cli_tenacity, Tenacity};
 
-/// The cognition dial's ladder of OVERRIDE positions (auto/inherit → off → levels).
-const COGNITION_LADDER: &[CognitionOverride] = &[
-    CognitionOverride::Unset, // "auto" — inherit persona/none
-    CognitionOverride::Off,
-    CognitionOverride::Set(Cognition::Glancing),
-    CognitionOverride::Set(Cognition::Pondering),
-    CognitionOverride::Set(Cognition::Deliberating),
-    CognitionOverride::Set(Cognition::Contemplating),
-];
+/// The cognition dial's ladder of OVERRIDE positions: auto (inherit persona or
+/// none), then off, then every [`Cognition::all`] level — derived, so a level
+/// added to the enum cannot be missing from the dial.
+fn cognition_ladder() -> Vec<CognitionOverride> {
+    let mut v = vec![CognitionOverride::Unset, CognitionOverride::Off];
+    v.extend(Cognition::all().into_iter().map(CognitionOverride::Set));
+    v
+}
 
 /// The tenacity dial's ladder: `None` = auto/inherit (clear the override), then
 /// the concrete levels.
@@ -413,12 +412,12 @@ impl PanelState {
                 }
             }
             Row::Cognition => {
-                let i = COGNITION_LADDER
+                let ladder = cognition_ladder();
+                let i = ladder
                     .iter()
                     .position(|o| *o == self.cognition.value())
                     .unwrap_or(0);
-                self.cognition
-                    .set(COGNITION_LADDER[clamp_step(i, dir, COGNITION_LADDER.len())]);
+                self.cognition.set(ladder[clamp_step(i, dir, ladder.len())]);
             }
             Row::Tenacity => {
                 let ladder = tenacity_ladder();
@@ -1642,21 +1641,21 @@ mod tests {
         set_cli_cognition(CognitionOverride::Unset);
         clear_cli_tenacity();
         let personas = vec![
-            choice("bob", Some(Cognition::Pondering), Some(Tenacity::Standard)),
+            choice("bob", Some(Cognition::Rational), Some(Tenacity::Standard)),
             choice(
                 "obsessive",
-                Some(Cognition::Contemplating),
+                Some(Cognition::Meticulous),
                 Some(Tenacity::Relentless),
             ),
         ];
         let mut s = panel(Some("bob"), personas, Tenacity::Standard);
         // Opens on bob → projects bob's declarations.
-        assert_eq!(s.projected_cognition(), Some(Cognition::Pondering));
+        assert_eq!(s.projected_cognition(), Some(Cognition::Rational));
         assert_eq!(s.projected_tenacity(), Tenacity::Standard);
         // Select obsessive → projection switches to obsessive's, not bob's.
         s.cycle(1); // bob
         s.cycle(1); // obsessive
-        assert_eq!(s.projected_cognition(), Some(Cognition::Contemplating));
+        assert_eq!(s.projected_cognition(), Some(Cognition::Meticulous));
         assert_eq!(s.projected_tenacity(), Tenacity::Relentless);
         let (ten_val, ten_prov) = s.tenacity_cell();
         assert!(ten_val.contains("relentless"), "shows projected level");
@@ -1685,7 +1684,7 @@ mod tests {
         clear_cli_tenacity();
         let personas = vec![choice(
             "bob",
-            Some(Cognition::Contemplating),
+            Some(Cognition::Meticulous),
             Some(Tenacity::Relentless),
         )];
         let mut s = panel(Some("bob"), personas, Tenacity::Standard);
@@ -1696,7 +1695,7 @@ mod tests {
         // The content passed to persist reproduces the projection.
         let content = s.persona_content("clone").unwrap();
         let rp = newt_core::RoleProfile::parse(&content).unwrap();
-        assert_eq!(rp.cognition, Some(Cognition::Contemplating));
+        assert_eq!(rp.cognition, Some(Cognition::Meticulous));
         assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
     }
 
@@ -1839,7 +1838,7 @@ model = "review-model"
 tier = "REVIEW"
 altitude = "coach"
 backend = "review-backend"
-cognition = "pondering"
+cognition = "rational"
 tenacity = "relaxed"
 crew = false
 
@@ -1888,7 +1887,7 @@ Read the code and explain findings. Do not edit files or run commands.
     #[serial_test::serial(real_fs)]
     fn style_only_draft_save_snapshots_projected_posture_and_preserves_restrictions() {
         let _g = GlobalSettingsGuard::acquire();
-        set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
         set_cli_tenacity(Tenacity::Relentless);
         newt_core::process_env::set_var("NEWT_TEAM", "1");
         let _ = newt_core::runtime::drain_preference_actions();
@@ -1929,7 +1928,7 @@ Read the code and explain findings. Do not edit files or run commands.
         assert_eq!(s.saved.as_deref(), Some("sparse-copy"));
         let mut expected = original.profile.clone();
         expected.backend = Some("sol".into()); // the fixture's operator baseline
-        expected.cognition = Some(Cognition::Contemplating);
+        expected.cognition = Some(Cognition::Meticulous);
         expected.tenacity = Some(Tenacity::Relentless);
         expected.crew = Some(true);
         expected.personality = Some(PersonalityTraits {
@@ -1946,7 +1945,7 @@ Read the code and explain findings. Do not edit files or run commands.
         assert_eq!(store.load("sparse").unwrap(), original);
         assert_eq!(
             cli_cognition(),
-            CognitionOverride::Set(Cognition::Contemplating)
+            CognitionOverride::Set(Cognition::Meticulous)
         );
         assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
         assert!(newt_core::runtime::drain_preference_actions().is_empty());
