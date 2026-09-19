@@ -46,6 +46,7 @@ pub fn engage_obsessive_dials() -> (Cognition, Tenacity) {
 /// Drop it and the thread resolves from the process dials again.
 #[must_use]
 pub struct TurnPsyche {
+    _verification: crate::agentic::self_verify::ScopedVerificationSettings,
     _cognition: crate::cognition::ScopedEffectiveCognition,
     _tenacity: crate::tenacity::ScopedEffectiveTenacity,
     _initiative: crate::initiative::ScopedEffectiveInitiative,
@@ -80,6 +81,9 @@ pub fn capture_turn_psyche() -> TurnPsyche {
     let tenacity = crate::tenacity::effective_tenacity();
     let initiative = crate::initiative::effective_initiative();
     TurnPsyche {
+        _verification: crate::agentic::self_verify::scoped_verification_settings(
+            crate::agentic::self_verify::VerificationSettings::capture(),
+        ),
         _cognition: crate::cognition::scoped_effective_cognition(cognition),
         _tenacity: crate::tenacity::scoped_effective_tenacity(tenacity),
         _initiative: crate::initiative::scoped_effective_initiative(initiative),
