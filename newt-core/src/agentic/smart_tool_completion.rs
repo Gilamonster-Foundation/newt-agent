@@ -39,6 +39,7 @@ impl<'a> ToolBatch<'a> {
             name,
             disclosure,
             output: Mutex::new(InvocationOutput::default()),
+            execution: std::sync::OnceLock::new(),
         })
     }
 
@@ -82,9 +83,14 @@ pub(crate) struct ToolInvocation<'a> {
     name: String,
     disclosure: Option<&'a crate::ocap::DisclosureFilter>,
     output: Mutex<InvocationOutput>,
+    execution: std::sync::OnceLock<crate::ExecOutcome>,
 }
 
 impl ToolInvocation<'_> {
+    pub(crate) fn execution_slot(&self) -> &std::sync::OnceLock<crate::ExecOutcome> {
+        &self.execution
+    }
+
     pub(crate) fn harness(&self) -> &SmartHarness {
         self.harness
     }
@@ -108,30 +114,34 @@ impl ToolInvocation<'_> {
     pub(crate) fn observe(
         &self,
         result: &str,
+        execution: Option<crate::ExecOutcome>,
         spill: Option<&dyn crate::agentic::content_spill::SpillStore>,
     ) -> anyhow::Result<()> {
-        self.observe_return(result, spill).map_err(|error| {
-            // The model-visible repair names the failure, while the observed
-            // bytes stay behind their retained CID (including invalid markers).
-            let interruption_reason = format!("{error:#}");
-            let disclosed = crate::agentic::redact_model_facing(self.disclosure, result.to_owned());
-            let disclosed = crate::agentic::compress::redact_secrets(&disclosed);
-            let error = error.context(format!(
-                "tool completion failed for {}; observed return: {disclosed}",
-                self.name
-            ));
-            match self.harness.interrupt_tools(&interruption_reason) {
-                Ok(()) => error,
-                Err(interruption) => error.context(format!(
-                    "could not persist tool interruption: {interruption:#}"
-                )),
-            }
-        })
+        self.observe_return(result, execution, spill)
+            .map_err(|error| {
+                // The model-visible repair names the failure, while the observed
+                // bytes stay behind their retained CID (including invalid markers).
+                let interruption_reason = format!("{error:#}");
+                let disclosed =
+                    crate::agentic::redact_model_facing(self.disclosure, result.to_owned());
+                let disclosed = crate::agentic::compress::redact_secrets(&disclosed);
+                let error = error.context(format!(
+                    "tool completion failed for {}; observed return: {disclosed}",
+                    self.name
+                ));
+                match self.harness.interrupt_tools(&interruption_reason) {
+                    Ok(()) => error,
+                    Err(interruption) => error.context(format!(
+                        "could not persist tool interruption: {interruption:#}"
+                    )),
+                }
+            })
     }
 
     fn observe_return(
         &self,
         result: &str,
+        execution: Option<crate::ExecOutcome>,
         spill: Option<&dyn crate::agentic::content_spill::SpillStore>,
     ) -> anyhow::Result<()> {
         let mut output = self
@@ -146,6 +156,11 @@ impl ToolInvocation<'_> {
         // The host has received these bytes. Publish that fact before parsing
         // textual handles or touching any optional retained source.
         let returned = match output.origin {
+            ReturnOrigin::Observed if execution.is_some() => ToolReturn::Native {
+                bytes: text.as_bytes(),
+                retained_sources: &[],
+                execution: execution.expect("native classification is present"),
+            },
             ReturnOrigin::Observed => ToolReturn::Observed {
                 bytes: text.as_bytes(),
                 retained_sources: &[],
@@ -329,6 +344,77 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// Grounds the mocked shell-envelope failure classification in a real
+    /// native process and the durable Smart Harness completion adapter. The
+    /// native outcome must survive independently of rendered error prose.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_failed_execution_retains_typed_failure_in_frame() {
+        use crate::agentic::prompt_intake::PromptDisposition;
+        use crate::agentic::tools::{execute_tool_with_collaborators, ToolCollaborators};
+
+        for collect_execution in [true, false] {
+            let workspace = tempfile::tempdir().unwrap();
+            let harness = SmartHarness::new(
+                agent_harness::Session::new(Default::default()).unwrap(),
+                Arc::new(|_| panic!("no inference")),
+                Default::default(),
+            )
+            .unwrap();
+            let args = serde_json::json!({"command":"/usr/bin/false"});
+            let batch = harness.fixture_tool_batch("run_command", args.clone());
+            let invocation = batch.start(0, None).unwrap();
+            let execution = std::sync::OnceLock::new();
+            let output = execute_tool_with_collaborators(
+                "run_command",
+                &args,
+                workspace.path().to_str().unwrap(),
+                false,
+                20,
+                &crate::Caveats::top(),
+                &mut crate::agentic::mcp::NoMcp,
+                ToolCollaborators {
+                    invocation: Some(&invocation),
+                    execution: collect_execution.then_some(&execution),
+                    ..Default::default()
+                },
+                false,
+                PromptDisposition::Act,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if collect_execution {
+                assert_eq!(
+                    execution.get(),
+                    Some(&crate::ExecOutcome::Failed),
+                    "{output}"
+                );
+                let mut event = crate::ToolEvent::from_call("run_command", &args, false, None);
+                event.execution = execution.get().copied();
+                assert_eq!(event.execution, Some(crate::ExecOutcome::Failed));
+            }
+            let mut state = harness.state().unwrap();
+            let call = state.session.tool_call(invocation.id).unwrap().clone();
+            let returned = call.returned.expect("the actual return is retained");
+            assert_eq!(
+                state
+                    .session
+                    .re_read(&returned.to_string(), 0, 4096)
+                    .unwrap()["text"],
+                output,
+                "failure classification must retain the exact observed return"
+            );
+            assert_eq!(
+                call.state,
+                ToolCallState::Failed,
+                "the typed native failure must not become an unclassified Returned observation"
+            );
+        }
+    }
+
     #[test]
     fn long_host_return_is_delivered_without_deriving_another_generation() {
         let harness = SmartHarness::new(
@@ -344,7 +430,7 @@ mod tests {
         let invocation = batch.start(0, None).unwrap();
         let text = "Error: re_read refused: the requested CID is outside this session";
         invocation.host();
-        invocation.observe(text, None).unwrap();
+        invocation.observe(text, None, None).unwrap();
         let model_text = invocation.model_text().unwrap();
         assert_eq!(model_text, text);
         invocation.deliver(&serde_json::json!({"role":"tool","tool_call_id":"fixture_call","content":model_text})).unwrap();
@@ -394,7 +480,7 @@ mod spill_failures {
             crate::agentic::content_spill::tool_output_retrieval_hint(&handle)
         );
         let error = invocation
-            .observe(&raw, Some(&store))
+            .observe(&raw, None, Some(&store))
             .expect_err("invalid source retention stops delivery");
         assert!(format!("{error:#}").contains(&raw));
         assert_eq!(

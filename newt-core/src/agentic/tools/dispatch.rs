@@ -354,6 +354,13 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
         tool_presentation(name, args, std::path::Path::new(workspace));
     display.call(&presentation_name, &presentation_detail);
     let invocation = collab.invocation;
+    let execution = collab
+        .execution
+        .or_else(|| invocation.map(|call| call.execution_slot()));
+    let collab = ToolCollaborators {
+        execution,
+        ..collab
+    };
     let spill = collab.spill_store;
     let result = {
         // #1727: the row under the header is never silent while the tool is
@@ -389,7 +396,11 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     match result {
         Some(result) => {
             if let Some(invocation) = invocation {
-                if let Err(error) = invocation.observe(&result, spill) {
+                if let Err(error) = invocation.observe(
+                    &result,
+                    execution.and_then(|slot| slot.get().copied()),
+                    spill,
+                ) {
                     display.result(&result);
                     display.result(&format!("error: tool completion failed: {error:#}"));
                     return Err(error);

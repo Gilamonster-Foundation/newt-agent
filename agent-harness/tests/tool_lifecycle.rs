@@ -709,3 +709,202 @@ fn storage_failure_never_becomes_an_observed_tool_failure() {
         assert!(status.returned.is_none());
     }
 }
+
+/// Grounds the current-turn view in a cold restore of the same durable calls;
+/// resetting the view must not erase or relabel interrupted historical calls.
+#[test]
+fn current_turn_calls_are_ordered_and_do_not_promote_restored_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    assert!(session.current_turn_tool_calls().unwrap().is_none());
+    session.start_turn();
+    assert_eq!(
+        session.current_turn_tool_calls().unwrap().unwrap().count(),
+        0
+    );
+    let (calls, _) = begin(&mut session, "ollama", 2);
+    session.start_tool_call(calls[0]).unwrap();
+    assert_eq!(
+        session
+            .current_turn_tool_calls()
+            .unwrap()
+            .unwrap()
+            .map(|call| (call.id, call.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (calls[0], ToolCallState::Started),
+            (calls[1], ToolCallState::Queued)
+        ]
+    );
+    session.interrupt_tool_batch("cancelled").unwrap();
+    let head = session.head();
+    let authority = session.config().authority.clone();
+    drop(session);
+    let mut restored = Session::restore(dir.path(), head, &authority).unwrap();
+    assert!(restored.current_turn_tool_calls().unwrap().is_none());
+    restored.start_turn();
+    assert_eq!(
+        restored.current_turn_tool_calls().unwrap().unwrap().count(),
+        0
+    );
+    assert_eq!(
+        restored.tool_call(calls[0]).unwrap().state,
+        ToolCallState::Uncertain
+    );
+    assert_eq!(
+        restored.tool_call(calls[1]).unwrap().state,
+        ToolCallState::NotStarted
+    );
+    let (fresh, _) = begin(&mut restored, "ollama", 2);
+    assert_eq!(
+        restored
+            .current_turn_tool_calls()
+            .unwrap()
+            .unwrap()
+            .map(|call| call.id)
+            .collect::<Vec<_>>(),
+        fresh
+    );
+    assert!(fresh.iter().all(|id| !calls.contains(id)));
+}
+
+#[test]
+fn starting_a_turn_only_resets_the_view_not_unfinished_occurrences() {
+    let mut session = Session::new(SessionConfig::default()).unwrap();
+    session.start_turn();
+    let (calls, _) = begin(&mut session, "openai", 2);
+    session.start_tool_call(calls[0]).unwrap();
+    session.start_turn();
+    assert_eq!(
+        session.current_turn_tool_calls().unwrap().unwrap().count(),
+        0
+    );
+    assert_eq!(
+        session.tool_call(calls[0]).unwrap().state,
+        ToolCallState::Started
+    );
+    assert_eq!(
+        session.tool_call(calls[1]).unwrap().state,
+        ToolCallState::Queued
+    );
+    session.interrupt_tool_batch("previous turn ended").unwrap();
+    assert_eq!(
+        session.tool_call(calls[0]).unwrap().state,
+        ToolCallState::Uncertain
+    );
+    assert_eq!(
+        session.tool_call(calls[1]).unwrap().state,
+        ToolCallState::NotStarted
+    );
+    assert_eq!(
+        session.current_turn_tool_calls().unwrap().unwrap().count(),
+        0
+    );
+}
+/// Grounds native classification and untyped-return separation in a cold
+/// filesystem restore: identical output bytes cannot manufacture an outcome.
+#[test]
+fn native_execution_outcomes_survive_restore_without_classifying_untyped_returns() {
+    use agent_harness::ExecOutcome;
+    let outcomes = [
+        ExecOutcome::Passed,
+        ExecOutcome::Failed,
+        ExecOutcome::Denied,
+        ExecOutcome::TimedOut,
+        ExecOutcome::Unavailable,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    let (calls, _) = begin(&mut session, "openai", outcomes.len() + 3);
+    let bytes = b"same result bytes, not outcome evidence";
+    for (ordinal, id) in calls.iter().enumerate() {
+        session.start_tool_call(*id).unwrap();
+        let returned = match outcomes.get(ordinal) {
+            Some(execution) => ToolReturn::Native {
+                bytes,
+                retained_sources: &[],
+                execution: *execution,
+            },
+            None if ordinal == outcomes.len() => ToolReturn::Observed {
+                bytes,
+                retained_sources: &[],
+            },
+            None if ordinal == outcomes.len() + 1 => ToolReturn::Failed {
+                bytes,
+                retained_sources: &[],
+            },
+            None => ToolReturn::Host(std::str::from_utf8(bytes).unwrap()),
+        };
+        session.record_tool_return(*id, returned).unwrap();
+        session
+            .record_tool_delivery(
+                *id,
+                &envelope("openai", ordinal, std::str::from_utf8(bytes).unwrap()),
+            )
+            .unwrap();
+    }
+    let head = session.head();
+    drop(session);
+    let mut restored = Session::restore(dir.path(), head, "local-session").unwrap();
+    for (ordinal, id) in calls.iter().enumerate() {
+        let call = restored.tool_call(*id).unwrap().clone();
+        assert_eq!(call.execution, outcomes.get(ordinal).copied());
+        let failure = matches!(
+            outcomes.get(ordinal),
+            Some(ExecOutcome::Failed | ExecOutcome::TimedOut)
+        ) || ordinal == outcomes.len() + 1;
+        assert_eq!(
+            call.state,
+            if failure {
+                ToolCallState::Failed
+            } else {
+                ToolCallState::Returned
+            }
+        );
+        assert_eq!(
+            restored
+                .re_read(&call.returned.unwrap().to_string(), 0, 4096)
+                .unwrap()["text"],
+            std::str::from_utf8(bytes).unwrap()
+        );
+    }
+}
+
+/// Grounds execution-field integrity in the same production restore verifier
+/// as every existing journal fact. Restoring the original bytes restores the
+/// original fact; editing the classification under its old CID is refused.
+#[test]
+fn native_execution_classification_tampering_is_rejected_on_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    let (calls, _) = begin(&mut session, "openai", 1);
+    session.start_tool_call(calls[0]).unwrap();
+    session
+        .record_tool_return(
+            calls[0],
+            ToolReturn::Native {
+                bytes: b"unchanged observed return",
+                retained_sources: &[],
+                execution: agent_harness::ExecOutcome::Denied,
+            },
+        )
+        .unwrap();
+    let head = session.head();
+    drop(session);
+    let path = dir.path().join(format!("{head}.cbor"));
+    let original = std::fs::read(&path).unwrap();
+    let mut changed = original.clone();
+    let position = changed
+        .windows(6)
+        .position(|bytes| bytes == b"denied")
+        .unwrap();
+    changed[position..position + 6].copy_from_slice(b"passed");
+    std::fs::write(&path, changed).unwrap();
+    assert!(Session::restore(dir.path(), head, "local-session").is_err());
+    std::fs::write(&path, &original).unwrap();
+    let restored = Session::restore(dir.path(), head, "local-session").unwrap();
+    assert_eq!(
+        restored.tool_call(calls[0]).unwrap().execution,
+        Some(agent_harness::ExecOutcome::Denied)
+    );
+}

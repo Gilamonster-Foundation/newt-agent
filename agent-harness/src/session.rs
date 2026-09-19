@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 mod tools;
 pub(crate) use tools::ToolChange;
-pub use tools::{ToolCallState, ToolCallStatus, ToolReturn};
+pub use tools::{ExecOutcome, ToolCallState, ToolCallStatus, ToolReturn};
 
 use crate::{
     projection::{Entry, Projection},
@@ -247,6 +247,8 @@ pub struct Session {
     reread_outputs: BTreeMap<String, Vec<ContentId>>,
     tool_calls: BTreeMap<ContentId, ToolCallStatus>,
     tool_order: Vec<ContentId>,
+    /// Ephemeral accounted-turn boundary, never reconstructed from historical prose.
+    turn_tool_start: Option<usize>,
     pending: BTreeSet<ContentId>,
     replies: BTreeSet<ContentId>,
     model_messages: BTreeSet<ContentId>,
@@ -326,6 +328,7 @@ impl Session {
             reread_outputs: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
             tool_order: Vec::new(),
+            turn_tool_start: None,
             pending: BTreeSet::new(),
             replies: BTreeSet::new(),
             model_messages: BTreeSet::new(),
@@ -367,12 +370,28 @@ impl Session {
         self.pending.iter().copied().collect()
     }
     pub fn start_turn(&mut self) {
+        self.turn_tool_start = Some(self.tool_order.len());
         self.transcript = self.restored_transcript.clone();
         self.navigation_elapsed = Duration::ZERO;
         self.fetched = 0;
         self.dereferences = 0;
         self.navigation_calls = 0;
         self.attempted_selections.clear();
+    }
+
+    /// Ordered host-accounted tool occurrences since the last explicit `start_turn`.
+    /// An empty view establishes zero occurrences only in that current turn, not
+    /// in historical or unaccounted conversation text. Restore requires a fresh
+    /// turn boundary; queued and uncertain calls retain their original states.
+    /// `None` means no current-turn boundary has been established. This view does
+    /// not establish whether a returned tool executed a command.
+    pub fn current_turn_tool_calls(&self) -> Result<Option<impl Iterator<Item = &ToolCallStatus>>> {
+        self.ensure_active()?;
+        Ok(self.turn_tool_start.map(|start| {
+            self.tool_order[start..]
+                .iter()
+                .map(|id| &self.tool_calls[id])
+        }))
     }
 
     /// Check execution ownership before host side effects. A failed check

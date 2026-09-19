@@ -3080,14 +3080,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
-            if let Some(nudge) = capability_evidence.correction(
+            if let Some(mut nudge) = capability_evidence.correction(
                 &probe_content,
                 &tools,
                 &mut probe_correction_used,
                 tools_supported && round + 1 < current_tool_round_limit && !is_cancelled(cancel),
             ) {
                 if let Some(harness) = smart_harness {
-                    harness.correct_answer(&probe_content, &nudge)?;
+                    nudge = harness.correct_answer(&probe_content, &nudge)?;
                 }
                 messages.push(serde_json::json!({"role":"assistant", "content":probe_content}));
                 messages.push(serde_json::json!({"role":"user", "content":nudge}));
@@ -3849,7 +3849,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 );
                 if let Some(invocation) = &invocation {
                     invocation.host();
-                    invocation.observe(&report, spill_store)?;
+                    invocation.observe(&report, None, spill_store)?;
                 }
                 print_synthetic_tool_result(
                     name,
@@ -7749,14 +7749,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
-            if let Some(nudge) = capability_evidence.correction(
+            if let Some(mut nudge) = capability_evidence.correction(
                 &oa_content,
                 &tools,
                 &mut probe_correction_used,
                 tools_supported && round + 1 < current_tool_round_limit && !is_cancelled(cancel),
             ) {
                 if let Some(harness) = smart_harness {
-                    harness.correct_answer(&oa_content, &nudge)?;
+                    nudge = harness.correct_answer(&oa_content, &nudge)?;
                 }
                 messages.push(serde_json::json!({"role":"assistant", "content":oa_content}));
                 messages.push(serde_json::json!({"role":"user", "content":nudge}));
@@ -8348,7 +8348,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 );
                 if let Some(invocation) = &invocation {
                     invocation.host();
-                    invocation.observe(&report, spill_store)?;
+                    invocation.observe(&report, None, spill_store)?;
                 }
                 print_synthetic_tool_result(
                     name,
@@ -10131,14 +10131,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
-            if let Some(nudge) = capability_evidence.correction(
+            if let Some(mut nudge) = capability_evidence.correction(
                 &oa_content,
                 &tools,
                 &mut probe_correction_used,
                 tools_supported && round + 1 < current_tool_round_limit && !is_cancelled(cancel),
             ) {
                 if let Some(harness) = smart_harness {
-                    harness.correct_answer(&oa_content, &nudge)?;
+                    nudge = harness.correct_answer(&oa_content, &nudge)?;
                 }
                 messages.push(serde_json::json!({"role":"assistant", "content":oa_content}));
                 messages.push(serde_json::json!({"role":"user", "content":nudge}));
@@ -10689,7 +10689,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 );
                 if let Some(invocation) = &invocation {
                     invocation.host();
-                    invocation.observe(&report, spill_store)?;
+                    invocation.observe(&report, None, spill_store)?;
                 }
                 print_synthetic_tool_result(
                     name,
@@ -11948,14 +11948,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
-            if let Some(nudge) = capability_evidence.correction(
+            if let Some(mut nudge) = capability_evidence.correction(
                 &text,
                 &tools_chat,
                 &mut probe_correction_used,
                 !refused && tools_supported && round + 1 < max_tool_rounds && !is_cancelled(cancel),
             ) {
                 if let Some(harness) = smart_harness {
-                    harness.correct_answer(&text, &nudge)?;
+                    nudge = harness.correct_answer(&text, &nudge)?;
                 }
                 input.extend(echo.clone());
                 input.push(serde_json::json!({"role":"assistant", "content":text}));
@@ -12249,7 +12249,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 );
                 if let Some(invocation) = &invocation {
                     invocation.host();
-                    invocation.observe(&report, spill_store)?;
+                    invocation.observe(&report, None, spill_store)?;
                 }
                 print_synthetic_tool_result(
                     name,
