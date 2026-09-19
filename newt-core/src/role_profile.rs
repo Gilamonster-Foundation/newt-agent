@@ -1692,6 +1692,24 @@ fs_read = [\"src/\", \"docs/\"]
         assert!(err.contains("is empty"), "got: {err}");
     }
 
+    /// Slice 1a rename: the headless `--persona` path migrates an old
+    /// cognition label instead of failing the strict parse. Grounds the
+    /// mocked `psyche_import` seam test: this real read reaches the importer.
+    #[test]
+    #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+    #[serial_test::serial(real_fs)]
+    fn load_from_dir_migrates_an_old_cognition_label() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("deep.md");
+        std::fs::write(&path, "+++\ncognition = \"contemplating\"\n+++\n# Deep\n").unwrap();
+        let rp = RoleProfile::load_from_dir("deep", tmp.path()).unwrap();
+        assert_eq!(rp.cognition, Some(Cognition::Meticulous));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "+++\ncognition = \"meticulous\"\n+++\n# Deep\n"
+        );
+    }
+
     #[test]
     fn load_from_dir_lowercases_the_name() {
         let tmp = tempfile::TempDir::new().unwrap();

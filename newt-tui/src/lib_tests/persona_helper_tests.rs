@@ -598,33 +598,38 @@ fn shipped_role_templates_parse() {
 }
 
 /// Slice 1a rename: a user persona still carrying an old cognition label is
-/// migrated on read. `list` used to skip it silently (the strict parse
-/// failed); now it lists, `load` resolves the new level, and the file is
-/// rewritten once.
-#[serial_test::serial(real_fs)]
+/// migrated on read by both `load` and `list`, each on its own file, so
+/// neither passes on the other's rewrite. `load` used to fail the strict
+/// parse and `list` skipped the persona silently.
+///
+/// Grounds the mocked `psyche_import` seam test
+/// (`read_writes_back_once_through_the_seam`): the store's real reads reach
+/// the importer and the rewrite lands on disk.
 #[test]
-fn store_list_and_load_migrate_an_old_cognition_label() {
+#[ignore = "real-resource: weekly/release tier; touches the filesystem"]
+#[serial_test::serial(real_fs)]
+fn store_load_and_list_each_migrate_an_old_cognition_label() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().join("personas");
     fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("deep.md");
-    fs::write(
-        &path,
-        "+++\ncognition = \"contemplating\"\n+++\n# Deep thinker\n",
-    )
-    .unwrap();
+    let persona = |label: &str| format!("+++\ncognition = \"{label}\"\n+++\n# Thinker\n");
+    let (deep, quick) = (dir.join("deep.md"), dir.join("quick.md"));
+    fs::write(&deep, persona("contemplating")).unwrap();
+    fs::write(&quick, persona("glancing")).unwrap();
     let store = PersonaStore::new(dir);
-    let names: Vec<_> = store.list().unwrap().into_iter().map(|p| p.name).collect();
-    assert!(names.iter().any(|n| n == "deep"), "listed: {names:?}");
+
+    // `load` before any `list`.
+    let loaded = store.load("deep").unwrap();
     assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        "+++\ncognition = \"meticulous\"\n+++\n# Deep thinker\n"
-    );
-    let persona = store.load("deep").unwrap();
-    assert_eq!(
-        persona.profile.cognition,
+        loaded.profile.cognition,
         Some(newt_core::role_profile::Cognition::Meticulous)
     );
+    assert_eq!(fs::read_to_string(&deep).unwrap(), persona("meticulous"));
+    assert_eq!(fs::read_to_string(&quick).unwrap(), persona("glancing"));
+
+    let names: Vec<_> = store.list().unwrap().into_iter().map(|p| p.name).collect();
+    assert!(names.iter().any(|n| n == "quick"), "listed: {names:?}");
+    assert_eq!(fs::read_to_string(&quick).unwrap(), persona("zen"));
 }
 
 /// The assistant persona prefers its bound skill's routine tools. These data
