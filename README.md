@@ -4,20 +4,19 @@
   <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
-Newt is an experimental agentic coder, written in Rust, that is built to run
-against local models first. The default build contains no cloud provider at all;
-hosted providers are opt-in plugins that you add when you build it.
+Newt is an experimental agentic coder in Rust, built for local models first.
+The default build contains no cloud provider; hosted providers are opt-in
+plugins added at build time.
 
-Every tool call that Newt makes runs under a capability that the operator
-grants. The grant says what the call may read, write, run, and reach on the
-network, and [`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle)
-enforces it, in the kernel where the operating system allows it. Because the
-grant is explicit, the operator can narrow it before a run and audit it after.
+Every tool call runs under a capability the operator grants: what the call
+may read, write, run, and reach on the network.
+[`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle)
+enforces it, in the kernel where the OS allows. An explicit grant can be
+narrowed before a run and audited after.
 
-We measure Newt instead of describing it. Each model's score on a fixed
-Terminal-Bench task set, both confined and unconfined, is recorded as a
-ratchet that is not allowed to go down between releases. The current numbers
-are on the [Terminal-Bench scoreboard](./docs/terminal-bench.md).
+Newt is measured, not described. Each model's score on a fixed Terminal-Bench
+task set, confined and unconfined, is a ratchet that may not fall between
+releases: [Terminal-Bench scoreboard](./docs/terminal-bench.md).
 
 ## Install
 
@@ -28,8 +27,8 @@ just install
 newt
 ```
 
-The first run of `newt` opens a setup wizard. After that, `newt --help` lists
-everything the binary can do, and it is the authority on that; this file is not.
+The first run opens a setup wizard. `newt --help` is the authority on what the
+binary does; this file is not.
 
 ## Read next
 
