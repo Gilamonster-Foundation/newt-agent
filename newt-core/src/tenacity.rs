@@ -1,21 +1,16 @@
 //! Tenacity — how long and hard the agent pursues the task.
 //!
-//! Two levels today: [`Tenacity::Normal`] stops at the first plausible finish
-//! within the configured tool-round limit, and [`Tenacity::Relentless`] also
-//! lifts that limit. `grit` and `resolute` arrive in later slices of
-//! `docs/design/psyche-effort-dials.md`.
-//!
-//! Until the initiative split (slice 1b) this dial also carried the
-//! read-before-acting nudge and the plan-exit edit. Those moved unchanged to
-//! [`crate::initiative`], together with the per-family defaults. Tenacity is
-//! set only explicitly: `--tenacity`, `/psyche tenacity`, a conversation's
-//! preference pin, or the obsessive posture. The lift is explicit-only for a
-//! reason: small loop-prone families must never silently receive 10,000
-//! rounds, so no persona, config or family layer feeds it.
+//! Normal retains optional verification. Resolute and relentless require fresh
+//! verification before an Act turn can complete. Only a direct operator choice
+//! of relentless lifts the tool-round cap; persona and config defaults never do.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+
+#[path = "tenacity_config.rs"]
+mod config;
+pub use config::TenacityConfig;
 
 /// Bounded sentinel used for an operator-selected relentless run. This is high
 /// enough to behave as "finish the objective" while remaining finite.
@@ -28,7 +23,9 @@ pub enum Tenacity {
     /// Stop at the first plausible finish, within the configured round limit.
     #[default]
     Normal,
-    /// Also lift the tool-round limit, when chosen explicitly.
+    /// Require fresh successful verification before completing an Act task.
+    Resolute,
+    /// Require verification and also lift the limit when chosen explicitly.
     Relentless,
 }
 
@@ -52,6 +49,7 @@ impl Tenacity {
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::Resolute => "resolute",
             Self::Relentless => "relentless",
         }
     }
@@ -63,17 +61,24 @@ impl Tenacity {
             Self::Normal => {
                 "stop at the first plausible finish, within the configured round limit".to_string()
             }
+            Self::Resolute => "require fresh successful verification before task completion".to_string(),
             Self::Relentless => format!(
-                "lift the tool-round limit to at least {RELENTLESS_TOOL_ROUND_TARGET} \
+                "require fresh verification; an explicit choice lifts the tool-round limit to at least {RELENTLESS_TOOL_ROUND_TARGET} \
                  (an explicit round limit still wins)"
             ),
         }
     }
 
+    /// Whether task completion must carry fresh successful verification.
+    #[must_use]
+    pub fn requires_verification(self) -> bool {
+        matches!(self, Self::Resolute | Self::Relentless)
+    }
+
     /// All levels, normal → relentless.
     #[must_use]
-    pub fn all() -> [Self; 2] {
-        [Self::Normal, Self::Relentless]
+    pub fn all() -> [Self; 3] {
+        [Self::Normal, Self::Resolute, Self::Relentless]
     }
 }
 
@@ -241,17 +246,67 @@ impl FromStr for Tenacity {
         if let Some(new) = crate::psyche_import::split_tenacity(&s) {
             return Err(format!(
                 "tenacity '{s}' was split: its read-before-acting half is now \
-                 `--initiative {new}`; tenacity is normal|relentless"
+                 `--initiative {new}`; tenacity is normal|resolute|relentless"
             ));
         }
-        Err(format!("unknown tenacity '{s}' (normal|relentless)"))
+        Err(format!(
+            "unknown tenacity '{s}' (normal|resolute|relentless)"
+        ))
     }
 }
 
 // The explicit operator choice (`--tenacity`, `/psyche tenacity`, a pin, the
-// obsessive posture). It is the only tenacity input: there is no persona,
-// config or family layer, because the round-cap lift must stay explicit.
+// obsessive posture). Only this raw choice may lift the round cap.
 static CLI_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+static TENACITY_CONFIG: std::sync::Mutex<Option<TenacityConfig>> = std::sync::Mutex::new(None);
+
+/// Resolve pursuit independently of the operator-only cap calculation.
+pub fn resolve_tenacity(
+    cli: Option<Tenacity>,
+    persona: Option<Tenacity>,
+    config: Option<&TenacityConfig>,
+    family: Option<&str>,
+) -> Tenacity {
+    cli.or(persona)
+        .unwrap_or_else(|| config.map(|c| c.resolve(family)).unwrap_or_default())
+}
+
+/// Install the active persona declaration; clearing it restores inheritance.
+pub fn set_persona_tenacity(level: Option<Tenacity>) {
+    if let Ok(mut slot) = PERSONA_TENACITY.lock() {
+        *slot = level;
+    }
+}
+
+pub fn persona_tenacity() -> Option<Tenacity> {
+    PERSONA_TENACITY.lock().ok().and_then(|slot| *slot)
+}
+
+/// Publish config defaults without granting an operator round-cap override.
+pub fn set_tenacity_config(config: TenacityConfig) {
+    if let Ok(mut slot) = TENACITY_CONFIG.lock() {
+        *slot = Some(config);
+    }
+}
+
+pub fn tenacity_config() -> Option<TenacityConfig> {
+    TENACITY_CONFIG.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// The family/config baseline shown by inherited panel settings.
+pub fn base_tenacity() -> Tenacity {
+    resolve_tenacity(
+        None,
+        None,
+        tenacity_config().as_ref(),
+        crate::initiative::active_model_family().as_deref(),
+    )
+}
+
+pub fn model_default_tenacity() -> Option<Tenacity> {
+    tenacity_config()?.family_default(crate::initiative::active_model_family().as_deref())
+}
 // #1998: the two inputs to `resolve_tool_round_limit` that were NOT here.
 //
 // Its other inputs have always been process globals in this module. The last — the `/rounds` session override — was a local variable inside
@@ -316,7 +371,7 @@ pub fn set_cli_tenacity(level: Tenacity) {
     }
 }
 
-/// Clear the explicit CLI `--tenacity` override, so tenacity is `Normal` again.
+/// Clear the explicit CLI override, restoring persona/config inheritance.
 /// The complement of [`set_cli_tenacity`]: it lets a surface
 /// express "inherit" (no override) rather than pinning the currently-resolved
 /// value — e.g. the config panel must not persist an untouched dial.
@@ -326,7 +381,7 @@ pub fn clear_cli_tenacity() {
     }
 }
 
-/// The raw CLI `--tenacity` override, if one is installed (`None` = `Normal`).
+/// The raw CLI `--tenacity` override, if one is installed (`None` = inherit).
 /// Distinct from [`effective_tenacity`], which also honours a turn's capture.
 #[must_use]
 pub fn cli_tenacity() -> Option<Tenacity> {
@@ -334,13 +389,18 @@ pub fn cli_tenacity() -> Option<Tenacity> {
 }
 
 /// The tenacity in effect: a turn's captured value, else the explicit
-/// operator choice, else `Normal`.
+/// operator choice, persona, exact family default, config default, then Normal.
 #[must_use]
 pub fn effective_tenacity() -> Tenacity {
     if let Some(level) = EFFECTIVE_TENACITY_OVERRIDE.with(std::cell::Cell::get) {
         return level;
     }
-    cli_tenacity().unwrap_or_default()
+    resolve_tenacity(
+        cli_tenacity(),
+        persona_tenacity(),
+        tenacity_config().as_ref(),
+        crate::initiative::active_model_family().as_deref(),
+    )
 }
 
 /// A complete snapshot of **every** mutable global in this module — the CLI
@@ -350,6 +410,8 @@ pub fn effective_tenacity() -> Tenacity {
 #[doc(hidden)]
 pub struct TenacityRuntimeSnapshot {
     cli: Option<Tenacity>,
+    persona: Option<Tenacity>,
+    config: Option<TenacityConfig>,
     session_rounds: Option<usize>,
     configured_rounds: Option<usize>,
 }
@@ -421,6 +483,8 @@ pub fn session_tool_round_limit() -> Option<ToolRoundLimit> {
 pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
     TenacityRuntimeSnapshot {
         cli: cli_tenacity(),
+        persona: persona_tenacity(),
+        config: tenacity_config(),
         session_rounds: session_tool_rounds(),
         configured_rounds: configured_tool_rounds(),
     }
@@ -433,6 +497,10 @@ pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
 pub fn restore_runtime_state(snapshot: TenacityRuntimeSnapshot) {
     if let Ok(mut s) = CLI_TENACITY.lock() {
         *s = snapshot.cli;
+    }
+    set_persona_tenacity(snapshot.persona);
+    if let Ok(mut s) = TENACITY_CONFIG.lock() {
+        *s = snapshot.config;
     }
     if let Ok(mut s) = SESSION_TOOL_ROUNDS.lock() {
         *s = snapshot.session_rounds;
@@ -662,3 +730,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tenacity_resolute_tests.rs"]
+mod resolute_tests;
