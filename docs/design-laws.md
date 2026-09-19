@@ -3,10 +3,12 @@
 The invariants. Each links to the decision record that argues it. Moved here
 from the README so the README stays a pointer, not a contract.
 
-- **Local-first inference.** The default binary speaks only to local
-  backends. Cloud providers are opt-in subprocess plugins speaking the
-  JSON-RPC schema in [`plugins-protocol/`](../plugins-protocol/) — the opt-in
-  is enforced at the **build** level, not a runtime flag.
+- **Local-first inference.** Setup probes for a local backend first; a
+  hosted provider is something the operator selects
+  ([`provider-presets.md`](./provider-presets.md)), and its key is never
+  stored in plaintext. Hosted clients ship in the default build; further
+  providers can be added as subprocess plugins speaking the JSON-RPC schema
+  in [`plugins-protocol/`](../plugins-protocol/).
 - **Fail-closed OCAP.** Authority is a caveat lattice, not a denylist; a
   fixed safety floor no mode or grant can unlock. See
   [`decisions/agentic_object_capability_security.md`](./decisions/agentic_object_capability_security.md)
