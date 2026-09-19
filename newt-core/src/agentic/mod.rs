@@ -35,7 +35,7 @@ mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
-pub use generation_policy::validate_output_allowance;
+pub use generation_policy::{projected_cognition, validate_output_allowance};
 mod git_tool;
 pub mod openai_sse;
 pub(crate) mod self_verify;
@@ -996,12 +996,17 @@ pub struct ChatCtx<'a> {
     /// for an explicitly capable Chat Completions endpoint, resolves a local
     /// generation policy. `None` omits cognition-derived fields. The TUI
     /// resolves this from the active persona's `cognition:` front-matter
-    /// alongside `persona_tools`; headless / eval callers pass `None`.
+    /// alongside `persona_tools`; the headless driver preserves semantic intent
+    /// separately and passes only the supported projection here.
     pub cognition: Option<crate::role_profile::Cognition>,
     /// Chat Completions extensions explicitly accepted by this endpoint.
     /// Unknown endpoints use the all-unset default and retain the historical
     /// request body even when cognition is active.
     pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
+    /// Responses declarations captured from the same active capability decision.
+    pub responses_capability: crate::model_card::ResponsesCapability,
+    /// The typed wire choice captured with this context, never reread mid-turn.
+    pub openai_api: crate::OpenAiApi,
     /// Explicit output-token allowance (`[[model_tuning]] output_allowance`,
     /// #2312). Overrides the cognition table's output budget without touching
     /// cognition, thinking or sampling; every loop reserves it locally, and it is
@@ -1869,7 +1874,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // A backend with `api = "responses"` speaks the newer Responses API
         // (gpt-5-codex et al., served only there); the default stays on
         // /v1/chat/completions.
-        if responses_api_selected() {
+        if ctx.openai_api == crate::OpenAiApi::Responses {
             return openai_responses_complete_with_prompt_and_artifacts(
                 ctx,
                 turn_prompt_context,
@@ -1920,6 +1925,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // fields to `_` so its request body remains unchanged.
         cognition: _,
         chat_completions_capability: _,
+        responses_capability: _,
+        openai_api: _,
         output_allowance,
         attempt_ledger,
         reasoning_replay_scope: _,
@@ -6545,6 +6552,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         output_allowance,
         attempt_ledger,
         chat_completions_capability,
+        responses_capability: _,
+        openai_api: _,
         reasoning_replay_scope,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -9071,6 +9080,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         output_allowance,
         attempt_ledger,
         chat_completions_capability,
+        responses_capability: _,
+        openai_api: _,
         reasoning_replay_scope,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -9163,6 +9174,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // `generation_policy` where the OpenAI path reads them.)
     let generation_policy::GenerationPolicy {
         thinking: _,
+        reasoning_effort: _,
         temperature: _,
         top_p: _,
         parallel_tool_calls: _,
@@ -11076,24 +11088,18 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
 // compaction (compact before overflow) and usage-learning ceiling raises.
 
 /// `true` when the active OpenAI backend selected the Responses API
-/// (`[backends].api = "responses"`, surfaced to the loop as `NEWT_OPENAI_API`).
+/// Used only for the legacy constructor default; explicit hosts supply typed API.
 fn responses_api_selected() -> bool {
     std::env::var("NEWT_OPENAI_API")
         .ok()
         .is_some_and(|v| v.eq_ignore_ascii_case("responses"))
 }
 
-/// The Responses-wire `reasoning` object for a cognition level, or `None` to omit
-/// it. The **single owner** of how the psyche `cognition` dial becomes a wire
-/// field: the value mapping lives in [`Cognition::reasoning_effort`], the Responses
-/// *shape* (`{"effort": …}`) lives here, so the chat-shape projection
-/// (`reasoning_effort: …`, a follow-up once the chat bodies are consolidated)
-/// reuses the same value without duplicating the ladder. `None` → the field is
-/// never added, leaving the request bit-for-bit unchanged for non-opt-in callers.
+/// Serialize only the effort admitted by the captured Responses policy.
 fn responses_reasoning_field(
-    cognition: Option<crate::role_profile::Cognition>,
+    effort: Option<crate::model_card::ReasoningEffort>,
 ) -> Option<serde_json::Value> {
-    cognition.map(|c| serde_json::json!({ "effort": c.reasoning_effort() }))
+    effort.map(|value| serde_json::json!({ "effort": value }))
 }
 
 /// Translate the chat/completions tool array (`{type:function,
@@ -11358,6 +11364,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         persona_tools,
         cognition,
         chat_completions_capability: _,
+        responses_capability,
+        openai_api: _,
         output_allowance,
         attempt_ledger,
         reasoning_replay_scope: _,
@@ -11426,6 +11434,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // about what it means for this wire instead of silently defaulting.
         emits_leading_reasoning: _,
     } = ctx;
+    let generation_policy = generation_policy::GenerationPolicy::resolve_responses(
+        cognition,
+        output_allowance,
+        &responses_capability,
+    )?;
+    if let Some(obs) = solve_obs.as_deref_mut() {
+        obs.responses_capability = Some(responses_capability);
+        obs.reasoning_effort = generation_policy.reasoning_effort;
+    }
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
     // discards it — without terminal writes — so a stale rewind can never
@@ -11560,8 +11577,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         max_ok_input,
         mid_loop_trim_tokens,
         input_ceiling_pct,
-        cognition,
-        output_allowance,
+        None,
+        generation_policy.output_allowance,
     );
     observability::observe_output_allowance(&mut solve_obs, budget_state.output_reserve(), false);
     let (tools_chat, hidden_tools) = crate::agentic::tools::select_exposed(
@@ -11635,7 +11652,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut observed_resolver = claim_check::workspace_resolver(workspace);
     let turn_start_head = claim_check::git_head(workspace, &caveats.fs_read);
 
-    let reasoning = responses_reasoning_field(cognition);
+    let reasoning = responses_reasoning_field(generation_policy.reasoning_effort);
     // Tools are passed per call (#2331): a promotion can append to them.
     let build_body = |input: &[serde_json::Value], tools: &[serde_json::Value]| {
         // `store` is set EXPLICITLY (#1526, invariant #5): the Responses API
