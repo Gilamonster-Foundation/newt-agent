@@ -53,7 +53,7 @@ POSTURE_COGNITION = {
     "baseline": "default",
     "tenacity": "default",
     "crew": "default",
-    "obsessive": "contemplating",
+    "obsessive": "meticulous",
 }
 POSTURE_CREW = {
     "baseline": "off",
@@ -944,7 +944,7 @@ class RunValidator:
                 backend.get("name"),
                 2,
                 "standard",
-                "contemplating",
+                "meticulous",
                 "off",
                 "off",
             )

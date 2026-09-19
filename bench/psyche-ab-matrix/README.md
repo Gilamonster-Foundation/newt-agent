@@ -51,7 +51,7 @@ model display name.
 
 Before contacting the inference server for a matrix cell, qualification mode
 drives the candidate Newt binary for two rounds against a loopback server with
-`--cognition contemplating`. It retains `preflight/first-request.json` and
+`--cognition meticulous`. It retains `preflight/first-request.json` and
 `preflight/second-request.json`. The first request must contain:
 
 - exactly the runner's qualification user prompt and no replay marker;
@@ -157,7 +157,7 @@ SERVER_LAUNCH_MANIFEST=/secure/run-records/nemotron-vllm-launch.json \
 
 The model's native vLLM launch should select the `qwen3_coder` tool parser,
 `nano_v3` reasoning parser, the declared chat template, and an output allowance
-large enough for Newt's contemplating policy. `CONTEXT_WINDOW` is passed to
+large enough for Newt's meticulous policy. `CONTEXT_WINDOW` is passed to
 every solve; Newt composes it with the cognition output reserve.
 
 ## Run the llama.cpp portability lane
@@ -196,7 +196,7 @@ locally reconstructed template. For example, after retaining `/props`, hash
 | `baseline` | no override | cognition default, tenacity standard, no crew |
 | `tenacity` | `--tenacity relentless` | cognition default, relentless, crew off |
 | `crew` | `NEWT_TEAM=1` | cognition default, standard, crew on |
-| `obsessive` | `--obsessive` | contemplating + relentless + crew |
+| `obsessive` | `--obsessive` | meticulous + relentless + crew |
 
 `default` means Newt sends no cognition selection. The inference server retains
 its own default behavior, which may include reasoning for Nemotron.
@@ -230,7 +230,7 @@ required cell:
 - reported a tenacity other than `standard` for baseline/crew or `relentless`
   for tenacity/obsessive;
 - reported cognition other than `default` for baseline/tenacity/crew or
-  `contemplating` for obsessive;
+  `meticulous` for obsessive;
 - reported crew other than `off` for baseline/tenacity or `on` for
   crew/obsessive; or
 - lacked qualification provenance or either structurally validated preflight request.

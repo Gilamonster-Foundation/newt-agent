@@ -451,7 +451,7 @@ if [ "$MODE" = "qualification" ]; then
   # evidence never tracks newt's default lane — P3 flipped that default to
   # confined, which silently turned the preflight contract to ocap=on. Pin the
   # unconfined lane the validator expects.
-  preflight_cmd=("$NEWT" --cognition contemplating --config "$PREFLIGHT_CFG" solve
+  preflight_cmd=("$NEWT" --cognition meticulous --config "$PREFLIGHT_CFG" solve
     --instruction-file "$OUT/preflight/instruction.txt" --cwd "$OUT/preflight/ws"
     --events "$OUT/preflight/events.jsonl" --non-interactive true --unsafe-host-exec
     --max-rounds 2 --plain)
