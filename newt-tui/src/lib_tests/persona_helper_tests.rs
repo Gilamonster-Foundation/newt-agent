@@ -597,6 +597,36 @@ fn shipped_role_templates_parse() {
     }
 }
 
+/// Slice 1a rename: a user persona still carrying an old cognition label is
+/// migrated on read. `list` used to skip it silently (the strict parse
+/// failed); now it lists, `load` resolves the new level, and the file is
+/// rewritten once.
+#[serial_test::serial(real_fs)]
+#[test]
+fn store_list_and_load_migrate_an_old_cognition_label() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("personas");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deep.md");
+    fs::write(
+        &path,
+        "+++\ncognition = \"contemplating\"\n+++\n# Deep thinker\n",
+    )
+    .unwrap();
+    let store = PersonaStore::new(dir);
+    let names: Vec<_> = store.list().unwrap().into_iter().map(|p| p.name).collect();
+    assert!(names.iter().any(|n| n == "deep"), "listed: {names:?}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "+++\ncognition = \"meticulous\"\n+++\n# Deep thinker\n"
+    );
+    let persona = store.load("deep").unwrap();
+    assert_eq!(
+        persona.profile.cognition,
+        Some(newt_core::role_profile::Cognition::Meticulous)
+    );
+}
+
 /// The assistant persona prefers its bound skill's routine tools. These data
 /// preferences guide selection; explicit permissions govern execution.
 #[test]

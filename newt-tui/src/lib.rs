@@ -4686,7 +4686,7 @@ impl PersonaStore {
         self.ensure_defaults()?;
         let name = normalize_persona_name(name)?;
         let path = self.dir.join(format!("{name}.md"));
-        let raw = match std::fs::read_to_string(&path) {
+        let raw = match newt_core::psyche_import::read_persona_file(&path) {
             Ok(raw) => raw,
             Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
         };
@@ -4719,7 +4719,7 @@ impl PersonaStore {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let raw = newt_core::psyche_import::read_persona_file(&path).unwrap_or_default();
             if raw.trim().is_empty() {
                 continue;
             }

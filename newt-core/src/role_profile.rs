@@ -829,7 +829,9 @@ impl RoleProfile {
     /// is correct first-run UX for an interactive session, but a stdio
     /// server silently writing files into `~/.newt/personas/` on every
     /// startup is a footgun under CI/systemd. A headless caller with an
-    /// unresolvable `--persona <name>` should fail loudly instead.
+    /// unresolvable `--persona <name>` should fail loudly instead. An existing
+    /// file with pre-rename labels is rewritten once by
+    /// [`crate::psyche_import::read_persona_file`], like every persona read.
     ///
     /// # Errors
     ///
@@ -848,7 +850,7 @@ impl RoleProfile {
             anyhow::bail!("persona names may only contain letters, numbers, '-' and '_'");
         }
         let path = dir.join(format!("{name}.md"));
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
+        let raw = crate::psyche_import::read_persona_file(&path).map_err(|e| {
             anyhow::anyhow!("persona `{name}` not found at {}: {e}", path.display())
         })?;
         let profile = Self::parse(&raw).map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
