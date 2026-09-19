@@ -866,6 +866,22 @@ impl RoleProfile {
 mod tests {
     use super::*;
 
+    /// The shipped personas must preserve the old explicit persona nudge.
+    /// This is distinct from the obsessive command, which holds initiative.
+    #[test]
+    fn psyche_split_review_bundled_personas_preserve_action_timing() {
+        for (name, text) in [
+            ("bob", include_str!("../../personas/bob.md")),
+            ("obsessive", include_str!("../../personas/obsessive.md")),
+        ] {
+            assert_eq!(
+                RoleProfile::parse(text).unwrap().initiative,
+                Some(Initiative::Eager),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn no_front_matter_is_prompt_only() {
         let text = "# Coder\n\nYou write code.\n";

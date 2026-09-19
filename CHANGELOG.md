@@ -25,8 +25,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   with the `--initiative` level that replaces it.
 - **Behaviour changes.** The bottom level nudges after 12 read-only rounds
   (old `relaxed`: 6). `--obsessive` and `/psyche obsessive` no longer move
-  initiative, so they no longer nudge after one round or force a plan-exit
-  edit. The headless contract is `contract_version: "2"`: `effective_config`
+  initiative, leaving its nudge and plan-exit edit rule unchanged. The bundled
+  `obsessive` persona retains its explicit `eager` initiative. The headless
+  contract is `contract_version: "2"`: `effective_config`
   gains `initiative`, and `tenacity` reads `normal`/`relentless`.
 - **Existing state migrates.** Persona files and the operator's own config
   are rewritten once on load (`tenacity` → `initiative`; relaxed → patient,
