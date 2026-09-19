@@ -4556,7 +4556,7 @@ fn build_system_prompt(workspace: &str, plan_path: &str) -> String {
     build_system_prompt_with_soul(workspace, None, plan_path)
 }
 
-/// Seat `persona`'s declared dials (cognition and initiative) as the persona
+/// Seat `persona`'s declared dials (cognition, tenacity and initiative) as the persona
 /// resolution layers, or clear them for `None`. Every persona activation site
 /// calls this one function: startup, `/persona set|clear`, a conversation
 /// restore and a fresh tab. Re-seating the dials one at a time is how the
@@ -4565,6 +4565,7 @@ pub(crate) fn seat_persona_dials(persona: Option<&Persona>) {
     let profile = persona.map(|p| &p.profile);
     newt_core::cognition::set_persona_cognition(profile.and_then(|p| p.cognition));
     newt_core::initiative::set_persona_initiative(profile.and_then(|p| p.initiative));
+    newt_core::tenacity::set_persona_tenacity(profile.and_then(|p| p.tenacity));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
