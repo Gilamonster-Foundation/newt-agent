@@ -15,7 +15,7 @@ harbor download terminal-bench -o /var/tmp/tbench-tasks
 
 NEWT_BENCH_BIN=/path/to/branch-built/newt \
 NEWT_BENCH_PROFILE=/path/to/bench.toml \
-NEWT_BENCH_TENACITY=insistent \
+NEWT_BENCH_INITIATIVE=decisive \
 PYTHONPATH=scripts/eval/harbor \
 harbor run --config scripts/eval/harbor/newt-job.example.json
 ```
@@ -25,7 +25,10 @@ path, `jobs_dir`, and model label to your setup. The injected profile determines
 the actual endpoint and model; keep Harbor's `model_name` label consistent.
 Use a local, uncommitted copy of the
 [backend profile example](../tbench-profile.example.toml) for endpoint details
-and credentials. `NEWT_BENCH_TENACITY` is optional.
+and credentials. `NEWT_BENCH_INITIATIVE` (`patient` | `measured` | `decisive` |
+`eager`) and `NEWT_BENCH_TENACITY` (`normal` | `relentless`) are optional. Before
+the tenacity/initiative split, `NEWT_BENCH_TENACITY=insistent` meant what
+`NEWT_BENCH_INITIATIVE=decisive` means now.
 
 ## pi and Codex on the same endpoint
 
