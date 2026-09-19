@@ -25,6 +25,7 @@ enum Step {
     /// JSON object, so validation rejects the whole batch.
     RejectedBatch(&'static str),
     Done,
+    Refusal,
 }
 
 fn rejected_batch(wire: &str, command: &str) -> ResponseTemplate {
@@ -34,6 +35,12 @@ fn rejected_batch(wire: &str, command: &str) -> ResponseTemplate {
             "model":"test-model","stop_reason":"tool_use","content":[
             {"type":"tool_use","id":"call_1","name":"run_command","input":run},
             {"type":"tool_use","id":"call_2","name":"run_command","input":"not an object"}]}),
+        "ollama" => serde_json::json!({"message":{"role":"assistant","content":"","tool_calls":[
+            {"function":{"name":"run_command","arguments":run}},
+            {"function":{"name":"run_command","arguments":"not an object"}}]},"done":true}),
+        "responses" => serde_json::json!({"id":"resp_1","status":"completed","output":[
+            {"type":"function_call","id":"fc_1","call_id":"call_1","name":"run_command","arguments":run.to_string()},
+            {"type":"function_call","id":"fc_2","call_id":"call_2","name":"run_command","arguments":"\"not an object\""}]}),
         _ => serde_json::json!({"choices":[{"message":{"role":"assistant","content":"",
             "tool_calls":[
             {"id":"call_1","type":"function","function":{"name":"run_command",
@@ -45,10 +52,23 @@ fn rejected_batch(wire: &str, command: &str) -> ResponseTemplate {
 }
 
 fn reply(wire: &str, step: Step) -> ResponseTemplate {
+    if matches!(step, Step::Refusal) {
+        let value = match wire {
+            "anthropic" => serde_json::json!({"id":"msg_1","type":"message","role":"assistant",
+                "model":"test-model","stop_reason":"refusal","content":[{"type":"text","text":"I decline this request."}]}),
+            "responses" => serde_json::json!({"id":"resp_1","status":"completed","output":[
+                {"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I decline this request."}]}]}),
+            _ => unreachable!(
+                "typed refusal fixture only covers providers with an existing refusal branch"
+            ),
+        };
+        return ResponseTemplate::new(200).set_body_json(value);
+    }
     let call = match step {
         Step::Run(command) => Some(("run_command", serde_json::json!({"command": command}))),
         Step::RejectedBatch(command) => return rejected_batch(wire, command),
         Step::Done => None,
+        Step::Refusal => unreachable!(),
     };
     let value = match (wire, call) {
         ("ollama", Some((name, args))) => {
@@ -91,6 +111,8 @@ struct Run {
     signals: Vec<observability::BehaviorSignal>,
     /// The loop reported that the turn ended at its round cap.
     at_cap: bool,
+    answer: String,
+    notes_bytes: Option<String>,
 }
 
 /// The model runs `check` once, then answers `done` every time it is asked.
@@ -140,6 +162,10 @@ struct Turn<'a> {
 }
 
 async fn run_turn(turn: Turn<'_>) -> Run {
+    run_turn_configured(turn, |_| {}).await
+}
+
+async fn run_turn_configured(turn: Turn<'_>, configure: impl FnOnce(&mut ChatCtx<'_>)) -> Run {
     let Turn {
         wire,
         smart,
@@ -203,7 +229,8 @@ async fn run_turn(turn: Turn<'_>) -> Run {
     context.end_reason = Some(&mut reason);
     let mut at_cap = false;
     context.round_cap_hit = Some(&mut at_cap);
-    if wire == "responses" {
+    configure(&mut context);
+    let (answer, _, _, _) = if wire == "responses" {
         openai_responses_complete(context, &mut NoMcp).await
     } else {
         chat_complete(context, &mut NoMcp).await
@@ -221,6 +248,9 @@ async fn run_turn(turn: Turn<'_>) -> Run {
         bodies,
         signals: obs.behavior_signals,
         at_cap,
+        answer,
+        notes_bytes: std::fs::read_to_string(std::path::Path::new(&workspace).join("notes.txt"))
+            .ok(),
     }
 }
 
@@ -825,3 +855,6 @@ async fn every_verification_case_ends_within_its_allowance() {
         }
     }
 }
+
+#[path = "http_resolute.rs"]
+mod resolute;
