@@ -144,6 +144,8 @@ pub(crate) struct PanelSeed {
     /// Initiative with no operator choice and no persona layer
     /// ([`newt_core::initiative::base_initiative`]).
     pub base_initiative: Initiative,
+    pub base_tenacity: Tenacity,
+    pub tenacity_from_family: bool,
     /// Whether that base is the active model family's entry
     /// ([`newt_core::initiative::model_default_initiative`]), shown as
     /// `model default`.
@@ -310,6 +312,8 @@ pub(crate) struct PanelState {
     /// default / `Measured`) — the value a persona that declares none inherits.
     base_initiative: Initiative,
     initiative_from_family: bool,
+    base_tenacity: Tenacity,
+    tenacity_from_family: bool,
     /// The crew launch gate at open (`NEWT_TEAM`) — the base a persona's `crew:`
     /// declaration projects over.
     base_crew: bool,
@@ -335,6 +339,8 @@ impl PanelState {
             backend,
             base_initiative,
             initiative_from_family,
+            base_tenacity,
+            tenacity_from_family,
             models,
             current_model,
             personality,
@@ -395,6 +401,8 @@ impl PanelState {
             current_model: current_model.to_string(),
             base_initiative,
             initiative_from_family,
+            base_tenacity,
+            tenacity_from_family,
             base_crew: std::env::var("NEWT_TEAM").is_ok(),
             backend,
             mode: Mode::Normal,
@@ -608,10 +616,16 @@ impl PanelState {
         }
     }
 
-    /// The tenacity that WILL be in effect after Apply: an explicit override,
-    /// else `Normal` (no persona or config layer feeds tenacity).
+    /// The chosen level, excluding inherited family/config defaults from saves.
+    fn chosen_tenacity(&self) -> Option<Tenacity> {
+        self.tenacity
+            .value()
+            .or_else(|| self.selected_profile().and_then(|p| p.tenacity))
+    }
+
+    /// The pursuit policy that will be in effect after Apply.
     fn projected_tenacity(&self) -> Tenacity {
-        self.tenacity.value().unwrap_or_default()
+        self.chosen_tenacity().unwrap_or(self.base_tenacity)
     }
 
     /// The initiative the operator CHOSE for the selected persona: an explicit
@@ -788,6 +802,7 @@ impl PanelState {
         // Only a chosen initiative: the base is a family/config default, and
         // baking it in would pin it for every model this persona runs on.
         profile.initiative = self.chosen_initiative();
+        profile.tenacity = self.chosen_tenacity();
         profile.crew = profile.crew.or_else(|| self.base_crew.then_some(true));
         let personality = self.projected_personality();
         if personality != PersonalityTraits::default() || profile.personality.is_some() {
@@ -813,10 +828,18 @@ impl PanelState {
     fn tenacity_cell(&self) -> (String, String) {
         match self.tenacity.value() {
             Some(t) => (t.label().to_string(), "override".to_string()),
-            None => (
-                format!("auto → {}", self.projected_tenacity().label()),
-                "base".to_string(),
-            ),
+            None => {
+                let from_persona = self.chosen_tenacity().is_some();
+                let provenance = if !from_persona && self.tenacity_from_family {
+                    "model default".to_string()
+                } else {
+                    self.inherit_provenance(from_persona)
+                };
+                (
+                    format!("auto → {}", self.projected_tenacity().label()),
+                    provenance,
+                )
+            }
         }
     }
     fn initiative_cell(&self) -> (String, String) {
@@ -1517,13 +1540,15 @@ mod tests {
             backend: Some("sol".to_string()),
             base_initiative: base_ini,
             initiative_from_family: false,
+            base_tenacity: Tenacity::Normal,
+            tenacity_from_family: false,
             models,
             current_model: current_model.to_string(),
             personality: PersonalityTraits::default(),
         }
     }
 
-    fn panel(
+    pub(super) fn panel(
         current: Option<&str>,
         personas: Vec<PersonaChoice>,
         base_ini: Initiative,
@@ -2049,8 +2074,9 @@ Read the code and explain findings. Do not edit files or run commands.
         let mut expected = original.profile.clone();
         expected.backend = Some("sol".into()); // the fixture's operator baseline
         expected.cognition = Some(Cognition::Meticulous);
-        // Tenacity is not a persona dial; a set initiative is snapshotted.
+        // Explicit pursuit and initiative choices are snapshotted.
         expected.initiative = Some(Initiative::Decisive);
+        expected.tenacity = Some(Tenacity::Relentless);
         expected.crew = Some(true);
         expected.personality = Some(PersonalityTraits {
             warmth: Some(PersonalityLevel::try_from(0).unwrap()),
@@ -2573,11 +2599,11 @@ Read the code and explain findings. Do not edit files or run commands.
         t.down(); // persona → model
         t.down(); // model → cognition
         t.down(); // cognition → tenacity
-        t.cycle(1); // normal → relentless (dirty)
+        t.cycle(1); // #2451: normal → resolute (dirty)
         assert_eq!(close_outcome(true, &t), applied);
         assert_eq!(
             cli_tenacity(),
-            Some(Tenacity::Relentless),
+            Some(Tenacity::Resolute),
             "the tenacity-only edit was applied, not silently discarded"
         );
         set_cli_tenacity(Tenacity::Normal);
@@ -2687,3 +2713,7 @@ Keep this loaded prompt and its restrictions.
         );
     }
 }
+
+#[cfg(test)]
+#[path = "config_panel_resolute_tests.rs"]
+mod resolute_tests;
