@@ -9,12 +9,18 @@ statement of direction, not a spec.
 
 ## The principle: cognition is now a priced resource
 
-Every token has a price. For the first time in the history of thinking machines,
-the **cost of cognitive load is literally quantified** — you can put a number on
-"how much thought did this take." That turns a vague design instinct into an
-engineering constraint you can budget against.
+Watch a model use a command, an API, or an MCP tool, and you can see how hard
+it has to work. When the interface fits the task, the model reads it once and
+uses it. When it doesn't, the model reasons around it: it reads the schema
+again, guesses, chains three calls where one should do, retries. That work is
+thought, and we can measure that now in tokens spent.
 
-The instinct has a name here: **altruistic laziness**. Push every unit of work
+Designing a good interface used to be an inexpressible art. You knew a
+well-fitted one when you used it, and you could not say what it saved you. Now
+you can: **the better an interface fits its task, the less a model must think to
+use it**, and that difference is a number you can design against.
+
+The discipline this calls for has a name here: **altruistic laziness**. Push every unit of work
 to the *cheapest layer that can actually do it*, and spend the expensive layer
 *only* on work that nothing cheaper can. This is not new — it is the
 conservation-of-energy law applied to cognition, the same move as caching,
