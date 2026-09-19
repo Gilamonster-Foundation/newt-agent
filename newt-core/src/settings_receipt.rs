@@ -561,6 +561,12 @@ mod tests {
                 serde_json::json!({"rounds":320,"source":"override","configured":40,"tenacity":"relentless"}),
                 "/rounds",
             ),
+            (
+                "rounds",
+                serde_json::json!({"rounds":40,"source":"config","configured":40,"tenacity":"relaxed"}),
+                serde_json::json!({"rounds":320,"source":"override","configured":40,"tenacity":"relaxed"}),
+                "/rounds",
+            ),
         ];
         for (setting, from, to, via) in fixtures {
             let wire = serde_json::json!({

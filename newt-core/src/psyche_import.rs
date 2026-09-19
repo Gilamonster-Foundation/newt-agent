@@ -100,10 +100,11 @@ pub fn migrate_persona_text(text: &str) -> Option<Migration> {
                     changes.push(format!("tenacity '{old}' -> initiative '{new}'"));
                 }
                 None => {
-                    edits.push((
-                        line_around(fm, key_span.start, value_span.end),
-                        String::new(),
-                    ));
+                    let line = line_around(fm, key_span.start, value_span.end);
+                    let suffix = &fm[value_span.end..line.end];
+                    // The setting goes; its explanation remains as a comment.
+                    let comment = if suffix.contains('#') { suffix } else { "" };
+                    edits.push((line, comment.to_string()));
                     changes.push(format!(
                         "dropped tenacity '{old}' (persona tenacity no longer exists)"
                     ));
@@ -142,6 +143,12 @@ fn line_around(text: &str, from: usize, to: usize) -> std::ops::Range<usize> {
 pub fn migrate_config_text(text: &str) -> Option<Migration> {
     use toml_edit::{DocumentMut, Item, Table};
     let mut doc: DocumentMut = text.parse().ok()?;
+    if let Some(initiative) = doc.get("initiative") {
+        // A malformed current setting belongs to the typed decoder, never
+        // to an importer that silently replaces it with a legacy value.
+        initiative.as_table_like()?;
+    }
+    let legacy_key = doc.key("tenacity")?.clone();
     let tenacity = doc.get("tenacity")?.as_table_like()?;
     if !tenacity.contains_key("default") && !tenacity.contains_key("families") {
         return None;
@@ -149,14 +156,15 @@ pub fn migrate_config_text(text: &str) -> Option<Migration> {
     let only_moved = tenacity
         .iter()
         .all(|(k, _)| k == "default" || k == "families");
-    let mut moved = if only_moved && !doc.contains_key("initiative") {
+    let mut moved = if only_moved {
         doc.remove("tenacity")?
     } else {
         let tenacity = doc.get_mut("tenacity")?.as_table_like_mut()?;
         let mut table = Table::new();
         for key in ["default", "families"] {
-            if let Some(item) = tenacity.remove(key) {
-                table.insert(key, item);
+            if let Some(formatted) = tenacity.key(key).cloned() {
+                let item = tenacity.remove(key)?;
+                table.insert_formatted(&formatted, item);
             }
         }
         if tenacity.is_empty() {
@@ -177,36 +185,110 @@ pub fn migrate_config_text(text: &str) -> Option<Migration> {
             map_tenacity_value(item, &format!("families.{}", family.get()), &mut changes);
         }
     }
-    match doc.get_mut("initiative").and_then(Item::as_table_like_mut) {
+    let mut comments = String::new();
+    match doc.get_mut("initiative") {
         None => {
-            doc.insert("initiative", moved);
+            let key = if only_moved {
+                toml_edit::Key::new("initiative")
+                    .with_leaf_decor(legacy_key.leaf_decor().clone())
+                    .with_dotted_decor(legacy_key.dotted_decor().clone())
+            } else {
+                toml_edit::Key::new("initiative")
+            };
+            doc.as_table_mut().insert_formatted(&key, moved);
         }
         Some(initiative) => {
-            let moved = moved.as_table_like_mut()?;
-            if let Some(default) = moved.remove("default") {
-                if initiative.contains_key("default") {
-                    changes.push("kept the existing [initiative] default".to_string());
-                } else {
-                    initiative.insert("default", default);
-                }
+            if initiative.get("default").is_some() && moved.get("default").is_some() {
+                changes.push("kept the existing [initiative] default".to_string());
             }
-            if let Some(mut families) = moved.remove("families") {
-                let target = initiative
-                    .entry("families")
-                    .or_insert(Item::Table(Table::new()))
-                    .as_table_like_mut()?;
-                for (family, item) in families.as_table_like_mut()?.iter_mut() {
-                    if !target.contains_key(family.get()) {
-                        target.insert(family.get(), std::mem::take(item));
-                    }
-                }
+            if only_moved {
+                keep_comments(legacy_key.leaf_decor(), &mut comments);
+                keep_comments(legacy_key.dotted_decor(), &mut comments);
             }
+            merge_config_tables(initiative, moved, &mut comments)?;
         }
+    }
+    if !comments.is_empty() {
+        // Comments attached to retired headers or overridden entries have
+        // no surviving owner. Keep them at the end rather than deleting them.
+        doc.set_trailing(format!(
+            "\n{comments}{}",
+            doc.trailing().as_str().unwrap_or_default()
+        ));
     }
     Some(Migration {
         text: doc.to_string(),
         changes,
     })
+}
+
+/// Merge legacy entries without replacing current choices. Preserve formatted
+/// keys and whole sub-tables; collect only comments whose owner is discarded.
+fn merge_config_tables(
+    target: &mut toml_edit::Item,
+    mut source: toml_edit::Item,
+    comments: &mut String,
+) -> Option<()> {
+    use toml_edit::{Entry, Item};
+    match &source {
+        Item::Table(table) => keep_comments(table.decor(), comments),
+        Item::Value(value) => keep_comments(value.decor(), comments),
+        _ => return None,
+    }
+    let inline = target.is_inline_table();
+    let target = target.as_table_like_mut()?;
+    let source = source.as_table_like_mut()?;
+    let keys: Vec<_> = source
+        .iter()
+        .filter_map(|(key, _)| source.key(key).cloned())
+        .collect();
+    for mut key in keys {
+        let mut item = source.remove(key.get())?;
+        if inline {
+            // A line comment copied inside `{ ... }` can swallow its closing
+            // brace. Move comments outside while rebuilding inline entries.
+            keep_comments(key.leaf_decor(), comments);
+            keep_comments(key.dotted_decor(), comments);
+            key.leaf_decor_mut().clear();
+            key.dotted_decor_mut().clear();
+        }
+        match target.entry_format(&key) {
+            Entry::Vacant(entry) => {
+                if inline {
+                    if item.as_table_like().is_some() {
+                        let mut value = Item::Value(toml_edit::InlineTable::new().into());
+                        merge_config_tables(&mut value, item, comments)?;
+                        item = value;
+                    } else if let Some(value) = item.as_value_mut() {
+                        keep_comments(value.decor(), comments);
+                        value.decor_mut().clear();
+                    }
+                }
+                entry.insert(item);
+            }
+            Entry::Occupied(mut entry) => {
+                keep_comments(key.leaf_decor(), comments);
+                keep_comments(key.dotted_decor(), comments);
+                if item.as_table_like().is_some() {
+                    merge_config_tables(entry.get_mut(), item, comments)?;
+                } else if let Some(value) = item.as_value() {
+                    keep_comments(value.decor(), comments);
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+fn keep_comments(decor: &toml_edit::Decor, comments: &mut String) {
+    for raw in [decor.prefix(), decor.suffix()].into_iter().flatten() {
+        if let Some(text) = raw.as_str().filter(|text| text.contains('#')) {
+            comments.push_str(text);
+            if !text.ends_with('\n') {
+                comments.push('\n');
+            }
+        }
+    }
 }
 
 /// Rewrite one old tenacity label to its initiative level, keeping the
@@ -304,6 +386,118 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    #[test]
+    fn psyche_split_review_persona_removal_preserves_comments() {
+        let raw = "+++\ninitiative = \"patient\"\ntenacity = \"insistent\" # keep this explanation\n+++\nBody\n";
+        let migrated = migrate_persona_text(raw).unwrap();
+        assert!(migrated.text.contains("# keep this explanation"));
+        assert_eq!(migrate_persona_text(&migrated.text), None);
+        assert_eq!(
+            crate::RoleProfile::parse(&migrated.text)
+                .unwrap()
+                .initiative,
+            Some(crate::Initiative::Patient)
+        );
+    }
+
+    #[test]
+    fn psyche_split_review_config_merge_preserves_comments() {
+        let raw = r#"# old header
+[tenacity] # header note
+# old default
+default = "insistent" # default note
+[tenacity.families] # family header
+# old family
+nemotron = "relentless" # family note
+# overridden family
+qwen = "standard" # override note
+[initiative]
+default = "patient"
+[initiative.families]
+qwen = "decisive"
+[initiative.rounds]
+measured = 7
+"#;
+        let migrated = migrate_config_text(raw).unwrap();
+        for comment in [
+            "# old header",
+            "# header note",
+            "# old default",
+            "# default note",
+            "# family header",
+            "# old family",
+            "# family note",
+            "# overridden family",
+            "# override note",
+        ] {
+            assert!(
+                migrated.text.contains(comment),
+                "lost {comment}: {}",
+                migrated.text
+            );
+        }
+        let config: crate::config::Config = toml::from_str(&migrated.text).unwrap();
+        let initiative = config.initiative.unwrap();
+        assert_eq!(initiative.default, Some(crate::Initiative::Patient));
+        assert_eq!(
+            initiative.resolve(Some("qwen")),
+            crate::Initiative::Decisive
+        );
+        assert_eq!(
+            initiative.resolve(Some("nemotron")),
+            crate::Initiative::Eager
+        );
+        assert_eq!(initiative.rounds.measured, 7);
+        assert_eq!(migrate_config_text(&migrated.text), None);
+    }
+
+    #[test]
+    fn psyche_split_review_inline_config_merge_preserves_comments() {
+        let raw = r#"initiative = { rounds = { measured = 7 } } # current note
+[tenacity] # old header
+default = "insistent" # default note
+[tenacity.families] # family header
+# old family
+nemotron = "relentless" # family note
+"#;
+        let migrated = migrate_config_text(raw).unwrap();
+        let config: crate::config::Config = toml::from_str(&migrated.text)
+            .unwrap_or_else(|error| panic!("{error}: {}", migrated.text));
+        let initiative = config.initiative.unwrap();
+        assert_eq!(initiative.default, Some(crate::Initiative::Decisive));
+        assert_eq!(
+            initiative.resolve(Some("nemotron")),
+            crate::Initiative::Eager
+        );
+        assert_eq!(initiative.rounds.measured, 7);
+        for comment in [
+            "# current note",
+            "# old header",
+            "# default note",
+            "# family header",
+            "# old family",
+            "# family note",
+        ] {
+            assert!(
+                migrated.text.contains(comment),
+                "lost {comment}: {}",
+                migrated.text
+            );
+        }
+        assert_eq!(migrate_config_text(&migrated.text), None);
+    }
+
+    #[test]
+    fn psyche_split_review_config_keeps_invalid_initiative_for_typed_refusal() {
+        let raw = "initiative = \"invalid\"\n[tenacity]\ndefault = \"insistent\"\n";
+        assert_eq!(
+            migrate_config_text(raw),
+            None,
+            "never overwrite an existing invalid setting"
+        );
+        assert!(toml::from_str::<crate::config::Config>(raw).is_err());
+    }
+
     const OLD: &str = "\
 +++
 role      = \"researcher\"   # who
@@ -393,7 +587,7 @@ Body keeps cognition = \"contemplating\" and tenacity = \"relaxed\" as prose.
         let m = migrate_persona_text(both).unwrap();
         assert_eq!(
             m.text,
-            "+++\ninitiative = \"patient\"\nrole = \"x\"\n+++\nB.\n"
+            "+++\ninitiative = \"patient\"\n  # old\nrole = \"x\"\n+++\nB.\n"
         );
         assert_eq!(
             m.changes,
