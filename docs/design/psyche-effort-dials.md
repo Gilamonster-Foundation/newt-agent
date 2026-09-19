@@ -38,23 +38,29 @@ initiative: survey — measured — decisive — eager
 | zen | Least reasoning the endpoint allows (`reasoning_effort = minimal`) |
 | rational | Short reasoning before acting (`low`) |
 | thoughtful | **Default.** Weighs options (`medium`) |
-| meticulous | `high`, plus one self-review of its diff before reporting done |
-| exhaustive | The highest level the endpoint advertises, plus considering alternatives before committing to one |
+| meticulous | `high`, plus the **self-review** technique |
+| exhaustive | The highest level the endpoint advertises, plus self-review and the **consider-alternatives** technique |
 
-`meticulous` and `exhaustive` differ from their neighbours by harness
-behaviour, not only by the wire value.
+Self-review (re-read the diff before reporting done) and consider-alternatives
+(weigh more than one approach before committing) are separate, reusable
+techniques. The dial composes them; a persona, crew role, or plan step can use
+either one without touching cognition.
 
 ### Tenacity — how long and hard it pursues the task
 
 | Level | Behaviour |
 |---|---|
 | normal | **Default.** Stops at the first plausible finish, within the configured round limit |
-| grit | Also retries, a bounded number of times, when a tool call or test fails |
+| grit | Also retries, up to a configured count, when a tool call or test fails |
 | resolute | Also refuses to report done until a check passes — a test run or other verification, not only the cited-path check [`claim_check.rs`](../../newt-core/src/agentic/claim_check.rs) does today |
 | relentless | Also lifts the tool-round limit (today's `project_tool_round_limit`) |
 
 Levels are cumulative. `grit` and `resolute` are new behaviour; `resolute` is
 aimed at the measured false-completion rate on Terminal-Bench.
+
+The retry count and the relentless round budget are ordinary config settings.
+Whether the panel shows them is a separate setting, on for now so the numbers
+are visible while they are tuned, and easy to hide later.
 
 ### Initiative — how much it looks before acting
 
@@ -86,6 +92,20 @@ It is a toggle, not a `/mode`. `/mode` selects authority — each mode changes
 the caveats a turn runs under. Effort must never change authority, so it
 cannot share that switch. `--obsessive` at launch stays.
 
+### In the `/psyche` panel
+
+`obsessive` is a toggle row above the three dials. When it is on:
+
+- The three effort dials grey out and cannot be moved. Cognition and tenacity
+  show the values obsessive forces; initiative shows its held value.
+- The panel sparkles — a subtle animated accent on its border or title — so the
+  posture is unmistakable at a glance.
+- Turning it off un-greys the dials at the values they had before.
+
+The sparkle is rich-TUI only. It stops under reduced motion or no colour, and
+the lean and piped surfaces show a plain `obsessive: on` line instead
+(plain-scroller rule).
+
 ## Migration
 
 No backward compatibility is owed. One rename, one importer for files users
@@ -107,13 +127,18 @@ reports what it changed. `exhaustive`, `grit`, and `resolute` have no old name.
 - Tuning the numbers: nudge thresholds keep today's values; retry and
   round-limit budgets are chosen during implementation and measured.
 
-## Open questions
+## Decisions (2026-09-18)
 
-1. `meticulous` and `exhaustive` add harness passes (self-review,
-   alternatives). Should those be separate techniques the dial composes, as
-   [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md)
-   proposes for `effort`?
-2. Should `grit`'s retry count and `relentless`'s budget be visible in the
-   panel, or only in config?
-3. Slices: rename + importer first (behaviour-preserving), then `resolute`,
-   then `grit`, then the cognition passes?
+- `/obsessive` is a toggle, shown in the panel as a special row that greys the
+  dials and sparkles.
+- Self-review and consider-alternatives are separate reusable techniques.
+- The grit retry count is a config setting; showing budgets in the panel is
+  its own setting, so it can be hidden later.
+
+## Build order
+
+1. Rename + importer — behaviour-preserving.
+2. `resolute` — verify before reporting done.
+3. `grit` — bounded retries.
+4. The cognition techniques: self-review, then consider-alternatives.
+5. The panel toggle and its sparkle can land with slice 1 or on its own.
