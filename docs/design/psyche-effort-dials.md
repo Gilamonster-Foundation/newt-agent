@@ -80,6 +80,31 @@ supplies the starting point.
 All three dials keep today's precedence: CLI flag, then persona, then the
 config's per-family value, then the config default, then the built-in default.
 
+### Tunable numbers
+
+A level is a name for a number, and the numbers are config, not code. Today
+the level *choice* is configurable (`[tenacity.families]`) but the numbers
+behind each level are hard-coded in `tenacity.rs`. They move to config, with
+today's values as the built-in defaults:
+
+```toml
+[initiative.rounds]      # read-only rounds before the nudge to act
+patient  = 12
+measured = 3
+decisive = 2
+eager    = 1
+
+[tenacity.budgets]
+grit_retries      = 2     # illustrative; chosen when grit is built
+relentless_rounds = 0     # 0 = effectively unlimited, today's behaviour
+```
+
+An operator can change a number without inventing a new level, and families
+still select levels by name, so retuning `decisive` retunes every family that
+uses it. The setting that shows budgets in the panel covers these numbers too.
+The right values are found by measurement — the refactor-lab and
+Terminal-Bench runs — not by argument.
+
 ## The `/obsessive` toggle
 
 `/obsessive` sets cognition to `exhaustive` and tenacity to `relentless`, and
@@ -127,8 +152,8 @@ only test fixtures do. `exhaustive`, `grit`, and `resolute` have no old name.
 ## Out of scope
 
 - The five communication-style sliders in `/psyche`; they are unchanged.
-- Tuning the numbers: nudge thresholds keep today's values; retry and
-  round-limit budgets are chosen during implementation and measured.
+- Choosing the final numbers. The defaults above are today's values; the
+  tuned values come from measured runs.
 
 ## Decisions (2026-09-18)
 
