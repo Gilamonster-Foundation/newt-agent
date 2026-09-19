@@ -86,6 +86,8 @@ fn hard_budget_ctx<'a>(
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
