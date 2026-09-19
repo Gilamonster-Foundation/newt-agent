@@ -1955,6 +1955,27 @@ delegation and frame-isolation boundaries still apply.
 network-enabled dependency installation, mutable shared cache/target writes,
 and expanding the embedded Git write surface.
 
+## Step 27.7 — Ground fresh capability claims in current execution (#2454)
+
+**Branch:** `step-27.7-capability-grounding`
+
+Prevent a resumed conversation from presenting remembered toolchain failures as
+fresh probes. Extend the existing capability checker with per-turn execution
+evidence, independent of optional telemetry. Before accepting an unsupported
+fresh-probe claim, offer one correction using the currently advertised tool
+schemas. Record that intervention through Agent Frame when Smart Harness is
+active. Preserve the answer and append an evidence notice if it remains
+unsupported, including streaming and round-limit exits.
+
+**Acceptance:** the observed fabricated-probe answers are corrected or visibly
+qualified on all four provider wires; history retrieval alone is not execution
+evidence; returned failures and denials count as attempts; future intent and
+quoted history remain unchanged. Refusals, cancellation, tool support, round
+limits and permission boundaries remain effective.
+
+**Out of scope:** verifying arbitrary natural-language claims or exact command
+results, expanding Git authority, and changing the confinement policy.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

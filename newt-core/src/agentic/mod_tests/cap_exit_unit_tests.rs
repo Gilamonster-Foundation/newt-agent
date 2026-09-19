@@ -225,6 +225,7 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
         &workspace.path().to_string_lossy(),
         &crate::Scope::All,
         None,
+        &capability_check::Evidence::default(),
         None,
     );
     assert!(

@@ -24,6 +24,14 @@ grant is available, or an alternative within existing authority. An unresolved
 blocker remains incomplete work. These reminders neither grant permissions nor
 replace the tool gates or cancellation and round-budget limits.
 
+Recovered capability claims are historical context, not current observations.
+Explicit claims of freshly completed toolchain probes receive one bounded
+correction when this turn has no returned execution attempt. The correction
+uses current tool schemas and preserves permission gates; an unsupported final
+claim carries a visible harness evidence notice. Failed and denied attempts
+count as attempts, but do not prove availability or the claimed command result.
+This narrow check covers the observed probe wording, not arbitrary prose.
+
 A successful built-in permission grant releases cached capability failures and
 typed failed native shell/lifecycle executions so the original operation can be
 checked again. A native execution receipt permits re-evaluation; it does not

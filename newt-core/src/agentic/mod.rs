@@ -2217,6 +2217,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    let mut capability_evidence = capability_check::Evidence::default();
+    let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: action-pressure nudges (narration rescue, workflow repair
     // steering, pending-plan pushes) fire ONLY when the user's turn actually
@@ -3078,6 +3080,20 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
+            if let Some(nudge) = capability_evidence.correction(
+                &probe_content,
+                &tools,
+                &mut probe_correction_used,
+                tools_supported && round + 1 < current_tool_round_limit && !is_cancelled(cancel),
+            ) {
+                if let Some(harness) = smart_harness {
+                    harness.correct_answer(&probe_content, &nudge)?;
+                }
+                messages.push(serde_json::json!({"role":"assistant", "content":probe_content}));
+                messages.push(serde_json::json!({"role":"user", "content":nudge}));
+                accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
+                continue 'round_loop;
+            }
             if let Some(harness) = smart_harness {
                 let more = round + 1 < current_tool_round_limit;
                 let control = harness
@@ -3119,6 +3135,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 harness.outcome(reason, &text)?;
@@ -3161,6 +3178,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -3672,6 +3690,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             return Ok((probe_content, false, accumulated_usage, hallucination_count));
@@ -3928,6 +3947,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
+            capability_evidence.record(name, ok, execution.get().copied());
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -4039,6 +4059,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
+            &capability_evidence,
             disclosure,
         );
         harness.outcome(cap_reason, &text)?;
@@ -4078,6 +4099,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
+        &capability_evidence,
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
@@ -5310,6 +5332,7 @@ fn retry_readonly_completion(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn readonly_completion_handoff(
     content: &str,
     end_reason: &mut Option<&mut Option<crate::TurnEndReason>>,
@@ -5317,6 +5340,7 @@ fn readonly_completion_handoff(
     workspace: &str,
     read_scope: &crate::Scope<String>,
     turn_start_head: Option<&str>,
+    capability_evidence: &capability_check::Evidence,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
 ) -> String {
     if let Some(slot) = end_reason {
@@ -5334,6 +5358,7 @@ fn readonly_completion_handoff(
         workspace,
         read_scope,
         turn_start_head,
+        capability_evidence,
         disclosure,
     )
 }
@@ -5949,8 +5974,10 @@ fn finalize_final_text(
     workspace: &str,
     read_scope: &crate::Scope<String>,
     turn_start_head: Option<&str>,
+    capability_evidence: &capability_check::Evidence,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
 ) -> String {
+    let text = capability_check::annotate_unobserved_probe(text, capability_evidence);
     let text = claim_check::annotate_against_workspace(text, workspace);
     let text = claim_check::annotate_action_claims(
         text,
@@ -6770,6 +6797,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    let mut capability_evidence = capability_check::Evidence::default();
+    let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop — see the comment there.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
@@ -7715,6 +7744,19 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
+            if let Some(nudge) = capability_evidence.correction(
+                &oa_content,
+                &tools,
+                &mut probe_correction_used,
+                tools_supported && round + 1 < current_tool_round_limit && !is_cancelled(cancel),
+            ) {
+                if let Some(harness) = smart_harness {
+                    harness.correct_answer(&oa_content, &nudge)?;
+                }
+                messages.push(serde_json::json!({"role":"assistant", "content":oa_content}));
+                messages.push(serde_json::json!({"role":"user", "content":nudge}));
+                continue 'round_loop;
+            }
             if let Some(harness) = smart_harness {
                 let more = round + 1 < current_tool_round_limit;
                 let control = harness
@@ -7756,6 +7798,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 harness.outcome(reason, &text)?;
@@ -7794,6 +7837,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -8097,6 +8141,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             return Ok((out, false, accumulated_usage, hallucination_count));
@@ -8395,6 +8440,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
+            capability_evidence.record(name, ok, execution.get().copied());
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -8502,6 +8548,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
+            &capability_evidence,
             disclosure,
         );
         harness.outcome(cap_reason, &text)?;
@@ -8559,6 +8606,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
+        &capability_evidence,
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
@@ -9272,6 +9320,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    let mut capability_evidence = capability_check::Evidence::default();
+    let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop.
     let action_turn = action_nudges && crate::classifiers::user_turn_invites_action(active_task);
@@ -9900,8 +9950,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
+            // Finalization can append evidence warnings or redact content;
+            // the live stream did not display that finalized answer.
+            let streamed = streamed && out == model_reply.text;
             return Ok((out, streamed, accumulated_usage, hallucination_count));
         }
 
@@ -10072,6 +10126,19 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
+            if let Some(nudge) = capability_evidence.correction(
+                &oa_content,
+                &tools,
+                &mut probe_correction_used,
+                tools_supported && round + 1 < current_tool_round_limit && !is_cancelled(cancel),
+            ) {
+                if let Some(harness) = smart_harness {
+                    harness.correct_answer(&oa_content, &nudge)?;
+                }
+                messages.push(serde_json::json!({"role":"assistant", "content":oa_content}));
+                messages.push(serde_json::json!({"role":"user", "content":nudge}));
+                continue 'round_loop;
+            }
             if let Some(harness) = smart_harness {
                 let more = round + 1 < current_tool_round_limit;
                 let control = harness
@@ -10113,6 +10180,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 harness.outcome(reason, &text)?;
@@ -10150,6 +10218,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -10425,8 +10494,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
+            let streamed = streamed && out == oa_content;
             return Ok((out, streamed, accumulated_usage, hallucination_count));
         }
 
@@ -10703,6 +10774,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
+            capability_evidence.record(name, ok, execution.get().copied());
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -10813,6 +10885,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
+            &capability_evidence,
             disclosure,
         );
         harness.outcome(cap_reason, &text)?;
@@ -10862,6 +10935,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
+        &capability_evidence,
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
@@ -11429,6 +11503,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    let mut capability_evidence = capability_check::Evidence::default();
+    let mut probe_correction_used = false;
     let mut readonly_completion_retried = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // Keep the same cap-exit evidence ledger as the three chat-shaped wires.
@@ -11800,6 +11876,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
         complete_responses_attempt(attempt.as_ref(), &json, &decoded);
+        let refused = matches!(
+            decoded,
+            Err(crate::responses_wire::ResponseDecodeError::Refused { .. })
+        );
         let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
@@ -11822,6 +11902,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -11862,6 +11943,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
+            if let Some(nudge) = capability_evidence.correction(
+                &text,
+                &tools_chat,
+                &mut probe_correction_used,
+                !refused && tools_supported && round + 1 < max_tool_rounds && !is_cancelled(cancel),
+            ) {
+                if let Some(harness) = smart_harness {
+                    harness.correct_answer(&text, &nudge)?;
+                }
+                input.extend(echo.clone());
+                input.push(serde_json::json!({"role":"assistant", "content":text}));
+                input.push(serde_json::json!({"role":"user", "content":nudge}));
+                continue;
+            }
             if let Some(harness) = smart_harness {
                 let more = round + 1 < max_tool_rounds;
                 let control = harness
@@ -11901,6 +11996,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 harness.outcome(reason, &text)?;
@@ -11927,6 +12023,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     workspace,
                     &caveats.fs_read,
                     turn_start_head.as_deref(),
+                    &capability_evidence,
                     disclosure,
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
@@ -11966,6 +12063,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             return Ok((text, false, accumulated_usage, hallucination_count));
@@ -12241,6 +12339,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
+            capability_evidence.record(name, ok, execution.get().copied());
             repeat_calls.record(name, &args, ok, &result, execution.get().copied());
             append_clean_build_warning(
                 if batch.is_some() {
@@ -12328,6 +12427,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
+            &capability_evidence,
             disclosure,
         );
         harness.outcome(cap_reason, &text)?;
@@ -12430,6 +12530,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
@@ -12482,6 +12583,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
@@ -12512,6 +12614,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
@@ -12534,6 +12637,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
+                &capability_evidence,
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
@@ -12554,6 +12658,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
+        &capability_evidence,
         disclosure,
     );
     if let Some(slot) = &mut end_reason {

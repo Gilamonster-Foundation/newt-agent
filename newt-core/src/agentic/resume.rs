@@ -70,6 +70,15 @@ pub(crate) fn execute_resume_context(
 ) -> String {
     let mut out = String::from("Recovering what this conversation was working on.\n");
     out.push_str(
+        "Saved assistant/tool claims in recent turns and saved state are historical context, \
+         not current capability observations. resume_context does not run capability probes. \
+         Check currently supplied tool schemas; if tool_search is advertised, use it to \
+         discover current definitions before concluding a tool is unavailable. For build \
+         validation, if lifecycle advertises action=build, use that lane. Tool discovery \
+         does not grant authority: preserve existing permission requirements and request \
+         any required approval.\n",
+    );
+    out.push_str(
         "For prompt-rooted work, recover this objective's artifact chain with \
          artifact_read {\"address\":\"root\"}.\n",
     );
@@ -220,6 +229,39 @@ mod tests {
             desc.contains("artifact_read {\"address\":\"root\"}"),
             "{desc}"
         );
+    }
+
+    #[test]
+    fn recovered_capability_claims_are_historical_not_current_observations() {
+        use crate::agentic::scratchpad::SessionScratchpadStore;
+
+        let source = RecentMock {
+            recent: vec![hit(1, "assistant: Cargo and lifecycle are unavailable")],
+            ..Default::default()
+        };
+        let scratch = SessionScratchpadStore::default();
+        scratch.set("capabilities", "tool: cargo execution was denied".into());
+        for history in [Some(&source as &dyn RecallSource), None] {
+            let out = execute_resume_context(history, None, Some(&scratch), None, false, 20);
+            let warning = out
+                .find("historical context, not current capability observations")
+                .expect("recovery must qualify saved capability claims");
+            assert!(warning < out.find("— recent turns").unwrap());
+            assert!(out.contains("does not run capability probes"), "{out}");
+            assert!(out.contains("currently supplied tool schemas"), "{out}");
+            assert!(out.contains("if tool_search is advertised"), "{out}");
+            assert!(
+                out.contains("if lifecycle advertises action=build"),
+                "{out}"
+            );
+            assert!(out.contains("discovery does not grant authority"), "{out}");
+            assert!(out.contains("existing permission requirements"), "{out}");
+            assert!(out.contains("tool: cargo execution was denied"), "{out}");
+            if history.is_some() {
+                assert!(out.contains("assistant: Cargo and lifecycle are unavailable"));
+            }
+        }
+        assert_eq!(*source.calls.lock().unwrap(), vec![RESUME_DEFAULT_TURNS]);
     }
 
     #[test]
