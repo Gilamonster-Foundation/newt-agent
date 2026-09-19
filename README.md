@@ -9,10 +9,9 @@ The default build contains no cloud provider; hosted providers are opt-in
 plugins added at build time.
 
 The operator grants each tool call a capability: what it may read, write,
-run, and reach on the network.
-[`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle)
-enforces the grant, in the kernel where the OS allows. The operator can narrow
-it before a run and audit it after.
+run, and reach on the network. The operator can narrow that grant before a run
+and audit it after. [`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle)
+enforces it, in the kernel where the OS allows.
 
 Confinement has a cost, so we measure it rather than describe it. We score each
 model on a fixed Terminal-Bench task set, with the grant enforced and without,
