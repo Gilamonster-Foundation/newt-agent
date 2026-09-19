@@ -110,6 +110,10 @@ pub struct TurnDriverConfig {
     pub api_key: Option<String>,
     /// Chat Completions extensions explicitly accepted by the endpoint.
     pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
+    /// Responses declarations captured from the same active capability decision.
+    pub responses_capability: crate::model_card::ResponsesCapability,
+    /// The typed wire choice captured with this context, never reread mid-turn.
+    pub openai_api: crate::OpenAiApi,
     /// Whether the active backend accepts replayed assistant reasoning.
     pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Whether the active model streams a lone leading `</think>` closer, so
@@ -199,6 +203,12 @@ impl TurnDriverConfig {
             kind,
             api_key: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: if super::responses_api_selected() {
+                crate::OpenAiApi::Responses
+            } else {
+                crate::OpenAiApi::ChatCompletions
+            },
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             workspace: workspace.into(),
@@ -314,6 +324,11 @@ pub struct TurnOutcome {
     pub was_streamed: bool,
     /// `reply` is harness-written text, not the model's claim (#2372).
     pub harness_reply: bool,
+    /// Semantic intent captured by this turn, independent of supported wire fields.
+    pub semantic_cognition: Option<crate::role_profile::Cognition>,
+    /// Captured admitted Responses declaration and actual wire effort.
+    pub responses_capability: Option<crate::model_card::ResponsesCapability>,
+    pub reasoning_effort: Option<crate::model_card::ReasoningEffort>,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
     /// What this turn sent and generated, summed per inference attempt, with
@@ -336,7 +351,7 @@ pub enum TurnStatus {
     Running,
     /// A turn finished successfully. Returned **once**; the reply has already
     /// been appended to the transcript as an assistant message.
-    Completed(TurnOutcome),
+    Completed(Box<TurnOutcome>),
     /// A turn failed (transport error, dispatch error, …). Returned **once**.
     Failed(String),
 }
@@ -424,7 +439,7 @@ impl TurnDriver {
         self.in_flight.is_some()
     }
 
-    /// Pin the cognition projection used by every turn this driver submits.
+    /// Pin the semantic cognition used by every turn this driver submits.
     /// The default is captured from the process posture when the driver is
     /// constructed, before its dedicated turn thread is spawned.
     #[must_use]
@@ -565,7 +580,7 @@ impl TurnDriver {
                 self.transcript
                     .push(MemMessage::assistant(outcome.reply.clone()));
                 self.in_flight = None;
-                TurnStatus::Completed(outcome)
+                TurnStatus::Completed(Box::new(outcome))
             }
             Ok(Err(err)) => {
                 self.in_flight = None;
@@ -608,10 +623,11 @@ async fn run_one_turn(
     messages: &[MemMessage],
     task: &str,
 ) -> Result<TurnOutcome, String> {
-    // Freeze every lazy `effective_tenacity()` / `effective_initiative()` read
+    // Freeze every lazy cognition, tenacity, and initiative read
     // beneath `chat_complete` (workflow state and exit_plan_mode included) to
     // the posture captured by this driver. The current-thread runtime keeps
     // these RAII TLS guards on the dedicated turn thread for the entire future.
+    let _cognition = crate::cognition::scoped_effective_cognition(runtime.cognition);
     let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
     let _initiative = crate::initiative::scoped_effective_initiative(runtime.initiative);
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
@@ -715,10 +731,17 @@ async fn run_one_turn(
         caveats: &config.caveats,
         // Headless cowork carries no persona surface (FR-1 part 2, #997). The
         // driver captured the effective cognition before spawning this thread,
-        // keeping the wire posture and contract observation identical.
+        // preserving semantic intent independently of supported wire controls.
         persona_tools: None,
-        cognition: runtime.cognition,
+        cognition: super::projected_cognition(
+            runtime.cognition,
+            config.kind,
+            config.openai_api,
+            config.chat_completions_capability,
+        ),
         chat_completions_capability: config.chat_completions_capability,
+        responses_capability: config.responses_capability.clone(),
+        openai_api: config.openai_api,
         output_allowance: config.output_allowance,
         attempt_ledger: Some(&attempt_ledger),
         reasoning_replay_scope: config.reasoning_replay_scope,
@@ -783,8 +806,7 @@ async fn run_one_turn(
     // that wants live MCP tools assembles its own ChatCtx.
     let mut mcp = NoMcp;
     // ONE dispatch owner. `chat_complete` routes openai-vs-ollama AND, for an
-    // openai backend, responses-vs-chat (`api = "responses"`, surfaced via
-    // NEWT_OPENAI_API). The headless driver goes through the SAME entry the
+    // openai backend, responses-vs-chat from the captured typed API. The headless driver goes through the SAME entry the
     // interactive TUI does, so the wire-format decision lives in exactly one
     // place and cannot drift. (This path used to fork its own `if kind==Openai`
     // branch that called `openai_chat_complete` directly, bypassing the
@@ -816,6 +838,9 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             features,
+            semantic_cognition: runtime.cognition,
+            responses_capability: solve_obs.responses_capability,
+            reasoning_effort: solve_obs.reasoning_effort,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
             attempts,
@@ -840,6 +865,9 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             features,
+            semantic_cognition: runtime.cognition,
+            responses_capability: solve_obs.responses_capability,
+            reasoning_effort: solve_obs.reasoning_effort,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
             attempts,
@@ -862,6 +890,8 @@ mod calibration_tests;
 
 #[cfg(test)]
 mod tests {
+    include!("driver_cognition_tests.rs");
+    include!("driver_cognition_wire_tests.rs");
     use super::*;
     use crate::agentic::SessionSemanticIndex;
     use crate::caveats::{Caveats, CountBound, Scope};
@@ -1171,7 +1201,7 @@ mod tests {
             panic!("the captured turn did not complete");
         };
         let out = bodies.lock().unwrap().clone();
-        (out, outcome)
+        (out, *outcome)
     }
 
     /// #1280: the headless driver advertises `code_search` **iff** the config
@@ -1342,7 +1372,7 @@ mod tests {
                 "the head is ephemeral: it never enters the driver transcript"
             );
             let bodies = bodies.lock().unwrap().clone();
-            (bodies, outcome)
+            (bodies, *outcome)
         }
 
         let store = Arc::new(SessionScratchpadStore::default());
