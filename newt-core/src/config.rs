@@ -220,6 +220,9 @@ pub struct Config {
     /// [`crate::initiative::InitiativeConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<crate::initiative::InitiativeConfig>,
+    /// Versioned pursuit defaults; automatic levels never lift tool-round caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenacity: Option<crate::tenacity::TenacityConfig>,
 
     /// `[tool_exposure]` — the progressive tool-schema controller (Pass 1).
     /// `None` → [`ExposureProfile::Full`] (identity; advertise the full
@@ -1339,6 +1342,7 @@ impl Default for Config {
             context: None,
             tools: None,
             initiative: None,
+            tenacity: None,
             tool_exposure: None,
             pricing: None,
             memory: None,
@@ -1381,7 +1385,17 @@ impl Config {
     /// is translated in memory with a warning.
     fn read_text(path: &Path) -> Result<String> {
         let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
-        Ok(crate::psyche_import::read_config_file(path, own)?)
+        let text = crate::psyche_import::read_config_file(path, own)?;
+        // Validate each source before merging: a project overlay must not hide
+        // an unsupported format version in the operator's base config.
+        #[derive(Deserialize)]
+        struct PsycheFormat {
+            #[serde(default, rename = "tenacity")]
+            _tenacity: Option<crate::tenacity::TenacityConfig>,
+        }
+        toml::from_str::<PsycheFormat>(&text)
+            .map_err(|error| NewtError::Config(error.to_string()))?;
+        Ok(text)
     }
 
     /// Resolve configuration by searching well-known locations, then layering a
@@ -1686,6 +1700,7 @@ impl Config {
     /// copies resolved values into process-global slots, it never edits the
     /// config.
     pub fn publish_runtime_settings(&self) {
+        crate::tenacity::set_tenacity_config(self.tenacity.clone().unwrap_or_default());
         // #726: push the resolved `[tools] max_output_tokens` into the
         // process-wide model-facing output budget without threading a new
         // `usize` through `ChatCtx` + `execute_tool` + every call site.
@@ -2220,3 +2235,7 @@ mod tests;
 mod select_backend_tests;
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 21:30 EDT | Date: 2026-08-12
+
+#[cfg(test)]
+#[path = "config_tests/resolute.rs"]
+mod resolute_tests;
