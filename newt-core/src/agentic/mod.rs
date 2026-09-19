@@ -2083,16 +2083,24 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
-    let result_aware = self_verify::enabled() && verify_outcomes;
+    let verification_policy =
+        self_verify::VerificationPolicy::capture(prompt_disposition, verify_outcomes);
+    let smart_verify = verification_policy.gate_on(smart_verify);
+    let result_aware = verification_policy.result_aware;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
-    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let verification_gate =
+        verification_policy.required || (smart_harness.is_some() && smart_verify);
+    if let Some(obs) = solve_obs.as_deref_mut() {
+        obs.verification = Some(verification_policy.receipt(verification_gate));
+    }
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
-        result_aware,
+        verification_policy,
         workspace,
-        action_nudges || (smart_harness.is_some() && smart_verify),
+        verification_gate,
     )
     .await;
+    let mut verification_nudges: usize = 0;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -3082,6 +3090,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            cancel,
                             messages: &messages,
                             workspace,
                             task,
@@ -3653,6 +3662,63 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 return Ok((msg.to_string(), false, merged, hallucination_count));
             }
             maybe_nudge_no_tool_content!(probe_content.as_str(), None);
+            // Resolute uses the same result ledger and bounded allowance on this wire.
+            let probe_content = if verification.required() {
+                if is_cancelled(cancel) {
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
+                }
+                let (decision, report) = self_verify::conclude_turn(
+                    self_verify::Concluding {
+                        cancel,
+                        messages: &messages,
+                        workspace,
+                        task,
+                        rounds_left: round + 1 < current_tool_round_limit,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    verification_nudges,
+                )
+                .await;
+                match decision {
+                    self_verify::Decision::Nudge(nudge) => {
+                        messages
+                            .push(serde_json::json!({"role":"assistant", "content":probe_content}));
+                        messages.push(serde_json::json!({"role":"user", "content":format!("{} {nudge}", compress::LOOP_GUIDANCE_PREFIX)}));
+                        verification_nudges += 1;
+                        continue 'round_loop;
+                    }
+                    self_verify::Decision::Stop(crate::TurnEndReason::Cancelled) => {
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ));
+                    }
+                    self_verify::Decision::Stop(reason) => {
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(reason);
+                        }
+                        self_verify::incomplete_answer(&probe_content, &report)
+                    }
+                    self_verify::Decision::Accept => {
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(crate::TurnEndReason::Completed);
+                        }
+                        probe_content
+                    }
+                }
+            } else {
+                probe_content
+            };
+
             // Phase 20 §2.2: non-empty probe content is usable output.
             emit_accepted(
                 &mut on_round_usage,
@@ -4010,7 +4076,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // summary reflects progress and the fallback advice is honest.
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification
+    let (cap_reason, cap_report) = verification
         .cap_exit_reason(
             workspace,
             smart_harness.is_some() && smart_verify,
@@ -4018,6 +4084,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if is_cancelled(cancel) {
+        return Ok((
+            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+            false,
+            accumulated_usage,
+            hallucination_count,
+        ));
+    }
+
     if let Some(hit) = &mut round_cap_hit {
         **hit = true;
     }
@@ -4030,7 +4105,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             progress.as_deref(),
         );
         let text = finalize_final_text(
-            text,
+            self_verify::cap_answer(text, cap_report.as_ref()),
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
@@ -4069,7 +4144,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         cw_retries + 1,
     )?;
     let text = finalize_final_text(
-        text,
+        self_verify::cap_answer(text, cap_report.as_ref()),
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
@@ -4078,7 +4153,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);
     }
-    Ok((text, streamed, usage, hallucination_count))
+    Ok((
+        text,
+        streamed && !verification.required(),
+        usage,
+        hallucination_count,
+    ))
 }
 
 /// Returns `true` when `name` is a tool that doesn't modify the workspace.
@@ -6651,14 +6731,21 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
-    let result_aware = self_verify::enabled() && verify_outcomes;
+    let verification_policy =
+        self_verify::VerificationPolicy::capture(prompt_disposition, verify_outcomes);
+    let smart_verify = verification_policy.gate_on(smart_verify);
+    let result_aware = verification_policy.result_aware;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
-    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let verification_gate =
+        verification_policy.required || action_nudges || (smart_harness.is_some() && smart_verify);
+    if let Some(obs) = solve_obs.as_deref_mut() {
+        obs.verification = Some(verification_policy.receipt(verification_gate));
+    }
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
-        result_aware,
+        verification_policy,
         workspace,
-        action_nudges || (smart_harness.is_some() && smart_verify),
+        verification_gate,
     )
     .await;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
@@ -7719,6 +7806,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            cancel,
                             messages: &messages,
                             workspace,
                             task,
@@ -7768,7 +7856,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
-            let content = oa_content.clone();
+            let mut content = oa_content.clone();
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
             {
@@ -7969,9 +8057,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // #2315: in the opt-in result-aware mode the same position decides
             // from observed outcomes instead (A12: one decision, three callers).
             let mut verification_stop = None;
-            if verification.result_aware() && action_nudges && !content.is_empty() {
+            if verification.result_aware()
+                && verification_policy.gate_on(action_nudges)
+                && !content.is_empty()
+            {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
+                        cancel,
                         messages: &messages,
                         workspace,
                         task: active_task,
@@ -7984,7 +8076,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 )
                 .await
                 {
-                    self_verify::Decision::Nudge(nudge) => {
+                    (self_verify::Decision::Nudge(nudge), _) => {
                         strip_trailing_nudge_exchange(&mut messages);
                         messages
                             .push(serde_json::json!({ "role": "assistant", "content": content }));
@@ -7995,10 +8087,23 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         verification_nudges += 1;
                         continue 'round_loop;
                     }
-                    self_verify::Decision::Stop(reason) => verification_stop = Some(reason),
-                    self_verify::Decision::Accept => {}
+                    (self_verify::Decision::Stop(crate::TurnEndReason::Cancelled), _) => {
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ));
+                    }
+                    (self_verify::Decision::Stop(reason), report) => {
+                        if verification.required() {
+                            content = self_verify::incomplete_answer(&content, &report);
+                        }
+                        verification_stop = Some(reason);
+                    }
+                    (self_verify::Decision::Accept, _) => {}
                 }
-            } else if self_verify::enabled()
+            } else if verification.gate_enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
@@ -8469,7 +8574,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification
+    let (cap_reason, cap_report) = verification
         .cap_exit_reason(
             workspace,
             if smart_harness.is_some() {
@@ -8481,6 +8586,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if is_cancelled(cancel) {
+        return Ok((
+            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+            false,
+            accumulated_usage,
+            hallucination_count,
+        ));
+    }
+
     if let Some(hit) = &mut round_cap_hit {
         **hit = true;
     }
@@ -8493,7 +8607,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             progress.as_deref(),
         );
         let text = finalize_final_text(
-            text,
+            self_verify::cap_answer(text, cap_report.as_ref()),
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
@@ -8550,7 +8664,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         cw_retries + 1,
     )?;
     let text = finalize_final_text(
-        text,
+        self_verify::cap_answer(text, cap_report.as_ref()),
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
@@ -8559,7 +8673,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);
     }
-    Ok((text, streamed, usage, hallucination_count))
+    Ok((
+        text,
+        streamed && !verification.required(),
+        usage,
+        hallucination_count,
+    ))
 }
 
 // ── Anthropic Messages API (`POST /v1/messages`) ───────────────────────────
@@ -9165,14 +9284,21 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
-    let result_aware = self_verify::enabled() && verify_outcomes;
+    let verification_policy =
+        self_verify::VerificationPolicy::capture(prompt_disposition, verify_outcomes);
+    let smart_verify = verification_policy.gate_on(smart_verify);
+    let result_aware = verification_policy.result_aware;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
-    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let verification_gate =
+        verification_policy.required || action_nudges || (smart_harness.is_some() && smart_verify);
+    if let Some(obs) = solve_obs.as_deref_mut() {
+        obs.verification = Some(verification_policy.receipt(verification_gate));
+    }
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
-        result_aware,
+        verification_policy,
         workspace,
-        action_nudges || (smart_harness.is_some() && smart_verify),
+        verification_gate,
     )
     .await;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
@@ -9871,6 +9997,41 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // refusal gets an honest placeholder. No rescue nudges: nudging a
         // refusal toward action would fight the provider's decline.
         if model_reply.stop_reason.as_deref() == Some("refusal") {
+            if verification.required() {
+                let answer = if model_reply.text.is_empty() {
+                    "the model declined this request (refusal)"
+                } else {
+                    model_reply.text.as_str()
+                };
+                let (out, reason) = self_verify::refusal_answer(
+                    self_verify::Concluding {
+                        cancel,
+                        messages: &messages,
+                        workspace,
+                        task,
+                        rounds_left: false,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    answer,
+                )
+                .await;
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(reason);
+                }
+                if let Some(harness) = smart_harness {
+                    harness.outcome(reason, &out)?;
+                }
+                let out = finalize_final_text(
+                    out,
+                    workspace,
+                    &caveats.fs_read,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
             if !model_reply.text.is_empty() {
                 emit_accepted(
                     &mut on_round_usage,
@@ -10076,6 +10237,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            cancel,
                             messages: &messages,
                             workspace,
                             task,
@@ -10124,7 +10286,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
-            let content = oa_content.clone();
+            let mut content = oa_content.clone();
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
             {
@@ -10312,9 +10474,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // #2315: in the opt-in result-aware mode the same position decides
             // from observed outcomes instead (A12: one decision, three callers).
             let mut verification_stop = None;
-            if verification.result_aware() && action_nudges && !content.is_empty() {
+            if verification.result_aware()
+                && verification_policy.gate_on(action_nudges)
+                && !content.is_empty()
+            {
                 match self_verify::conclude_turn(
                     self_verify::Concluding {
+                        cancel,
                         messages: &messages,
                         workspace,
                         task: active_task,
@@ -10327,7 +10493,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 )
                 .await
                 {
-                    self_verify::Decision::Nudge(nudge) => {
+                    (self_verify::Decision::Nudge(nudge), _) => {
                         strip_trailing_nudge_exchange(&mut messages);
                         messages
                             .push(serde_json::json!({ "role": "assistant", "content": content }));
@@ -10338,10 +10504,23 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         verification_nudges += 1;
                         continue 'round_loop;
                     }
-                    self_verify::Decision::Stop(reason) => verification_stop = Some(reason),
-                    self_verify::Decision::Accept => {}
+                    (self_verify::Decision::Stop(crate::TurnEndReason::Cancelled), _) => {
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ));
+                    }
+                    (self_verify::Decision::Stop(reason), report) => {
+                        if verification.required() {
+                            content = self_verify::incomplete_answer(&content, &report);
+                        }
+                        verification_stop = Some(reason);
+                    }
+                    (self_verify::Decision::Accept, _) => {}
                 }
-            } else if self_verify::enabled()
+            } else if verification.gate_enabled()
                 && action_nudges
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
@@ -10407,7 +10586,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             // The streamed flag is true iff THIS round's SSE already printed
             // the accepted text live (so the TUI doesn't re-print).
-            let streamed = printed_live && !content.is_empty();
+            let streamed = printed_live
+                && !content.is_empty()
+                && !(verification.required() && verification_stop.is_some());
             if content.is_empty() {
                 let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
                 observability::observe_harness_reply(&mut solve_obs);
@@ -10780,7 +10961,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification
+    let (cap_reason, cap_report) = verification
         .cap_exit_reason(
             workspace,
             if smart_harness.is_some() {
@@ -10792,6 +10973,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if is_cancelled(cancel) {
+        return Ok((
+            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+            false,
+            accumulated_usage,
+            hallucination_count,
+        ));
+    }
+
     if let Some(hit) = &mut round_cap_hit {
         **hit = true;
     }
@@ -10804,7 +10994,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             progress.as_deref(),
         );
         let text = finalize_final_text(
-            text,
+            self_verify::cap_answer(text, cap_report.as_ref()),
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
@@ -10853,7 +11043,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         cw_retries + 1,
     )?;
     let text = finalize_final_text(
-        text,
+        self_verify::cap_answer(text, cap_report.as_ref()),
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
@@ -10862,7 +11052,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     if let Some(slot) = &mut end_reason {
         **slot = Some(cap_reason);
     }
-    Ok((text, streamed, usage, hallucination_count))
+    Ok((
+        text,
+        streamed && !verification.required(),
+        usage,
+        hallucination_count,
+    ))
 }
 
 // ── OpenAI Responses API (`POST /v1/responses`) ────────────────────────────
@@ -11407,16 +11602,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
-    let result_aware = self_verify::enabled() && verify_outcomes;
+    let verification_policy =
+        self_verify::VerificationPolicy::capture(prompt_disposition, verify_outcomes);
+    let smart_verify = verification_policy.gate_on(smart_verify);
+    let result_aware = verification_policy.result_aware;
     let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
-    // #2315: what each check actually did, fed at the per-tool-result funnel.
+    let verification_gate =
+        verification_policy.required || (smart_harness.is_some() && smart_verify);
+    if let Some(obs) = solve_obs.as_deref_mut() {
+        obs.verification = Some(verification_policy.receipt(verification_gate));
+    }
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
-        result_aware,
+        verification_policy,
         workspace,
-        action_nudges || (smart_harness.is_some() && smart_verify),
+        verification_gate,
     )
     .await;
+    let mut verification_nudges: usize = 0;
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -11798,7 +12001,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
-                if smart_harness.is_some() =>
+                if smart_harness.is_some() && !verification.required() =>
             {
                 crate::responses_wire::DecodedResponse {
                     text: message,
@@ -11810,6 +12013,36 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
                 accumulated_usage = merge_round_usage(accumulated_usage, usage);
+                if verification.required() {
+                    let (out, reason) = self_verify::refusal_answer(
+                        self_verify::Concluding {
+                            cancel,
+                            messages: &input,
+                            workspace,
+                            task,
+                            rounds_left: false,
+                            round,
+                            ledger: &verification,
+                            solve_obs: solve_obs.as_deref_mut(),
+                        },
+                        &format!("(the model refused the request) {message}"),
+                    )
+                    .await;
+                    if let Some(slot) = &mut end_reason {
+                        **slot = Some(reason);
+                    }
+                    if let Some(harness) = smart_harness {
+                        harness.outcome(reason, &out)?;
+                    }
+                    let out = finalize_final_text(
+                        out,
+                        workspace,
+                        &caveats.fs_read,
+                        turn_start_head.as_deref(),
+                        disclosure,
+                    );
+                    return Ok((out, false, accumulated_usage, hallucination_count));
+                }
                 // #1964: this normal (non-cap) finish gets the same claim
                 // check + disclosure gate as a cap-exit summary.
                 let out = finalize_final_text(
@@ -11866,6 +12099,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     .verify_answer(
                         control,
                         self_verify::Concluding {
+                            cancel,
                             messages: &input,
                             workspace,
                             task,
@@ -11952,6 +12186,63 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 unverified_exec_blocker_nudges += 1;
                 continue;
             }
+            // Resolute uses the same result ledger and bounded allowance on this wire.
+            let text = if verification.required() {
+                if is_cancelled(cancel) {
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
+                }
+                let (decision, report) = self_verify::conclude_turn(
+                    self_verify::Concluding {
+                        cancel,
+                        messages: &input,
+                        workspace,
+                        task,
+                        rounds_left: round + 1 < max_tool_rounds,
+                        round,
+                        ledger: &verification,
+                        solve_obs: solve_obs.as_deref_mut(),
+                    },
+                    verification_nudges,
+                )
+                .await;
+                match decision {
+                    self_verify::Decision::Nudge(nudge) => {
+                        input.extend(echo.clone());
+                        input.push(serde_json::json!({"role":"assistant", "content":text}));
+                        input.push(serde_json::json!({"role":"user", "content":format!("{} {nudge}", compress::LOOP_GUIDANCE_PREFIX)}));
+                        verification_nudges += 1;
+                        continue;
+                    }
+                    self_verify::Decision::Stop(crate::TurnEndReason::Cancelled) => {
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ));
+                    }
+                    self_verify::Decision::Stop(reason) => {
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(reason);
+                        }
+                        self_verify::incomplete_answer(&text, &report)
+                    }
+                    self_verify::Decision::Accept => {
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(crate::TurnEndReason::Completed);
+                        }
+                        text
+                    }
+                }
+            } else {
+                text
+            };
+
             // The decoder guarantees affirmative output here (text or calls); with
             // no calls, `text` is non-empty — return it as the turn's answer.
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -12299,7 +12590,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let cap_accumulated = accumulated_usage;
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification
+    let (cap_reason, cap_report) = verification
         .cap_exit_reason(
             workspace,
             smart_harness.is_some() && smart_verify,
@@ -12307,6 +12598,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             solve_obs.as_deref_mut(),
         )
         .await;
+    if is_cancelled(cancel) {
+        return Ok((
+            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+            false,
+            accumulated_usage,
+            hallucination_count,
+        ));
+    }
+
     if let Some(hit) = &mut round_cap_hit {
         **hit = true;
     }
@@ -12319,7 +12619,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             progress.as_deref(),
         );
         let text = finalize_final_text(
-            text,
+            self_verify::cap_answer(text, cap_report.as_ref()),
             workspace,
             &caveats.fs_read,
             turn_start_head.as_deref(),
@@ -12416,11 +12716,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 "Responses cap-exit summary validation failed; returning captured progress"
             );
             let text = finalize_final_text(
-                cap_exit_fallback(
-                    max_tool_rounds,
-                    cap_accumulated,
-                    repeat_calls.total_failures(),
-                    progress.as_deref(),
+                self_verify::cap_answer(
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        cap_accumulated,
+                        repeat_calls.total_failures(),
+                        progress.as_deref(),
+                    ),
+                    cap_report.as_ref(),
                 ),
                 workspace,
                 &caveats.fs_read,
@@ -12468,11 +12771,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 "Responses cap-exit summary dispatch failed; returning captured progress"
             );
             let text = finalize_final_text(
-                cap_exit_fallback(
-                    max_tool_rounds,
-                    cap_accumulated,
-                    repeat_calls.total_failures(),
-                    progress.as_deref(),
+                self_verify::cap_answer(
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        cap_accumulated,
+                        repeat_calls.total_failures(),
+                        progress.as_deref(),
+                    ),
+                    cap_report.as_ref(),
                 ),
                 workspace,
                 &caveats.fs_read,
@@ -12503,7 +12809,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 progress.as_deref(),
             );
             let text = finalize_final_text(
-                text,
+                self_verify::cap_answer(text, cap_report.as_ref()),
                 workspace,
                 &caveats.fs_read,
                 turn_start_head.as_deref(),
@@ -12520,11 +12826,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 "Responses cap-exit summary decode failed; returning captured progress"
             );
             let text = finalize_final_text(
-                cap_exit_fallback(
-                    max_tool_rounds,
-                    cap_accumulated,
-                    repeat_calls.total_failures(),
-                    progress.as_deref(),
+                self_verify::cap_answer(
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        cap_accumulated,
+                        repeat_calls.total_failures(),
+                        progress.as_deref(),
+                    ),
+                    cap_report.as_ref(),
                 ),
                 workspace,
                 &caveats.fs_read,
@@ -12545,7 +12854,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         progress.as_deref(),
     );
     let text = finalize_final_text(
-        text,
+        self_verify::cap_answer(text, cap_report.as_ref()),
         workspace,
         &caveats.fs_read,
         turn_start_head.as_deref(),
