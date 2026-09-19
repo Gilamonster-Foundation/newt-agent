@@ -546,9 +546,9 @@ pub(crate) struct TurnBinding {
 ///   resolves on a later round — while still taking effect on the next turn,
 ///   because the binding is dropped in between.
 ///
-/// Call at the turn-dispatch boundary, beside the OCAP disclosure guard which
-/// is already scoped exactly this way. Do NOT hoist it to session start: see
-/// the module docs for what each of those breaks.
+/// Call at the accepted-turn boundary, before reading any psyche-dependent
+/// wire or technique selection. Hold through setup and dispatch; the later OCAP
+/// disclosure guard shares its turn lifetime. Do NOT hoist to session start.
 ///
 /// The OCAP disclosure guard is NOT installed here — it needs the turn's
 /// resolved provider secret, which this module deliberately never sees.
