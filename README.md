@@ -5,8 +5,7 @@
 </p>
 
 Newt is an experimental agentic coder in Rust, built for local models first.
-Hosted models work too, through opt-in provider plugins; the default build
-ships only local backends.
+Hosted providers are a choice in `newt setup`, never the default.
 
 The operator grants each tool call a capability: what it may read, write,
 run, and reach on the network. The operator can narrow that grant before a run
