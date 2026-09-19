@@ -17,8 +17,8 @@ drifted.
   correct small models that read and never act. That is harness tuning for a
   model's habit, not an operator's wish, yet it shows up as the operator's
   tenacity.
-- **"Obsessive" names a person, not a behaviour.** It is also the only name
-  for the max-everything posture.
+- **The max-everything posture has no off switch.** `--obsessive` and
+  `/psyche obsessive` turn it on; nothing restores the dials it replaced.
 
 ## The design
 
