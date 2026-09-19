@@ -318,11 +318,11 @@ bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE *FLAGS:
 bench-gate MODEL RUN_DIR *FLAGS:
     python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --run-dir {{RUN_DIR}} {{FLAGS}}
 
-# The README carries MEASURED models only (`--no-queued`) — the scoreboard is
+# docs/terminal-bench.md carries MEASURED models only (`--no-queued`) — the scoreboard is
 # the bragging right, not the to-do list. The full roster-tracking table, with
 # queued models and per-run provenance, is published by gilamonster-bench.
 bench-publish:
-    python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued
+    python3 scripts/eval/bench_scoreboard.py render --readme docs/terminal-bench.md --no-queued
 
 # Offline eval-ingestion self-tests (#2316): fixture Harbor runs through
 # parse_run and cross-tab.py. Stdlib Python, well under a second. The ratchet

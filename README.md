@@ -4,92 +4,42 @@
   <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
-> **Experimental agentic coder**, written in Rust. Local-first: the default
-> build ships no cloud provider. The scoreboard below is the claim.
+Newt is an experimental agentic coder in Rust, built for local models first.
+Hosted providers are also available through `newt setup`.
 
-## Terminal-Bench
+The operator grants each tool call a capability: what it may read, write,
+run, and reach on the network. The operator can narrow that grant before a run
+and audit it after. [`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle)
+enforces it, in the kernel where the OS allows.
 
-Measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
-via `newt headless` and the Harbor adapter, confined (**OCAP on**) and unconfined
-(**OCAP off**). Each lane is a per-model monotonic ratchet: a score never goes
-down across releases.
+Confinement has a cost, so we measure it rather than describe it. We score each
+model on a fixed Terminal-Bench task set, with the grant enforced and without,
+and no release may lower a score: [Terminal-Bench scoreboard](./docs/terminal-bench.md).
 
-<!-- BENCH-SCOREBOARD:START -->
-_Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do not edit by hand._
-
-| Model | OCAP off | OCAP on |
-|-------|----------|---------|
-| `deepseek-v4-pro`<br><sub>deepseek · tb-30 · ctx 65536 · v0.8.0 · 2026-08-06</sub> | 56.7% (17/30) | 50.0% (15/30) |
-| `nemotron-3-super`<br><sub>nemotron · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 36.7% (11/30) | 26.7% (8/30) |
-| `ornith-1.0-35b-q8`<br><sub>ornith · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | _pending_ | 36.7% (11/30) |
-| `qwen3.6_35b`<br><sub>qwen · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | 20.0% (6/30) | 26.7% (8/30) |
-| `o4-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 13.3% (4/30) | 16.7% (5/30) |
-| `qwen3-coder_30b`<br><sub>qwen · tb-30 · ctx 65536 · v0.7.6 · 2026-07-29</sub> | 10.0% (3/30) | 13.3% (4/30) |
-| `gpt-oss_120b`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 10.0% (3/30) | 10.0% (3/30) |
-| `kimi-linear_48b`<br><sub>kimi · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 10.0% (3/30) |
-| `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
-| `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
-| `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 0.0% (0/30) | 3.3% (1/30) |
-| `kimi-k2.7-code`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
-| `nemotron-3-ultra`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `ornith-1.0-397b-iq1_m`<br><sub>ornith · queued</sub> | _queued_ | _queued_ |
-
-<!-- BENCH-SCOREBOARD:END -->
-
-Evidence, provenance, rejected runs, and the scoring rules live in
-[`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard),
-an instrument with no dependency on Newt. If the ruler shipped with the thing
-it measures, one commit could move both at once.
-
-## Use Newt
+## Install
 
 ```bash
 git clone https://github.com/Gilamonster-Foundation/newt-agent
 cd newt-agent
-just install   # → ~/bin/newt, ~/bin/newt-mcp-server
-newt           # first run opens the setup wizard, then the TUI coder
+just install
+newt
 ```
 
-`newt --help` is the authority on the binary's surface; this file is not.
-The HTMX web cockpit is a separately built binary: `just install-web`, then
-`newt web` ([`newt-web/`](./newt-web/README.md)).
+The first run opens a setup wizard. `newt --help` is the authority on what the
+binary does; this file is not.
 
-## Why Newt
+## Read next
 
-A *harness* helps the model work; a **bridle** lets the operator steer, and
-prove afterwards exactly where the horse went. Newt is an experiment in making
-Object Capability (OCAP) security pragmatic inside an agent loop, as a reusable
-component ([`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle))
-other harnesses can adopt. Who acted, on what, under whose grant, and whether
-*only* what was permitted happened then become properties of the system, not
-promises in a policy document. Long form: [`docs/vision.md`](./docs/vision.md).
-
-## Design laws
-
-Seven invariants, each argued in a decision record:
-[`docs/design-laws.md`](./docs/design-laws.md). Local-first inference;
-fail-closed OCAP; small crates, zero warnings, coverage-gated; patch, not
-prose; skills are on-demand context; issues are ground truth; causal
-ordering, not wall-clock.
-
-## Where things live
-
-| What | Where |
+| Topic | Where |
 |---|---|
-| Setup, discovery, credentials | [`docs/guide/setup.md`](./docs/guide/setup.md) |
-| Hosted providers and Hermes import | [`docs/provider-presets.md`](./docs/provider-presets.md) |
-| Terminal UI and its walkthroughs | [`newt-tui/README.md`](./newt-tui/README.md), [`demos/README.md`](./demos/README.md) |
-| Python bindings | [`newt-agent-py/README.md`](./newt-agent-py/README.md) |
-| Cloud-provider plugin protocol | [`plugins-protocol/`](./plugins-protocol/README.md) |
-| Smart harness (adjudication, frames, forensics) | [`docs/guide/smart-harness.md`](./docs/guide/smart-harness.md) |
-| Derivation kernel and recorded sessions | [`agent-frame/`](./agent-frame/README.md), [`agent-harness/`](./agent-harness/README.md), [`agent-harness-py/`](./agent-harness-py/README.md) |
-| Evaluation harness | [`newt-eval/README.md`](./newt-eval/README.md) |
-| Terminal-Bench runner | [`scripts/eval/harbor/README.md`](./scripts/eval/harbor/README.md) |
-| Benchmark evidence | [`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard) |
+| Why Newt exists | [`docs/vision.md`](./docs/vision.md) |
+| The invariants it keeps | [`docs/design-laws.md`](./docs/design-laws.md) |
+| Setup and backends | [`docs/guide/setup.md`](./docs/guide/setup.md) |
+| Confinement and `--full-access` | [`docs/guide/full-access.md`](./docs/guide/full-access.md) |
+| Benchmarks | [`docs/terminal-bench.md`](./docs/terminal-bench.md) |
+| Decisions | [`docs/decisions/`](./docs/decisions/) |
 | What changed | [`CHANGELOG.md`](./CHANGELOG.md) |
-| Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue state is authoritative) |
-| Design docs, decisions, field notes | [`docs/design/`](./docs/design/), [`docs/decisions/`](./docs/decisions/), [`docs/notes/`](./docs/notes/README.md) |
-| Local gate | `just check` (see [`justfile`](./justfile)) |
+| Contributing | [`AGENTS.md`](./AGENTS.md) — `just check` runs the CI gates locally |
 
 ## License
 

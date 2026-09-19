@@ -23,7 +23,7 @@ Four jobs, one durable record:
           trial store beside the manifest (``x.jsonl`` -> ``x.trials.jsonl``).
   parity  --model M [--tolerance T]   fail (exit 3) if OCAP-on trails OCAP-off by
                                     more than T; exit 2 while a lane is unmeasured.
-  render  --readme README.md        rewrite the scoreboard (each model's off/on
+  render  --readme docs/terminal-bench.md  rewrite the scoreboard (each model's off/on
                                     champions + parity Δ) between the README markers.
                                     ``--no-queued`` trims never-run roster rows for
                                     the README; the full roster-tracking table is
@@ -723,8 +723,8 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--manifest", default=MANIFEST_DEFAULT)
     pp.set_defaults(fn=_cmd_parity)
 
-    pr = sub.add_parser("render", help="rewrite the README scoreboard table")
-    pr.add_argument("--readme", default="README.md")
+    pr = sub.add_parser("render", help="rewrite the scoreboard table in docs/terminal-bench.md")
+    pr.add_argument("--readme", default="docs/terminal-bench.md")
     pr.add_argument("--manifest", default=MANIFEST_DEFAULT)
     pr.add_argument("--roster", default=ROSTER_DEFAULT)
     pr.add_argument(
