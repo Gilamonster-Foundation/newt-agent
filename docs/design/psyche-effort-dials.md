@@ -55,8 +55,16 @@ either one without touching cognition.
 | resolute | Also refuses to report done until a check passes — a test run or other verification, not only the cited-path check [`claim_check.rs`](../../newt-core/src/agentic/claim_check.rs) does today |
 | relentless | Also lifts the tool-round limit (today's `project_tool_round_limit`) |
 
-Levels are cumulative. `grit` and `resolute` are new behaviour; `resolute` is
-aimed at the measured false-completion rate on Terminal-Bench.
+Levels are cumulative in the target design. Slice 2 ships `normal`, `resolute`,
+and `relentless`; `grit` remains a later slice. Resolute uses the existing three
+verification nudges. For typed Act tasks, resolute and relentless require fresh
+observed successful checks on every wire, with SmartHarness on or off. Missing
+checks, denied/unavailable execution, hidden exit status, stale passes, and
+exhausted repair allowance produce an incomplete result with an explanation.
+Informational and clarification turns keep their existing completion semantics.
+Neither `NEWT_SELF_VERIFY=0` nor disabled action nudges suppress this obligation.
+Only direct operator relentless raises the tool-round cap; an explicit round
+limit still wins. Automatic relentless requires verification without raising it.
 
 The retry count and the relentless round budget are ordinary config settings.
 Whether the panel shows them is a separate setting, on for now so the numbers
@@ -79,9 +87,25 @@ supplies the starting point.
 
 All three dials keep today's precedence: CLI flag, then persona, then the
 config's per-family value, then the config default, then the built-in default.
-Slice 1b removes the persona and config layers of tenacity, which never lifted
-the round cap and would be inert until `resolute` returns them in slice 2, so
-until then tenacity is set only explicitly (flag, `/psyche`, a pin, obsessive).
+Slice 2 restores persona and config tenacity. Family matching uses the existing
+typed family label, never a substring of a model name. Resolution and verification
+switches are captured for each turn, including headless driver boundaries.
+
+Current config declarations require a discriminator:
+
+```toml
+[tenacity]
+version = 2
+default = "normal"
+[tenacity.families]
+example = "resolute"
+```
+
+Persona front matter uses `psyche_version = 2` beside `tenacity = "resolute"`.
+Writers stamp the supported version. Unversioned recognized legacy labels still
+migrate once to initiative (including old `relentless` → `eager`); unversioned
+`normal`/`resolute` receive a version hint. Unknown versions fail without rewriting
+the source. Historical settings receipts retain their original bytes and IDs.
 
 ### Tunable numbers
 
@@ -143,7 +167,7 @@ already have:
 |---|---|
 | cognition `glancing` / `pondering` / `deliberating` / `contemplating` | `zen` / `rational` / `thoughtful` / `meticulous` |
 | tenacity `relaxed` / `standard` / `insistent` | initiative `patient` / `measured` / `decisive`; tenacity `normal` |
-| tenacity `relentless` | initiative `eager` **and** tenacity `relentless` |
+| unversioned persona/config tenacity `relentless` | initiative `eager`; tenacity inherits its current default |
 | config `[tenacity]` per-family table | `[initiative]` per-family table |
 
 The importer rewrites persona front-matter and config keys once, on load, and
