@@ -10,10 +10,10 @@ fn cognition_output_is_reserved_from_32k_and_65k_context_windows() {
         ..Default::default()
     };
     let cases = [
-        (Cognition::Glancing, 26_214, 52_428),
-        (Cognition::Pondering, 26_214, 52_428),
-        (Cognition::Deliberating, 22_768, 52_428),
-        (Cognition::Contemplating, 16_768, 49_536),
+        (Cognition::Zen, 26_214, 52_428),
+        (Cognition::Rational, 26_214, 52_428),
+        (Cognition::Thoughtful, 22_768, 52_428),
+        (Cognition::Meticulous, 16_768, 49_536),
     ];
 
     for (cognition, expected_32k, expected_65k) in cases {
@@ -40,7 +40,7 @@ fn recovered_full_window_reapplies_output_reserve_without_failing_open() {
     assert_eq!(
         recovered_input_budget(32_768, 80, Some(16_000), Some(49_536)),
         16_768,
-        "a 32K recovered window reserves contemplating's 16K output"
+        "a 32K recovered window reserves meticulous's 16K output"
     );
     assert_eq!(
         recovered_input_budget(8_000, 80, Some(10_000), Some(22_768)),

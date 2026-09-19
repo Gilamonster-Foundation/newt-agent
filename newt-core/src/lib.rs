@@ -111,6 +111,8 @@ pub mod prune;
 /// Psyche posture macros (e.g. `obsessive`) — named acts that move several
 /// psyche dials ([`cognition`] + [`tenacity`], + crew at the caller) at once.
 pub mod psyche;
+/// One-time importer for the psyche vocabulary rename (deletable after one release).
+pub mod psyche_import;
 pub mod reasoning;
 pub mod responses_wire;
 pub mod retry;

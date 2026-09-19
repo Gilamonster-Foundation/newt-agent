@@ -176,7 +176,7 @@ pub struct Cli {
     pub tenacity: Option<newt_core::Tenacity>,
 
     /// Cognition (#psyche): how much reasoning to spend per call —
-    /// `glancing` | `pondering` | `deliberating` | `contemplating`, mapping to the
+    /// `zen` | `rational` | `thoughtful` | `meticulous`, mapping to the
     /// OpenAI `reasoning.effort` wire field (minimal … high) on the Responses API.
     /// A session-wide override that beats a persona's `cognition:`; applies to the
     /// interactive TUI AND the `headless` / worker path. Unset ⇒ no
@@ -186,7 +186,7 @@ pub struct Cli {
 
     /// Obsessive (#psyche): the max-everything posture — newt's "ultra". A named
     /// launch act that moves three orthogonal dials at once: cognition to
-    /// `contemplating` (deepest reasoning.effort), tenacity to `relentless` (most
+    /// `meticulous` (deepest reasoning.effort), tenacity to `relentless` (most
     /// forcing), and the crew ON (as if `NEWT_TEAM` were set). For interactive
     /// code sessions and `headless`, Relentless makes the default round budget
     /// effectively unlimited. An explicit
@@ -1281,7 +1281,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // CLI `--cognition`: install the session cognition override (→ the
     // `reasoning.effort` wire field), read by both the TUI's `resolve_cognition`
     // and the headless driver. Applied AFTER `--obsessive` so an explicit
-    // `--cognition` supersedes the macro's contemplating.
+    // `--cognition` supersedes the macro's meticulous.
     if let Some(level) = cli.cognition {
         newt_core::cognition::set_cli_cognition(newt_core::cognition::CognitionOverride::Set(
             level,
@@ -2202,6 +2202,24 @@ mod tests {
     #[test]
     fn backend_kind_rejects_garbage() {
         assert!(Cli::try_parse_from(["newt", "--backend-kind", "banana"]).is_err());
+    }
+
+    /// Slice 1a rename: `--cognition` takes the new labels, and an old label
+    /// is a parse error that names its replacement.
+    #[test]
+    fn cognition_flag_rejects_an_old_label_with_the_rename() {
+        let cli = Cli::try_parse_from(["newt", "--cognition", "meticulous"]).unwrap();
+        assert_eq!(
+            cli.cognition,
+            Some(newt_core::role_profile::Cognition::Meticulous)
+        );
+        let err = Cli::try_parse_from(["newt", "--cognition", "contemplating"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cognition 'contemplating' was renamed to 'meticulous'"),
+            "{err}"
+        );
     }
 
     #[test]

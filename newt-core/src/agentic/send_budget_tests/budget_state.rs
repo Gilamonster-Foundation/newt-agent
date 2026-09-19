@@ -1,6 +1,6 @@
 use super::*;
 
-/// THE numerical regression: with a 32K window at 80% and Contemplating
+/// THE numerical regression: with a 32K window at 80% and Meticulous
 /// (16K output reserve), the percentage ceiling is 26,214 but the ENFORCED
 /// hard ceiling is the tighter 16,768 — and EVERY Responses budget surface
 /// reports that same 16,768, closing the old `get_context_remaining`
@@ -16,7 +16,7 @@ fn responses_budget_state_reports_one_enforced_ceiling() {
     let mut state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -68,7 +68,7 @@ fn learned_hard_ceiling_only_ever_tightens() {
     let mut state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -113,7 +113,7 @@ fn tightening_and_overhead_only_shrink_reported_remaining() {
     let mut state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -144,7 +144,7 @@ fn cloud_responses_none_num_ctx_stays_ceiling_less() {
     let state = ResponsesBudgetState::new(
         None,
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -163,12 +163,12 @@ fn cloud_responses_none_num_ctx_stays_ceiling_less() {
 #[test]
 fn zero_input_room_window_stays_authoritative_zero() {
     use super::ResponsesBudgetState;
-    // 80% of 16_000 = 12_800; window − 16_000 Contemplating reserve = 0 →
+    // 80% of 16_000 = 12_800; window − 16_000 Meticulous reserve = 0 →
     // min = Some(0). A cached max_ok_input=2_000 must be shadowed, not win.
     let state = ResponsesBudgetState::new(
         Some(16_000),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         Some(2_000),
         None,
         None,

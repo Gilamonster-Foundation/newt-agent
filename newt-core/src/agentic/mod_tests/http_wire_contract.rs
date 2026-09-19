@@ -370,7 +370,7 @@ async fn openai_chat_projects_cognition_only_for_an_explicitly_capable_endpoint(
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
-    c.cognition = Some(crate::role_profile::Cognition::Deliberating);
+    c.cognition = Some(crate::role_profile::Cognition::Thoughtful);
     c.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
         cognition: Some(true),
         chat_template_kwargs: Some(true),
@@ -415,7 +415,7 @@ async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
-    c.cognition = Some(crate::role_profile::Cognition::Contemplating);
+    c.cognition = Some(crate::role_profile::Cognition::Meticulous);
     // #2312 (A6): an explicit allowance is not a declaration that the endpoint
     // accepts a cap field — no `max_tokens` is guessed onto this wire.
     c.output_allowance = Some(12_000);
@@ -494,10 +494,10 @@ async fn capable_chat_bodies(
 /// override the cognition table still supplies the historical 10,000.
 #[tokio::test]
 async fn openai_chat_output_allowance_varies_only_the_cap_field() {
-    let deliberating = Some(crate::role_profile::Cognition::Deliberating);
-    let default_bodies = capable_chat_bodies(deliberating, None).await;
-    let small_bodies = capable_chat_bodies(deliberating, Some(3_000)).await;
-    let large_bodies = capable_chat_bodies(deliberating, Some(12_000)).await;
+    let thoughtful = Some(crate::role_profile::Cognition::Thoughtful);
+    let default_bodies = capable_chat_bodies(thoughtful, None).await;
+    let small_bodies = capable_chat_bodies(thoughtful, Some(3_000)).await;
+    let large_bodies = capable_chat_bodies(thoughtful, Some(12_000)).await;
     assert!(!default_bodies.is_empty());
     assert_eq!(default_bodies.len(), small_bodies.len());
     assert_eq!(default_bodies.len(), large_bodies.len());

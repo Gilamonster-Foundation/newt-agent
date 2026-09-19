@@ -10,7 +10,7 @@ fn get_context_remaining_reports_enforced_not_percentage_ceiling() {
     let state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -122,7 +122,7 @@ fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
     let s = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         Some(6_000),
@@ -138,7 +138,7 @@ fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
     let s = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -176,7 +176,7 @@ fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
     let mut s = ResponsesBudgetState::new(
         Some(65_536),
         80,
-        resolve_output_allowance(None, Some(Cognition::Deliberating)),
+        resolve_output_allowance(None, Some(Cognition::Thoughtful)),
         Some(40_000),
         Some(40_000),
         Some(30_000),
@@ -209,7 +209,7 @@ fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
     let s = ResponsesBudgetState::new(
         None,
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -237,7 +237,7 @@ fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
     let s = ResponsesBudgetState::new(
         Some(16_000),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         None,
@@ -291,7 +291,7 @@ fn get_context_remaining_agrees_with_dispatch_across_budget_shapes() {
     let s = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        resolve_output_allowance(None, Some(Cognition::Meticulous)),
         None,
         None,
         Some(6_000),

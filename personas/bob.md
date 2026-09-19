@@ -1,7 +1,7 @@
 +++
 role      = "researcher"
 backend   = "sol"
-cognition = "contemplating"
+cognition = "meticulous"
 tenacity  = "relentless"
 crew      = false
 tools     = ["read_file", "list_dir", "find", "web_fetch", "use_skill"]

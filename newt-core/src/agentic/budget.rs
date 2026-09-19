@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn output_reserve_ceiling_is_not_misreported_as_percentage_derived() {
-        // Contemplating at 32K reserves 16K for output, so the effective input
+        // Meticulous at 32K reserves 16K for output, so the effective input
         // ceiling (16,768) is tighter than the configured 80% ceiling (26,214).
         let out = render_context_budget(1000, Some(16_768), Some(32_768), 80, 15);
         assert!(out.contains("configured num_ctx 32768"), "{out}");

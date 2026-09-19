@@ -90,15 +90,15 @@ fn cognition_maps_to_the_responses_reasoning_field_or_is_omitted() {
     use crate::role_profile::Cognition;
     // Opt-in: each level projects to the Responses `reasoning.effort` value.
     assert_eq!(
-        responses_reasoning_field(Some(Cognition::Contemplating)),
+        responses_reasoning_field(Some(Cognition::Meticulous)),
         Some(serde_json::json!({ "effort": "high" }))
     );
     assert_eq!(
-        responses_reasoning_field(Some(Cognition::Glancing)),
+        responses_reasoning_field(Some(Cognition::Zen)),
         Some(serde_json::json!({ "effort": "minimal" }))
     );
     assert_eq!(
-        responses_reasoning_field(Some(Cognition::Deliberating)),
+        responses_reasoning_field(Some(Cognition::Thoughtful)),
         Some(serde_json::json!({ "effort": "medium" }))
     );
     // Not opted in → the field is omitted entirely (request unchanged).
@@ -321,7 +321,7 @@ async fn responses_emits_cognition_as_reasoning_effort_on_the_wire() {
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
     ctx.safe_context = None;
     ctx.max_ok_input = None;
-    ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+    ctx.cognition = Some(crate::role_profile::Cognition::Meticulous);
 
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
         .await
@@ -335,7 +335,7 @@ async fn responses_emits_cognition_as_reasoning_effort_on_the_wire() {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(
         body["reasoning"]["effort"], "high",
-        "cognition=contemplating must ride the wire as reasoning.effort=high"
+        "cognition=meticulous must ride the wire as reasoning.effort=high"
     );
 }
 
@@ -519,7 +519,7 @@ async fn responses_output_allowance_never_changes_the_request_body() {
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
         ctx.safe_context = None;
         ctx.max_ok_input = None;
-        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+        ctx.cognition = Some(crate::role_profile::Cognition::Meticulous);
         ctx.output_allowance = output_allowance;
         ctx.solve_obs = Some(&mut obs);
         openai_responses_complete(ctx, &mut NoMcp)

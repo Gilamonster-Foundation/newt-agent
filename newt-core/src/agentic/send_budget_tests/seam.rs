@@ -13,7 +13,7 @@ fn responses_honors_the_configured_window_as_a_local_safety_limit() {
         OpenAiApi::Responses,
         Some(32_768),
         80,
-        Some(Cognition::Contemplating),
+        Some(Cognition::Meticulous),
         None,
         ChatCompletionsCapability {
             cognition: Some(true),
@@ -23,7 +23,7 @@ fn responses_honors_the_configured_window_as_a_local_safety_limit() {
         None,
         None,
     );
-    // 32_768 − 16_000 Contemplating output reserve = 16_768, tighter than the
+    // 32_768 − 16_000 Meticulous output reserve = 16_768, tighter than the
     // 80% percentage bound (26,214) — the SAME value the Responses loop enforces.
     assert_eq!(
         ceiling,
@@ -38,7 +38,7 @@ fn responses_honors_the_configured_window_as_a_local_safety_limit() {
             OpenAiApi::Responses,
             None,
             80,
-            Some(Cognition::Contemplating),
+            Some(Cognition::Meticulous),
             None,
             ChatCompletionsCapability {
                 cognition: Some(true),
@@ -66,10 +66,10 @@ fn seam_projects_the_responses_budget_state_for_every_cognition() {
     };
     let cognitions = [
         None,
-        Some(Cognition::Glancing),
-        Some(Cognition::Pondering),
-        Some(Cognition::Deliberating),
-        Some(Cognition::Contemplating),
+        Some(Cognition::Zen),
+        Some(Cognition::Rational),
+        Some(Cognition::Thoughtful),
+        Some(Cognition::Meticulous),
     ];
     // (num_ctx, max_ok_input, safe_context): configured-window-only, cached
     // caps present, a learned/cached cap tighter than the window, and the
@@ -115,20 +115,20 @@ fn seam_projects_the_responses_budget_state_for_every_cognition() {
             );
         }
     }
-    // Lock the exact reserve divergence the fix closes: Contemplating at 32K
+    // Lock the exact reserve divergence the fix closes: Meticulous at 32K
     // reports the RESERVED 16,768, never the un-reserved 26,214.
-    let contemplating = super::initial_context_input_budget(
+    let meticulous = super::initial_context_input_budget(
         BackendKind::Openai,
         OpenAiApi::Responses,
         Some(32_768),
         80,
-        Some(Cognition::Contemplating),
+        Some(Cognition::Meticulous),
         None,
         capability,
         ReasoningReplayScope::CurrentUserTurn,
         None,
         None,
     );
-    assert_eq!(contemplating, Some(16_768));
-    assert_ne!(contemplating, Some(26_214), "no un-reserved over-report");
+    assert_eq!(meticulous, Some(16_768));
+    assert_ne!(meticulous, Some(26_214), "no un-reserved over-report");
 }

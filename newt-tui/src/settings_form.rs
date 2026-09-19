@@ -1162,7 +1162,7 @@ mod tests {
         for (field, value) in [
             (Field::EditMode, "nano"),
             (Field::Tenacity, "insistent"),
-            (Field::Cognition, "deliberating"),
+            (Field::Cognition, "thoughtful"),
             (Field::Thinking, "off"),
             (Field::Nudge, "off"),
         ] {

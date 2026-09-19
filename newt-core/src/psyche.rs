@@ -18,7 +18,7 @@ use crate::role_profile::Cognition;
 use crate::tenacity::{set_cli_tenacity, Tenacity};
 
 /// The obsessive posture's cognition: the deepest backend-specific reasoning level.
-pub const OBSESSIVE_COGNITION: Cognition = Cognition::Contemplating;
+pub const OBSESSIVE_COGNITION: Cognition = Cognition::Meticulous;
 /// The obsessive posture's tenacity: the most forcing level.
 pub const OBSESSIVE_TENACITY: Tenacity = Tenacity::Relentless;
 
@@ -92,12 +92,12 @@ mod tests {
         set_cli_tenacity(Tenacity::Standard);
 
         let (cog, ten) = engage_obsessive_dials();
-        assert_eq!(cog, Cognition::Contemplating);
+        assert_eq!(cog, Cognition::Meticulous);
         assert_eq!(ten, Tenacity::Relentless);
         // The overrides are actually installed (not just returned).
         assert_eq!(
             cli_cognition(),
-            CognitionOverride::Set(Cognition::Contemplating)
+            CognitionOverride::Set(Cognition::Meticulous)
         );
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
 
@@ -119,18 +119,18 @@ mod tests {
     #[test]
     fn a_captured_turn_does_not_see_a_dial_changed_after_it_started() {
         let _g = crate::test_guard::GlobalSettingsGuard::acquire();
-        set_cli_cognition(CognitionOverride::Set(Cognition::Pondering));
+        set_cli_cognition(CognitionOverride::Set(Cognition::Rational));
         set_cli_tenacity(Tenacity::Relaxed);
 
         {
             let _turn = capture_turn_psyche();
             // The operator moves both dials mid-turn.
-            set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+            set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
             set_cli_tenacity(Tenacity::Relentless);
 
             assert_eq!(
                 crate::cognition::effective_cognition(),
-                Some(Cognition::Pondering),
+                Some(Cognition::Rational),
                 "the running turn keeps the cognition it started with"
             );
             assert_eq!(
@@ -144,7 +144,7 @@ mod tests {
         // assertions above are measuring the capture, not a frozen global.
         assert_eq!(
             crate::cognition::effective_cognition(),
-            Some(Cognition::Contemplating)
+            Some(Cognition::Meticulous)
         );
         assert_eq!(effective_tenacity(), Tenacity::Relentless);
 
@@ -183,7 +183,7 @@ mod tests {
         set_cli_cognition(CognitionOverride::Off);
         {
             let _turn = capture_turn_psyche();
-            set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+            set_cli_cognition(CognitionOverride::Set(Cognition::Meticulous));
             assert_eq!(
                 crate::cognition::effective_cognition(),
                 None,

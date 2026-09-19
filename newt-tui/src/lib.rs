@@ -6468,7 +6468,7 @@ fn commit_prepared(
     // LAYER that `effective_cognition` ranks beneath the CLI layer. A restore
     // that swapped the struct but left that layer alone carried the OUTGOING
     // conversation's persona cognition into the incoming one, so resuming a
-    // plain conversation from a `contemplating` persona kept contemplating with
+    // plain conversation from a `meticulous` persona kept meticulous with
     // nothing on screen naming a persona to explain it.
     //
     // Derived from the persona now installed rather than from `record.persona`,

@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn contract_cognition_is_the_level_the_backend_can_receive() {
-        let level = Some(Cognition::Contemplating);
+        let level = Some(Cognition::Meticulous);
         let capable = ChatCompletionsCapability {
             cognition: Some(true),
             ..Default::default()

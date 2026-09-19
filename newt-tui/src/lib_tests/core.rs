@@ -669,13 +669,13 @@ fn psyche_apply_summary_includes_the_effective_round_source() {
     use newt_core::Tenacity;
 
     let summary = psyche_apply_summary(
-        "psyche: contemplating + relentless",
+        "psyche: meticulous + relentless",
         40,
         Some(Tenacity::Relentless),
         Some(7),
     );
     assert!(
-        summary.starts_with("psyche: contemplating + relentless"),
+        summary.starts_with("psyche: meticulous + relentless"),
         "{summary}"
     );
     assert!(
@@ -1669,7 +1669,7 @@ fn retired_dials_through_the_real_router_mutate_nothing() {
     set_cli_cognition(CognitionOverride::Unset);
     set_cli_tenacity(Tenacity::Standard);
     assert!(dispatch_slash("/tenacity relentless", "/ws", false, false, false).unwrap());
-    assert!(dispatch_slash("/cognition contemplating", "/ws", false, false, false).unwrap());
+    assert!(dispatch_slash("/cognition meticulous", "/ws", false, false, false).unwrap());
     assert_eq!(cli_tenacity(), Some(Tenacity::Standard));
     assert_eq!(cli_cognition(), CognitionOverride::Unset);
     // And the surviving /psyche text setters DO mutate through the router —

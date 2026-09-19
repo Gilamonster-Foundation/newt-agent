@@ -584,6 +584,17 @@ fn shipped_role_templates_parse() {
         // Converts to canonical caveats without panicking.
         let _ = rp.caveats.unwrap().to_caveats();
     }
+    // The psyche personas pin dials rather than a full role; a renamed dial
+    // label left behind in one of them must fail here, not at an operator's
+    // `--persona`.
+    for name in ["bob", "obsessive"] {
+        let path = personas.join(format!("{name}.md"));
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing shipped persona {}: {e}", path.display()));
+        let rp = newt_core::RoleProfile::parse(&raw)
+            .unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
+        assert!(rp.cognition.is_some(), "{name} pins cognition");
+    }
 }
 
 /// The assistant persona prefers its bound skill's routine tools. These data
