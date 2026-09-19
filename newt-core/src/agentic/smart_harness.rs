@@ -857,12 +857,14 @@ impl SmartHarness {
         gate_on: bool,
         answer: &str,
     ) -> anyhow::Result<Control> {
-        if !matches!(control, Control::Answer) || !gate_on {
+        if !matches!(control, Control::Answer) || !(gate_on || turn.ledger.required()) {
             return Ok(control);
         }
         if turn.ledger.result_aware() {
             let used = self.state()?.verify_repairs;
-            return Ok(match super::self_verify::conclude_turn(turn, used).await {
+            let required = turn.ledger.required();
+            let (decision, report) = super::self_verify::conclude_turn(turn, used).await;
+            return Ok(match decision {
                 super::self_verify::Decision::Accept => control,
                 super::self_verify::Decision::Nudge(text) => {
                     let text = format!("{} {text}", super::compress::LOOP_GUIDANCE_PREFIX);
@@ -871,12 +873,18 @@ impl SmartHarness {
                     Control::Continue(text)
                 }
                 super::self_verify::Decision::Stop(reason) => Control::Finish {
-                    text: answer.to_string(),
+                    text: if reason == crate::TurnEndReason::Cancelled {
+                        String::new()
+                    } else if required {
+                        super::self_verify::incomplete_answer(answer, &report)
+                    } else {
+                        answer.to_string()
+                    },
                     reason,
                 },
             });
         }
-        if turn.rounds_left && super::self_verify::enabled() && !self.state()?.verified {
+        if turn.rounds_left && turn.ledger.gate_enabled() && !self.state()?.verified {
             let (messages, workspace, task) = (turn.messages, turn.workspace, turn.task);
             let commands = super::self_verify::commands_from_messages(messages);
             let checks = turn
