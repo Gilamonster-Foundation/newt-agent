@@ -187,13 +187,16 @@ impl Field {
                 ("nano", "nano-style editing"),
             ]),
             Self::Tenacity => ValueSpace::Choice(
-                std::iter::once(("auto", "normal, unless set explicitly".to_string()))
-                    .chain(
-                        Tenacity::all()
-                            .into_iter()
-                            .map(|t| (t.label(), t.describe())),
-                    )
-                    .collect(),
+                std::iter::once((
+                    "auto",
+                    "inherit persona, model-family or config defaults".to_string(),
+                ))
+                .chain(
+                    Tenacity::all()
+                        .into_iter()
+                        .map(|t| (t.label(), t.describe())),
+                )
+                .collect(),
             ),
             Self::Initiative => ValueSpace::Choice(
                 std::iter::once((
