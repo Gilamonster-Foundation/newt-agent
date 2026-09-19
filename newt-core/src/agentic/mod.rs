@@ -2360,11 +2360,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // stop exploring and call edit_file or write_file.  This breaks the
         // "endless exploration → empty response" failure mode seen with some
         // local models (e.g. nemotron3:33b).
-        // The action-forcing threshold is an initiative level rather than a
-        // magic constant. This loop keeps `Measured` (built-in 3, or its
-        // `[initiative.rounds]` value) whatever the dial says; honouring the
-        // dial here is a separate change, plugging into exactly this seam.
-        let read_only_nudge_after = crate::initiative::Initiative::Measured.read_only_nudge_after();
+        // Use the turn's captured level and configured rounds, matching the
+        // other action-nudge loops without changing this counter's timing.
+        let read_only_nudge_after = workflow_runtime.initiative.read_only_nudge_after();
         if action_nudges && read_only_rounds >= read_only_nudge_after {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
