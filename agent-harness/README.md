@@ -56,6 +56,13 @@ this closure before returning. It never reruns a call. Requests and ordinary
 transcript replacement refuse an incomplete batch. A same-process host must
 close abandoned work before starting another turn.
 
+Hosts can explicitly admit quoted legacy context with
+`record_historical_message`. It uses the existing observation journal with
+`Historical` origin and a fixed textual wire envelope. Historical material
+remains selectable and retrievable after projection without becoming current
+operator or tool evidence. The host verifies and filters the imported source;
+the session does not reconstruct missing tool occurrences from transcript text.
+
 This unmerged experimental interface now writes session schema **2** and removes
 the old dispatch-only API. Writable restoration of schema 1 is explicitly
 refused because it cannot prove per-call completion; start a new run. Read-only

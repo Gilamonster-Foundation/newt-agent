@@ -11,6 +11,56 @@ use content_addressable::{ContentAddressable, ContentId, MerkleNode, RawContentI
 type Events = BTreeMap<ContentId, Event>;
 
 #[test]
+fn historical_data_keeps_its_origin_through_retrieval_and_cannot_ground_a_verdict() {
+    let historical: EventOrigin = serde_json::from_value(serde_json::json!("historical"))
+        .expect("imported transcript data needs an origin distinct from current actors");
+    let mut events = Events::new();
+    let source = append(
+        &mut events,
+        body(EventKind::Observation, historical, &[], 0),
+        &[],
+    );
+    let unit = Unit::seal(
+        Op::Elide,
+        b"material",
+        Span::new(0, 8),
+        events[&source].body().root,
+    )
+    .unwrap();
+    for kind in [
+        EventKind::Retrieval,
+        EventKind::Elision {
+            unit: unit.id().unwrap(),
+        },
+    ] {
+        let id = append(
+            &mut events,
+            body(kind.clone(), historical, &[source], 0),
+            &[source],
+        );
+        let decoded = Event::admit(events[&id].to_raw(), |id| events.get(id).cloned()).unwrap();
+        assert_eq!(decoded.body().origin, historical);
+        assert_refused(
+            body(kind, EventOrigin::Tool, &[source], 0),
+            &[source],
+            &events,
+        );
+    }
+    assert_refused(
+        body(
+            EventKind::Verdict {
+                verdict: ReplyVerdict::Question,
+            },
+            EventOrigin::Harness,
+            &[source],
+            1,
+        ),
+        &[source],
+        &events,
+    );
+}
+
+#[test]
 fn every_event_kind_preserves_typed_cids_through_canonical_decode() {
     let source = body(EventKind::Observation, EventOrigin::Model, &[], 0);
     let unit = Unit::seal(Op::Elide, b"material", Span::new(0, 8), source.root).unwrap();

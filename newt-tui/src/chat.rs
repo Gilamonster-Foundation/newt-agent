@@ -1648,6 +1648,13 @@ fn session_body(
         std::env::var("NEWT_RESUME").ok(),
         cfg.conversations.clone().unwrap_or_default().resume,
     );
+    let adoption_request = std::env::var("NEWT_ADOPT_FRAME").ok();
+    if let Some(selected) = adoption_request.as_deref() {
+        anyhow::ensure!(
+            smart_sessions::adoption_selection_matches(selected, &session_start),
+            "--adopt-frame requires its explicit --resume selection; remove conflicting conversation overrides"
+        );
+    }
     let ephemeral_session = session_start == SessionStart::Ephemeral;
     // Ephemeral sessions get NO store handle at all (17.7): nothing to
     // create rows, nothing to append turns, nothing to read past
@@ -1824,6 +1831,10 @@ fn session_body(
         SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
     let smart_startup_caveats = cap.caveats().clone();
     let smart_config = cfg.smart_harness.clone().filter(|config| config.enabled);
+    anyhow::ensure!(
+        adoption_request.is_none() || smart_config.is_some(),
+        "--adopt-frame requires [smart_harness] enabled = true"
+    );
     if let Some(config) = smart_config.as_ref() {
         newt_core::agentic::smart_harness::validate_isolation_runtime()?;
         // Local MCP processes inherit this capability when the pool starts.
@@ -2738,6 +2749,10 @@ fn session_body(
         match store.claim(&active_conversation_id) {
             Ok(newt_core::ClaimOutcome::Claimed) => {}
             Ok(newt_core::ClaimOutcome::HeldBy { host, pid }) => {
+                anyhow::ensure!(
+                    adoption_request.is_none(),
+                    "cannot adopt a conversation held by another session"
+                );
                 claim_refused = true;
                 print_newt(
                     &format!(
@@ -2777,12 +2792,27 @@ fn session_body(
                 }
                 let _ = store.claim(&active_conversation_id);
             }
+            Err(e) if adoption_request.is_some() => {
+                return Err(e.context("cannot claim the selected conversation for frame adoption"))
+            }
             Err(e) => print_newt(
                 &format!("warning: could not claim the conversation ({e})"),
                 color,
                 verbose,
             ),
         }
+    }
+
+    if adoption_request.is_some() {
+        anyhow::ensure!(
+            resumed_at_start && !claim_refused,
+            "frame adoption requires a successfully resumed conversation"
+        );
+        let store = conversation_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("frame adoption requires a durable conversation store")
+        })?;
+        smart_sessions.adopt_selected(store, &active_conversation_id, mem_budget)?;
+        print_newt("Smart Harness will admit only the selected conversation as historical context; past execution remains unaccounted.", color, verbose);
     }
 
     // #1668: apply the resumed conversation's preference pin — AFTER the claim
