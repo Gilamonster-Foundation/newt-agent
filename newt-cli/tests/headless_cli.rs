@@ -200,8 +200,15 @@ impl Respond for ReadThenFinishOnNudge {
 /// attribution (#1819: an exact catalog card declaring `family = "nemotron"`,
 /// associated through the SelectedModel principal — never a model-name
 /// substring) changed runtime behavior as well as the emitted contract.
+///
+/// The config is deliberately in the PRE-SPLIT shape (`[tenacity]` default
+/// and families): this is the importer's end-to-end regression (slice 1b).
+/// Without the importer on the load path the table is ignored, the family
+/// default never engages, and no nudge fires within two rounds. An explicit
+/// `--config` is not the operator's own config, so it is translated in memory
+/// with a warning and left unchanged on disk.
 #[tokio::test(flavor = "multi_thread")]
-async fn explicit_config_applies_nemotron_initiative_to_runtime_and_contract() {
+async fn a_pre_split_config_applies_nemotron_initiative_to_runtime_and_contract() {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -243,16 +250,17 @@ model = "{NEMOTRON_MODEL}"
 kind = "openai"
 card = "nemo-run"
 
-[initiative]
-default = "patient"
+[tenacity]
+default = "relaxed"
 
-[initiative.families]
-nemotron = "eager"
+[tenacity.families]
+nemotron = "relentless"
 "#,
             server.uri()
         ),
     )
     .expect("write explicit headless config");
+    let config_before = std::fs::read_to_string(&config_path).expect("read config back");
     std::fs::write(
         &instruction_path,
         "Inspect the workspace, then complete the task.\n",
@@ -274,7 +282,13 @@ nemotron = "eager"
         .arg(&events_path)
         .args(["--max-rounds", "2"])
         .assert()
-        .success();
+        .success()
+        .stderr(predicates::str::contains("uses old psyche labels"));
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config back"),
+        config_before,
+        "an explicit config is migrated in memory, never rewritten"
+    );
 
     let requests = requests.lock().expect("request capture lock");
     assert!(requests.len() >= 2, "expected at least two chat requests");

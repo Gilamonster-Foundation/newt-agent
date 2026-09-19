@@ -214,7 +214,9 @@ pub struct Config {
     /// `[initiative]` — how much the model looks before acting: a baseline
     /// level, per-model-family defaults, and the read-only rounds behind each
     /// level. `None` → `Measured` with the built-in rounds. An explicit
-    /// `--initiative` or a persona's `initiative` supersedes it. See
+    /// `--initiative` or a persona's `initiative` supersedes it. A pre-split
+    /// `[tenacity]` table is migrated here on load
+    /// ([`crate::psyche_import::migrate_config_text`]). See
     /// [`crate::initiative::InitiativeConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<crate::initiative::InitiativeConfig>,
@@ -1366,8 +1368,20 @@ impl Default for Config {
 impl Config {
     /// Load configuration from an explicit file path.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = Self::read_text(path)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
+    }
+
+    /// Read a config file's text for decoding: the ONE file-read chokepoint
+    /// ([`Self::load`] and every layered path through `load_value`). It runs
+    /// the psyche importer first, so a pre-split `[tenacity]` table reaches
+    /// the typed decode as `[initiative]`. Only the operator's own config
+    /// (under [`Self::user_config_dir`]) is rewritten on disk; a project,
+    /// ambient, `/etc` or explicitly named file is shared or untrusted, so it
+    /// is translated in memory with a warning.
+    fn read_text(path: &Path) -> Result<String> {
+        let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
+        Ok(crate::psyche_import::read_config_file(path, own)?)
     }
 
     /// Resolve configuration by searching well-known locations, then layering a
@@ -1804,7 +1818,7 @@ impl Config {
 
     /// Load a config file as a raw `toml::Value` (for layered merging).
     fn load_value(path: &Path) -> Result<toml::Value> {
-        let text = std::fs::read_to_string(path)?;
+        let text = Self::read_text(path)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
