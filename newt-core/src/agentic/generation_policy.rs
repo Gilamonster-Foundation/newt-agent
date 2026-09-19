@@ -1,6 +1,26 @@
 use crate::model_card::{ChatCompletionsCapability, ReasoningReplayScope};
 use crate::role_profile::Cognition;
 
+/// The cognition controls this backend can receive. Semantic intent remains in
+/// the captured runtime even when this projection is absent.
+#[must_use]
+pub fn projected_cognition(
+    cognition: Option<Cognition>,
+    kind: crate::BackendKind,
+    api: crate::OpenAiApi,
+    chat_capability: ChatCompletionsCapability,
+) -> Option<Cognition> {
+    match (kind, api) {
+        (crate::BackendKind::Openai, crate::OpenAiApi::Responses) => cognition,
+        (crate::BackendKind::Openai, crate::OpenAiApi::ChatCompletions)
+            if chat_capability.cognition == Some(true) =>
+        {
+            cognition
+        }
+        _ => None,
+    }
+}
+
 /// The ONE output-allowance resolver (#2312). Precedence: an explicit operator
 /// allowance (`[[model_tuning]] output_allowance`) wins; otherwise the
 /// per-cognition table supplies it; otherwise `None`, and a wire that REQUIRES
@@ -50,6 +70,7 @@ pub fn validate_output_allowance(
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct GenerationPolicy {
     pub(crate) thinking: Option<bool>,
+    pub(crate) reasoning_effort: Option<crate::model_card::ReasoningEffort>,
     /// Wire cap: projected as `max_tokens` only where the endpoint declared it.
     pub(crate) max_output_tokens: Option<u32>,
     /// The resolved allowance local admission reserves, sent or not.
@@ -107,6 +128,21 @@ impl GenerationPolicy {
         policy.temperature = Some(temperature);
         policy.top_p = Some(top_p);
         policy
+    }
+
+    /// Resolve Responses fields and local reservation from the same captured
+    /// declaration. Unsupported explicit effort fails before any dispatch.
+    pub(crate) fn resolve_responses(
+        cognition: Option<Cognition>,
+        output_allowance: Option<u32>,
+        capability: &crate::model_card::ResponsesCapability,
+    ) -> anyhow::Result<Self> {
+        let reasoning_effort = capability.resolve(cognition).map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            reasoning_effort,
+            output_allowance: resolve_output_allowance(output_allowance, cognition),
+            ..Self::default()
+        })
     }
 
     /// Add only explicitly resolved Chat Completions fields. An empty policy
