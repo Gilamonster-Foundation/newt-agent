@@ -35,6 +35,7 @@ binary does; this file is not.
 | Why Newt exists | [`docs/vision.md`](./docs/vision.md) |
 | The invariants it keeps | [`docs/design-laws.md`](./docs/design-laws.md) |
 | Setup and backends | [`docs/guide/setup.md`](./docs/guide/setup.md) |
+| Confinement and `--full-access` | [`docs/guide/full-access.md`](./docs/guide/full-access.md) |
 | Benchmarks | [`docs/terminal-bench.md`](./docs/terminal-bench.md) |
 | Decisions | [`docs/decisions/`](./docs/decisions/) |
 | What changed | [`CHANGELOG.md`](./CHANGELOG.md) |
