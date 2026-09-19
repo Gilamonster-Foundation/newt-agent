@@ -135,7 +135,8 @@ approachability, and prosocial-behavior dials. Select `steady`, `direct`, or
 `sociable`, adjust values from 0 through 100, and use `auto` to inherit a
 persona's value. Enter applies the draft; Esc cancels. `:w <name>` saves a named
 persona, while `:wq <name>` saves and applies. Existing names need explicit `!`
-overwrite. Style remains separate from cognition, tenacity, and tool authority.
+overwrite. Style remains separate from cognition, tenacity, initiative, and tool
+authority.
 
 `/posture <name>` and `/settings posture <name>` are that tool-authority axis,
 and they share one resolved skill/framing plus an optional permission floor.
