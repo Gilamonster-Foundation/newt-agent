@@ -14,9 +14,9 @@ run, and reach on the network.
 enforces the grant, in the kernel where the OS allows. The operator can narrow
 it before a run and audit it after.
 
-We measure Newt rather than describe it. We score each model on a fixed
-Terminal-Bench task set, confined and unconfined, and no release may lower a
-score: [Terminal-Bench scoreboard](./docs/terminal-bench.md).
+Confinement has a cost, so we measure it rather than describe it. We score each
+model on a fixed Terminal-Bench task set, with the grant enforced and without,
+and no release may lower a score: [Terminal-Bench scoreboard](./docs/terminal-bench.md).
 
 ## Install
 
