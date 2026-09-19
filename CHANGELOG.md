@@ -19,7 +19,8 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - **Existing files are rewritten once, on load.** A persona whose front-matter
   names an old label is rewritten in place (only that value changes) and newt
   prints one line saying so. A conversation's pinned cognition is rewritten
-  in the store on the first open. See
+  whenever the store opens, so a pin an older newt writes later is caught
+  too. See
   [`docs/design/psyche-effort-dials.md`](docs/design/psyche-effort-dials.md).
 
 ### Fixed — a hosted model with a local family name is no longer priced as free (#2313)

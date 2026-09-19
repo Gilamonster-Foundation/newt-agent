@@ -70,11 +70,14 @@ fn preference_pin_round_trips_defaults_empty_and_is_workspace_fenced() {
 }
 
 /// Psyche rename (slice 1a): a pin written with an old cognition label is
-/// rewritten to the new label on open, every other key untouched, and only
-/// once. Before the migration the old label failed to parse and the pinned
-/// cognition was dropped with a notice on every resume.
+/// rewritten to the new label on open, every other key untouched. Before the
+/// migration the old label failed to parse, so resume degraded the tab.
+///
+/// Regression (review of slice 1a): the rewrite was once gated by a run-once
+/// marker, so an old label written after the first open (by a pre-rename
+/// binary sharing the database) was never migrated. It now runs every open.
 #[test]
-fn open_rewrites_an_old_pin_cognition_label_once() {
+fn open_rewrites_an_old_pin_cognition_label_on_every_open() {
     let root = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let open = || ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
@@ -101,11 +104,6 @@ fn open_rewrites_an_old_pin_cognition_label_once() {
         store
             .set_raw_preference_pin_for_test(&garbled, "not json")
             .unwrap();
-        // A database from before the migration existed.
-        store
-            .lock_conn()
-            .execute("DELETE FROM store_migrations", [])
-            .unwrap();
         (old, garbled)
     };
 
@@ -122,12 +120,13 @@ fn open_rewrites_an_old_pin_cognition_label_once() {
         "left for the strict decode"
     );
 
-    // Once: an old label that appears after the migration ran is left alone.
+    // An old label written after an earlier open (a pre-rename binary on the
+    // same database) is migrated by the next open too.
     store
         .set_raw_preference_pin_for_test(&old, r#"{"cognition":"pondering"}"#)
         .unwrap();
     drop(store);
-    assert_eq!(raw_pin(&open(), &old), r#"{"cognition":"pondering"}"#);
+    assert_eq!(raw_pin(&open(), &old), r#"{"cognition":"rational"}"#);
 }
 
 /// #1668: posture writes are metadata — they must not tick the §6

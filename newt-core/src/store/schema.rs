@@ -321,12 +321,7 @@ pub(super) fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              created_tick    INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_enrollment_requests_pending
-             ON enrollment_requests (conversation_id, workspace_key, resolved);
-         -- One row per one-time data migration that has run, so it runs once
-         -- (the psyche rename's pin rewrite is the first).
-         CREATE TABLE IF NOT EXISTS store_migrations (
-             name TEXT PRIMARY KEY
-         );",
+             ON enrollment_requests (conversation_id, workspace_key, resolved);",
     )?;
     Ok(())
 }
