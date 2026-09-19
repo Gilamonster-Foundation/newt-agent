@@ -45,6 +45,7 @@ fn backend(model: &str, emits: Option<bool>) -> newt_core::BackendConfig {
             reasoning_content_field: None,
             reasoning_replay_scope: None,
             chat_completions: None,
+            responses: None,
         });
     }
     b
