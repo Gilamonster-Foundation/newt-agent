@@ -2,9 +2,9 @@
 //! step of `docs/design/psyche-effort-dials.md` (*Migration*).
 //!
 //! Slice 1a renamed the cognition levels. Slice 1b split tenacity: its
-//! read-before-acting half became the initiative dial, and persona and config
-//! tenacity went away (tenacity is now set only explicitly). A persona file or
-//! config written before either change is rewritten once, on load, and the
+//! read-before-acting half became the initiative dial. Slice 2 restores persona
+//! and config pursuit under explicit version-2 discriminators. An unversioned
+//! legacy file is rewritten once on load, and the
 //! importer reports what it changed. After that the file holds only the new
 //! vocabulary, and the strict parsers never see the old one.
 //!
@@ -62,8 +62,8 @@ pub struct Migration {
 
 /// Migrate a persona's `+++` front-matter: rewrite a pre-rename top-level
 /// `cognition` value, and turn a top-level `tenacity` entry into `initiative`
-/// (persona tenacity no longer exists; if the file already names an
-/// initiative, the tenacity line is dropped).
+/// when it is an unversioned legacy declaration. If the file already names an
+/// initiative, the old tenacity line is dropped. Versioned pursuit is retained.
 ///
 /// Only the edited bytes change; comments, alignment, every other key and the
 /// body are kept byte-for-byte. `None` when there is nothing to change: no
@@ -80,6 +80,26 @@ pub fn migrate_persona_text(text: &str) -> Option<Migration> {
     debug_assert_eq!(text.get(start..start + fm.len()), Some(fm));
     let doc = toml_edit::Document::parse(fm).ok()?;
     let root = doc.as_table();
+    // Unknown envelopes and unversioned current labels belong to the strict
+    // decoder. Never rewrite bytes whose meaning the importer cannot own.
+    let versioned = root.contains_key("psyche_version");
+    if versioned
+        && root
+            .get("psyche_version")
+            .and_then(toml_edit::Item::as_integer)
+            != Some(2)
+    {
+        return None;
+    }
+    if !versioned
+        && root
+            .get("tenacity")
+            .and_then(toml_edit::Item::as_str)
+            .is_some_and(|label| matches!(label, "normal" | "resolute"))
+    {
+        return None;
+    }
+
     let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let mut changes = Vec::new();
     if let Some(value) = root.get("cognition").and_then(toml_edit::Item::as_value) {
@@ -90,7 +110,7 @@ pub fn migrate_persona_text(text: &str) -> Option<Migration> {
             }
         }
     }
-    if let Some((key, item)) = root.get_key_value("tenacity") {
+    if let Some((key, item)) = root.get_key_value("tenacity").filter(|_| !versioned) {
         if let (Some(key_span), Some(value_span)) = (key.span(), item.span()) {
             let old = item.as_str().unwrap_or("?");
             match split_tenacity(old).filter(|_| !root.contains_key("initiative")) {
@@ -106,7 +126,7 @@ pub fn migrate_persona_text(text: &str) -> Option<Migration> {
                     let comment = if suffix.contains('#') { suffix } else { "" };
                     edits.push((line, comment.to_string()));
                     changes.push(format!(
-                        "dropped tenacity '{old}' (persona tenacity no longer exists)"
+                        "dropped legacy tenacity '{old}' (initiative already declared or label unsupported)"
                     ));
                 }
             }
@@ -150,6 +170,20 @@ pub fn migrate_config_text(text: &str) -> Option<Migration> {
     }
     let legacy_key = doc.key("tenacity")?.clone();
     let tenacity = doc.get("tenacity")?.as_table_like()?;
+    let current = |item: &Item| {
+        item.as_str()
+            .is_some_and(|label| matches!(label, "normal" | "resolute"))
+    };
+    if tenacity.contains_key("version")
+        || tenacity.get("default").is_some_and(current)
+        || tenacity
+            .get("families")
+            .and_then(Item::as_table_like)
+            .is_some_and(|families| families.iter().any(|(_, item)| current(item)))
+    {
+        return None;
+    }
+
     if !tenacity.contains_key("default") && !tenacity.contains_key("families") {
         return None;
     }
@@ -620,9 +654,8 @@ Body keeps cognition = \"contemplating\" and tenacity = \"relaxed\" as prose.
         }
     }
 
-    /// Regression (slice 1b): persona tenacity no longer exists, so a
-    /// `tenacity` key goes even when it cannot map: a file that already names
-    /// an initiative keeps it, and an unknown level is dropped, not kept inert.
+    /// A current initiative supersedes the legacy declaration. Slice 2 current
+    /// labels are preserved for a typed format-version error, never discarded.
     #[test]
     fn a_tenacity_key_is_dropped_when_initiative_is_already_set_or_it_cannot_map() {
         let both = "+++\ninitiative = \"patient\"\ntenacity = \"insistent\"  # old\nrole = \"x\"\n+++\nB.\n";
@@ -633,13 +666,11 @@ Body keeps cognition = \"contemplating\" and tenacity = \"relaxed\" as prose.
         );
         assert_eq!(
             m.changes,
-            ["dropped tenacity 'insistent' (persona tenacity no longer exists)"]
+            ["dropped legacy tenacity 'insistent' (initiative already declared or label unsupported)"]
         );
         let unknown = "+++\ntenacity = \"normal\"\n+++\nB.\n";
-        assert_eq!(
-            migrate_persona_text(unknown).unwrap().text,
-            "+++\n+++\nB.\n"
-        );
+        assert_eq!(migrate_persona_text(unknown), None);
+        assert!(crate::RoleProfile::parse(unknown).is_err());
     }
 
     #[test]
