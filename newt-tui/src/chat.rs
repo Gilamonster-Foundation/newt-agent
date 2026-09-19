@@ -6441,6 +6441,9 @@ fn session_body(
                                     backend,
                                     base_initiative,
                                     initiative_from_family,
+                                    base_tenacity: newt_core::tenacity::base_tenacity(),
+                                    tenacity_from_family:
+                                        newt_core::tenacity::model_default_tenacity().is_some(),
                                     personality: tabs.active().sidecar.personality,
                                     models: served_models,
                                     current_model: panel_choice
