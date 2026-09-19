@@ -48,7 +48,8 @@ pub enum Initiative {
 
 impl Initiative {
     /// Consecutive read-only rounds tolerated before the action nudge, from
-    /// the installed `[initiative.rounds]` (built-in defaults 12/3/2/1).
+    /// the turn's captured `[initiative.rounds]`, or the installed config
+    /// outside a turn (built-in defaults 12/3/2/1).
     #[must_use]
     pub fn read_only_nudge_after(self) -> usize {
         installed_rounds().get(self)
@@ -227,9 +228,9 @@ static INITIATIVE_CONFIG: Mutex<Option<InitiativeConfig>> = Mutex::new(None);
 static ACTIVE_FAMILY: Mutex<Option<String>> = Mutex::new(None);
 
 std::thread_local! {
-    /// A driven turn resolves initiative before its first round; every read
-    /// in the turn sees that value (see `crate::psyche::capture_turn_psyche`).
-    static EFFECTIVE_INITIATIVE_OVERRIDE: std::cell::Cell<Option<Initiative>> =
+    /// A driven turn captures the level AND its configured numeric budgets;
+    /// config publication cannot retune the nudge during the turn.
+    static EFFECTIVE_INITIATIVE_OVERRIDE: std::cell::Cell<Option<(Initiative, InitiativeRounds)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -237,7 +238,7 @@ std::thread_local! {
 /// the guard on the thread whose slot it owns.
 #[must_use]
 pub struct ScopedEffectiveInitiative {
-    previous: Option<Initiative>,
+    previous: Option<(Initiative, InitiativeRounds)>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -247,11 +248,14 @@ impl Drop for ScopedEffectiveInitiative {
     }
 }
 
-/// Pin [`effective_initiative`] on this thread until the guard drops. Nests in
+/// Pin [`effective_initiative`] and its numeric round budgets on this thread
+/// until the guard drops. Nests in
 /// LIFO order. Prefer [`crate::psyche::capture_turn_psyche`] at a turn
 /// boundary, so no dial is pinned without the others.
 pub fn scoped_effective_initiative(level: Initiative) -> ScopedEffectiveInitiative {
-    let previous = EFFECTIVE_INITIATIVE_OVERRIDE.with(|slot| slot.replace(Some(level)));
+    // Inherit an outer capture's numbers when scopes nest.
+    let rounds = installed_rounds();
+    let previous = EFFECTIVE_INITIATIVE_OVERRIDE.with(|slot| slot.replace(Some((level, rounds))));
     ScopedEffectiveInitiative {
         previous,
         _thread_bound: std::marker::PhantomData,
@@ -308,6 +312,9 @@ pub fn initiative_config() -> Option<InitiativeConfig> {
 }
 
 fn installed_rounds() -> InitiativeRounds {
+    if let Some((_, rounds)) = EFFECTIVE_INITIATIVE_OVERRIDE.with(std::cell::Cell::get) {
+        return rounds;
+    }
     INITIATIVE_CONFIG
         .lock()
         .ok()
@@ -341,7 +348,7 @@ pub fn active_model_family() -> Option<String> {
 /// active family, else the config default, else `Measured`.
 #[must_use]
 pub fn effective_initiative() -> Initiative {
-    if let Some(level) = EFFECTIVE_INITIATIVE_OVERRIDE.with(std::cell::Cell::get) {
+    if let Some((level, _)) = EFFECTIVE_INITIATIVE_OVERRIDE.with(std::cell::Cell::get) {
         return level;
     }
     resolve_initiative(
@@ -625,3 +632,7 @@ mod tests {
         assert_eq!(active_model_family(), None);
     }
 }
+
+#[cfg(test)]
+#[path = "initiative_regression_tests.rs"]
+mod regression_tests;
