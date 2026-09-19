@@ -46,10 +46,10 @@ Starting a new conversation resets the tab's unsaved overrides. Named persona
 files survive restarts; unsaved session edits do not.
 
 Saving with `:w` or `:wq` snapshots the panel's full projected posture, not only
-the edited style axes: personality, cognition, initiative, backend, and crew.
-Initiative is written only when it was chosen (moved in the panel, or declared
-by the persona); a model-family default is never baked into the file. Tenacity
-is not a persona setting and is not saved.
+the edited style axes: personality, cognition, tenacity, initiative, backend, and crew.
+Tenacity and initiative are written only when chosen (an explicit override or
+a persona declaration); model-family and config defaults are never baked into
+the file. New persona writes stamp `psyche_version = 2`.
 Inherited values and existing session overrides can become explicit settings
 in the saved file, even when their rows were untouched. Reselecting that saved
 persona can therefore affect more than communication style; inspect the full
