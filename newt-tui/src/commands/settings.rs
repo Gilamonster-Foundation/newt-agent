@@ -260,7 +260,7 @@ fn level_usage<'a>(labels: impl IntoIterator<Item = &'a str>) -> String {
 }
 
 /// Build the `/psyche tenacity` response and, when `arg` names a level,
-/// install it as the explicit override (tenacity's only input). Pure for the
+/// install it as the explicit override above persona/config inheritance. Pure for the
 /// show/list/error paths; the set path mutates the process-global via
 /// `set_cli_tenacity`.
 fn tenacity_command(arg: &str) -> String {
@@ -283,7 +283,7 @@ fn tenacity_command(arg: &str) -> String {
         }
         "list" => {
             let mut out = String::from("tenacity levels (normal → relentless):");
-            out.push_str("\n  auto       normal, unless set explicitly");
+            out.push_str("\n  auto       inherit persona, model-family or config defaults");
             // Snapshot the active level ONCE, so a concurrent override change
             // cannot slip the "← active" marker off every row.
             let active_level = effective_tenacity();
@@ -296,7 +296,7 @@ fn tenacity_command(arg: &str) -> String {
             }
             out
         }
-        // review-2 #2: clear the override so tenacity is `normal` again.
+        // Release the operator override and restore automatic precedence.
         "auto" | "inherit" | "reset" => {
             // #1981: the clear AND the #1668 unpin both live in
             // `settings_form::apply` now — releasing the dial is an operator
@@ -736,7 +736,7 @@ mod tests {
         let status = tenacity_command("");
         assert!(status.starts_with("tenacity: "), "{status}");
         assert!(
-            status.contains("/psyche tenacity <auto|normal|relentless>"),
+            status.contains("/psyche tenacity <auto|normal|resolute|relentless>"),
             "{status}"
         );
         // List enumerates every level, marking the active one.
