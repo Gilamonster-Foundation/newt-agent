@@ -274,6 +274,8 @@ impl InstantiatedFeatures {
 /// The outcome of one completed turn.
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
+    /// The captured verification policy actually instantiated by the loop.
+    pub verification: Option<serde_json::Value>,
     /// The model's reply text.
     pub reply: String,
     /// Token usage for the turn, when the backend reported it.
@@ -322,7 +324,7 @@ pub struct TurnOutcome {
     pub attempts: Option<crate::attempts::UsageTotals>,
     /// The attempt ledger's chain lines, in observation order, for a trace
     /// (`newt solve --events`). The last line's id is the chain head. A boxed
-    /// slice, not a `Vec`: the lines are final, and `TurnStatus` stays small.
+    /// slice, not a `Vec`: the lines are final and need no spare capacity.
     pub attempt_lines: Box<[crate::event_journal::JournalLine<crate::attempts::AttemptRecord>]>,
 }
 
@@ -336,7 +338,7 @@ pub enum TurnStatus {
     Running,
     /// A turn finished successfully. Returned **once**; the reply has already
     /// been appended to the transcript as an assistant message.
-    Completed(TurnOutcome),
+    Completed(Box<TurnOutcome>),
     /// A turn failed (transport error, dispatch error, …). Returned **once**.
     Failed(String),
 }
@@ -354,6 +356,7 @@ struct InFlight {
 /// dedicated worker thread.
 #[derive(Clone)]
 struct HeadlessRuntimePosture {
+    verification: super::self_verify::VerificationSettings,
     cognition: Option<crate::role_profile::Cognition>,
     tenacity: crate::tenacity::Tenacity,
     initiative: crate::initiative::Initiative,
@@ -365,6 +368,7 @@ struct HeadlessRuntimePosture {
 impl HeadlessRuntimePosture {
     fn capture() -> Self {
         Self {
+            verification: super::self_verify::VerificationSettings::capture(),
             cognition: crate::cognition::effective_cognition(),
             tenacity: crate::tenacity::effective_tenacity(),
             initiative: crate::initiative::effective_initiative(),
@@ -565,7 +569,7 @@ impl TurnDriver {
                 self.transcript
                     .push(MemMessage::assistant(outcome.reply.clone()));
                 self.in_flight = None;
-                TurnStatus::Completed(outcome)
+                TurnStatus::Completed(Box::new(outcome))
             }
             Ok(Err(err)) => {
                 self.in_flight = None;
@@ -613,6 +617,7 @@ async fn run_one_turn(
     // the posture captured by this driver. The current-thread runtime keeps
     // these RAII TLS guards on the dedicated turn thread for the entire future.
     let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
+    let _verification = super::self_verify::scoped_verification_settings(runtime.verification);
     let _initiative = crate::initiative::scoped_effective_initiative(runtime.initiative);
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
     // borrows these mutably; the borrows release when `ctx` is consumed by the
@@ -815,6 +820,7 @@ async fn run_one_turn(
             served_model: solve_obs.served_model,
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
+            verification: solve_obs.verification,
             features,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
@@ -839,6 +845,7 @@ async fn run_one_turn(
             served_model: solve_obs.served_model,
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
+            verification: solve_obs.verification,
             features,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
@@ -1171,7 +1178,7 @@ mod tests {
             panic!("the captured turn did not complete");
         };
         let out = bodies.lock().unwrap().clone();
-        (out, outcome)
+        (out, *outcome)
     }
 
     /// #1280: the headless driver advertises `code_search` **iff** the config
@@ -1342,7 +1349,7 @@ mod tests {
                 "the head is ephemeral: it never enters the driver transcript"
             );
             let bodies = bodies.lock().unwrap().clone();
-            (bodies, outcome)
+            (bodies, *outcome)
         }
 
         let store = Arc::new(SessionScratchpadStore::default());
@@ -1533,7 +1540,14 @@ mod tests {
             panic!("crew turn did not complete")
         };
         assert_eq!(outcome.error, None);
-        assert_eq!(outcome.reply, "tool result reviewed");
+        // #2451: a crew's prose claim of `just check PASS` is not observed
+        // execution evidence. Captured Relentless must qualify completion.
+        assert!(outcome.reply.starts_with("tool result reviewed\n\n"));
+        assert!(outcome.reply.contains("Harness: verification incomplete"));
+        assert_eq!(
+            outcome.end_reason,
+            Some(crate::TurnEndReason::VerificationIncomplete)
+        );
         assert_eq!(
             dispatches.lock().unwrap().as_slice(),
             &[CrewDispatch {
@@ -1879,3 +1893,7 @@ mod tests {
         assert_eq!(driver.transcript()[0].content, "start a slow turn");
     }
 }
+
+#[cfg(test)]
+#[path = "driver_resolute_tests.rs"]
+mod resolute_tests;
