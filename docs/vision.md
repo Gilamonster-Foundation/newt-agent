@@ -7,7 +7,7 @@ This document explains *what we are building* and *why*, so that individual
 issues, ADRs, and PRs can be read against a shared intent. It is deliberately a
 statement of direction, not a spec.
 
-## The principle: cognition is now a priced resource
+## The principle: interface fit is now measurable
 
 Watch a model use a command, an API, or an MCP tool, and you can see how hard
 it has to work. When the interface fits the task, the model reads it once and
