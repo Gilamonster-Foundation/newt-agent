@@ -98,3 +98,63 @@ fn psyche_split_fix_config_migration_respects_the_save_lock() {
         "release the migration lock"
     );
 }
+
+/// #2451: a versioned current persona declaration must survive the importer.
+#[test]
+fn resolute_2451_marked_persona_tenacity_is_not_deleted() {
+    for level in ["normal", "resolute", "relentless"] {
+        let text = format!("+++\npsyche_version = 2\ntenacity = \"{level}\"\n+++\nBody\n");
+        assert_eq!(migrate_persona_text(&text), None, "{level}");
+    }
+}
+
+/// #2451: versioned pursuit defaults must never move into initiative.
+#[test]
+fn resolute_2451_marked_config_tenacity_is_not_moved() {
+    for level in ["normal", "resolute", "relentless"] {
+        let text = format!("[tenacity]\nversion = 2\ndefault = \"{level}\"\n[tenacity.families]\nexample = \"{level}\"\n");
+        assert_eq!(migrate_config_text(&text), None, "{level}");
+    }
+}
+
+/// #2451: normal/resolute are current labels, so unversioned declarations
+/// require a format hint rather than destructive legacy migration.
+#[test]
+fn resolute_2451_unversioned_current_labels_are_preserved_and_refused() {
+    for level in ["normal", "resolute"] {
+        let persona = format!("+++\ntenacity = \"{level}\"\n+++\nBody\n");
+        assert_eq!(migrate_persona_text(&persona), None);
+        let error = crate::RoleProfile::parse(&persona).unwrap_err().to_string();
+        assert!(error.contains("psyche_version"), "{error}");
+        let config = format!("[tenacity]\ndefault = \"{level}\"\n");
+        assert_eq!(migrate_config_text(&config), None);
+        let error = toml::from_str::<crate::Config>(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("version"), "{error}");
+    }
+}
+
+/// #2451: an unsupported version is not permission to rewrite the file.
+#[test]
+fn resolute_2451_unknown_versions_are_preserved_and_refused() {
+    let persona = "+++\npsyche_version = 3\ntenacity = \"relentless\"\n+++\nBody\n";
+    assert_eq!(migrate_persona_text(persona), None);
+    assert!(crate::RoleProfile::parse(persona).is_err());
+    let config = "[tenacity]\nversion = 3\ndefault = \"relentless\"\n";
+    assert_eq!(migrate_config_text(config), None);
+    assert!(toml::from_str::<crate::Config>(config).is_err());
+}
+
+/// #2451: the existing metadata writer must retain restored tenacity and stamp
+/// the discriminator, so its output survives the next file load.
+#[test]
+fn resolute_2451_persona_save_round_trips_current_tenacity() {
+    let text = "+++\npsyche_version = 2\ntenacity = \"relentless\"\n+++\nBody\n";
+    let profile = crate::RoleProfile::parse(text).unwrap();
+    let saved = profile.to_markdown().unwrap();
+    assert!(saved.contains("psyche_version = 2"), "{saved}");
+    assert!(saved.contains("tenacity = \"relentless\""), "{saved}");
+    assert_eq!(migrate_persona_text(&saved), None);
+    assert_eq!(crate::RoleProfile::parse(&saved).unwrap(), profile);
+}
