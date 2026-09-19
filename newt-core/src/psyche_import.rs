@@ -338,13 +338,36 @@ pub fn read_persona_file(path: &Path) -> std::io::Result<String> {
 ///
 /// Only the read's own I/O error.
 pub fn read_config_file(path: &Path, rewrite: bool) -> std::io::Result<String> {
+    // Use Config::save's lock and keep the resolved destination stable across
+    // read, migration, and replacement (including reads through a symlink).
+    let locked = rewrite.then(|| {
+        let destination = crate::atomic_fs::ResolvedPath::resolve(path)?;
+        let lock = crate::atomic_fs::acquire_lock(&destination.lock_path())?;
+        anyhow::Ok((destination, lock))
+    });
+    let locked = match locked.transpose() {
+        Ok(locked) => locked,
+        Err(error) => {
+            eprintln!(
+                "newt: warning: cannot lock config {} for migration: {error:#}; \
+                 loading in memory only",
+                path.display()
+            );
+            None
+        }
+    };
+    let destination = locked.as_ref().map(|(destination, _)| destination);
     read_migrating(
-        path,
+        destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path),
         "config",
         migrate_config_text,
-        rewrite,
+        destination.is_some(),
         |p| std::fs::read_to_string(p),
-        |p, text| crate::atomic_fs::atomic_write(p, text.as_bytes()),
+        |_, text| {
+            destination
+                .expect("rewrite holds the config lock")
+                .atomic_write(text.as_bytes())
+        },
     )
 }
 
@@ -355,7 +378,7 @@ fn read_migrating(
     kind: &str,
     migrate: fn(&str) -> Option<Migration>,
     rewrite: bool,
-    read: impl FnOnce(&Path) -> std::io::Result<String>,
+    mut read: impl FnMut(&Path) -> std::io::Result<String>,
     write: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
 ) -> std::io::Result<String> {
     let raw = read(path)?;
@@ -370,6 +393,25 @@ fn read_migrating(
              using the new ones in memory, the file is unchanged"
         );
         return Ok(migration.text);
+    }
+    // A non-cooperating editor may have changed the file despite the lock.
+    // Never replace a snapshot that no longer matches the destination bytes.
+    match read(path) {
+        Ok(current) if current != raw => {
+            eprintln!(
+                "newt: warning: {kind} {shown} changed during migration; \
+                 loading the latest text in memory, the file is unchanged"
+            );
+            return Ok(migrate(&current).map_or(current, |latest| latest.text));
+        }
+        Err(error) => {
+            eprintln!(
+                "newt: warning: cannot re-read {kind} {shown} before migration: {error}; \
+                 loaded the new labels but left the file unchanged"
+            );
+            return Ok(migration.text);
+        }
+        Ok(_) => {}
     }
     match write(path, &migration.text) {
         Ok(()) => eprintln!("newt: migrated {kind} {shown}: {changes}"),
@@ -793,3 +835,7 @@ kimi = \"insistent\"
         assert_eq!(read_persona_file(&path).unwrap(), got, "idempotent on disk");
     }
 }
+
+#[cfg(test)]
+#[path = "psyche_import_regression_tests.rs"]
+mod regression_tests;
