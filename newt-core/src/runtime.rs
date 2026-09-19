@@ -50,7 +50,7 @@ pub struct RuntimeSettingsSnapshot {
     /// Effective cognition (override > persona > off). `None` means no
     /// backend-specific reasoning controls are requested.
     pub cognition: Option<Cognition>,
-    /// Effective tenacity (the explicit choice, else Normal).
+    /// Effective tenacity (CLI > persona > exact family > config > Normal).
     pub tenacity: Tenacity,
     /// Effective initiative (CLI > persona > config/family > Measured).
     pub initiative: Initiative,
