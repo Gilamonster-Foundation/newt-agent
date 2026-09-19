@@ -9,6 +9,19 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — cognition levels renamed (psyche effort dials, slice 1a)
+
+- **Cognition is now `zen` / `rational` / `thoughtful` (default) /
+  `meticulous`**, replacing `glancing` / `pondering` / `deliberating` /
+  `contemplating`. The `reasoning.effort` mapping (minimal … high) is
+  unchanged, and so is the headless contract version. `--cognition` and
+  `/psyche cognition` reject an old label and name its replacement.
+- **Existing files are rewritten once, on load.** A persona whose front-matter
+  names an old label is rewritten in place (only that value changes) and newt
+  prints one line saying so. A conversation's pinned cognition is rewritten
+  in the store on the first open. See
+  [`docs/design/psyche-effort-dials.md`](docs/design/psyche-effort-dials.md).
+
 ### Fixed — a hosted model with a local family name is no longer priced as free (#2313)
 
 - A model id starting with a local family name (qwen, llama, mistral,
