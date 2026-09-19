@@ -8,15 +8,15 @@ Newt is an experimental agentic coder in Rust, built for local models first.
 The default build contains no cloud provider; hosted providers are opt-in
 plugins added at build time.
 
-Every tool call runs under a capability the operator grants: what the call
-may read, write, run, and reach on the network.
+The operator grants each tool call a capability: what it may read, write,
+run, and reach on the network.
 [`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle)
-enforces it, in the kernel where the OS allows. An explicit grant can be
-narrowed before a run and audited after.
+enforces the grant, in the kernel where the OS allows. The operator can narrow
+it before a run and audit it after.
 
-Newt is measured, not described. Each model's score on a fixed Terminal-Bench
-task set, confined and unconfined, is a ratchet that may not fall between
-releases: [Terminal-Bench scoreboard](./docs/terminal-bench.md).
+We measure Newt rather than describe it. We score each model on a fixed
+Terminal-Bench task set, confined and unconfined, and no release may lower a
+score: [Terminal-Bench scoreboard](./docs/terminal-bench.md).
 
 ## Install
 
