@@ -848,13 +848,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             output_allowance: o_opt.and_then(|o| o.output_allowance),
             run_allowance,
             features: o_opt.map(|o| o.features),
-            // The headless driver always arms action nudges; whether the loop
-            // has a gate at all depends on the wire and SmartHarness.
-            verification: Some(newt_core::agentic::verification_receipt(
-                newt_core::agentic::verification_gate_present(kind, api, smart_manifest.is_some()),
-                newt_core::agentic::self_verify_enabled(),
-                newt_core::agentic::verify_outcomes_requested(),
-            )),
+            verification: o_opt.and_then(|o| o.verification.clone()),
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
             required: &args.require_feature,
         },
