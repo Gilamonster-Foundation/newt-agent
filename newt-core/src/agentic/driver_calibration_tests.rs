@@ -68,6 +68,8 @@ async fn consecutive_requests(usage: ReportedUsage) -> Vec<Value> {
         BackendKind::Openai,
         "driver-calibration-test-no-workspace",
     );
+    // Pin the wire: `new` follows NEWT_OPENAI_API, which parallel tests set.
+    config.openai_api = crate::OpenAiApi::ChatCompletions;
     config.num_ctx = Some(65_536);
     config.max_tool_rounds = 2;
     config.workflow_grace_rounds = 0;
@@ -191,6 +193,8 @@ async fn inferred_overflows_cannot_permanently_refuse_the_next_small_driver_prom
         BackendKind::Openai,
         "driver-calibration-test-no-workspace",
     );
+    // Pin the wire: `new` follows NEWT_OPENAI_API, which parallel tests set.
+    config.openai_api = crate::OpenAiApi::ChatCompletions;
     config.num_ctx = Some(65_536);
     config.max_tool_rounds = 2;
     config.workflow_grace_rounds = 0;
