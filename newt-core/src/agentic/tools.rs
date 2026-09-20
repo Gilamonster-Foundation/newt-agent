@@ -37,6 +37,8 @@ pub use output_budget::{
 mod catalog;
 mod dispatch;
 mod file_capture;
+mod io_failure;
+use io_failure::IoFailure;
 mod file_change;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
@@ -462,13 +464,13 @@ fn object_bound_target<'a>(
 
 /// Unconfined directory listing via `std::fs` — the `Scope::All` / non-Linux /
 /// #263-gate-approved path. One owner so the three call sites don't drift.
-fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, String> {
+fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, IoFailure> {
     match std::fs::read_dir(full) {
-        Ok(entries) => Ok(entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect()),
-        Err(e) => Err(format!("error: {e}")),
+        Ok(entries) => io_failure::directory_names(
+            entries
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned())),
+        ),
+        Err(e) => Err(IoFailure::io(&e, format!("error: {e}"))),
     }
 }
 
@@ -489,15 +491,14 @@ fn object_bound_read(
     path: &str,
     full: &std::path::Path,
     full_str: &str,
-) -> Result<String, String> {
+) -> Result<String, IoFailure> {
     use std::io::Read;
     match object_bound_target(scope, full_str) {
         // The gate already permitted this read, so `None` here would be a logic
         // error (the two matchers disagreeing); fail closed rather than read.
-        None => Err(denied_fs_result(axis, path)),
-        Some(None) => {
-            std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
-        }
+        None => Err(IoFailure::denied(denied_fs_result(axis, path))),
+        Some(None) => std::fs::read_to_string(full)
+            .map_err(|e| IoFailure::io(&e, format!("error reading {path}: {e}"))),
         Some(Some((root, rel))) => {
             let read = crate::fs_cap::WorkspaceDir::open_granted_file(
                 std::path::Path::new(root),
@@ -511,8 +512,10 @@ fn object_bound_read(
             });
             match read {
                 Ok(s) => Ok(s),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
-                Err(e) => Err(format!("error reading {path}: {e}")),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(IoFailure::denied(denied_fs_result(axis, path)))
+                }
+                Err(e) => Err(IoFailure::io(&e, format!("error reading {path}: {e}"))),
             }
         }
     }
@@ -528,9 +531,9 @@ fn object_bound_list(
     path: &str,
     full: &std::path::Path,
     full_str: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, IoFailure> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_read", path)),
+        None => Err(IoFailure::denied(denied_fs_result("fs_read", path))),
         Some(None) => std_list_dir(full),
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
@@ -540,8 +543,10 @@ fn object_bound_list(
                     .into_iter()
                     .map(|n| n.to_string_lossy().into_owned())
                     .collect()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_read", path)),
-                Err(e) => Err(format!("error: {e}")),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(IoFailure::denied(denied_fs_result("fs_read", path)))
+                }
+                Err(e) => Err(IoFailure::io(&e, format!("error: {e}"))),
             }
         }
     }
@@ -557,8 +562,9 @@ fn object_bound_read(
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
-) -> Result<String, String> {
-    std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+) -> Result<String, IoFailure> {
+    std::fs::read_to_string(full)
+        .map_err(|e| IoFailure::io(&e, format!("error reading {path}: {e}")))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -567,17 +573,18 @@ fn object_bound_list(
     _path: &str,
     full: &std::path::Path,
     _full_str: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, IoFailure> {
     std_list_dir(full)
 }
 
 /// Unconfined write via `std::fs` (creating parents) — the `Scope::All` /
 /// non-Linux / #263-gate-approved path. One owner so the call sites don't drift.
-fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), String> {
+fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), IoFailure> {
     if let Some(parent) = full.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(full, content).map_err(|e| format!("error writing {path}: {e}"))
+    std::fs::write(full, content)
+        .map_err(|e| IoFailure::io(&e, format!("error writing {path}: {e}")))
 }
 
 /// Object-bound write of `content` to `full` (the workspace-joined model path)
@@ -596,10 +603,10 @@ fn object_bound_write(
     full: &std::path::Path,
     full_str: &str,
     content: &str,
-) -> Result<(), String> {
+) -> Result<(), IoFailure> {
     use std::io::Write;
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result(axis, path)),
+        None => Err(IoFailure::denied(denied_fs_result(axis, path))),
         Some(None) => std_write(full, path, content),
         Some(Some((root, rel))) => {
             let write =
@@ -610,8 +617,10 @@ fn object_bound_write(
                     });
             match write {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
-                Err(e) => Err(format!("error writing {path}: {e}")),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(IoFailure::denied(denied_fs_result(axis, path)))
+                }
+                Err(e) => Err(IoFailure::io(&e, format!("error writing {path}: {e}"))),
             }
         }
     }
@@ -625,7 +634,7 @@ fn object_bound_write(
     full: &std::path::Path,
     _full_str: &str,
     content: &str,
-) -> Result<(), String> {
+) -> Result<(), IoFailure> {
     std_write(full, path, content)
 }
 
@@ -640,17 +649,20 @@ fn object_bound_delete(
     path: &str,
     full: &std::path::Path,
     full_str: &str,
-) -> Result<(), String> {
+) -> Result<(), IoFailure> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_write", path)),
-        Some(None) => std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}")),
+        None => Err(IoFailure::denied(denied_fs_result("fs_write", path))),
+        Some(None) => std::fs::remove_file(full)
+            .map_err(|e| IoFailure::io(&e, format!("error deleting {path}: {e}"))),
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
                 .and_then(|dir| dir.unlink(&rel))
             {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
-                Err(e) => Err(format!("error deleting {path}: {e}")),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(IoFailure::denied(denied_fs_result("fs_write", path)))
+                }
+                Err(e) => Err(IoFailure::io(&e, format!("error deleting {path}: {e}"))),
             }
         }
     }
@@ -662,8 +674,8 @@ fn object_bound_delete(
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
-) -> Result<(), String> {
-    std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}"))
+) -> Result<(), IoFailure> {
+    std::fs::remove_file(full).map_err(|e| IoFailure::io(&e, format!("error deleting {path}: {e}")))
 }
 
 /// Whether `find`'s recursive-read root is contained to the WORKSPACE. Unlike
@@ -844,7 +856,11 @@ fn mutation_confirm_definition(question: &str) -> newt_interaction::InteractionD
 /// ([`build_tool_caveats`], #9), and where the kernel fence cannot be established
 /// the spawn is **refused** rather than run unconfined (#10). It is no longer a
 /// raw `sh -c` on the host.
-pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
+pub(crate) fn run_build_check(
+    cmd: &str,
+    workspace: &str,
+    execution: Option<&std::sync::OnceLock<crate::ExecOutcome>>,
+) -> String {
     use crate::confined_exec::{
         build_tool_caveats, ConstrainedExecutor, ExecOrigin, ExecRequest, NetGrant,
     };
@@ -874,7 +890,22 @@ pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
         req = req.env("PATH", path);
     }
 
-    match ConstrainedExecutor::run(&req) {
+    let result = ConstrainedExecutor::run(&req);
+    let outcome = match &result {
+        Ok(out) if out.timed_out => Some(crate::ExecOutcome::TimedOut),
+        Ok(out) if out.success => Some(crate::ExecOutcome::Passed),
+        Ok(_) => Some(crate::ExecOutcome::Failed),
+        Err(crate::confined_exec::ExecRefused::Authorize(_)) => Some(crate::ExecOutcome::Denied),
+        Err(crate::confined_exec::ExecRefused::ConfinementUnenforceable(_)) => {
+            Some(crate::ExecOutcome::Unavailable)
+        }
+        // Spawn also covers errors draining output after partial execution.
+        Err(crate::confined_exec::ExecRefused::Spawn(_)) => None,
+    };
+    if let (Some(slot), Some(outcome)) = (execution, outcome) {
+        let _ = slot.set(outcome);
+    }
+    match result {
         Ok(out) if out.success => "  ✓ build check passed".to_string(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2532,6 +2563,7 @@ async fn execute_authorized_tool(
         live_tool_output,
         completed_spill_renderer: _,
         execution,
+        build_check_execution,
     } = collab;
     let smart_harness = invocation.map(|call| call.harness());
     // #2315: hand the shell's execution class to the funnel, return the text.
@@ -3337,10 +3369,11 @@ async fn execute_authorized_tool(
             let read = if scope_permits {
                 object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
             } else {
-                std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
+                std::fs::read_to_string(&full).map_err(|e| IoFailure::io(&e, format!("error reading {path}: {e}")))
             };
             match read {
                 Ok(contents) => {
+                    if let Some(slot) = execution { let _ = slot.set(crate::ExecOutcome::Passed); }
                     // #719: window + cap the MODEL-facing payload (the on-screen
                     // display is capped separately) so one read of a large file
                     // can't saturate the context window and abandon the task.
@@ -3350,7 +3383,7 @@ async fn execute_authorized_tool(
                     // budget so read_file and run_command share one cap.
                     paginate_read(&contents, offset, limit, max_output_tokens())
                 }
-                Err(tool_output) => tool_output,
+                Err(tool_output) => tool_output.record(execution),
             }
         }
 
@@ -3521,11 +3554,11 @@ async fn execute_authorized_tool(
                             }
                         };
                         let check = build_check_cmd
-                            .map(|cmd| run_build_check(cmd, workspace))
+                            .map(|cmd| run_build_check(cmd, workspace, build_check_execution))
                             .unwrap_or_default();
                         receipt.present(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
-                    Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                    Err(tool_output) => receipt.present(file_capture::failure(tool_output.record(execution), ""), "", presentation),
                 }
             } else {
                 format!("user declined to write {path}")
@@ -3596,7 +3629,7 @@ async fn execute_authorized_tool(
             let delete_result = if scope_permits {
                 object_bound_delete(&caveats.fs_write, path, &full, &full_str)
             } else {
-                std::fs::remove_file(&full).map_err(|e| format!("error deleting {path}: {e}"))
+                std::fs::remove_file(&full).map_err(|e| IoFailure::io(&e, format!("error deleting {path}: {e}")))
             };
             let receipt_after = file_capture::capture(&caveats.fs_read, &full);
             let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
@@ -3646,11 +3679,11 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, workspace))
+                        .map(|cmd| run_build_check(cmd, workspace, build_check_execution))
                         .unwrap_or_default();
                     receipt.present(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output.record(execution), ""), "", presentation),
             }
         }
 
@@ -3700,10 +3733,11 @@ async fn execute_authorized_tool(
             let read = file_capture::read_for_edit(mutation_scope, &full, path);
             let existing = match read {
                 Ok(s) => s,
-                Err(tool_output) => return tool_output,
+                Err(tool_output) => return tool_output.record(execution),
             };
             let count = existing.matches(old_string).count();
             if count == 0 {
+                if let Some(slot) = execution { let _ = slot.set(crate::ExecOutcome::Failed); }
                 // Show the file's actual head so the model can copy the exact
                 // text and self-correct on the next call — instead of guessing
                 // old_string blind and looping (the failure mode that left a
@@ -3834,11 +3868,11 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, workspace))
+                        .map(|cmd| run_build_check(cmd, workspace, build_check_execution))
                         .unwrap_or_default();
                     receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total)"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output.record(execution), ""), "", presentation),
             }
         }
 
@@ -3877,10 +3911,11 @@ async fn execute_authorized_tool(
             };
             match listing {
                 Ok(mut names) => {
+                    if let Some(slot) = execution { let _ = slot.set(crate::ExecOutcome::Passed); }
                     names.sort();
                     names.join("\n")
                 }
-                Err(tool_output) => tool_output,
+                Err(tool_output) => tool_output.record(execution),
             }
         }
 
