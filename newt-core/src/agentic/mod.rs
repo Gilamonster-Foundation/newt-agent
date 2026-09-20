@@ -8855,11 +8855,12 @@ async fn anthropic_dispatch_round(
         // streams thinking as its own SSE action rather than inline `<think>`,
         // but the operator-facing question — "how much of this do I want in my
         // scrollback" — is identical, so it gets the identical answer.
-        let anth_budget = if thinking_mode() == crate::ThinkingMode::Fold {
-            display::spill_lines()
-        } else {
-            0
-        };
+        let anth_budget =
+            if display::with_migration_notices(thinking_mode) == crate::ThinkingMode::Fold {
+                display::spill_lines()
+            } else {
+                0
+            };
         let mut anth_reason = ReasoningTrickle::default();
         let mut started = false;
         let mut transport_break: Option<String> = None;
@@ -12889,7 +12890,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 /// `NEWT_THINKING` in the form would show `on` while `[tui] thinking = "off"`
 /// quietly won (#1981).
 #[must_use]
-pub fn thinking_mode() -> crate::ThinkingMode {
+pub fn thinking_mode(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> crate::ThinkingMode {
     match std::env::var("NEWT_THINKING").ok().as_deref() {
         Some("off") => return crate::ThinkingMode::Off,
         // `stream` asks for the UNBOUNDED cargo-style trickle by name; plain
@@ -12898,7 +12899,7 @@ pub fn thinking_mode() -> crate::ThinkingMode {
         Some("on" | "fold") => return crate::ThinkingMode::Fold,
         _ => {}
     }
-    crate::Config::resolve()
+    crate::Config::resolve(report)
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.thinking)
@@ -12914,7 +12915,7 @@ pub fn thinking_mode() -> crate::ThinkingMode {
 /// error anywhere — the gate-collapse this split exists to prevent.
 #[must_use]
 pub fn thinking_stream_enabled() -> bool {
-    thinking_mode() != crate::ThinkingMode::Off
+    display::with_migration_notices(thinking_mode) != crate::ThinkingMode::Off
 }
 
 /// Commit a complete reasoning body as a fold block.
@@ -12930,13 +12931,13 @@ fn commit_reasoning_fold(
     retain: Option<&dyn CompletedSpillRenderer>,
     color: bool,
 ) {
-    if thinking_mode() == crate::ThinkingMode::Off {
+    if display::with_migration_notices(thinking_mode) == crate::ThinkingMode::Off {
         return;
     }
     let Some(reasoning) = reasoning.filter(|r| !r.trim().is_empty()) else {
         return;
     };
-    let budget = if thinking_mode() == crate::ThinkingMode::Fold {
+    let budget = if display::with_migration_notices(thinking_mode) == crate::ThinkingMode::Fold {
         display::spill_lines()
     } else {
         0
