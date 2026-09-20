@@ -1792,3 +1792,11 @@ pub(crate) use terminal_acceptance::cockpit_pager_case;
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case, panel_resize_case,
 };
+
+#[cfg(test)]
+#[path = "presenter_migration_acceptance.rs"]
+mod migration_acceptance;
+#[cfg(test)]
+pub(crate) use migration_acceptance::{
+    cockpit_migration_case, persona_migration_case, startup_migration_case,
+};
