@@ -14,6 +14,7 @@ mod codex_env;
 mod color;
 mod crew_form;
 mod help;
+mod migration_notices;
 mod navigator_cmds;
 mod session_capability;
 // `chat.rs` establishes and reapplies the session capability, and
@@ -649,7 +650,8 @@ pub fn run_code(
     // Color: NEWT_COLOR (--color/--mono) > NO_COLOR/TERM=dumb > [tui] color > auto
     // (issue #527). Config is folded in here, where a session reads it; the
     // `color_supported_with` shim (used pre-config, e.g. the wizard) stays Auto.
-    let cfg_color = newt_core::Config::resolve()
+    let mut migration_notices = crate::migration_notices::Pending::default();
+    let cfg_color = newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.color)
@@ -674,12 +676,13 @@ pub fn run_code(
         // Background work starts AT splash entry: a configured box pre-warms
         // its backend probe while the logo shows; run_chat consumes the result
         // when (and only when) the resolved choice still matches.
-        let prewarm = spawn_backend_prewarm();
+        let prewarm = spawn_backend_prewarm(&mut |notice| migration_notices.report(notice));
         // The unboxed state names the splash context ("initial setup") —
         // computed before `setup` is consumed below.
-        let unconfigured = newt_core::Config::resolve()
-            .map(|c| c.is_unconfigured())
-            .unwrap_or(true);
+        let unconfigured =
+            newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
+                .map(|c| c.is_unconfigured())
+                .unwrap_or(true);
         let context = if unconfigured || setup.is_some() {
             "initial setup"
         } else {
@@ -700,6 +703,7 @@ pub fn run_code(
         // inside the alternate screen. Explicit rather than implicit at the end
         // of the block so the ordering stays visible to a reader.
         drop(screen);
+        migration_notices.flush();
         if !cont {
             if let Some(pw) = prewarm {
                 pw.handle.abort();
@@ -717,6 +721,9 @@ pub fn run_code(
         return run_chat(&workspace, color, persona, altitude, crew_runner, prewarm);
     }
 
+    // No splash owns the terminal on this branch. Deliver before the wizard
+    // or either run_chat path, including inline setup's early return.
+    migration_notices.flush();
     // No-splash paths keep the pre-splash order exactly (wizard first): CI,
     // piped, and --no-splash launches see no behavior change.
     wizard::maybe_run(color)?;
@@ -765,9 +772,11 @@ pub(crate) fn probe_timeout_secs(url: &str) -> u64 {
 /// Start the pre-warm probe for the resolved backend choice, if this box is
 /// configured (an unconfigured box has nothing real to probe — the wizard is
 /// about to change everything) and a tokio runtime is available.
-fn spawn_backend_prewarm() -> Option<Prewarm> {
+fn spawn_backend_prewarm(
+    report: &mut dyn FnMut(newt_core::tty::Notice<'static>),
+) -> Option<Prewarm> {
     let runtime = tokio::runtime::Handle::try_current().ok()?;
-    let cfg = newt_core::Config::resolve_runtime_unpublished().ok()?;
+    let cfg = newt_core::Config::resolve_runtime_unpublished(report).ok()?;
     if cfg.is_unconfigured() {
         return None;
     }
@@ -4330,10 +4339,11 @@ pub(crate) fn resolve_backend_choice(
 /// falls back to the AS-IS default config so command surfaces still
 /// render; the chat startup path prints its own visible line.
 pub(crate) fn resolve_runtime_or_default() -> newt_core::ResolvedConfig {
-    newt_core::Config::resolve_runtime_unpublished().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "config resolution failed — running on built-in defaults");
-        newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
-    })
+    crate::migration_notices::read(|report| newt_core::Config::resolve_runtime_unpublished(report))
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "config resolution failed — running on built-in defaults");
+            newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
+        })
 }
 
 /// Surface the resolved OpenAI API surface to the agent loop via
@@ -4695,65 +4705,70 @@ impl PersonaStore {
     }
 
     fn load(&self, name: &str) -> anyhow::Result<Persona> {
-        self.ensure_defaults()?;
-        let name = normalize_persona_name(name)?;
-        let path = self.dir.join(format!("{name}.md"));
-        let raw = match newt_core::psyche_import::read_persona_file(&path) {
-            Ok(raw) => raw,
-            Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
-        };
-        // Parse optional `+++` front-matter into a role profile. A plain `.md`
-        // with no front-matter yields a prompt-only profile (backward
-        // compatible). The injected `prompt` is the markdown BODY, so
-        // front-matter never leaks into the system prompt.
-        let profile = newt_core::RoleProfile::parse(&raw)
-            .map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
-        if profile.prompt.is_empty() {
-            anyhow::bail!("persona `{name}` is empty: {}", path.display());
-        }
-        Ok(Persona {
-            name,
-            prompt: profile.prompt.clone(),
-            path,
-            profile,
+        crate::migration_notices::read(|report| {
+            self.ensure_defaults()?;
+            let name = normalize_persona_name(name)?;
+            let path = self.dir.join(format!("{name}.md"));
+            let raw = match newt_core::psyche_import::read_persona_file(&path, report) {
+                Ok(raw) => raw,
+                Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
+            };
+            // Parse optional `+++` front-matter into a role profile. A plain `.md`
+            // with no front-matter yields a prompt-only profile (backward
+            // compatible). The injected `prompt` is the markdown BODY, so
+            // front-matter never leaks into the system prompt.
+            let profile = newt_core::RoleProfile::parse(&raw)
+                .map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
+            if profile.prompt.is_empty() {
+                anyhow::bail!("persona `{name}` is empty: {}", path.display());
+            }
+            Ok(Persona {
+                name,
+                prompt: profile.prompt.clone(),
+                path,
+                profile,
+            })
         })
     }
 
     fn list(&self) -> anyhow::Result<Vec<PersonaSummary>> {
-        self.ensure_defaults()?;
-        let mut personas = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
+        crate::migration_notices::read(|report| {
+            self.ensure_defaults()?;
+            let mut personas = Vec::new();
+            for entry in std::fs::read_dir(&self.dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let raw =
+                    newt_core::psyche_import::read_persona_file(&path, report).unwrap_or_default();
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                // Skip files whose front-matter is malformed in the listing rather
+                // than failing the whole list; `load` surfaces the error on use.
+                let Ok(profile) = newt_core::RoleProfile::parse(&raw) else {
+                    continue;
+                };
+                let persona = Persona {
+                    name: name.to_string(),
+                    prompt: profile.prompt.clone(),
+                    path: path.clone(),
+                    profile,
+                };
+                let description = persona.description();
+                personas.push(PersonaSummary {
+                    name: persona.name,
+                    description,
+                });
             }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let raw = newt_core::psyche_import::read_persona_file(&path).unwrap_or_default();
-            if raw.trim().is_empty() {
-                continue;
-            }
-            // Skip files whose front-matter is malformed in the listing rather
-            // than failing the whole list; `load` surfaces the error on use.
-            let Ok(profile) = newt_core::RoleProfile::parse(&raw) else {
-                continue;
-            };
-            let persona = Persona {
-                name: name.to_string(),
-                prompt: profile.prompt.clone(),
-                path: path.clone(),
-                profile,
-            };
-            let description = persona.description();
-            personas.push(PersonaSummary {
-                name: persona.name,
-                description,
-            });
-        }
-        personas.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(personas)
+            personas.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(personas)
+        })
     }
 
     fn list_message(&self) -> anyhow::Result<String> {
@@ -5284,7 +5299,7 @@ fn build_system_prompt_with_persona(
     // tool. Skills come from the one resolver `use_skill` also reads (#2331):
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
-    let skills_dirs = newt_core::Config::resolve()
+    let skills_dirs = crate::migration_notices::read(|report| newt_core::Config::resolve(report))
         .map(|c| c.skill_search_dirs())
         .unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
@@ -8295,7 +8310,7 @@ pub(crate) fn build_adjudicator(
 /// resolver falls back to `Config::resolve()` only when nobody has.
 fn markdown_enabled(cfg: &newt_core::Config, color: bool) -> bool {
     let mode = if newt_core::config::markdown_is_session_pinned() {
-        newt_core::config::session_markdown_mode()
+        crate::migration_notices::read(newt_core::config::session_markdown_mode)
     } else {
         cfg.tui.as_ref().map(|t| t.markdown).unwrap_or_default()
     };
@@ -8327,7 +8342,9 @@ fn context_manager(
 /// owns the precedence now, so this asks rather than being told.
 fn compaction_trigger_policy(cfg: &newt_core::Config) -> newt_core::CompactionTriggerPolicy {
     if newt_core::config::compaction_trigger_is_session_pinned() {
-        return newt_core::config::session_compaction_trigger_policy();
+        return crate::migration_notices::read(
+            newt_core::config::session_compaction_trigger_policy,
+        );
     }
     configured_compaction_trigger_policy(cfg)
 }
