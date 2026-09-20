@@ -507,8 +507,8 @@ pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<
 
     let env = crate::mcp_cmd::parse_env_pairs(&args.env)?;
     let cfg = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
     let workspace = std::env::current_dir().context("cannot resolve the current directory")?;
     // The shared probe leash (#1292 hard rule): exactly doctor's policy —
