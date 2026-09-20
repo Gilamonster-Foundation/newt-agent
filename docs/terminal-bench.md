@@ -35,3 +35,49 @@ it measures, one commit could move both at once.
 How the runs are produced: [`scripts/eval/harbor/README.md`](../scripts/eval/harbor/README.md).
 The block between the markers is rewritten by `just bench-publish`
 (`scripts/eval/bench_scoreboard.py render`); edit the manifest, not the table.
+
+
+## Headless policy identity
+
+New headless traces declare observability contract version `3`. Their existing
+`agent_version` field carries the opaque `VERSION_WITH_COMMIT` build string,
+including any source suffix or dirty marker. Preserve it exactly: package
+semver alone cannot distinguish different implementations of the same dials.
+An independent candidate binary digest is still needed to identify the exact
+executable; a build string is not binary authentication.
+
+The existing `config_digest` field is a `content-addressable` structured
+`ContentId` minted from canonical DAG-CBOR over the **complete emitted
+`effective_config` JSON value**. Unknown nested members, array order and the
+difference between absence and explicit null participate. JSON whitespace and
+object key order do not. There is no selected-key hash or default insertion.
+Encoding failure refuses the record before the events file is opened, rather
+than emitting a partial identity.
+
+The configuration retains projected `cognition` and separately records captured
+`semantic_cognition`; a captured null is not proof of an operator-off selection.
+Admitted Responses effort, instantiated verification and allowance, numeric
+initiative threshold, and existing output/run/round limits describe the policy
+actually supplied to the turn. The same verification policy remains in the
+existing receipt; completion and verification results remain execution evidence.
+A missing outcome does not manufacture instantiated-policy evidence. This
+contract does not claim that future cognition techniques have been implemented.
+The `wire_api` field describes the configured typed dispatch selection, even if
+no request occurs; it does not manufacture request or technique evidence.
+
+Smart configuration contains the immutable launch manifest, including starting
+CID and session configuration. Its final execution head remains available in
+`solve_result.smart_harness.head`. This is an explicit v3 correction: legacy
+configuration also contained that runtime head. Changing only the final head,
+answer, timing or build string cannot change configuration identity; changing a
+captured starting CID or configuration can.
+
+Historical v1/v2 records retain their original field meanings and receipts.
+Missing build/config identity is unknown, not equivalent to current defaults.
+Do not pool runs by dial labels when build or configuration identity differs or
+is unknown; compare model, fixture and contract identity as well. The independent
+consumer verifies claimed Newt v3 identity before binding a result. Keep the
+original readable events file beside the bound row: the row's digest cannot
+reconstruct the full configuration. Retention is caller-managed, and matrix
+attempt-count summaries are not policy-qualified rows. Identity proves which
+configuration was described, not model quality or provider authenticity.
