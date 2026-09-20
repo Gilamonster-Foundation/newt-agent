@@ -35,7 +35,7 @@ fn request(messages: &[Value]) -> CompressRequest<'_> {
 async fn overflow_reclaims_an_optional_third_tail_message_before_refusing() {
     let messages = fixture("newest tool result must stay whole");
     let mut state = super::super::CompressState::new();
-    let result = compress(request(&messages), None, &mut state, None)
+    let result = compress(request(&messages), None, &mut state, None, None)
         .await
         .unwrap();
     assert!(
@@ -66,9 +66,15 @@ async fn overflow_can_shrink_without_crossing_the_protected_prompt_floor() {
     let corrected_budget = 1_066;
     let mut input = request(&messages);
     input.budget = target(&messages, corrected_budget, est);
-    let result = compress(input, None, &mut super::super::CompressState::new(), None)
-        .await
-        .unwrap();
+    let result = compress(
+        input,
+        None,
+        &mut super::super::CompressState::new(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_ne!(
         result.action,
         CompressAction::Refused,
@@ -85,7 +91,7 @@ async fn overflow_can_shrink_without_crossing_the_protected_prompt_floor() {
 async fn overflow_never_trims_the_newest_result_to_force_a_fit() {
     let messages = fixture(&"observed external result ".repeat(1_000));
     let mut state = super::super::CompressState::new();
-    let result = compress(request(&messages), None, &mut state, None)
+    let result = compress(request(&messages), None, &mut state, None, None)
         .await
         .unwrap();
     assert!(result.tokens_after > 1_000);
@@ -99,14 +105,14 @@ async fn overflow_respects_append_only_and_endpoint_replay_protection() {
     let mut state = super::super::CompressState::new();
     let mut input = request(&messages);
     input.rewrites_history = false;
-    let append_only = compress(input, None, &mut state, None).await.unwrap();
+    let append_only = compress(input, None, &mut state, None, None).await.unwrap();
     assert_eq!(append_only.action, CompressAction::Refused);
     assert_eq!(append_only.refusal, Some(RefusalReason::AppendOnly));
     assert_eq!(append_only.messages, messages);
 
     let mut input = request(&messages);
     input.replay_protected_tail_len = 3;
-    let replay = compress(input, None, &mut state, None).await.unwrap();
+    let replay = compress(input, None, &mut state, None, None).await.unwrap();
     assert!(replay.tokens_after > 1_000);
     assert!(replay.messages.ends_with(&messages[3..]));
 }
@@ -162,6 +168,7 @@ async fn overflow_smart_projection_cannot_skip_elision_due_to_per_message_roundi
         None,
         &mut super::super::CompressState::new(),
         Some(&harness),
+        None,
     )
     .await
     .expect("a removable source must be projected despite token/byte rounding differences");
@@ -227,6 +234,7 @@ async fn overflow_smart_responses_projection_cannot_skip_elision_due_to_rounding
         false,
         Some(&harness),
         true,
+        None,
     )
     .await;
     assert!(
