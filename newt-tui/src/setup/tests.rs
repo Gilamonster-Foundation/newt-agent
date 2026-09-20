@@ -809,7 +809,7 @@ fn detected_setup_writes_all_backends_and_preserves_existing_config() {
         std::fs::read_to_string(path.with_file_name("config.toml.bak")).unwrap(),
         "# keep this comment\ndefault_backend = \"old\"\n\n[tui]\nno_splash = true\n"
     );
-    let config = Config::load(&path).unwrap();
+    let config = crate::migration_notices::read(|report| Config::load(&path, report)).unwrap();
     assert_eq!(
         config.default_backend.as_deref(),
         Some("dgx1-home-arpa-8000")
@@ -857,7 +857,7 @@ fn detected_setup_suffixes_a_colliding_name_without_overwriting() {
         Some("dgx1-home-arpa-8000-2.toml")
     );
     assert_eq!(
-        Config::load(&config_path)
+        crate::migration_notices::read(|report| Config::load(&config_path, report))
             .unwrap()
             .default_backend
             .as_deref(),
@@ -900,7 +900,7 @@ fn detected_setup_reuses_a_matching_dropin_byte_for_byte() {
     assert_eq!(std::fs::read_to_string(&existing).unwrap(), hand_authored);
     assert!(!backend_dir.join("dgx1-home-arpa-8080.toml").exists());
     assert_eq!(
-        Config::load(&config_path)
+        crate::migration_notices::read(|report| Config::load(&config_path, report))
             .unwrap()
             .default_backend
             .as_deref(),
@@ -987,7 +987,7 @@ fn detected_setup_preserves_but_does_not_select_a_stale_operator_dropin() {
     assert_eq!(std::fs::read_to_string(existing).unwrap(), hand_authored);
     assert_eq!(written.len(), 1);
     assert_eq!(
-        Config::load(&config_path)
+        crate::migration_notices::read(|report| Config::load(&config_path, report))
             .unwrap()
             .default_backend
             .as_deref(),
@@ -1674,7 +1674,8 @@ async fn target_flow_probes_multiple_ports_and_writes_each_live_endpoint() {
         2,
         "one drop-in per live endpoint"
     );
-    let config = Config::load(&config_path).unwrap();
+    let config =
+        crate::migration_notices::read(|report| Config::load(&config_path, report)).unwrap();
     assert_eq!(
         config.default_backend.as_deref(),
         Some(format!("127-0-0-1-{}", vllm.address().port()).as_str())
@@ -2025,7 +2026,7 @@ async fn ollama_flow_writes_config() {
     let console = ScriptedConsole::new(&["1", &server.uri(), "2", "y"]);
     run_with(&console.operator(), &client, &path).await.unwrap();
 
-    let cfg = Config::load(&path).unwrap();
+    let cfg = crate::migration_notices::read(|report| Config::load(&path, report)).unwrap();
     assert!(cfg.dgx.is_none(), "no legacy [dgx] block (#1140)");
     assert_eq!(cfg.default_backend.as_deref(), Some("default"));
     let b = read_dropin(&path, "default");
@@ -2150,7 +2151,7 @@ async fn two_backends_in_one_sitting_with_default_pick() {
         .with_file_name("backends")
         .join(format!("{host2_name}.toml"))
         .exists());
-    let cfg = Config::load(&cfg_path).unwrap();
+    let cfg = crate::migration_notices::read(|report| Config::load(&cfg_path, report)).unwrap();
     assert_eq!(
         cfg.default_backend.as_deref(),
         Some(host2_name.as_str()),
@@ -2180,7 +2181,7 @@ async fn custom_host_flow_detects_openai_backend() {
     run_with(&console.operator(), &client, &path).await.unwrap();
 
     let name = format!("127-0-0-1-{}", server.address().port());
-    let cfg = Config::load(&path).unwrap();
+    let cfg = crate::migration_notices::read(|report| Config::load(&path, report)).unwrap();
     assert_eq!(cfg.default_backend.as_deref(), Some(name.as_str()));
     let b = read_dropin(&path, &name);
     assert_eq!(b.kind, Some(BackendKind::Openai));
@@ -2246,7 +2247,7 @@ async fn manual_model_when_endpoint_unreachable() {
         "y",
     ]);
     run_with(&console.operator(), &client, &path).await.unwrap();
-    let cfg = Config::load(&path).unwrap();
+    let cfg = crate::migration_notices::read(|report| Config::load(&path, report)).unwrap();
     assert_eq!(cfg.default_backend.as_deref(), Some("default"));
     assert_eq!(
         read_dropin(&path, "default").effective_model(),
@@ -3021,7 +3022,7 @@ async fn custom_host_requires_a_host() {
     let console = ScriptedConsole::new(&["2", "", &server.uri(), "1", "1", "y"]);
     run_with(&console.operator(), &client, &path).await.unwrap();
     let name = format!("127-0-0-1-{}", server.address().port());
-    let cfg = Config::load(&path).unwrap();
+    let cfg = crate::migration_notices::read(|report| Config::load(&path, report)).unwrap();
     assert_eq!(cfg.default_backend.as_deref(), Some(name.as_str()));
     assert_eq!(
         read_dropin(&path, &name).effective_model(),
