@@ -143,3 +143,41 @@ fn migration_library_persona_read_does_not_print() {
 fn migration_library_layered_decode_failure_retains_both_reports() {
     assert_library_does_not_print("layered-error");
 }
+
+/// The operator is shown the path they named, not the one the lock and the
+/// atomic write resolved it to. A symlinked directory reproduces on Linux what
+/// Windows canonicalization (`\\?\` prefix, 8.3 names) does: the resolved path
+/// differs from the caller's. Grounds the reporter's display/operate split.
+#[cfg(unix)]
+#[test]
+fn migration_notice_names_the_callers_path_not_the_resolved_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let old = "[tenacity]\ndefault = \"standard\"\n";
+    std::fs::write(real.join("config.toml"), old).unwrap();
+    let via_link = link.join("config.toml");
+
+    let mut notices = Vec::new();
+    newt_core::psyche_import::read_config_file(&via_link, true, &mut |notice| {
+        notices.push(notice);
+    })
+    .unwrap();
+
+    assert_eq!(notices.len(), 1);
+    let line = notices[0].line();
+    assert!(line.contains(via_link.to_str().unwrap()), "{line}");
+    assert!(
+        !line.contains(real.to_str().unwrap()),
+        "the resolved path leaked into the notice: {line}"
+    );
+    // The rewrite still landed on the file behind the link.
+    assert_eq!(
+        std::fs::read_to_string(real.join("config.toml")).unwrap(),
+        newt_core::psyche_import::migrate_config_text(old)
+            .unwrap()
+            .text
+    );
+}
