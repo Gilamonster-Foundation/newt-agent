@@ -47,13 +47,18 @@ pub fn read_config_file(
         ),
     };
     let destination = locked.as_ref().map(|(destination, _)| destination);
+    // Display the caller's path; operate on the resolved one. Canonicalization
+    // can add a verbatim `\\?\` prefix (Windows), expand 8.3 short names, or
+    // follow a symlinked directory, and the operator should be shown the path
+    // they actually named.
+    let operated = destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path);
     let mut reported = false;
     let result = read_migrating(
-        destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path),
+        path,
         "config",
         migrate_config_text,
         destination.is_some(),
-        |p| std::fs::read_to_string(p),
+        |_| std::fs::read_to_string(operated),
         |_, text| {
             destination
                 .expect("rewrite holds the config lock")
