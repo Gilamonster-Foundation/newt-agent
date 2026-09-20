@@ -2599,11 +2599,11 @@ Read the code and explain findings. Do not edit files or run commands.
         t.down(); // persona → model
         t.down(); // model → cognition
         t.down(); // cognition → tenacity
-        t.cycle(1); // #2451: normal → resolute (dirty)
+        t.cycle(1); // #2449: normal → grit (dirty)
         assert_eq!(close_outcome(true, &t), applied);
         assert_eq!(
             cli_tenacity(),
-            Some(Tenacity::Resolute),
+            Some(Tenacity::Grit),
             "the tenacity-only edit was applied, not silently discarded"
         );
         set_cli_tenacity(Tenacity::Normal);
