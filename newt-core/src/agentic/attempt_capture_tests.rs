@@ -4,6 +4,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn scope(ledger: &Mutex<AttemptLedger>) -> AttemptScope<'_> {
     AttemptScope {
+        admission: None,
         run_allowance: None,
         ledger,
         turn: "prompt:turn",
@@ -140,6 +141,7 @@ async fn a_dropped_attempt_is_cancelled_only_when_unsettled_under_an_interrupt()
         let ledger = Mutex::new(AttemptLedger::default());
         let flag = std::sync::atomic::AtomicBool::new(false);
         let scope = AttemptScope {
+            admission: None,
             cancel: Some(&flag),
             ..scope(&ledger)
         };
@@ -179,6 +181,7 @@ async fn an_exhausted_run_allowance_refuses_dispatch_before_any_request_is_sent(
     let ledger = Mutex::new(AttemptLedger::default());
     let allowance = crate::agentic::run_allowance::RunAllowance::new(0);
     let scope = AttemptScope {
+        admission: None,
         run_allowance: Some(&allowance),
         ..scope(&ledger)
     };
@@ -218,6 +221,7 @@ async fn a_dispatch_under_budget_succeeds_and_reserves_exactly_one_call() {
     let ledger = Mutex::new(AttemptLedger::default());
     let allowance = crate::agentic::run_allowance::RunAllowance::new(2);
     let scope = AttemptScope {
+        admission: None,
         run_allowance: Some(&allowance),
         ..scope(&ledger)
     };
