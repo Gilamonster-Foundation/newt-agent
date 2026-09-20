@@ -367,27 +367,29 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
     }
 
     if let Some(cmd) = instruction_verify_command(instruction) {
-        let marker = cmd.to_ascii_lowercase();
-        // #2374: the command runs as its last segment after the prefixes that
-        // run it unchanged, so `cd app && pytest` and `time make test` match
-        // their own runs; it takes that runner's non-run forms.
-        let runner = split_command(&cmd)
-            .iter()
-            .rev()
-            .find(|(segment, _)| !segment.is_empty())
-            .map(|(segment, _)| strip_transparent_prefix(segment).join(" "))
-            .filter(|runner| !runner.is_empty())
-            .unwrap_or_else(|| marker.clone());
-        let mut named = VerifyCheck::new(
+        checks.push(named_check(
+            &cmd,
             format!("the command the task says to run: `{cmd}`"),
-            &[marker.as_str()],
-        )
-        .runs_as(&[runner.as_str()])
-        .except(non_runs_for(&runner.to_ascii_lowercase()));
-        named.flags_only = true;
-        checks.push(named);
+        ));
     }
     checks
+}
+
+fn named_check(cmd: &str, label: String) -> VerifyCheck {
+    let marker = cmd.to_ascii_lowercase();
+    // #2374: reuse the same invocation rules for explicit configured checks.
+    let runner = split_command(cmd)
+        .iter()
+        .rev()
+        .find(|(segment, _)| !segment.is_empty())
+        .map(|(segment, _)| strip_transparent_prefix(segment).join(" "))
+        .filter(|runner| !runner.is_empty())
+        .unwrap_or_else(|| marker.clone());
+    let mut named = VerifyCheck::new(label, &[marker.as_str()])
+        .runs_as(&[runner.as_str()])
+        .except(non_runs_for(&runner.to_ascii_lowercase()));
+    named.flags_only = true;
+    named
 }
 
 /// Pull a verify/run command the instruction spells out in backticks near a
@@ -739,13 +741,25 @@ enum Observed {
     Write,
 }
 
+/// Only executed evidence and its original objective survive host re-entry.
+/// This payload has no owner reference, so retaining it cannot form an Arc cycle.
+#[derive(Debug, Clone)]
+pub(crate) struct VerificationHistory {
+    entries: Vec<Observed>,
+    configured_checks: Vec<VerifyCheck>,
+    initial_tree: Option<ContentId>,
+    task: String,
+}
+
 /// The turn's ordered verification observations, fed at the per-tool-result
 /// funnel of every loop. Pairs each command with what it actually did, which
 /// neither the tool-event ledger (digested args, optional recorder) nor the
 /// message history (requests, never results) can.
 #[derive(Debug, Default, Clone)]
 pub struct VerificationLedger {
+    admission: Option<std::sync::Arc<super::turn_admission::TurnAdmission>>,
     entries: Vec<Observed>,
+    configured_checks: Vec<VerifyCheck>,
     /// Bounded workspace state before the turn. Unknown keeps inferred checks
     /// eligible; an unchanged workspace only needs explicit or attempted checks.
     initial_tree: Option<ContentId>,
@@ -769,6 +783,8 @@ impl VerificationLedger {
     pub(crate) fn for_turn(task: &str, result_aware: bool) -> Self {
         Self {
             entries: Vec::new(),
+            configured_checks: Vec::new(),
+            admission: None,
             initial_tree: None,
             task: task.to_string(),
             result_aware,
@@ -795,6 +811,49 @@ impl VerificationLedger {
         ledger
     }
 
+    pub(crate) async fn bind_admission(
+        &mut self,
+        admission: Option<std::sync::Arc<super::turn_admission::TurnAdmission>>,
+        workspace: &str,
+    ) {
+        if let Some(owner) = &admission {
+            if let Some(history) = owner.verification_history() {
+                self.entries = history.entries;
+                self.configured_checks = history.configured_checks;
+                self.initial_tree = history.initial_tree;
+                self.task = history.task;
+                // Files can change between host phases without record_write.
+                self.checks = None;
+            } else {
+                if self.initial_tree.is_none() {
+                    self.initial_tree = tree_state_off_worker(workspace).await;
+                }
+                owner.retain_verification_history(self.history());
+            }
+        }
+        // Keep this phase's policy: Plan approval may activate strict Act.
+        self.admission = admission;
+    }
+
+    fn history(&self) -> VerificationHistory {
+        VerificationHistory {
+            entries: self.entries.clone(),
+            configured_checks: self.configured_checks.clone(),
+            initial_tree: self.initial_tree,
+            task: self.task.clone(),
+        }
+    }
+
+    fn retain_history(&self) {
+        if let Some(owner) = &self.admission {
+            owner.retain_verification_history(self.history());
+        }
+    }
+
+    pub(crate) fn recovery_enabled(&self) -> bool {
+        self.admission.as_ref().is_some_and(|owner| owner.enabled())
+    }
+
     /// Workspace manifests alone do not make a permission, read, or external
     /// report turn a coding task. Retain explicitly named and attempted checks
     /// even without a mutation, including their failures and denials. Unknown
@@ -805,7 +864,13 @@ impl VerificationLedger {
         task: &str,
         requested: &[String],
     ) -> Option<Vec<VerifyCheck>> {
+        let task = if self.admission.is_some() {
+            &self.task
+        } else {
+            task
+        };
         let mut checks = detect_off_worker(workspace, task, self.required()).await?;
+        checks.extend(self.configured_checks.iter().cloned());
         if !self.policy.required
             && !checks.is_empty()
             && self.initial_tree.is_some()
@@ -831,6 +896,9 @@ impl VerificationLedger {
     async fn checks(&mut self, workspace: &str) -> &[VerifyCheck] {
         if self.checks.is_none() {
             self.checks = detect_off_worker(workspace, &self.task, self.required()).await;
+            if let Some(checks) = &mut self.checks {
+                checks.extend(self.configured_checks.iter().cloned());
+            }
         }
         self.checks.as_deref().unwrap_or_default()
     }
@@ -856,6 +924,7 @@ impl VerificationLedger {
             outcome,
             tree,
         });
+        self.retain_history();
     }
 
     /// Record a call that may have changed the workspace (and so created a
@@ -863,10 +932,37 @@ impl VerificationLedger {
     pub fn record_write(&mut self) {
         self.checks = None;
         self.entries.push(Observed::Write);
+        self.retain_history();
     }
 
-    /// The funnel's single call. A no-op unless result-aware mode is on, so the
-    /// default path does no extra work and no workspace scan.
+    /// The configured check is a distinct invocation after the file operation.
+    /// Normal keeps its previous optional-verification behavior unchanged.
+    pub(crate) async fn observe_build_check(
+        &mut self,
+        command: &str,
+        outcome: ExecOutcome,
+        workspace: &str,
+    ) {
+        if self.admission.is_none() {
+            return;
+        }
+        let check = named_check(command, format!("the configured build check: `{command}`"));
+        if !self.configured_checks.contains(&check) {
+            self.configured_checks.push(check);
+            self.checks = None;
+        }
+        self.observe(
+            "run_command",
+            &serde_json::json!({"command":command}),
+            outcome == ExecOutcome::Passed,
+            Some(outcome),
+            workspace,
+        )
+        .await;
+    }
+
+    /// The funnel's single call. Normal without result-aware verification stays
+    /// a no-op; retained recovery turns preserve evidence for later Act phases.
     pub(crate) async fn observe(
         &mut self,
         name: &str,
@@ -875,26 +971,54 @@ impl VerificationLedger {
         execution: Option<ExecOutcome>,
         workspace: &str,
     ) {
-        if !self.result_aware {
+        // Classify only an actually executed failing invocation. Optional
+        // verification controls proactive obligations, not this causal fact.
+        let failed_check = if self.recovery_enabled()
+            && matches!(execution, Some(ExecOutcome::Failed | ExecOutcome::TimedOut))
+            && super::dispatched_tool_name(name) == Some("run_command")
+        {
+            if let Some(command) = args["command"].as_str() {
+                self.checks(workspace).await.iter().any(|check| {
+                    check
+                        .invocation(command)
+                        .is_some_and(|invocation| invocation.evidence)
+                })
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if let Some(admission) = &self.admission {
+            admission.observe(execution, failed_check);
+        }
+        if !self.result_aware && self.admission.is_none() {
             return;
         }
         let _ = ok;
+        // Non-shell failures still reach recovery above, but their operation
+        // names are not shell commands. Preserve read-only mutation semantics
+        // even when a bounded tree snapshot is unavailable.
+        if super::dispatched_tool_name(name) != Some("run_command") {
+            if super::may_change_workspace(name, args) {
+                self.record_write();
+            }
+            return;
+        }
         match execution {
             Some(outcome) => {
-                let command = match args["command"].as_str() {
-                    Some(command) if super::dispatched_tool_name(name) == Some("run_command") => {
-                        command.to_string()
-                    }
-                    _ => format!("{name} {args}"),
+                let Some(command) = args["command"].as_str() else {
+                    self.record_write();
+                    return;
                 };
                 // A command other than a read or a plain run of a known check
                 // may have created a check (`cargo new`, a new test file).
                 let plain = self.checks.as_ref().is_some_and(|checks| {
                     checks
                         .iter()
-                        .any(|check| check.invocation(&command).is_some_and(|i| i.plain))
+                        .any(|check| check.invocation(command).is_some_and(|i| i.plain))
                 });
-                if !plain && !super::is_verification_read_command(&command) {
+                if !plain && !super::is_verification_read_command(command) {
                     self.checks = None;
                 }
                 // Hash only pass evidence for a detected check; any other
@@ -904,13 +1028,13 @@ impl VerificationLedger {
                         .checks(workspace)
                         .await
                         .iter()
-                        .any(|check| check.invocation(&command).is_some_and(|i| i.evidence));
+                        .any(|check| check.invocation(command).is_some_and(|i| i.evidence));
                 let tree = if evidence {
                     tree_state_off_worker(workspace).await
                 } else {
                     None
                 };
-                self.record_exec(&command, outcome, tree);
+                self.record_exec(command, outcome, tree);
             }
             // Every call that is not read-only may have changed the tree, ok or
             // not (a failed write can still leave partial bytes).
@@ -929,18 +1053,30 @@ impl VerificationLedger {
         workspace: &str,
         gate_on: bool,
         round: usize,
-        solve_obs: Option<&mut super::observability::SolveObservation>,
+        mut solve_obs: Option<&mut super::observability::SolveObservation>,
     ) -> (crate::TurnEndReason, Option<VerificationReport>) {
-        if !(self.result_aware && self.policy.gate_on(gate_on)) {
-            return (crate::TurnEndReason::RoundCap, None);
+        if !(self.result_aware && self.policy.gate_on(gate_on))
+            && !self
+                .admission
+                .as_ref()
+                .is_some_and(|owner| owner.has_unacknowledged_failed_check())
+        {
+            return (
+                self.recovery_cap_reason(crate::TurnEndReason::RoundCap, solve_obs),
+                None,
+            );
         }
+        let repairs_used = self
+            .admission
+            .as_ref()
+            .map_or(VERIFY_REPAIR_ALLOWANCE, |owner| owner.verification_used());
         let scanned = self.applicable_checks(workspace, &self.task, &[]).await;
         let (decision, report) = conclude(&Conclusion {
             checks: scanned.as_deref().unwrap_or_default(),
             requested: &[],
             ledger: self,
             tree_now: self.tree_now(workspace).await,
-            repairs_used: VERIFY_REPAIR_ALLOWANCE,
+            repairs_used,
             rounds_left: false,
         });
         let exhausted = decision == Decision::Stop(crate::TurnEndReason::RepairExhausted);
@@ -951,6 +1087,7 @@ impl VerificationLedger {
             _ if exhausted => crate::TurnEndReason::RepairExhausted,
             _ => crate::TurnEndReason::RoundCap,
         };
+        let reason = self.recovery_cap_reason(reason, solve_obs.as_deref_mut());
         if let Some(obs) = solve_obs.filter(|_| self.required() || exhausted || scanned.is_none()) {
             obs.behavior_signals
                 .push(super::observability::BehaviorSignal::Verification {
@@ -965,12 +1102,44 @@ impl VerificationLedger {
                         "round_cap"
                     }
                     .to_string(),
-                    repairs_used: VERIFY_REPAIR_ALLOWANCE,
+                    repairs_used,
                     allowance: VERIFY_REPAIR_ALLOWANCE,
                     report: report.clone(),
                 });
         }
-        (reason, self.required().then_some(report))
+        (
+            reason,
+            (self.required() || (self.recovery_enabled() && exhausted)).then_some(report),
+        )
+    }
+
+    fn recovery_cap_reason(
+        &self,
+        reason: crate::TurnEndReason,
+        solve_obs: Option<&mut super::observability::SolveObservation>,
+    ) -> crate::TurnEndReason {
+        let Some(owner) = &self.admission else {
+            return reason;
+        };
+        use super::turn_admission::CorrectionCause;
+        let cause = if reason == crate::TurnEndReason::RepairExhausted
+            || owner.has_unacknowledged_failed_check()
+        {
+            Some(CorrectionCause::FailedCheck)
+        } else if owner.has_unacknowledged_failure() {
+            Some(CorrectionCause::ToolFailure)
+        } else {
+            None
+        };
+        let reason = cause.map_or(reason, |cause| {
+            owner
+                .propose(cause, false, None)
+                .expect_err("no correction fits after the cap")
+        });
+        if let Some(obs) = solve_obs {
+            obs.behavior_signals.extend(owner.drain_signals());
+        }
+        reason
     }
 
     /// The current tree state, computed (off the async worker) only when some
@@ -1041,6 +1210,21 @@ pub(crate) struct Concluding<'a> {
     pub solve_obs: Option<&'a mut super::observability::SolveObservation>,
 }
 
+impl Concluding<'_> {
+    pub(crate) fn reborrow(&mut self) -> Concluding<'_> {
+        Concluding {
+            cancel: self.cancel,
+            messages: self.messages,
+            workspace: self.workspace,
+            task: self.task,
+            rounds_left: self.rounds_left,
+            round: self.round,
+            ledger: self.ledger,
+            solve_obs: self.solve_obs.as_deref_mut(),
+        }
+    }
+}
+
 /// The one result-aware decision every caller uses (the two ordinary gates and
 /// SmartHarness), with its evidence recorded as a solve trace signal. A turn
 /// with no check to run records `no_checks`, so it is told apart from a turn
@@ -1051,7 +1235,21 @@ pub(crate) async fn conclude_turn(
     turn: Concluding<'_>,
     repairs_used: usize,
 ) -> (Decision, VerificationReport) {
-    conclude_with_terminal(turn, repairs_used, None).await
+    conclude_with_terminal(turn, repairs_used, None, true).await
+}
+
+/// Recovery remains active when optional verification is disabled. The caller
+/// supplies its existing verification switch; Grit does not strengthen it.
+pub(crate) async fn conclude_turn_with_gate(
+    turn: Concluding<'_>,
+    repairs_used: usize,
+    verification_active: bool,
+) -> (Decision, VerificationReport) {
+    if verification_active {
+        conclude_turn(turn, repairs_used).await
+    } else {
+        conclude_with_terminal(turn, repairs_used, None, false).await
+    }
 }
 
 /// Provider refusal is terminal; it never consumes a repair attempt or nudges
@@ -1060,7 +1258,7 @@ pub(crate) async fn refusal_answer(
     turn: Concluding<'_>,
     answer: &str,
 ) -> (String, crate::TurnEndReason) {
-    let (decision, report) = conclude_with_terminal(turn, 0, Some("provider_refusal")).await;
+    let (decision, report) = conclude_with_terminal(turn, 0, Some("provider_refusal"), true).await;
     let reason = match decision {
         Decision::Stop(reason) => reason,
         _ => unreachable!("a terminal refusal never continues"),
@@ -1077,12 +1275,30 @@ async fn conclude_with_terminal(
     turn: Concluding<'_>,
     repairs_used: usize,
     terminal: Option<&str>,
+    verification_active: bool,
 ) -> (Decision, VerificationReport) {
+    let admission = turn.ledger.admission.as_ref();
+    let repairs_used = admission.map_or(repairs_used, |owner| owner.verification_used());
     let requested = commands_from_messages(turn.messages);
-    let scanned = turn
-        .ledger
-        .applicable_checks(turn.workspace, turn.task, &requested)
-        .await;
+    let verification_active = verification_active && turn.ledger.result_aware();
+    let mut scanned = if verification_active || turn.ledger.recovery_enabled() {
+        turn.ledger
+            .applicable_checks(turn.workspace, turn.task, &requested)
+            .await
+    } else {
+        Some(Vec::new())
+    };
+    if !verification_active {
+        // Report executed checks without inventing NeverRun obligations for
+        // Grit. Old failures remain diagnostic after their batch is acknowledged.
+        if let Some(checks) = &mut scanned {
+            checks.retain(|check| {
+                turn.ledger.entries.iter().any(|entry| {
+                matches!(entry, Observed::Exec {command, ..} if check.invocation(command).is_some())
+            })
+            });
+        }
+    }
     let checks = scanned.as_deref().unwrap_or_default();
     let (mut decision, report) = conclude(&Conclusion {
         checks,
@@ -1092,8 +1308,72 @@ async fn conclude_with_terminal(
         repairs_used,
         rounds_left: turn.rounds_left,
     });
+    if !verification_active {
+        decision = Decision::Accept;
+    }
     if terminal.is_some() {
         decision = Decision::Stop(crate::TurnEndReason::VerificationIncomplete);
+    }
+    if terminal.is_none() && !super::is_cancelled(turn.cancel) {
+        if let Some(owner) = admission {
+            use super::turn_admission::CorrectionCause;
+            let failed_check = report
+                .checks
+                .iter()
+                .any(|check| matches!(check.status, CheckStatus::Failed | CheckStatus::TimedOut));
+            let cause = match &decision {
+                Decision::Nudge(_) if failed_check => Some(CorrectionCause::FailedCheck),
+                Decision::Nudge(_) => Some(CorrectionCause::Verification),
+                Decision::Accept | Decision::Stop(crate::TurnEndReason::VerificationIncomplete)
+                    if owner.has_unacknowledged_failure() =>
+                {
+                    Some(if owner.has_unacknowledged_failed_check() {
+                        CorrectionCause::FailedCheck
+                    } else {
+                        CorrectionCause::ToolFailure
+                    })
+                }
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                // A continuation can owe both verification and operation
+                // recovery. Queue the union before any actual model admission.
+                let overlapping = if cause == CorrectionCause::Verification
+                    && owner.has_unacknowledged_failure()
+                {
+                    Some(CorrectionCause::ToolFailure)
+                } else if cause == CorrectionCause::ToolFailure
+                    && verification_active
+                    && turn.ledger.result_aware()
+                    && matches!(
+                        decision,
+                        Decision::Stop(crate::TurnEndReason::VerificationIncomplete)
+                    )
+                {
+                    Some(CorrectionCause::Verification)
+                } else {
+                    None
+                };
+                let proposed = owner
+                    .propose(cause, turn.rounds_left, turn.cancel)
+                    .and_then(|()| match overlapping {
+                        Some(other) => owner.propose(other, turn.rounds_left, turn.cancel),
+                        None => Ok(()),
+                    });
+                match proposed {
+                    Ok(())
+                        if cause == CorrectionCause::ToolFailure
+                            || (cause == CorrectionCause::FailedCheck && !verification_active) =>
+                    {
+                        decision = Decision::Nudge(super::workflow_guidance(
+                            "An operation failed. Inspect its observed result and decide whether correction is needed. Correct the cause within existing permissions, or explain an expected nonzero result. Do not replay an operation automatically or broaden authority.".to_string()
+                        ));
+                    }
+                    Ok(()) => {}
+                    Err(reason) => decision = Decision::Stop(reason),
+                }
+            }
+        }
     }
     // Scanning/tree hashing yield to other tasks; cancellation may arrive while
     // those jobs run. Recheck before any caller can accept or spend a nudge.
@@ -1101,25 +1381,33 @@ async fn conclude_with_terminal(
         decision = Decision::Stop(crate::TurnEndReason::Cancelled);
     }
     if let Some(obs) = turn.solve_obs {
-        obs.behavior_signals
-            .push(super::observability::BehaviorSignal::Verification {
-                round: turn.round,
-                decision: match &decision {
-                    Decision::Stop(crate::TurnEndReason::Cancelled) => "cancelled".to_string(),
-                    _ if terminal.is_some() => terminal.unwrap().to_string(),
-                    _ if scanned.is_none() => SCAN_FAILED.to_string(),
-                    _ if checks.is_empty() => NO_CHECKS.to_string(),
-                    Decision::Accept => "accept".to_string(),
-                    Decision::Nudge(_) => "nudge".to_string(),
-                    Decision::Stop(reason) => serde_json::to_value(reason)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_string))
-                        .unwrap_or_default(),
-                },
-                repairs_used,
-                allowance: VERIFY_REPAIR_ALLOWANCE,
-                report: report.clone(),
-            });
+        if let Some(owner) = admission {
+            obs.behavior_signals.extend(owner.drain_signals());
+        }
+        // A recovery owner can conclude an informational turn without any
+        // verification. Keep actual attempted-check diagnostics, but do not
+        // manufacture a verification event for that empty optional path.
+        if verification_active || !checks.is_empty() {
+            obs.behavior_signals
+                .push(super::observability::BehaviorSignal::Verification {
+                    round: turn.round,
+                    decision: match &decision {
+                        Decision::Stop(crate::TurnEndReason::Cancelled) => "cancelled".to_string(),
+                        _ if terminal.is_some() => terminal.unwrap().to_string(),
+                        _ if scanned.is_none() => SCAN_FAILED.to_string(),
+                        _ if checks.is_empty() => NO_CHECKS.to_string(),
+                        Decision::Accept => "accept".to_string(),
+                        Decision::Nudge(_) => "nudge".to_string(),
+                        Decision::Stop(reason) => serde_json::to_value(reason)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_default(),
+                    },
+                    repairs_used,
+                    allowance: VERIFY_REPAIR_ALLOWANCE,
+                    report: report.clone(),
+                });
+        }
     }
     (decision, report)
 }
@@ -1195,6 +1483,23 @@ pub struct VerificationReport {
     pub state_now: Option<String>,
 }
 
+/// Non-check recovery exhaustion is distinct from a failed verification check.
+pub(crate) fn stopped_answer(
+    answer: &str,
+    reason: crate::TurnEndReason,
+    report: &VerificationReport,
+    required: bool,
+    recovery: bool,
+) -> String {
+    if reason == crate::TurnEndReason::Failed {
+        format!("{answer}\n\n[Harness: recovery incomplete — a failed operation remains unresolved and no corrective continuation could be admitted. Operator steering is available.]")
+    } else if required || (recovery && reason == crate::TurnEndReason::RepairExhausted) {
+        incomplete_answer(answer, report)
+    } else {
+        answer.to_string()
+    }
+}
+
 /// Preserve the model's answer while clearly qualifying an incomplete finish.
 pub(crate) fn incomplete_answer(answer: &str, report: &VerificationReport) -> String {
     let details = if report.checks.is_empty() {
@@ -1214,6 +1519,19 @@ pub(crate) fn incomplete_answer(answer: &str, report: &VerificationReport) -> St
         details
     };
     format!("{answer}\n\n[Harness: verification incomplete — {details}. Task completion remains unverified; operator steering is available.]")
+}
+
+/// A recovery-bound cap cannot silently return ordinary final-answer prose.
+pub(crate) fn recovery_cap_answer(
+    answer: String,
+    report: Option<&VerificationReport>,
+    reason: crate::TurnEndReason,
+) -> String {
+    if reason == crate::TurnEndReason::Failed {
+        format!("{answer}\n\n[Harness: recovery incomplete — the turn's round allowance is exhausted. Operator steering is available.]")
+    } else {
+        cap_answer(answer, report)
+    }
 }
 
 /// Qualify every strict cap summary, including provider/fallback summaries.
@@ -2047,3 +2365,7 @@ mod tests {
 #[cfg(test)]
 #[path = "self_verify_resolute_tests.rs"]
 mod resolute_tests;
+
+#[cfg(test)]
+#[path = "self_verify_grit_tests.rs"]
+mod grit_mutation_tests;
