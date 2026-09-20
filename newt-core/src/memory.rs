@@ -512,7 +512,7 @@ impl RollingWindow {
 }
 
 fn newt_core_memory_window() -> usize {
-    crate::Config::resolve()
+    crate::Config::resolve_unpublished()
         .ok()
         .and_then(|c| c.memory)
         .map(|m| m.window)
@@ -1613,7 +1613,7 @@ impl SoulProvider {
 
     /// Create from config, reading `[memory] soul_file` if present.
     pub fn from_config() -> Self {
-        let override_path = crate::Config::resolve()
+        let override_path = crate::Config::resolve_unpublished()
             .ok()
             .and_then(|c| c.memory)
             .and_then(|m| m.soul_file)
