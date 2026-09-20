@@ -276,6 +276,9 @@ impl InstantiatedFeatures {
 pub struct TurnOutcome {
     /// The captured verification policy actually instantiated by the loop.
     pub verification: Option<serde_json::Value>,
+    /// Immutable recovery policy actually instantiated; execution counters are
+    /// separate behavior evidence and never part of effective-config identity.
+    pub recovery_policy: Option<serde_json::Value>,
     /// The model's reply text.
     pub reply: String,
     /// Token usage for the turn, when the backend reported it.
@@ -359,6 +362,7 @@ struct HeadlessRuntimePosture {
     verification: super::self_verify::VerificationSettings,
     cognition: Option<crate::role_profile::Cognition>,
     tenacity: crate::tenacity::Tenacity,
+    tenacity_budgets: crate::tenacity::TenacityBudgets,
     initiative: crate::initiative::Initiative,
     crew_runner: Option<Arc<dyn CrewRunner>>,
     scratchpad: Option<Arc<dyn ScratchpadStore>>,
@@ -371,6 +375,7 @@ impl HeadlessRuntimePosture {
             verification: super::self_verify::VerificationSettings::capture(),
             cognition: crate::cognition::effective_cognition(),
             tenacity: crate::tenacity::effective_tenacity(),
+            tenacity_budgets: crate::tenacity::effective_tenacity_budgets(),
             initiative: crate::initiative::effective_initiative(),
             crew_runner: None,
             scratchpad: None,
@@ -616,7 +621,8 @@ async fn run_one_turn(
     // beneath `chat_complete` (workflow state and exit_plan_mode included) to
     // the posture captured by this driver. The current-thread runtime keeps
     // these RAII TLS guards on the dedicated turn thread for the entire future.
-    let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
+    let _tenacity =
+        crate::tenacity::scoped_tenacity_settings(runtime.tenacity, runtime.tenacity_budgets);
     let _verification = super::self_verify::scoped_verification_settings(runtime.verification);
     let _initiative = crate::initiative::scoped_effective_initiative(runtime.initiative);
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
@@ -664,6 +670,7 @@ async fn run_one_turn(
         .run_allowance
         .map(super::run_allowance::RunAllowance::new);
     let ctx = ChatCtx {
+        turn_admission: None,
         run_allowance: run_allowance.as_ref(),
         verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
         round_cap_hit: None,
@@ -821,6 +828,7 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             verification: solve_obs.verification,
+            recovery_policy: solve_obs.recovery_policy,
             features,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
@@ -846,6 +854,7 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             verification: solve_obs.verification,
+            recovery_policy: solve_obs.recovery_policy,
             features,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
@@ -1897,3 +1906,7 @@ mod tests {
 #[cfg(test)]
 #[path = "driver_resolute_tests.rs"]
 mod resolute_tests;
+
+#[cfg(test)]
+#[path = "driver_grit_tests.rs"]
+mod grit_tests;
