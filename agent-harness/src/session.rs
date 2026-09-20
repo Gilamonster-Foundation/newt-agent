@@ -1176,7 +1176,7 @@ impl Session {
             .filter(|(i, (_, c))| *i >= start || c.required)
             .filter(|(_, (entry, _))| {
                 let event = &self.events[&entry.event];
-                event.body().origin != EventOrigin::Harness && event.depth() == 0
+                !is_generated(event)
             })
             .map(|(index, (entry, c))| {
                 json!({
@@ -1193,11 +1193,7 @@ impl Session {
         let pinned = entries
             .iter()
             .zip(&candidates)
-            .filter(|(entry, c)| {
-                c.required
-                    && (self.events[&entry.event].body().origin == EventOrigin::Harness
-                        || self.events[&entry.event].depth() > 0)
-            })
+            .filter(|(entry, c)| c.required && is_generated(&self.events[&entry.event]))
             .map(|(entry, _)| entry.event)
             .collect::<Vec<_>>();
         Ok(json!({"max_bytes":max_bytes,"candidates":cards,"host_pinned":pinned}))
@@ -1296,13 +1292,31 @@ impl Session {
         // source-only relevance selection. The complete union is still validated.
         for candidate in &candidates {
             if candidate.required
-                && (self.events[&candidate.id].body().origin == EventOrigin::Harness
-                    || self.events[&candidate.id].depth() > 0)
+                && is_generated(&self.events[&candidate.id])
                 && !selected.contains(&candidate.id)
             {
                 selected.push(candidate.id);
             }
         }
+        // Generated wire companions are protocol framing, not relevance
+        // candidates. Complete only through selected sources and generated
+        // entries; an omitted source must still fail pair validation.
+        let framing = candidates
+            .iter()
+            .filter(|candidate| {
+                selected.contains(&candidate.id) || is_generated(&self.events[&candidate.id])
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut completed = selected.iter().copied().collect();
+        complete_pairs(&framing, &mut completed);
+        for id in completed {
+            if !selected.contains(&id) {
+                selected.push(id);
+            }
+        }
+        // Keep the original proposal's duplicates and unknown IDs: framing
+        // completion cannot repair an otherwise inadmissible selection.
         self.render_selection(messages, &entries, &candidates, &selected, max_bytes)
     }
 
@@ -1325,9 +1339,7 @@ impl Session {
             })
             .collect::<Result<BTreeSet<ContentId>>>()?;
         for id in &sources {
-            if self.events.get(id).is_none_or(|event| {
-                event.body().origin == EventOrigin::Harness || event.depth() != 0
-            }) {
+            if self.events.get(id).is_none_or(is_generated) {
                 return Err(Error::Access(
                     "harness or generated material is not relevance evidence".into(),
                 ));
@@ -1995,6 +2007,12 @@ fn tool_contents(message: &Value) -> Vec<&str> {
         .filter(|item| item["type"] == "tool_result")
         .filter_map(|item| item.get("content").and_then(Value::as_str))
         .collect()
+}
+
+/// Harness-generated framing (system text, wire companions) as opposed to a
+/// visible source entry: depth 0 and not harness-originated.
+fn is_generated(event: &Event) -> bool {
+    event.body().origin == EventOrigin::Harness || event.depth() != 0
 }
 
 fn tool_pairs(message: &Value) -> BTreeSet<String> {

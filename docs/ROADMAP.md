@@ -2061,6 +2061,30 @@ fail. Raw replies remain byte-exact, and retained sources remain retrievable.
 **Out of scope:** classifier-verdict tolerance, deterministic selection repair,
 new record formats, and changes to authority or navigation budgets.
 
+## Step 27.12 — Complete the generated companions of a selected navigation source (#2463)
+
+**Branch:** `step-27.12-nav-generated-companions`
+
+The navigation catalog offers a tool call but not the generated, model-facing
+result entry that frames it, so a selection of that call was refused as "splits
+a tool exchange". Keep relevance selection with the auxiliary and let the host
+add only the generated companions of sources it already selected, reusing
+`complete_pairs`. The completed selection goes through the unchanged validator,
+including its final byte budget.
+
+**Acceptance:** with two real accounted tool batches and an older generated
+result omitted from the catalog, selecting the older call yields a legal
+exchange that keeps that result. Without the completion the same selection is
+refused as "splits a tool exchange". An omitted source call is still refused.
+
+**Known gaps:** the catalog does not price a companion, so a selection that fits
+by the catalog's own byte counts can still exceed the budget once completed and
+is then refused; and completion pairs by provider wire id, so it does nothing
+for the Ollama wire format, whose results carry no id.
+
+**Out of scope:** pricing companions in the catalog, provenance-based pairing,
+classifier-verdict parsing, and any change to authority or navigation budgets.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

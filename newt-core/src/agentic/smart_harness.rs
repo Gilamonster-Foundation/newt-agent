@@ -2132,4 +2132,112 @@ mod tests {
         assert_eq!(tail["complete"], true);
         assert_eq!(tail["text"], &full[full.len() - 20..]);
     }
+
+    #[tokio::test]
+    async fn navigation_retains_generated_companions_of_selected_source_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SmartHarness::new(
+            Session::open(dir.path(), Default::default()).unwrap(),
+            Arc::new(|prompt| {
+                let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+                let cards = catalog["candidates"].as_array().unwrap();
+                assert_eq!(
+                    cards
+                        .iter()
+                        .filter(|card| card["role"] == "assistant")
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    cards.iter().filter(|card| card["role"] == "tool").count(),
+                    1,
+                    "the older generated preview is not relevance evidence"
+                );
+                assert!(
+                    catalog["host_pinned"].as_array().unwrap().is_empty(),
+                    "the older generated result must not be a required host pin"
+                );
+                let selected = cards
+                    .iter()
+                    .filter(|card| card["required"] == true || card["role"] == "assistant")
+                    .map(|card| card["cid"].clone())
+                    .collect::<Vec<_>>();
+                Box::pin(async move { Ok((serde_json::to_string(&selected).unwrap(), None)) })
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        let full = "retained old tool output\n".repeat(300);
+        let mut messages =
+            vec![serde_json::json!({"role":"user","content":"older context ".repeat(400)})];
+        let mut old_delivery = Value::Null;
+        let mut source = Value::Null;
+        for (id, output) in [("older", full.as_str()), ("current", "current tool output")] {
+            h.request(&serde_json::json!({"messages":messages}), "openai")
+                .unwrap();
+            let args = serde_json::json!({"path":format!("{id}.rs")});
+            let assistant = serde_json::json!({"role":"assistant","content":"","tool_calls":[{
+                "id":id,"type":"function","function":{"name":"read_file","arguments":args}
+            }]});
+            h.observe(
+                &serde_json::to_vec(&serde_json::json!({"choices":[{"message":assistant}]}))
+                    .unwrap(),
+            )
+            .unwrap();
+            messages.push(assistant);
+            let batch = h
+                .tool_batch(
+                    &[crate::agentic::tools::ValidatedCall {
+                        call_id: id.into(),
+                        name: "read_file".into(),
+                        args,
+                    }],
+                    &messages,
+                )
+                .unwrap();
+            let invocation = batch.start(0, None).unwrap();
+            invocation.observe(output, None, None).unwrap();
+            let rendered = invocation.model_text().unwrap();
+            let delivery = serde_json::json!({"role":"tool","tool_call_id":id,"content":rendered});
+            if id == "older" {
+                let envelope: Value = serde_json::from_str(&rendered).unwrap();
+                source = envelope["sources"][0]["source_cid"].clone();
+                old_delivery = delivery.clone();
+            }
+            push_tool_return(&mut messages, delivery, Some(&invocation)).unwrap();
+        }
+        messages.push(serde_json::json!({"role":"user","content":"current operator request"}));
+        // The kept exchange needs ~3.7 KB (the older generated result alone is
+        // 3046 B); 3600 refuses on protected inputs. Below the ~9 KB full history,
+        // the older user turn must be elided, so the budget is doing work.
+        const PROJECTION_BUDGET: usize = 4200;
+        let projected = h.project(&messages, PROJECTION_BUDGET).await.unwrap();
+        assert!(
+            projected.contains(&old_delivery),
+            "selected call keeps its exact generated protocol companion"
+        );
+        assert_eq!(projected.last(), messages.last());
+        assert!(serde_json::to_vec(&projected).unwrap().len() <= PROJECTION_BUDGET);
+        let head = h.head().unwrap();
+        drop(h);
+        let restored = Session::restore(dir.path(), head, "local-session").unwrap();
+        assert!(restored
+            .restored_messages()
+            .unwrap()
+            .contains(&old_delivery));
+        let restored = SmartHarness::new(
+            restored,
+            Arc::new(|_| panic!("retrieval requires no inference")),
+            Default::default(),
+        )
+        .unwrap();
+        let read: Value = serde_json::from_str(
+            &restored
+                .read(&serde_json::json!({"cid":source,"max_bytes":128}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read["text"], &full[..128]);
+        assert_eq!(read["complete"], false);
+    }
 }
