@@ -6,8 +6,8 @@ use std::path::Path;
 
 pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     let mut config = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
 
     // Surface the prompt set to its built-in default (visible + editable) when
