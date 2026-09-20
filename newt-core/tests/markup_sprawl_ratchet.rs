@@ -1604,6 +1604,7 @@ fn parent_gated_test_children_are_excluded_structurally() {
         "newt-tui/src/lib_tests/core.rs",
         "newt-tui/src/prompt_visibility_test.rs",
         "newt-core/src/tty/pty_notice_test.rs",
+        "newt-core/src/tty/pty_migration_notice_tests.rs",
     ];
     let leaked: Vec<_> = children.iter().filter(|c| visited.contains(**c)).collect();
     assert!(
