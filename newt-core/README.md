@@ -52,6 +52,12 @@ decision, and a direct executable denial does not establish a confined Build
 denial. This evidence supplies context without changing authority or guaranteeing
 that the model chooses an available action.
 
+Navigation selections also accept a complete bare or `json` Markdown fence
+around the CID array. The raw auxiliary reply stays recorded; unknown CIDs,
+missing protected inputs, split tool exchanges, and over-budget selections
+remain refused. Prose and incomplete fences are not repaired, and classifier
+verdicts retain their strict JSON-string protocol.
+
 A successful built-in permission grant releases cached capability failures and
 typed failed native shell/lifecycle executions so the original operation can be
 checked again. A native execution receipt permits re-evaluation; it does not

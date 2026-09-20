@@ -56,7 +56,7 @@ pub(super) fn build_adjudication_prompt(intake: &PromptIntake) -> String {
 /// whitespace and a ```json fence. It does NOT hunt for a decision inside
 /// prose: an unparseable reply is a refusal, not an invitation to guess.
 pub(super) fn parse_adjudication_reply(reply: &str) -> Option<Vec<AdjudicationVerdict>> {
-    let trimmed = strip_code_fence(reply.trim());
+    let trimmed = strip_code_fence(reply);
     let start = trimmed.find('[')?;
     let end = trimmed.rfind(']')?;
     if end < start {
@@ -65,15 +65,18 @@ pub(super) fn parse_adjudication_reply(reply: &str) -> Option<Vec<AdjudicationVe
     serde_json::from_str::<Vec<AdjudicationVerdict>>(&trimmed[start..=end]).ok()
 }
 
-fn strip_code_fence(reply: &str) -> &str {
-    let Some(rest) = reply.strip_prefix("```") else {
-        return reply;
-    };
-    let rest = rest.strip_prefix("json").unwrap_or(rest);
-    rest.trim_start_matches('\n')
-        .trim_end()
-        .strip_suffix("```")
-        .unwrap_or(rest)
+/// Remove only a complete, whole-response bare or JSON Markdown fence.
+/// Invalid wrappers remain intact so strict JSON callers refuse them.
+pub(super) fn strip_code_fence(reply: &str) -> &str {
+    let reply = reply.trim();
+    ["```json\n", "```\n", "```json\r\n", "```\r\n"]
+        .iter()
+        .find_map(|opening| reply.strip_prefix(opening))
+        .and_then(|body| {
+            body.strip_suffix("\r\n```")
+                .or_else(|| body.strip_suffix("\n```"))
+        })
+        .unwrap_or(reply)
 }
 
 /// Why an adjudication produced no locks. Returned so the harness can TELL the
@@ -164,6 +167,28 @@ mod tests {
     /// A candidate prompt whose decisions the heuristic detects deterministically.
     const DELEGATED: &str = "Choose the smallest coherent fix consistent with existing design.";
     const OPERATOR_OWNED: &str = "Choose SQLite or Postgres.";
+
+    /// The helper unwraps only a complete whole-response fence and hands every
+    /// other shape back byte-for-byte, so strict JSON callers refuse it.
+    #[test]
+    fn strip_code_fence_unwraps_only_a_complete_fence() {
+        for (reply, want) in [
+            ("[1]", "[1]"),
+            ("```json\n[1]\n```", "[1]"),
+            ("```\n[1]\n```", "[1]"),
+            ("  ```json\n[1]\n```  \n", "[1]"),
+            ("```json\r\n[1]\r\n```", "[1]"),
+            ("```\r\n[1]\r\n```", "[1]"),
+            // Not a complete whole-response fence: returned unchanged.
+            ("```json\n[1]", "```json\n[1]"),
+            ("```js\n[1]\n```", "```js\n[1]\n```"),
+            ("```JSON\n[1]\n```", "```JSON\n[1]\n```"),
+            ("here:\n```json\n[1]\n```", "here:\n```json\n[1]\n```"),
+            ("```json\n[1]\n```\nthanks", "```json\n[1]\n```\nthanks"),
+        ] {
+            assert_eq!(strip_code_fence(reply), want, "input: {reply:?}");
+        }
+    }
 
     fn summarizer(reply: &'static str) -> Summarizer {
         Box::new(move |_prompt: String| {

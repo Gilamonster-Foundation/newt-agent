@@ -2044,6 +2044,23 @@ automatic adoption of other conversations, changing backend selection, and
 guaranteeing that the resumed model completes its task.
 
 
+## Step 27.11 — Accept complete navigation JSON envelopes (#2462)
+
+**Branch:** `step-27.11-nav-json-envelope`
+
+Reuse the existing code-fence helper to accept only a complete bare or `json`
+Markdown wrapper around a navigation CID array. Record and bound the original
+reply before parsing the unwrapped view. Selection admission remains the
+existing kernel decision; malformed proposals receive no deterministic fallback.
+
+**Acceptance:** bare JSON and whole fenced arrays work, including CRLF line
+endings. Outside prose, incomplete fences, and other language tags refuse.
+Unknown CIDs, omitted pins, split tool pairs, and oversized selections still
+fail. Raw replies remain byte-exact, and retained sources remain retrievable.
+
+**Out of scope:** classifier-verdict tolerance, deterministic selection repair,
+new record formats, and changes to authority or navigation budgets.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool
