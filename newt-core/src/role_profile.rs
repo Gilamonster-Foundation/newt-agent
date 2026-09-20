@@ -851,7 +851,11 @@ impl RoleProfile {
     /// in sync deliberately rather than shared, since crossing the
     /// `newt-core`/`newt-tui` boundary for an 8-line check isn't worth the
     /// coupling), if the file doesn't exist, or if it fails to parse.
-    pub fn load_from_dir(name: &str, dir: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn load_from_dir(
+        name: &str,
+        dir: &std::path::Path,
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> anyhow::Result<Self> {
         let name = name.trim().to_ascii_lowercase();
         if name.is_empty()
             || !name
@@ -861,7 +865,7 @@ impl RoleProfile {
             anyhow::bail!("persona names may only contain letters, numbers, '-' and '_'");
         }
         let path = dir.join(format!("{name}.md"));
-        let raw = crate::psyche_import::read_persona_file(&path).map_err(|e| {
+        let raw = crate::psyche_import::read_persona_file(&path, report).map_err(|e| {
             anyhow::anyhow!("persona `{name}` not found at {}: {e}", path.display())
         })?;
         let profile = Self::parse(&raw).map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
@@ -1705,7 +1709,7 @@ fs_read = [\"src/\", \"docs/\"]
             "+++\nrole = \"personal-assistant\"\ntools = [\"a\"]\n+++\n\n# PA\nbody\n",
         )
         .unwrap();
-        let rp = RoleProfile::load_from_dir("personal-assistant", tmp.path()).unwrap();
+        let rp = RoleProfile::load_from_dir("personal-assistant", tmp.path(), &mut |_| {}).unwrap();
         assert_eq!(rp.role.as_deref(), Some("personal-assistant"));
         assert_eq!(rp.prompt, "# PA\nbody");
     }
@@ -1713,7 +1717,7 @@ fs_read = [\"src/\", \"docs/\"]
     #[test]
     fn load_from_dir_errors_loudly_on_a_missing_file_no_seeding() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let err = RoleProfile::load_from_dir("nope", tmp.path())
+        let err = RoleProfile::load_from_dir("nope", tmp.path(), &mut |_| {})
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "got: {err}");
@@ -1726,7 +1730,7 @@ fs_read = [\"src/\", \"docs/\"]
     #[test]
     fn load_from_dir_rejects_invalid_names() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let err = RoleProfile::load_from_dir("bad name!", tmp.path())
+        let err = RoleProfile::load_from_dir("bad name!", tmp.path(), &mut |_| {})
             .unwrap_err()
             .to_string();
         assert!(err.contains("letters, numbers"), "got: {err}");
@@ -1736,7 +1740,7 @@ fs_read = [\"src/\", \"docs/\"]
     fn load_from_dir_rejects_an_empty_persona_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("blank.md"), "   \n").unwrap();
-        let err = RoleProfile::load_from_dir("blank", tmp.path())
+        let err = RoleProfile::load_from_dir("blank", tmp.path(), &mut |_| {})
             .unwrap_err()
             .to_string();
         assert!(err.contains("is empty"), "got: {err}");
@@ -1752,7 +1756,7 @@ fs_read = [\"src/\", \"docs/\"]
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("deep.md");
         std::fs::write(&path, "+++\ncognition = \"contemplating\"\n+++\n# Deep\n").unwrap();
-        let rp = RoleProfile::load_from_dir("deep", tmp.path()).unwrap();
+        let rp = RoleProfile::load_from_dir("deep", tmp.path(), &mut |_| {}).unwrap();
         assert_eq!(rp.cognition, Some(Cognition::Meticulous));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1764,7 +1768,7 @@ fs_read = [\"src/\", \"docs/\"]
     fn load_from_dir_lowercases_the_name() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("coach.md"), "# Coach\nbody\n").unwrap();
-        let rp = RoleProfile::load_from_dir("  CoAcH  ", tmp.path()).unwrap();
+        let rp = RoleProfile::load_from_dir("  CoAcH  ", tmp.path(), &mut |_| {}).unwrap();
         assert_eq!(rp.prompt, "# Coach\nbody");
     }
 }
