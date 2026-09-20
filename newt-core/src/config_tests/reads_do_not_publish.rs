@@ -24,11 +24,14 @@ fn published_patient_rounds() -> Option<usize> {
 }
 
 /// The readers that only need a config value: the thinking mode (read every
-/// turn), the memory window and the soul-file override.
+/// turn), the memory window, the soul-file override, the markdown mode and the
+/// compaction-trigger policy.
 #[test]
 fn value_readers_do_not_republish_runtime_settings() {
     let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
-    crate::process_env::remove_var("NEWT_THINKING");
+    for key in ["NEWT_THINKING", "NEWT_MARKDOWN", "NEWT_COMPACTION_TRIGGER"] {
+        crate::process_env::remove_var(key);
+    }
     initiative::set_initiative_config(marker());
 
     let _ = crate::agentic::thinking_mode();
@@ -37,6 +40,14 @@ fn value_readers_do_not_republish_runtime_settings() {
     assert_eq!(published_patient_rounds(), Some(91), "memory window");
     let _ = crate::memory::SoulProvider::from_config();
     assert_eq!(published_patient_rounds(), Some(91), "soul provider");
+    let _ = crate::config::session_markdown_mode();
+    assert_eq!(published_patient_rounds(), Some(91), "markdown mode");
+    let _ = crate::config::session_compaction_trigger_policy();
+    assert_eq!(
+        published_patient_rounds(),
+        Some(91),
+        "compaction trigger policy"
+    );
 }
 
 /// Control: the publishing resolve really does overwrite the marker, and the
