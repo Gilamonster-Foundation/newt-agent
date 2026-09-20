@@ -11,12 +11,13 @@
 //! (every existing caller today) is bit-for-bit unchanged behavior.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// A budget of remaining inference calls for one run, shared across every
 /// wire's dispatch through [`super::attempt_capture::AttemptScope`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunAllowance {
-    remaining: AtomicU32,
+    remaining: Arc<AtomicU32>,
 }
 
 /// The run allowance was already spent when a new dispatch was attempted.
@@ -30,7 +31,7 @@ impl RunAllowance {
     /// A budget of `calls` remaining inference calls.
     pub fn new(calls: u32) -> Self {
         Self {
-            remaining: AtomicU32::new(calls),
+            remaining: Arc::new(AtomicU32::new(calls)),
         }
     }
 
