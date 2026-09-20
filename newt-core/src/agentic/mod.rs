@@ -12687,7 +12687,7 @@ pub fn thinking_mode() -> crate::ThinkingMode {
         Some("on" | "fold") => return crate::ThinkingMode::Fold,
         _ => {}
     }
-    crate::Config::resolve()
+    crate::Config::resolve_unpublished()
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.thinking)
