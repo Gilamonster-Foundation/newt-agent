@@ -154,6 +154,15 @@ fn interaction_view_child() {
         "cockpit_acceptance" => {
             crate::cockpit::presenter::cockpit_acceptance_case();
         }
+        "startup_migration" => {
+            crate::cockpit::presenter::startup_migration_case();
+        }
+        "persona_migration" => {
+            crate::cockpit::presenter::persona_migration_case();
+        }
+        "cockpit_migration" => {
+            crate::cockpit::presenter::cockpit_migration_case();
+        }
         "cockpit_bang" => {
             crate::cockpit::presenter::cockpit_bang_case();
         }
@@ -334,6 +343,18 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
 /// event source out of sibling keyboard tests, without dropping assertions.
 pub(crate) fn drive_cockpit_resize() {
     drive_cockpit_case("cockpit_resize");
+}
+
+pub(crate) fn drive_startup_migration() {
+    drive_cockpit_case("startup_migration");
+}
+
+pub(crate) fn drive_persona_migration() {
+    drive_cockpit_case("persona_migration");
+}
+
+pub(crate) fn drive_cockpit_migration() {
+    drive_cockpit_case("cockpit_migration");
 }
 
 pub(crate) fn drive_cockpit_acceptance() {
