@@ -13,6 +13,10 @@ use newt_core::agentic::print_newt;
 use crate::settings_form::{self, Field};
 use crate::{current_prompt_and_preview, prompt_token_help, strip_one_quote_pair};
 
+#[cfg(test)]
+#[path = "settings_obsessive_tests.rs"]
+mod obsessive_tests;
+
 /// Perform one setting change through the single mutation path (#1981) and
 /// return the line it produced.
 ///
@@ -458,32 +462,36 @@ fn psyche_command(rest: &str) -> String {
         Some((s, a)) => (s, a.trim()),
         None => (rest, ""),
     };
-    // `/psyche obsessive` — engage the max-effort posture's two dials.
-    // Initiative is left alone, by design: the deepest thinking and acting
-    // after one round pull against each other.
-    // Crew is a startup gate (crew_runner is built once at launch), so it can't
-    // be turned on mid-session; say so honestly and point at the launch flag.
     if sub.eq_ignore_ascii_case("obsessive") || sub.eq_ignore_ascii_case("obsessive-relentless") {
-        // #1981: the posture still means what `psyche` says it means — the
-        // constants are that module's to own — but engaging it is two ordinary
-        // setting changes, so it takes the same path, the same #1668 pins and
-        // the same record as `/settings cognition meticulous` would.
-        let (cog, ten) = (
-            newt_core::psyche::OBSESSIVE_COGNITION,
-            newt_core::psyche::OBSESSIVE_TENACITY,
-        );
-        apply_setting(Field::Cognition, cog.label(), "/psyche obsessive");
-        apply_setting(Field::Tenacity, ten.label(), "/psyche obsessive");
+        let enabled = match arg.to_ascii_lowercase().as_str() {
+            "" => newt_core::psyche::obsessive_selection().is_none(),
+            "on" => true,
+            "off" => false,
+            _ => return "usage: /obsessive [on|off]".into(),
+        };
+        let transition = settings_form::apply_obsessive(enabled, "/psyche obsessive");
+        if !enabled {
+            return format!("{transition}; original effort selections restored");
+        }
         return format!(
-            "obsessive engaged (live): cognition → {}, tenacity → {}, \
-             default tool-round budget → effectively unlimited (an explicit \
-             `/rounds` override still wins); initiative stays {}.\n\
+            "{transition}: cognition → {}, tenacity → {}; initiative stays {}.\n\
              crew is a launch gate — relaunch with `newt --obsessive` (or set \
              NEWT_TEAM) to add the crew this session.",
-            cog.label(),
-            ten.label(),
+            newt_core::psyche::OBSESSIVE_COGNITION.label(),
+            newt_core::psyche::OBSESSIVE_TENACITY.label(),
             effective_initiative().label()
         );
+    }
+    if !arg.is_empty() {
+        let field = match sub {
+            "cognition" => Some(Field::Cognition),
+            "tenacity" => Some(Field::Tenacity),
+            "initiative" => Some(Field::Initiative),
+            _ => None,
+        };
+        if let Some(reason) = field.and_then(settings_form::effort_lock) {
+            return reason;
+        }
     }
     match sub {
         "cognition" => return cognition_command(arg),

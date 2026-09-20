@@ -18,6 +18,87 @@
 use crate::cognition::{set_cli_cognition, CognitionOverride};
 use crate::role_profile::Cognition;
 use crate::tenacity::{set_cli_tenacity, Tenacity};
+use std::sync::Mutex;
+
+mod obsessive_pin;
+pub use obsessive_pin::{ObsessiveMode, ObsessivePin};
+
+/// Original operator selections beneath the temporary effort overlay.
+/// Auto remains a selector; no resolved persona/default values are captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObsessiveSelection {
+    pub cognition: CognitionOverride,
+    // Null explicitly means auto; absence is missing restore evidence. Using
+    // serde's normal value decoder explicitly makes the field required.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub tenacity: Option<Tenacity>,
+}
+
+impl ObsessiveSelection {
+    /// Pure transition shared by the live command and the panel's draft.
+    /// Returns original inputs only on a real transition in either direction.
+    pub fn transition(state: &mut Option<Self>, enabled: bool, selected: Self) -> Option<Self> {
+        match (enabled, state.is_some()) {
+            (true, false) => {
+                *state = Some(selected);
+                Some(selected)
+            }
+            (false, true) => state.take(),
+            _ => None,
+        }
+    }
+}
+
+// The active conversation's projection, like the adjacent dial globals. The
+// conversation preference owner saves/restores this at identity boundaries;
+// this slot alone is never durable evidence of the original selections.
+static OBSESSIVE_SELECTION: Mutex<Option<ObsessiveSelection>> = Mutex::new(None);
+
+/// The original selections if this conversation currently owns an overlay.
+#[must_use]
+pub fn obsessive_selection() -> Option<ObsessiveSelection> {
+    *OBSESSIVE_SELECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Install the incoming conversation's already validated overlay projection.
+/// A plain conversation clears the outgoing inverse; its baseline owns dials.
+pub fn restore_obsessive_selection(selection: Option<ObsessiveSelection>) {
+    *OBSESSIVE_SELECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = selection;
+    if selection.is_some() {
+        force_obsessive_dials();
+    }
+}
+
+/// Set the temporary overlay, returning whether it changed. Snapshot only on
+/// off-to-on; repeated setters cannot replace originals with forced values.
+/// Initiative, persona defaults, authority and crew startup are untouched.
+pub fn set_obsessive(enabled: bool) -> bool {
+    let mut original = OBSESSIVE_SELECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let selected = ObsessiveSelection {
+        cognition: crate::cognition::cli_cognition(),
+        tenacity: crate::tenacity::cli_tenacity(),
+    };
+    let Some(selection) = ObsessiveSelection::transition(&mut original, enabled, selected) else {
+        return false;
+    };
+    if enabled {
+        force_obsessive_dials();
+    } else {
+        set_cli_cognition(selection.cognition);
+        match selection.tenacity {
+            Some(level) => set_cli_tenacity(level),
+            None => crate::tenacity::clear_cli_tenacity(),
+        }
+    }
+    true
+}
 
 /// The obsessive posture's cognition: the deepest backend-specific reasoning level.
 pub const OBSESSIVE_COGNITION: Cognition = Cognition::Meticulous;
@@ -31,9 +112,13 @@ pub const OBSESSIVE_TENACITY: Tenacity = Tenacity::Relentless;
 /// it — at launch for full effect, or deferred with a note in-session. Returns
 /// the pair it set, for the caller's confirmation line.
 pub fn engage_obsessive_dials() -> (Cognition, Tenacity) {
+    set_obsessive(true);
+    (OBSESSIVE_COGNITION, OBSESSIVE_TENACITY)
+}
+
+fn force_obsessive_dials() {
     set_cli_cognition(CognitionOverride::Set(OBSESSIVE_COGNITION));
     set_cli_tenacity(OBSESSIVE_TENACITY);
-    (OBSESSIVE_COGNITION, OBSESSIVE_TENACITY)
 }
 
 // ---------------------------------------------------------------------------

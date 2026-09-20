@@ -20,7 +20,8 @@ use std::sync::Mutex;
 /// (no `reasoning.effort` field at all): the operator must be able to force it
 /// off even when a persona sets a level, and to step back to following the
 /// persona.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CognitionOverride {
     /// No operator override — the active persona's cognition (if any) applies.
     #[default]

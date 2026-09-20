@@ -98,15 +98,17 @@ enum Row {
     Cognition,
     Tenacity,
     Initiative,
+    Obsessive,
     Personality(PersonalityTrait),
 }
 
-const ROWS: [Row; 10] = [
+const ROWS: [Row; 11] = [
     Row::Persona,
     Row::Model,
     Row::Cognition,
     Row::Tenacity,
     Row::Initiative,
+    Row::Obsessive,
     Row::Personality(PersonalityTrait::Agreeableness),
     Row::Personality(PersonalityTrait::Extraversion),
     Row::Personality(PersonalityTrait::Warmth),
@@ -298,6 +300,7 @@ pub(crate) struct PanelState {
     cognition: Dial<CognitionOverride>,
     tenacity: Dial<Option<Tenacity>>,
     initiative: Dial<Option<Initiative>>,
+    obsessive: Dial<Option<newt_core::psyche::ObsessiveSelection>>,
     personality: [Dial<Option<PersonalityLevel>>; 5],
     /// The active backend's served models (#1666); `None` = the backend could
     /// not be listed when the panel opened — the row renders but won't dial.
@@ -385,6 +388,7 @@ impl PanelState {
             .as_ref()
             .and_then(|c| persona_opts.iter().position(|n| n == c))
             .unwrap_or(0);
+        let original = newt_core::psyche::obsessive_selection();
         Self {
             via,
             sel: 0,
@@ -392,9 +396,10 @@ impl PanelState {
             personas,
             persona_idx,
             current_persona,
-            cognition: Dial::Inherit(cli_cognition()),
-            tenacity: Dial::Inherit(cli_tenacity()),
+            cognition: Dial::Inherit(original.map_or_else(cli_cognition, |s| s.cognition)),
+            tenacity: Dial::Inherit(original.map_or_else(cli_tenacity, |s| s.tenacity)),
             initiative: Dial::Inherit(cli_initiative()),
+            obsessive: Dial::Inherit(original),
             personality: PersonalityTrait::ALL.map(|kind| Dial::Inherit(personality.get(kind))),
             model_opts,
             model: Dial::Inherit(model_idx),
@@ -426,7 +431,28 @@ impl PanelState {
 
     pub(crate) fn cycle(&mut self, dir: i32) {
         self.status = None;
+        if self.obsessive.value().is_some()
+            && matches!(
+                ROWS[self.sel],
+                Row::Cognition | Row::Tenacity | Row::Initiative
+            )
+        {
+            self.status = Some("obsessive is on; turn it off before editing effort dials".into());
+            return;
+        }
         match ROWS[self.sel] {
+            Row::Obsessive => {
+                let mut state = self.obsessive.value();
+                let enabled = state.is_none();
+                let selected = newt_core::psyche::ObsessiveSelection {
+                    cognition: self.cognition.value(),
+                    tenacity: self.tenacity.value(),
+                };
+                let _ = newt_core::psyche::ObsessiveSelection::transition(
+                    &mut state, enabled, selected,
+                );
+                self.obsessive.set(state);
+            }
             Row::Persona => {
                 self.persona_idx = clamp_step(self.persona_idx, dir, self.persona_opts.len());
             }
@@ -507,6 +533,9 @@ impl PanelState {
     /// `/model` path the caller routes it through, after that path's
     /// served-validation gate.)
     pub(crate) fn apply(&self) {
+        if self.obsessive.is_dirty() && newt_core::psyche::obsessive_selection().is_some() {
+            crate::settings_form::apply_obsessive(false, self.via);
+        }
         if self.cognition.is_dirty() {
             let _ = crate::settings_form::apply_cognition(self.cognition.value(), self.via);
         }
@@ -515,6 +544,9 @@ impl PanelState {
         }
         if self.initiative.is_dirty() {
             let _ = crate::settings_form::apply_initiative(self.initiative.value(), self.via);
+        }
+        if self.obsessive.is_dirty() && self.obsessive.value().is_some() {
+            crate::settings_form::apply_obsessive(true, self.via);
         }
     }
 
@@ -543,6 +575,7 @@ impl PanelState {
         !self.cognition.is_dirty()
             && !self.tenacity.is_dirty()
             && !self.initiative.is_dirty()
+            && !self.obsessive.is_dirty()
             && !self.model.is_dirty()
             && !self.personality.iter().any(|dial| dial.is_dirty())
             && self.persona_action() == PersonaAction::Keep
@@ -609,6 +642,9 @@ impl PanelState {
     /// an explicit override wins, else the selected persona's declared level, else
     /// none.
     fn projected_cognition(&self) -> Option<Cognition> {
+        if self.obsessive.value().is_some() {
+            return Some(newt_core::psyche::OBSESSIVE_COGNITION);
+        }
         match self.cognition.value() {
             CognitionOverride::Set(c) => Some(c),
             CognitionOverride::Off => None,
@@ -618,6 +654,9 @@ impl PanelState {
 
     /// The chosen level, excluding inherited family/config defaults from saves.
     fn chosen_tenacity(&self) -> Option<Tenacity> {
+        if self.obsessive.value().is_some() {
+            return Some(newt_core::psyche::OBSESSIVE_TENACITY);
+        }
         self.tenacity
             .value()
             .or_else(|| self.selected_profile().and_then(|p| p.tenacity))
@@ -815,6 +854,12 @@ impl PanelState {
     /// `(value, provenance)` for the cognition row. Provenance distinguishes an
     /// explicit override from a value inherited from the selected persona / base.
     fn cognition_cell(&self) -> (String, String) {
+        if self.obsessive.value().is_some() {
+            return (
+                newt_core::psyche::OBSESSIVE_COGNITION.label().into(),
+                "obsessive on; turn off to edit".into(),
+            );
+        }
         match self.cognition.value() {
             CognitionOverride::Set(c) => (c.label().to_string(), "override".to_string()),
             CognitionOverride::Off => ("off".to_string(), "override".to_string()),
@@ -826,6 +871,12 @@ impl PanelState {
         }
     }
     fn tenacity_cell(&self) -> (String, String) {
+        if self.obsessive.value().is_some() {
+            return (
+                newt_core::psyche::OBSESSIVE_TENACITY.label().into(),
+                "obsessive on; turn off to edit".into(),
+            );
+        }
         match self.tenacity.value() {
             Some(t) => (t.label().to_string(), "override".to_string()),
             None => {
@@ -908,20 +959,36 @@ impl PanelState {
                 value: cog_val,
                 provenance: cog_prov,
                 selected: ROWS[self.sel] == Row::Cognition,
-                editable: true,
+                editable: self.obsessive.value().is_none(),
             },
             RowView {
                 label: "tenacity",
                 value: ten_val,
                 provenance: ten_prov,
                 selected: ROWS[self.sel] == Row::Tenacity,
-                editable: true,
+                editable: self.obsessive.value().is_none(),
             },
             RowView {
                 label: "initiative",
                 value: ini_val,
-                provenance: ini_prov,
+                provenance: if self.obsessive.value().is_some() {
+                    "obsessive on; turn off to edit".into()
+                } else {
+                    ini_prov
+                },
                 selected: ROWS[self.sel] == Row::Initiative,
+                editable: self.obsessive.value().is_none(),
+            },
+            RowView {
+                label: "obsessive",
+                value: if self.obsessive.value().is_some() {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+                provenance: "temporary effort; crew requires a new launch".into(),
+                selected: ROWS[self.sel] == Row::Obsessive,
                 editable: true,
             },
             RowView {
@@ -2717,3 +2784,7 @@ Keep this loaded prompt and its restrictions.
 #[cfg(test)]
 #[path = "config_panel_resolute_tests.rs"]
 mod resolute_tests;
+
+#[cfg(test)]
+#[path = "config_panel_obsessive_tests.rs"]
+mod obsessive_tests;

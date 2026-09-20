@@ -2809,6 +2809,7 @@ fn session_body(
                 color,
                 verbose,
             },
+            tabs.active_mut(),
         );
         // Same re-probe discipline as every other backend switch (review
         // finding 5): a pin that repointed the endpoint must repoint the DGX
@@ -6988,50 +6989,27 @@ fn session_body(
                 {
                     clean_exit = true;
                     break;
-                } else if let Some(refusal) =
-                    crate::tab_switch::degraded_turn_refusal(tabs.active().pin_degraded.as_ref())
-                {
-                    // #1669 PR-A (item 5) — CONTRACT: while a tab's pinned
-                    // posture is not in force, the operator prompt is NOT
-                    // ACCEPTED. Nothing durable is written for it.
-                    //
-                    // Chosen over "accept durably, refuse inference" because the
-                    // prompt receipt chain is the conversation's authority
-                    // lineage: admitting a prompt that never ran would leave a
-                    // receipt whose ancestry, current-objective and clarification
-                    // state describe a turn that does not exist, and `/resume`
-                    // would later rehydrate it as real.
-                    //
-                    // Placed AFTER every slash and `!host` command has been
-                    // dispatched above, BEFORE `begin_model_prompt`, so the
-                    // recovery commands stay reachable: `/tab retry`,
-                    // `/backends`, `/psyche` and `/tab` all still work.
-                    print_newt(&refusal, color, verbose);
-                    println!();
-                    continue;
                 } else {
-                    // Past every interception (`!shell`, `/command`, help,
-                    // `exit`): this line IS a model turn. Announce Working now
-                    // — and only now — so commands never flip the pane state.
-                    newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::TurnStarted);
-                    // Durable ingress is the FIRST operation in the final
-                    // model-input branch. It precedes hardware probes,
-                    // retrieval, inference, and every tool-capable path. Raw
-                    // bytes are the accepted surface line; model bytes are the
-                    // exact normalized `task` sent below.
-                    match begin_model_prompt(
+                    // The production admission owner refuses degraded posture
+                    // before lifecycle work or any durable prompt receipt.
+                    match admit_model_prompt(
+                        tabs.active(),
                         PromptIngress {
                             durable: conversation_store.as_ref(),
                             ephemeral: &ephemeral_prompt_store,
                         },
-                        &active_conversation_id,
                         &conversation_title_from_task(&task),
                         active_persona.as_ref().map(|p| p.name.as_str()),
                         line.as_bytes(),
                         task.as_bytes(),
                         &model_input_origin,
                     ) {
-                        Ok(context) => {
+                        Ok(ModelPromptAdmission::Refused(refusal)) => {
+                            print_newt(&refusal, color, verbose);
+                            println!();
+                            continue;
+                        }
+                        Ok(ModelPromptAdmission::Accepted(context)) => {
                             // Receipt creation is the durable acceptance point.
                             // A fresh substantive operator ask supersedes the
                             // old capped objective here; a bare continuation was
@@ -7053,7 +7031,7 @@ fn session_body(
                                     &context.submitted_prompt().id().to_string(),
                                 );
                             }
-                            active_prompt_context = Some(context);
+                            active_prompt_context = Some(*context);
                         }
                         Err(e) => {
                             active_prompt_context = None;
@@ -9219,3 +9197,7 @@ mod incomplete_turn_persistence_tests;
 mod memory_retrieval_tests;
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15
+
+#[path = "chat_admission.rs"]
+mod admission;
+use admission::{admit_model_prompt, ModelPromptAdmission};

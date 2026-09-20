@@ -2,6 +2,12 @@ use super::*;
 use crate::tabs::{TabAction, TabSet};
 use newt_core::lifecycle::new_session_id;
 
+#[path = "obsessive_tests.rs"]
+mod obsessive_tests;
+
+#[path = "obsessive_lifecycle_tests.rs"]
+mod obsessive_lifecycle_tests;
+
 /// Every backend shares one endpoint AND one model, so no route change ever
 /// fires `refresh_backend`'s served-adoption probe — the tier stays
 /// network-free while still exercising the real posture machinery.
@@ -1800,6 +1806,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
                 tenacity: Some(newt_core::Tenacity::Relentless),
                 initiative: Some(newt_core::Initiative::Eager),
                 model: Some("m0".into()),
+                obsessive: None,
             },
         )
         .unwrap();
@@ -1848,7 +1855,8 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
     }
 
     // And the pin itself cannot carry authority: its axes are exactly the
-    // five preference axes, so there is nothing security-shaped to migrate.
+    // preference axes plus their reversible effort overlay. The inverse holds
+    // only cognition/tenacity selectors, never grants or permission clamps.
     let pin = h.store.preference_pin(&b).unwrap().unwrap();
     let newt_core::OperatorPreferencePin {
         backend: _,
@@ -1856,6 +1864,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
         cognition: _,
         tenacity: _,
         initiative: _,
+        obsessive: _,
     } = pin;
 }
 

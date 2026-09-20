@@ -359,6 +359,7 @@ impl TabSwitchCtx<'_> {
         // `/backends` choice made before the first prompt survives a switch.
         if let Some(seed) = tabs.active().fresh_seed.as_ref() {
             *self.pending = seed.pending.clone();
+            self.pending.restore_effort_projection();
         }
         self.hydrate_sidecar(tabs);
         restored

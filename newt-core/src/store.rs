@@ -194,6 +194,7 @@ use liveness::{
 };
 pub use liveness::{ClaimOutcome, LivenessFn, StoredOwner};
 
+mod preference_pins;
 mod prompts;
 #[cfg(test)]
 use prompts::{insert_prompt_receipt, MAX_PROMPT_LINEAGE_DEPTH};
@@ -1689,6 +1690,7 @@ impl ConversationStore {
         pin: &crate::OperatorPreferencePin,
     ) -> anyhow::Result<()> {
         let id = self.resolve_id(id)?;
+        self.validate_preference_pin(&id, pin)?;
         let json = serde_json::to_string(pin)?;
         let conn = self.lock_conn();
         conn.execute(
@@ -1740,6 +1742,7 @@ impl ConversationStore {
                          operator preference pin ({e}); refusing to load garbage"
                     )
                 })?;
+                self.validate_preference_pin(id, &pin)?;
                 Ok(Some(pin))
             }
             None => Ok(None),
@@ -2382,6 +2385,9 @@ mod liveness_tests;
 #[cfg(test)]
 #[path = "store_tests/misc.rs"]
 mod misc_tests;
+#[cfg(test)]
+#[path = "store_tests/obsessive_pin.rs"]
+mod obsessive_pin_tests;
 #[cfg(test)]
 #[path = "store_tests/prompts.rs"]
 mod prompts_tests;

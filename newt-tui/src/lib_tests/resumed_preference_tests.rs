@@ -10,6 +10,8 @@ use newt_core::tenacity::{clear_cli_tenacity, cli_tenacity, set_cli_tenacity, Te
 use newt_core::test_guard::GlobalSettingsGuard;
 use newt_core::{OperatorPreferencePin, PreferenceActions, PreferenceAxes};
 
+include!("obsessive_startup_tests.rs");
+
 /// Every backend shares one endpoint AND one model, so switching between
 /// them never changes the resolved URL/model and therefore never fires
 /// `refresh_backend`'s served-adoption probe — the unit tier stays
@@ -99,7 +101,12 @@ impl Session {
         baseline: &PreferenceBaseline,
         cfg: &newt_core::ResolvedConfig,
     ) -> bool {
-        apply_startup_preference_pin(outcome, self.switch_args(store, id, baseline, cfg, None))
+        let mut tabs = crate::tabs::TabSet::new(newt_core::lifecycle::new_session_id(), id);
+        apply_startup_preference_pin(
+            outcome,
+            self.switch_args(store, id, baseline, cfg, None),
+            tabs.active_mut(),
+        )
     }
 
     /// Switch with a persona active — the branch every earlier test left
@@ -458,6 +465,7 @@ fn a_failed_open_pin_survives_verbatim_in_the_row() {
         cognition: Some("transcending".into()),
         tenacity: Some(Tenacity::Relentless),
         initiative: Some(Initiative::Patient),
+        obsessive: None,
     };
     store.update_preference_pin(&id, &stale).unwrap();
 

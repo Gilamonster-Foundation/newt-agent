@@ -4533,31 +4533,30 @@ pub(crate) fn persist_preference_actions(
         *pending = newt_core::PreferenceActions::default();
         return Ok(());
     };
-    let stored = match store.preference_pin(conversation_id) {
-        // No durable row yet — hold the actions until there is one.
-        Ok(None) => return Ok(()),
-        Ok(Some(pin)) => pin,
-        Err(e) => {
+    match store.merge_preference_actions(conversation_id, pending) {
+        Ok(true) => {
             *pending = newt_core::PreferenceActions::default();
-            return Err(format!(
-                "could not read the conversation preference pin ({e}) — \
-                 this change applies to the session but is not pinned"
-            ));
+            Ok(())
         }
-    };
-    let merged = stored.merged(pending);
-    *pending = newt_core::PreferenceActions::default();
-    if merged == stored {
-        return Ok(());
+        Ok(false) => Ok(()), // Rowless: retain the exact pending transition.
+        Err(error) => Err(format!(
+            "could not persist the conversation preference pin: {error}; \
+             pending selections retained for retry"
+        )),
     }
-    store
-        .update_preference_pin(conversation_id, &merged)
-        .map_err(|e| format!("could not persist the conversation preference pin: {e}"))
 }
 
 #[cfg(test)]
 #[path = "lib_tests/resumed_preference_tests.rs"]
 mod resumed_preference_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/obsessive_persist_tests.rs"]
+mod obsessive_persist_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/obsessive_route_tests.rs"]
+mod obsessive_route_tests;
 
 /// Build a system prompt with workspace context so the model knows the project.
 // build_system_prompt_with_soul is used directly now; this wrapper kept for tests.

@@ -40,6 +40,8 @@ pub(crate) struct PreferenceBaseline {
     pub tenacity: Option<newt_core::Tenacity>,
     /// The `/psyche initiative` override the invocation started with.
     pub initiative: Option<newt_core::Initiative>,
+    /// The launch overlay's original inputs, if --obsessive was requested.
+    pub obsessive: Option<newt_core::psyche::ObsessiveSelection>,
 }
 
 impl PreferenceBaseline {
@@ -52,6 +54,7 @@ impl PreferenceBaseline {
             cognition: newt_core::cognition::cli_cognition(),
             tenacity: newt_core::tenacity::cli_tenacity(),
             initiative: newt_core::initiative::cli_initiative(),
+            obsessive: newt_core::psyche::obsessive_selection(),
         }
     }
 }
@@ -165,11 +168,14 @@ impl StartupConversation {
 pub(crate) fn apply_startup_preference_pin(
     outcome: StartupConversation,
     sw: ConversationPreferenceSwitch<'_>,
+    tab: &mut crate::tabs::TabState,
 ) -> bool {
     if !outcome.applies_pin() {
         return false;
     }
-    restore_preference_pin(sw).url_changed
+    let restored = restore_preference_pin_for(sw, RestoreReason::Startup);
+    tab.pin_degraded = restored.degraded;
+    restored.url_changed
 }
 
 /// #1668: re-seat the session posture for the conversation being switched to —
@@ -202,6 +208,19 @@ pub(crate) fn apply_startup_preference_pin(
 /// Returns whether the endpoint URL changed, so the caller re-probes DGX
 /// telemetry only when it matters (same contract as [`apply_persona_backend`]).
 pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> PinRestore {
+    restore_preference_pin_for(sw, RestoreReason::Conversation)
+}
+
+#[derive(Clone, Copy)]
+enum RestoreReason {
+    Startup,
+    Conversation,
+}
+
+fn restore_preference_pin_for(
+    sw: ConversationPreferenceSwitch<'_>,
+    reason: RestoreReason,
+) -> PinRestore {
     let ConversationPreferenceSwitch {
         store,
         conversation_id,
@@ -274,6 +293,7 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
         Some(i) => newt_core::initiative::set_cli_initiative(i),
         None => newt_core::initiative::clear_cli_initiative(),
     }
+    newt_core::psyche::restore_obsessive_selection(baseline.obsessive);
     *base_provider = baseline.provider.clone();
     *base_model = baseline.model.clone();
 
@@ -293,6 +313,33 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
     if let Some(i) = plan.initiative {
         newt_core::initiative::set_cli_initiative(i);
         applied.push(format!("initiative {}", i.label()));
+    }
+    // Launch choices win when starting a new invocation. Later switches restore
+    // this conversation's acted On/Off, including explicit auto/off selectors;
+    // an absent overlay still inherits the launch baseline. The actual store
+    // reader already verified the mode, selectors and expected owner together.
+    let apply_overlay = matches!(reason, RestoreReason::Conversation)
+        || (!owned.cognition && !owned.tenacity && baseline.obsessive.is_none());
+    let overlay_applied = apply_overlay && pin.obsessive.is_some();
+    if apply_overlay {
+        if let Some(overlay) = &pin.obsessive {
+            let original = overlay.original();
+            match overlay.mode() {
+                newt_core::psyche::ObsessiveMode::On => {
+                    newt_core::psyche::restore_obsessive_selection(Some(original));
+                    applied.push("obsessive on".into());
+                }
+                newt_core::psyche::ObsessiveMode::Off => {
+                    newt_core::psyche::restore_obsessive_selection(None);
+                    newt_core::cognition::set_cli_cognition(original.cognition);
+                    match original.tenacity {
+                        Some(level) => newt_core::tenacity::set_cli_tenacity(level),
+                        None => newt_core::tenacity::clear_cli_tenacity(),
+                    }
+                    applied.push("obsessive off".into());
+                }
+            }
+        }
     }
     // The backend axis the session should route on once the switch settles:
     // the pin if it names one, else the active persona's declared route, else
@@ -377,8 +424,8 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
     let suppressed = newt_core::PreferenceAxes {
         backend: owned.backend && pin.backend.is_some(),
         model: owned.model && pin.model.is_some(),
-        cognition: owned.cognition && pin.cognition.is_some(),
-        tenacity: owned.tenacity && pin.tenacity.is_some(),
+        cognition: !overlay_applied && owned.cognition && pin.cognition.is_some(),
+        tenacity: !overlay_applied && owned.tenacity && pin.tenacity.is_some(),
         initiative: owned.initiative && pin.initiative.is_some(),
     };
     if !suppressed.is_empty() {

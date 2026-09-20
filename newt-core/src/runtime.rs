@@ -223,6 +223,9 @@ pub struct OperatorPreferencePin {
     /// The `/psyche initiative` session override, if any (slice 1b).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initiative: Option<Initiative>,
+    /// Active effort overlay and its verified original selectors. No authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obsessive: Option<crate::psyche::ObsessivePin>,
 }
 
 /// What applying a [`OperatorPreferencePin`] on resume should DO — resolved purely (no
@@ -355,9 +358,34 @@ pub struct PreferenceActions {
     pub tenacity: Option<Option<Tenacity>>,
     /// The `/psyche initiative` override the operator chose (`Some(None)` = `auto`).
     pub initiative: Option<Option<Initiative>>,
+    /// A changed overlay: untouched, enabled with original selectors, or off.
+    pub obsessive: Option<Option<crate::psyche::ObsessiveSelection>>,
 }
 
 impl PreferenceActions {
+    /// Rehydrate previously accepted effort edits owned by a rowless tab.
+    /// No new action/receipt is produced, and current persona defaults survive.
+    pub fn restore_effort_projection(&self) {
+        if let Some(cognition) = self.cognition {
+            crate::cognition::set_cli_cognition(cognition);
+        }
+        if let Some(tenacity) = self.tenacity {
+            match tenacity {
+                Some(level) => crate::tenacity::set_cli_tenacity(level),
+                None => crate::tenacity::clear_cli_tenacity(),
+            }
+        }
+        if let Some(initiative) = self.initiative {
+            match initiative {
+                Some(level) => crate::initiative::set_cli_initiative(level),
+                None => crate::initiative::clear_cli_initiative(),
+            }
+        }
+        if let Some(selection) = self.obsessive {
+            crate::psyche::restore_obsessive_selection(selection);
+        }
+    }
+
     /// `true` when no axis was acted on — nothing to persist.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -383,6 +411,9 @@ impl PreferenceActions {
         if other.initiative.is_some() {
             self.initiative = other.initiative;
         }
+        if other.obsessive.is_some() {
+            self.obsessive = other.obsessive;
+        }
     }
 }
 
@@ -398,7 +429,17 @@ static PREFERENCE_ACTIONS: Mutex<PreferenceActions> = Mutex::new(PreferenceActio
     cognition: None,
     tenacity: None,
     initiative: None,
+    obsessive: None,
 });
+
+/// Record a successful overlay transition alongside its exact original inputs.
+pub fn mark_obsessive_choice(selection: Option<crate::psyche::ObsessiveSelection>) {
+    if let Ok(mut slot) = PREFERENCE_ACTIONS.lock() {
+        slot.obsessive = Some(selection);
+        slot.cognition = Some(crate::cognition::cli_cognition());
+        slot.tenacity = Some(crate::tenacity::cli_tenacity());
+    }
+}
 
 // #1668: the axes THIS INVOCATION's explicit inputs own (see [`PreferenceAxes`]).
 // Recorded once at launch by `newt-cli`, read by every pin apply.
@@ -486,6 +527,7 @@ pub fn cli_preference_axes() -> PreferenceAxes {
 pub struct PreferenceRuntimeSnapshot {
     actions: PreferenceActions,
     cli_axes: PreferenceAxes,
+    obsessive: Option<crate::psyche::ObsessiveSelection>,
 }
 
 /// Snapshot the #1668 posture globals (see [`PreferenceRuntimeSnapshot`]).
@@ -498,12 +540,14 @@ pub fn snapshot_runtime_state() -> PreferenceRuntimeSnapshot {
             .map(|s| s.clone())
             .unwrap_or_default(),
         cli_axes: cli_preference_axes(),
+        obsessive: crate::psyche::obsessive_selection(),
     }
 }
 
 /// Restore the #1668 posture globals from a snapshot.
 #[doc(hidden)]
 pub fn restore_runtime_state(snapshot: PreferenceRuntimeSnapshot) {
+    crate::psyche::restore_obsessive_selection(snapshot.obsessive);
     if let Ok(mut slot) = PREFERENCE_ACTIONS.lock() {
         *slot = snapshot.actions;
     }
@@ -855,6 +899,7 @@ mod tests {
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
             initiative: Some(Initiative::Patient),
+            obsessive: None,
         };
         let dial_only = PreferenceActions {
             cognition: Some(CognitionOverride::Set(Cognition::Zen)),
@@ -875,6 +920,7 @@ mod tests {
             cognition: Some(CognitionOverride::Unset),
             model: Some(None),
             backend: None,
+            obsessive: None,
         });
         assert!(
             cleared.is_empty(),
@@ -923,6 +969,7 @@ mod tests {
                 initiative: Some(Initiative::Patient),
                 tenacity: None,
                 cognition: None,
+                obsessive: None,
             }
         );
     }
@@ -1119,6 +1166,7 @@ mod tests {
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
             initiative: Some(Initiative::Eager),
+            obsessive: None,
         };
         let plan = pin.apply_plan(
             &["sol"],
@@ -1198,6 +1246,7 @@ mod tests {
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
             initiative: Some(Initiative::Eager),
+            obsessive: None,
         };
         let value: serde_json::Value = serde_json::to_value(&full).unwrap();
         let mut keys: Vec<&str> = value
@@ -1262,6 +1311,7 @@ mod tests {
             cognition: Some("off".into()),
             tenacity: Some(Tenacity::Relentless),
             initiative: Some(Initiative::Eager),
+            obsessive: None,
         };
         // Exhaustive destructure: a new PreferenceApplyPlan field fails to compile
         // here, forcing the next author past the invariant above.

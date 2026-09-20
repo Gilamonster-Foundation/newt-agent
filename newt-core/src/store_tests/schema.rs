@@ -52,6 +52,7 @@ fn preference_pin_round_trips_defaults_empty_and_is_workspace_fenced() {
         cognition: Some("off".into()),
         tenacity: Some(crate::Tenacity::Relentless),
         initiative: Some(crate::Initiative::Decisive),
+        obsessive: None,
     };
     store_a.update_preference_pin(&id, &pin).unwrap();
     assert_eq!(store_a.preference_pin(&id).unwrap(), Some(pin.clone()));

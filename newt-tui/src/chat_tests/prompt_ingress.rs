@@ -604,3 +604,9 @@ fn durable_pending_clarification_rehydrates_its_lineage_after_resume() {
         "a fully explicit answer must clear the recovered pending state"
     );
 }
+
+#[path = "obsessive_row_birth.rs"]
+mod obsessive_row_birth_tests;
+
+#[path = "obsessive_startup_admission.rs"]
+mod obsessive_startup_admission_tests;

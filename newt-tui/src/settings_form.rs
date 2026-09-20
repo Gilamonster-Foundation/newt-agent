@@ -735,6 +735,35 @@ pub(crate) fn apply_and_record(field: Field, value: &str, via: &str) -> Result<S
     recorded(field, via, || apply(field, value)).map(|(message, _)| message)
 }
 
+/// The posture transition shares the existing recorder and pending pin owner.
+/// Repeating an explicit setter is a no-op, including receipts and pin actions.
+pub(crate) fn apply_obsessive(enabled: bool, via: &str) -> String {
+    let before = newt_core::psyche::obsessive_selection().is_some();
+    let token = |on| if on { "on" } else { "off" };
+    if before == enabled {
+        return format!("obsessive: {} (unchanged)", token(enabled));
+    }
+    recorded_values("psyche", token(before).into(), via, || {
+        newt_core::psyche::set_obsessive(enabled);
+        newt_core::runtime::mark_obsessive_choice(newt_core::psyche::obsessive_selection());
+        Ok((
+            format!("obsessive: {}", token(enabled)),
+            token(enabled).into(),
+        ))
+    })
+    .map(|(message, _)| message)
+    .unwrap_or_else(|error| error)
+}
+
+/// A shared refusal for every text and typed dial writer while the overlay owns it.
+pub(crate) fn effort_lock(field: Field) -> Option<String> {
+    (matches!(
+        field,
+        Field::Cognition | Field::Tenacity | Field::Initiative
+    ) && newt_core::psyche::obsessive_selection().is_some())
+    .then(|| "obsessive is on; use /obsessive off before editing effort dials".to_string())
+}
+
 /// Snapshot the setting, run the write, record what moved.
 ///
 /// The recording half of [`apply_and_record`], factored out because there is
@@ -747,6 +776,9 @@ fn recorded<T>(
     via: &str,
     write: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Option<SettingChange>), String> {
+    if let Some(reason) = effort_lock(field) {
+        return Err(reason);
+    }
     recorded_values(field.name(), field.value_now(), via, || {
         let applied = write()?;
         Ok((applied, field.value_now()))
