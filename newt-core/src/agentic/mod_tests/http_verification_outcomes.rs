@@ -21,11 +21,16 @@ fn instruction(check: &str) -> String {
 #[derive(Clone, Copy)]
 enum Step {
     Run(&'static str),
+    /// A real non-shell operation, retaining typed producer behavior.
+    Tool(&'static str, &'static str),
+    /// Multiple valid calls in one real model response.
+    Tools(&'static [(&'static str, &'static str)]),
     /// A `run_command` of this command beside a call whose arguments are not a
     /// JSON object, so validation rejects the whole batch.
     RejectedBatch(&'static str),
     Done,
     Refusal,
+    HttpError(u16),
 }
 
 fn rejected_batch(wire: &str, command: &str) -> ResponseTemplate {
@@ -51,6 +56,32 @@ fn rejected_batch(wire: &str, command: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(value)
 }
 
+fn tool_batch(wire: &str, calls: &[(&str, &str)]) -> ResponseTemplate {
+    let calls: Vec<_> = calls.iter().enumerate().map(|(i, (name, arguments))| {
+        let args: serde_json::Value = serde_json::from_str(arguments).expect("fixture arguments");
+        let id = format!("call_{i}");
+        match wire {
+            "anthropic" => serde_json::json!({"type":"tool_use","id":id,"name":name,"input":args}),
+            "ollama" => serde_json::json!({"function":{"name":name,"arguments":args}}),
+            "responses" => serde_json::json!({"type":"function_call","id":format!("fc_{i}"),"call_id":id,"name":name,"arguments":args.to_string()}),
+            _ => serde_json::json!({"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}),
+        }
+    }).collect();
+    let value = match wire {
+        "anthropic" => {
+            serde_json::json!({"id":"msg_1","type":"message","role":"assistant","model":"test-model","stop_reason":"tool_use","content":calls})
+        }
+        "ollama" => {
+            serde_json::json!({"message":{"role":"assistant","content":"","tool_calls":calls},"done":true})
+        }
+        "responses" => serde_json::json!({"id":"resp_1","status":"completed","output":calls}),
+        _ => {
+            serde_json::json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":calls},"finish_reason":"tool_calls"}]})
+        }
+    };
+    ResponseTemplate::new(200).set_body_json(value)
+}
+
 fn reply(wire: &str, step: Step) -> ResponseTemplate {
     if matches!(step, Step::Refusal) {
         let value = match wire {
@@ -66,9 +97,14 @@ fn reply(wire: &str, step: Step) -> ResponseTemplate {
     }
     let call = match step {
         Step::Run(command) => Some(("run_command", serde_json::json!({"command": command}))),
+        Step::Tool(name, args) => {
+            Some((name, serde_json::from_str(args).expect("fixture arguments")))
+        }
+        Step::Tools(calls) => return tool_batch(wire, calls),
         Step::RejectedBatch(command) => return rejected_batch(wire, command),
         Step::Done => None,
         Step::Refusal => unreachable!(),
+        Step::HttpError(status) => return ResponseTemplate::new(status),
     };
     let value = match (wire, call) {
         ("ollama", Some((name, args))) => {
@@ -166,6 +202,15 @@ async fn run_turn(turn: Turn<'_>) -> Run {
 }
 
 async fn run_turn_configured(turn: Turn<'_>, configure: impl FnOnce(&mut ChatCtx<'_>)) -> Run {
+    run_turn_with_auxiliary(turn, configure, None, None).await
+}
+
+async fn run_turn_with_auxiliary(
+    turn: Turn<'_>,
+    configure: impl FnOnce(&mut ChatCtx<'_>),
+    auxiliary: Option<Arc<SummarizeFn>>,
+    allowance: Option<&run_allowance::RunAllowance>,
+) -> Run {
     let Turn {
         wire,
         smart,
@@ -199,7 +244,9 @@ async fn run_turn_configured(turn: Turn<'_>, configure: impl FnOnce(&mut ChatCtx
         .await;
     let harness = SmartHarness::new(
         agent_harness::Session::new(Default::default()).unwrap(),
-        Arc::new(|_| Box::pin(async { Ok(("\"answer\"".to_string(), None)) })),
+        auxiliary.unwrap_or_else(|| {
+            Arc::new(|_| Box::pin(async { Ok(("\"answer\"".to_string(), None)) }))
+        }),
         AdjudicationSettings::default(),
     )
     .unwrap();
@@ -211,8 +258,11 @@ async fn run_turn_configured(turn: Turn<'_>, configure: impl FnOnce(&mut ChatCtx
         .into_owned();
     let task = workspace_task.map_or_else(|| instruction(check), |(_, task)| task.to_string());
     let (uri, messages) = (server.uri(), msgs());
+    let attempt_ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let mut context = ctx(&uri, &messages, &caveats);
     context.workspace = &workspace;
+    context.run_allowance = allowance;
+    context.attempt_ledger = allowance.map(|_| &attempt_ledger);
     context.task = &task;
     context.max_tool_rounds = max_tool_rounds;
     context.verify_outcomes = outcomes;
@@ -858,3 +908,6 @@ async fn every_verification_case_ends_within_its_allowance() {
 
 #[path = "http_resolute.rs"]
 mod resolute;
+
+#[path = "http_grit.rs"]
+mod grit;
