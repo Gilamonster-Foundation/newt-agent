@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 #[path = "tenacity_config.rs"]
 mod config;
-pub use config::TenacityConfig;
+pub use config::{TenacityBudgets, TenacityConfig};
 
 /// Bounded sentinel used for an operator-selected relentless run. This is high
 /// enough to behave as "finish the objective" while remaining finite.
@@ -23,6 +23,8 @@ pub enum Tenacity {
     /// Stop at the first plausible finish, within the configured round limit.
     #[default]
     Normal,
+    /// Admit bounded corrective reasoning after observed operational failures.
+    Grit,
     /// Require fresh successful verification before completing an Act task.
     Resolute,
     /// Require verification and also lift the limit when chosen explicitly.
@@ -49,6 +51,7 @@ impl Tenacity {
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::Grit => "grit",
             Self::Resolute => "resolute",
             Self::Relentless => "relentless",
         }
@@ -61,6 +64,7 @@ impl Tenacity {
             Self::Normal => {
                 "stop at the first plausible finish, within the configured round limit".to_string()
             }
+            Self::Grit => "recover from observed failures within the captured retry allowance".to_string(),
             Self::Resolute => "require fresh successful verification before task completion".to_string(),
             Self::Relentless => format!(
                 "require fresh verification; an explicit choice lifts the tool-round limit to at least {RELENTLESS_TOOL_ROUND_TARGET} \
@@ -75,10 +79,16 @@ impl Tenacity {
         matches!(self, Self::Resolute | Self::Relentless)
     }
 
+    /// Whether observed failures receive bounded harness corrective reasoning.
+    #[must_use]
+    pub fn recovers_failures(self) -> bool {
+        self != Self::Normal
+    }
+
     /// All levels, normal → relentless.
     #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::Normal, Self::Resolute, Self::Relentless]
+    pub fn all() -> [Self; 4] {
+        [Self::Normal, Self::Grit, Self::Resolute, Self::Relentless]
     }
 }
 
@@ -246,11 +256,11 @@ impl FromStr for Tenacity {
         if let Some(new) = crate::psyche_import::split_tenacity(&s) {
             return Err(format!(
                 "tenacity '{s}' was split: its read-before-acting half is now \
-                 `--initiative {new}`; tenacity is normal|resolute|relentless"
+                 `--initiative {new}`; tenacity is normal|grit|resolute|relentless"
             ));
         }
         Err(format!(
-            "unknown tenacity '{s}' (normal|resolute|relentless)"
+            "unknown tenacity '{s}' (normal|grit|resolute|relentless)"
         ))
     }
 }
@@ -331,6 +341,8 @@ std::thread_local! {
     /// immutable posture without replacing the interactive process globals.
     static EFFECTIVE_TENACITY_OVERRIDE: std::cell::Cell<Option<Tenacity>> =
         const { std::cell::Cell::new(None) };
+    static BUDGET_OVERRIDE: std::cell::Cell<Option<TenacityBudgets>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Restores the prior current-thread override on drop. The `Rc` marker keeps
@@ -339,12 +351,14 @@ std::thread_local! {
 #[must_use]
 pub struct ScopedEffectiveTenacity {
     previous: Option<Tenacity>,
+    previous_budgets: Option<TenacityBudgets>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Drop for ScopedEffectiveTenacity {
     fn drop(&mut self) {
         let _ = EFFECTIVE_TENACITY_OVERRIDE.try_with(|slot| slot.set(self.previous));
+        let _ = BUDGET_OVERRIDE.try_with(|slot| slot.set(self.previous_budgets));
     }
 }
 
@@ -356,11 +370,32 @@ impl Drop for ScopedEffectiveTenacity {
 /// [`crate::psyche::capture_turn_psyche`] at a turn boundary, so tenacity is
 /// never pinned without the other dials.
 pub fn scoped_effective_tenacity(level: Tenacity) -> ScopedEffectiveTenacity {
+    scoped_tenacity_settings(level, effective_tenacity_budgets())
+}
+
+/// Install the level and numerical policy already captured by the turn owner.
+pub fn scoped_tenacity_settings(
+    level: Tenacity,
+    budgets: TenacityBudgets,
+) -> ScopedEffectiveTenacity {
+    let previous_budgets = BUDGET_OVERRIDE.with(|slot| slot.replace(Some(budgets)));
     let previous = EFFECTIVE_TENACITY_OVERRIDE.with(|slot| slot.replace(Some(level)));
     ScopedEffectiveTenacity {
         previous,
+        previous_budgets,
         _thread_bound: std::marker::PhantomData,
     }
+}
+
+/// A turn sees its frozen numerical policy; other threads resolve live config.
+pub fn effective_tenacity_budgets() -> TenacityBudgets {
+    BUDGET_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| {
+            tenacity_config()
+                .map(|config| config.budgets)
+                .unwrap_or_default()
+        })
 }
 
 /// Install the explicit CLI `--tenacity` override (highest priority). Call once,
@@ -734,3 +769,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tenacity_resolute_tests.rs"]
 mod resolute_tests;
+
+#[cfg(test)]
+#[path = "tenacity_grit_tests.rs"]
+mod grit_tests;
