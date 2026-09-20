@@ -53,7 +53,7 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
         .stderr(predicate::str::contains("secret-value").not());
 
     let config_path = config_dir.path().join("config.toml");
-    let config = newt_core::Config::load(&config_path).unwrap();
+    let config = newt_core::Config::load(&config_path, &mut |_| {}).unwrap();
     let backend_name = format!("127-0-0-1-{}", server.address().port());
     assert_eq!(
         config.default_backend.as_deref(),
