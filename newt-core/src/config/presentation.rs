@@ -154,7 +154,7 @@ pub fn session_markdown_mode() -> MarkdownMode {
     {
         return mode;
     }
-    Config::resolve()
+    Config::resolve_unpublished()
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.markdown)
