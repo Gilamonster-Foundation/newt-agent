@@ -194,7 +194,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
     let args = serde_json::json!({"path": "report.txt"});
     let permission = serde_json::json!({"capability": "fs_read", "target": "report.txt"});
     for result_aware in [false, true] {
-        let mut guard = RepeatCallGuard::for_verification(result_aware);
+        let mut guard = RepeatCallGuard::for_policy(result_aware, false);
         guard.record(
             "read_file",
             &args,
@@ -327,7 +327,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 "error: command exited 1\nhead: /approved/config: Operation not permitted",
                 "error: command exited 101\ncompilation failed",
             ] {
-                let mut guard = RepeatCallGuard::for_verification(result_aware);
+                let mut guard = RepeatCallGuard::for_policy(result_aware, false);
                 guard.record(name, &command, tool_result_ok(failed), failed, outcome);
                 guard.record(
                     "read_file",
