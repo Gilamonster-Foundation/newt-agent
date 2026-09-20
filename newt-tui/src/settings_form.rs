@@ -286,7 +286,9 @@ impl Field {
             // same word `/posture off` uses.
             Self::Posture => {
                 let mut options = vec![("off", "no posture — release the clamp".to_string())];
-                if let Ok(cfg) = newt_core::Config::resolve() {
+                if let Ok(cfg) =
+                    crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+                {
                     for (name, m) in &cfg.modes {
                         let what = m.preset.as_ref().map_or_else(
                             || "guidance only (no permission clamp)".to_string(),
@@ -342,27 +344,33 @@ impl Field {
             Self::Cognition => cognition_token(cli_cognition()),
             // Three states now, so this reports the mode rather than
             // collapsing `fold` and `stream` into one "on".
-            Self::Thinking => match newt_core::agentic::thinking_mode() {
-                newt_core::ThinkingMode::Fold => "fold",
-                newt_core::ThinkingMode::Stream => "stream",
-                newt_core::ThinkingMode::Off => "off",
+            Self::Thinking => {
+                match crate::migration_notices::read(newt_core::agentic::thinking_mode) {
+                    newt_core::ThinkingMode::Fold => "fold",
+                    newt_core::ThinkingMode::Stream => "stream",
+                    newt_core::ThinkingMode::Off => "off",
+                }
+                .to_string()
             }
-            .to_string(),
             Self::Nudge => if nudges_off() { "off" } else { "on" }.to_string(),
             // The OVERRIDE, like the dials — `auto` is what this form can set
             // and what resolution then fills in from colour.
-            Self::Markdown => newt_core::config::session_markdown_mode()
-                .keyword()
-                .to_string(),
+            Self::Markdown => {
+                crate::migration_notices::read(newt_core::config::session_markdown_mode)
+                    .keyword()
+                    .to_string()
+            }
             Self::Mode => newt_core::operating_mode::session_operating_mode()
                 .as_str()
                 .to_string(),
             // The TEMPLATE, not the rendered preview: the setting is what this
             // form can change, and the preview is what resolution makes of it.
             Self::Prompt => crate::prompt::active_prompt_template(),
-            Self::Compaction => newt_core::config::session_compaction_trigger_policy()
-                .keyword()
-                .to_string(),
+            Self::Compaction => {
+                crate::migration_notices::read(newt_core::config::session_compaction_trigger_policy)
+                    .keyword()
+                    .to_string()
+            }
             // The OVERRIDE, like the dials: `auto` is a real choosable value
             // that resolution then fills in from `[tui] spill_lines`.
             Self::Detail => newt_core::config::session_spill_lines()
@@ -650,7 +658,9 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
             if value == "off" {
                 newt_core::posture::set_active_posture(None);
             } else {
-                let cfg = newt_core::Config::resolve().map_err(|e| e.to_string())?;
+                let cfg =
+                    crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+                        .map_err(|e| e.to_string())?;
                 let dirs = cfg.skill_search_dirs();
                 let posture = newt_core::posture::build_posture(value, &cfg, |skill| {
                     newt_skills::load_body_from(&dirs, skill)
@@ -1618,7 +1628,7 @@ mod tests {
         newt_core::process_env::remove_var("NEWT_MARKDOWN");
         assert_eq!(
             Field::Markdown.current(),
-            newt_core::config::session_markdown_mode().keyword(),
+            crate::migration_notices::read(newt_core::config::session_markdown_mode).keyword(),
             "unpinned, the field reports what the resolver resolves"
         );
 
