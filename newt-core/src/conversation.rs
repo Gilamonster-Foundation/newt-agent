@@ -47,29 +47,31 @@ pub struct ToolEvent {
     /// the events array position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    /// #2315: what a shell call (`run_command` / `lifecycle`) observably did,
-    /// classified where its envelope is produced. `None` for every other call
-    /// and for calls refused before reaching the shell. Additive: absent from
-    /// older rows and omitted when `None`, so those serialize as before.
+    /// What an operation observably did: shell envelope facts or known typed
+    /// filesystem producer outcomes. `None` means no supported classification,
+    /// including unknown IO and string-only tools; it never means success.
+    /// Additive: absent from older rows and omitted when `None`, so historical
+    /// rows serialize as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecOutcome>,
 }
 
-/// #2315: the class of one shell execution, read from its envelope's facts
-/// (structured denial, timeout flag, exit status, program resolution) — never
-/// re-derived from the rendered result text, which [`ToolEvent::ok`] reads.
+/// The class of an observed operation, read from shell envelope facts or
+/// known typed filesystem outcomes before presentation erases them. Never
+/// re-derived from rendered result text, which [`ToolEvent::ok`] reads.
+/// Unknown errors retain absent evidence rather than inventing a class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecOutcome {
-    /// Ran and exited 0.
+    /// Ran successfully (exit 0 for shell execution).
     Passed,
-    /// Ran and exited nonzero, including a program that exists but exits 127.
+    /// Observed operational failure: nonzero shell exit or a known failed IO/precondition.
     Failed,
-    /// A structured leash denial, or the kernel refusing the program.
+    /// A structured leash, filesystem permission, or kernel denial.
     Denied,
-    /// Killed at its wall-clock ceiling (the envelope's `timed_out` flag).
+    /// Observed timeout from the shell envelope or a typed IO timeout.
     TimedOut,
-    /// Never ran: the program does not resolve, or the dispatch itself failed.
+    /// Unavailable operation: unresolved program, refused dispatch, or explicitly unsupported IO.
     Unavailable,
 }
 
