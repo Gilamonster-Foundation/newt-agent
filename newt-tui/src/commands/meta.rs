@@ -41,7 +41,7 @@ pub(crate) fn dispatch(
         // settings interface is future work — until then, bare `/config`
         // points at `/config show` rather than silently dumping.
         "config" => match arg1 {
-            "show" => match newt_core::Config::resolve() {
+            "show" => match crate::migration_notices::read(|report| newt_core::Config::resolve(report)) {
                 Ok(cfg) => match cfg.to_redacted_toml() {
                     Ok(toml_str) => {
                         print_newt("Resolved config (secrets redacted):", color, verbose);
