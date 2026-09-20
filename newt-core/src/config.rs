@@ -1371,8 +1371,8 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from an explicit file path.
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = Self::read_text(path)?;
+    pub fn load(path: &Path, report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
+        let text = Self::read_text(path, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
@@ -1383,9 +1383,12 @@ impl Config {
     /// (under [`Self::user_config_dir`]) is rewritten on disk; a project,
     /// ambient, `/etc` or explicitly named file is shared or untrusted, so it
     /// is translated in memory with a warning.
-    fn read_text(path: &Path) -> Result<String> {
+    fn read_text(
+        path: &Path,
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<String> {
         let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
-        let text = crate::psyche_import::read_config_file(path, own)?;
+        let text = crate::psyche_import::read_config_file(path, own, report)?;
         // Validate each source before merging: a project overlay must not hide
         // an unsupported format version in the operator's base config.
         #[derive(Deserialize)]
@@ -1433,8 +1436,8 @@ impl Config {
         self.backend_fallback
     }
 
-    pub fn resolve() -> Result<Self> {
-        Self::resolve_runtime().map(ResolvedConfig::into_config)
+    pub fn resolve(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
+        Self::resolve_runtime(report).map(ResolvedConfig::into_config)
     }
 
     /// [`Config::resolve_runtime_unpublished`] plus the process-global
@@ -1442,8 +1445,10 @@ impl Config {
     ///
     /// # Errors
     /// Any config-load error `resolve` itself would surface.
-    pub fn resolve_runtime() -> Result<ResolvedConfig> {
-        let resolved = Self::resolve_runtime_unpublished()?;
+    pub fn resolve_runtime(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<ResolvedConfig> {
+        let resolved = Self::resolve_runtime_unpublished(report)?;
         resolved.publish_runtime_settings();
         Ok(resolved)
     }
@@ -1458,7 +1463,9 @@ impl Config {
     ///
     /// # Errors
     /// Any config-load error `resolve` itself would surface.
-    pub fn resolve_runtime_unpublished() -> Result<ResolvedConfig> {
+    pub fn resolve_runtime_unpublished(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<ResolvedConfig> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
@@ -1485,13 +1492,13 @@ impl Config {
                     // the base vector the convergence audit surfaced. A
                     // `$NEWT_CONFIG`-pinned / user-home / `/etc` base is
                     // operator-explicit (Trusted) and loaded verbatim.
-                    let mut base_val = Self::load_value(p)?;
+                    let mut base_val = Self::load_value(p, report)?;
                     strip_control_plane(&mut base_val);
                     base_val
                         .try_into()
                         .map_err(|e| NewtError::Config(e.to_string()))?
                 } else {
-                    Self::load(p)?
+                    Self::load(p, report)?
                 }
             }
             (None, None) => Self::default(),
@@ -1499,7 +1506,7 @@ impl Config {
             // config when there is no base file).
             (base, Some(proj)) => {
                 let mut merged = match base {
-                    Some(p) => Self::load_value(p)?,
+                    Some(p) => Self::load_value(p, report)?,
                     None => toml::Value::try_from(Self::default())
                         .map_err(|e| NewtError::Config(e.to_string()))?,
                 };
@@ -1509,7 +1516,7 @@ impl Config {
                 if base_ambient {
                     strip_control_plane(&mut merged);
                 }
-                let project_val = Self::load_value(proj)?;
+                let project_val = Self::load_value(proj, report)?;
                 // The merge strategy is itself config: the project declares how
                 // it wants to be merged (`[merge] arrays = ...`), else the global
                 // config's setting, else the built-in default (Replace).
@@ -1832,8 +1839,11 @@ impl Config {
     }
 
     /// Load a config file as a raw `toml::Value` (for layered merging).
-    fn load_value(path: &Path) -> Result<toml::Value> {
-        let text = Self::read_text(path)?;
+    fn load_value(
+        path: &Path,
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<toml::Value> {
+        let text = Self::read_text(path, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
