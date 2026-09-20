@@ -326,6 +326,9 @@ pub struct TurnOutcome {
     pub was_streamed: bool,
     /// `reply` is harness-written text, not the model's claim (#2372).
     pub harness_reply: bool,
+    /// Numeric initiative threshold from the same worker-pinned policy used by
+    /// the actual loop, preserved even when dispatch returns a partial failure.
+    pub initiative_read_only_rounds: usize,
     /// Semantic intent captured by this turn, independent of supported wire fields.
     pub semantic_cognition: Option<crate::role_profile::Cognition>,
     /// Captured admitted Responses declaration and actual wire effort.
@@ -635,6 +638,7 @@ async fn run_one_turn(
     let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
     let _verification = super::self_verify::scoped_verification_settings(runtime.verification);
     let _initiative = crate::initiative::scoped_effective_initiative(runtime.initiative);
+    let initiative_read_only_rounds = runtime.initiative.read_only_nudge_after();
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
     // borrows these mutably; the borrows release when `ctx` is consumed by the
     // await below, after which they move into the TurnOutcome.
@@ -844,6 +848,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             verification: solve_obs.verification,
             features,
+            initiative_read_only_rounds,
             semantic_cognition: runtime.cognition,
             responses_capability: solve_obs.responses_capability,
             reasoning_effort: solve_obs.reasoning_effort,
@@ -872,6 +877,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             verification: solve_obs.verification,
             features,
+            initiative_read_only_rounds,
             semantic_cognition: runtime.cognition,
             responses_capability: solve_obs.responses_capability,
             reasoning_effort: solve_obs.reasoning_effort,
@@ -899,6 +905,7 @@ mod calibration_tests;
 mod tests {
     include!("driver_cognition_tests.rs");
     include!("driver_cognition_wire_tests.rs");
+    include!("driver_policy_identity_tests.rs");
     use super::*;
     use crate::agentic::SessionSemanticIndex;
     use crate::caveats::{Caveats, CountBound, Scope};

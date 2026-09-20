@@ -230,7 +230,8 @@ required cell:
 
 - failed its task verifier or returned a nonzero solve code;
 - did not report `completed`;
-- lacked exactly one contract-v2 record;
+- lacked exactly one contract record (v3, or a legacy v2 record);
+- carried a v3 record whose `config_digest` is not a well-formed ContentId;
 - did not point to its exact runner-owned event path
   `events/{posture}-{ocap}-{task}.jsonl`, or reused another cell's evidence;
 - reported a requested/effective model mismatch;
@@ -250,6 +251,12 @@ so changing the retained manifest from `qualification` to `exploratory` cannot
 downgrade the gate. Every retained gate artifact must also be a regular file
 reached without traversing a symlink; the validator rejects symlinked leaves and
 parent directories.
+
+A v3 record adds `config_digest`, a ContentId over the exact emitted
+`effective_config`, and an `agent_version` that carries the build. The
+validator checks the digest's shape only; it does not recompute it, and a
+legacy v2 record (no digest) still validates so older bundles can be
+revalidated.
 
 The additive contract-v1 posture fields are
 `effective_config.cognition = default|<level>` and

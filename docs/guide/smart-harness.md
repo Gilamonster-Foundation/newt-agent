@@ -82,8 +82,11 @@ Additional `[smart_harness]` limits are `max_catalog_entries`,
 `max_record_bytes` defaults to 64 MiB per source or structured record and applies
 to both writes and reads, including restoration and replay. The resolved
 auxiliary identity, placement evidence, protocol instructions, and budgets are
-committed in the session configuration. The solve contract includes this
-configuration, invocation mode, starting CID, and final head CID.
+committed in the session configuration. The headless contract's
+`effective_config.smart_harness` carries this launch manifest: the
+configuration, invocation mode, and starting CID. The final head CID is
+execution evidence in `solve_result.smart_harness.head`; it is not part of
+`config_digest`.
 
 Smart solves start a fresh resumable session by default. Use
 `--frame-dir PATH` to select its storage directory and

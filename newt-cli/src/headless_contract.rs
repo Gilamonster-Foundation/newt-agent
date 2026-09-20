@@ -1,7 +1,7 @@
 //! The observability-contract record `newt headless` emits (W0 #1511, epic
 //! #1506) — the wire format the EXTERNAL evaluator consumes.
 //!
-//! The contract (`gilamonster-bench/CONTRACT.md`, `contract_version: "2"`) is
+//! The contract (`gilamonster-bench/CONTRACT.md`, `contract_version: "3"`) is
 //! **data, deliberately re-declared per consumer**: this module is newt's
 //! emitter-side declaration, and the bench keeps its own consumer-side
 //! structs. Do NOT extract a shared `-contract` crate — that re-introduces
@@ -13,6 +13,8 @@
 //! per headless — the bench keys on the presence of `contract_version` and
 //! rejects ambiguous traces.
 
+use anyhow::Context;
+use content_addressable::{canonical, ContentId};
 use newt_core::agentic::InstantiatedFeatures;
 use newt_core::{BehaviorSignal, ErrorClass, ParseSignal, TurnEndReason};
 
@@ -24,7 +26,10 @@ use newt_core::{BehaviorSignal, ErrorClass, ParseSignal, TurnEndReason};
 /// read-before-acting level it used to carry is the new
 /// `effective_config.initiative` (`patient` | `measured` | `decisive` |
 /// `eager`). A v1 row's `tenacity` is not comparable with a v2 row's.
-pub const CONTRACT_VERSION: &str = "2";
+/// `"3"` qualifies psyche selections by captured policy and source build. The
+/// exact emitted effective_config is content-addressed; legacy v1/v2 evidence
+/// is never reinterpreted or backfilled as this policy.
+pub const CONTRACT_VERSION: &str = "3";
 
 /// Provenance: which family member emitted the record.
 pub const AGENT: &str = "newt-agent";
@@ -56,6 +61,17 @@ pub struct ContractInputs<'a> {
     /// The initiative level the run resolved (explicit / persona / family
     /// default / config default).
     pub initiative: &'a str,
+    /// Actual worker-pinned threshold; absent if no turn outcome exists.
+    pub initiative_read_only_rounds: Option<usize>,
+    /// Configured typed dispatch surface, not proof that a request occurred.
+    pub wire_api: &'a str,
+    /// The accepted Chat Completions controls and reasoning replay scope, captured
+    /// at launch with the wire selection they configure. `None` unless the wire is
+    /// OpenAI-compatible Chat Completions: absent is evidence, never defaulted.
+    pub chat_completions: Option<(
+        newt_core::model_card::ChatCompletionsCapability,
+        newt_core::model_card::ReasoningReplayScope,
+    )>,
     /// Effective cognition label (`default` when Newt sends no selection, or
     /// one of the explicit cognition levels).
     pub cognition: &'a str,
@@ -71,6 +87,8 @@ pub struct ContractInputs<'a> {
     pub ocap: &'static str,
     /// The max tool-rounds cap the driver actually used.
     pub max_rounds: u32,
+    /// The existing resolver's full derivation for that enforced round limit.
+    pub tool_round_limit: newt_core::tenacity::ToolRoundLimit,
     /// Wall-clock duration of the headless in milliseconds.
     pub wall_ms: u64,
     /// Generated (output) tokens, when the backend reported usage.
@@ -427,9 +445,9 @@ pub fn feature_receipt(
     (!features.is_empty()).then(|| serde_json::json!({ "features": features }))
 }
 
-/// Build THE contract record — exactly the `contract_version: "2"` fields.
+/// Build the v3 contract; mint identity over the exact final emitted policy.
 /// Optional fields go through [`conditional_stanza`].
-pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
+pub fn contract_record(i: &ContractInputs<'_>) -> anyhow::Result<serde_json::Value> {
     let mut timing = serde_json::json!({ "wall_ms": i.wall_ms });
     conditional_stanza(&mut timing, "gen_tokens", i.gen_tokens);
     // tok_s only when derivable: tokens AND a non-zero wall clock.
@@ -441,17 +459,30 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     let mut effective_config = serde_json::json!({
         "tenacity": i.tenacity,
         "initiative": i.initiative,
+        "wire_api": i.wire_api,
         "cognition": i.cognition,
         "crew": i.crew,
         "ocap": i.ocap,
         "max_rounds": i.max_rounds,
+        "tool_round_limit": i.tool_round_limit,
     });
+    // Evidence a turn outcome captured is claimed only when one exists
+    // (`features` is `None` without one): a missing outcome never instantiated
+    // anything, whatever the caller passed. The receipt below follows the same rule.
+    let has_outcome = i.features.is_some();
+    conditional_stanza(
+        &mut effective_config,
+        "initiative_read_only_rounds",
+        i.initiative_read_only_rounds.filter(|_| has_outcome),
+    );
     conditional_stanza(
         &mut effective_config,
         "semantic_cognition",
-        i.semantic_cognition.map(|value| serde_json::json!(value)),
+        i.semantic_cognition
+            .filter(|_| has_outcome)
+            .map(|value| serde_json::json!(value)),
     );
-    if let Some(capability) = i.responses_capability {
+    if let Some(capability) = i.responses_capability.filter(|_| has_outcome) {
         conditional_stanza(
             &mut effective_config,
             "responses_capability",
@@ -463,9 +494,18 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
             Some(serde_json::json!(i.reasoning_effort)),
         );
     }
+    // Launch-captured with `wire_api`, not outcome evidence.
+    conditional_stanza(
+        &mut effective_config,
+        "chat_completions",
+        i.chat_completions.map(|(capability, scope)| {
+            serde_json::json!({ "capability": capability, "reasoning_replay_scope": scope })
+        }),
+    );
     conditional_stanza(&mut effective_config, "context_window", i.context_window);
     let output_allowance = i
         .output_allowance
+        .filter(|_| has_outcome)
         .map(|a| serde_json::to_value(a).expect("OutputAllowance serializes infallibly"));
     conditional_stanza(&mut effective_config, "output_allowance", output_allowance);
     conditional_stanza(&mut effective_config, "run_allowance", i.run_allowance);
@@ -474,6 +514,16 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "smart_harness",
         i.smart_harness.cloned(),
     );
+    // The same instantiated policy remains byte-compatible in receipt below.
+    conditional_stanza(
+        &mut effective_config,
+        "verification",
+        i.verification.clone().filter(|_| has_outcome),
+    );
+    let config_digest = ContentId::from_canonical_bytes(
+        &canonical::to_canonical_dagcbor(&effective_config)
+            .context("encoding the exact effective configuration for contract v3")?,
+    );
     let mut record = serde_json::json!({
         "contract_version": CONTRACT_VERSION,
         "requested_model": i.requested_model,
@@ -481,7 +531,8 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "outcome": i.outcome,
         "backend": { "name": i.backend_name, "kind": i.backend_kind },
         "agent": AGENT,
-        "agent_version": env!("CARGO_PKG_VERSION"),
+        "agent_version": newt_core::build_info::VERSION_WITH_COMMIT,
+        "config_digest": config_digest.to_string(),
         "effective_config": effective_config,
         "timing": timing,
     });
@@ -491,7 +542,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         receipt.get_or_insert_with(|| serde_json::json!({}))["verification"] = verification.clone();
     }
     conditional_stanza(&mut record, "receipt", receipt);
-    record
+    Ok(record)
 }
 
 /// The consumer's permitted `outcome` values, checked in beside this code.
@@ -520,6 +571,7 @@ fn permitted_outcomes() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     include!("headless_contract_cognition_tests.rs");
+    include!("headless_contract_v3_tests.rs");
     use super::*;
     use newt_core::{BehaviorSignal, ToolCallDialect};
 
@@ -872,6 +924,9 @@ mod tests {
             context_window: Some(32768),
             tenacity: "normal",
             initiative: "measured",
+            initiative_read_only_rounds: None,
+            wire_api: "chat_completions",
+            chat_completions: None,
             cognition: "default",
             semantic_cognition: None,
             responses_capability: None,
@@ -879,6 +934,7 @@ mod tests {
             crew: "off",
             ocap: "off",
             max_rounds: 40,
+            tool_round_limit: newt_core::tenacity::resolve_tool_round_limit(40, None, None),
             wall_ms: 10_000,
             gen_tokens: Some(500),
             smart_harness: None,
@@ -1046,7 +1102,7 @@ mod tests {
 
     // --- the record itself ---
 
-    /// The record round-trips as valid JSON with EXACTLY the contract-v2
+    /// The record round-trips as valid JSON with EXACTLY the contract-v3
     /// fields — no extras for the bench to trip on, none of ours missing.
     #[test]
     fn record_round_trips_with_exactly_the_contract_fields() {
@@ -1065,6 +1121,7 @@ mod tests {
                 "agent",
                 "agent_version",
                 "backend",
+                "config_digest",
                 "contract_version",
                 "effective_config",
                 "effective_model",
@@ -1075,9 +1132,12 @@ mod tests {
             ],
             "exactly the contract fields (model_digest absent: not supplied)"
         );
-        assert_eq!(parsed["contract_version"], "2");
+        assert_eq!(parsed["contract_version"], "3");
         assert_eq!(parsed["agent"], "newt-agent");
-        assert_eq!(parsed["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            parsed["agent_version"],
+            newt_core::build_info::VERSION_WITH_COMMIT
+        );
         assert_eq!(
             parsed["backend"],
             serde_json::json!({"name": "dgx", "kind": "openai"})
@@ -1088,7 +1148,11 @@ mod tests {
                 "context_window": 32768, "tenacity": "normal",
                 "initiative": "measured",
                 "cognition": "default", "crew": "off", "ocap": "off",
-                "max_rounds": 40
+                "max_rounds": 40,
+                "wire_api": "chat_completions",
+                "tool_round_limit": {
+                    "rounds": 40, "source": "config", "configured": 40, "tenacity": null
+                }
             })
         );
         // 500 tokens over 10s ⇒ 50 tok/s, derived — never measured twice.
@@ -1181,12 +1245,12 @@ mod tests {
 
     #[test]
     fn smart_harness_configuration_is_declared_with_a_permitted_v1_outcome() {
-        let manifest = serde_json::json!({"head":"retained-head", "invocation_mode":"fresh", "configuration":{"auxiliary":{"placement":"cpu","max_calls":4}}});
+        let manifest = serde_json::json!({"invocation_mode":"fresh", "starting_cid":null, "configuration":{"auxiliary":{"placement":"cpu","max_calls":4}}});
         let mut inputs = inputs();
         inputs.smart_harness = Some(&manifest);
         let record = contract_record(&inputs);
         assert_eq!(record["effective_config"]["smart_harness"], manifest);
-        assert_eq!(record["contract_version"], "2");
+        assert_eq!(record["contract_version"], "3");
         assert!(permitted_outcomes().contains(&record["outcome"].as_str().unwrap()));
     }
 

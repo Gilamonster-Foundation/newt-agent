@@ -41,6 +41,10 @@ OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 MODEL_DIGEST_RE = re.compile(
     r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|sha256:[0-9a-fA-F]{64})$"
 )
+# A ContentId's frozen text form (CIDv1, dag-cbor, BLAKE3-256, base32-lower).
+# Shape only: recomputing it over the canonical effective_config is the bench
+# consumer's job, not this validator's.
+CONFIG_DIGEST_RE = re.compile(r"^bafyr4i[a-z2-7]{52}$")
 QUALIFICATION_POSTURES = {"baseline", "tenacity", "crew", "obsessive"}
 QUALIFICATION_OCAPS = {"off", "on"}
 POSTURE_TENACITY = {
@@ -521,11 +525,19 @@ class RunValidator:
             )
             return None
         contract = contracts[0]
-        if contract.get("contract_version") != "2":
-            self.error(
-                f"{label}: contract_version={contract.get('contract_version')!r}, expected '2'"
-            )
+        version = contract.get("contract_version")
+        # v2 stays accepted for bundles collected before v3 existed.
+        if version not in ("2", "3"):
+            self.error(f"{label}: contract_version={version!r}, expected '2' or '3'")
             return None
+        digest = contract.get("config_digest")
+        if version == "3" and not (
+            isinstance(digest, str) and CONFIG_DIGEST_RE.fullmatch(digest)
+        ):
+            self.error(
+                f"{label}: v3 contract config_digest must be a well-formed ContentId, "
+                f"got {digest!r}"
+            )
         return contract
 
     def validate_contract(

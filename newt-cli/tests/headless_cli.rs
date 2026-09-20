@@ -332,7 +332,7 @@ nemotron = "relentless"
         1,
         "headless emits exactly one contract record"
     );
-    assert_eq!(contracts[0]["contract_version"], "2");
+    assert_eq!(contracts[0]["contract_version"], "3");
     assert_eq!(contracts[0]["effective_config"]["initiative"], "eager");
     assert_eq!(
         contracts[0]["effective_config"]["tenacity"], "normal",
@@ -1835,3 +1835,9 @@ mod resolute;
 
 #[path = "headless_cli/cognition.rs"]
 mod cognition;
+
+#[path = "headless_cli/contract_v3.rs"]
+mod contract_v3;
+
+#[path = "headless_cli/policy_identity.rs"]
+mod policy_identity;

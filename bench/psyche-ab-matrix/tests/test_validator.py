@@ -20,6 +20,35 @@ PREFLIGHT_PROMPT = (
     "Answer briefly that the qualification preflight is complete. Do not call a tool."
 )
 DIGEST = "b" * 64
+# The identity fields of a v3 contract record, shaped as `newt headless` emits
+# them. The digest is a well-formed ContentId; the validator checks its shape
+# only, since recomputing it over the canonical config is the bench consumer's job.
+CONFIG_DIGEST = "bafyr4ib52x6s3qahxqphaovb3d7mcleasimf2ittpwqq2msmjkrrxbb4am"
+V3_IDENTITY = {
+    "contract_version": "3",
+    "agent_version": "0.8.0 (0123456789ab)",
+    "config_digest": CONFIG_DIGEST,
+}
+
+
+def v3_config_fields(rounds: int) -> dict[str, object]:
+    """The optional effective_config fields a v3 record adds to the v2 ones."""
+    return {
+        "wire_api": "chat_completions",
+        "initiative_read_only_rounds": 7,
+        "tool_round_limit": {
+            "rounds": rounds,
+            "source": "config",
+            "configured": rounds,
+            "tenacity": None,
+        },
+        "chat_completions": {
+            "capability": {"cognition": True, "chat_template_kwargs": True},
+            "reasoning_replay_scope": "never",
+        },
+    }
+
+
 BINARY_DIGEST = "a" * 64
 SOURCE_DIGEST = "e" * 64
 POSTURES = ["baseline", "tenacity", "crew", "obsessive"]
@@ -299,14 +328,13 @@ def make_valid_fixture(root: Path) -> None:
             "status": "completed",
         },
         {
-            "contract_version": "2",
+            **V3_IDENTITY,
             "requested_model": MODEL,
             "effective_model": MODEL,
             "model_digest": DIGEST,
             "outcome": "completed",
             "backend": {"name": "nemotron", "kind": "openai"},
             "agent": "newt-agent",
-            "agent_version": "0.7.6",
             "effective_config": {
                 "context_window": 65536,
                 "tenacity": "normal",
@@ -315,6 +343,7 @@ def make_valid_fixture(root: Path) -> None:
                 "crew": "off",
                 "ocap": "off",
                 "max_rounds": 2,
+                **v3_config_fields(2),
             },
             "timing": {"wall_ms": 10},
         },
@@ -351,14 +380,13 @@ def make_valid_fixture(root: Path) -> None:
                     "status": "completed",
                 },
                 {
-                    "contract_version": "2",
+                    **V3_IDENTITY,
                     "requested_model": MODEL,
                     "effective_model": MODEL,
                     "model_digest": DIGEST,
                     "outcome": "completed",
                     "backend": {"name": "nemotron", "kind": "openai"},
                     "agent": "newt-agent",
-                    "agent_version": "0.7.6",
                     "effective_config": {
                         "context_window": 65536,
                         "tenacity": TENACITY[posture],
@@ -367,6 +395,7 @@ def make_valid_fixture(root: Path) -> None:
                         "crew": CREW[posture],
                         "ocap": ocap,
                         "max_rounds": 15,
+                        **v3_config_fields(15),
                     },
                     "timing": {"wall_ms": 10},
                 },
@@ -599,6 +628,44 @@ class ValidatorFixtureTests(unittest.TestCase):
         self._edit_contract(("contract_version",), "1", "baseline", "off")
         self.assert_rejected("contract_version")
 
+    def test_an_unknown_future_contract_version_is_rejected(self) -> None:
+        self._edit_contract(("contract_version",), "4", "baseline", "off")
+        self.assert_rejected("contract_version")
+
+    def test_a_v3_record_requires_a_well_formed_config_digest(self) -> None:
+        for bad in (
+            None,
+            "",
+            42,
+            "b" * 64,
+            # An IPFS dag-pb/sha2-256 CID: valid CID text, off the ContentId profile.
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            CONFIG_DIGEST[:-1],
+            CONFIG_DIGEST.upper(),
+        ):
+            with self.subTest(config_digest=bad):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                make_valid_fixture(self.root)
+                self._edit_contract(("config_digest",), bad)
+                self.assert_rejected("config_digest")
+
+    def test_a_legacy_v2_record_without_a_digest_still_validates(self) -> None:
+        paths = [self._event_path(p, o) for p in POSTURES for o in OCAPS]
+        paths.append(self.root / "preflight" / "events.jsonl")
+        for path in paths:
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            for record in records:
+                if "contract_version" in record:
+                    record["contract_version"] = "2"
+                    del record["config_digest"]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+        result = self.validate()
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_contract_cognition_and_crew_must_match_posture(self) -> None:
         self._edit_contract(
             ("effective_config", "cognition"), "off", "obsessive", "off"
@@ -680,7 +747,7 @@ class ValidatorFixtureTests(unittest.TestCase):
         path = self._event_path()
         path.write_text(
             path.read_text(encoding="utf-8")
-            + json.dumps({"contract_version": "2", "agent": "foreign-agent"})
+            + json.dumps({"contract_version": "3", "agent": "foreign-agent"})
             + "\n",
             encoding="utf-8",
         )

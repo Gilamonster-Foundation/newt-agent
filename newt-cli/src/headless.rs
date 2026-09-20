@@ -234,14 +234,9 @@ fn headless_tool_round_limit(
     configured: usize,
     explicit_tenacity: Option<newt_core::Tenacity>,
     explicit_rounds: Option<usize>,
-) -> usize {
-    // `headless` enforces the same effective cap the TUI would, but it
-    // does not persist per-turn records, so the derivation (`source`,
-    // `configured`, `tenacity`) has nowhere durable to land here — an
-    // asymmetry #1982 documents rather than hides. If headless ever grows turn
-    // persistence, record the full `ToolRoundLimit` there too.
+) -> newt_core::tenacity::ToolRoundLimit {
+    // Keep the resolver's derivation beside the enforced cap for the contract.
     newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, explicit_rounds)
-        .rounds
 }
 
 /// The serving principal `headless` decides capabilities for — the
@@ -501,11 +496,27 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // stream. `headless_takes_every_capability_from_the_decision`
     // (tests/capability_wiring.rs) pins the pair.
     dc.emits_leading_reasoning = decision.emits_leading_reasoning();
-    dc.max_tool_rounds = headless_tool_round_limit(
+    let tool_round_limit = headless_tool_round_limit(
         dc.max_tool_rounds,
         newt_core::tenacity::cli_tenacity(),
         args.max_rounds,
     );
+    dc.max_tool_rounds = tool_round_limit.rounds;
+    // Preserve the existing u32 contract schema without silently truncating an
+    // accepted usize budget. Refuse before primary or auxiliary dispatch.
+    let max_rounds = u32::try_from(dc.max_tool_rounds)
+        .context("max-rounds exceeds contract maximum of 4294967295")?;
+    // This is the configured dispatch selection, not evidence that inference
+    // ran. The exact same typed fields move into the driver below.
+    let wire_api = match dc.kind {
+        BackendKind::Openai => dc.openai_api.label(),
+        kind => kind.label(),
+    };
+    // The Chat Completions controls the driver's request policy reads, captured
+    // from the same typed fields; absent on every other wire.
+    let chat_completions = (dc.kind == BackendKind::Openai
+        && dc.openai_api == OpenAiApi::ChatCompletions)
+        .then_some((dc.chat_completions_capability, dc.reasoning_replay_scope));
     // OCAP-ON confined lane: replace the default unconfined caveat with a
     // workspace-fenced authority. The tool gate consults `dc.caveats` and the
     // permission_gate stays `None` — an in-fence write auto-consents; an
@@ -598,9 +609,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     if let Some(cw) = args.context_window {
         apply_context_window(&mut dc, cw);
     }
-    // Captured before `dc` moves into the driver: the cap the run ACTUALLY
-    // uses (post `--max-rounds`), for the contract's effective_config.
-    let max_rounds = dc.max_tool_rounds as u32;
+    // Configuration identity covers launch inputs, while the final execution
+    // head remains in the existing solve_result.smart_harness trace below.
+    let smart_launch_manifest = smart_manifest.clone();
     let mut driver = TurnDriver::new(dc)
         .with_cognition(runtime.cognition)
         .with_tenacity(runtime.tenacity)
@@ -829,6 +840,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             context_window: args.context_window,
             tenacity: tenacity_level,
             initiative: initiative_level,
+            initiative_read_only_rounds: o_opt.map(|o| o.initiative_read_only_rounds),
+            wire_api,
+            chat_completions,
             cognition: cognition_level,
             semantic_cognition: o_opt.map(|o| o.semantic_cognition),
             responses_capability: o_opt.and_then(|o| o.responses_capability.as_ref()),
@@ -840,11 +854,12 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
                 "on"
             },
             max_rounds,
+            tool_round_limit,
             wall_ms,
             gen_tokens: o_opt
                 .and_then(|o| o.usage.as_ref())
                 .map(|u| u64::from(u.output_tokens)),
-            smart_harness: smart_manifest.as_ref(),
+            smart_harness: smart_launch_manifest.as_ref(),
             output_allowance: o_opt.and_then(|o| o.output_allowance),
             run_allowance,
             features: o_opt.map(|o| o.features),
@@ -852,7 +867,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
             required: &args.require_feature,
         },
-    ));
+    )?);
     // #2372: the Chat and Ollama loops return their answer unprinted, so show it
     // here, before anything that can fail — the model's final claim is what a
     // transcript tail must carry. `▸` marks a model claim only; harness-written
@@ -1415,15 +1430,15 @@ mod tests {
         use newt_core::Tenacity;
 
         assert_eq!(
-            headless_tool_round_limit(40, Some(Tenacity::Relentless), None),
+            headless_tool_round_limit(40, Some(Tenacity::Relentless), None).rounds,
             RELENTLESS_TOOL_ROUND_TARGET
         );
         assert_eq!(
-            headless_tool_round_limit(40, Some(Tenacity::Relentless), Some(2)),
+            headless_tool_round_limit(40, Some(Tenacity::Relentless), Some(2)).rounds,
             2
         );
         assert_eq!(
-            headless_tool_round_limit(40, None, None),
+            headless_tool_round_limit(40, None, None).rounds,
             40,
             "automatic family tenacity must not silently expand the safety cap"
         );

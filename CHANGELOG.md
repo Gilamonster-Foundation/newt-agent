@@ -9,6 +9,24 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — headless contract version 3 (policy identity)
+
+- **`contract_version` is now `"3"`**, superseding the `"2"` noted under the
+  tenacity split below. `agent_version` now carries the opaque build string
+  (`0.8.0 (a3f9c21b4d5e)`), not the package semver alone, and the new
+  `config_digest` is a `ContentId` over the complete emitted `effective_config`.
+  Build string, outcome and timing stay outside it. Missing identity is unknown,
+  and v1/v2 traces keep their historical meaning.
+- **`effective_config` gains captured policy**: `wire_api`, `tool_round_limit`,
+  `initiative_read_only_rounds`, `verification`, and on the Chat Completions wire
+  a `chat_completions` stanza of the accepted controls. Outcome-derived fields are
+  omitted when no turn outcome exists.
+- **`effective_config.smart_harness` is the launch manifest** (configuration,
+  invocation mode, starting CID). The final head CID moves out of the
+  configuration and stays in `solve_result.smart_harness.head`.
+- The `bench/psyche-ab-matrix` validator accepts v3 (requiring a well-formed
+  `config_digest`) and still accepts v2.
+
 ### Changed — tenacity split into tenacity and initiative (psyche effort dials, slice 1b)
 
 - **Initiative (`patient` / `measured` (default) / `decisive` / `eager`) is
