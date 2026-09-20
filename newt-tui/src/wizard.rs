@@ -34,7 +34,7 @@ pub fn maybe_run(color: bool) -> anyhow::Result<()> {
     // Second gate: a config-file-less box whose backends arrive some other
     // way (a backends/*.toml drop-in, a --backend-* flag) is configured, not
     // virgin — do not wizard it.
-    if !Config::resolve()
+    if !crate::migration_notices::read(|report| Config::resolve(report))
         .map(|c| c.is_unconfigured())
         .unwrap_or(true)
     {
@@ -395,7 +395,7 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("[dgx]"), "chimera dead: {written}");
         // Round-trips through the real loader: minimal config + drop-in.
-        let cfg = Config::load(&path).unwrap();
+        let cfg = crate::migration_notices::read(|report| Config::load(&path, report)).unwrap();
         assert!(cfg.dgx.is_none(), "no legacy [dgx] block (#1140)");
         assert_eq!(cfg.default_backend.as_deref(), Some("ollama"));
         let dropin = path.with_file_name("backends").join("ollama.toml");
