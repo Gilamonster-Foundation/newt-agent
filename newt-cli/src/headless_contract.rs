@@ -85,6 +85,8 @@ pub struct ContractInputs<'a> {
     /// does a record with no turn outcome (`features` is `None`), whose gate
     /// never ran.
     pub verification: Option<serde_json::Value>,
+    /// Immutable external-turn recovery policy, absent if no owner ran.
+    pub recovery: Option<serde_json::Value>,
     /// Content id of the explicit scratchpad seed, when the run supplied one.
     pub scratchpad_seed: Option<&'a str>,
     /// The features the run was told to require (`--require-feature`).
@@ -155,6 +157,33 @@ pub fn terminal(
     }
 }
 
+/// Non-check recovery exhaustion is a real attempted task, established by
+/// typed recovery evidence. An unrelated Failed ending stays a harness error.
+pub fn terminal_with_recovery(
+    clean: bool,
+    class: Option<ErrorClass>,
+    end_reason: Option<TurnEndReason>,
+    smart_harness: bool,
+    signals: &[newt_core::BehaviorSignal],
+) -> Terminal {
+    if clean
+        && class.is_none()
+        && end_reason == Some(TurnEndReason::Failed)
+        && signals.iter().any(|signal| {
+            matches!(signal,
+            newt_core::BehaviorSignal::Recovery {
+                cause: newt_core::agentic::turn_admission::CorrectionCause::ToolFailure,
+                decision, ..
+            } if matches!(decision.as_str(),
+                "grit_allowance" | "verification_allowance" | "round_allowance" | "run_allowance"))
+        })
+    {
+        Terminal::StoppedShort(TurnEndReason::Failed)
+    } else {
+        terminal(clean, class, end_reason, smart_harness)
+    }
+}
+
 /// The contract record's `outcome` — the closed set pinned in
 /// `contract/bench_outcome_values_v1.txt`. #2268 adds `context_exceeded` as an
 /// explicit extension that requires a matching bench consumer update.
@@ -192,7 +221,9 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // it passes is the suite verifier's call (A13), so it is never `timeout`,
         // which would drop it from capability scoring. `status` says incomplete.
         Terminal::StoppedShort(
-            TurnEndReason::RepairExhausted | TurnEndReason::VerificationIncomplete,
+            TurnEndReason::RepairExhausted
+            | TurnEndReason::VerificationIncomplete
+            | TurnEndReason::Failed,
         ) => "completed",
         // The model was exercised but did not deliver an answer. A question is
         // a valid interactive pause, yet a headless still needs an answer.
@@ -206,7 +237,7 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         ) => "model_error",
         // The remaining variants cannot construct `StoppedShort`; listed so a
         // new one fails to compile rather than inheriting a bucket.
-        Terminal::StoppedShort(TurnEndReason::Completed | TurnEndReason::Failed) => "harness_error",
+        Terminal::StoppedShort(TurnEndReason::Completed) => "harness_error",
         Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
         Terminal::Failed(Some(ErrorClass::ContextExceeded)) => "context_exceeded",
         Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
@@ -466,6 +497,9 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     let mut receipt = feature_receipt(i.features, i.required, i.scratchpad_seed);
     if let (Some(verification), Some(_)) = (&i.verification, &i.features) {
         receipt.get_or_insert_with(|| serde_json::json!({}))["verification"] = verification.clone();
+    }
+    if let (Some(recovery), Some(_)) = (&i.recovery, &i.features) {
+        receipt.get_or_insert_with(|| serde_json::json!({}))["recovery"] = recovery.clone();
     }
     conditional_stanza(&mut record, "receipt", receipt);
     record
@@ -862,6 +896,7 @@ mod tests {
                 ..InstantiatedFeatures::default()
             }),
             verification: None,
+            recovery: None,
             scratchpad_seed: None,
             required: &[],
         }
@@ -1194,3 +1229,7 @@ mod tests {
 #[cfg(test)]
 #[path = "headless_contract_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+#[path = "headless_contract_grit_tests.rs"]
+mod grit_tests;
