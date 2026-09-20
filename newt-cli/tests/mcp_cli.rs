@@ -62,7 +62,7 @@ fn newt(sb: &Sandbox) -> Command {
 }
 
 fn load_config(path: &Path) -> newt_core::Config {
-    newt_core::Config::load(path).unwrap()
+    newt_core::Config::load(path, &mut |_| {}).unwrap()
 }
 
 // Families under `mcp_cli/`. The composed private-MCP UAT stays inline
