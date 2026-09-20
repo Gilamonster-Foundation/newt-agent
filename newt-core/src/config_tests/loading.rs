@@ -55,7 +55,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
     f.write_all(toml_text.as_bytes()).unwrap();
     f.flush().unwrap();
 
-    let cfg = Config::load(f.path()).unwrap();
+    let cfg = Config::load(f.path(), &mut |_| {}).unwrap();
     assert_eq!(cfg.backends.len(), 1);
     assert_eq!(cfg.backends[0].name, "local-ollama");
     assert_eq!(cfg.backends[0].effective_model(), Some("mistral:7b"));
@@ -68,7 +68,10 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
 
 #[test]
 fn missing_file_returns_io_error() {
-    let result = Config::load(Path::new("/tmp/newt-does-not-exist-12345.toml"));
+    let result = Config::load(
+        Path::new("/tmp/newt-does-not-exist-12345.toml"),
+        &mut |_| {},
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -83,7 +86,7 @@ fn malformed_toml_returns_config_error() {
     f.write_all(b"{{{{").unwrap();
     f.flush().unwrap();
 
-    let result = Config::load(f.path());
+    let result = Config::load(f.path(), &mut |_| {});
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -111,7 +114,7 @@ fn resolve_returns_default_when_no_file() {
     let prev_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
 
-    let cfg = Config::resolve().unwrap();
+    let cfg = Config::resolve(&mut |_| {}).unwrap();
 
     // Restore environment.
     std::env::set_current_dir(prev_dir).unwrap();
@@ -244,7 +247,7 @@ fn resolve_reports_unconfigured_only_without_operator_backends() {
 
     // 1. Config file with no backends and no drop-ins → still unboxed.
     std::fs::write(&config_toml, "providers = []\n").unwrap();
-    let bare = Config::resolve().unwrap();
+    let bare = Config::resolve(&mut |_| {}).unwrap();
 
     // 2. Inline [[backends]] → configured.
     std::fs::write(
@@ -252,7 +255,7 @@ fn resolve_reports_unconfigured_only_without_operator_backends() {
         "[[backends]]\nname = \"gpu\"\nendpoint = \"http://gpu:8000\"\n",
     )
     .unwrap();
-    let inline = Config::resolve().unwrap();
+    let inline = Config::resolve(&mut |_| {}).unwrap();
 
     // 3. Backend-less config file + a drop-in → configured.
     std::fs::write(&config_toml, "providers = []\n").unwrap();
@@ -262,7 +265,7 @@ fn resolve_reports_unconfigured_only_without_operator_backends() {
         "endpoint = \"http://gpu:11434\"\n",
     )
     .unwrap();
-    let dropin = Config::resolve().unwrap();
+    let dropin = Config::resolve(&mut |_| {}).unwrap();
 
     std::env::set_current_dir(prev_dir).unwrap();
     match saved_home {
