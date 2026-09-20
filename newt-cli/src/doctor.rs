@@ -27,8 +27,8 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     // a finding and keep going with everything that does not need a resolved
     // config; only the sections built from `config` below are skipped.
     let config = match config_path {
-        Some(p) => Config::load(p),
-        None => Config::resolve(),
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report)),
+        None => crate::migration_notices::read(|report| Config::resolve(report)),
     };
     let config = match config {
         Ok(c) => Some(c),
