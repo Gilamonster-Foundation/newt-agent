@@ -66,6 +66,11 @@ async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W
 #[tokio::test]
 #[serial_test::serial]
 async fn persistence_failure_preserves_result_with_captured_or_discarded_display() {
+    // This fixture exercises storage failure after permitted dispatch. Other
+    // tests temporarily widen launch authority, which durable frames refuse.
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
     let (error, rendered) = failed_return(Vec::new()).await;
     let rendered = String::from_utf8(rendered).unwrap();
     assert!(
