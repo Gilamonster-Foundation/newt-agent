@@ -676,7 +676,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // cannot disagree about whether the turn finished. They used to be
     // independent expressions over the same `o`, twenty-four lines apart, and
     // a round-cap exit satisfied one and not the other.
-    let terminal = headless_contract::terminal(
+    let terminal = headless_contract::terminal_with_recovery(
         clean,
         match &outcome {
             Ok(o) => o.error_class,
@@ -684,6 +684,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         },
         o_opt.and_then(|o| o.end_reason),
         smart_harness.is_some(),
+        o_opt.map_or(&[], |o| o.behavior_signals.as_slice()),
     );
     let outcome_label = headless_contract::outcome_label(terminal);
     let status = headless_contract::status_label(terminal);
@@ -849,6 +850,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             run_allowance,
             features: o_opt.map(|o| o.features),
             verification: o_opt.and_then(|o| o.verification.clone()),
+            recovery: o_opt.and_then(|o| o.recovery_policy.clone()),
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
             required: &args.require_feature,
         },
