@@ -501,8 +501,8 @@ impl RollingWindow {
     }
 
     /// Create from config, falling back to the default window size.
-    pub fn from_config() -> Self {
-        let window = newt_core_memory_window();
+    pub fn from_config(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Self {
+        let window = newt_core_memory_window(report);
         Self::new(window)
     }
 
@@ -511,8 +511,8 @@ impl RollingWindow {
     }
 }
 
-fn newt_core_memory_window() -> usize {
-    crate::Config::resolve()
+fn newt_core_memory_window(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> usize {
+    crate::Config::resolve(report)
         .ok()
         .and_then(|c| c.memory)
         .map(|m| m.window)
@@ -1612,8 +1612,8 @@ impl SoulProvider {
     }
 
     /// Create from config, reading `[memory] soul_file` if present.
-    pub fn from_config() -> Self {
-        let override_path = crate::Config::resolve()
+    pub fn from_config(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Self {
+        let override_path = crate::Config::resolve(report)
             .ok()
             .and_then(|c| c.memory)
             .and_then(|m| m.soul_file)
