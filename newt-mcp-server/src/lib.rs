@@ -79,8 +79,11 @@ async fn connect_persona(
     let Some(name) = persona else {
         return Ok((newt_mcp_client::McpToolset::empty(), None));
     };
-    let profile = newt_core::RoleProfile::load_from_dir(name, &newt_core::Config::personas_dir())?;
-    let cfg = newt_core::Config::resolve().unwrap_or_default();
+    let profile = read_with_notices(|report| {
+        newt_core::RoleProfile::load_from_dir(name, &newt_core::Config::personas_dir(), report)
+    })?;
+    let cfg =
+        crate::read_with_notices(|report| newt_core::Config::resolve(report)).unwrap_or_default();
     let workspace = std::env::current_dir().unwrap_or_default();
     // #1243 Leg 3: a spawned stdio server is confined by the ACTIVATED PERSONA's
     // authority (its `CaveatProfile`), or a read-only default when the persona
@@ -125,7 +128,8 @@ async fn connect_persona(
 /// surface `NoBackendForTier` as a clean JSON-RPC error rather than
 /// crashing the whole server (the other tools still work fine).
 async fn build_default_registry() -> anyhow::Result<Arc<BackendRegistry>> {
-    let cfg = newt_core::Config::resolve().unwrap_or_default();
+    let cfg =
+        crate::read_with_notices(|report| newt_core::Config::resolve(report)).unwrap_or_default();
     let registry = registry_from_config(&cfg)?;
     if !registry.is_empty() {
         tracing::info!(
@@ -157,6 +161,18 @@ async fn build_default_registry() -> anyhow::Result<Arc<BackendRegistry>> {
 
 fn registry_from_config(cfg: &newt_core::Config) -> anyhow::Result<BackendRegistry> {
     BackendRegistry::load_from_config(cfg)
+}
+
+/// The protocol host owns stderr even while its stdout carries JSON-RPC.
+fn read_with_notices<T>(
+    operation: impl FnOnce(&mut dyn FnMut(newt_core::tty::Notice<'static>)) -> T,
+) -> T {
+    let mut notices = Vec::new();
+    let result = operation(&mut |notice| notices.push(notice));
+    for notice in notices {
+        let _ = notice.diagnostic(newt_core::tty::LineCaps::None, false, std::io::stderr());
+    }
+    result
 }
 
 #[cfg(test)]
