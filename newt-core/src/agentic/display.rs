@@ -1605,3 +1605,23 @@ pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: 
 #[cfg(test)]
 #[path = "display_tests/mod.rs"]
 mod display_tests;
+
+/// Presentation boundary for config reads made while preparing core-owned
+/// thinking/tool output. Flush after the result exists, through the same line
+/// owner as that presentation, and preserve redirected stderr.
+pub(super) fn with_migration_notices<T>(
+    operation: impl FnOnce(&mut dyn FnMut(crate::tty::Notice<'static>)) -> T,
+) -> T {
+    use std::io::IsTerminal as _;
+    let mut notices = Vec::new();
+    let result = operation(&mut |notice| notices.push(notice));
+    let caps = if std::io::stderr().is_terminal() {
+        crate::tty::LineCaps::detect()
+    } else {
+        crate::tty::LineCaps::None
+    };
+    for notice in notices {
+        let _ = notice.diagnostic(caps, false, std::io::stderr());
+    }
+    result
+}
