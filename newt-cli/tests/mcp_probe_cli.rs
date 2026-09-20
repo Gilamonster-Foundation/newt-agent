@@ -83,7 +83,7 @@ fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
         .success()
         // Status lines live on stderr; stdout is report-only.
         .stderr(predicate::str::contains("Registered MCP server"));
-    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml")).unwrap();
+    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml"), &mut |_| {}).unwrap();
     assert_eq!(cfg.mcp_servers.len(), 1);
     assert_eq!(cfg.mcp_servers[0].name, "newt-mcp-server");
     assert_eq!(cfg.mcp_servers[0].args, vec!["mcp"]);
@@ -142,7 +142,7 @@ fn probe_to_catalog_then_install_round_trips() {
         .args(["mcp", "install", "self-probe"])
         .assert()
         .success();
-    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml")).unwrap();
+    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml"), &mut |_| {}).unwrap();
     assert_eq!(cfg.mcp_servers[0].name, "self-probe");
     assert_eq!(cfg.mcp_servers[0].args, vec!["mcp"]);
 }
