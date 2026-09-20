@@ -1146,12 +1146,14 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let config = TurnDriverConfig::new(
+        // Pin the wire: `new` follows NEWT_OPENAI_API, which parallel tests set.
+        let mut config = TurnDriverConfig::new(
             server.uri(),
             "test-model",
             BackendKind::Openai,
             "newt-core-test-workspace-that-does-not-exist",
         );
+        config.openai_api = crate::OpenAiApi::ChatCompletions;
         let mut driver = TurnDriver::new(config);
         driver.submit("what is two plus two").expect("submit");
         let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
@@ -1642,6 +1644,8 @@ mod tests {
 
         let mut config =
             TurnDriverConfig::new(server.uri(), "test-model", BackendKind::Openai, ".");
+        // Pin the wire: `new` follows NEWT_OPENAI_API, which parallel tests set.
+        config.openai_api = crate::OpenAiApi::ChatCompletions;
         config.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
             cognition: Some(true),
             ..Default::default()
