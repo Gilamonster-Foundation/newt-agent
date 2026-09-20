@@ -2061,6 +2061,42 @@ fail. Raw replies remain byte-exact, and retained sources remain retrievable.
 **Out of scope:** classifier-verdict tolerance, deterministic selection repair,
 new record formats, and changes to authority or navigation budgets.
 
+## Step 27.12 — Complete the generated companions of a selected navigation source (#2463)
+
+**Branch:** `step-27.12-nav-generated-companions`
+
+The navigation catalog offers a tool call but not the generated, model-facing
+result entry that frames it, so a selection of that call was refused as "splits
+a tool exchange". Keep relevance selection with the auxiliary and let the host
+add only the generated companions of sources it already selected, reusing
+`complete_pairs`. The completed selection goes through the unchanged validator,
+including its final byte budget.
+
+**Acceptance:** with two real accounted tool batches and an older generated
+result omitted from the catalog, selecting the older call yields a legal
+exchange that keeps that result. Without the completion the same selection is
+refused as "splits a tool exchange". An omitted source call is still refused.
+
+The catalog is the selector's only price list and a refused selection fails the
+turn, so it offers only what can be selected and charges what the host charges.
+A tool exchange is offered whole or not at all, including at the catalog
+window's edge, and its cards show one `pairs` set. A card's `bytes` include the
+generated entries its exchange brings, each charged once. `max_bytes` is what
+remains after the brackets, the entries the host adds regardless, and the
+re-read pointer. A card that a required entry forces says `required`. Any
+selection that includes the required cards, takes each `pairs` group whole, and
+whose `bytes` sum to at most `max_bytes` is admitted; when something is elided
+the prices are exact to the byte, and otherwise the unused pointer reserve is
+left over.
+
+**Known gap:** completion pairs by provider wire id, so it does nothing for the
+Ollama wire format, whose results carry no id.
+
+**Out of scope:** provenance-based pairing, failing before the auxiliary call
+when the required set cannot fit, the 512-byte pointer reserve still hardcoded
+in the deterministic `project` fallback, classifier-verdict parsing, and any
+change to authority or to the validator.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

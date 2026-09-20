@@ -58,6 +58,15 @@ missing protected inputs, split tool exchanges, and over-budget selections
 remain refused. Prose and incomplete fences are not repaired, and classifier
 verdicts retain their strict JSON-string protocol.
 
+When a navigation selection includes a tool call, the host adds the generated
+result that frames it, so the model does not have to name harness-generated
+entries. A selection that omits the call itself is still refused, and the
+completed selection is validated against the byte budget like any other. The
+catalog prices that in: a card's `bytes` include the generated results its
+exchange brings, `max_bytes` is what is left after pinned entries and the
+re-read pointer, and an exchange is offered whole or not at all, so a selection
+that adds up is not refused for size or for a missing half.
+
 A successful built-in permission grant releases cached capability failures and
 typed failed native shell/lifecycle executions so the original operation can be
 checked again. A native execution receipt permits re-evaluation; it does not
