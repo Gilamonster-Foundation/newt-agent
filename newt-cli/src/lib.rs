@@ -225,6 +225,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME", conflicts_with = "ephemeral")]
     pub resume: Option<String>,
 
+    /// Admit only the explicitly resumed conversation into Smart Harness as
+    /// historical context, without reconstructing past execution evidence.
+    /// Requires [smart_harness] enabled = true. Interactive TUI only.
+    #[arg(long, global = true, requires = "resume", conflicts_with = "ephemeral")]
+    pub adopt_frame: bool,
+
     /// When a tool call is denied by the session's permission caveats, ask
     /// interactively — allow once / allow for this session / deny — instead
     /// of failing the call outright (issue #263). Decisions are recorded to
@@ -1104,7 +1110,16 @@ fn abs_grant_paths(paths: &[PathBuf]) -> Result<std::ffi::OsString, std::env::Jo
     std::env::join_paths(paths.iter().map(|p| abs_grant_path(p)))
 }
 
+fn validate_frame_adoption(cli: &Cli) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cli.adopt_frame || matches!(cli.command.as_ref(), None | Some(Command::Code { .. })),
+        "--adopt-frame is available only for the interactive TUI with --resume"
+    );
+    Ok(())
+}
+
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    validate_frame_adoption(&cli)?;
     // #1303 clause B: install the one-time mouse-capture panic-release hook at
     // binary entry, before any turn can enable capture. It emits
     // `DisableMouseCapture` ONLY when capture is currently active, so the
@@ -1463,6 +1478,18 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // fails hard on a miss. clap already refuses --resume + --ephemeral.
             if let Some(name) = cli.resume.as_deref() {
                 unsafe { std::env::set_var("NEWT_RESUME", name) };
+            }
+            // A launch-scoped selected name, never a persisted blanket opt-in.
+            // Clear inherited consent when this invocation did not request it.
+            unsafe {
+                if cli.adopt_frame {
+                    std::env::set_var(
+                        "NEWT_ADOPT_FRAME",
+                        cli.resume.as_deref().expect("clap requires resume"),
+                    );
+                } else {
+                    std::env::remove_var("NEWT_ADOPT_FRAME");
+                }
             }
             // --prompt-for-permissions threads the same way (issue #263);
             // only the interactive TUI reads it — worker/eval never prompt.
@@ -2422,6 +2449,32 @@ mod tests {
         assert!(Cli::try_parse_from(["newt"]).unwrap().resume.is_none());
         // Resume-a-conversation and never-persist cannot both be meant.
         assert!(Cli::try_parse_from(["newt", "--resume", "x", "--ephemeral"]).is_err());
+    }
+
+    #[test]
+    fn frame_adoption_requires_explicit_selected_resume() {
+        assert!(Cli::try_parse_from(["newt", "--adopt-frame"]).is_err());
+        assert!(
+            Cli::try_parse_from(["newt", "--resume", "saved", "--adopt-frame", "--ephemeral"])
+                .is_err()
+        );
+        assert!(!Cli::try_parse_from(["newt"]).unwrap().adopt_frame);
+        for args in [
+            vec!["newt", "--resume", "saved", "--adopt-frame"],
+            vec!["newt", "code", "--resume", "saved", "--adopt-frame"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.adopt_frame);
+            assert_eq!(cli.resume.as_deref(), Some("saved"));
+            assert!(validate_frame_adoption(&cli).is_ok());
+        }
+    }
+
+    #[test]
+    fn frame_adoption_rejects_noninteractive_commands_before_dispatch() {
+        let cli =
+            Cli::try_parse_from(["newt", "--resume", "saved", "--adopt-frame", "doctor"]).unwrap();
+        assert!(validate_frame_adoption(&cli).is_err());
     }
 
     /// The continuity flags share the ONE global `--resume`; `headless` must not

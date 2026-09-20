@@ -2015,6 +2015,35 @@ text. Permission gates, cancellation, and existing round limits remain binding.
 historical receipts, exact permission-decision provenance, arbitrary claim
 verification, and a guarantee that a model chooses the suggested next action.
 
+## Step 27.9 — Admit selected historical conversations into Frame (#2458)
+
+**Branch:** `step-27.9-frame-legacy-admission`
+
+Add explicit, default-off `--resume <conversation> --adopt-frame` admission for
+the selected saved conversation when Smart Harness is enabled. Verify stored
+history and reuse the existing persisted-compaction restore semantics. Bind
+admission to the successfully resolved and owned conversation, without extending
+it to unrelated tabs or selector overrides.
+
+Represent quoted imported transcript data with a distinct `Historical` event
+origin. Reuse existing addressed observations, projection, elision, and bounded
+retrieval. Historical claims are inspectable sources, not current operator
+instructions, new model replies, or witnessed tool executions. Publish the
+conversation locator only after complete durable admission; subsequent resumes
+restore that Frame without importing again.
+
+**Acceptance:** default refusal remains; explicit launch validation and
+conversation binding prevent accidental admission. Corrupt history and failed
+imports publish no usable locator. Projection, restart, and retrieval preserve
+historical origin and content without minting tool occurrences or satisfying
+tool-output/model-verdict authority checks. The latest operator task appears
+once, and existing isolation, disclosure, and permission gates remain enforced.
+
+**Out of scope:** reconstructing missing historical execution receipts,
+automatic adoption of other conversations, changing backend selection, and
+guaranteeing that the resumed model completes its task.
+
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

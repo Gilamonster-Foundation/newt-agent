@@ -1916,6 +1916,26 @@ impl Session {
         Ok(event)
     }
 
+    /// Retain a quoted historical datum without inventing its original actor's
+    /// authority or execution. The fixed text-only envelope cannot carry tool
+    /// calls. Call `record_messages` to publish the completed transcript.
+    pub fn record_historical_message(&mut self, text: &str) -> Result<ContentId> {
+        self.ensure_tools_closed()?;
+        let message = json!({"role":"user", "content":text});
+        let payload = serde_json::to_vec(&message).map_err(integrity)?;
+        let event = self.event(
+            EventOrigin::Historical,
+            EventKind::Observation,
+            &payload,
+            self.last_message().into_iter().collect(),
+            BTreeSet::new(),
+            0,
+        )?;
+        self.append(JournalEntry::Observation { event })?;
+        self.transcript.push(event);
+        Ok(event)
+    }
+
     /// Explicitly admit a host-supplied wire message before inserting it in
     /// history. Arbitrary harness payloads never establish a user's origin.
     pub fn record_host_message(&mut self, text: &str, parent: ContentId) -> Result<ContentId> {
