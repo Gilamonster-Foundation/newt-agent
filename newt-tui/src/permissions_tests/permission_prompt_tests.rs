@@ -1037,11 +1037,13 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
             assert_eq!(cancel.load(Ordering::Relaxed), cancelled);
             assert_eq!(exit.load(Ordering::Relaxed), exited);
             if outcome == HumanQuestionOutcome::Answer("A".into()) {
-                let permissions = newt_core::Config::load(&config)
-                    .unwrap()
-                    .tui
-                    .unwrap()
-                    .permissions;
+                let permissions = crate::migration_notices::read(|report| {
+                    newt_core::Config::load(&config, report)
+                })
+                .unwrap()
+                .tui
+                .unwrap()
+                .permissions;
                 assert_eq!(permissions.net, vec![request.target]);
             } else {
                 assert!(!config.exists(), "only a permanent answer writes config");
@@ -1937,7 +1939,7 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
         let base = if force_full_access {
             Caveats::top()
         } else {
-            newt_core::Config::load(&config)
+            crate::migration_notices::read(|report| newt_core::Config::load(&config, report))
                 .unwrap()
                 .tui
                 .unwrap()
@@ -1997,11 +1999,12 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
             written.contains("github.com"),
             "host not persisted: {written}"
         );
-        let permissions = newt_core::Config::load(&config)
-            .unwrap()
-            .tui
-            .unwrap()
-            .permissions;
+        let permissions =
+            crate::migration_notices::read(|report| newt_core::Config::load(&config, report))
+                .unwrap()
+                .tui
+                .unwrap()
+                .permissions;
         assert!(permissions.net.contains(&"github.com".to_string()));
         let reloaded = if force_full_access {
             Caveats::top()
