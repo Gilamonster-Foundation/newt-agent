@@ -55,9 +55,13 @@ either one without touching cognition.
 | resolute | Also refuses to report done until a check passes — a test run or other verification, not only the cited-path check [`claim_check.rs`](../../newt-core/src/agentic/claim_check.rs) does today |
 | relentless | Also lifts the tool-round limit (today's `project_tool_round_limit`) |
 
-Levels are cumulative in the target design. Slice 2 ships `normal`, `resolute`,
-and `relentless`; `grit` remains a later slice. Resolute uses the existing three
-verification nudges. For typed Act tasks, resolute and relentless require fresh
+Levels are cumulative. Grit admits up to `grit_retries` corrective model
+continuations after observed operational failures; the default is two and zero
+disables correction. It does not replay failed tools. Denied or unavailable
+operations and unclassified errors do not authorize correction. A Grit-only
+turn may assess an expected failure and finish after a correction without a
+new check. Resolute uses the existing three verification nudges; failed-check
+repair shares both allowances. For typed Act tasks, resolute and relentless require fresh
 observed successful checks on every wire, with SmartHarness on or off. Missing
 checks, denied/unavailable execution, hidden exit status, stale passes, and
 exhausted repair allowance produce an incomplete result with an explanation.
@@ -104,7 +108,7 @@ example = "resolute"
 Persona front matter uses `psyche_version = 2` beside `tenacity = "resolute"`.
 Writers stamp the supported version. Unversioned recognized legacy labels still
 migrate once to initiative (including old `relentless` → `eager`); unversioned
-`normal`/`resolute` receive a version hint. Unknown versions fail without rewriting
+`normal`/`grit`/`resolute` receive a version hint. Unknown versions fail without rewriting
 the source. Historical settings receipts retain their original bytes and IDs.
 
 ### Tunable numbers
@@ -122,7 +126,7 @@ decisive = 2
 eager    = 1
 
 [tenacity.budgets]
-grit_retries      = 2     # illustrative; chosen when grit is built
+grit_retries      = 2     # admitted corrective continuations; 0 disables them
 relentless_rounds = 0     # 0 = effectively unlimited, today's behaviour
 ```
 
