@@ -522,7 +522,11 @@ impl SmartHarness {
         s.session.record_navigation_reply(request, &raw)?;
         let selection = self
             .admit_output(&raw)
-            .and_then(|()| Ok(serde_json::from_str::<Vec<String>>(&raw)?))
+            .and_then(|()| {
+                Ok(serde_json::from_str::<Vec<String>>(
+                    super::adjudicate::strip_code_fence(&raw),
+                )?)
+            })
             .and_then(|selected| {
                 Ok(s.session
                     .project_selection(messages, &selected, max_bytes)?)
@@ -1862,6 +1866,118 @@ mod tests {
             error.to_string().contains("AdjudicationFailure"),
             "invalid auxiliary output must stop navigation: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn navigation_json_envelopes_preserve_raw_reply_and_kernel_validation() {
+        for case in [
+            "bare",
+            "json",
+            "crlf",
+            "fence",
+            "outside",
+            "trailing",
+            "unclosed",
+            "wrong_language",
+            "inline",
+            "invented",
+            "duplicate",
+            "missing_pin",
+            "missing_pair",
+            "over_budget",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let session = Session::open(dir.path(), Default::default()).unwrap();
+            let unrelated = session.head().to_string();
+            let recorded = Arc::new(std::sync::Mutex::new(String::new()));
+            let capture = recorded.clone();
+            let h = SmartHarness::new(
+                session,
+                Arc::new(move |prompt| {
+                    let catalog: Value =
+                        serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+                    let cards = catalog["candidates"].as_array().unwrap();
+                    let mut selected = cards
+                        .iter()
+                        .filter(|card| {
+                            card["required"] == true
+                                || !card["pairs"].as_array().unwrap().is_empty()
+                        })
+                        .map(|card| card["cid"].clone())
+                        .collect::<Vec<_>>();
+                    selected.extend(catalog["host_pinned"].as_array().unwrap().iter().cloned());
+                    match case {
+                        "invented" => selected.push(Value::String(unrelated.clone())),
+                        "duplicate" => selected.push(selected[0].clone()),
+                        "missing_pin" => selected.clear(),
+                        "missing_pair" => {
+                            let call = &cards
+                                .iter()
+                                .find(|card| card["role"] == "assistant")
+                                .unwrap()["cid"];
+                            selected.retain(|cid| cid != call);
+                        }
+                        "over_budget" => {
+                            selected = cards.iter().map(|card| card["cid"].clone()).collect();
+                        }
+                        _ => {}
+                    }
+                    let json = serde_json::to_string(&selected).unwrap();
+                    let raw = match case {
+                        "bare" => json,
+                        "fence" => format!("```\n{json}\n```"),
+                        "crlf" => format!("```json\r\n{json}\r\n```"),
+                        "outside" => format!("Here is my selection:\n```json\n{json}\n```"),
+                        "trailing" => format!("```json\n{json}\n```\nDone."),
+                        "unclosed" => format!("```json\n{json}"),
+                        "wrong_language" => format!("```python\n{json}\n```"),
+                        "inline" => format!("```json{json}```"),
+                        _ => format!(" \n```json\n{json}\n```\n "),
+                    };
+                    *capture.lock().unwrap() = raw.clone();
+                    Box::pin(async move { Ok((raw, None)) })
+                }),
+                Default::default(),
+            )
+            .unwrap();
+            let messages = serde_json::json!([
+                {"role":"system","content":"system pin"},
+                {"role":"user","content":"retained source ".repeat(300)},
+                {"role":"assistant","content":"","tool_calls":[{"id":"read1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"read1","content":"earlier file result"},
+                {"role":"user","content":"current request"}
+            ]);
+            let result = h.project(messages.as_array().unwrap(), 1800).await;
+            if matches!(case, "bare" | "json" | "fence" | "crlf") {
+                let projected = result.unwrap_or_else(|error| panic!("{case}: {error:#}"));
+                assert_eq!(projected[0], messages[0]);
+                assert_eq!(projected.last().unwrap(), &messages[4]);
+                assert!(serde_json::to_vec(&projected).unwrap().len() <= 1800);
+            } else {
+                let error = result.expect_err(case);
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains("AdjudicationFailure"),
+                    "{case}: {diagnostic}"
+                );
+                let expected = match case {
+                    "invented" | "duplicate" => "unauthorized selection",
+                    "missing_pin" => "drops pinned input",
+                    "missing_pair" => "splits a tool exchange",
+                    "over_budget" => "projection bytes",
+                    _ => "expected value",
+                };
+                assert!(diagnostic.contains(expected), "{case}: {diagnostic}");
+            }
+            let raw = recorded.lock().unwrap().clone();
+            let store = agent_harness::store::FrameStore::open(dir.path()).unwrap();
+            let id = content_addressable::RawContentId::from_content(raw.as_bytes());
+            assert_eq!(
+                store.source(&id).unwrap(),
+                raw.as_bytes(),
+                "{case}: raw reply must be retained verbatim"
+            );
+        }
     }
 
     #[tokio::test]
