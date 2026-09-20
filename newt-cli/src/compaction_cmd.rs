@@ -27,8 +27,8 @@ fn effective_count_trigger(configured_threshold: usize, max_tool_rounds: usize) 
 
 pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     let cfg = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
 
     let provider = cfg
