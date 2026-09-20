@@ -24,5 +24,7 @@ A question seeks information or a decision from the operator. Preserve questions
 The harness antecedent shows any instruction that caused the reply. Compliance with a request to
 say "finished" is not itself a deliverable. A genuine answer following a nudge remains an answer.
 You do not verify task success or infer that claimed external actions happened. Emit only the JSON string.
+host_tool_evidence contains host-accounted calls, not model claims. Missing historical accounting
+is unknown. A recorded native outcome describes its execution envelope, not overall task success.
 """
 nudge = "The requested work is still unfinished. Take the next concrete action now with an available tool, or provide the promised substantive result. An empty plan is normal: create it with update_plan, or work directly on a one-step task. If a real missing input prevents progress, ask the operator a specific question. Describing the next action is not executing it."

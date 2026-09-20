@@ -1,9 +1,36 @@
 //! Tool occurrence facts in the session's existing verified journal.
 use super::*;
 
+/// The class of one native shell execution, read from its envelope's facts
+/// (structured denial, timeout flag, exit status, program resolution) — never
+/// re-derived from the rendered result text, or a display-level success bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecOutcome {
+    /// Ran and exited 0.
+    Passed,
+    /// Ran and exited nonzero, including a program that exists but exits 127.
+    Failed,
+    /// A structured leash denial, or the kernel refusing the program.
+    Denied,
+    /// Killed at its wall-clock ceiling (the envelope's `timed_out` flag).
+    TimedOut,
+    /// The final program does not resolve, or dispatch failed. Earlier stages
+    /// of a compound command may already have run.
+    Unavailable,
+}
+
 /// A return observed by the host. String contents never establish success or
 /// failure. Callers own disclosure, tool authority, and the truth of this claim.
 pub enum ToolReturn<'a> {
+    /// A native execution classified by the dispatcher, never inferred from text.
+    /// Denied does not identify an operator decision; unavailable does not
+    /// assert that earlier stages of a compound command had no side effects.
+    Native {
+        bytes: &'a [u8],
+        retained_sources: &'a [ContentId],
+        execution: ExecOutcome,
+    },
     Observed {
         bytes: &'a [u8],
         retained_sources: &'a [ContentId],
@@ -40,6 +67,8 @@ pub struct ToolCallStatus {
     pub ordinal: usize,
     pub call: Value,
     pub state: ToolCallState,
+    /// Exact native execution classification, absent for untyped/legacy returns.
+    pub execution: Option<ExecOutcome>,
     /// The exact observed return, including a typed failure when present.
     pub returned: Option<ContentId>,
     pub retained_sources: Vec<ContentId>,
@@ -63,6 +92,8 @@ pub(crate) enum ToolChange {
         event: ContentId,
         sources: Vec<ContentId>,
         kind: ReturnKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<ExecOutcome>,
     },
     Sources {
         sources: Vec<ContentId>,
@@ -170,17 +201,31 @@ impl Session {
         if call.state != ToolCallState::Started {
             return Err(integrity("tool return requires a started invocation"));
         }
-        let (bytes, sources, kind) = match returned {
+        let (bytes, sources, kind, execution) = match returned {
+            ToolReturn::Native {
+                bytes,
+                retained_sources,
+                execution,
+            } => (
+                bytes,
+                retained_sources,
+                if matches!(execution, ExecOutcome::Failed | ExecOutcome::TimedOut) {
+                    ReturnKind::Failed
+                } else {
+                    ReturnKind::Observed
+                },
+                Some(execution),
+            ),
             ToolReturn::Observed {
                 bytes,
                 retained_sources,
-            } => (bytes, retained_sources, ReturnKind::Observed),
+            } => (bytes, retained_sources, ReturnKind::Observed, None),
             ToolReturn::Failed {
                 bytes,
                 retained_sources,
-            } => (bytes, retained_sources, ReturnKind::Failed),
-            ToolReturn::Retrieval(text) => (text.as_bytes(), &[][..], ReturnKind::Retrieval),
-            ToolReturn::Host(text) => (text.as_bytes(), &[][..], ReturnKind::Host),
+            } => (bytes, retained_sources, ReturnKind::Failed, None),
+            ToolReturn::Retrieval(text) => (text.as_bytes(), &[][..], ReturnKind::Retrieval, None),
+            ToolReturn::Host(text) => (text.as_bytes(), &[][..], ReturnKind::Host, None),
         };
         let (origin, parents) = self.return_provenance(&call, bytes, sources, kind)?;
         self.ensure_writer()?;
@@ -203,6 +248,7 @@ impl Session {
                     event,
                     sources: sources.to_vec(),
                     kind,
+                    execution,
                 },
             })?;
             Ok(event)
@@ -394,6 +440,7 @@ impl Session {
                     ordinal: occurrence.ordinal,
                     call: occurrence.call,
                     state: ToolCallState::Queued,
+                    execution: None,
                     returned: None,
                     retained_sources: Vec::new(),
                     delivery: None,
@@ -421,7 +468,18 @@ impl Session {
                 event,
                 sources,
                 kind,
+                execution,
             } => {
+                if execution.is_some_and(|outcome| match outcome {
+                    ExecOutcome::Failed | ExecOutcome::TimedOut => {
+                        !matches!(kind, ReturnKind::Failed)
+                    }
+                    _ => !matches!(kind, ReturnKind::Observed),
+                }) {
+                    return Err(integrity(
+                        "native execution classification differs from return kind",
+                    ));
+                }
                 if call.state != ToolCallState::Started {
                     return Err(integrity("only started calls can return"));
                 }
@@ -444,6 +502,7 @@ impl Session {
                 }
                 self.events.insert(*event, value);
                 call.returned = Some(*event);
+                call.execution = *execution;
                 call.retained_sources = sources.clone();
                 call.state = if matches!(kind, ReturnKind::Failed) {
                     ToolCallState::Failed

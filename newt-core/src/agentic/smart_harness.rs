@@ -42,8 +42,9 @@ impl AdjudicationSettings {
         text: &str,
         antecedent: Option<&str>,
         task: Option<&str>,
+        tool_evidence: Option<&Value>,
     ) -> String {
-        let evidence = serde_json::json!({"reply_cid":reply.to_string(),"reply":text,"harness_antecedent":antecedent,"operator_task":task});
+        let evidence = serde_json::json!({"reply_cid":reply.to_string(),"reply":text,"harness_antecedent":antecedent,"operator_task":task,"host_tool_evidence":tool_evidence});
         format!("{}\n{}", self.instruction, evidence)
     }
 
@@ -718,6 +719,76 @@ impl SmartHarness {
         })
     }
 
+    /// Derive a bounded view of the existing occurrence journal. No model text,
+    /// return-body parsing, or permission inference contributes execution facts.
+    fn tool_evidence(session: &Session) -> anyhow::Result<Value> {
+        let Some(calls) = session.current_turn_tool_calls()? else {
+            return Ok(serde_json::json!({"scope":"unknown"}));
+        };
+        let calls = calls.collect::<Vec<_>>();
+        let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
+        for call in &calls {
+            let Some(outcome) = call.execution else {
+                continue;
+            };
+            let label = match outcome {
+                crate::ExecOutcome::Passed => "passed",
+                crate::ExecOutcome::Failed => "failed",
+                crate::ExecOutcome::Denied => "denied",
+                crate::ExecOutcome::TimedOut => "timed_out",
+                crate::ExecOutcome::Unavailable => "unavailable",
+            };
+            *outcomes.entry(label).or_default() += 1;
+        }
+        let build_calls = calls
+            .iter()
+            .filter(|call| {
+                call.call["function"]["name"] == "lifecycle"
+                    && call.call["function"]["arguments"]["action"] == "build"
+            })
+            .count();
+        let recent = calls
+            .iter()
+            .skip(calls.len().saturating_sub(6))
+            .map(|call| {
+                // Names and arguments are model-supplied. Only these fixed labels
+                // enter host guidance; the invocation CID preserves exact input.
+                let tool = match call.call["function"]["name"].as_str() {
+                    Some("run_command") => "run_command",
+                    Some("lifecycle") => "lifecycle",
+                    Some("request_permissions") => "request_permissions",
+                    _ => "other",
+                };
+                serde_json::json!({
+                    "invocation_cid":call.id, "tool":tool, "state":call.state,
+                    "execution":call.execution, "return_cid":call.returned,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "scope":"current_accounted_turn",
+            "admitted_calls":calls.len(),
+            "lifecycle_build_calls":build_calls,
+            "native_outcomes":outcomes,
+            "recent_calls":recent,
+            "omitted_calls":calls.len().saturating_sub(recent.len()),
+        }))
+    }
+
+    fn grounding_guidance(evidence: &Value) -> String {
+        format!(
+            "Host-recorded tool evidence at this recovery boundary: {evidence}\n\
+            Plans and summaries are claims, not execution receipts. These counts describe only \
+            the accounted current turn; absent historical records are unknown. A queued or \
+            returned call alone does not prove a command ran. Native outcomes describe the \
+            execution envelope, not every subcommand or overall task success. A denial does not \
+            identify an operator decision, and a direct-execution denial does not establish a \
+            distinct Build denial. No entry grants authority or cancels an earlier refusal. \
+            If the authorized next action remains untested, issue the advertised tool call; \
+            otherwise report the specific recorded blocker without inventing a receipt."
+        )
+    }
+
     /// Classify an already-recorded observation; ancestry is evidence, never a verdict.
     pub(crate) async fn classify(
         &self,
@@ -732,11 +803,13 @@ impl SmartHarness {
                 .reply
                 .ok_or_else(|| anyhow::anyhow!("cannot adjudicate an unrecorded reply"))?;
             s.session.record_model_message(reply, text)?;
+            let evidence = Self::tool_evidence(&s.session)?;
             let prompt = self.settings.classification_prompt(
                 reply,
                 text,
                 s.antecedent.as_deref(),
                 s.operator_task.as_deref(),
+                Some(&evidence),
             );
             (
                 reply,
@@ -791,9 +864,10 @@ impl SmartHarness {
             }),
             Verdict::Narration if more_rounds && s.nudges < nudge_cap => {
                 let nudge = format!(
-                    "{} {}",
+                    "{} {}\n\n{}",
                     super::compress::LOOP_GUIDANCE_PREFIX,
-                    super::workflow_guidance(&self.settings.nudge)
+                    super::workflow_guidance(&self.settings.nudge),
+                    Self::grounding_guidance(&Self::tool_evidence(&s.session)?)
                 );
                 s.session.record_host_message(&nudge, reply)?;
                 s.session.record_outcome(reply, "continue", &nudge)?;
@@ -848,15 +922,20 @@ impl SmartHarness {
 
     /// A deterministic evidence check can correct an answer before auxiliary
     /// adjudication. Keep its actual reply and intervention in the same ledger.
-    pub(crate) fn correct_answer(&self, answer: &str, nudge: &str) -> anyhow::Result<()> {
-        {
+    pub(crate) fn correct_answer(&self, answer: &str, nudge: &str) -> anyhow::Result<String> {
+        let nudge = {
             let mut s = self.state()?;
             let reply = s
                 .reply
                 .ok_or_else(|| anyhow::anyhow!("correction has no reply parent"))?;
             s.session.record_model_message(reply, answer)?;
-        }
-        self.intervention(nudge)
+            format!(
+                "{nudge}\n\n{}",
+                Self::grounding_guidance(&Self::tool_evidence(&s.session)?)
+            )
+        };
+        self.intervention(&nudge)?;
+        Ok(nudge)
     }
 
     /// The auxiliary classification never replaces workspace verification.
@@ -1261,6 +1340,10 @@ pub fn parse_verdict(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 #[path = "smart_harness_tests/context_exceeded.rs"]
 mod context_exceeded_tests;
+
+#[cfg(test)]
+#[path = "smart_harness_tests/execution_evidence.rs"]
+mod execution_evidence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1892,7 +1975,7 @@ mod tests {
             "head ... tail\n{}\nerror: command exited 7",
             super::super::content_spill::tool_output_retrieval_hint(&handle.unwrap())
         );
-        invocation.observe(&display, Some(&store)).unwrap();
+        invocation.observe(&display, None, Some(&store)).unwrap();
         let rendered = tool_result(
             "run_command",
             display,

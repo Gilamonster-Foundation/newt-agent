@@ -1988,6 +1988,33 @@ plan without repeating fabricated capability or operator-denial claims.
 **Out of scope:** verifying arbitrary natural-language claims or exact command
 results, expanding Git authority, and changing the confinement policy.
 
+## Step 27.8 — Retain execution evidence for Smart Harness recovery (#2457)
+
+**Branch:** `step-27.8-frame-execution-evidence`
+
+Carry Newt's native execution outcome into the existing Agent Frame tool-return
+journal before presentation, independently of optional conversation telemetry.
+Reuse the current occurrence identities, content-addressed records, verified
+restore, and interruption states. Expose a derived ordered view since an explicit
+turn boundary; missing historical accounting remains unknown.
+
+Derive bounded recovery context from those records for Smart Harness
+classification, narration nudges, and unsupported-probe corrections. Separate
+admitted calls from native outcomes and explicit lifecycle Build requests.
+Retain invocation and return references without promoting model arguments,
+returned prose, or advisory plan descriptions into execution facts.
+
+**Acceptance:** a real failing process retains its typed failure and exact
+disclosed return with or without optional telemetry; all native outcomes survive
+cold restore; changed journal bytes refuse admission. Current-turn reset leaves
+historical and interrupted calls intact. Recovery distinguishes unknown history
+from an empty accounted turn, remains bounded, and ignores fabricated outcome
+text. Permission gates, cancellation, and existing round limits remain binding.
+
+**Out of scope:** automatic legacy-conversation adoption, reconstructing absent
+historical receipts, exact permission-decision provenance, arbitrary claim
+verification, and a guarantee that a model chooses the suggested next action.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

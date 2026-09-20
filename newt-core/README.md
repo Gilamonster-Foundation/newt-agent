@@ -41,6 +41,17 @@ project-validation route from per-binary direct execution grants, which do not
 grant compiler descendants or their filesystem access. This guidance never
 retries or grants authority itself.
 
+Smart Harness also retains native execution outcomes in Agent Frame's existing
+verified occurrence journal, before display and independently of optional turn
+telemetry. Classification and recovery nudges receive bounded current-turn
+facts derived from that journal, with references to the actual occurrences and
+returns. Model-authored plans and summaries cannot establish these outcomes.
+An absent historical record remains unknown; only an explicitly accounted turn
+can establish zero calls. A recorded denial does not itself identify an operator
+decision, and a direct executable denial does not establish a confined Build
+denial. This evidence supplies context without changing authority or guaranteeing
+that the model chooses an available action.
+
 A successful built-in permission grant releases cached capability failures and
 typed failed native shell/lifecycle executions so the original operation can be
 checked again. A native execution receipt permits re-evaluation; it does not
