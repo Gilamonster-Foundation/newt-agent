@@ -14,8 +14,9 @@ pub(super) async fn compress(
     summarizer: Option<&super::compress::SummarizeFn>,
     state: &mut super::CompressState,
     harness: Option<&smart_harness::SmartHarness>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<super::compress::CompressOutcome> {
-    let outcome = smart_harness::compress(request, summarizer, state, harness).await?;
+    let outcome = smart_harness::compress(request, summarizer, state, harness, cancel).await?;
     if outcome.tokens_after <= request.budget || !request.rewrites_history || harness.is_some() {
         return Ok(outcome);
     }
@@ -26,7 +27,7 @@ pub(super) async fn compress(
         .max(1);
     let mut bounded = request;
     bounded.max_messages = Some(head.saturating_add(1).saturating_add(tail));
-    smart_harness::compress(bounded, summarizer, state, harness).await
+    smart_harness::compress(bounded, summarizer, state, harness, cancel).await
 }
 
 /// Protect the newest tool result and its call/result suffix. Dropping its
