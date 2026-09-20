@@ -2077,13 +2077,25 @@ result omitted from the catalog, selecting the older call yields a legal
 exchange that keeps that result. Without the completion the same selection is
 refused as "splits a tool exchange". An omitted source call is still refused.
 
-**Known gaps:** the catalog does not price a companion, so a selection that fits
-by the catalog's own byte counts can still exceed the budget once completed and
-is then refused; and completion pairs by provider wire id, so it does nothing
-for the Ollama wire format, whose results carry no id.
+The catalog is the selector's only price list and a refused selection fails the
+turn, so it offers only what can be selected and charges what the host charges.
+A tool exchange is offered whole or not at all, including at the catalog
+window's edge, and its cards show one `pairs` set. A card's `bytes` include the
+generated entries its exchange brings, each charged once. `max_bytes` is what
+remains after the brackets, the entries the host adds regardless, and the
+re-read pointer. A card that a required entry forces says `required`. Any
+selection that includes the required cards, takes each `pairs` group whole, and
+whose `bytes` sum to at most `max_bytes` is admitted; when something is elided
+the prices are exact to the byte, and otherwise the unused pointer reserve is
+left over.
 
-**Out of scope:** pricing companions in the catalog, provenance-based pairing,
-classifier-verdict parsing, and any change to authority or navigation budgets.
+**Known gap:** completion pairs by provider wire id, so it does nothing for the
+Ollama wire format, whose results carry no id.
+
+**Out of scope:** provenance-based pairing, failing before the auxiliary call
+when the required set cannot fit, the 512-byte pointer reserve still hardcoded
+in the deterministic `project` fallback, classifier-verdict parsing, and any
+change to authority or to the validator.
 
 ### Status correction (2026-09-07) — measurement against the premise
 
