@@ -1619,7 +1619,9 @@ fn session_body(
     // UNPUBLISHED resolution: process-globals land only after the typed
     // backend choice below ACCEPTS — a refused startup publishes nothing.
     // A resolution failure is visible, then the session runs on defaults.
-    let mut cfg = match newt_core::Config::resolve_runtime_unpublished() {
+    let mut cfg = match crate::migration_notices::read(|report| {
+        newt_core::Config::resolve_runtime_unpublished(report)
+    }) {
         Ok(cfg) => cfg,
         Err(e) => {
             print_newt(
