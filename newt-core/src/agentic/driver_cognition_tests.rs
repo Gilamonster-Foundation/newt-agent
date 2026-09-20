@@ -14,6 +14,7 @@ async fn cognition_capture_reaches_nested_core_reader_without_wire_controls() {
             _op: &str,
             _args: &serde_json::Value,
             _caveats: &Caveats,
+            _context: crate::agentic::CrewDispatchContext<'_>,
         ) -> Result<String, String> {
             self.0
                 .lock()

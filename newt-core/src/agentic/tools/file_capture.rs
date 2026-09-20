@@ -66,40 +66,162 @@ pub(super) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
         Err(_) => {
             return TextSnapshot::Unavailable(
                 "the file could not be read as an authorized regular file",
-            )
+            );
         }
     };
-    let before = file.metadata().ok();
-    let limit = super::file_change::MAX_VERSION_BYTES as u64;
-    if before
-        .as_ref()
-        .is_some_and(|metadata| metadata.len() > limit)
-    {
-        return TextSnapshot::Unavailable("receipt capture limit exceeded (256 KiB per version)");
+    capture_opened(&mut file)
+}
+
+fn capture_opened(file: &mut File) -> TextSnapshot {
+    match observe_opened(file, super::file_change::MAX_VERSION_BYTES) {
+        Ok(version) => match String::from_utf8(version.bytes) {
+            Ok(text) => TextSnapshot::Present(text),
+            Err(_) => TextSnapshot::Unavailable("the file could not be read as UTF-8 text"),
+        },
+        Err(crate::self_review::CaptureFailure::OverLimit) => {
+            TextSnapshot::Unavailable("receipt capture limit exceeded (256 KiB per version)")
+        }
+        Err(_) => TextSnapshot::Unavailable("the file could not be read as stable authorized text"),
     }
-    // Metadata can become stale while reading. Read at most one byte beyond
-    // the budget, and never pass a truncated version to the diff engine.
+}
+
+/// The one bounded descriptor reader for both file-change receipts and review.
+/// The caller's remaining aggregate allowance bounds allocation and actual read.
+fn observe_opened(
+    file: &mut File,
+    limit: usize,
+) -> Result<crate::self_review::ReviewFile, crate::self_review::CaptureFailure> {
+    use crate::self_review::{CaptureFailure, ReviewFile};
+    let unavailable = |error: io::Error| CaptureFailure::Incomplete(error.to_string());
+    let before = file.metadata().map_err(unavailable)?;
+    let bound = u64::try_from(limit).map_err(|_| CaptureFailure::OverLimit)?;
+    if before.len() > bound {
+        return Err(CaptureFailure::OverLimit);
+    }
     let mut bytes = Vec::new();
-    if (&mut file).take(limit + 1).read_to_end(&mut bytes).is_err() {
-        return TextSnapshot::Unavailable("the file could not be read as UTF-8 text");
+    (&mut *file)
+        .take(bound.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
+    if bytes.len() > limit {
+        return Err(CaptureFailure::OverLimit);
     }
-    if bytes.len() as u64 > limit {
-        return TextSnapshot::Unavailable("receipt capture limit exceeded (256 KiB per version)");
+    let after = file.metadata().map_err(unavailable)?;
+    if before.len() != after.len()
+        || after.len() != bytes.len() as u64
+        || before.modified().ok() != after.modified().ok()
+        || before.permissions() != after.permissions()
+    {
+        return Err(CaptureFailure::Incomplete(
+            "file changed during capture".into(),
+        ));
     }
-    let Ok(text) = String::from_utf8(bytes) else {
-        return TextSnapshot::Unavailable("the file could not be read as UTF-8 text");
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        before.permissions().mode() & 0o111 != 0
     };
-    let after = file.metadata().ok();
-    match (before, after) {
-        (Some(before), Some(after))
-            if before.len() == after.len()
-                && after.len() == text.len() as u64
-                && before.modified().ok() == after.modified().ok() =>
-        {
-            TextSnapshot::Present(text)
-        }
-        _ => TextSnapshot::Unavailable("the file changed while being read"),
+    #[cfg(not(unix))]
+    let executable = false;
+    Ok(ReviewFile { bytes, executable })
+}
+
+/// Explicit artifacts retain the existing per-version presentation cap while
+/// respecting the caller's smaller remaining aggregate allowance.
+pub(crate) fn review_bytes(
+    scope: &Scope<String>,
+    path: &Path,
+    remaining: usize,
+) -> Result<crate::self_review::ReviewFile, crate::self_review::CaptureFailure> {
+    use crate::self_review::CaptureFailure;
+    let limit = remaining.min(super::file_change::MAX_VERSION_BYTES);
+    let version = review_optional(scope, path, limit)
+        .map_err(|failure| {
+            if failure == CaptureFailure::OverLimit
+                && remaining >= super::file_change::MAX_VERSION_BYTES
+            {
+                CaptureFailure::Incomplete(
+                    "receipt capture limit exceeded (256 KiB per version)".into(),
+                )
+            } else {
+                failure
+            }
+        })?
+        .ok_or_else(|| CaptureFailure::Incomplete("supplied review artifact is absent".into()))?;
+    let text = std::str::from_utf8(&version.bytes).map_err(|_| {
+        CaptureFailure::Incomplete("the file could not be read as UTF-8 text".into())
+    })?;
+    if text.contains('\0') {
+        return Err(CaptureFailure::Binary);
     }
+    Ok(version)
+}
+
+/// Raw authorized observation: binary/large unchanged baseline versions need
+/// not be model text. Only authorized NotFound is absence.
+pub(crate) fn review_optional(
+    scope: &Scope<String>,
+    path: &Path,
+    remaining: usize,
+) -> Result<Option<crate::self_review::ReviewFile>, crate::self_review::CaptureFailure> {
+    use crate::self_review::CaptureFailure;
+    let full = path
+        .to_str()
+        .ok_or_else(|| CaptureFailure::Incomplete("review path is not UTF-8".into()))?;
+    if !super::tui_permits_path(scope, full) {
+        return Err(CaptureFailure::Denied);
+    }
+    match open_for_scope(scope, path, true) {
+        Ok(file) => review_opened(file, remaining).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CaptureFailure::Incomplete(format!(
+            "review artifact unavailable: {error}"
+        ))),
+    }
+}
+
+/// Observe one relative member through the caller's already-authorized root.
+/// Keep absence handling here beside the same descriptor reader used above.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn review_relative_optional(
+    directory: &crate::fs_cap::WorkspaceDir,
+    path: &Path,
+    remaining: usize,
+) -> Result<Option<crate::self_review::ReviewFile>, crate::self_review::CaptureFailure> {
+    match directory.open_regular(path, true) {
+        Ok(file) => review_opened(file, remaining).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(crate::self_review::CaptureFailure::Incomplete(format!(
+            "review artifact unavailable: {error}"
+        ))),
+    }
+}
+
+pub(crate) fn review_opened(
+    mut file: File,
+    remaining: usize,
+) -> Result<crate::self_review::ReviewFile, crate::self_review::CaptureFailure> {
+    observe_opened(&mut file, remaining)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn review_directory(
+    scope: &Scope<String>,
+    path: &Path,
+) -> Result<crate::fs_cap::WorkspaceDir, crate::self_review::CaptureFailure> {
+    use crate::self_review::CaptureFailure;
+    let full = path
+        .to_str()
+        .ok_or_else(|| CaptureFailure::Incomplete("review directory path is not UTF-8".into()))?;
+    let opened = match super::object_bound_target(scope, full) {
+        Some(Some((root, relative))) => crate::fs_cap::WorkspaceDir::open_root(Path::new(root))
+            .and_then(|directory| directory.open_dir(&relative)),
+        Some(None) => crate::fs_cap::WorkspaceDir::open_root(path),
+        None => return Err(CaptureFailure::Denied),
+    };
+    opened.map_err(|error| {
+        CaptureFailure::Incomplete(format!("review directory unavailable: {error}"))
+    })
 }
 
 /// A failed or partial operation still has an observed result. Never build its
@@ -111,7 +233,7 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
             return Receipt::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
         }
         (Absent, Absent) => {
-            return Receipt::plain("\n\nNo file was present before or after the operation.".into())
+            return Receipt::plain("\n\nNo file was present before or after the operation.".into());
         }
         (Absent, Present(after)) => (None, Some(after.as_str())),
         (Present(before), Absent) => (Some(before.as_str()), None),

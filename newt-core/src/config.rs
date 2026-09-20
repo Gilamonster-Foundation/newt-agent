@@ -46,8 +46,8 @@ pub use presentation::{
     set_session_spill_lines, ColorMode, EditMode, FooterMode, MarkdownMode, ThinkingMode,
 };
 pub use profile::{
-    BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, VerifyGateKnobs,
-    KNOWN_TECHNIQUES,
+    BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, SelfReviewKnobs,
+    VerifyGateKnobs, KNOWN_TECHNIQUES,
 };
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;

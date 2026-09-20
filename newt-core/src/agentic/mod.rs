@@ -54,6 +54,12 @@ pub(crate) mod scheduled;
 pub(crate) mod content_spill;
 /// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
 pub(crate) mod plan_exec;
+#[cfg(test)]
+mod self_review_host_projection_tests;
+#[cfg(test)]
+mod self_review_plan_tests;
+#[cfg(test)]
+mod self_review_selection_tests;
 // W0 (#1511, epic #1506): typed dispatch-error classification + per-round
 // tool-call parse signals — the structural inputs of the observability
 // contract `newt solve` emits for the external evaluator.
@@ -176,6 +182,9 @@ mod routing;
 // seam + #717 phantom telemetry).
 mod tool_search;
 mod tools;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use tools::{capture_review_relative_optional, open_review_directory};
+pub(crate) use tools::{capture_review_file, capture_review_opened};
 mod transcript;
 mod trim;
 // Scoped FR-14 (#1042): wrap a remote MCP tool's result as explicitly
@@ -204,7 +213,9 @@ pub use content_spill::{
     SpillStore,
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
-pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
+pub use crew_tool::{
+    compose_roster_tool_definition, crew_tool_definition, CrewDispatchContext, CrewRunner,
+};
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
@@ -918,6 +929,8 @@ impl Drop for CompletedSpillDismissGuard<'_> {
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
 pub struct ChatCtx<'a> {
+    /// Captured configured technique intent, distinct from executed evidence.
+    pub techniques: Option<&'a crate::kit::CapturedTechniques>,
     /// Optional accounted projection and auxiliary completion adjudication.
     pub smart_harness: Option<&'a smart_harness::SmartHarness>,
     pub url: &'a str,
@@ -1896,6 +1909,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .await;
     }
     let ChatCtx {
+        techniques,
         verify_outcomes,
         smart_harness,
         url,
@@ -3933,6 +3947,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        techniques,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
@@ -6517,6 +6532,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        techniques,
         verify_outcomes,
         smart_harness,
         url,
@@ -8433,6 +8449,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        techniques,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
@@ -9045,6 +9062,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        techniques,
         verify_outcomes,
         smart_harness,
         url,
@@ -10827,6 +10845,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        techniques,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
@@ -11335,6 +11354,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        techniques,
         verify_outcomes,
         smart_harness,
         url,
@@ -12475,6 +12495,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        techniques,
                         invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),

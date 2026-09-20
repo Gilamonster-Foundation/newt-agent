@@ -98,6 +98,12 @@ impl std::fmt::Debug for HeadlessCodeSearch {
 /// separately by the driver and shared across its submitted turns.
 #[derive(Debug, Clone)]
 pub struct TurnDriverConfig {
+    /// Immutable independently selected techniques. Absence preserves old turns.
+    pub techniques: Option<crate::kit::CapturedTechniques>,
+    /// Explicit read-only review membership, supplied by the trusted host.
+    /// Absence selects the implementation turn's actual baseline/current delta;
+    /// technique selection and the existing caveats remain separate requirements.
+    pub review_subject: Option<crate::self_review::ReviewSubject>,
     /// Shared accounted session and independent narration adjudicator.
     pub smart_harness: Option<Arc<super::smart_harness::SmartHarness>>,
     /// Inference endpoint base URL.
@@ -197,6 +203,8 @@ impl TurnDriverConfig {
         workspace: impl Into<String>,
     ) -> Self {
         Self {
+            techniques: None,
+            review_subject: None,
             smart_harness: None,
             url: url.into(),
             model: model.into(),
@@ -680,6 +688,7 @@ async fn run_one_turn(
         .run_allowance
         .map(super::run_allowance::RunAllowance::new);
     let ctx = ChatCtx {
+        techniques: config.techniques.as_ref(),
         run_allowance: run_allowance.as_ref(),
         verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
         round_cap_hit: None,
@@ -899,6 +908,7 @@ mod calibration_tests;
 mod tests {
     include!("driver_cognition_tests.rs");
     include!("driver_cognition_wire_tests.rs");
+    include!("driver_self_review_tests.rs");
     use super::*;
     use crate::agentic::SessionSemanticIndex;
     use crate::caveats::{Caveats, CountBound, Scope};
@@ -1125,6 +1135,7 @@ mod tests {
             _op: &str,
             _args: &serde_json::Value,
             _caveats: &Caveats,
+            _context: crate::agentic::CrewDispatchContext<'_>,
         ) -> Result<String, String> {
             Ok("unused fixture crew".to_string())
         }
@@ -1491,6 +1502,7 @@ mod tests {
             op: &str,
             args: &serde_json::Value,
             caveats: &Caveats,
+            _context: crate::agentic::CrewDispatchContext<'_>,
         ) -> Result<String, String> {
             self.dispatches.lock().unwrap().push(CrewDispatch {
                 op: op.to_string(),

@@ -11,6 +11,7 @@ impl crate::agentic::CrewRunner for StubCrew {
         op: &str,
         _args: &serde_json::Value,
         _caveats: &Caveats,
+        _context: crate::agentic::CrewDispatchContext<'_>,
     ) -> Result<String, String> {
         match op {
             "compose_roster" => Ok("proposed roster: planner <- qwen3-coder:30b".to_string()),
@@ -139,4 +140,53 @@ fn crew_names_stay_real_and_unflagged_by_existing_seams() {
             "{name} must not be flagged by classify_phantom_reach"
         );
     }
+}
+
+#[derive(Default)]
+struct TrustedContextRecorder(
+    std::sync::Mutex<Option<(crate::kit::CapturedTechniques, Option<String>)>>,
+);
+
+#[async_trait::async_trait]
+impl crate::agentic::CrewRunner for TrustedContextRecorder {
+    async fn dispatch(
+        &self,
+        _op: &str,
+        _args: &serde_json::Value,
+        _caveats: &Caveats,
+        context: crate::agentic::CrewDispatchContext<'_>,
+    ) -> Result<String, String> {
+        self.0.lock().unwrap().replace((
+            context.techniques.expect("real captured policy").clone(),
+            context.plan_step.map(str::to_owned),
+        ));
+        Ok("captured context observed".into())
+    }
+}
+
+/// #2449: model arguments cannot substitute policy knobs or impersonate a
+/// canonical plan step at the actual existing tool-to-crew dispatch boundary.
+#[tokio::test]
+async fn self_review_trusted_dispatch_ignores_model_policy_and_step_spoof() {
+    let profile: crate::config::ProfileConfig =
+        toml::from_str("techniques = [\"self_review\"]\n[self_review]\nmax_rounds = 1").unwrap();
+    let pick = crate::config::ProfilePick {
+        name: "real-profile".into(),
+        via: crate::config::PickVia::Profile,
+    };
+    let captured = crate::kit::CapturedTechniques::capture(Some((&pick, &profile)), []).unwrap();
+    let runner = TrustedContextRecorder::default();
+    let ws = tempfile::tempdir().unwrap();
+    let result = execute_tool_with_collaborators(
+        "crew", &serde_json::json!({"task":"inspect", "plan_step":"spoofed-step", "technique_context":{"self_review":{"max_rounds":999}, "selections":[]}}),
+        &ws.path().to_string_lossy(), false, 20, &caveats_rw(ws.path()), &mut NoMcp,
+        ToolCollaborators { crew_runner: Some(&runner), techniques: Some(&captured), ..Default::default() },
+        false, PromptDisposition::Act, None,
+    ).await.unwrap().unwrap();
+    assert_eq!(result, "captured context observed");
+    let received = runner.0.lock().unwrap();
+    let (policy, step) = received.as_ref().unwrap();
+    assert_eq!(policy, &captured);
+    assert!(step.is_none());
+    assert_eq!(policy.self_review().unwrap().max_rounds, 1);
 }

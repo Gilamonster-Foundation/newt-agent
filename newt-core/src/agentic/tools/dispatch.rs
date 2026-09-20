@@ -49,6 +49,7 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     pub(crate) exec_floor: Option<&'a crate::caveats::Scope<String>>,
     pub(crate) git_tool: Option<&'a dyn GitTool>,
     pub(crate) crew_runner: Option<&'a dyn CrewRunner>,
+    pub(crate) techniques: Option<&'a crate::kit::CapturedTechniques>,
     pub(crate) scratchpad_store: Option<&'a dyn agentic::scratchpad::ScratchpadStore>,
     pub(crate) code_search: Option<agentic::semantic::CodeSearch<'a>>,
     pub(crate) where_is: Option<&'a crate::where_is::WhereIsIndex>,

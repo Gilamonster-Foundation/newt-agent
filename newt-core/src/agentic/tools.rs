@@ -37,6 +37,14 @@ pub use output_budget::{
 mod catalog;
 mod dispatch;
 mod file_capture;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use file_capture::{
+    review_directory as open_review_directory,
+    review_relative_optional as capture_review_relative_optional,
+};
+pub(crate) use file_capture::{
+    review_bytes as capture_review_file, review_opened as capture_review_opened,
+};
 mod file_change;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
@@ -2517,6 +2525,7 @@ async fn execute_authorized_tool(
         exec_floor,
         git_tool,
         crew_runner,
+        techniques,
         scratchpad_store,
         code_search,
         where_is,
@@ -3078,7 +3087,7 @@ async fn execute_authorized_tool(
             { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into() },
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
-                let out = match runner.dispatch(name, args, caveats).await {
+                let out = match runner.dispatch(name, args, caveats, super::CrewDispatchContext { techniques, plan_step: None }).await {
                     Ok(rendered) => rendered,
                     Err(e) => format!("error: {e}"),
                 };

@@ -512,6 +512,7 @@ impl super::super::crew_tool::CrewRunner for UnconfinedDelegate {
         _: &str,
         _: &serde_json::Value,
         _: &Caveats,
+        _context: crate::agentic::CrewDispatchContext<'_>,
     ) -> Result<String, String> {
         Ok(std::fs::read_to_string(&self.0).unwrap())
     }

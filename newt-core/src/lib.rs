@@ -125,6 +125,7 @@ pub mod roadmap_eval;
 /// #1082 roadmap-as-code: the on-repo TOML codec (`.newt/roadmap.toml`).
 pub mod roadmap_file;
 pub mod role_profile;
+pub mod self_review;
 pub mod router;
 pub mod runtime;
 pub mod sas_confirm;

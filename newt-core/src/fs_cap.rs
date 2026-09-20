@@ -87,6 +87,31 @@ impl WorkspaceDir {
         Ok(Self { root })
     }
 
+    /// Child cwd bound to this retained directory, rather than its former name.
+    /// The caller must keep this capability alive until spawning has completed:
+    /// child chdir runs before exec closes the CLOEXEC descriptor. This does not
+    /// change the parent cwd or grant any additional filesystem authority.
+    pub(crate) fn command_directory(&self) -> io::Result<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            Ok(std::path::PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                self.root.as_raw_fd()
+            )))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // /dev/fd is not directory traversal on Darwin. The public spawn
+            // fchdir action needs an adapter at the existing process owner;
+            // neither pathname reopening nor pre_exec is a safe substitute.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "retained-directory Git launch requires the macOS spawn adapter",
+            ))
+        }
+    }
+
     /// The single choke point: resolve `rel` beneath the root fd and return the
     /// opened fd, or an error if resolution would escape. Every public method
     /// flows through here, so the containment property has one owner.
@@ -326,6 +351,19 @@ impl WorkspaceDir {
         })
     }
 
+    /// Open a child directory without following a final symlink. Complete
+    /// review traversal uses this to refuse cycles/aliases rather than silently
+    /// treating a linked tree as independent subject membership.
+    pub fn open_dir_nofollow(&self, rel: &Path) -> io::Result<Self> {
+        Ok(Self {
+            root: self.resolve(
+                rel,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?,
+        })
+    }
+
     /// List the entry names of a subdirectory, contained beneath the root. The
     /// directory is resolved object-bound — a symlink-escape directory is refused
     /// by the kernel — and its entries are read straight off the returned fd, so
@@ -333,6 +371,17 @@ impl WorkspaceDir {
     /// order is filesystem order (the caller sorts). Names only, matching the
     /// `list_dir` tool's output.
     pub fn read_dir(&self, rel: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        self.read_dir_bounded(rel, usize::MAX, usize::MAX)
+    }
+
+    /// The same descriptor iterator with caller-owned allocation limits.
+    /// Refuses before retaining an entry beyond either bound.
+    pub(crate) fn read_dir_bounded(
+        &self,
+        rel: &Path,
+        max_entries: usize,
+        mut name_bytes: usize,
+    ) -> io::Result<Vec<std::ffi::OsString>> {
         use std::os::unix::ffi::OsStringExt;
         let dirfd = self.resolve(rel, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
         let dir = rustix::fs::Dir::read_from(&dirfd).map_err(io::Error::from)?;
@@ -343,6 +392,13 @@ impl WorkspaceDir {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
+            if names.len() >= max_entries || bytes.len() > name_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "directory capture limit exceeded",
+                ));
+            }
+            name_bytes -= bytes.len();
             names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
         }
         Ok(names)

@@ -720,7 +720,7 @@ pub fn verification_receipt(
 pub const VERIFY_REPAIR_ALLOWANCE: usize = 3;
 
 /// Entry bound for one workspace tree state; the name scan's own bound.
-const MAX_TREE_ENTRIES: usize = MAX_ENTRIES;
+pub(crate) const MAX_TREE_ENTRIES: usize = MAX_ENTRIES;
 /// Byte bound for one workspace tree state. Past it the turn falls back to
 /// the mutation chain rather than hashing a huge tree at every check.
 const MAX_TREE_BYTES: u64 = 64 * 1024 * 1024;

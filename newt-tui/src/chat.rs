@@ -1321,7 +1321,10 @@ pub(crate) trait InputSurface {
 fn repick_active_profile(
     cfg: &newt_core::ResolvedConfig,
     choice: &crate::BackendChoice,
-    active_profile: &mut Option<newt_core::config::ProfileConfig>,
+    active_profile: &mut Option<(
+        newt_core::config::ProfilePick,
+        newt_core::config::ProfileConfig,
+    )>,
     color: bool,
     verbose: bool,
 ) {
@@ -1360,16 +1363,16 @@ fn repick_active_profile(
         },
         None => None,
     };
-    // ProfileConfig carries no name — compare CONTENT identity (a re-pick
-    // resolving to an identical profile is a no-op, whatever its name).
-    let changed = active_profile.as_ref() != next.as_ref().map(|(_, p)| p);
+    // Preserve the actual winning selector even when two profiles have equal
+    // knobs; content equality alone cannot erase selection provenance.
+    let changed = active_profile.as_ref() != next.as_ref();
     if !changed {
         return;
     }
     match next {
         Some((pick, profile)) => {
             announce_profile(&pick.name, &profile, &pick.via, color);
-            *active_profile = Some(profile);
+            *active_profile = Some((pick, profile));
         }
         None => {
             print_newt(
@@ -1769,7 +1772,7 @@ fn session_body(
                     .map_err(|e| anyhow::anyhow!("profile '{}': {e}", p.name))?
                     .clone();
                 announce_profile(&p.name, &profile, &p.via, color);
-                Some(profile)
+                Some((p, profile))
             }
             None => None,
         }
@@ -2300,6 +2303,7 @@ fn session_body(
         // non-PyO3 workspace. See docs/design/technique-library.md.
         if active_profile
             .as_ref()
+            .map(|(_, profile)| profile)
             .is_some_and(|p| p.enables("knowledge_base"))
         {
             // The PyO3/FFI import surface (#74) + the general workspace API
@@ -2826,6 +2830,7 @@ fn session_body(
     // the queue is never primed and behavior is unchanged.
     let retry_max = active_profile
         .as_ref()
+        .map(|(_, profile)| profile)
         .filter(|p| p.enables("retry"))
         .map(|p| p.retry_knobs().max_retries)
         .unwrap_or(0);
@@ -7281,6 +7286,23 @@ fn session_body(
                     let _turn_binding =
                         crate::session_worker::bind_turn(tabs.active().session_id());
                     let cognition = newt_core::cognition::effective_cognition();
+                    // Capture independent selectors at this same accepted-turn
+                    // boundary, before any setup can block or publish settings.
+                    let turn_techniques = newt_core::kit::CapturedTechniques::capture(
+                        active_profile
+                            .as_ref()
+                            .map(|(pick, profile)| (pick, profile)),
+                        active_persona.as_ref().map(|persona| {
+                            (
+                                newt_core::kit::TechniqueSource::Persona {
+                                    name: persona.name.clone(),
+                                },
+                                persona.profile.techniques.clone(),
+                            )
+                        }),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    let turn_techniques = turn_techniques.has_context().then_some(turn_techniques);
                     let turn_api = choice.api;
                     let turn_capabilities = choice.capability_decision();
 
@@ -7992,13 +8014,13 @@ fn session_body(
                     // file-write tools record newt's OWN writes; the post-turn gate
                     // then reverts exactly those files (and only those — a file newt
                     // did not write is never touched).
-                    let retry_ledger =
-                        active_profile
-                            .as_ref()
-                            .filter(|p| p.enables("retry"))
-                            .map(|_| {
-                                std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
-                            });
+                    let retry_ledger = active_profile
+                        .as_ref()
+                        .map(|(_, profile)| profile)
+                        .filter(|p| p.enables("retry"))
+                        .map(|_| {
+                            std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
+                        });
                     // Under the cockpit the terminal thread owns the keyboard
                     // for the whole session: no cbreak, no watcher here.
                     let interruptible = io::stdin().is_terminal()
@@ -8179,6 +8201,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        techniques: turn_techniques.as_ref(),
                                         // #2313 b3: the session-scoped allowance
                                         // constructed above, shared with the
                                         // summarizer.
@@ -8700,6 +8723,7 @@ fn session_body(
                                 if let Some(ledger) = retry_ledger.as_ref() {
                                     let mode = active_profile
                                         .as_ref()
+                                        .map(|(_, profile)| profile)
                                         .map(|p| p.verify_gate_knobs().surface_match)
                                         .unwrap_or_default();
                                     let action = tokio::task::block_in_place(|| {
@@ -8769,8 +8793,10 @@ fn session_body(
                                             println!("{line}");
                                         }
                                     }
-                                } else if let Some(p) =
-                                    active_profile.as_ref().filter(|p| p.enables("verify_gate"))
+                                } else if let Some(p) = active_profile
+                                    .as_ref()
+                                    .map(|(_, profile)| profile)
+                                    .filter(|p| p.enables("verify_gate"))
                                 {
                                     if let Some(warn) = verify_gate_summary(
                                         workspace,

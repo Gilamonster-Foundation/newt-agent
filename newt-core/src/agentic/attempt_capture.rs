@@ -171,3 +171,7 @@ pub(crate) fn failed(attempt: Option<&Attempt<'_>>, error: &anyhow::Error) {
 #[cfg(test)]
 #[path = "attempt_capture_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "attempt_capture_review_input_tests.rs"]
+mod review_input_tests;

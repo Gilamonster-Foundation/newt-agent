@@ -78,6 +78,8 @@ pub struct RoleProfile {
     /// this role binds on activation (FR-4, #1041). `None` = no bound
     /// skills — today's behavior, unaffected.
     pub skills: Option<Vec<String>>,
+    /// Independently selected techniques; knobs come from the active profile.
+    pub techniques: Vec<String>,
     /// Declared capability profile. Advisory for interactive personas; explicit
     /// worker/server role bindings may use it as an authority ceiling.
     pub caveats: Option<CaveatProfile>,
@@ -400,6 +402,12 @@ struct FrontMatter {
     tools: Option<Vec<String>>,
     #[serde(default)]
     skills: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::kit::deserialize_selection"
+    )]
+    techniques: Vec<String>,
     #[serde(default)]
     caveats: Option<CaveatProfile>,
     #[serde(default)]
@@ -767,6 +775,7 @@ impl RoleProfile {
             role: fm.role,
             tools: fm.tools,
             skills: fm.skills,
+            techniques: fm.techniques,
             caveats: fm.caveats,
             model: fm.model,
             tier: fm.tier,
@@ -795,6 +804,7 @@ impl RoleProfile {
             role: self.role.clone(),
             tools: self.tools.clone(),
             skills: self.skills.clone(),
+            techniques: self.techniques.clone(),
             caveats: self.caveats.clone(),
             model: self.model.clone(),
             tier: self.tier,
@@ -820,6 +830,7 @@ impl RoleProfile {
         self.role.is_some()
             || self.tools.is_some()
             || self.skills.is_some()
+            || !self.techniques.is_empty()
             || self.caveats.is_some()
             || self.model.is_some()
             || self.tier.is_some()

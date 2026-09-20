@@ -23,6 +23,14 @@ use crate::caveats::Caveats;
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// Host-owned context borrowed from the current external turn. Model arguments
+/// cannot manufacture a selected profile, its knobs, or canonical plan ancestry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CrewDispatchContext<'a> {
+    pub techniques: Option<&'a crate::kit::CapturedTechniques>,
+    pub plan_step: Option<&'a str>,
+}
+
 /// The injected crew/team capability. Object-safe and shareable (the loop holds
 /// `&dyn CrewRunner`; `Send + Sync` because the borrow lives across `.await`,
 /// exactly like [`GitTool`](super::git_tool::GitTool)).
@@ -45,7 +53,13 @@ use serde_json::Value;
 /// just local I/O.
 #[async_trait]
 pub trait CrewRunner: Send + Sync {
-    async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String>;
+    async fn dispatch(
+        &self,
+        op: &str,
+        args: &Value,
+        caveats: &Caveats,
+        context: CrewDispatchContext<'_>,
+    ) -> Result<String, String>;
 }
 
 /// `compose_roster` — survey the live environment and **propose** a roster for the

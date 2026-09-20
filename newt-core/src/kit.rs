@@ -7,8 +7,12 @@
 //! parts honestly — its **axis**, its **kind** (where it mounts), what it
 //! **presupposes**, and its **tier** (does it run headless).
 //!
-//! This PR is internal — it changes no behavior. It is the substrate the bundle +
-//! loadout layers (and `Config::validate`'s presupposes check) build on.
+//! The bundle/loadout layers and profile prerequisite checks share this registry.
+//! Executable turn behavior is owned by the core loop, not this catalog.
+
+#[path = "kit_selection.rs"]
+mod selection;
+pub use selection::{CapturedTechniques, SelectedTechnique, TechniqueSource};
 
 /// Where a component mounts in the harness loop — tells a driver how to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +88,13 @@ pub const COMPONENT_REGISTRY: &[RegistryEntry] = &[
         tier: Tier::Headless,
     },
     RegistryEntry {
+        id: "self_review",
+        kind: MountKind::Loop,
+        axis: Axis::GatingRepair,
+        presupposes: &[],
+        tier: Tier::Headless,
+    },
+    RegistryEntry {
         id: "retry", // the revert-retry loop — the gate's action arm
         kind: MountKind::Loop,
         axis: Axis::GatingRepair,
@@ -105,6 +116,29 @@ pub fn component(id: &str) -> Option<&'static RegistryEntry> {
 #[must_use]
 pub fn is_known(id: &str) -> bool {
     component(id).is_some()
+}
+
+/// Validate independent selectors against the same registry as profiles.
+/// Knobs and prerequisite composition are resolved from the active profile.
+///
+/// # Errors
+/// Rejects unknown names rather than silently ignoring an asserted technique.
+pub fn validate_selection(names: &[String]) -> Result<(), String> {
+    for name in names {
+        if !is_known(name) {
+            return Err(format!("unknown technique '{name}'"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn deserialize_selection<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
+    validate_selection(&names).map_err(serde::de::Error::custom)?;
+    Ok(names)
 }
 
 #[cfg(test)]

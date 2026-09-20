@@ -17,6 +17,7 @@ use super::Config;
 pub const KNOWN_TECHNIQUES: &[&str] = &[
     "knowledge_base", // R1 — inject the authoritative import surface (#74)
     "verify_gate",    // R2 — revert files with fabricated imports (#73)
+    "self_review",    // independently selected bounded review before completion
     "retry",          // revert-retry loop over the gate's revert set
 ];
 
@@ -48,6 +49,30 @@ pub struct ProfileConfig {
     /// Knobs for the `retry` technique (applied iff it is enabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryKnobs>,
+    /// Independent review knobs; selectors elsewhere do not override these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_review: Option<SelfReviewKnobs>,
+}
+
+/// A stricter local review bound, in addition to shared run/round admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfReviewKnobs {
+    /// Cumulative review requests in one external turn. Zero admits none; it
+    /// does not disable the selected technique or grant unlimited requests.
+    #[serde(default = "default_review_rounds")]
+    pub max_rounds: u32,
+}
+
+const fn default_review_rounds() -> u32 {
+    3
+}
+
+impl Default for SelfReviewKnobs {
+    fn default() -> Self {
+        Self {
+            max_rounds: default_review_rounds(),
+        }
+    }
 }
 
 /// Tunable knobs for the `verify_gate` technique.
@@ -123,6 +148,12 @@ impl ProfileConfig {
         self.verify_gate.unwrap_or_default()
     }
 
+    /// Effective independent self-review knobs, including an absent table.
+    #[must_use]
+    pub fn self_review_knobs(&self) -> SelfReviewKnobs {
+        self.self_review.unwrap_or_default()
+    }
+
     /// The effective `retry` knobs (defaults when unset).
     #[must_use]
     pub fn retry_knobs(&self) -> RetryKnobs {
@@ -164,7 +195,7 @@ pub struct BundleConfig {
 }
 
 /// The active-profile selection + how it was chosen (for honest banner output).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfilePick {
     /// The chosen profile name (to feed [`Config::resolve_profile`]).
     pub name: String,
@@ -173,7 +204,8 @@ pub struct ProfilePick {
 }
 
 /// How a [`ProfilePick`] was selected.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PickVia {
     /// An explicit `--profile` / `NEWT_PROFILE`.
     Profile,

@@ -344,6 +344,8 @@ fn marker_sub(id: &str, instruction: &str, deps: &[&str]) -> newt_core::plan::Su
     newt_core::plan::Subtask {
         id: id.into(),
         instruction: instruction.into(),
+        techniques: Vec::new(),
+        review: None,
         deps: deps.iter().map(|s| (*s).to_string()).collect(),
         parallel_ok: false,
         context: vec![],

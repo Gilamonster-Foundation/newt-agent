@@ -17,6 +17,7 @@ const CANNED_SUMMARY: &str = "summary retained for the automatic checkpoint regr
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        techniques: None,
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,

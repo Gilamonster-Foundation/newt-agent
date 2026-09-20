@@ -168,6 +168,7 @@ pub(super) async fn run_scenario_for(
     let ws = workspace.to_string_lossy().into_owned();
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let mut c = ChatCtx {
+        techniques: None,
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,

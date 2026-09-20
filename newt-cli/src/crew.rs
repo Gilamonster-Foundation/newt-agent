@@ -795,7 +795,7 @@ pub async fn execute_plan(
     let runner =
         crate::crew_runner::LocalCrewRunner::new(cfg, dir, newt_core::agentic::Presence::Prompt)
             .with_locked_verify(locked_verify);
-    let run = newt_core::agentic::run_plan_with_reground(plan, &caveats, &runner, &reground).await;
+    let run = newt_core::agentic::run_plan_with_reground(plan, &caveats, &runner, &reground, None).await;
     for id in &run.dispatched {
         if let Some(s) = plan.subtask(id) {
             println!("  [{:?}] {}", s.status, id);
@@ -940,6 +940,8 @@ fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
         subtasks.push(Subtask {
             id,
             instruction,
+            techniques: Vec::new(),
+            review: None,
             deps,
             parallel_ok: false,
             context,
@@ -1696,3 +1698,7 @@ fn render(o: &CrewOutcome, worktree: &Path) -> i32 {
 #[cfg(test)]
 #[path = "crew/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "crew/self_review_tests.rs"]
+mod self_review_tests;

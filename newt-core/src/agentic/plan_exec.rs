@@ -96,7 +96,7 @@ const MAX_REGROUND: usize = 2;
 /// depends on a *branch* (a non-leaf, never dispatched) stalls honestly (see
 /// [`PlanRun::remaining`]) until branch-status roll-up lands.
 pub async fn run_plan(plan: &mut Plan, parent: &Caveats, runner: &dyn CrewRunner) -> PlanRun {
-    run_plan_with_reground(plan, parent, runner, &NoReground).await
+    run_plan_with_reground(plan, parent, runner, &NoReground, None).await
 }
 
 /// Like [`run_plan`], but on a leaf failure the `reground` seam may correct the
@@ -107,6 +107,7 @@ pub async fn run_plan_with_reground(
     parent: &Caveats,
     runner: &dyn CrewRunner,
     reground: &dyn Reground,
+    techniques: Option<&crate::kit::CapturedTechniques>,
 ) -> PlanRun {
     let mut dispatched = Vec::new();
     let mut failed = None;
@@ -130,7 +131,10 @@ pub async fn run_plan_with_reground(
             break;
         }
         plan.mark(&id, SubtaskStatus::Running, None);
-        let mut args = json!({ "task": task.goal });
+        let mut args = json!({ "task": task.goal, "plan_step": id });
+        if !task.techniques.is_empty() {
+            args["techniques"] = json!(task.techniques);
+        }
         // The executor owns dependency order, so it supplies placement
         // explicitly. A runner must never keep a mutable process-local cursor:
         // two runners can start from the same HEAD and both legitimately land.
@@ -151,7 +155,18 @@ pub async fn run_plan_with_reground(
             many => {
                 let branches: Vec<&str> = many.iter().map(|(branch, _)| branch.as_str()).collect();
                 let merge_args = json!({ "base_ref": "HEAD", "branches": branches });
-                match runner.dispatch("consolidate", &merge_args, parent).await {
+                match runner
+                    .dispatch(
+                        "consolidate",
+                        &merge_args,
+                        parent,
+                        super::CrewDispatchContext {
+                            techniques,
+                            plan_step: None,
+                        },
+                    )
+                    .await
+                {
                     Ok(report) => match landed_artifact(&report) {
                         Some((_, commit)) => commit,
                         None => {
@@ -173,6 +188,9 @@ pub async fn run_plan_with_reground(
             }
         };
         args["base_ref"] = Value::String(base_ref);
+        if let Some(review) = &task.review {
+            args["review"] = json!(review);
+        }
         // Forward a plan-authored `verify` ONLY when the leaf's exec caveat
         // permits it. `verify` is a model-authored shell command the runner runs
         // via `sh -c`; forwarding it past a denied exec axis would let a
@@ -192,7 +210,18 @@ pub async fn run_plan_with_reground(
         if !task.context.is_empty() {
             args["scope"] = json!(task.context);
         }
-        match runner.dispatch("crew", &args, &task.caveats).await {
+        match runner
+            .dispatch(
+                "crew",
+                &args,
+                &task.caveats,
+                super::CrewDispatchContext {
+                    techniques,
+                    plan_step: Some(&id),
+                },
+            )
+            .await
+        {
             Ok(result) => {
                 if let Some((branch, commit)) = landed_artifact(&result) {
                     plan.set_artifact_commit(&id, &commit, Some(&branch));
@@ -239,7 +268,18 @@ pub async fn run_plan_with_reground(
             .collect();
         if !branches.is_empty() {
             let args = json!({ "base_ref": "HEAD", "branches": branches });
-            match runner.dispatch("consolidate", &args, parent).await {
+            match runner
+                .dispatch(
+                    "consolidate",
+                    &args,
+                    parent,
+                    super::CrewDispatchContext {
+                        techniques,
+                        plan_step: None,
+                    },
+                )
+                .await
+            {
                 Ok(report) => consolidated = Some(report),
                 Err(error) => failed = Some(format!("consolidation failed: {error}")),
             }
@@ -295,6 +335,7 @@ mod tests {
             op: &str,
             args: &Value,
             _caveats: &Caveats,
+            _context: crate::agentic::CrewDispatchContext<'_>,
         ) -> Result<String, String> {
             let task = args["task"].as_str().unwrap_or_default().to_string();
             let verify = args
@@ -345,6 +386,7 @@ mod tests {
             op: &str,
             args: &Value,
             _caveats: &Caveats,
+            _context: crate::agentic::CrewDispatchContext<'_>,
         ) -> Result<String, String> {
             if op == "consolidate" {
                 let branches = args["branches"]
@@ -571,7 +613,7 @@ context = ["src/wrong.rs"]
 "#;
         let mut plan = Plan::from_toml_str(toml).unwrap();
         let runner = MockRunner::new(Some("step a"));
-        let run = run_plan_with_reground(&mut plan, &Caveats::top(), &runner, &FixIt).await;
+        let run = run_plan_with_reground(&mut plan, &Caveats::top(), &runner, &FixIt, None).await;
         assert!(run.complete, "the reground retry converged");
         let seen = runner.seen.lock().unwrap();
         let first = seen.iter().find(|(_, t, _, _)| t == "step a").unwrap();
@@ -666,7 +708,8 @@ context = ["src/wrong.rs"]
         let reground = MockReground {
             to: "right".to_string(),
         };
-        let run = run_plan_with_reground(&mut plan, &Caveats::top(), &runner, &reground).await;
+        let run =
+            run_plan_with_reground(&mut plan, &Caveats::top(), &runner, &reground, None).await;
         assert!(
             run.complete,
             "leaf should recover after re-grounding: {run:?}"
@@ -681,7 +724,8 @@ context = ["src/wrong.rs"]
             Plan::from_toml_str("goal = \"g\"\n[[subtask]]\nid = \"a\"\ninstruction = \"wrong\"\n")
                 .unwrap();
         let runner = MockRunner::new(Some("wrong"));
-        let run = run_plan_with_reground(&mut plan, &Caveats::top(), &runner, &NoReground).await;
+        let run =
+            run_plan_with_reground(&mut plan, &Caveats::top(), &runner, &NoReground, None).await;
         assert!(!run.complete);
         assert!(run.failed.is_some());
     }

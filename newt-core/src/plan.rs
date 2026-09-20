@@ -329,6 +329,16 @@ pub struct Subtask {
     pub id: String,
     /// What the child agent is asked to do.
     pub instruction: String,
+    /// Independent technique selectors; no per-step knob override authority.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::kit::deserialize_selection"
+    )]
+    pub techniques: Vec<String>,
+    /// Explicit read-only subject; selection and original authority still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::self_review::ReviewSubject>,
     /// Ids of subtasks that must complete before this one may start.
     #[serde(default)]
     pub deps: Vec<String>,
@@ -405,6 +415,10 @@ pub struct Subtask {
 pub struct CrewTask {
     /// What the child agent is asked to do (the subtask's instruction).
     pub goal: String,
+    /// Validated selectors forwarded from the canonical plan step.
+    pub techniques: Vec<String>,
+    /// Explicit read subject, separate from the write lane.
+    pub review: Option<crate::self_review::ReviewSubject>,
     /// The authority the child runs under — the parent's grant **met** with the
     /// subtask's declared policy. `meet` is the greatest lower bound, so this can
     /// only *narrow* the parent (attenuation, never amplify): a model-proposed
@@ -435,6 +449,8 @@ impl Subtask {
         Self {
             id: id.into(),
             instruction: instruction.into(),
+            techniques: Vec::new(),
+            review: None,
             deps: Vec::new(),
             parallel_ok: false,
             context: Vec::new(),
@@ -460,6 +476,8 @@ impl Subtask {
     pub fn to_crew_task(&self, parent: &Caveats) -> CrewTask {
         CrewTask {
             goal: self.instruction.clone(),
+            techniques: self.techniques.clone(),
+            review: self.review.clone(),
             caveats: parent.meet(&self.caveat_policy.to_caveats()),
             context: self.context.clone(),
             verify: self.verify.clone(),
@@ -729,6 +747,8 @@ instruction = "x"
             subtasks: vec![Subtask {
                 id: "s1".to_string(),
                 instruction: "write the module".to_string(),
+                techniques: Vec::new(),
+                review: None,
                 deps: vec![],
                 parallel_ok: true,
                 context: vec!["src/lib.rs".to_string()],

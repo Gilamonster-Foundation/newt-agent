@@ -421,7 +421,26 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
-    let runtime = resolve_runtime_posture(&cfg, caps.family_for_route(&destination, principal));
+    let family = caps.family_for_route(&destination, principal);
+    let runtime = resolve_runtime_posture(&cfg, family);
+    // --profile remains a Config FILE. Named technique selection uses the
+    // existing profile/bundle selectors and this route's typed family.
+    let profile_name = std::env::var("NEWT_PROFILE").ok();
+    let bundle_name = std::env::var("NEWT_BUNDLE").ok();
+    let technique_pick = cfg
+        .pick_active_profile(profile_name.as_deref(), bundle_name.as_deref(), family)
+        .map_err(anyhow::Error::msg)?;
+    let technique_profile = technique_pick
+        .as_ref()
+        .map(|pick| cfg.resolve_profile(&pick.name))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let techniques = newt_core::kit::CapturedTechniques::capture(
+        technique_pick.as_ref().zip(technique_profile),
+        [],
+    )
+    .map_err(anyhow::Error::msg)?;
+    let techniques = techniques.has_context().then_some(techniques);
     // #2314: a required feature this run cannot supply stops here, before the
     // instruction is read or anything reaches a backend.
     headless_contract::admit_required(&args.require_feature, |feature| match feature {
@@ -482,6 +501,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
 
     // 5. Drive one full turn (== a complete multi-round agentic turn).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
+    dc.techniques = techniques;
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.output_allowance = output_allowance;
     dc.run_allowance = run_allowance;
