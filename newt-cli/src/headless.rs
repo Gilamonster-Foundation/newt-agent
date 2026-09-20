@@ -305,7 +305,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             // warn-and-continue.
             resolve_profile(path)?
         }
-        None => newt_core::Config::resolve_runtime_unpublished().context("resolving config")?,
+        None => crate::migration_notices::read(|report| {
+            newt_core::Config::resolve_runtime_unpublished(report)
+        })
+        .context("resolving config")?,
     };
     // NOTHING is published yet: the process-global settings land only after
     // the backend pick + capability sidecar VALIDATE below — a refused
@@ -888,7 +891,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
 /// publish explicitly.
 fn resolve_profile(path: &std::path::Path) -> Result<newt_core::ResolvedConfig> {
     use anyhow::Context as _;
-    Config::load(path)
+    crate::migration_notices::read(|report| Config::load(path, report))
         .with_context(|| format!("loading --profile {}", path.display()))?
         .prepare_runtime()
         .with_context(|| format!("preparing --profile {}", path.display()))
