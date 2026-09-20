@@ -12,6 +12,7 @@
 //! labels; they read [`renamed_cognition`] and [`split_tenacity`] only to word
 //! their errors.
 
+#[cfg(test)]
 use std::path::Path;
 
 /// Old cognition label → new label. The single legacy table: every rewrite
@@ -343,119 +344,11 @@ fn map_tenacity_value(item: &mut toml_edit::Item, key: &str, changes: &mut Vec<S
     *value.decor_mut() = decor;
 }
 
-/// Read a persona file, migrating it once. Every production persona read goes
-/// through here. A migrated file is rewritten atomically (temp file + rename
-/// in the same directory) and one stderr line names the changes. If the
-/// rewrite fails the migrated text is still returned, with a warning, so the
-/// persona loads either way.
-///
-/// # Errors
-///
-/// Only the read's own I/O error.
-pub fn read_persona_file(path: &Path) -> std::io::Result<String> {
-    read_migrating(
-        path,
-        "persona",
-        migrate_persona_text,
-        true,
-        |p| std::fs::read_to_string(p),
-        |p, text| crate::atomic_fs::atomic_write(p, text.as_bytes()),
-    )
-}
-
-/// Read a config file, migrating it: rewritten in place when `rewrite` (the
-/// operator's own config), otherwise translated in memory with a warning,
-/// because a project or ambient config is shared or untrusted and `/etc` is
-/// the system's.
-///
-/// # Errors
-///
-/// Only the read's own I/O error.
-pub fn read_config_file(path: &Path, rewrite: bool) -> std::io::Result<String> {
-    // Use Config::save's lock and keep the resolved destination stable across
-    // read, migration, and replacement (including reads through a symlink).
-    let locked = rewrite.then(|| {
-        let destination = crate::atomic_fs::ResolvedPath::resolve(path)?;
-        let lock = crate::atomic_fs::acquire_lock(&destination.lock_path())?;
-        anyhow::Ok((destination, lock))
-    });
-    let locked = match locked.transpose() {
-        Ok(locked) => locked,
-        Err(error) => {
-            eprintln!(
-                "newt: warning: cannot lock config {} for migration: {error:#}; \
-                 loading in memory only",
-                path.display()
-            );
-            None
-        }
-    };
-    let destination = locked.as_ref().map(|(destination, _)| destination);
-    read_migrating(
-        destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path),
-        "config",
-        migrate_config_text,
-        destination.is_some(),
-        |p| std::fs::read_to_string(p),
-        |_, text| {
-            destination
-                .expect("rewrite holds the config lock")
-                .atomic_write(text.as_bytes())
-        },
-    )
-}
-
-/// The shared read-then-migrate step, with the filesystem injected so the
-/// unit tier is fs-free.
-fn read_migrating(
-    path: &Path,
-    kind: &str,
-    migrate: fn(&str) -> Option<Migration>,
-    rewrite: bool,
-    mut read: impl FnMut(&Path) -> std::io::Result<String>,
-    write: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
-) -> std::io::Result<String> {
-    let raw = read(path)?;
-    let Some(migration) = migrate(&raw) else {
-        return Ok(raw);
-    };
-    let changes = migration.changes.join(", ");
-    let shown = path.display();
-    if !rewrite {
-        eprintln!(
-            "newt: warning: {kind} {shown} uses old psyche labels ({changes}); \
-             using the new ones in memory, the file is unchanged"
-        );
-        return Ok(migration.text);
-    }
-    // A non-cooperating editor may have changed the file despite the lock.
-    // Never replace a snapshot that no longer matches the destination bytes.
-    match read(path) {
-        Ok(current) if current != raw => {
-            eprintln!(
-                "newt: warning: {kind} {shown} changed during migration; \
-                 loading the latest text in memory, the file is unchanged"
-            );
-            return Ok(migrate(&current).map_or(current, |latest| latest.text));
-        }
-        Err(error) => {
-            eprintln!(
-                "newt: warning: cannot re-read {kind} {shown} before migration: {error}; \
-                 loaded the new labels but left the file unchanged"
-            );
-            return Ok(migration.text);
-        }
-        Ok(_) => {}
-    }
-    match write(path, &migration.text) {
-        Ok(()) => eprintln!("newt: migrated {kind} {shown}: {changes}"),
-        Err(e) => eprintln!(
-            "newt: warning: {kind} {shown} uses old psyche labels ({changes}); loaded the new \
-             labels but could not rewrite the file: {e}"
-        ),
-    }
-    Ok(migration.text)
-}
+#[path = "psyche_import_read.rs"]
+mod reader;
+#[cfg(test)]
+use reader::read_migrating;
+pub use reader::{read_config_file, read_persona_file};
 
 #[cfg(test)]
 mod tests {
@@ -606,6 +499,7 @@ Body keeps cognition = \"contemplating\" and tenacity = \"relaxed\" as prose.
             rewrite,
             |_| Ok(raw.to_string()),
             write,
+            &mut |_| {},
         )
     }
 
@@ -818,6 +712,7 @@ kimi = \"insistent\"
             false,
             |_| Ok(OLD_CONFIG.to_string()),
             |_, _| panic!("a shared config is never rewritten"),
+            &mut |_| {},
         )
         .unwrap();
         assert!(got.contains("[initiative]"), "{got}");
@@ -841,6 +736,7 @@ kimi = \"insistent\"
             true,
             |_| Err(std::io::ErrorKind::NotFound.into()),
             |_, _| panic!("nothing to write"),
+            &mut |_| {},
         )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -855,7 +751,7 @@ kimi = \"insistent\"
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("bob.md");
         std::fs::write(&path, OLD).unwrap();
-        let got = read_persona_file(&path).unwrap();
+        let got = read_persona_file(&path, &mut |_| {}).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), got);
         assert_eq!(got, migrated_old());
         let names: Vec<_> = std::fs::read_dir(dir.path())
@@ -863,7 +759,11 @@ kimi = \"insistent\"
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["bob.md"], "no temp file or lock left behind");
-        assert_eq!(read_persona_file(&path).unwrap(), got, "idempotent on disk");
+        assert_eq!(
+            read_persona_file(&path, &mut |_| {}).unwrap(),
+            got,
+            "idempotent on disk"
+        );
     }
 }
 
