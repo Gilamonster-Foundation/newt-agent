@@ -40,6 +40,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     let mut reaches = Vec::new();
     chat_complete(
         ChatCtx {
+            turn_admission: None,
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -131,8 +132,10 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     assert_eq!(events.len(), 2, "one event per tool call: {events:?}");
     assert_eq!(events[0].tool, "list_dir");
     assert!(events[0].ok, "a real listing reads as success");
-    // #2315 twin: only a shell execution fills the funnel's execution slot.
-    assert!(events.iter().all(|e| e.execution.is_none()), "{events:?}");
+    // Typed filesystem evidence classifies the real read; an unknown tool
+    // still has no execution classification. Neither implies a mutation.
+    assert_eq!(events[0].execution, Some(crate::ExecOutcome::Passed));
+    assert_eq!(events[1].execution, None);
     assert!(events[0].args_digest.contains("path"));
     assert!(events[0].duration_ms.is_some());
     assert_eq!(events[1].tool, "definitely_not_a_real_tool");
@@ -196,6 +199,7 @@ async fn openai_loop_records_tool_events_with_digested_args() {
     let mut events: Vec<crate::ToolEvent> = Vec::new();
     openai_chat_complete(
         ChatCtx {
+            turn_admission: None,
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -318,6 +322,7 @@ fn outcome_ctx<'a>(
     events: &'a mut Vec<crate::ToolEvent>,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        turn_admission: None,
         verify_outcomes: false,
         round_cap_hit: None,
         model: "test-model",
