@@ -160,7 +160,9 @@ impl CompactionTriggerPolicy {
 /// "session override, else config, else default" is how the three come to
 /// disagree.
 #[must_use]
-pub fn session_compaction_trigger_policy() -> CompactionTriggerPolicy {
+pub fn session_compaction_trigger_policy(
+    report: &mut dyn FnMut(crate::tty::Notice<'static>),
+) -> CompactionTriggerPolicy {
     if let Some(policy) = std::env::var("NEWT_COMPACTION_TRIGGER")
         .ok()
         .as_deref()
@@ -168,7 +170,7 @@ pub fn session_compaction_trigger_policy() -> CompactionTriggerPolicy {
     {
         return policy;
     }
-    Config::resolve()
+    Config::resolve(report)
         .ok()
         .and_then(|c| c.context)
         .map(|c| c.compaction_trigger_policy)
