@@ -32,7 +32,7 @@ pub(crate) fn resolve_edit_mode() -> newt_core::EditMode {
             _ => None,
         })
         .or_else(|| {
-            newt_core::Config::resolve()
+            crate::migration_notices::read(|report| newt_core::Config::resolve(report))
                 .ok()
                 .and_then(|c| c.tui)
                 .map(|t| t.edit_mode)
@@ -67,7 +67,7 @@ pub(crate) fn resolve_gutter_setting() -> Option<u16> {
             }
         }
     }
-    newt_core::Config::resolve()
+    crate::migration_notices::read(|report| newt_core::Config::resolve(report))
         .ok()
         .and_then(|c| c.tui)
         .and_then(|t| t.gutter)
@@ -86,7 +86,7 @@ pub(crate) fn footer_mode() -> newt_core::FooterMode {
             _ => {}
         }
     }
-    newt_core::Config::resolve()
+    crate::migration_notices::read(|report| newt_core::Config::resolve(report))
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.footer)
@@ -178,7 +178,7 @@ pub(crate) fn active_prompt_template() -> String {
     std::env::var("NEWT_PROMPT")
         .ok()
         .or_else(|| {
-            newt_core::Config::resolve()
+            crate::migration_notices::read(|report| newt_core::Config::resolve(report))
                 .ok()
                 .and_then(|c| c.tui)
                 .and_then(|t| t.prompt)
@@ -192,7 +192,7 @@ pub(crate) fn active_prompt_template() -> String {
 /// backslash/TOML escaping mistake is visible at a glance.
 pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
     let template = active_prompt_template();
-    let model = newt_core::Config::resolve_runtime()
+    let model = crate::migration_notices::read(|report| newt_core::Config::resolve_runtime(report))
         .ok()
         .and_then(|c| super::resolve_backend_choice(&c).ok())
         .map(|choice| choice.display_model().to_string())
@@ -214,7 +214,7 @@ pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
 /// `\w` workspace basename, `\W` full path, `\v` newt version.
 pub(crate) fn prompt_str(workspace: &str, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
-        newt_core::Config::resolve()
+        crate::migration_notices::read(|report| newt_core::Config::resolve(report))
             .ok()
             .and_then(|c| c.tui)
             .and_then(|t| t.prompt)
