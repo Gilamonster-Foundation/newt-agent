@@ -27,6 +27,7 @@ pub mod help_suite;
 mod identity_cmd;
 mod mcp_cmd;
 mod mcp_probe_cmd;
+mod migration_notices;
 mod models_cmd;
 mod new_project;
 mod ocap_cmd;
@@ -1352,7 +1353,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .or_else(|| std::env::var("NEWT_LOADOUT").ok())
                     .filter(|s| !s.is_empty());
                 if let Some(name) = name {
-                    let cfg = newt_core::Config::resolve()?;
+                    let cfg = crate::migration_notices::read(|report| {
+                        newt_core::Config::resolve(report)
+                    })?;
                     let loadout = cfg.loadouts.get(&name).ok_or_else(|| {
                         let known = if cfg.loadouts.is_empty() {
                             "none defined".to_string()
@@ -1430,7 +1433,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             {
                 let session = newt_core::settings::load();
                 if !session.is_empty() {
-                    let cfg = newt_core::Config::resolve().ok();
+                    let cfg =
+                        crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+                            .ok();
                     let current_provider = std::env::var("NEWT_PROVIDER")
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -1533,7 +1538,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // legacy backend drop-in) logged the same warning repeatedly on
             // a single command, paying the disk read + drop-in merge again
             // for an answer already in hand.
-            let session_cfg = newt_core::Config::resolve().ok();
+            let session_cfg =
+                crate::migration_notices::read(|report| newt_core::Config::resolve(report)).ok();
             // --shell-engine selects which agent-bridle engine run_command uses
             // (ADR 0005 D2 seam). Precedence: `--shell-engine` > `[shell] engine`
             // > `--full-access`→`host` > `safe-subset` — published via
