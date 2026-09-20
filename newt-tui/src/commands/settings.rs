@@ -736,12 +736,12 @@ mod tests {
         let status = tenacity_command("");
         assert!(status.starts_with("tenacity: "), "{status}");
         assert!(
-            status.contains("/psyche tenacity <auto|normal|resolute|relentless>"),
+            status.contains("/psyche tenacity <auto|normal|grit|resolute|relentless>"),
             "{status}"
         );
         // List enumerates every level, marking the active one.
         let list = tenacity_command("list");
-        for label in ["normal", "relentless"] {
+        for label in ["normal", "grit", "resolute", "relentless"] {
             assert!(list.contains(label), "list missing {label}: {list}");
         }
         assert!(
