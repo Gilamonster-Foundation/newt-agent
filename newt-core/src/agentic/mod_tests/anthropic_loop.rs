@@ -126,6 +126,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        turn_admission: None,
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -799,6 +800,20 @@ impl Respond for ToolsUntilCap {
 #[serial_test::serial(anthropic_loop_env)]
 async fn tool_round_cap_summary_request_has_no_tools_key() {
     let _env = test_env(false);
+    // Keep the original unrecorded send path and retain server-side evidence:
+    // the cap fallback hides dispatch errors from its final prose.
+    let env_snapshot = || {
+        [
+            "NEWT_ANTHROPIC_STREAM",
+            "NEWT_ANTHROPIC_MAX_TOKENS",
+            "NEWT_HTTP_MAX_RETRIES",
+            "NEWT_HTTP_BACKOFF_BASE_MS",
+            "NEWT_HTTP_BACKOFF_MAX_MS",
+            "NEWT_HTTP_JITTER",
+        ]
+        .map(|key| (key, std::env::var(key).ok()))
+    };
+    let env_before = env_snapshot();
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -827,7 +842,14 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
         .await
         .expect("cap exit should produce the summary");
 
-    assert!(reply.starts_with("capped summary"), "{reply}");
+    let requests = server.received_requests().await.expect("recorded");
+    let bodies: Vec<_> = requests.iter().map(body_json).collect();
+    assert!(
+        reply.starts_with("capped summary"),
+        "{reply}\nrequest_count={}\nrequest_bodies={bodies:#?}\nenv_before={env_before:?}\nenv_after={:?}",
+        calls.load(Ordering::SeqCst),
+        env_snapshot(),
+    );
     assert!(!streamed, "the cap-exit summary is stream:false");
     assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     assert_eq!(
@@ -836,7 +858,6 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
         "two tool rounds + one tools-disabled summary"
     );
 
-    let requests = server.received_requests().await.expect("recorded");
     let last = body_json(requests.last().expect("summary request"));
     assert!(last.get("tools").is_none(), "no tools on the summary");
     assert!(last.get("tool_choice").is_none(), "no tool_choice either");
@@ -1743,6 +1764,7 @@ async fn raw_anthropic_round(
     };
     let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let scope = attempt_capture::AttemptScope {
+        admission: None,
         run_allowance: None,
         ledger: &ledger,
         turn: "prompt:turn",

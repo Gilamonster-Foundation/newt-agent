@@ -124,6 +124,7 @@ fn openai_loop_recovers_from_context_window_400() {
             };
             openai_chat_complete(
                 ChatCtx {
+                    turn_admission: None,
                     run_allowance: None,
                     verify_outcomes: false,
                     round_cap_hit: None,

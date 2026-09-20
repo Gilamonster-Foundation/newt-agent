@@ -250,7 +250,7 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     // `kernel_fs_fence_available()` is used (not `cfg!() &&
     // agent_bridle::landlock_is_supported()`): that symbol is Linux-only, so
     // calling it under a runtime `cfg!()` fails to COMPILE off Linux.
-    let passed = run_build_check(passing_build_check_cmd(), &ws_str);
+    let passed = run_build_check(passing_build_check_cmd(), &ws_str, None);
     if crate::confined_exec::kernel_fs_fence_available() {
         // Under the DenyAll egress floor the trivial command runs confined via
         // the net guard — resolved as a sibling `newt-net-guard` in a dev/test
@@ -259,7 +259,7 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
         // CLOSED (a secure outcome), so accept either the confined pass or the
         // fail-closed refusal; assert the fail path only when the pass path ran.
         if passed == "  ✓ build check passed" {
-            let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str);
+            let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str, None);
             assert!(failed.contains("✗ build check failed"), "got: {failed}");
             assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
         } else {
@@ -276,6 +276,6 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
         );
     }
     // A nonexistent workspace dir → the command can't even spawn/confine.
-    let err = run_build_check(passing_build_check_cmd(), "/definitely/not/a/dir");
+    let err = run_build_check(passing_build_check_cmd(), "/definitely/not/a/dir", None);
     assert!(err.contains("⚠ build check could not run"), "got: {err}");
 }

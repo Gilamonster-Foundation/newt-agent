@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 pub struct TenacityConfig {
     pub default: Option<Tenacity>,
     pub families: BTreeMap<String, Tenacity>,
+    pub budgets: TenacityBudgets,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -20,6 +21,8 @@ struct WireConfig {
     default: Option<Tenacity>,
     #[serde(default)]
     families: BTreeMap<String, Tenacity>,
+    #[serde(default)]
+    budgets: TenacityBudgets,
 }
 
 impl TryFrom<WireConfig> for TenacityConfig {
@@ -27,7 +30,7 @@ impl TryFrom<WireConfig> for TenacityConfig {
 
     fn try_from(wire: WireConfig) -> Result<Self, Self::Error> {
         match wire.version {
-            Some(2) => Ok(Self { default: wire.default, families: wire.families }),
+            Some(2) => Ok(Self { default: wire.default, families: wire.families, budgets: wire.budgets }),
             None => Err("current [tenacity] settings require version = 2; unversioned legacy labels belong to the one-time initiative importer".to_string()),
             Some(version) => Err(format!("unsupported [tenacity] version {version}; supported version is 2")),
         }
@@ -40,6 +43,7 @@ impl From<TenacityConfig> for WireConfig {
             version: Some(2),
             default: config.default,
             families: config.families,
+            budgets: config.budgets,
         }
     }
 }
@@ -58,5 +62,19 @@ impl TenacityConfig {
         self.family_default(family)
             .or(self.default)
             .unwrap_or_default()
+    }
+}
+
+/// Numeric pursuit bounds, captured once for an accepted external turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TenacityBudgets {
+    /// Harness corrective continuations, not individual tools or HTTP retries.
+    pub grit_retries: u32,
+}
+
+impl Default for TenacityBudgets {
+    fn default() -> Self {
+        Self { grit_retries: 2 }
     }
 }

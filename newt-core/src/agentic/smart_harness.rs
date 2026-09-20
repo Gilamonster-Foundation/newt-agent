@@ -106,6 +106,7 @@ impl Default for AdjudicationSettings {
 }
 
 struct State {
+    admission: Option<Arc<super::turn_admission::TurnAdmission>>,
     session: Session,
     request: Option<ContentId>,
     reply: Option<ContentId>,
@@ -236,6 +237,7 @@ impl SmartHarness {
         let initial = (!initial.is_empty()).then_some(initial);
         Ok(Self {
             state: Mutex::new(State {
+                admission: None,
                 session,
                 request: None,
                 reply: None,
@@ -305,6 +307,18 @@ impl SmartHarness {
         s.reply = None;
         s.admission_rejection = None;
         Ok(())
+    }
+
+    /// Install only for the active driven turn; drop restores reused harnesses.
+    pub(crate) fn bind_admission(
+        &self,
+        admission: Option<Arc<super::turn_admission::TurnAdmission>>,
+    ) -> anyhow::Result<AdmissionBinding<'_>> {
+        let previous = std::mem::replace(&mut self.state()?.admission, admission);
+        Ok(AdmissionBinding {
+            harness: self,
+            previous,
+        })
     }
 
     pub fn head(&self) -> anyhow::Result<ContentId> {
@@ -485,6 +499,7 @@ impl SmartHarness {
         &self,
         messages: &[Value],
         max_bytes: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<Vec<Value>> {
         if serde_json::to_vec(messages)?.len() <= max_bytes {
             return Ok(messages.to_vec());
@@ -504,7 +519,7 @@ impl SmartHarness {
                 started: Instant::now(),
                 pending: Some(request),
             };
-            let result = self.complete_bounded(prompt).await;
+            let result = self.complete_bounded(prompt, cancel).await;
             elapsed.pending = None;
             result
         };
@@ -649,7 +664,11 @@ impl SmartHarness {
         Ok(())
     }
 
-    async fn complete_bounded(&self, prompt: String) -> anyhow::Result<String> {
+    async fn complete_bounded(
+        &self,
+        prompt: String,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<String> {
         let timeout = {
             let mut s = self.state()?;
             anyhow::ensure!(
@@ -670,6 +689,9 @@ impl SmartHarness {
                 !remaining.is_zero(),
                 "auxiliary elapsed-time budget exhausted"
             );
+            if let Some(admission) = &s.admission {
+                admission.reserve_model(cancel)?;
+            }
             s.calls += 1;
             remaining.min(Duration::from_millis(self.settings.timeout_ms))
         };
@@ -744,7 +766,7 @@ impl SmartHarness {
                 prompt,
             )
         };
-        let result = super::cancellable(cancel, self.complete_bounded(prompt)).await;
+        let result = super::cancellable(cancel, self.complete_bounded(prompt, cancel)).await;
         let raw = match result {
             None => {
                 self.state()?
@@ -853,38 +875,53 @@ impl SmartHarness {
     pub(crate) async fn verify_answer(
         &self,
         control: Control,
-        turn: super::self_verify::Concluding<'_>,
+        mut turn: super::self_verify::Concluding<'_>,
         gate_on: bool,
         answer: &str,
     ) -> anyhow::Result<Control> {
-        if !matches!(control, Control::Answer) || !(gate_on || turn.ledger.required()) {
+        if !matches!(control, Control::Answer)
+            || !(gate_on || turn.ledger.required() || turn.ledger.recovery_enabled())
+        {
             return Ok(control);
         }
-        if turn.ledger.result_aware() {
+        let verification_active = turn.ledger.result_aware() && (gate_on || turn.ledger.required());
+        if verification_active || turn.ledger.recovery_enabled() {
             let used = self.state()?.verify_repairs;
             let required = turn.ledger.required();
-            let (decision, report) = super::self_verify::conclude_turn(turn, used).await;
-            return Ok(match decision {
-                super::self_verify::Decision::Accept => control,
+            let (decision, report) = super::self_verify::conclude_turn_with_gate(
+                turn.reborrow(),
+                used,
+                verification_active,
+            )
+            .await;
+            match decision {
+                super::self_verify::Decision::Accept if verification_active => return Ok(control),
+                super::self_verify::Decision::Accept => {}
                 super::self_verify::Decision::Nudge(text) => {
                     let text = format!("{} {text}", super::compress::LOOP_GUIDANCE_PREFIX);
                     self.intervention(&text)?;
                     self.state()?.verify_repairs += 1;
-                    Control::Continue(text)
+                    return Ok(Control::Continue(text));
                 }
-                super::self_verify::Decision::Stop(reason) => Control::Finish {
-                    text: if reason == crate::TurnEndReason::Cancelled {
-                        String::new()
-                    } else if required {
-                        super::self_verify::incomplete_answer(answer, &report)
-                    } else {
-                        answer.to_string()
-                    },
-                    reason,
-                },
-            });
+                super::self_verify::Decision::Stop(reason) => {
+                    return Ok(Control::Finish {
+                        text: if reason == crate::TurnEndReason::Cancelled {
+                            String::new()
+                        } else {
+                            super::self_verify::stopped_answer(
+                                answer,
+                                reason,
+                                &report,
+                                required,
+                                turn.ledger.recovery_enabled(),
+                            )
+                        },
+                        reason,
+                    })
+                }
+            }
         }
-        if turn.rounds_left && turn.ledger.gate_enabled() && !self.state()?.verified {
+        if gate_on && turn.rounds_left && turn.ledger.gate_enabled() && !self.state()?.verified {
             let (messages, workspace, task) = (turn.messages, turn.workspace, turn.task);
             let commands = super::self_verify::commands_from_messages(messages);
             let checks = turn
@@ -1178,6 +1215,7 @@ pub(super) async fn compress(
     summarizer: Option<&SummarizeFn>,
     state: &mut super::CompressState,
     harness: Option<&SmartHarness>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<super::compress::CompressOutcome> {
     let Some(harness) = harness else {
         return Ok(super::compress::compress(req, summarizer, state).await);
@@ -1186,6 +1224,7 @@ pub(super) async fn compress(
         .project(
             req.messages,
             projection_byte_budget(req.messages, req.budget, req.est)?,
+            cancel,
         )
         .await?;
     let tokens_before = super::estimate_tokens(req.messages, req.est);
@@ -1560,7 +1599,7 @@ mod tests {
                     {"role":"user","content":"current task"}
                 ]);
                 let error = h
-                    .project(messages.as_array().unwrap(), 1200)
+                    .project(messages.as_array().unwrap(), 1200, None)
                     .await
                     .unwrap_err();
                 assert!(format!("{error:#}").contains("byte budget"));
@@ -1596,7 +1635,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let error = h.complete_bounded("payload".into()).await.unwrap_err();
+        let error = h
+            .complete_bounded("payload".into(), None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("input exceeds its byte budget"));
         assert_eq!(h.state().unwrap().calls, 0, "no inference before admission");
         assert!(AdjudicationSettings::default()
@@ -1662,7 +1704,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut navigation = Box::pin(super::super::cancellable(
             Some(&cancel),
-            h.project(messages.as_array().unwrap(), 1200),
+            h.project(messages.as_array().unwrap(), 1200, None),
         ));
         tokio::select! {
             _ = started.notified() => {},
@@ -1736,7 +1778,7 @@ mod tests {
         ]);
         assert!(super::super::cancellable(
             Some(&cancel),
-            h.project(messages.as_array().unwrap(), 1200),
+            h.project(messages.as_array().unwrap(), 1200, None),
         )
         .await
         .is_none());
@@ -1765,7 +1807,7 @@ mod tests {
             {"role":"user","content":"current request"}
         ]);
         let error = h
-            .project(messages.as_array().unwrap(), 1200)
+            .project(messages.as_array().unwrap(), 1200, None)
             .await
             .unwrap_err();
         assert!(
@@ -1800,7 +1842,10 @@ mod tests {
             {"role":"assistant","content":"old answer"},
             {"role":"user","content":"current request"}
         ]);
-        let projected = h.project(messages.as_array().unwrap(), 1200).await.unwrap();
+        let projected = h
+            .project(messages.as_array().unwrap(), 1200, None)
+            .await
+            .unwrap();
         assert_eq!(projected[0], messages[0]);
         assert_eq!(projected.last().unwrap(), &messages[3]);
         assert!(serde_json::to_vec(&projected).unwrap().len() <= 1200);
@@ -1927,3 +1972,24 @@ mod tests {
         assert_eq!(tail["text"], &full[full.len() - 20..]);
     }
 }
+
+pub(crate) struct AdmissionBinding<'a> {
+    harness: &'a SmartHarness,
+    previous: Option<Arc<super::turn_admission::TurnAdmission>>,
+}
+
+impl Drop for AdmissionBinding<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.harness.state.lock() {
+            state.admission = self.previous.take();
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "smart_harness_grit_tests.rs"]
+mod grit_tests;
+
+#[cfg(test)]
+#[path = "smart_harness_grit_order_tests.rs"]
+mod grit_order_tests;

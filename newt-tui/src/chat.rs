@@ -3,6 +3,7 @@ use super::*;
 use crate::session_worker::PanelMode;
 use newt_core::agentic::chat_complete_with_prompt_and_artifacts;
 
+mod import_retry;
 mod navigation_execution;
 mod smart_sessions;
 use navigation_execution::handle_nav_command;
@@ -141,8 +142,28 @@ enum ModelInputOrigin {
 }
 
 impl ModelInputOrigin {
+    /// Host-generated continuations share the accepted operator turn's limits.
+    /// Web input is external model input even though it is inert for slash UI.
+    fn starts_external_turn(&self) -> bool {
+        !matches!(
+            self,
+            Self::HarnessRetry { .. } | Self::HarnessPlanApproval { .. }
+        )
+    }
+
     fn is_operator(&self) -> bool {
         matches!(self, Self::Operator | Self::OperatorContinuation { .. })
+    }
+}
+
+/// Apply the accepted-input ownership boundary; queue consumption itself is
+/// not an external turn and never refills the shared allowance.
+fn retain_external_admission(
+    origin: &ModelInputOrigin,
+    owner: &mut Option<std::sync::Arc<newt_core::agentic::turn_admission::TurnAdmission>>,
+) {
+    if origin.starts_external_turn() {
+        *owner = None;
     }
 }
 
@@ -346,6 +367,17 @@ mod context_window_handoff_tests;
 struct PendingRetry {
     text: String,
     parent: Box<newt_core::TurnPromptContext>,
+}
+
+impl PendingRetry {
+    fn into_input(self) -> (ReadOutcome, ModelInputOrigin) {
+        (
+            ReadOutcome::Line(self.text),
+            ModelInputOrigin::HarnessRetry {
+                parent: self.parent,
+            },
+        )
+    }
 }
 
 /// #2424: what kind of turn the plan-mode approval hook queued to run next,
@@ -2240,6 +2272,12 @@ fn session_body(
             std::sync::Arc::new(newt_core::agentic::run_allowance::RunAllowance::new(calls))
         });
 
+    // Retained only across harness-created continuations. A new accepted
+    // external input replaces this owner, even if it keeps the objective CID.
+    let mut turn_admission_state: Option<
+        std::sync::Arc<newt_core::agentic::turn_admission::TurnAdmission>,
+    > = None;
+
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
     // Memory/compression budget (Step 18.2, #247): the SAME empirical
@@ -3019,20 +3057,18 @@ fn session_body(
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
             // decremented when it was queued.
-            (
-                ReadOutcome::Line(retry.text),
-                ModelInputOrigin::HarnessRetry {
-                    parent: retry.parent,
-                },
-            )
+            retry.into_input()
         } else if let Some(queued) = pending_plan_turn.take() {
             // #2424: run the turn the approval hook queued — the operator's
             // own "discuss" answer, or the harness-authored implementation
             // turn after approval — instead of reading from the operator. A
             // fresh turn: reset the re-prompt budget, matching the
             // web-inject and normal-turn branches below.
-            retry_budget = retry_max;
-            queued.into_input()
+            let input = queued.into_input();
+            if turn_admission_state.is_none() || input.1.starts_external_turn() {
+                retry_budget = retry_max;
+            }
+            input
         } else if let Some(injected) = pending_clarification
             .is_none()
             .then(|| {
@@ -7274,6 +7310,14 @@ fn session_body(
                         pending_clarification = None;
                     }
 
+                    retain_external_admission(&model_input_origin, &mut turn_admission_state);
+                    let _retained_policy = turn_admission_state
+                        .as_ref()
+                        .map(|owner| owner.bind_policy());
+                    // Bind at accepted input before resolving any turn settings.
+                    let _turn_binding =
+                        crate::session_worker::bind_turn(tabs.active().session_id());
+
                     // Pre-turn hardware snapshot: read the latest value the
                     // background sampler published (instant, never blocks). None
                     // unless verbose + a reachable DCGM (issue #414).
@@ -7317,10 +7361,28 @@ fn session_body(
                         newt_core::tenacity::cli_tenacity(),
                         newt_core::tenacity::session_tool_rounds(),
                     );
-                    let eff_max_tool_rounds = tool_round_limit.rounds;
                     let eff_workflow_grace_rounds = model_tune
                         .and_then(|t| t.workflow_grace_rounds)
                         .unwrap_or_else(|| workflow_grace_rounds(&cfg));
+                    if turn_admission_state.is_none()
+                        && newt_core::tenacity::effective_tenacity().recovers_failures()
+                    {
+                        turn_admission_state =
+                            Some(newt_core::agentic::turn_admission::TurnAdmission::new(
+                                newt_core::agentic::turn_admission::TurnPolicy::capture(
+                                    tool_round_limit,
+                                    eff_workflow_grace_rounds,
+                                ),
+                                run_allowance.as_deref().cloned(),
+                            ));
+                    }
+                    let tool_round_limit = turn_admission_state
+                        .as_ref()
+                        .map_or(tool_round_limit, |owner| owner.policy.rounds);
+                    let eff_max_tool_rounds = tool_round_limit.rounds;
+                    let eff_workflow_grace_rounds = turn_admission_state
+                        .as_ref()
+                        .map_or(eff_workflow_grace_rounds, |owner| owner.policy.grace_rounds);
                     // #1162: the operator's live nudge dial (/nudge off|on).
                     let nudges_off =
                         std::env::var("NEWT_NUDGE").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
@@ -7822,8 +7884,10 @@ fn session_body(
                     // The same effective context cap the main loop sends — the
                     // summary request must not be silently truncated at Ollama's
                     // default window (F5).
+                    let turn_cancel =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let loop_summarizer = smart_config.is_none().then(|| {
-                        build_session_summarizer(
+                        build_turn_summarizer(
                             &sum_cfg,
                             &cfg,
                             &inf_url,
@@ -7833,6 +7897,8 @@ fn session_body(
                             eff_num_ctx,
                             color,
                             run_allowance.clone(),
+                            turn_admission_state.clone(),
+                            turn_admission_state.as_ref().map(|_| turn_cancel.clone()),
                         )
                     });
                     // Per-turn tool-event recorder (Step 17.6, #246): the
@@ -7892,8 +7958,6 @@ fn session_body(
                     // Shared with the terminal thread under the cockpit, which
                     // trips them from Ctrl-C; the session reads them exactly as
                     // it always did.
-                    let turn_cancel =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let turn_exit = std::sync::atomic::AtomicBool::new(false);
                     // Paired with `turn_ended` right after the blocking call
                     // below. A `?` between them ends the session, which ends
@@ -8139,18 +8203,7 @@ fn session_body(
                     // visible throughout.
                     let _disclosure_guard =
                         newt_core::ocap::scoped_session_disclosure(session_disclosure.clone());
-                    // #1669: bind THIS TURN to the tab that is active right
-                    // now, and pin its psyche — both dropped when the turn
-                    // ends, which is what lets the next turn see a `/tab`
-                    // switch and a moved dial.
-                    //
-                    // Scoped exactly like the disclosure guard above, and for
-                    // the same reason: all three describe THIS turn. Hoisting
-                    // any of them to session start would attribute a later
-                    // tab's work to the startup tab and freeze the dials for
-                    // the life of the process.
-                    let _turn_binding =
-                        crate::session_worker::bind_turn(tabs.active().session_id());
+                    // The accepted-input binding above remains held through this dispatch.
                     let turn_smart_harness = if let Some(config) = &smart_config {
                         let launch = newt_core::config::HarnessLaunch {
                             workspace: std::path::Path::new(workspace),
@@ -8187,6 +8240,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        turn_admission: turn_admission_state.clone(),
                                         // #2313 b3: the session-scoped allowance
                                         // constructed above, shared with the
                                         // summarizer.
@@ -8743,31 +8797,17 @@ fn session_body(
                                                 }
                                             }
                                         }
-                                        let extra = match retry_step(retry_budget) {
-                                        RetryStep::Reprompt => {
-                                            retry_budget -= 1;
-                                            // Queue the grounded corrective turn as the
-                                            // next loop iteration's derived input. It
-                                            // inherits the operator root captured before
-                                            // this turn; it never masquerades as a new
-                                            // operator prompt.
-                                            if let Some(parent) = active_prompt_context.clone() {
-                                                pending_retry = Some(PendingRetry {
-                                                    text: action.corrective,
-                                                    parent: Box::new(parent),
-                                                });
-                                                format!(
-                                                    "\n↻ retry: re-prompting the model to ground the rewrite ({retry_budget} re-prompt(s) remaining)"
-                                                )
-                                            } else {
-                                                "\n✗ retry: corrective input was not queued because the turn has no prompt receipt"
-                                                    .to_string()
-                                            }
+                                        let (queued, extra) = import_retry::queue(
+                                            &mut retry_budget,
+                                            retry_max,
+                                            active_prompt_context.clone(),
+                                            action.corrective,
+                                            turn_admission_state.as_deref(),
+                                            Some(&turn_cancel),
+                                        );
+                                        if queued.is_some() {
+                                            pending_retry = queued;
                                         }
-                                        RetryStep::GiveUp => format!(
-                                            "\n✗ retry: gave up after {retry_max} re-prompt(s) — file(s) left reverted"
-                                        ),
-                                    };
                                         let line = format!("↩ {}{extra}", action.banner);
                                         if color {
                                             let _ = execute!(
@@ -9228,3 +9268,11 @@ mod incomplete_turn_persistence_tests;
 mod memory_retrieval_tests;
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15
+
+#[cfg(test)]
+#[path = "chat_tests/grit_continuations.rs"]
+mod grit_continuations_tests;
+
+#[cfg(test)]
+#[path = "chat_tests/grit_import_retry.rs"]
+mod grit_import_retry_tests;

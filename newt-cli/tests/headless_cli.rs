@@ -1832,3 +1832,6 @@ async fn headless_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
 
 #[path = "headless_cli/resolute.rs"]
 mod resolute;
+
+#[path = "headless_cli/grit.rs"]
+mod grit;

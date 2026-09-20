@@ -102,6 +102,15 @@ pub fn reasoning_overflow_signature(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BehaviorSignal {
+    /// Captured Grit admission/refusal, consumed by terminal classification.
+    Recovery {
+        round: usize,
+        cause: super::turn_admission::CorrectionCause,
+        decision: String,
+        retries_used: u32,
+        allowance: u32,
+        verification_used: usize,
+    },
     /// #2315: one result-aware verification decision at a concluding answer:
     /// `accept`, `nudge`, the stop reason, `no_checks` (nothing to verify) or
     /// `check_scan_failed`; the per-check status; and which state evidence
@@ -160,6 +169,9 @@ impl BehaviorSignal {
 pub struct SolveObservation {
     /// Verification policy instantiated at turn entry, never recomputed after it.
     pub verification: Option<serde_json::Value>,
+    /// Immutable recovery policy actually instantiated; execution counters are
+    /// separate behavior evidence and never part of effective-config identity.
+    pub recovery_policy: Option<serde_json::Value>,
     /// The `model` field of the last chat response body, when the backend
     /// reported one — what the backend says it actually served, feeding the
     /// contract's `effective_model`. `None` when no response carried it.

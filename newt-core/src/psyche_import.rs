@@ -95,7 +95,7 @@ pub fn migrate_persona_text(text: &str) -> Option<Migration> {
         && root
             .get("tenacity")
             .and_then(toml_edit::Item::as_str)
-            .is_some_and(|label| matches!(label, "normal" | "resolute"))
+            .is_some_and(|label| matches!(label, "normal" | "grit" | "resolute"))
     {
         return None;
     }
@@ -172,7 +172,7 @@ pub fn migrate_config_text(text: &str) -> Option<Migration> {
     let tenacity = doc.get("tenacity")?.as_table_like()?;
     let current = |item: &Item| {
         item.as_str()
-            .is_some_and(|label| matches!(label, "normal" | "resolute"))
+            .is_some_and(|label| matches!(label, "normal" | "grit" | "resolute"))
     };
     if tenacity.contains_key("version")
         || tenacity.get("default").is_some_and(current)

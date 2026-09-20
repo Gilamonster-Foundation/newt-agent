@@ -76,6 +76,8 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
+    /// Separate configured check result; never overwrites the file operation.
+    pub(crate) build_check_execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
 }
 
 #[allow(clippy::too_many_arguments)]

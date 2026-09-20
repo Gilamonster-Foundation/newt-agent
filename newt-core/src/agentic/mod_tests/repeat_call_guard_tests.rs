@@ -1042,7 +1042,7 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     ]
     .into_iter()
     .filter_map(|(name, args, clears)| {
-        let mut guard = RepeatCallGuard::for_verification(true);
+        let mut guard = RepeatCallGuard::for_policy(true, false);
         guard.record(
             "run_command",
             &check,

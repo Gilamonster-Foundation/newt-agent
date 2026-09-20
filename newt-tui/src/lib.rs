@@ -2265,6 +2265,9 @@ struct SummarizerOpts {
     /// `Arc` clone, not a second counter. `None` (the default) is unbudgeted,
     /// unchanged behavior.
     run_allowance: Option<std::sync::Arc<newt_core::agentic::run_allowance::RunAllowance>>,
+    /// External-turn owner for corrective summary work; absent preserves Normal.
+    turn_admission: Option<std::sync::Arc<newt_core::agentic::turn_admission::TurnAdmission>>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for SummarizerOpts {
@@ -2278,6 +2281,8 @@ impl Default for SummarizerOpts {
             color: false,
             caps: newt_core::tty::LineCaps::None,
             run_allowance: None,
+            turn_admission: None,
+            cancel: None,
         }
     }
 }
@@ -2315,12 +2320,23 @@ async fn summarize_attempt(
     body: &serde_json::Value,
     api_key: &Option<String>,
     openai: bool,
+    opts: &SummarizerOpts,
 ) -> anyhow::Result<(String, Option<newt_core::TokenUsage>)> {
+    // Preserve the unbound archival/Normal reservation behavior.
+    if opts.turn_admission.is_none() {
+        if let Some(allowance) = &opts.run_allowance {
+            allowance.try_reserve()?;
+        }
+    }
     let mut req = client.post(chat_url).json(body);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
-    let resp = req.send().await?;
+    let request = req.build()?;
+    if let Some(owner) = &opts.turn_admission {
+        owner.reserve_model(opts.cancel.as_deref())?;
+    }
+    let resp = client.execute(request).await?;
     if !resp.status().is_success() {
         anyhow::bail!("summarizer endpoint {}", resp.status());
     }
@@ -2372,6 +2388,7 @@ async fn summarize_one_model(
     opts: &SummarizerOpts,
     api_key: &Option<String>,
 ) -> anyhow::Result<(String, Option<newt_core::TokenUsage>)> {
+    check_summary_cancellation(opts)?;
     let chat_url = if openai {
         format!("{}/v1/chat/completions", url.trim_end_matches('/'))
     } else {
@@ -2451,15 +2468,24 @@ async fn summarize_one_model(
         // primary loop, and each attempt (not just the first) is one call.
         // Refused here, before any wire bytes go out, exactly like the
         // primary loop's own `attempt_capture::send`.
-        if let Some(allowance) = &opts.run_allowance {
-            allowance.try_reserve()?;
-        }
-        match summarize_attempt(&client, &chat_url, &body, api_key, openai).await {
+        check_summary_cancellation(opts)?;
+        match summarize_attempt(&client, &chat_url, &body, api_key, openai, opts).await {
             Ok(s) => return Ok(s),
             Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarizer failed")))
+}
+
+fn check_summary_cancellation(opts: &SummarizerOpts) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !opts
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)),
+        "summarizer cancelled"
+    );
+    Ok(())
 }
 
 fn make_loop_summarizer(
@@ -2473,7 +2499,7 @@ fn make_loop_summarizer(
     // #661 group C: an embedded summarizer runs the in-process candle engine
     // (#659) instead of an HTTP backend — zero contention with the primary model.
     if kind == newt_core::BackendKind::Embedded {
-        return make_embedded_summarizer(model, model_path, opts.timeout_secs);
+        return make_embedded_summarizer(model, model_path, opts);
     }
     Box::new(move |prompt: String| {
         let url = url.clone();
@@ -2540,7 +2566,7 @@ fn failing_summarizer(msg: String) -> newt_core::Summarizer {
 fn make_embedded_summarizer(
     model: String,
     model_path: Option<String>,
-    timeout_secs: u64,
+    opts: SummarizerOpts,
 ) -> newt_core::Summarizer {
     #[cfg(feature = "embedded")]
     {
@@ -2555,15 +2581,20 @@ fn make_embedded_summarizer(
                 let backend = std::sync::Arc::new(backend);
                 Box::new(move |prompt: String| {
                     let backend = backend.clone();
+                    let opts = opts.clone();
                     Box::pin(async move {
+                        check_summary_cancellation(&opts)?;
                         let req = newt_inference::ChatRequest {
                             messages: vec![newt_inference::backend::Message::user(prompt)],
                             max_tokens: Some(1024),
                         };
+                        if let Some(owner) = &opts.turn_admission {
+                            owner.reserve_model(opts.cancel.as_deref())?;
+                        }
                         backend
                             .complete_with_timeout(
                                 req,
-                                std::time::Duration::from_secs(timeout_secs),
+                                std::time::Duration::from_secs(opts.timeout_secs),
                             )
                             .await
                             .map(|reply| (reply.content, reply.usage))
@@ -8003,6 +8034,8 @@ fn summarizer_opts(
         fallback_model: sum_cfg.fallback_model.clone(),
         color,
         run_allowance: None,
+        turn_admission: None,
+        cancel: None,
         // The live-notice decision is ownership, not styling: detect it once
         // here rather than re-deriving it from `color` at three call sites.
         caps: newt_core::tty::LineCaps::detect(),
@@ -8194,6 +8227,37 @@ fn build_session_summarizer(
     // primary loop's `ChatCtx.run_allowance` reserves against.
     run_allowance: Option<std::sync::Arc<newt_core::agentic::run_allowance::RunAllowance>>,
 ) -> newt_core::Summarizer {
+    build_turn_summarizer(
+        sum_cfg,
+        cfg,
+        inf_url,
+        inf_model,
+        inf_kind,
+        inf_key,
+        num_ctx,
+        color,
+        run_allowance,
+        None,
+        None,
+    )
+}
+
+/// The actual loop callback alone binds corrective admission. Archival, close
+/// and explicit-compress callbacks use the unbound session factory above.
+#[allow(clippy::too_many_arguments)]
+fn build_turn_summarizer(
+    sum_cfg: &newt_core::SummarizerConfig,
+    cfg: &newt_core::Config,
+    inf_url: &str,
+    inf_model: &str,
+    inf_kind: newt_core::BackendKind,
+    inf_key: &Option<String>,
+    num_ctx: Option<u32>,
+    color: bool,
+    run_allowance: Option<std::sync::Arc<newt_core::agentic::run_allowance::RunAllowance>>,
+    turn_admission: Option<std::sync::Arc<newt_core::agentic::turn_admission::TurnAdmission>>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> newt_core::Summarizer {
     let (url, model, kind, key, model_path) = resolve_summarizer_backend(
         sum_cfg,
         inf_url,
@@ -8204,6 +8268,8 @@ fn build_session_summarizer(
     );
     let opts = SummarizerOpts {
         run_allowance,
+        turn_admission,
+        cancel,
         ..summarizer_opts(sum_cfg, cfg, num_ctx, color)
     };
     let caps = opts.caps;
@@ -9615,3 +9681,7 @@ mod http_loop_tests;
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:23 EDT | Date: 2026-09-15
+
+#[cfg(test)]
+#[path = "lib_tests/summarizer_grit_tests.rs"]
+mod summarizer_grit_tests;

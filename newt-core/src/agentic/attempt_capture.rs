@@ -17,6 +17,7 @@ use crate::TokenUsage;
 /// One turn's handle on the attempt ledger.
 #[derive(Clone, Copy)]
 pub(crate) struct AttemptScope<'a> {
+    pub(crate) admission: Option<&'a super::turn_admission::TurnAdmission>,
     pub(crate) ledger: &'a Mutex<AttemptLedger>,
     /// The turn's active-prompt address.
     pub(crate) turn: &'a str,
@@ -109,8 +110,10 @@ pub(crate) async fn send<'a>(
     };
     // #2313: refused before any wire bytes are built or sent — an exhausted
     // run allowance stops dispatch, it does not fail a request that went out.
-    if let Some(allowance) = scope.run_allowance {
-        allowance.try_reserve()?;
+    if scope.admission.is_none() {
+        if let Some(allowance) = scope.run_allowance {
+            allowance.try_reserve()?;
+        }
     }
     let (client, request) = request.build_split();
     let request = request.map_err(dispatch_error)?;
@@ -119,6 +122,11 @@ pub(crate) async fn send<'a>(
             "an inference request without an in-memory body cannot be recorded as an attempt"
         );
     };
+    // A local construction/body rejection never admitted model work. The
+    // shared correction and round counters commit only after these checks.
+    if let Some(admission) = scope.admission {
+        admission.reserve_model(scope.cancel)?;
+    }
     let key = scope.ledger().dispatch(scope.turn, role, bytes);
     scope.observe(&key, None, AttemptState::Failed);
     let attempt = Attempt {
@@ -171,3 +179,7 @@ pub(crate) fn failed(attempt: Option<&Attempt<'_>>, error: &anyhow::Error) {
 #[cfg(test)]
 #[path = "attempt_capture_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "attempt_capture_grit_tests.rs"]
+mod grit_tests;
