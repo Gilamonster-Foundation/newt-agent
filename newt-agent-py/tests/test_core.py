@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from io import StringIO
+from pathlib import Path
+
 import pytest
 
 import newt_agent.core as core
@@ -19,7 +23,10 @@ def test_router_review_keyword_routes_review() -> None:
 
 def test_router_refactor_keyword_routes_complex() -> None:
     router = core.Router()
-    assert router.classify("refactor the auth middleware to use traits") == core.Tier.Complex
+    assert (
+        router.classify("refactor the auth middleware to use traits")
+        == core.Tier.Complex
+    )
 
 
 def test_router_override_always_returns_its_tier() -> None:
@@ -78,3 +85,64 @@ def test_config_defaults_are_sensible() -> None:
 
 def test_newt_error_exported() -> None:
     assert hasattr(core, "NewtError")
+
+
+@pytest.mark.parametrize("method", ["load", "resolve"])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_config_migration_reports_once_even_before_decode_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, invalid: bool
+) -> None:
+    """Python owns stderr; a later typed decode error must not lose migration."""
+    path = tmp_path / "config.toml"
+    old = '[tenacity]\ndefault = "standard"\n'
+    path.write_text(("default_backend = 7\n" if invalid else "") + old)
+    monkeypatch.setenv("NEWT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("NEWT_CONFIG", str(path))
+    monkeypatch.chdir(tmp_path)
+    read = (lambda: core.Config.load(path)) if method == "load" else core.Config.resolve
+    captured = StringIO()
+    with redirect_stderr(captured):
+        if invalid:
+            with pytest.raises(core.NewtError):
+                read()
+        else:
+            assert isinstance(read(), core.Config)
+    assert captured.getvalue().count("newt: migrated config") == 1
+    assert str(path) in captured.getvalue()
+    assert "standard" not in path.read_text()
+    # The successful physical rewrite is not reported again, even if typed
+    # decoding still fails on the now-current text.
+    captured = StringIO()
+    with redirect_stderr(captured):
+        if invalid:
+            with pytest.raises(core.NewtError):
+                read()
+        else:
+            read()
+    assert captured.getvalue() == ""
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_config_migration_sink_failure_preserves_primary_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: bool
+) -> None:
+    """A raising sys.stderr is not a new config-success or error gate."""
+
+    class FailingSink:
+        def write(self, _text: str) -> None:
+            raise OSError("diagnostic sink sentinel")
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        ("default_backend = 7\n" if invalid else "")
+        + '[tenacity]\ndefault = "standard"\n'
+    )
+    monkeypatch.setenv("NEWT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    with redirect_stderr(FailingSink()):
+        if invalid:
+            with pytest.raises(core.NewtError) as error:
+                core.Config.load(path)
+            assert "diagnostic sink sentinel" not in str(error.value)
+        else:
+            assert isinstance(core.Config.load(path), core.Config)
