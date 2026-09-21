@@ -916,7 +916,7 @@ async fn responses_idless_call_is_re_asked_then_recovers() {
     assert!(last["content"]
         .as_str()
         .unwrap()
-        .contains("without call ids"));
+        .contains("could not be correlated"));
     assert!(
         second
             .iter()
