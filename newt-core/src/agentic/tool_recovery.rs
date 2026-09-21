@@ -45,15 +45,16 @@ pub struct Recovery {
 
 /// What a recovered call IS, and so what its identity is minted from: the
 /// dialect that matched, the call's position among the calls recovered from one
-/// reply, and the call itself. Arguments are carried as their compact JSON text
-/// (serde_json keeps object keys ordered), so the canonical encoding never sees
-/// a float. The causal parent is the inference attempt that produced the reply.
+/// reply, and the call itself. `arguments` enters as the `Value`, encoded
+/// canonically (dag-cbor, sorted keys) by the crate, so the id does not depend
+/// on a serde_json feature flag. The causal parent is the inference attempt that
+/// produced the reply.
 #[derive(serde::Serialize)]
 struct RecoveredCall<'a> {
     dialect: ToolCallDialect,
     ordinal: u32,
     name: &'a str,
-    arguments: String,
+    arguments: &'a Value,
 }
 
 /// Give each recovered call a harness-DERIVED id (identity is derived, not
@@ -62,7 +63,8 @@ struct RecoveredCall<'a> {
 /// inside every documented `tool_call_id` charset and length cap). Two identical
 /// calls in one reply differ by ordinal; the same call in a later round differs
 /// by parent, so a looping model never repeats an id. A call whose identity
-/// cannot be encoded is left id-less and the caller's bounded re-ask handles it.
+/// cannot be canonically encoded (e.g. a float dag-cbor forbids) is left id-less
+/// and the caller's bounded re-ask handles it.
 ///
 /// Only calls the harness itself recovered are touched: a provider call that
 /// arrived without an id never passes through here.
@@ -76,7 +78,7 @@ pub fn assign_ids(recovery: &mut Recovery, parent: Option<ContentId>) -> Vec<Rec
             dialect,
             ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
             name: call["function"]["name"].as_str().unwrap_or_default(),
-            arguments: call["function"]["arguments"].to_string(),
+            arguments: &call["function"]["arguments"],
         };
         let Ok(id) = MerkleNode::new(payload, parent).id() else {
             continue;
@@ -334,6 +336,99 @@ pub fn recover_tool_calls(content: &str) -> Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed_parent() -> ContentId {
+        use content_addressable::ContentAddressable;
+        crate::attempts::AttemptKey {
+            turn: "golden-turn".into(),
+            role: "primary".into(),
+            request: content_addressable::RawContentId::from_content(b"golden request body"),
+            ordinal: 0,
+        }
+        .content_id()
+        .expect("encodes")
+    }
+
+    fn golden_recovery() -> Recovery {
+        Recovery {
+            calls: vec![
+                json!({"function": {"name": "read_file", "arguments": {"path": "a.rs", "limit": 5}}}),
+                json!({"function": {"name": "read_file", "arguments": {"path": "a.rs", "limit": 5}}}),
+            ],
+            tool_shaped: true,
+            dialect: Some(ToolCallDialect::BareJson),
+        }
+    }
+
+    /// (locator, CID) for the two golden calls. The locator is `nwt-rc-` plus the
+    /// first 32 hex chars of the CID's digest (checked independently by decoding
+    /// the base32 CID: version, codec, hash code, length, then the digest).
+    const GOLDEN: &[(&str, &str)] = &[
+        (
+            "nwt-rc-4cfe734efb8fb492009d376e086da619",
+            "bafyr4icm7zzu564pwsjabhjxnyeg3jqzf5reyimo6ocgucaw2wxj3jdv4y",
+        ),
+        (
+            "nwt-rc-2e2dc0f5868362b8e8ebc2af18e5fb7b",
+            "bafyr4ibofxaplbudmk4or26cv4mol633kghspb7ke2qcvseukoedo3jrsy",
+        ),
+    ];
+
+    /// GOLDEN VECTOR: a fixed recovered call and a fixed parent must derive
+    /// exactly these ids. Any change to the derivation — the payload shape, the
+    /// dialect label, the encoder, the locator rule — changes them and fails
+    /// here, loudly. The two calls are textually identical and differ only by
+    /// ordinal.
+    #[test]
+    fn golden_vector_fixed_call_and_parent_derive_fixed_ids() {
+        let mut r = golden_recovery();
+        let ids = assign_ids(&mut r, Some(fixed_parent()));
+        let got: Vec<(&str, &str)> = ids
+            .iter()
+            .map(|i| (i.locator.as_str(), i.cid.as_str()))
+            .collect();
+        assert_eq!(got, GOLDEN, "the derivation changed: {got:?}");
+        assert_eq!(r.calls[0]["id"], ids[0].locator);
+        assert!(ids
+            .iter()
+            .all(|i| i.locator.len() == 39 && i.locator.starts_with("nwt-rc-")));
+    }
+
+    /// Recovery is a function of (call, parent): no parent is a different
+    /// identity, and the same inputs derive the same ids.
+    #[test]
+    fn derivation_is_deterministic_and_parent_sensitive() {
+        let mut a = golden_recovery();
+        let mut b = golden_recovery();
+        let mut none = golden_recovery();
+        let ia = assign_ids(&mut a, Some(fixed_parent()));
+        let ib = assign_ids(&mut b, Some(fixed_parent()));
+        let inone = assign_ids(&mut none, None);
+        assert_eq!(ia, ib);
+        assert_ne!(ia[0].locator, inone[0].locator);
+        assert_ne!(
+            ia[0].locator, ia[1].locator,
+            "ordinal separates identical calls"
+        );
+    }
+
+    /// A finite float in a recovered argument encodes canonically (measured: the
+    /// crate's encoder carries it), so it derives an id like any other argument.
+    /// A value the encoder cannot carry would leave the call id-less and fall to
+    /// the bounded re-ask; JSON cannot produce one (no NaN or infinity).
+    #[test]
+    fn a_finite_float_argument_still_derives_an_id() {
+        let mut r = Recovery {
+            calls: vec![json!({"function": {"name": "read_file", "arguments": {"x": 1.5}}})],
+            tool_shaped: true,
+            dialect: Some(ToolCallDialect::BareJson),
+        };
+        let ids = assign_ids(&mut r, None);
+        assert_eq!(ids.len(), 1, "a float must not defeat identity derivation");
+        assert!(r.calls[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("nwt-rc-")));
+    }
 
     #[test]
     fn recovers_function_tag_form_qwen3_coder_observed() {
