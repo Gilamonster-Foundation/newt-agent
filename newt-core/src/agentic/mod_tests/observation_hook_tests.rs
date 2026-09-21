@@ -1315,3 +1315,146 @@ async fn an_interrupted_ollama_probe_is_a_cancelled_attempt() {
         (crate::attempts::AttemptState::Cancelled, None)
     );
 }
+
+// ---------------------------------------------------------------------------
+// A tool-call batch with no call id is re-asked, not fatal (P0 U3).
+// ---------------------------------------------------------------------------
+
+/// Serves `script` in order (last entry repeats) and records every request body.
+struct ScriptedChat {
+    script: Vec<serde_json::Value>,
+    bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for ScriptedChat {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let i = bodies.len().min(self.script.len() - 1);
+        bodies.push(serde_json::from_slice(&req.body).expect("JSON request"));
+        ResponseTemplate::new(200).set_body_json(self.script[i].clone())
+    }
+}
+
+fn idless_call() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": null, "tool_calls": [{
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"no/such/file\"}"}
+        }]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+fn call_with_id() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": null, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"no/such/file\"}"}
+        }]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+fn final_answer() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": "all done"}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+/// Runs the chat-completions loop against `script`; returns the result, the
+/// recorded request bodies, and how many `read_file` tool events ran.
+async fn run_scripted(
+    script: Vec<serde_json::Value>,
+) -> (anyhow::Result<String>, Vec<serde_json::Value>, usize) {
+    let server = MockServer::start().await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedChat {
+            script,
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    c.tool_events = Some(&mut events);
+    let result = chat_complete(c, &mut NoMcp).await.map(|(reply, ..)| reply);
+    let ran = events.iter().filter(|e| e.tool == "read_file").count();
+    let bodies = bodies.lock().unwrap().clone();
+    (result, bodies, ran)
+}
+
+/// The id-less batch dispatches nothing and is re-asked; the next, well-formed
+/// batch runs once and the turn completes.
+#[tokio::test]
+async fn idless_tool_call_is_re_asked_and_the_turn_completes() {
+    let (result, bodies, ran) =
+        run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
+    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    assert_eq!(ran, 1, "only the well-formed batch ran a tool");
+}
+
+/// Three id-less batches in a row abort exactly as before.
+#[tokio::test]
+async fn three_idless_batches_in_a_row_abort_with_todays_error() {
+    let (result, bodies, ran) = run_scripted(vec![idless_call()]).await;
+    let err = result.expect_err("the budget is spent");
+    assert!(
+        err.to_string().contains("malformed provider output")
+            && err.to_string().contains("missing a call id"),
+        "{err}"
+    );
+    assert_eq!(bodies.len(), 3, "the third id-less batch aborts");
+    assert_eq!(ran, 0, "nothing was dispatched");
+}
+
+/// A well-formed batch resets the budget: two id-less, one good, two more
+/// id-less, then an answer completes.
+#[tokio::test]
+async fn a_well_formed_batch_resets_the_idless_budget() {
+    let (result, _, ran) = run_scripted(vec![
+        idless_call(),
+        idless_call(),
+        call_with_id(),
+        idless_call(),
+        idless_call(),
+        final_answer(),
+    ])
+    .await;
+    assert_eq!(result.expect("completes"), "all done");
+    assert_eq!(ran, 1);
+}
+
+/// The re-ask text reaches the next request as a plain user message, and the
+/// id-less calls are not replayed on the assistant turn.
+#[tokio::test]
+async fn the_re_ask_reaches_the_next_request_body() {
+    let (_, bodies, _) = run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user", "a user message, not a tool result");
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .contains("without call ids"),
+        "{last}"
+    );
+    assert!(
+        second
+            .iter()
+            .all(|m| m["role"] != "assistant" || m.get("tool_calls").is_none()),
+        "id-less calls must not be replayed: {second:?}"
+    );
+    assert!(second.iter().all(|m| m["role"] != "tool"));
+}
