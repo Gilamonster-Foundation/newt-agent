@@ -2267,7 +2267,7 @@ impl McpToolset {
             let admitted = match newt_core::mcp::admit(entry) {
                 Ok(a) => a,
                 Err(denied) => {
-                    tracing::warn!("MCP server `{}` not admitted: {denied}", entry.name);
+                    tracing::warn!("MCP server {:?} not admitted: {denied}", entry.name);
                     continue;
                 }
             };
