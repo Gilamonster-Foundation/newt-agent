@@ -127,6 +127,10 @@ jobs:
       # the harness x model table; stdlib only, no Harbor install needed.
       # Ratchet rows (#2317): sweep.sh and file-regressions.sh classify and
       # count RATCHET rows; their self-tests are offline (no gh, no models).
+      # Container adapter lanes: test_lanes.py guards the write-root grant and
+      # the lane flags that keep the OCAP-parity benchmark comparable. The
+      # adapter imports the `harbor` package, which CI does not install, so the
+      # test-only stub under scripts/eval/harbor/tests/stubs stands in for it.
       # HOOK PARITY: mirrored by the `eval-selftest` recipe, which `just check`
       # runs via .githooks/pre-push. Add a line to both.
       - name: eval self-tests (eval-selftest)
@@ -134,6 +138,7 @@ jobs:
         run: |
           python3 scripts/eval/bench_scoreboard.py --self-test
           PYTHONPATH=scripts/eval/harbor python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_tb_campaign.py'
+          PYTHONPATH=scripts/eval/harbor:scripts/eval/harbor/tests/stubs python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_lanes.py'
           bash scripts/eval/sweep.sh --self-test
           bash scripts/eval/file-regressions.sh --self-test
 
