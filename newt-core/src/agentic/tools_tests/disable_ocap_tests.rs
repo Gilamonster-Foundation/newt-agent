@@ -1339,3 +1339,30 @@ async fn no_route_bypasses_routing_but_keeps_l3() {
         "the L3 confined dispatch must still gate the command; got: {out}"
     );
 }
+
+/// The confined brush child does not inherit newt's env (`do_not_inherit_env`;
+/// the `env` seam is the only import), so the temp dir its tools use must be
+/// handed over EXPLICITLY, matching the write fence's scratch root — else a
+/// configured scratch/`TMPDIR` is granted while the child defaults to `/tmp`,
+/// which the fence denies. `NEWT_CHILD_TMPDIR` is published by the headless
+/// confined lane from the same value the fence was built from.
+#[tokio::test]
+async fn confined_shell_env_carries_the_fence_scratch_root_as_tmpdir() {
+    let _lock = env_lock().await;
+    let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", "/nonexistent-newt-tmpdir-test");
+    // newt's own TMPDIR is never passed through by accident.
+    let _parent = EnvVar::set("TMPDIR", "/parent-only-tmpdir");
+    {
+        let _child = EnvVar::unset("NEWT_CHILD_TMPDIR");
+        assert!(
+            !venv_env_map().contains_key("TMPDIR"),
+            "no root published, none passed"
+        );
+    }
+    let _child = EnvVar::set("NEWT_CHILD_TMPDIR", "/srv/scratch");
+    assert_eq!(
+        venv_env_map().get("TMPDIR").map(String::as_str),
+        Some("/srv/scratch")
+    );
+}

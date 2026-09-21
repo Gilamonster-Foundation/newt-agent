@@ -23,8 +23,15 @@
 //!   OCAP stays ON.
 //!   Instead of full access, [`confined_bench_caveats`] seeds a workspace-fenced
 //!   authority — reads/exec/net stay open, but writes are confined to the
-//!   workspace and the container's mutable system roots (a `Scope::Only`
-//!   fs_write, never `Scope::All`). A `Scope::Only` write auto-consents at the
+//!   workspace, the configured scratch root (the platform temp dir unless
+//!   `NEWT_SCRATCH_DIR` / `[scratch] dir` names an absolute one) and explicit
+//!   `NEWT_WRITE_PATHS` grants (a `Scope::Only`
+//!   fs_write, never `Scope::All`). The container's mutable system roots
+//!   (`/usr /usr/local /var /etc /opt /root /home`, the #1487 bench rationale:
+//!   package installs) are OPT-IN: this lane is the default, and a default must
+//!   be safe on a developer host, where `/home` held `~/.rustup`, `~/.ssh` and
+//!   every other checkout. Bench containers pass them via `NEWT_WRITE_PATHS`.
+//!   A `Scope::Only` write auto-consents at the
 //!   tool gate (the preset IS the operator's consent — see
 //!   `tools::confirm_unrestricted_fs_mutation`), so in-fence writes run with no
 //!   prompt. This is the lane the 0.7.6 OCAP-parity gate measures against the
@@ -38,8 +45,8 @@
 //! when Landlock is absent, so a spawned command's writes are then advisory, not
 //! kernel-enforced. Combined with `fs_read = All` + `net = All`, this lane is a
 //! **bench isolation control for disposable containers, not a security sandbox**
-//! against a hostile agent. The fence is also deliberately broad on this first
-//! cut (workspace + standard mutable roots); tightening it is a later ratchet.
+//! against a hostile agent. The fence started broad on its first cut (#1487); the
+//! standard mutable roots have since moved behind an explicit grant.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -514,10 +521,25 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let smart_config = cfg.smart_harness.clone().unwrap_or_default();
     let smart_enabled = args.smart_harness || smart_config.enabled;
     if lane == HeadlessLane::Confined {
-        dc.caveats = confined_bench_caveats(&workspace);
+        // Scratch is resolved ONCE, here: it builds the fence AND becomes the
+        // child's `TMPDIR` (the brush child does not inherit newt's env, so it
+        // would otherwise write `/tmp`, which a configured fence does not grant).
+        // Not for the smart lane, whose fence is workspace-only and whose callers
+        // point temp at the workspace.
+        let scratch = resolve_fence_scratch();
+        if let (false, Some(root)) = (smart_enabled, scratch.first()) {
+            // Same single-threaded-at-this-point contract as the lane's other
+            // env writes above.
+            unsafe { std::env::set_var("NEWT_CHILD_TMPDIR", root) };
+        }
+        dc.caveats = confined_bench_caveats(&workspace, &scratch);
         if smart_enabled {
             let scoped =
                 newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
+            // The smart lane's isolation needs a write fence with NO model-writable
+            // ancestor of the workspace/frame, so it drops `/tmp` and takes the
+            // workspace-only set; the default lane's fence must contain it
+            // (`smart_fence_is_within_the_default_fence`).
             dc.caveats.fs_read = scoped.fs_read;
             dc.caveats.fs_write = scoped.fs_write;
             newt_core::caveats::apply_cli_fs_grants(&mut dc.caveats, &workspace);
@@ -985,22 +1007,20 @@ fn pick_backend(
 ///
 /// Reads / exec / net stay fully open (a bench task legitimately reads the
 /// whole tree, runs arbitrary toolchains, and installs packages over the
-/// network), but **writes are fenced** to the workspace plus the mutable system
-/// roots a container's package managers and toolchains need (`/tmp`, `/usr`,
-/// `/usr/local`, `/var`, `/etc`, `/opt`, `/root`, `/home`) — plus any per-task
-/// `NEWT_WRITE_PATHS` grant. The fence is a `Scope::Only`, **never**
-/// `Scope::All`: that is the whole point of the lane (a `Scope::Only` write
-/// auto-consents at the tool gate, so in-fence writes run promptless while a
-/// write to an un-granted absolute path fails closed), and it is what the 0.7.6
-/// OCAP-parity gate measures. The fence is deliberately broad on this first cut
-/// so parity isolates *"does routing every op through the caveat lattice + the
-/// bridled shell break tasks?"* from *"is the fence too tight?"*; tightening
-/// per-task is a later ratchet.
+/// network), but **writes are fenced** to the workspace, the configured scratch
+/// root (see [`fence_scratch_roots`]) and any explicit `NEWT_WRITE_PATHS` grant.
+/// The mutable system roots and `$HOME` are opt-in by grant (#1487's bench
+/// rationale preserved: a container passes them; a default must be safe on a
+/// developer host). The fence is a `Scope::Only`, **never** `Scope::All`: that is
+/// the whole point of the lane (a `Scope::Only` write auto-consents at the tool
+/// gate, so in-fence writes run promptless while a write to an un-granted
+/// absolute path fails closed), and it is what the 0.7.6 OCAP-parity gate
+/// measures.
 ///
 /// Matching at the enforcement site (`tools::tui_permits_path`) is by
 /// lexically-normalized path **prefix**, so a root entry covers everything
 /// beneath it (`/usr` grants `/usr/lib/python3/...`).
-fn confined_bench_caveats(workspace: &str) -> Caveats {
+fn confined_bench_caveats(workspace: &str, scratch: &[String]) -> Caveats {
     // The per-task extra write grants the harness may pass (same env the
     // interactive `--write` grants flow through). `split_paths` keeps a Windows
     // drive-letter grant intact rather than shattering it on `:`. Read here so
@@ -1014,27 +1034,45 @@ fn confined_bench_caveats(workspace: &str) -> Caveats {
                 .collect()
         })
         .unwrap_or_default();
-    confined_bench_caveats_with_grants(workspace, &extra)
+    confined_bench_caveats_with_grants(workspace, scratch, &extra)
+}
+
+/// The fence's scratch root(s), resolved at run start. Scratch is CONFIGURATION
+/// (`NEWT_SCRATCH_DIR` / `[scratch] dir`, via the one existing resolver), never a
+/// literal; see [`fence_scratch_roots`].
+fn resolve_fence_scratch() -> Vec<String> {
+    fence_scratch_roots(&newt_core::scratch::scratch_dir(), &std::env::temp_dir())
+}
+
+/// The fence's scratch root(s): the configured scratch dir when it is ABSOLUTE
+/// (an operator relocated it, e.g. to `/var/tmp` or a PVC), else the platform
+/// temp dir (`temp_dir`, which honours `TMPDIR`). A relative dir — including the
+/// `.scratch` default — already lives inside the workspace, so it is "nothing
+/// configured" for this purpose. Pure. There is no way to drop the scratch root
+/// through configuration today; see RESULT-2501 for the proposed key.
+fn fence_scratch_roots(scratch_dir: &str, temp_dir: &std::path::Path) -> Vec<String> {
+    if std::path::Path::new(scratch_dir).is_absolute() {
+        vec![scratch_dir.to_string()]
+    } else {
+        vec![temp_dir.to_string_lossy().into_owned()]
+    }
 }
 
 /// Pure core of [`confined_bench_caveats`]: the workspace fence plus explicit
 /// extra write roots, with no environment access (so it is deterministic and
 /// parallel-safe to test).
-fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[String]) -> Caveats {
-    let mut write_roots: Vec<String> = [
-        workspace,
-        "/tmp",
-        "/usr",
-        "/usr/local",
-        "/var",
-        "/etc",
-        "/opt",
-        "/root",
-        "/home",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+fn confined_bench_caveats_with_grants(
+    workspace: &str,
+    scratch_roots: &[String],
+    extra_write_roots: &[String],
+) -> Caveats {
+    // The workspace, the resolved scratch root(s) passed in, and explicit grants.
+    // `$HOME`, `/root` and the system roots are OPT-IN via `NEWT_WRITE_PATHS`: a
+    // confined `run_command` once rewrote the operator's `~/.rustup` because
+    // `/home` was a built-in root. Disposable bench containers that need package
+    // installs ask for the broad roots.
+    let mut write_roots: Vec<String> = vec![workspace.to_string()];
+    write_roots.extend(scratch_roots.iter().cloned());
     write_roots.extend(extra_write_roots.iter().cloned());
     // Built axis-by-axis rather than narrowing `Caveats::top()`: a headless
     // dispatch path must not even MENTION `Caveats::top()` (the `#94` no-top-leak
@@ -1552,7 +1590,8 @@ mod tests {
     /// None`, silently DENIES) — the exact WS1 trap the lane exists to avoid.
     #[test]
     fn confined_caveats_fence_writes_never_all() {
-        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
         assert!(
             !matches!(cv.fs_write, Scope::All),
             "confined lane must NEVER grant fs_write = Scope::All"
@@ -1570,12 +1609,24 @@ mod tests {
 
     #[test]
     fn confined_caveats_permit_workspace_and_scratch_writes() {
-        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
         // The workspace root and the standard mutable roots are writable
         // (exact-match here; the enforcement site adds prefix coverage).
         assert!(cv.permits_fs_write("/app/task"), "workspace root writable");
-        assert!(cv.permits_fs_write("/tmp"), "scratch writable");
-        assert!(cv.permits_fs_write("/usr"), "package-manager root writable");
+        // Changed ON PURPOSE (was: `/tmp` writable as a literal). The scratch root
+        // now comes in as a parameter, resolved from configuration by the caller.
+        assert!(
+            cv.permits_fs_write("/srv/scratch"),
+            "configured scratch writable"
+        );
+        assert!(
+            !cv.permits_fs_write("/tmp"),
+            "/tmp is no longer a built-in root"
+        );
+        // Changed ON PURPOSE (was: `/usr` writable). The default lane is a default on a
+        // developer host, so system roots are opt-in via NEWT_WRITE_PATHS.
+        assert!(!cv.permits_fs_write("/usr"), "system roots are opt-in");
         // An un-granted absolute path outside every root is NOT writable.
         assert!(
             !cv.permits_fs_write("/boot/vmlinuz"),
@@ -1583,9 +1634,107 @@ mod tests {
         );
     }
 
+    /// The default lane's fence must not contain `$HOME`, `/root` or system
+    /// roots: a confined `run_command` (`rustup default nightly`) rewrote the
+    /// operator's `~/.rustup` because `/home` was a built-in write root.
+    #[test]
+    fn confined_fence_excludes_home_and_system_roots_by_default() {
+        use newt_core::caveats::permits_path;
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
+        for p in [
+            "/home/u/.rustup/settings.toml",
+            "/home/u/.ssh/id",
+            "/root/x",
+            "/usr/bin/x",
+            "/etc/passwd",
+        ] {
+            assert!(!permits_path(&cv.fs_write, p), "{p} must not be writable");
+        }
+        for p in ["/app/task/src/x", "/srv/scratch/x"] {
+            assert!(permits_path(&cv.fs_write, p), "{p} must be writable");
+        }
+    }
+
+    #[test]
+    fn confined_fence_broad_roots_are_opt_in_by_grant() {
+        use newt_core::caveats::permits_path;
+        let grants = ["/data/scratch".to_string(), "/home".to_string()];
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &grants);
+        assert!(permits_path(&cv.fs_write, "/data/scratch/f"));
+        assert!(permits_path(&cv.fs_write, "/home/u/x"));
+    }
+
+    /// The smart-harness lane narrows the default fence, never widens it: its
+    /// isolation forbids a model-writable ancestor (`/tmp`), so it cannot be
+    /// EQUAL, but every root it grants must already be inside the default's.
+    #[test]
+    fn smart_fence_is_within_the_default_fence() {
+        use newt_core::caveats::permits_path;
+        let default =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
+        let smart = newt_core::confined_exec::build_tool_caveats("/app/task".as_ref());
+        let Scope::Only(roots) = &smart.fs_write else {
+            panic!("smart fs_write must be an explicit Scope::Only");
+        };
+        for root in roots {
+            assert!(
+                permits_path(&default.fs_write, root),
+                "{root} outside default"
+            );
+        }
+    }
+
+    /// Three Cs (configuration over a hardcoded constant): the fence's scratch
+    /// root is the CONFIGURED scratch dir when it is absolute (an operator moved
+    /// it), else the platform temp dir (which honours `TMPDIR`). `/tmp` is never
+    /// a literal: not every distro uses it the way we think.
+    #[test]
+    fn fence_scratch_root_comes_from_configuration_then_temp_dir() {
+        use newt_core::caveats::permits_path;
+        // `fence_scratch_roots` asks the HOST whether a dir is absolute, so the
+        // "configured absolute dir" and the fallback must be absolute ON THE
+        // RUNNING HOST: `/srv/scratch` has no drive on Windows and would be
+        // "relative" there. Built from the platform temp dir, they are absolute
+        // everywhere; only the fence paths are compared as component paths.
+        let base = std::env::temp_dir();
+        let configured = base.join("newt-scratch-test");
+        let temp = base.join("newt-fallback-test");
+        let (configured_s, temp_s) = (
+            configured.to_string_lossy().into_owned(),
+            temp.to_string_lossy().into_owned(),
+        );
+        let writable = |cv: &Caveats, dir: &std::path::Path| {
+            permits_path(&cv.fs_write, &dir.join("x").to_string_lossy())
+        };
+        // Configured absolute dir wins, and the temp dir is NOT also granted.
+        let roots = fence_scratch_roots(&configured_s, &temp);
+        assert_eq!(roots, std::slice::from_ref(&configured_s));
+        let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
+        assert!(writable(&cv, &configured));
+        assert!(!writable(&cv, &temp));
+        assert!(!writable(&cv, &base), "the temp dir itself is not granted");
+        // Unset (the relative `.scratch` default lives in the workspace already):
+        // fall back to the platform temp dir, not a literal `/tmp`.
+        let roots = fence_scratch_roots(".scratch", &temp);
+        assert_eq!(roots, [temp_s]);
+        let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
+        assert!(writable(&cv, &temp));
+        assert!(!writable(&cv, &configured));
+        // No scratch root at all: workspace + explicit grants only.
+        let cv = confined_bench_caveats_with_grants("/app/task", &[], &[]);
+        assert!(!writable(&cv, &temp));
+        assert!(permits_path(&cv.fs_write, "/app/task/x"));
+    }
+
     #[test]
     fn confined_caveats_honor_write_paths_grant() {
-        let cv = confined_bench_caveats_with_grants("/app/task", &["/data/scratch".to_string()]);
+        let cv = confined_bench_caveats_with_grants(
+            "/app/task",
+            &["/srv/scratch".to_string()],
+            &["/data/scratch".to_string()],
+        );
         assert!(
             cv.permits_fs_write("/data/scratch"),
             "a per-task NEWT_WRITE_PATHS grant joins the fence"
