@@ -1481,33 +1481,167 @@ async fn the_re_ask_reaches_the_next_request_body() {
 }
 
 /// The measured run-2483-b failure: the model wrote its tool call as bare JSON
-/// in the reply, the harness RECOVERED it into a native-shaped call, and a
-/// recovered call has no id by construction, so it reached the batch validator
-/// (trace: `recovered_tool_call`, dialect `bare_json`). It is re-asked like any
-/// id-less batch and the turn completes.
+/// in the reply, the harness RECOVERED it, and a recovered call had no id, so it
+/// reached the batch validator and was re-asked (trace: `recovered_tool_call`,
+/// dialect `bare_json`). The harness now derives the id, so the recovered batch
+/// never enters the re-ask path (see the derived-id tests below).
 #[tokio::test]
-async fn a_recovered_content_call_has_no_id_and_is_re_asked() {
-    let bare = serde_json::json!({
-        "choices": [{"message": {"content":
-            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"no/such/file\"}}"}}],
-        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
-    });
+async fn a_recovered_content_call_is_not_re_asked() {
     let (result, bodies, _, rejected) =
-        run_scripted(vec![bare, call_with_id(), final_answer()]).await;
-    assert_eq!(result.expect("completes after the re-ask"), "all done");
+        run_scripted(vec![bare_reply(BARE), call_with_id(), final_answer()]).await;
+    assert_eq!(result.expect("completes"), "all done");
+    assert_eq!(rejected, 0, "no re-ask round: the id was derived");
     assert_eq!(bodies.len(), 3);
-    assert_eq!(rejected, 1, "one re-ask round");
-    let last = bodies[1]["messages"]
+    assert!(
+        bodies[1]["messages"].to_string().contains("nwt-rc-"),
+        "the recovered call rode the transcript with a derived id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P0: a call the harness RECOVERED from reply text gets a harness-derived id.
+// ---------------------------------------------------------------------------
+
+const BARE: &str = r#"{"name": "read_file", "arguments": {"path": "no/such/file"}}"#;
+
+fn bare_reply(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": content}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+/// Like `run_scripted`, but with an attempt ledger (the causal parent of a
+/// derived id) and the solve observation (the trace's parse signals).
+async fn run_recovery(
+    script: Vec<serde_json::Value>,
+) -> (
+    anyhow::Result<String>,
+    Vec<serde_json::Value>,
+    Vec<crate::ToolEvent>,
+    Vec<crate::ParseSignal>,
+) {
+    let server = MockServer::start().await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedChat {
+            script,
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut obs = crate::agentic::observability::SolveObservation::default();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    c.tool_events = Some(&mut events);
+    c.attempt_ledger = Some(&ledger);
+    c.solve_obs = Some(&mut obs);
+    let result = chat_complete(c, &mut NoMcp).await.map(|(reply, ..)| reply);
+    let bodies = bodies.lock().unwrap().clone();
+    (result, bodies, events, obs.parse_signals)
+}
+
+/// The recovered-call ids the replayed assistant turns carry, in request order.
+fn replayed_ids(request: &serde_json::Value) -> Vec<String> {
+    request["messages"]
         .as_array()
         .unwrap()
-        .last()
-        .unwrap()
-        .clone();
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .flat_map(|m| m["tool_calls"].as_array().cloned().unwrap_or_default())
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_recovered_call_completes_with_a_derived_id_and_a_reshaped_turn() {
+    let (result, bodies, events, _) = run_recovery(vec![bare_reply(BARE), final_answer()]).await;
+    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(bodies.len(), 2, "recovered call, then the final answer");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+    let messages = bodies[1]["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .expect("the replayed assistant turn");
+    let call = &assistant["tool_calls"][0];
+    let id = call["id"].as_str().expect("a derived id");
+    assert!(id.starts_with("nwt-rc-") && id.len() == 39, "{id}");
+    assert_eq!(call["type"], "function");
     assert!(
-        last["content"]
-            .as_str()
-            .unwrap()
-            .contains("native tool calls"),
-        "{last}"
+        call["function"]["arguments"].is_string(),
+        "stringified: {call}"
     );
+    assert_eq!(
+        assistant["content"], BARE,
+        "the original text stays as evidence"
+    );
+    let tool = messages.last().unwrap();
+    assert_eq!(tool["role"], "tool");
+    assert_eq!(
+        tool["tool_call_id"], id,
+        "the result answers the derived id"
+    );
+}
+
+#[tokio::test]
+async fn identical_reply_text_in_two_rounds_derives_different_ids() {
+    let (result, bodies, _, _) =
+        run_recovery(vec![bare_reply(BARE), bare_reply(BARE), final_answer()]).await;
+    result.expect("completes");
+    let ids = replayed_ids(&bodies[2]);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "the causal parent differs per round");
+}
+
+#[tokio::test]
+async fn two_identical_calls_in_one_reply_get_distinct_ids() {
+    let one = "<function=read_file><parameter=path>no/such/file</parameter></function>";
+    let (result, bodies, events, _) =
+        run_recovery(vec![bare_reply(&format!("{one}{one}")), final_answer()]).await;
+    result.expect("completes");
+    let ids = replayed_ids(&bodies[1]);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "the ordinal separates identical calls");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 2);
+}
+
+/// A NATIVE id-less call keeps #2500's bounded re-ask: no id is ever derived
+/// for a provider call.
+#[tokio::test]
+async fn a_native_idless_call_never_gets_a_derived_id() {
+    let (result, bodies, _, _) =
+        run_recovery(vec![idless_call(), call_with_id(), final_answer()]).await;
+    result.expect("re-asked, then completes");
+    assert!(
+        bodies.iter().all(|b| !b.to_string().contains("nwt-rc-")),
+        "no derived id may appear for a provider call"
+    );
+}
+
+#[tokio::test]
+async fn the_trace_signal_carries_the_full_cid_and_the_locator() {
+    let (_, bodies, _, signals) = run_recovery(vec![bare_reply(BARE), final_answer()]).await;
+    let id = replayed_ids(&bodies[1]).remove(0);
+    let recovered = signals
+        .iter()
+        .find_map(|s| match s {
+            crate::ParseSignal::RecoveredToolCall { calls, .. } => Some(calls.clone()),
+            _ => None,
+        })
+        .expect("a recovered_tool_call signal");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].locator, id);
+    assert!(recovered[0].cid.starts_with("bafy"), "{}", recovered[0].cid);
 }
