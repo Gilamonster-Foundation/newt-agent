@@ -122,7 +122,8 @@ structure ValidatedCall where
 
 /-- A whole validated batch: the calls, plus a proof their ids are all distinct.
     A missing/duplicate id cannot be represented — the exact `BHV-TOOLS-002`
-    "correlation-impossible" state the Rust loop must abort on. -/
+    "correlation-impossible" state the Rust loop must never dispatch: it
+    re-asks within a bounded budget, then aborts. -/
 structure ValidatedBatch where
   calls : List ValidatedCall
   ids_nodup : (calls.map (·.id)).Nodup
