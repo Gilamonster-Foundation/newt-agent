@@ -1365,7 +1365,7 @@ fn final_answer() -> serde_json::Value {
 /// recorded request bodies, and how many `read_file` tool events ran.
 async fn run_scripted(
     script: Vec<serde_json::Value>,
-) -> (anyhow::Result<String>, Vec<serde_json::Value>, usize) {
+) -> (anyhow::Result<String>, Vec<serde_json::Value>, usize, usize) {
     let server = MockServer::start().await;
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1389,25 +1389,33 @@ async fn run_scripted(
     c.tool_events = Some(&mut events);
     let result = chat_complete(c, &mut NoMcp).await.map(|(reply, ..)| reply);
     let ran = events.iter().filter(|e| e.tool == "read_file").count();
+    let rejected = events
+        .iter()
+        .filter(|e| e.tool == "(rejected tool-call batch)" && !e.ok)
+        .count();
     let bodies = bodies.lock().unwrap().clone();
-    (result, bodies, ran)
+    (result, bodies, ran, rejected)
 }
 
 /// The id-less batch dispatches nothing and is re-asked; the next, well-formed
 /// batch runs once and the turn completes.
 #[tokio::test]
 async fn idless_tool_call_is_re_asked_and_the_turn_completes() {
-    let (result, bodies, ran) =
+    let (result, bodies, ran, rejected) =
         run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
     assert_eq!(result.expect("the turn completes"), "all done");
     assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
     assert_eq!(ran, 1, "only the well-formed batch ran a tool");
+    assert_eq!(
+        rejected, 1,
+        "the trace records why the re-ask round produced nothing"
+    );
 }
 
 /// Three id-less batches in a row abort exactly as before.
 #[tokio::test]
 async fn three_idless_batches_in_a_row_abort_with_todays_error() {
-    let (result, bodies, ran) = run_scripted(vec![idless_call()]).await;
+    let (result, bodies, ran, _) = run_scripted(vec![idless_call()]).await;
     let err = result.expect_err("the budget is spent");
     assert!(
         err.to_string().contains("malformed provider output")
@@ -1422,7 +1430,7 @@ async fn three_idless_batches_in_a_row_abort_with_todays_error() {
 /// id-less, then an answer completes.
 #[tokio::test]
 async fn a_well_formed_batch_resets_the_idless_budget() {
-    let (result, _, ran) = run_scripted(vec![
+    let (result, _, ran, _) = run_scripted(vec![
         idless_call(),
         idless_call(),
         call_with_id(),
@@ -1439,7 +1447,7 @@ async fn a_well_formed_batch_resets_the_idless_budget() {
 /// id-less calls are not replayed on the assistant turn.
 #[tokio::test]
 async fn the_re_ask_reaches_the_next_request_body() {
-    let (_, bodies, _) = run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
+    let (_, bodies, _, _) = run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
     let second = bodies[1]["messages"].as_array().expect("messages");
     let last = second.last().unwrap();
     assert_eq!(last["role"], "user", "a user message, not a tool result");
