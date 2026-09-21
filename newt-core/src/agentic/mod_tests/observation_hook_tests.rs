@@ -1455,7 +1455,7 @@ async fn the_re_ask_reaches_the_next_request_body() {
         last["content"]
             .as_str()
             .unwrap()
-            .contains("without call ids"),
+            .contains("could not be correlated"),
         "{last}"
     );
     assert!(
@@ -1465,4 +1465,49 @@ async fn the_re_ask_reaches_the_next_request_body() {
         "id-less calls must not be replayed: {second:?}"
     );
     assert!(second.iter().all(|m| m["role"] != "tool"));
+    // The default replay sends a tool-only assistant turn as `content: ""`;
+    // strict gateways reject that, so the withdrawn turn must carry text.
+    let withdrawn = second
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .expect("the withdrawn assistant turn is still replayed");
+    assert!(
+        withdrawn["content"]
+            .as_str()
+            .is_some_and(|c| !c.trim().is_empty()),
+        "empty assistant content on the wire: {withdrawn}"
+    );
+}
+
+/// The measured run-2483-b failure: the model wrote its tool call as bare JSON
+/// in the reply, the harness RECOVERED it into a native-shaped call, and a
+/// recovered call has no id by construction, so it reached the batch validator
+/// (trace: `recovered_tool_call`, dialect `bare_json`). It is re-asked like any
+/// id-less batch and the turn completes.
+#[tokio::test]
+async fn a_recovered_content_call_has_no_id_and_is_re_asked() {
+    let bare = serde_json::json!({
+        "choices": [{"message": {"content":
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"no/such/file\"}}"}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    });
+    let (result, bodies, _, rejected) =
+        run_scripted(vec![bare, call_with_id(), final_answer()]).await;
+    assert_eq!(result.expect("completes after the re-ask"), "all done");
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(rejected, 1, "one re-ask round");
+    let last = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .contains("native tool calls"),
+        "{last}"
+    );
 }
