@@ -23,8 +23,13 @@
 //!   OCAP stays ON.
 //!   Instead of full access, [`confined_bench_caveats`] seeds a workspace-fenced
 //!   authority — reads/exec/net stay open, but writes are confined to the
-//!   workspace and the container's mutable system roots (a `Scope::Only`
-//!   fs_write, never `Scope::All`). A `Scope::Only` write auto-consents at the
+//!   workspace, `/tmp` and explicit `NEWT_WRITE_PATHS` grants (a `Scope::Only`
+//!   fs_write, never `Scope::All`). The container's mutable system roots
+//!   (`/usr /usr/local /var /etc /opt /root /home`, the #1487 bench rationale:
+//!   package installs) are OPT-IN: this lane is the default, and a default must
+//!   be safe on a developer host, where `/home` held `~/.rustup`, `~/.ssh` and
+//!   every other checkout. Bench containers pass them via `NEWT_WRITE_PATHS`.
+//!   A `Scope::Only` write auto-consents at the
 //!   tool gate (the preset IS the operator's consent — see
 //!   `tools::confirm_unrestricted_fs_mutation`), so in-fence writes run with no
 //!   prompt. This is the lane the 0.7.6 OCAP-parity gate measures against the
@@ -39,7 +44,7 @@
 //! kernel-enforced. Combined with `fs_read = All` + `net = All`, this lane is a
 //! **bench isolation control for disposable containers, not a security sandbox**
 //! against a hostile agent. The fence is also deliberately broad on this first
-//! cut (workspace + standard mutable roots); tightening it is a later ratchet.
+//! cut; the standard mutable roots have since moved behind an explicit grant.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -518,6 +523,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         if smart_enabled {
             let scoped =
                 newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
+            // The smart lane's isolation needs a write fence with NO model-writable
+            // ancestor of the workspace/frame, so it drops `/tmp` and takes the
+            // workspace-only set; the default lane's fence must contain it
+            // (`smart_fence_is_within_the_default_fence`).
             dc.caveats.fs_read = scoped.fs_read;
             dc.caveats.fs_write = scoped.fs_write;
             newt_core::caveats::apply_cli_fs_grants(&mut dc.caveats, &workspace);
@@ -997,20 +1006,11 @@ fn confined_bench_caveats(workspace: &str) -> Caveats {
 /// extra write roots, with no environment access (so it is deterministic and
 /// parallel-safe to test).
 fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[String]) -> Caveats {
-    let mut write_roots: Vec<String> = [
-        workspace,
-        "/tmp",
-        "/usr",
-        "/usr/local",
-        "/var",
-        "/etc",
-        "/opt",
-        "/root",
-        "/home",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    // The workspace and `/tmp` only. `$HOME`, `/root` and the system roots are
+    // OPT-IN via `NEWT_WRITE_PATHS`: a confined `run_command` once rewrote the
+    // operator's `~/.rustup` because `/home` was a built-in root. Disposable
+    // bench containers that need package installs ask for the broad roots.
+    let mut write_roots: Vec<String> = [workspace, "/tmp"].iter().map(|s| s.to_string()).collect();
     write_roots.extend(extra_write_roots.iter().cloned());
     // Built axis-by-axis rather than narrowing `Caveats::top()`: a headless
     // dispatch path must not even MENTION `Caveats::top()` (the `#94` no-top-leak
@@ -1551,12 +1551,63 @@ mod tests {
         // (exact-match here; the enforcement site adds prefix coverage).
         assert!(cv.permits_fs_write("/app/task"), "workspace root writable");
         assert!(cv.permits_fs_write("/tmp"), "scratch writable");
-        assert!(cv.permits_fs_write("/usr"), "package-manager root writable");
+        // Changed ON PURPOSE (was: `/usr` writable). The default lane is a default on a
+        // developer host, so system roots are opt-in via NEWT_WRITE_PATHS.
+        assert!(!cv.permits_fs_write("/usr"), "system roots are opt-in");
         // An un-granted absolute path outside every root is NOT writable.
         assert!(
             !cv.permits_fs_write("/boot/vmlinuz"),
             "a path outside every granted root fails closed"
         );
+    }
+
+    /// The default lane's fence must not contain `$HOME`, `/root` or system
+    /// roots: a confined `run_command` (`rustup default nightly`) rewrote the
+    /// operator's `~/.rustup` because `/home` was a built-in write root.
+    #[test]
+    fn confined_fence_excludes_home_and_system_roots_by_default() {
+        use newt_core::caveats::permits_path;
+        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        for p in [
+            "/home/u/.rustup/settings.toml",
+            "/home/u/.ssh/id",
+            "/root/x",
+            "/usr/bin/x",
+            "/etc/passwd",
+        ] {
+            assert!(!permits_path(&cv.fs_write, p), "{p} must not be writable");
+        }
+        for p in ["/app/task/src/x", "/tmp/x"] {
+            assert!(permits_path(&cv.fs_write, p), "{p} must be writable");
+        }
+    }
+
+    #[test]
+    fn confined_fence_broad_roots_are_opt_in_by_grant() {
+        use newt_core::caveats::permits_path;
+        let grants = ["/data/scratch".to_string(), "/home".to_string()];
+        let cv = confined_bench_caveats_with_grants("/app/task", &grants);
+        assert!(permits_path(&cv.fs_write, "/data/scratch/f"));
+        assert!(permits_path(&cv.fs_write, "/home/u/x"));
+    }
+
+    /// The smart-harness lane narrows the default fence, never widens it: its
+    /// isolation forbids a model-writable ancestor (`/tmp`), so it cannot be
+    /// EQUAL, but every root it grants must already be inside the default's.
+    #[test]
+    fn smart_fence_is_within_the_default_fence() {
+        use newt_core::caveats::permits_path;
+        let default = confined_bench_caveats_with_grants("/app/task", &[]);
+        let smart = newt_core::confined_exec::build_tool_caveats("/app/task".as_ref());
+        let Scope::Only(roots) = &smart.fs_write else {
+            panic!("smart fs_write must be an explicit Scope::Only");
+        };
+        for root in roots {
+            assert!(
+                permits_path(&default.fs_write, root),
+                "{root} outside default"
+            );
+        }
     }
 
     #[test]
