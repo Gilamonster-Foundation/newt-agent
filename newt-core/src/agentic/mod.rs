@@ -2368,7 +2368,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut messages, color);
+        if drain_steering_into(steering, &mut messages, color) > 0 {
+            workflow_runtime.note_operator_steering();
+        }
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
@@ -4546,6 +4548,14 @@ impl WorkflowRuntimeState {
     /// 2483-a's edit were `passed`), and classifying commands by keyword would be
     /// an invented classifier.
     fn note_verified_pass(&mut self) {
+        self.round_progressed = true;
+    }
+
+    /// Operator steering was delivered this round. A human steer is new
+    /// information the model has not yet acted on, so it restarts the count (and
+    /// re-arms the steer-once latch) exactly like progress; otherwise a stop on
+    /// the very next statement would throw the operator's words away unread.
+    fn note_operator_steering(&mut self) {
         self.round_progressed = true;
     }
 
@@ -7054,7 +7064,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut messages, color);
+        if drain_steering_into(steering, &mut messages, color) > 0 {
+            workflow_runtime.note_operator_steering();
+        }
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -9632,7 +9644,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut messages, color);
+        if drain_steering_into(steering, &mut messages, color) > 0 {
+            workflow_runtime.note_operator_steering();
+        }
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -11852,6 +11866,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 hallucination_count,
             ));
         }
+        // #952/#1669: operator steering, delivered BEFORE this round's model
+        // call and AFTER any tool that was already running finished above.
+        // Steering changes what the agent does NEXT; it never abandons the
+        // turn (that is `cancel`, checked immediately above).
+        if drain_steering_into(steering, &mut input, color) > 0 {
+            workflow_runtime.note_operator_steering();
+        }
+        // The drain precedes the gate: steering delivered now resets the brake.
         // U4b: the brake's gate runs EVERY round (see the chat arms).
         if round > 0 {
             no_progress_gate!(
@@ -11866,11 +11888,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 |harness| harness.record_responses_messages(instructions.as_deref(), &input)?
             );
         }
-        // #952/#1669: operator steering, delivered BEFORE this round's model
-        // call and AFTER any tool that was already running finished above.
-        // Steering changes what the agent does NEXT; it never abandons the
-        // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut input, color);
         // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
         // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
         // out and lets `round` advance, so recovery never consumes a tool-capable
