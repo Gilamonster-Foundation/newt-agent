@@ -1973,18 +1973,27 @@ impl Respond for WriteThenGrind {
         let body: serde_json::Value = serde_json::from_slice(&request.body).expect("chat body");
         self.requests.lock().expect("capture").push(body);
         let n = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let call = if n == 0 {
-            serde_json::json!({"name": "write_file", "arguments": "{\"path\":\"out.txt\",\"content\":\"x\\n\"}"})
+        let (name, arguments) = if n == 0 {
+            ("write_file", "{\"path\":\"out.txt\",\"content\":\"x\\n\"}")
         } else {
-            serde_json::json!({"name": "list_dir", "arguments": "{\"path\":\".\"}"})
+            ("list_dir", "{\"path\":\".\"}")
         };
+        if request.url.path() == "/v1/responses" {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": format!("resp_{n}"), "status": "completed", "model": "m",
+                "output": [{"type": "function_call", "id": format!("fc_{n}"),
+                    "call_id": format!("c{n}"), "name": name, "arguments": arguments,
+                    "status": "completed"}]
+            }));
+        }
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "model": "m",
             "choices": [{
                 "message": {
                     "role": "assistant",
                     "content": null,
-                    "tool_calls": [{"id": format!("c{n}"), "type": "function", "function": call}]
+                    "tool_calls": [{"id": format!("c{n}"), "type": "function",
+                        "function": {"name": name, "arguments": arguments}}]
                 },
                 "finish_reason": "tool_calls"
             }]
@@ -1996,12 +2005,19 @@ impl Respond for WriteThenGrind {
 /// is steered at `steer_after` and ends, typed, at `stop_after` — filed like the
 /// round cap (`timeout` / `incomplete`), with a harness-written notice and NO
 /// model summary call. The thresholds are configuration (`[initiative.no_progress]`).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_write_then_no_progress_is_steered_then_stopped_like_a_cap() {
+async fn assert_write_then_no_progress_stops(api: &str) {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenGrind {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
         .respond_with(WriteThenGrind {
             sequence: AtomicUsize::new(0),
             requests: requests.clone(),
@@ -2029,6 +2045,7 @@ async fn a_write_then_no_progress_is_steered_then_stopped_like_a_cap() {
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
+        .args(["--backend-api", api])
         .args(["headless", "--cwd"])
         .arg(workspace.path())
         .arg("--instruction-file")
@@ -2070,9 +2087,26 @@ async fn a_write_then_no_progress_is_steered_then_stopped_like_a_cap() {
         requests.iter().all(|r| r.get("tools").is_some()),
         "no tools-disabled summary"
     );
-    let last_messages = requests[3]["messages"].to_string();
+    // Chat bodies carry `messages`; Responses bodies carry `input`.
+    let last_messages = requests[3]
+        .get("messages")
+        .or_else(|| requests[3].get("input"))
+        .expect("messages or input")
+        .to_string();
     assert!(
         last_messages.contains("rounds have passed since your last successful change"),
         "the steer must precede the final round: {last_messages}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_then_no_progress_is_steered_then_stopped_like_a_cap() {
+    assert_write_then_no_progress_stops("chat").await;
+}
+
+/// Review fix 5 (RED first): the Responses loop had no brake at all, so the same
+/// stall ran to the round cap on that wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_then_no_progress_is_stopped_on_the_responses_wire_too() {
+    assert_write_then_no_progress_stops("responses").await;
 }
