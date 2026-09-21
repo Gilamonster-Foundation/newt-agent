@@ -219,7 +219,7 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
     };
     let msg = |cmd: &str| {
         let e = stdio_entry("srv", Some(cmd));
-        missing_stdio_command(&e, &dirs, Some(home), has)
+        missing_stdio_command(&e, &dirs, Some(home), false, has)
     };
     let m = msg("nope").expect("bare command not on PATH");
     assert!(m.contains("`srv`") && m.contains(r#""nope""#), "{m}");
@@ -227,7 +227,14 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
     assert!(msg("~/tool").is_none() && msg("~/gone").is_some());
     assert!(msg("/abs/x").is_none() && msg("/abs/y").is_some());
     assert!(msg("x\u{1b}y").unwrap().contains("\\u{1b}"));
+    // Relative pathed commands depend on the spawn cwd: never flagged.
+    assert!(msg("./bin/x").is_none() && msg("tools/x").is_none());
+    // Windows bare commands need PATHEXT: skipped; absolute still checked.
+    let e = stdio_entry("srv", Some("npx"));
+    assert!(missing_stdio_command(&e, &dirs, Some(home), true, has).is_none());
+    let e = stdio_entry("srv", Some("/abs/y"));
+    assert!(missing_stdio_command(&e, &dirs, Some(home), true, has).is_some());
     let mut http = stdio_entry("h", None);
     http.transport = TransportKind::Http;
-    assert!(missing_stdio_command(&http, &dirs, Some(home), has).is_none());
+    assert!(missing_stdio_command(&http, &dirs, Some(home), false, has).is_none());
 }
