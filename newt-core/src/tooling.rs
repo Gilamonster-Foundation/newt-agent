@@ -51,6 +51,16 @@ impl Phase {
         Self::Clean,
     ];
 
+    /// Whether a PASSING run of this phase is evidence of progress after an edit:
+    /// the two gates, `test` and `check`. `format`, `lint`, `clean` and `setup`
+    /// pass trivially or say nothing about behaviour, so a model looping on them
+    /// must not reset the no-progress brake. Part of the fixed vocabulary, so it
+    /// lives here beside the phase names rather than as per-run configuration.
+    #[must_use]
+    pub fn is_gate(self) -> bool {
+        matches!(self, Self::Test | Self::Check)
+    }
+
     /// The stable string key (the TOML field name).
     #[must_use]
     pub fn as_str(self) -> &'static str {
