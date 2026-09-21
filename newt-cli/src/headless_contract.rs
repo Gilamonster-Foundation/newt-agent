@@ -146,6 +146,7 @@ pub fn terminal(
         Some(TurnEndReason::NarrationFinalRound) if !smart_harness => Terminal::Completed,
         Some(
             reason @ (TurnEndReason::RoundCap
+            | TurnEndReason::RunAllowance
             | TurnEndReason::Empty
             | TurnEndReason::Cancelled
             | TurnEndReason::AwaitingOperator
@@ -192,7 +193,11 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // `newt-tui/src/chat.rs` on an operator interrupt — but an abandoned
         // run did not finish either, so it files the same way rather than
         // falling through to a wildcard.
-        Terminal::StoppedShort(TurnEndReason::RoundCap | TurnEndReason::Cancelled) => "timeout",
+        // `RunAllowance` (#2313, `--run-allowance`) is a budget wall just like the
+        // round cap: same bucket, no new vocabulary value.
+        Terminal::StoppedShort(
+            TurnEndReason::RoundCap | TurnEndReason::RunAllowance | TurnEndReason::Cancelled,
+        ) => "timeout",
         // #2315: the model delivered an answer the harness's own verification
         // did not confirm. That is a real attempt at a terminal state; whether
         // it passes is the suite verifier's call (A13), so it is never `timeout`,
@@ -545,6 +550,7 @@ mod tests {
         TurnEndReason::AwaitingOperator,
         TurnEndReason::RepairExhausted,
         TurnEndReason::VerificationIncomplete,
+        TurnEndReason::RunAllowance,
     ];
 
     fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
@@ -605,6 +611,7 @@ mod tests {
             TurnEndReason::AwaitingOperator => 7,
             TurnEndReason::RepairExhausted => 8,
             TurnEndReason::VerificationIncomplete => 9,
+            TurnEndReason::RunAllowance => 10,
         }
     }
 
@@ -911,6 +918,17 @@ mod tests {
              Completed|ModelError. #2215 emitted `round_cap`, which the bench's \
              closed enum cannot parse, so the row vanished instead."
         );
+    }
+
+    /// U4a: an exhausted `--run-allowance` is filed like the round cap — a
+    /// budget wall (`timeout`, `incomplete`), never `harness_error`, and no new
+    /// value in the pinned outcome vocabulary.
+    #[test]
+    fn a_run_allowance_exit_files_like_a_round_cap() {
+        let t = terminal(true, None, Some(TurnEndReason::RunAllowance), false);
+        assert_eq!(outcome_label(t), "timeout");
+        assert_eq!(status_label(t), "incomplete");
+        assert!(permitted_outcomes().contains(&outcome_label(t)));
     }
 
     #[test]
