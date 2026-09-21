@@ -229,11 +229,23 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
     assert!(msg("x\u{1b}y").unwrap().contains("\\u{1b}"));
     // Relative pathed commands depend on the spawn cwd: never flagged.
     assert!(msg("./bin/x").is_none() && msg("tools/x").is_none());
-    // Windows bare commands need PATHEXT: skipped; absolute still checked.
+    // Absoluteness is decided from the string under the `windows` flag, not the host.
+    let has_w = |p: &Path| p == Path::new("C:\\abs\\x");
+    let win = |cmd: &str| {
+        missing_stdio_command(
+            &stdio_entry("srv", Some(cmd)),
+            &dirs,
+            Some(home),
+            true,
+            has_w,
+        )
+    };
+    assert!(win("C:\\abs\\x").is_none() && win("C:\\abs\\y").is_some());
+    assert!(win("C:/abs/y").is_some() && win("\\\\host\\s\\y").is_some());
+    assert!(win("/abs/y").is_none(), "no drive: relative on Windows");
+    // Windows bare commands need PATHEXT: skipped.
     let e = stdio_entry("srv", Some("npx"));
     assert!(missing_stdio_command(&e, &dirs, Some(home), true, has).is_none());
-    let e = stdio_entry("srv", Some("/abs/y"));
-    assert!(missing_stdio_command(&e, &dirs, Some(home), true, has).is_some());
     let mut http = stdio_entry("h", None);
     http.transport = TransportKind::Http;
     assert!(missing_stdio_command(&http, &dirs, Some(home), false, has).is_none());
