@@ -722,14 +722,33 @@ async fn headless_with_an_exhausted_run_allowance_refuses_dispatch_before_any_re
         .arg("--events")
         .arg(&events_path)
         .args(["--run-allowance", "0"])
+        // Changed ON PURPOSE (was `.failure()`): exhaustion is now a TYPED, clean
+        // stop filed like the round cap (exit 0, `timeout`/`incomplete`), with a
+        // harness-written notice — not an untyped `harness_error`.
         .assert()
-        .failure()
+        .success()
         .stdout(predicates::str::contains("run allowance is exhausted"));
 
     assert!(
         requests.lock().expect("request capture lock").is_empty(),
         "an exhausted run allowance must not reach the model"
     );
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
+        .expect("events")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    let result = lines
+        .iter()
+        .find(|r| r["kind"] == "solve_result")
+        .expect("solve_result");
+    assert_eq!(result["end_reason"], "Some(RunAllowance)", "{result}");
+    assert_eq!(result["status"], "incomplete");
+    let contract = lines
+        .iter()
+        .find(|r| r.get("contract_version").is_some())
+        .expect("contract");
+    assert_eq!(contract["outcome"], "timeout");
 }
 
 /// #2313: a configured, non-exhausted run allowance is reported in the
