@@ -1814,6 +1814,29 @@ fn announce_tool_activity(name: &str) {
     }
 }
 
+/// U4b: the no-progress brake's start-of-round gate, shared by every loop arm
+/// that owns rounds (the SAME place the read-only nudge lives: the arm's
+/// `WorkflowRuntimeState`). A steer is one user message; a stop ends the turn as
+/// a typed `NoProgress` with a harness-written notice and NO model summary call
+/// (a summary before the round cap would break BHV-ROUND-002).
+macro_rules! no_progress_gate {
+    ($runtime:expr, $messages:expr, $end_reason:expr, $solve_obs:expr, $usage:expr, $halluc:expr) => {
+        match $runtime.no_progress_verdict() {
+            NoProgress::Continue => {}
+            NoProgress::Steer(text) => {
+                $messages.push(serde_json::json!({ "role": "user", "content": text }));
+            }
+            NoProgress::Stop => {
+                if let Some(slot) = &mut $end_reason {
+                    **slot = Some(crate::TurnEndReason::NoProgress);
+                }
+                observability::observe_harness_reply(&mut $solve_obs);
+                return Ok(($runtime.no_progress_notice(), false, $usage, $halluc));
+            }
+        }
+    };
+}
+
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -2241,6 +2264,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
         initiative: crate::initiative::effective_initiative(),
+        no_progress: crate::initiative::installed_no_progress(),
         ..Default::default()
     };
     // The matching workflow's round-cap grace horizon override, resolved once
@@ -2359,6 +2383,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
+            no_progress_gate!(
+                workflow_runtime,
+                messages,
+                end_reason,
+                solve_obs,
+                accumulated_usage,
+                hallucination_count
+            );
         }
 
         // Read-only round nudge: if the model has spent several consecutive
@@ -3956,6 +3988,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
+            if ok
+                && name == "lifecycle"
+                && execution.get().copied() == Some(crate::ExecOutcome::Passed)
+            {
+                workflow_runtime.note_verified_pass();
+            }
             if ok && meaningful_workflow_progress(name, &result) {
                 round_progress = true;
             }
@@ -4411,6 +4449,30 @@ struct WorkflowRuntimeState {
     /// Reset on any workspace-write round; drives the initiative action-forcing
     /// nudge.
     consecutive_read_only_rounds: usize,
+    /// U4b: the no-progress brake's thresholds (`[initiative.no_progress]`),
+    /// captured once per turn beside `initiative`.
+    no_progress: crate::initiative::NoProgressRounds,
+    /// Armed by the turn's first SUCCESSFUL workspace write. A turn that never
+    /// writes (an explain task) can never trip the brake.
+    wrote_this_turn: bool,
+    /// Consecutive rounds since the last successful write or passing `lifecycle`
+    /// run. Separate from `consecutive_read_only_rounds` on purpose: that counter
+    /// RESETS whenever its nudge fires, so it cannot measure a whole stall.
+    rounds_without_change: usize,
+    /// The one steer for this stall has been sent.
+    no_progress_steered: bool,
+    /// A passing `lifecycle` build/test ran this round (consumed by
+    /// `record_round_outcome`).
+    round_verified: bool,
+}
+
+/// What the no-progress brake wants done at the start of a round.
+enum NoProgress {
+    Continue,
+    /// Inject this one steer.
+    Steer(String),
+    /// End the turn: `TurnEndReason::NoProgress`, harness-written notice.
+    Stop,
 }
 
 impl WorkflowRuntimeState {
@@ -4458,7 +4520,61 @@ impl WorkflowRuntimeState {
         }
     }
 
+    /// A passing `lifecycle` build/test ran this round. THE reset rule, exactly:
+    /// only the harness's structured lane counts. A `run_command` exit code is not
+    /// evidence of a passing build (`| tail` masks it: 27 of the 29 rounds after
+    /// run 2483-a's edit were `passed`), and classifying commands by keyword would
+    /// be an invented classifier.
+    fn note_verified_pass(&mut self) {
+        self.round_verified = true;
+    }
+
+    /// U4b: decide at the start of a round. Armed only after a successful write;
+    /// `0` disables that half of the brake.
+    fn no_progress_verdict(&mut self) -> NoProgress {
+        if !self.wrote_this_turn {
+            return NoProgress::Continue;
+        }
+        let (n, cfg) = (self.rounds_without_change, self.no_progress);
+        if cfg.stop_after > 0 && n >= cfg.stop_after {
+            return NoProgress::Stop;
+        }
+        if cfg.steer_after > 0 && n >= cfg.steer_after && !self.no_progress_steered {
+            self.no_progress_steered = true;
+            return NoProgress::Steer(format!(
+                "No progress: {n} rounds have passed since your last successful change to the \
+                 workspace, and none of them ran a passing build or test. Stop varying the \
+                 command. Say what is done and what is not done, then stop."
+            ));
+        }
+        NoProgress::Continue
+    }
+
+    /// The harness-written reply when the brake ends the turn.
+    fn no_progress_notice(&self) -> String {
+        format!(
+            "Stopped: {} consecutive rounds changed nothing in the workspace and ran no \
+             passing build or test since the last successful change. Work done so far is \
+             left in the workspace; the hand-back names what changed. Re-run with a larger \
+             `[initiative.no_progress] stop_after` (0 disables) if the task needs longer.",
+            self.rounds_without_change
+        )
+    }
+
     fn record_round_outcome(&mut self, round_wrote: bool, round_progress: bool) {
+        // U4b: rounds since the last change. A successful write arms the brake and
+        // resets; a passing lifecycle run resets but leaves it armed.
+        let verified = std::mem::take(&mut self.round_verified);
+        if round_wrote {
+            self.wrote_this_turn = true;
+            self.rounds_without_change = 0;
+            self.no_progress_steered = false;
+        } else if verified {
+            self.rounds_without_change = 0;
+            self.no_progress_steered = false;
+        } else if self.wrote_this_turn {
+            self.rounds_without_change = self.rounds_without_change.saturating_add(1);
+        }
         // Initiative counter: consecutive rounds that changed nothing
         // in the workspace. Unconditional — independent of the error-evidence
         // workflow below — so it drives action-forcing on ANY task, not only
@@ -6818,6 +6934,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
         initiative: crate::initiative::effective_initiative(),
+        no_progress: crate::initiative::installed_no_progress(),
         ..Default::default()
     };
     // See the Ollama path: a matching workflow's grace-horizon override.
@@ -6915,6 +7032,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
+            no_progress_gate!(
+                workflow_runtime,
+                messages,
+                end_reason,
+                solve_obs,
+                accumulated_usage,
+                hallucination_count
+            );
             // Initiative action-forcing: the OpenAI-chat loop had no read-only
             // action nudge (only the Ollama loop did), so a model driven here
             // could read/plan its whole budget without ever editing. Fire the
@@ -8456,6 +8581,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
+            if ok
+                && name == "lifecycle"
+                && execution.get().copied() == Some(crate::ExecOutcome::Passed)
+            {
+                workflow_runtime.note_verified_pass();
+            }
             if ok && meaningful_workflow_progress(name, &result) {
                 round_progress = true;
             }
@@ -9345,6 +9476,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState {
         initiative: crate::initiative::effective_initiative(),
+        no_progress: crate::initiative::installed_no_progress(),
         ..Default::default()
     };
     // See the OpenAI path: a matching workflow's grace-horizon override.
@@ -9439,6 +9571,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
                 messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
+            no_progress_gate!(
+                workflow_runtime,
+                messages,
+                end_reason,
+                solve_obs,
+                accumulated_usage,
+                hallucination_count
+            );
             // Initiative action-forcing — mirrors the OpenAI path.
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             if let Some(nudge) = workflow_runtime.action_forcing_nudge(remaining, step_ledger, None)
@@ -10793,6 +10933,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             capability_evidence.record(name, ok, execution.get().copied());
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
+            }
+            if ok
+                && name == "lifecycle"
+                && execution.get().copied() == Some(crate::ExecOutcome::Passed)
+            {
+                workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
                 round_progress = true;
