@@ -38,6 +38,7 @@ fn entry_from_env() -> Option<McpServerEntry> {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
     })
 }
 
