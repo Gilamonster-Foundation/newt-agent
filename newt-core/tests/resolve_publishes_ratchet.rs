@@ -41,7 +41,6 @@ const KNOWN_PUBLISHING_RESOLVES: &[(&str, usize)] = &[
     ("newt-tui/src/commands/meta.rs", 1),
     ("newt-tui/src/crew_form/mod.rs", 1),
     ("newt-tui/src/lib.rs", 3),
-    ("newt-tui/src/prompt.rs", 6),
     ("newt-tui/src/settings_form.rs", 2),
     ("newt-tui/src/wizard.rs", 1),
 ];
