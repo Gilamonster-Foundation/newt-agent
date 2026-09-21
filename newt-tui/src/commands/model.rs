@@ -240,6 +240,7 @@ pub(crate) fn dispatch(
                                 .map(|c| c.estimation)
                                 .unwrap_or_default(),
                             choice.kind,
+                            choice.api_key.as_deref(),
                         );
                         cache.insert(key, entry);
                         probe::save_cache(&cache);

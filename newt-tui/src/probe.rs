@@ -709,6 +709,7 @@ pub fn fetch_context_window(
     endpoint: &str,
     model: &str,
     kind: newt_core::BackendKind,
+    api_key: Option<&str>,
 ) -> Option<u32> {
     // Ask the backend (#backend-trait): Ollama reads /api/show, vLLM reads
     // /v1/models max_model_len (#1195) — the per-API impl owns which. Sync
@@ -720,7 +721,7 @@ pub fn fetch_context_window(
                 .build()
                 .ok()?;
             newt_core::backend_probe::api_for(kind)
-                .context_window(&client, endpoint, model, None)
+                .context_window(&client, endpoint, model, api_key)
                 .await
         })
     })
@@ -741,6 +742,7 @@ pub fn ensure_context_window(
     model: &str,
     trust_declared: bool,
     kind: newt_core::BackendKind,
+    api_key: Option<&str>,
 ) -> bool {
     // Empirical mode keeps the original fetch-once contract: when the window is
     // already known, do nothing — a reined-down safe_context must persist.
@@ -752,7 +754,7 @@ pub fn ensure_context_window(
     // safe_context below in trust-declared mode.
     let mut changed = false;
     if entry.context_window.is_none() {
-        let Some(window) = fetch_context_window(endpoint, model, kind) else {
+        let Some(window) = fetch_context_window(endpoint, model, kind, api_key) else {
             return false;
         };
         entry.context_window = Some(window);
@@ -810,8 +812,9 @@ pub fn refresh_context_window(
     model: &str,
     trust_declared: bool,
     kind: newt_core::BackendKind,
+    api_key: Option<&str>,
 ) -> bool {
-    let Some(window) = fetch_context_window(endpoint, model, kind) else {
+    let Some(window) = fetch_context_window(endpoint, model, kind, api_key) else {
         return false;
     };
     let mut changed = entry.context_window != Some(window);
@@ -1324,6 +1327,7 @@ pub fn full_probe(
     mut progress: impl FnMut(&str),
     est: TokenEstimation,
     kind: newt_core::BackendKind,
+    api_key: Option<&str>,
 ) -> FullProbeReport {
     let mut notes = Vec::new();
 
@@ -1352,7 +1356,7 @@ pub fn full_probe(
     // the active (empirical) discovery driver, so it keeps the conservative
     // bootstrap-if-none behaviour; the passive session path
     // (`ensure_context_window`) delivers the trust-declared default.
-    refresh_context_window(entry, endpoint, model, false, kind);
+    refresh_context_window(entry, endpoint, model, false, kind, api_key);
 
     // 3. Thinking probe + calibration bootstrap (§4.3 / §4.4).
     let mut emits_thinking = entry.emits_thinking.unwrap_or(false);

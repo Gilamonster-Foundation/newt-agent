@@ -65,6 +65,17 @@ pub fn print_newt(msg: &str, color: bool, verbose: bool) {
     println!("{}", newt_line(msg, color, verbose));
 }
 
+/// The marker printed before a reply's first line.
+pub const REPLY_MARKER: &str = "▸  ";
+
+/// Display width of [`REPLY_MARKER`] (pinned by a test).
+pub const REPLY_MARKER_COLS: usize = 3;
+
+/// Wrap width for Markdown rendered after the reply marker (#2442).
+pub fn reply_cols(cols: usize) -> usize {
+    cols.saturating_sub(REPLY_MARKER_COLS)
+}
+
 /// The narrator line [`print_newt`] prints, as a string.
 ///
 /// Split out so a caller holding a [`crate::tty::PromptWindow`] can route the
@@ -1626,4 +1637,39 @@ pub(super) fn with_migration_notices<T>(
         let _ = notice.diagnostic(caps, false, std::io::stderr());
     }
     result
+}
+
+#[cfg(all(test, feature = "markdown"))]
+mod reply_wrap_tests {
+    use super::*;
+    use crate::agentic::{render_markdown, RenderOpts};
+
+    /// #2442: the `▸  ` marker is printed outside the Markdown renderer, so a
+    /// first line wrapped to the full width overflowed and the terminal
+    /// split it mid-word. Marker + first line must fit in `cols`.
+    #[test]
+    fn marker_plus_first_line_fits_terminal_width() {
+        let cols = 20;
+        let out = render_markdown(
+            "alpha bravo charlie delta echo foxtrot",
+            RenderOpts {
+                color: true,
+                cols: reply_cols(cols),
+            },
+        );
+        let first = out.lines().next().unwrap();
+        let w = crate::tty::width::str_width(&crate::tty::width::strip_ansi(first));
+        assert!(
+            REPLY_MARKER_COLS + w <= cols,
+            "first line {first:?} is {w} cols"
+        );
+    }
+
+    #[test]
+    fn marker_width_matches_constant() {
+        assert_eq!(
+            crate::tty::width::str_width(REPLY_MARKER),
+            REPLY_MARKER_COLS
+        );
+    }
 }

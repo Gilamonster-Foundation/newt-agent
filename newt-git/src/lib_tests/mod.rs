@@ -147,6 +147,10 @@ mod ambient_environment {
 
         // Unscrubbed, that config changes what `git tag` builds: it either
         // refuses for want of an editor, or writes an annotated tag object.
+        // All three stdio streams are closed because there is a third outcome
+        // (#2483): with no editor configured git falls back to `vi`, which
+        // waits forever on an inherited terminal. Closing stdin alone is not
+        // enough — vim then reads its keys from a terminal on stderr.
         let unscrubbed = Command::new("git")
             .current_dir(p)
             .env("GIT_CONFIG_GLOBAL", &poison)
@@ -154,6 +158,9 @@ mod ambient_environment {
             .env_remove("GIT_EDITOR")
             .env_remove("VISUAL")
             .args(["tag", "poisoned"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .expect("git runs");
         if unscrubbed.success() {

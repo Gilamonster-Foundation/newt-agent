@@ -129,24 +129,128 @@ fn import_selection_never_silently_discards_rejected_entries() {
             issue: newt_core::mcp::McpImportIssue::UnknownField,
         }],
     };
-    assert!(
-        select_import_entries(report.clone(), None, true, Path::new("source.toml"))
-            .unwrap_err()
-            .to_string()
-            .contains("cannot import all")
-    );
+    assert!(select_import_entries(
+        report.clone(),
+        None,
+        true,
+        Path::new("source.toml"),
+        "--from-codex"
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("cannot import all"));
     assert!(select_import_entries(
         report.clone(),
         Some("rejected"),
         false,
-        Path::new("source.toml")
+        Path::new("source.toml"),
+        "--from-codex"
     )
     .unwrap_err()
     .to_string()
     .contains("unsupported fields"));
     assert_eq!(
-        select_import_entries(report, Some("valid"), false, Path::new("source.toml")).unwrap()[0]
+        select_import_entries(
+            report,
+            Some("valid"),
+            false,
+            Path::new("source.toml"),
+            "--from-codex"
+        )
+        .unwrap()[0]
             .name,
         "valid"
     );
+}
+
+#[test]
+fn import_without_selector_lists_names_as_commands() {
+    let report = McpImportParseReport {
+        entries: vec![
+            stdio_entry("zeta", Some("z")),
+            stdio_entry("alpha", Some("a")),
+        ],
+        rejected: vec![],
+    };
+    let err = select_import_entries(report, None, false, Path::new("s.json"), "--from-claude")
+        .unwrap_err()
+        .to_string();
+    let a = err
+        .find("newt mcp import --from-claude --name alpha")
+        .expect(&err);
+    let z = err
+        .find("newt mcp import --from-claude --name zeta")
+        .expect(&err);
+    assert!(a < z, "{err}");
+    assert!(err.contains("--all"), "{err}");
+}
+
+#[test]
+fn import_listing_never_renders_untrusted_names_as_commands() {
+    let report = McpImportParseReport {
+        entries: vec![
+            stdio_entry("ok-name", Some("a")),
+            stdio_entry("x; rm -rf ~", Some("b")),
+            stdio_entry("\u{1b}[31m", Some("c")),
+        ],
+        rejected: vec![],
+    };
+    let err = select_import_entries(report, None, false, Path::new("s"), "my dir/.mcp.json")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("newt mcp import 'my dir/.mcp.json' --name ok-name"),
+        "{err}"
+    );
+    assert!(!err.contains("--name x;"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err}");
+    assert!(
+        err.contains(r#""x; rm -rf ~""#) && err.contains(r#""\u{1b}[31m""#),
+        "{err}"
+    );
+}
+
+#[test]
+fn import_flags_stdio_command_that_resolves_to_nothing() {
+    let dirs = [PathBuf::from("/bin")];
+    let has = |p: &Path| {
+        p == Path::new("/bin/ok") || p == Path::new("/h/tool") || p == Path::new("/abs/x")
+    };
+    let msg = |cmd: &str| {
+        let e = stdio_entry("srv", Some(cmd));
+        missing_stdio_command(&e, &dirs, false, has)
+    };
+    let m = msg("nope").expect("bare command not on PATH");
+    assert!(m.contains("`srv`") && m.contains(r#""nope""#), "{m}");
+    assert!(msg("ok").is_none());
+    // The MCP launcher passes `command` to the spawn verbatim and never expands
+    // `~`, so EVERY `~`-prefixed command warns — even when the expansion exists
+    // (`~/tool` does under the fake home) — and says so, rather than "not found".
+    for cmd in ["~/tool", "~/gone", "~bob/bin/x", "~"] {
+        let m = msg(cmd).unwrap_or_else(|| panic!("{cmd} must warn"));
+        assert!(
+            m.contains("does not expand `~`") && m.contains("absolute path"),
+            "{m}"
+        );
+        assert!(!m.contains("was not found"), "{m}");
+    }
+    assert!(msg("/abs/x").is_none() && msg("/abs/y").is_some());
+    assert!(msg("x\u{1b}y").unwrap().contains("\\u{1b}"));
+    // Relative pathed commands depend on the spawn cwd: never flagged.
+    assert!(msg("./bin/x").is_none() && msg("tools/x").is_none());
+    // Absoluteness is decided from the string under the `windows` flag, not the host.
+    let has_w = |p: &Path| p == Path::new("C:\\abs\\x");
+    let win = |cmd: &str| missing_stdio_command(&stdio_entry("srv", Some(cmd)), &dirs, true, has_w);
+    assert!(win("C:\\abs\\x").is_none() && win("C:\\abs\\y").is_some());
+    assert!(win("C:/abs/y").is_some());
+    assert!(win("/abs/y").is_none(), "no drive: relative on Windows");
+    // A UNC path names a remote host from an UNTRUSTED file: probing it would
+    // open an SMB connection before import. Never probed, so never flagged.
+    assert!(win("\\\\host\\s\\y").is_none());
+    // Windows bare commands need PATHEXT: skipped.
+    let e = stdio_entry("srv", Some("npx"));
+    assert!(missing_stdio_command(&e, &dirs, true, has).is_none());
+    let mut http = stdio_entry("h", None);
+    http.transport = TransportKind::Http;
+    assert!(missing_stdio_command(&http, &dirs, false, has).is_none());
 }

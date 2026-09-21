@@ -370,3 +370,73 @@ fn a_host_127_the_shell_did_not_attribute_is_failed() {
     let own = "lookup: definitely-absent-2315: not found\n";
     assert_eq!(host(envelope(127, "", own, false)).1, ExecOutcome::Failed);
 }
+
+/// P0 U6: a timed-out confined run must say what happened and what to do —
+/// the limit, that the command was killed, and the lane for long builds — and
+/// the tool description must state the limit up front. Both texts come from one
+/// owner, so they cannot disagree.
+#[test]
+fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
+    let limit = agent_bridle::LimitsPolicy::default().default_timeout_secs;
+    let (text, class) = confined(
+        "cargo test",
+        envelope(124, "partial", "command timed out after 60s\n", true),
+    );
+    assert_eq!(class, ExecOutcome::TimedOut);
+    for needle in [
+        format!("{limit}s"),
+        "killed".into(),
+        "lifecycle".into(),
+        "action=build".into(),
+    ] {
+        let needle: String = needle;
+        assert!(text.contains(&needle), "missing {needle:?}: {text}");
+    }
+    assert!(text.contains("partial"), "partial output survives: {text}");
+
+    // An ordinary failure gets no timeout coaching.
+    let (plain, _) = confined("cargo test", failing_compile_envelope());
+    assert!(!plain.contains("action=build"), "{plain}");
+
+    let defs = crate::agentic::tools::tool_definitions();
+    let run_command = defs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["function"]["name"] == "run_command")
+        .unwrap();
+    let description = run_command["function"]["description"].as_str().unwrap();
+    assert!(
+        description.contains(&format!("{limit} seconds")) && description.contains("action=build"),
+        "the description must state the wall up front: {description}"
+    );
+}
+
+/// U6d: a model followed "use lifecycle action=build" by calling
+/// `phase="build"` ("unknown lifecycle phase"). The coaching must give the
+/// LITERAL call, with a real phase, in both the timeout result and the tool
+/// description (one owner for the text).
+#[test]
+fn timeout_coaching_gives_the_literal_lifecycle_call() {
+    const CALL: &str = r#"{"action":"build","phase":"test"}"#;
+    let (text, _) = confined("cargo test", envelope(124, "", "", true));
+    assert!(
+        text.contains(CALL),
+        "the result must show the call shape: {text}"
+    );
+    assert!(text.contains("not `build`"), "phase is not `build`: {text}");
+    let defs = crate::agentic::tools::tool_definitions();
+    let description = defs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["function"]["name"] == "run_command")
+        .unwrap()["function"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        description.contains(CALL),
+        "the description must too: {description}"
+    );
+}

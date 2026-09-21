@@ -100,21 +100,22 @@ pub enum McpCmd {
     /// (created if absent). Literal or active secret-bearing values make the
     /// selected import fail; environment references survive.
     Import {
-        /// Path to a Claude JSON or Codex TOML MCP config. Omit with a built-in
-        /// source flag.
+        /// Path to a Claude JSON or Codex TOML MCP config. An alternative to
+        /// --from-claude / --from-codex: give exactly one source.
         #[arg(
             required_unless_present_any = ["from_claude", "from_codex"],
             conflicts_with_all = ["from_claude", "from_codex"]
         )]
         path: Option<PathBuf>,
-        /// Import from `~/.claude.json`.
+        /// Import from `~/.claude.json` (instead of PATH).
         #[arg(long = "from-claude", conflicts_with = "from_codex")]
         from_claude: bool,
         /// Import from `$CODEX_HOME/config.toml` or `~/.codex/config.toml`.
         #[arg(long = "from-codex")]
         from_codex: bool,
-        /// Import exactly one named server.
-        #[arg(long, value_name = "NAME", required_unless_present = "all")]
+        /// Import exactly one named server. Omit --name and --all to list the
+        /// server names found in the source.
+        #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Import every server in the selected source.
         #[arg(long, conflicts_with = "name")]
@@ -856,6 +857,7 @@ fn select_import_entries(
     name: Option<&str>,
     all: bool,
     source: &Path,
+    selector: &str,
 ) -> anyhow::Result<Vec<McpServerEntry>> {
     report.entries.sort_by(|a, b| a.name.cmp(&b.name));
     if let Some(name) = name {
@@ -878,7 +880,35 @@ fn select_import_entries(
         ));
     }
     if !all {
-        bail!("choose exactly one selector: --name <NAME> or --all");
+        let mut names: Vec<&str> = report.entries.iter().map(|e| e.name.as_str()).collect();
+        names.extend(report.rejected.iter().filter_map(|r| r.name.as_deref()));
+        names.sort_unstable();
+        if names.is_empty() {
+            bail!("no MCP servers found in {}", source.display());
+        }
+        let (good, bad): (Vec<&str>, Vec<&str>) = names
+            .into_iter()
+            .partition(|n| validate_import_server_name(n).is_ok());
+        let sel = if selector
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/~+-".contains(c))
+        {
+            selector.to_string()
+        } else {
+            format!("'{}'", selector.replace('\'', "'\\''"))
+        };
+        let mut msg = format!("choose a server to import; found in {}:", source.display());
+        for n in good {
+            msg.push_str(&format!("\n  newt mcp import {sel} --name {n}"));
+        }
+        if !bad.is_empty() {
+            msg.push_str("\nthese names cannot be imported under that name:");
+            for n in bad {
+                msg.push_str(&format!("\n  {n:?}"));
+            }
+        }
+        msg.push_str("\nor import every server with --all");
+        bail!("{msg}");
     }
     if !report.rejected.is_empty() {
         let count = report.rejected.len();
@@ -1510,6 +1540,13 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     }
     let (source, format) =
         resolve_import_source(request.path, request.from_claude, request.from_codex)?;
+    let selector = if request.from_claude {
+        "--from-claude".to_string()
+    } else if request.from_codex {
+        "--from-codex".to_string()
+    } else {
+        source.display().to_string()
+    };
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))?;
     let imported = parse_import_entries(&text, format)
@@ -1517,8 +1554,12 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     if imported.entries.is_empty() && imported.rejected.is_empty() {
         bail!("no MCP server entries found in {}", source.display());
     }
-    let mut imported = select_import_entries(imported, request.name, request.all, &source)?;
+    let mut imported =
+        select_import_entries(imported, request.name, request.all, &source, &selector)?;
     let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
     for entry in &mut imported {
         validate_import_server_name(&entry.name)?;
         validate_imported_secret_locations(entry)?;
@@ -1526,6 +1567,10 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         // side effects of `--grant-net`: an adopted server must be connectable
         // and its persisted URL and permission host must agree byte-for-byte.
         canonicalize_import_http_url(entry)?;
+        if let Some(msg) = missing_stdio_command(entry, &path_dirs, cfg!(windows), |p| p.is_file())
+        {
+            writeln!(out, "warning: {msg}; imported anyway")?;
+        }
         let omitted = source_omissions.remove(&entry.name).unwrap_or_default()
             + sanitize_imported_secrets(entry);
         if omitted > 0 {
@@ -1777,6 +1822,61 @@ fn binary_candidates_in(
         candidates.push(v.join(command));
     }
     candidates
+}
+
+/// Absoluteness from the string under the target flavour, not the host:
+/// unix `/x`; windows `X:\` / `X:/` or a `\\` UNC prefix.
+fn is_absolute_for(command: &str, windows: bool) -> bool {
+    let b = command.as_bytes();
+    if windows {
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+            || command.starts_with("\\\\")
+    } else {
+        command.starts_with('/')
+    }
+}
+
+/// A stdio server whose `command` resolves to nothing, as a message (the
+/// command is untrusted, so Debug-quoted). Pathed commands must exist as given
+/// when absolute; bare ones must be on `path_dirs`. Relative pathed commands and
+/// UNC paths are skipped (spawn cwd differs; probing a UNC path would touch the
+/// network before import). A `~`-prefixed command ALWAYS warns: the MCP launcher
+/// (`newt-mcp-client` `spawn`) hands `command` to the OS verbatim and never
+/// expands `~`, so it fails at spawn even when the expansion exists. All I/O is
+/// injected.
+fn missing_stdio_command(
+    entry: &McpServerEntry,
+    path_dirs: &[PathBuf],
+    windows: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    let command = entry
+        .command
+        .as_deref()
+        .filter(|_| entry.transport == TransportKind::Stdio)?;
+    if command.starts_with('~') {
+        return Some(format!(
+            "MCP server `{}` command {command:?} starts with `~`, but the MCP launcher does not expand `~` at spawn; use an absolute path",
+            entry.name
+        ));
+    }
+    // Cannot judge, so never flag: a UNC path names a remote host taken from an
+    // UNTRUSTED file (probing it would open an SMB connection before import).
+    let unc = windows && command.starts_with("\\\\");
+    let found = if command.contains(['/', '\\']) {
+        unc || !is_absolute_for(command, windows) || exists(Path::new(command))
+    } else if windows {
+        // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
+        true
+    } else {
+        first_existing(&binary_candidates_in(path_dirs, None, command), exists).is_some()
+    };
+    (!found).then(|| {
+        format!(
+            "MCP server `{}` command {command:?} was not found",
+            entry.name
+        )
+    })
 }
 
 /// The first candidate that `exists`. Pure — order + existence predicate both

@@ -2282,6 +2282,7 @@ fn session_body(
                 &inf_model,
                 !real_context_discovery(&cfg, &inf_model),
                 inf_kind,
+                inf_key.as_deref(),
             );
         if updated {
             probe::save_cache(&cap_cache);
@@ -7427,6 +7428,7 @@ fn session_body(
                                 &inf_model,
                                 !real_context_discovery(&cfg, &inf_model),
                                 inf_kind,
+                                inf_key.as_deref(),
                             );
                         let cached_sc = entry.safe_context;
                         let cached_window = entry.context_window;
@@ -8620,14 +8622,14 @@ fn session_body(
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)
                                             .max(20);
-                                        print!("▸  ");
+                                        print!("{}", newt_core::agentic::REPLY_MARKER);
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
                                                 &reply,
                                                 newt_core::agentic::RenderOpts {
                                                     color: true,
-                                                    cols
+                                                    cols: newt_core::agentic::reply_cols(cols),
                                                 },
                                             )
                                         );
@@ -8657,12 +8659,15 @@ fn session_body(
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)
                                             .max(20);
-                                        print!("▸  ");
+                                        print!("{}", newt_core::agentic::REPLY_MARKER);
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
                                                 &plan.draft.markdown,
-                                                newt_core::agentic::RenderOpts { color, cols },
+                                                newt_core::agentic::RenderOpts {
+                                                    color,
+                                                    cols: newt_core::agentic::reply_cols(cols),
+                                                },
                                             )
                                         );
                                         println!();

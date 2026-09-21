@@ -32,7 +32,7 @@ pub(crate) fn resolve_edit_mode() -> newt_core::EditMode {
             _ => None,
         })
         .or_else(|| {
-            crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+            crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
                 .ok()
                 .and_then(|c| c.tui)
                 .map(|t| t.edit_mode)
@@ -67,7 +67,7 @@ pub(crate) fn resolve_gutter_setting() -> Option<u16> {
             }
         }
     }
-    crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+    crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
         .ok()
         .and_then(|c| c.tui)
         .and_then(|t| t.gutter)
@@ -86,7 +86,7 @@ pub(crate) fn footer_mode() -> newt_core::FooterMode {
             _ => {}
         }
     }
-    crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+    crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.footer)
@@ -178,7 +178,7 @@ pub(crate) fn active_prompt_template() -> String {
     std::env::var("NEWT_PROMPT")
         .ok()
         .or_else(|| {
-            crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+            crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
                 .ok()
                 .and_then(|c| c.tui)
                 .and_then(|t| t.prompt)
@@ -192,11 +192,13 @@ pub(crate) fn active_prompt_template() -> String {
 /// backslash/TOML escaping mistake is visible at a glance.
 pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
     let template = active_prompt_template();
-    let model = crate::migration_notices::read(|report| newt_core::Config::resolve_runtime(report))
-        .ok()
-        .and_then(|c| super::resolve_backend_choice(&c).ok())
-        .map(|choice| choice.display_model().to_string())
-        .unwrap_or_default();
+    let model = crate::migration_notices::read(|report| {
+        newt_core::Config::resolve_runtime_unpublished(report)
+    })
+    .ok()
+    .and_then(|c| super::resolve_backend_choice(&c).ok())
+    .map(|choice| choice.display_model().to_string())
+    .unwrap_or_default();
     let is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
     let preview = expand_prompt_tokens(&template, workspace, &model, is_vi);
     (template, preview)
@@ -214,7 +216,7 @@ pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
 /// `\w` workspace basename, `\W` full path, `\v` newt version.
 pub(crate) fn prompt_str(workspace: &str, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
-        crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+        crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
             .ok()
             .and_then(|c| c.tui)
             .and_then(|t| t.prompt)
@@ -412,5 +414,49 @@ mod footer_tests {
         );
         // A leading `"""` that is NOT alone on the first line is not a fence.
         assert!(!crate::footer_continues("\"\"\" inline text"));
+    }
+}
+
+/// #2488: the prompt readers run on every prompt draw and only read a value, so
+/// they must not republish the process-global runtime settings. Mirrors
+/// `newt-core`'s `config_tests/reads_do_not_publish.rs`.
+#[cfg(test)]
+mod reads_do_not_publish {
+    use super::*;
+    use newt_core::initiative::{self, Initiative, InitiativeConfig, InitiativeRounds};
+
+    fn published_patient_rounds() -> Option<usize> {
+        initiative::initiative_config().map(|c| c.rounds.patient)
+    }
+
+    #[test]
+    fn prompt_readers_do_not_republish_runtime_settings() {
+        let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        initiative::set_initiative_config(InitiativeConfig {
+            default: Some(Initiative::Eager),
+            families: Default::default(),
+            rounds: InitiativeRounds {
+                patient: 91,
+                measured: 92,
+                decisive: 93,
+                eager: 94,
+            },
+        });
+
+        let _ = resolve_edit_mode();
+        assert_eq!(published_patient_rounds(), Some(91), "resolve_edit_mode");
+        #[cfg(feature = "rich-tui")]
+        {
+            let _ = resolve_gutter_setting();
+            assert_eq!(published_patient_rounds(), Some(91), "gutter");
+        }
+        let _ = footer_mode();
+        assert_eq!(published_patient_rounds(), Some(91), "footer_mode");
+        let _ = active_prompt_template();
+        assert_eq!(published_patient_rounds(), Some(91), "prompt template");
+        let _ = prompt_str("/w", true, "m", true);
+        assert_eq!(published_patient_rounds(), Some(91), "prompt_str");
+        let _ = current_prompt_and_preview("/w");
+        assert_eq!(published_patient_rounds(), Some(91), "preview");
     }
 }
