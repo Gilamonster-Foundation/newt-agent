@@ -241,8 +241,14 @@ fn import_flags_stdio_command_that_resolves_to_nothing() {
         )
     };
     assert!(win("C:\\abs\\x").is_none() && win("C:\\abs\\y").is_some());
-    assert!(win("C:/abs/y").is_some() && win("\\\\host\\s\\y").is_some());
+    assert!(win("C:/abs/y").is_some());
     assert!(win("/abs/y").is_none(), "no drive: relative on Windows");
+    // A UNC path names a remote host from an UNTRUSTED file: probing it would
+    // open an SMB connection before import. Never probed, so never flagged.
+    assert!(win("\\\\host\\s\\y").is_none());
+    // `~user/…` is another user's home, which this check cannot resolve.
+    assert!(msg("~bob/bin/x").is_none());
+    assert!(msg("~/gone").is_some(), "plain ~/ is still checked");
     // Windows bare commands need PATHEXT: skipped.
     let e = stdio_entry("srv", Some("npx"));
     assert!(missing_stdio_command(&e, &dirs, Some(home), true, has).is_none());
