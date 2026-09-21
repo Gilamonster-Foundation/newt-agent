@@ -411,3 +411,32 @@ fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
         "the description must state the wall up front: {description}"
     );
 }
+
+/// U6d: a model followed "use lifecycle action=build" by calling
+/// `phase="build"` ("unknown lifecycle phase"). The coaching must give the
+/// LITERAL call, with a real phase, in both the timeout result and the tool
+/// description (one owner for the text).
+#[test]
+fn timeout_coaching_gives_the_literal_lifecycle_call() {
+    const CALL: &str = r#"{"action":"build","phase":"test"}"#;
+    let (text, _) = confined("cargo test", envelope(124, "", "", true));
+    assert!(
+        text.contains(CALL),
+        "the result must show the call shape: {text}"
+    );
+    assert!(text.contains("not `build`"), "phase is not `build`: {text}");
+    let defs = crate::agentic::tools::tool_definitions();
+    let description = defs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["function"]["name"] == "run_command")
+        .unwrap()["function"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        description.contains(CALL),
+        "the description must too: {description}"
+    );
+}
