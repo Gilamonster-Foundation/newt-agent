@@ -1243,6 +1243,13 @@ pub(crate) trait InputSurface {
     /// still compiling. `session_worker::tests::the_proxy_forwards_every_
     /// surface_method` exists to make that fail loudly instead.
     fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {}
+    /// Share the bounded retained-output archive with the terminal owner.
+    #[cfg(feature = "live-spill")]
+    fn set_spill_archive(
+        &mut self,
+        _archive: std::sync::Arc<crate::completed_spill::CompletedSpillArchive>,
+    ) {
+    }
     /// #1669 cockpit: a turn is starting, and this is the flag it races its
     /// work against. A surface that reads the keyboard WHILE a turn runs
     /// (the cockpit) trips it from Ctrl-C; every other surface leaves the
@@ -1643,6 +1650,13 @@ fn session_body(
         std::env::var("NEWT_RESUME").ok(),
         cfg.conversations.clone().unwrap_or_default().resume,
     );
+    let adoption_request = std::env::var("NEWT_ADOPT_FRAME").ok();
+    if let Some(selected) = adoption_request.as_deref() {
+        anyhow::ensure!(
+            smart_sessions::adoption_selection_matches(selected, &session_start),
+            "--adopt-frame requires its explicit --resume selection; remove conflicting conversation overrides"
+        );
+    }
     let ephemeral_session = session_start == SessionStart::Ephemeral;
     // Ephemeral sessions get NO store handle at all (17.7): nothing to
     // create rows, nothing to append turns, nothing to read past
@@ -1819,6 +1833,10 @@ fn session_body(
         SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
     let smart_startup_caveats = cap.caveats().clone();
     let smart_config = cfg.smart_harness.clone().filter(|config| config.enabled);
+    anyhow::ensure!(
+        adoption_request.is_none() || smart_config.is_some(),
+        "--adopt-frame requires [smart_harness] enabled = true"
+    );
     if let Some(config) = smart_config.as_ref() {
         newt_core::agentic::smart_harness::validate_isolation_runtime()?;
         // Local MCP processes inherit this capability when the pool starts.
@@ -1868,6 +1886,8 @@ fn session_body(
     #[cfg(feature = "live-spill")]
     let completed_spills =
         std::sync::Arc::new(crate::completed_spill::CompletedSpillArchive::default());
+    #[cfg(feature = "live-spill")]
+    surface.set_spill_archive(completed_spills.clone());
     // #1998: the human-only per-session tool-round override used to be a local
     // right here, which is why the escalation #1965 documents was unrecoverable
     // — nothing outside this function could read it. It now lives in
@@ -2731,6 +2751,10 @@ fn session_body(
         match store.claim(&active_conversation_id) {
             Ok(newt_core::ClaimOutcome::Claimed) => {}
             Ok(newt_core::ClaimOutcome::HeldBy { host, pid }) => {
+                anyhow::ensure!(
+                    adoption_request.is_none(),
+                    "cannot adopt a conversation held by another session"
+                );
                 claim_refused = true;
                 print_newt(
                     &format!(
@@ -2770,12 +2794,27 @@ fn session_body(
                 }
                 let _ = store.claim(&active_conversation_id);
             }
+            Err(e) if adoption_request.is_some() => {
+                return Err(e.context("cannot claim the selected conversation for frame adoption"))
+            }
             Err(e) => print_newt(
                 &format!("warning: could not claim the conversation ({e})"),
                 color,
                 verbose,
             ),
         }
+    }
+
+    if adoption_request.is_some() {
+        anyhow::ensure!(
+            resumed_at_start && !claim_refused,
+            "frame adoption requires a successfully resumed conversation"
+        );
+        let store = conversation_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("frame adoption requires a durable conversation store")
+        })?;
+        smart_sessions.adopt_selected(store, &active_conversation_id, mem_budget)?;
+        print_newt("Smart Harness will admit only the selected conversation as historical context; past execution remains unaccounted.", color, verbose);
     }
 
     // #1668: apply the resumed conversation's preference pin — AFTER the claim
@@ -7273,6 +7312,16 @@ fn session_body(
                         pending_clarification = None;
                     }
 
+                    // Pin before deriving ANY cognition value for this accepted
+                    // turn. Context/retrieval setup may block while another tab
+                    // changes a dial; wire intent and nested readers must keep
+                    // the same capture. This guard drops on every later exit.
+                    let _turn_binding =
+                        crate::session_worker::bind_turn(tabs.active().session_id());
+                    let cognition = newt_core::cognition::effective_cognition();
+                    let turn_api = choice.api;
+                    let turn_capabilities = choice.capability_decision();
+
                     // Pre-turn hardware snapshot: read the latest value the
                     // background sampler published (instant, never blocks). None
                     // unless verbose + a reachable DCGM (issue #414).
@@ -7850,24 +7899,18 @@ fn session_body(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // Psyche: the turn's cognition → `reasoning.effort` (via
-                    // ChatCtx.cognition). Effective precedence: a live `/cognition`
-                    // override wins; else the active persona's declared cognition
-                    // (installed as PERSONA_COGNITION on activation); else `None`.
-                    let cognition = newt_core::cognition::effective_cognition();
                     // Cognition always rides the Responses wire and may also
                     // project to Chat Completions when the endpoint explicitly
                     // advertises that extension. Otherwise say so once — never
                     // silently accept and ignore a live dial.
                     if cognition.is_some() && !cognition_scope_noted {
-                        let responses = std::env::var("NEWT_OPENAI_API")
-                            .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
+                        let responses = choice.kind == newt_core::BackendKind::Openai
+                            && turn_api == newt_core::OpenAiApi::Responses;
                         let capable_chat = choice.kind == newt_core::BackendKind::Openai
-                            && choice.capability_decision().chat_completions().cognition
-                                == Some(true);
+                            && turn_capabilities.chat_completions().cognition == Some(true);
                         if !responses && !capable_chat {
                             print_newt(
-                                "note: the active backend does not advertise a cognition generation policy — cognition is ignored.",
+                                "note: the active backend does not advertise cognition wire controls; the semantic selection is retained.",
                                 color,
                                 verbose,
                             );
@@ -8138,18 +8181,6 @@ fn session_body(
                     // visible throughout.
                     let _disclosure_guard =
                         newt_core::ocap::scoped_session_disclosure(session_disclosure.clone());
-                    // #1669: bind THIS TURN to the tab that is active right
-                    // now, and pin its psyche — both dropped when the turn
-                    // ends, which is what lets the next turn see a `/tab`
-                    // switch and a moved dial.
-                    //
-                    // Scoped exactly like the disclosure guard above, and for
-                    // the same reason: all three describe THIS turn. Hoisting
-                    // any of them to session start would attribute a later
-                    // tab's work to the startup tab and freeze the dials for
-                    // the life of the process.
-                    let _turn_binding =
-                        crate::session_worker::bind_turn(tabs.active().session_id());
                     let turn_smart_harness = if let Some(config) = &smart_config {
                         let launch = newt_core::config::HarnessLaunch {
                             workspace: std::path::Path::new(workspace),
@@ -8162,7 +8193,7 @@ fn session_body(
                             (&active_conversation_id, messages.len() > 2),
                             config,
                             &launch,
-                            (&inf_url, inf_kind, choice.api),
+                            (&inf_url, inf_kind, turn_api),
                             || newt_inference::smart_harness::build(config, &inf_url, inf_kind),
                         ) {
                             Ok(harness) => Some(harness),
@@ -8267,17 +8298,14 @@ fn session_body(
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         cognition,
-                                        chat_completions_capability: choice
-                                            .capability_decision().chat_completions(),
+                                        chat_completions_capability: turn_capabilities.chat_completions(),
+                                        responses_capability: turn_capabilities.responses(),
+                                        openai_api: turn_api,
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
                                         attempt_ledger: Some(&turn_attempts),
-                                        reasoning_replay_scope: choice
-                                            .capability_decision()
-                                            .reasoning_replay_scope(),
-                                        emits_leading_reasoning: choice
-                                            .capability_decision()
-                                            .emits_leading_reasoning(),
+                                        reasoning_replay_scope: turn_capabilities.reasoning_replay_scope(),
+                                        emits_leading_reasoning: turn_capabilities.emits_leading_reasoning(),
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the
@@ -9050,14 +9078,14 @@ fn session_body(
                                     };
                                     let gauge_budget = context_gauge_budget(
                                         inf_kind,
-                                        choice.api,
+                                        turn_api,
                                         eff_num_ctx,
                                         recovered_context_window.get(),
                                         eff_input_ceiling_pct,
                                         cognition,
                                         model_tune.and_then(|t| t.output_allowance),
-                                        choice.capability_decision().chat_completions(),
-                                        choice.capability_decision().reasoning_replay_scope(),
+                                        turn_capabilities.chat_completions(),
+                                        turn_capabilities.reasoning_replay_scope(),
                                         gauge_max_ok,
                                         gauge_safe,
                                     );

@@ -206,6 +206,12 @@ impl ExecRequest {
     pub fn env_grants(&self) -> &[(String, String)] {
         &self.env
     }
+
+    /// The exact prepared fence, for admission before this request is spawned.
+    #[must_use]
+    pub fn caveats(&self) -> &Caveats {
+        &self.caveats
+    }
 }
 
 /// Why a confined spawn did not run. Every variant is a refusal to weaken the
@@ -321,6 +327,43 @@ impl ConstrainedExecutor {
     /// kernel-enforced — so a platform/kernel without Landlock (or any OS fs
     /// backend) fails closed here rather than running the child unconfined.
     pub fn run(req: &ExecRequest) -> Result<ConfinedOutput, ExecRefused> {
+        Self::run_until_cancelled(req, None)
+    }
+
+    /// The same executor for model-visible async tools. Dropping this future
+    /// signals the existing wait loop to kill/reap the confined process group;
+    /// dropping a bare spawn_blocking handle alone would leave it running.
+    pub async fn run_async(req: ExecRequest) -> Result<ConfinedOutput, ExecRefused> {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct CancelOnDrop(Arc<AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let flag = Arc::clone(&cancel.0);
+        let result =
+            tokio::task::spawn_blocking(move || Self::run_until_cancelled(&req, Some(&flag)))
+                .await
+                .map_err(|error| ExecRefused::Spawn(std::io::Error::other(error)))?;
+        drop(cancel);
+        result
+    }
+
+    fn run_until_cancelled(
+        req: &ExecRequest,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<ConfinedOutput, ExecRefused> {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(ExecRefused::Spawn(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "confined execution cancelled before spawn",
+            )));
+        }
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
         // escapes the process group — can be terminated with one `cgroup.kill`.
@@ -393,19 +436,20 @@ impl ConstrainedExecutor {
             if let Some(s) = child.child.try_wait().map_err(ExecRefused::Spawn)? {
                 break s;
             }
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    #[cfg(target_os = "linux")]
-                    if let Some(cg) = &cgroup {
-                        cg.kill();
-                    }
-                    #[cfg(target_os = "windows")]
-                    kill_child_tree(&mut child.child, pgid, windows_job.as_ref());
-                    #[cfg(not(target_os = "windows"))]
-                    kill_child_tree(&mut child.child, pgid);
-                    timed_out = true;
-                    break child.child.wait().map_err(ExecRefused::Spawn)?;
+            let deadline_reached = deadline.is_some_and(|dl| Instant::now() >= dl);
+            let cancelled =
+                cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+            if deadline_reached || cancelled {
+                #[cfg(target_os = "linux")]
+                if let Some(cg) = &cgroup {
+                    cg.kill();
                 }
+                #[cfg(target_os = "windows")]
+                kill_child_tree(&mut child.child, pgid, windows_job.as_ref());
+                #[cfg(not(target_os = "windows"))]
+                kill_child_tree(&mut child.child, pgid);
+                timed_out = deadline_reached;
+                break child.child.wait().map_err(ExecRefused::Spawn)?;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -928,6 +972,83 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
     }
 }
 
+/// Prepare a build under the existing calibrated fence. Resolve operator
+/// tool homes before replacing HOME; no shell credentials or global target /
+/// compiler-cache authority are inherited. Cargo build scripts and tests inherit
+/// the same kernel fence as the compiler.
+#[must_use]
+pub fn build_tool_request(
+    workspace: &Path,
+    cwd: &Path,
+    program: impl Into<String>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+) -> ExecRequest {
+    let root = workspace.to_string_lossy();
+    let mut request = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        program,
+        args,
+        cwd,
+        build_tool_caveats(workspace),
+    )
+    .net_grant(NetGrant::DenyAll)
+    .env("HOME", root.as_ref())
+    .env("TMPDIR", root.as_ref())
+    .env(
+        "CARGO_TARGET_DIR",
+        workspace.join("target").to_string_lossy(),
+    )
+    // Operator Cargo config may name an out-of-fence compiler cache daemon.
+    // A confined build uses the compiler directly, not that ambient deputy.
+    .env("CARGO_NET_OFFLINE", "true")
+    .env("RUSTC_WRAPPER", "")
+    .env("RUSTC_WORKSPACE_WRAPPER", "");
+    for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+        if let Some(path) = operator_tool_home(name, default) {
+            request = request.env(name, path);
+        }
+    }
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = selected_developer_directory() {
+        // Xcode's Developer/usr/bin/cc is another xcrun shim. Prefer its
+        // actual compiler, which needs no per-user xcrun cache/frameworks.
+        paths.push(PathBuf::from(developer).join("Toolchains/XcodeDefault.xctoolchain/usr/bin"));
+        paths.push(PathBuf::from(developer).join("usr/bin"));
+        if let Some(sdk) = selected_macos_sdk() {
+            request = request.env("SDKROOT", sdk);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    if let Ok(path) = std::env::join_paths(paths) {
+        request = request.env("PATH", path.to_string_lossy());
+    }
+    request
+}
+
+fn operator_tool_home(name: &str, default: &str) -> Option<String> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(default)))
+        .filter(|path| path.is_absolute())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn selected_macos_sdk() -> Option<String> {
+    let developer = Path::new(selected_developer_directory()?);
+    [
+        "Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+        "SDKs/MacOSX.sdk",
+    ]
+    .into_iter()
+    .filter_map(|relative| developer.join(relative).canonicalize().ok())
+    .find(|path| path.is_dir() && path.starts_with(developer))
+    .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// A `Caveats` fence for a repo-configured **build / test / format tool** run on
 /// the model's edits (`build_check_cmd`, crew formatters, roadmap `verify`).
 ///
@@ -980,17 +1101,14 @@ pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[Str
 /// reopen the read-then-disclose path.
 fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     let mut roots = vec![workspace.to_string_lossy().into_owned()];
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     // (env var that overrides the default, default subdir under HOME)
     for (var, default) in [
         ("CARGO_HOME", ".cargo"),
         ("RUSTUP_HOME", ".rustup"),
         ("XDG_CACHE_HOME", ".cache"),
     ] {
-        if let Some(explicit) = std::env::var_os(var) {
-            roots.push(explicit.to_string_lossy().into_owned());
-        } else if let Some(home) = &home {
-            roots.push(home.join(default).to_string_lossy().into_owned());
+        if let Some(path) = operator_tool_home(var, default) {
+            roots.push(path);
         }
     }
     roots
@@ -999,6 +1117,68 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn already_cancelled_request_never_attempts_spawn() {
+        let request = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            "missing-program",
+            ["unused"],
+            "/missing",
+            workspace_confined_caveats(Path::new("/missing")),
+        );
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            matches!(ConstrainedExecutor::run_until_cancelled(&request, Some(&cancel)), Err(ExecRefused::Spawn(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+    }
+
+    #[test]
+    fn build_request_discovers_toolchain_before_replacing_home() {
+        let request = build_tool_request(Path::new("/ws"), Path::new("/ws"), "cargo", ["test"]);
+        let env: std::collections::BTreeMap<_, _> = request.env_grants().iter().cloned().collect();
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/ws"));
+        assert_eq!(
+            env.get("CARGO_TARGET_DIR").map(std::path::Path::new),
+            Some(Path::new("/ws").join("target").as_path())
+        );
+        for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+            if let Some(path) = operator_tool_home(
+                name,
+                if name == "CARGO_HOME" {
+                    ".cargo"
+                } else {
+                    ".rustup"
+                },
+            ) {
+                assert_eq!(env.get(name), Some(&path));
+                assert!(crate::caveats::permits_path(
+                    &request.caveats.fs_read,
+                    &path
+                ));
+                assert!(!crate::caveats::permits_path(
+                    &request.caveats.fs_write,
+                    &path
+                ));
+            }
+        }
+        assert!(env.keys().all(|name| [
+            "HOME",
+            "TMPDIR",
+            "PATH",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_NET_OFFLINE",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "SDKROOT"
+        ]
+        .contains(&name.as_str())));
+        assert_eq!(request.net_grant, NetGrant::DenyAll);
+        assert_eq!(request.caveats.exec, Scope::All);
+        assert_eq!(request.caveats.fs_write, Scope::only(["/ws".to_owned()]));
+    }
 
     #[test]
     fn agent_influenced_mints_under_a_kernel_strength_floor() {

@@ -236,6 +236,7 @@ fn permission_definition_with_default(
         }
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
         DenialKind::RemoteTool => ("call", "requires operator permission"),
+        DenialKind::Build => ("build/test", "requires confined build authority"),
         DenialKind::GitWrite => (
             "commit/stage via git",
             "outside the granted git-write authority",
@@ -701,6 +702,9 @@ fn ceiling_permits(
             newt_core::git_caveats::GitCaveats::from_session(ceiling).permits_commit()
         }
         newt_core::DenialKind::RemoteTool => false,
+        newt_core::DenialKind::Build => {
+            newt_core::confined_exec::build_tool_caveats(std::path::Path::new(target)).leq(ceiling)
+        }
     }
 }
 
@@ -1575,6 +1579,22 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         if requests.is_empty() {
             return Deny;
         }
+        // A prepared build request carries its exact projected fence. Check
+        // that fence before prompting as well as the named Build capability;
+        // returned authority is clamped again by mint().
+        if requests
+            .iter()
+            .any(|request| request.kind == newt_core::DenialKind::Build)
+            && (self
+                .preset_clamp
+                .as_ref()
+                .is_some_and(|ceiling| !baseline.leq(ceiling))
+                || self
+                    .delegation
+                    .is_some_and(|delegation| !baseline.leq(delegation.caveats())))
+        {
+            return Deny;
+        }
         // A filesystem manifest must not consume lawful pending siblings
         // before discovering that another target cannot survive the preset.
         let filesystem_batch = requests.iter().any(|request| {
@@ -1628,6 +1648,17 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
         let web = self.state.web_store.clone();
         for req in requests {
+            // Build grants are non-axis but still bounded by an explicit
+            // posture ceiling; a prompt cannot expand that ceiling.
+            if req.kind == newt_core::DenialKind::Build
+                && self
+                    .preset_clamp
+                    .as_ref()
+                    .is_some_and(|floor| !ceiling_permits(floor, req.kind, &req.target))
+            {
+                self.record(req, "deny", "preset-floor-build");
+                return Deny;
+            }
             // GitWrite is non-axis, so enforce the readonly preset before minting.
             if req.kind == newt_core::DenialKind::GitWrite {
                 if let Some(clamp) = &self.preset_clamp {

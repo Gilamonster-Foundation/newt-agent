@@ -22,7 +22,50 @@ can correct the plan or request a stop or report-only response. Recovery guidanc
 allows an exact permission request when the operator has not declined it and a
 grant is available, or an alternative within existing authority. An unresolved
 blocker remains incomplete work. These reminders neither grant permissions nor
-replace the tool gates or cancellation and round-budget limits.
+replace the tool gates or cancellation and round-budget limits. Recurring plan
+reminders show progress and step indexes as agent-maintained, advisory state.
+Step descriptions remain in the source plan rather than being repeated as host
+claims about tool availability or operator decisions.
+
+Recovered capability claims are historical context, not current observations.
+Explicit claims of freshly completed toolchain probes or CI attempts receive one
+bounded correction when this turn has no returned execution attempt. The correction
+uses current tool schemas and preserves permission gates; an unsupported final
+claim carries a visible harness evidence notice. Failed and denied attempts
+count as attempts, but do not prove availability or the claimed command result.
+This narrow check covers the observed probe wording, not arbitrary prose.
+Receipt-shaped lifecycle denials also require an observed execution or permission
+request. Lifecycle discovery and unavailable-run results advertise the explicit
+offline build action. Host-present shell absence guidance distinguishes this
+project-validation route from per-binary direct execution grants, which do not
+grant compiler descendants or their filesystem access. This guidance never
+retries or grants authority itself.
+
+Smart Harness also retains native execution outcomes in Agent Frame's existing
+verified occurrence journal, before display and independently of optional turn
+telemetry. Classification and recovery nudges receive bounded current-turn
+facts derived from that journal, with references to the actual occurrences and
+returns. Model-authored plans and summaries cannot establish these outcomes.
+An absent historical record remains unknown; only an explicitly accounted turn
+can establish zero calls. A recorded denial does not itself identify an operator
+decision, and a direct executable denial does not establish a confined Build
+denial. This evidence supplies context without changing authority or guaranteeing
+that the model chooses an available action.
+
+Navigation selections also accept a complete bare or `json` Markdown fence
+around the CID array. The raw auxiliary reply stays recorded; unknown CIDs,
+missing protected inputs, split tool exchanges, and over-budget selections
+remain refused. Prose and incomplete fences are not repaired, and classifier
+verdicts retain their strict JSON-string protocol.
+
+When a navigation selection includes a tool call, the host adds the generated
+result that frames it, so the model does not have to name harness-generated
+entries. A selection that omits the call itself is still refused, and the
+completed selection is validated against the byte budget like any other. The
+catalog prices that in: a card's `bytes` include the generated results its
+exchange brings, `max_bytes` is what is left after pinned entries and the
+re-read pointer, and an exchange is offered whole or not at all, so a selection
+that adds up is not refused for size or for a missing half.
 
 A successful built-in permission grant releases cached capability failures and
 typed failed native shell/lifecycle executions so the original operation can be
@@ -31,6 +74,20 @@ prove that permissions caused the failure. Refused or unavailable permission
 requests leave the cache unchanged. Untyped native error text and ordinary
 failures from other tools remain cached; every retry still passes through the
 normal tool gate, and executed-failure history is retained.
+
+For compiler/test subprocesses that cannot run under a literal executable grant,
+call `lifecycle` with `{"phase":"test","action":"build"}` (or `check`, `lint`,
+`format`). This requests explicit, once-only confined build authority. The
+resolved command and calibrated read roots are shown before approval. Build
+scripts and tests inherit workspace-only writes and denied network access;
+Cargo uses installed toolchains, cached dependencies and a workspace-local
+`target`. The ordinary `run` action and raw shell grants remain unchanged.
+Restricted preset/delegated ceilings and Smart Harness frame isolation still
+apply. Dependencies must already be cached; this action does not authorize
+network installation or shared-cache writes. Network denial includes loopback:
+tests that start localhost servers need a separately authorized execution
+policy. This action does not promise that a project's entire test suite can
+run offline.
 
 Confined shell and lifecycle calls refresh standing session and verified durable
 grants before starting a child, so a grant applies to the next call in the same

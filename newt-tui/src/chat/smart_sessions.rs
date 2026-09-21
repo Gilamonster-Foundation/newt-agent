@@ -10,9 +10,14 @@ use newt_core::{
 use newt_inference::smart_harness::Auxiliary;
 use serde_json::Value;
 
+pub(super) fn adoption_selection_matches(selected: &str, start: &crate::SessionStart) -> bool {
+    matches!(start, crate::SessionStart::ResumeNamed(name) if name == selected.trim())
+}
+
 pub(super) struct Sessions {
     startup_caveats: newt_core::Caveats,
     sessions: BTreeMap<String, CachedSession>,
+    adoption: Option<(String, Vec<Value>)>,
 }
 
 struct CachedSession {
@@ -26,7 +31,36 @@ impl Sessions {
         Self {
             startup_caveats,
             sessions: BTreeMap::new(),
+            adoption: None,
         }
+    }
+
+    /// Prepare only from the store's verified snapshot, never current wire input.
+    /// Reuse the existing persisted-compaction cut without invoking a summarizer.
+    pub(super) fn adopt_selected(
+        &mut self,
+        store: &newt_core::ConversationStore,
+        selected: &str,
+        budget: u32,
+    ) -> anyhow::Result<()> {
+        use newt_core::MemoryProvider;
+        let record = store.load_verified(selected)?;
+        let mut projection = newt_core::Summarizing::new(budget);
+        projection.restore_turns(&record.turns);
+        let mut messages = projection.build_messages("", "");
+        messages.pop(); // Empty new-task slot; the real current ask is appended later.
+        let history = messages.into_iter().skip(1).map(|message| {
+            serde_json::json!({"role":message.role.as_str(),"content":message.content})
+        }).collect();
+        self.adoption = Some((record.id, history));
+        Ok(())
+    }
+
+    fn adoption_history(&self, conversation: &str) -> Option<&[Value]> {
+        self.adoption
+            .as_ref()
+            .filter(|(id, _)| id == conversation)
+            .map(|(_, history)| history.as_slice())
     }
 
     fn preflight(
@@ -77,13 +111,25 @@ impl Sessions {
             );
             return Ok(cached.harness.clone());
         }
-        let session =
-            config.open_conversation(launch, conversation.0, conversation.1, auxiliary.manifest)?;
+        let session = match self.adoption_history(conversation.0) {
+            Some(history) => {
+                config.adopt_conversation(launch, conversation.0, history, auxiliary.manifest)?
+            }
+            None => config.open_conversation(
+                launch,
+                conversation.0,
+                conversation.1,
+                auxiliary.manifest,
+            )?,
+        };
         let harness = Arc::new(SmartHarness::new(
             session,
             auxiliary.complete,
             config.adjudication.clone(),
         )?);
+        if self.adoption_history(conversation.0).is_some() {
+            self.adoption = None;
+        }
         self.sessions.insert(
             conversation.0.to_owned(),
             CachedSession {
@@ -134,6 +180,235 @@ mod tests {
                 hermetic: false,
             }
         }
+    }
+
+    /// Grounds adoption scope in a verified durable conversation snapshot;
+    /// the selected snapshot must never follow a later tab switch.
+    #[test]
+    fn adoption_snapshot_is_verified_and_bound_to_one_conversation() {
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let store =
+            newt_core::ConversationStore::new(storage.path(), fixture.workspace.path(), 100)
+                .unwrap();
+        let selected = store.create("selected", None).unwrap();
+        store
+            .append_turn(&selected, "preserve this task", "historical cargo denial")
+            .unwrap();
+        let mut sessions = Sessions::new(fixture.caveats.clone());
+        sessions.adopt_selected(&store, &selected, 4096).unwrap();
+        assert!(sessions.adoption_history("other").is_none());
+        let history = sessions.adoption_history(&selected).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["content"], "preserve this task");
+        assert_eq!(history[1]["content"], "historical cargo denial");
+        assert!(history.iter().all(|message| message["role"] != "system"));
+        assert!(sessions
+            .adopt_selected(&store, "missing-conversation", 4096)
+            .is_err());
+        assert!(
+            sessions.adoption_history(&selected).is_some(),
+            "failed preparation preserves the selected snapshot"
+        );
+    }
+
+    #[test]
+    fn adoption_snapshot_uses_existing_persisted_compaction_cut() {
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let store =
+            newt_core::ConversationStore::new(storage.path(), fixture.workspace.path(), 100)
+                .unwrap();
+        let selected = store.create("selected", None).unwrap();
+        store
+            .append_turn(&selected, "obsolete task", "old blocker")
+            .unwrap();
+        let summary = "[CONTEXT COMPACTION — REFERENCE ONLY]\npreserve refactor edits";
+        newt_core::persist_compaction_summary(&store, &selected, summary).unwrap();
+        store
+            .append_turn(&selected, "latest saved instruction", "saved response")
+            .unwrap();
+        let mut sessions = Sessions::new(fixture.caveats.clone());
+        sessions.adopt_selected(&store, &selected, 4096).unwrap();
+        let history = sessions.adoption_history(&selected).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0]["content"], summary);
+        assert_eq!(history[1]["content"], "latest saved instruction");
+        assert!(!serde_json::to_string(history)
+            .unwrap()
+            .contains("old blocker"));
+    }
+
+    #[test]
+    fn adoption_consent_does_not_extend_to_other_tabs_or_reimport_after_restart() {
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let store =
+            newt_core::ConversationStore::new(storage.path(), fixture.workspace.path(), 100)
+                .unwrap();
+        let selected = store.create("selected", None).unwrap();
+        store
+            .append_turn(&selected, "old task", "old claim")
+            .unwrap();
+        let primary = (
+            "http://primary.invalid",
+            BackendKind::Openai,
+            OpenAiApi::ChatCompletions,
+        );
+        let build = || {
+            Ok(Auxiliary {
+                complete: Arc::new(|_| panic!("adoption must not run inference")),
+                manifest: serde_json::json!({"backend":"embedded","model":"fixture","placement":"cpu"}),
+            })
+        };
+        let mut sessions = Sessions::new(fixture.caveats.clone());
+        sessions.adopt_selected(&store, &selected, 4096).unwrap();
+        assert!(sessions
+            .get(
+                ("other", true),
+                &fixture.config,
+                &fixture.launch(),
+                primary,
+                build
+            )
+            .is_err());
+        let harness = sessions
+            .get(
+                (&selected, true),
+                &fixture.config,
+                &fixture.launch(),
+                primary,
+                build,
+            )
+            .unwrap();
+        assert!(sessions.adoption_history(&selected).is_none());
+        assert!(harness.head().is_ok());
+        drop(harness);
+        drop(sessions);
+        store
+            .append_turn(&selected, "later database history", "not reimported")
+            .unwrap();
+        let mut reopened = Sessions::new(fixture.caveats.clone());
+        let restored = reopened
+            .get(
+                (&selected, true),
+                &fixture.config,
+                &fixture.launch(),
+                primary,
+                build,
+            )
+            .unwrap();
+        drop(restored);
+        drop(reopened);
+        let mut manifest = build().unwrap().manifest;
+        manifest["primary_api"] = serde_json::json!(primary.2.label());
+        let restored = fixture
+            .config
+            .open_conversation(&fixture.launch(), &selected, true, manifest)
+            .unwrap();
+        let messages = restored.restored_messages().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "notice and original historical messages only"
+        );
+        let text = serde_json::to_string(&messages).unwrap();
+        assert!(text.contains("old task") && text.contains("old claim"));
+        assert!(!text.contains("later database history") && !text.contains("not reimported"));
+    }
+
+    #[test]
+    fn adoption_selection_matches_normal_resume_trimming_but_rejects_overrides() {
+        use crate::SessionStart;
+        assert!(adoption_selection_matches(
+            " saved ",
+            &SessionStart::ResumeNamed("saved".into())
+        ));
+        for start in [
+            SessionStart::ResumeNamed("other".into()),
+            SessionStart::ResumeExact("saved".into()),
+            SessionStart::ResumeLatest,
+            SessionStart::Fresh,
+            SessionStart::Ephemeral,
+        ] {
+            assert!(!adoption_selection_matches("saved", &start), "{start:?}");
+        }
+    }
+
+    #[test]
+    fn adoption_refuses_tampered_source_before_preparing_any_history() {
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let store =
+            newt_core::ConversationStore::new(storage.path(), fixture.workspace.path(), 100)
+                .unwrap();
+        let selected = store.create("selected", None).unwrap();
+        store.append_turn(&selected, "u1", "a1").unwrap();
+        store.append_turn(&selected, "u2", "a2").unwrap();
+        let connection =
+            rusqlite::Connection::open(storage.path().join("conversations.db")).unwrap();
+        assert_eq!(connection.execute("UPDATE turns SET assistant='forged' WHERE conversation_id=?1 AND seq=(SELECT MIN(seq) FROM turns WHERE conversation_id=?1)", [&selected]).unwrap(), 1);
+        let mut sessions = Sessions::new(fixture.caveats.clone());
+        assert!(sessions.adopt_selected(&store, &selected, 4096).is_err());
+        assert!(sessions.adoption_history(&selected).is_none());
+        assert!(!fixture.config.frame_dir.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn adoption_applies_the_current_provider_disclosure_guard_when_persisting() {
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let store =
+            newt_core::ConversationStore::new(storage.path(), fixture.workspace.path(), 100)
+                .unwrap();
+        let selected = store.create("selected", None).unwrap();
+        let secret = "opaque-provider-credential-fixture-6482";
+        store.append_turn(&selected, "old task", secret).unwrap();
+        let primary = (
+            "http://primary.invalid",
+            BackendKind::Openai,
+            OpenAiApi::ChatCompletions,
+        );
+        let manifest =
+            serde_json::json!({"backend":"embedded","model":"fixture","placement":"cpu"});
+        let mut sessions = Sessions::new(fixture.caveats.clone());
+        sessions.adopt_selected(&store, &selected, 4096).unwrap();
+        assert!(
+            serde_json::to_string(sessions.adoption_history(&selected).unwrap())
+                .unwrap()
+                .contains(secret)
+        );
+        let _disclosure = newt_core::ocap::scoped_session_disclosure(
+            newt_core::ocap::session_disclosure_filter(Some(secret)),
+        );
+        let harness = sessions
+            .get(
+                (&selected, true),
+                &fixture.config,
+                &fixture.launch(),
+                primary,
+                || {
+                    Ok(Auxiliary {
+                        complete: Arc::new(|_| panic!("adoption must not run inference")),
+                        manifest: manifest.clone(),
+                    })
+                },
+            )
+            .unwrap();
+        drop(harness);
+        drop(sessions);
+        let mut resolved = manifest;
+        resolved["primary_api"] = serde_json::json!(primary.2.label());
+        let restored = fixture
+            .config
+            .open_conversation(&fixture.launch(), &selected, true, resolved)
+            .unwrap();
+        let text = serde_json::to_string(&restored.restored_messages().unwrap()).unwrap();
+        assert!(
+            !text.contains(secret),
+            "provider value must never enter the frame"
+        );
+        assert!(text.contains("REDACTED"), "{text}");
     }
 
     /// Exercises the same lazy factory used by chat; the real pinned-file test

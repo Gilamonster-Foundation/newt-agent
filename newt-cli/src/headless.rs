@@ -269,22 +269,14 @@ fn headless_principal(
 /// The cognition level this backend can actually receive from Newt. Responses
 /// always has a defined `reasoning.effort` projection; Chat Completions must
 /// explicitly opt into the local generation fields; Ollama has no projection.
-/// The contract and driver both consume this one answer.
+/// This describes wire projection only; the driver retains semantic intent.
 fn projected_cognition(
     cognition: Option<Cognition>,
     kind: BackendKind,
     api: OpenAiApi,
     chat_capability: ChatCompletionsCapability,
 ) -> Option<Cognition> {
-    match (kind, api) {
-        (BackendKind::Openai, OpenAiApi::Responses) => cognition,
-        (BackendKind::Openai, OpenAiApi::ChatCompletions)
-            if chat_capability.cognition == Some(true) =>
-        {
-            cognition
-        }
-        _ => None,
-    }
+    newt_core::agentic::projected_cognition(cognition, kind, api, chat_capability)
 }
 
 /// Run one task headless and emit its trace. Returns the process exit code:
@@ -498,6 +490,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     dc.run_allowance = run_allowance;
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
+    dc.responses_capability = decision.responses();
+    dc.openai_api = api;
     dc.reasoning_replay_scope = decision.reasoning_replay_scope();
     // Paired with the line above ON PURPOSE. `headless` resolves the
     // model's capabilities from the same backend the TUI does; omitting this
@@ -608,7 +602,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // uses (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
     let mut driver = TurnDriver::new(dc)
-        .with_cognition(cognition)
+        .with_cognition(runtime.cognition)
         .with_tenacity(runtime.tenacity)
         .with_initiative(runtime.initiative);
     if runtime.crew {
@@ -836,6 +830,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             tenacity: tenacity_level,
             initiative: initiative_level,
             cognition: cognition_level,
+            semantic_cognition: o_opt.map(|o| o.semantic_cognition),
+            responses_capability: o_opt.and_then(|o| o.responses_capability.as_ref()),
+            reasoning_effort: o_opt.and_then(|o| o.reasoning_effort),
             crew: crew_level,
             ocap: if lane == HeadlessLane::Yolo {
                 "off"

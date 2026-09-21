@@ -1158,6 +1158,21 @@ completed-view resize and cleanup, and the existing terminal acceptance tier.
 export, permission previews, shell/Git change discovery, and Mermaid renderer
 or settings state-machine adoption. Those remain subsequent functional slices.
 
+## Step 13.4 — Operator inspection of retained output and pending requests
+
+**Branch:** `step-13.4-spill-inspection` · **Issue:** #2444.
+
+**What:** F4 opens the existing bounded session archive from the rich cockpit,
+including during a turn. A shared read-only text viewer supports search and
+horizontal scrolling. Pending interactions expose their original prompt text
+through the same viewer without answering the request or losing the draft.
+
+**Tests:** archive snapshots and eviction, key dispatch and search, plus real
+terminal checks for input ownership, draft preservation and non-approval.
+
+**Out of scope:** mouse activation of native scrollback, immutable interpreter
+payloads bound to OCAP grants, expired-output recovery and exact patch export.
+
 ---
 
 # Phase 14 - `newt dgx` command suite (9 steps)
@@ -1920,6 +1935,167 @@ fully-mocked unit tier, coverage ratchet.
   (`newt-core/src/agentic/mod.rs`, `compress.rs`). Salvage the `<plan>`/`<state>`
   ledger into the final summary; when rounds were hallucination/dead-tool
   dominated, say so rather than advising "raise max_tool_rounds".
+
+## Step 27.6 — Explicit confined lifecycle builds (#2446)
+
+**Branch:** `step-27.6-confined-lifecycle-builds`
+
+Restore a usable validation route when an installed compiler is unreachable
+under literal executable grants. Extend the existing `lifecycle` tool with
+`action=build`, an explicit once-only build permission and the existing
+calibrated `ConstrainedExecutor` fence. Resolve Cargo/Rustup and the macOS SDK
+before replacing the child's home; keep target/scratch writes in the workspace.
+
+**Acceptance:** actual Cargo compilation, build scripts and tests run under
+Seatbelt; declined authority launches nothing; toolchain reads do not grant the
+whole home directory; unrelated reads/writes and network remain denied. Preset,
+delegation and frame-isolation boundaries still apply.
+
+**Out of scope:** changing generic `exec:cargo` into unrestricted shell authority,
+network-enabled dependency installation, mutable shared cache/target writes,
+and expanding the embedded Git write surface.
+
+## Step 27.7 — Ground fresh capability claims in current execution (#2454)
+
+**Branch:** `step-27.7-capability-grounding`
+
+Prevent a resumed conversation from presenting remembered toolchain failures as
+fresh probes. Extend the existing capability checker with per-turn execution
+evidence, independent of optional telemetry. Before accepting an unsupported
+fresh-probe claim, offer one correction using the currently advertised tool
+schemas. Record that intervention through Agent Frame when Smart Harness is
+active. Preserve the answer and append an evidence notice if it remains
+unsupported, including streaming and round-limit exits.
+Cover the observed invented CI-attempt and operator-denial wording too. Make the
+explicit offline build action visible in compact discovery and unavailable-run
+guidance, without retrying or changing authority. Host-present shell absence
+guidance distinguishes explicit confined Build for project validation from
+per-binary direct execution grants, which do not grant compiler descendants.
+Recurring plan reminders carry
+only numeric progress and step indexes, labeled agent-maintained and advisory;
+agent-authored descriptions remain in the source plan, not fresh host guidance.
+
+**Acceptance:** the observed fabricated-probe answers are corrected or visibly
+qualified on all four provider wires; history retrieval alone is not execution
+evidence; returned failures and denials count as attempts; future intent and
+quoted history remain unchanged. Refusals, cancellation, tool support, round
+limits and permission boundaries remain effective.
+Genuine permission requests can ground denial claims without establishing that
+a command ran; lifecycle denials and completed execution outcomes get no build
+recovery suggestion. Plan reminders preserve action guidance and the full source
+plan without repeating fabricated capability or operator-denial claims.
+
+**Out of scope:** verifying arbitrary natural-language claims or exact command
+results, expanding Git authority, and changing the confinement policy.
+
+## Step 27.8 — Retain execution evidence for Smart Harness recovery (#2457)
+
+**Branch:** `step-27.8-frame-execution-evidence`
+
+Carry Newt's native execution outcome into the existing Agent Frame tool-return
+journal before presentation, independently of optional conversation telemetry.
+Reuse the current occurrence identities, content-addressed records, verified
+restore, and interruption states. Expose a derived ordered view since an explicit
+turn boundary; missing historical accounting remains unknown.
+
+Derive bounded recovery context from those records for Smart Harness
+classification, narration nudges, and unsupported-probe corrections. Separate
+admitted calls from native outcomes and explicit lifecycle Build requests.
+Retain invocation and return references without promoting model arguments,
+returned prose, or advisory plan descriptions into execution facts.
+
+**Acceptance:** a real failing process retains its typed failure and exact
+disclosed return with or without optional telemetry; all native outcomes survive
+cold restore; changed journal bytes refuse admission. Current-turn reset leaves
+historical and interrupted calls intact. Recovery distinguishes unknown history
+from an empty accounted turn, remains bounded, and ignores fabricated outcome
+text. Permission gates, cancellation, and existing round limits remain binding.
+
+**Out of scope:** automatic legacy-conversation adoption, reconstructing absent
+historical receipts, exact permission-decision provenance, arbitrary claim
+verification, and a guarantee that a model chooses the suggested next action.
+
+## Step 27.9 — Admit selected historical conversations into Frame (#2458)
+
+**Branch:** `step-27.9-frame-legacy-admission`
+
+Add explicit, default-off `--resume <conversation> --adopt-frame` admission for
+the selected saved conversation when Smart Harness is enabled. Verify stored
+history and reuse the existing persisted-compaction restore semantics. Bind
+admission to the successfully resolved and owned conversation, without extending
+it to unrelated tabs or selector overrides.
+
+Represent quoted imported transcript data with a distinct `Historical` event
+origin. Reuse existing addressed observations, projection, elision, and bounded
+retrieval. Historical claims are inspectable sources, not current operator
+instructions, new model replies, or witnessed tool executions. Publish the
+conversation locator only after complete durable admission; subsequent resumes
+restore that Frame without importing again.
+
+**Acceptance:** default refusal remains; explicit launch validation and
+conversation binding prevent accidental admission. Corrupt history and failed
+imports publish no usable locator. Projection, restart, and retrieval preserve
+historical origin and content without minting tool occurrences or satisfying
+tool-output/model-verdict authority checks. The latest operator task appears
+once, and existing isolation, disclosure, and permission gates remain enforced.
+
+**Out of scope:** reconstructing missing historical execution receipts,
+automatic adoption of other conversations, changing backend selection, and
+guaranteeing that the resumed model completes its task.
+
+
+## Step 27.11 — Accept complete navigation JSON envelopes (#2462)
+
+**Branch:** `step-27.11-nav-json-envelope`
+
+Reuse the existing code-fence helper to accept only a complete bare or `json`
+Markdown wrapper around a navigation CID array. Record and bound the original
+reply before parsing the unwrapped view. Selection admission remains the
+existing kernel decision; malformed proposals receive no deterministic fallback.
+
+**Acceptance:** bare JSON and whole fenced arrays work, including CRLF line
+endings. Outside prose, incomplete fences, and other language tags refuse.
+Unknown CIDs, omitted pins, split tool pairs, and oversized selections still
+fail. Raw replies remain byte-exact, and retained sources remain retrievable.
+
+**Out of scope:** classifier-verdict tolerance, deterministic selection repair,
+new record formats, and changes to authority or navigation budgets.
+
+## Step 27.12 — Complete the generated companions of a selected navigation source (#2463)
+
+**Branch:** `step-27.12-nav-generated-companions`
+
+The navigation catalog offers a tool call but not the generated, model-facing
+result entry that frames it, so a selection of that call was refused as "splits
+a tool exchange". Keep relevance selection with the auxiliary and let the host
+add only the generated companions of sources it already selected, reusing
+`complete_pairs`. The completed selection goes through the unchanged validator,
+including its final byte budget.
+
+**Acceptance:** with two real accounted tool batches and an older generated
+result omitted from the catalog, selecting the older call yields a legal
+exchange that keeps that result. Without the completion the same selection is
+refused as "splits a tool exchange". An omitted source call is still refused.
+
+The catalog is the selector's only price list and a refused selection fails the
+turn, so it offers only what can be selected and charges what the host charges.
+A tool exchange is offered whole or not at all, including at the catalog
+window's edge, and its cards show one `pairs` set. A card's `bytes` include the
+generated entries its exchange brings, each charged once. `max_bytes` is what
+remains after the brackets, the entries the host adds regardless, and the
+re-read pointer. A card that a required entry forces says `required`. Any
+selection that includes the required cards, takes each `pairs` group whole, and
+whose `bytes` sum to at most `max_bytes` is admitted; when something is elided
+the prices are exact to the byte, and otherwise the unused pointer reserve is
+left over.
+
+**Known gap:** completion pairs by provider wire id, so it does nothing for the
+Ollama wire format, whose results carry no id.
+
+**Out of scope:** provenance-based pairing, failing before the auxiliary call
+when the required set cannot fit, the 512-byte pointer reserve still hardcoded
+in the deterministic `project` fallback, classifier-verdict parsing, and any
+change to authority or to the validator.
 
 ### Status correction (2026-09-07) — measurement against the premise
 

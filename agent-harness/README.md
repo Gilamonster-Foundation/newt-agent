@@ -36,6 +36,18 @@ an operation had no side effects. Retrieval receipts and known host refusals
 use separate provenance variants. Frame persistence errors stop the writer;
 they are never relabelled as tool failures.
 
+`ToolReturn::Native` preserves the host's typed `ExecOutcome` in that same
+return record. Failed and timed-out native calls retain failure state; denied
+and unavailable outcomes retain their distinct classifications. These facts
+describe an execution envelope, not every command in a compound operation or
+an operator's permission decision. Untyped and older returns have no native
+outcome; their text cannot supply one.
+
+After `start_turn`, `current_turn_tool_calls` provides an ordered view over the
+existing occurrence ledger. Before an explicit boundary, including after
+restore, it returns `None`; a known empty turn is `Some` of an empty iterator.
+Resetting this view never deletes or relabels historical calls.
+
 `interrupt_tool_batch` closes unfinished protocol slots in original order:
 queued calls become `NotStarted`, started calls become `Uncertain`, and durable
 returns/failures remain observed even if presentation failed. Recovery notices
@@ -43,6 +55,13 @@ are attributed to the harness and point to retained sources. Restore performs
 this closure before returning. It never reruns a call. Requests and ordinary
 transcript replacement refuse an incomplete batch. A same-process host must
 close abandoned work before starting another turn.
+
+Hosts can explicitly admit quoted legacy context with
+`record_historical_message`. It uses the existing observation journal with
+`Historical` origin and a fixed textual wire envelope. Historical material
+remains selectable and retrievable after projection without becoming current
+operator or tool evidence. The host verifies and filters the imported source;
+the session does not reconstruct missing tool occurrences from transcript text.
 
 This unmerged experimental interface now writes session schema **2** and removes
 the old dispatch-only API. Writable restoration of schema 1 is explicitly

@@ -283,6 +283,10 @@ mod crew;
 mod find;
 
 #[cfg(test)]
+#[path = "reads_do_not_publish.rs"]
+mod reads_do_not_publish;
+
+#[cfg(test)]
 #[path = "execute_display.rs"]
 mod display;
 

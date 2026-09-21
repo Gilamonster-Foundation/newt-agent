@@ -657,6 +657,8 @@ pub(crate) struct Presenter {
     capture: PtyCapture,
     stream: TranscriptStream,
     pending_read: Option<SyncSender<anyhow::Result<ReadOutcome>>>,
+    #[cfg(feature = "live-spill")]
+    spills: Option<Arc<crate::completed_spill::CompletedSpillArchive>>,
     queued: VecDeque<String>,
     turn: Option<Turn>,
     /// The `suspended` edge detector for re-asserting raw mode after a modal.
@@ -830,6 +832,8 @@ impl Presenter {
             capture,
             stream: TranscriptStream::new(),
             pending_read: None,
+            #[cfg(feature = "live-spill")]
+            spills: None,
             queued: VecDeque::new(),
             turn: None,
             arbiter,
@@ -931,6 +935,14 @@ impl Presenter {
             SurfaceRequest::SetBackgroundJobs(jobs) => {
                 self.surface.set_background_jobs(jobs);
                 self.dirty = true;
+            }
+            #[cfg(feature = "live-spill")]
+            SurfaceRequest::SetSpillArchive(archive) => {
+                archive.enable_inspection();
+                self.spills = Some(archive);
+                self.screen.insert_rows(vec![
+                    b"F4 inspect retained output (including /spill open IDs)".to_vec(),
+                ])?;
             }
             SurfaceRequest::SetTabs(tabs) => {
                 self.surface.set_tabs(tabs);
@@ -1193,6 +1205,14 @@ impl Presenter {
         // Drain every event crossterm has parsed so far.
         while event::poll(Duration::from_millis(1))? {
             let evt = event::read()?;
+            // The modal takes the prompt token. Release the watcher token
+            // first: acquiring a prompt while we still own it deadlocks.
+            #[cfg(feature = "live-spill")]
+            if matches!(evt, Event::Key(key) if key.kind == KeyEventKind::Press && key.code == crossterm::event::KeyCode::F(4))
+            {
+                drop(_stdin);
+                return self.on_event(evt);
+            }
             self.on_event(evt)?;
         }
         Ok(())
@@ -1201,6 +1221,25 @@ impl Presenter {
     fn on_event(&mut self, evt: Event) -> io::Result<()> {
         self.dirty = true;
         match evt {
+            #[cfg(feature = "live-spill")]
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press
+                    && key.code == crossterm::event::KeyCode::F(4) =>
+            {
+                if let Some(archive) = &self.spills {
+                    let snapshot = archive.snapshot();
+                    let output = self.screen.tty.try_clone()?;
+                    let window = Self::suspend_terminal(self.screen.tty.try_clone()?);
+                    let result = crate::transcript_pager::run_spill_picker(&snapshot, output);
+                    drop(window);
+                    let cleanup = self.finish_modal(None);
+                    self.screen.term.clear()?;
+                    self.draw()?;
+                    cleanup?;
+                    result?;
+                }
+                Ok(())
+            }
             Event::Resize(cols, rows) => {
                 self.capture.resize(cols, rows);
                 let status_rows = self.status_rows();

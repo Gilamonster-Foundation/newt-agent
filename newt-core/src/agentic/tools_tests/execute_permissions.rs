@@ -1348,3 +1348,81 @@ async fn gate_allow_without_real_coverage_is_still_denied() {
     .await;
     assert_eq!(out, denied_fs_result("fs_read", "secret.txt"));
 }
+
+#[tokio::test]
+async fn declined_or_incomplete_lifecycle_build_launches_nothing() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname=\"denied-build\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+    let base = crate::confined_exec::workspace_confined_caveats(ws.path());
+    for allow in [false, true] {
+        let mut gate = MockGate::new(allow, &base);
+        let result = run_tool_gated(
+            "lifecycle",
+            serde_json::json!({"phase":"test", "action":"build"}),
+            ws.path(),
+            &base,
+            &mut gate,
+        )
+        .await;
+        assert!(
+            result.starts_with("capability denied: lifecycle action=build"),
+            "{result}"
+        );
+        assert_eq!(gate.asks.len(), 1);
+        assert!(gate.asks[0].1.starts_with("build:"));
+        assert!(!ws.path().join("target").exists());
+        assert!(!ws.path().join("Cargo.lock").exists());
+    }
+}
+
+/// Grounds the Build grant unit tests in the full tool dispatch: the same
+/// workspace cannot run without the gate and runs Cargo/tests after AllowOnce.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+#[tokio::test]
+#[ignore = "real Cargo compiler and Seatbelt"]
+async fn lifecycle_build_grant_runs_real_cargo() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir(ws.path().join("src")).unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname=\"granted-build\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.path().join("src/lib.rs"),
+        "#[test] fn actual_test() { assert_eq!(2 + 2, 4); }",
+    )
+    .unwrap();
+    let base = crate::confined_exec::workspace_confined_caveats(ws.path());
+    for allow in [false, true] {
+        // Real lifecycle admission uses the canonical workspace in its prompt.
+        let canonical = ws.path().canonicalize().unwrap();
+        let mut gate = MockGate::new(allow, &crate::confined_exec::build_tool_caveats(&canonical));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_tool_gated(
+                "lifecycle",
+                serde_json::json!({"phase":"test", "action":"build"}),
+                ws.path(),
+                &base,
+                &mut gate,
+            ),
+        )
+        .await
+        .expect("real lifecycle build deadline");
+        assert_eq!(gate.asks.len(), 1);
+        if allow {
+            assert!(result.contains("1 passed"), "{result}");
+        } else {
+            assert!(
+                result.starts_with("capability denied: lifecycle action=build"),
+                "{result}"
+            );
+            assert!(!ws.path().join("target").exists());
+        }
+    }
+}

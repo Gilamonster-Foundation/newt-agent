@@ -168,6 +168,10 @@ pub struct SolveObservation {
     pub behavior_signals: Vec<BehaviorSignal>,
     /// The output cap the turn's wire applied (#2312), when it applied one.
     pub output_allowance: Option<OutputAllowance>,
+    /// Captured Responses declarations, present only after policy admission.
+    pub responses_capability: Option<crate::model_card::ResponsesCapability>,
+    /// The actual accepted Responses effort, independent of semantic intent.
+    pub reasoning_effort: Option<crate::model_card::ReasoningEffort>,
     /// The reply is harness-written text (an empty-response note, a refusal
     /// placeholder, a cap-exit fallback), not a model claim (#2372).
     pub harness_reply: bool,

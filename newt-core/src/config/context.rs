@@ -170,7 +170,7 @@ pub fn session_compaction_trigger_policy(
     {
         return policy;
     }
-    Config::resolve(report)
+    Config::resolve_unpublished(report)
         .ok()
         .and_then(|c| c.context)
         .map(|c| c.compaction_trigger_policy)

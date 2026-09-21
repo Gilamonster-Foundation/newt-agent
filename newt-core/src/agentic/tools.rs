@@ -839,40 +839,16 @@ fn mutation_confirm_definition(question: &str) -> newt_interaction::InteractionD
 /// The `build_check_cmd` is **repository-configured** (`.newt/config.toml`), so a
 /// hostile repo controls the shell string. It is therefore attacker-influenced
 /// execution and runs **confined** through [`ConstrainedExecutor`] (P4): the
-/// child starts env-empty (only `PATH`/`HOME` granted — no credentials, #8), its
-/// writes are fenced to the workspace + temp dir and its network denied
-/// ([`build_tool_caveats`], #9), and where the kernel fence cannot be established
+/// child starts env-empty with explicit toolchain/support variables only. Its
+/// writes stay within the workspace and its network is denied by the calibrated
+/// [`crate::confined_exec::build_tool_caveats`] fence. Where that fence cannot be established
 /// the spawn is **refused** rather than run unconfined (#10). It is no longer a
 /// raw `sh -c` on the host.
 pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
-    use crate::confined_exec::{
-        build_tool_caveats, ConstrainedExecutor, ExecOrigin, ExecRequest, NetGrant,
-    };
+    use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
     let (program, args) = build_check_argv(cmd);
-    let mut req = ExecRequest::new(
-        ExecOrigin::AgentInfluenced,
-        program,
-        args,
-        workspace,
-        build_tool_caveats(std::path::Path::new(workspace)),
-    )
-    // The `net: none` caveat already Landlock-denies TCP egress; the seccomp
-    // egress floor (`DenyAll`) additionally closes the UDP/DNS/raw leg Landlock
-    // cannot filter, so an attacker-influenced build step (a hostile `build.rs` /
-    // test) cannot resolve a name or exfiltrate over UDP. Pure hardening: the
-    // build already ran with no network, so nothing that legitimately fetched
-    // regresses (fetches happen outside the confined check).
-    .net_grant(NetGrant::DenyAll)
-    // `HOME` + `TMPDIR` point at the workspace so any HOME-relative or scratch
-    // writes stay inside the write fence; nothing credential-bearing is granted
-    // (#8).
-    .env("HOME", workspace)
-    .env("TMPDIR", workspace);
-    // `PATH` so the configured build tools (cargo/make/…) resolve. It is not a
-    // credential; the fence still governs everything the resolved tool may do.
-    if let Ok(path) = std::env::var("PATH") {
-        req = req.env("PATH", path);
-    }
+    let workspace = std::path::Path::new(workspace);
+    let req = build_tool_request(workspace, workspace, program, args);
 
     match ConstrainedExecutor::run(&req) {
         Ok(out) if out.success => "  ✓ build check passed".to_string(),
@@ -884,6 +860,46 @@ pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
             format!("  ✗ build check failed:\n{excerpt}")
         }
         Err(e) => format!("  ⚠ build check could not run: {e}"),
+    }
+}
+
+/// Preserve execution evidence while coaching an unavailable lifecycle run.
+fn lifecycle_run_result(
+    args: &serde_json::Value,
+    mut result: (String, crate::ExecOutcome),
+) -> (String, crate::ExecOutcome) {
+    if result.1 == crate::ExecOutcome::Unavailable {
+        let mut suggestion = serde_json::json!({"phase": args["phase"], "action": "build"});
+        if let Some(dir) = args.get("dir").and_then(serde_json::Value::as_str) {
+            suggestion["dir"] = dir.into();
+        }
+        result.0.push_str(&format!(
+            "\nThis was lifecycle action=run. For compiler/test validation, action=build \
+             requests explicit approval for toolchain/cache reads and workspace writes, \
+             with network denied. Existing permission requirements and denials remain binding; \
+             do not retry a declined grant.\nSuggested lifecycle call: {suggestion}"
+        ));
+    }
+    result
+}
+
+/// A call-scoped grant for the existing lifecycle surface, not an exec-axis
+/// wildcard. The command stays visible at the decision point; no shell grant
+/// (including exec:cargo) silently acquires compiler/test descendant authority.
+fn lifecycle_build_request(
+    workspace: &str,
+    command: &str,
+    build: &crate::Caveats,
+) -> PermissionRequest {
+    let reads = match &build.fs_read {
+        crate::Scope::Only(roots) => roots.iter().cloned().collect::<Vec<_>>().join("\n"),
+        crate::Scope::All => unreachable!("build reads are calibrated"),
+    };
+    PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Build,
+        target: workspace.into(),
+        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites and scratch within the workspace; network denied. Compiler, build-script and test subprocesses inherit the same kernel fence."),
     }
 }
 
@@ -1758,7 +1774,7 @@ fn find_source_extensions(
     if opts.category == FindCategory::Any {
         return Ok(None);
     }
-    let api_cfg = super::display::with_migration_notices(crate::Config::resolve)
+    let api_cfg = super::display::with_migration_notices(crate::Config::resolve_unpublished)
         .ok()
         .and_then(|cfg| cfg.context.map(|context| context.api_surface))
         .unwrap_or_default();
@@ -3273,7 +3289,48 @@ async fn execute_authorized_tool(
             let joined = cmds.join(" && ");
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
-                "run" => executed(
+                "build" => {
+                    use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
+                    // The configured command is attacker-influenced. Its cwd
+                    // may be nested, but never an outside root or symlink escape.
+                    let root = match std::path::Path::new(workspace).canonicalize() {
+                        Ok(root) => root,
+                        Err(error) => return host_return(format!("error: build workspace: {error}")),
+                    };
+                    let cwd = match effective_path.canonicalize() {
+                        Ok(cwd) if cwd.starts_with(&root) => cwd,
+                        _ => return host_return("capability denied: lifecycle build directory must remain inside the workspace".into()),
+                    };
+                    let (program, argv) = build_check_argv(&joined);
+                    let request = build_tool_request(&root, &cwd, program, argv)
+                        .timeout(std::time::Duration::from_secs(30 * 60));
+                    let build = request.caveats();
+                    if let Some(harness) = smart_harness {
+                        if let Err(error) = harness.validate_tool_authority(build, &root) {
+                            return host_return(format!("Error: frame isolation: {error}"));
+                        }
+                    }
+                    if !build.leq(caveats) {
+                        let permission = lifecycle_build_request(&root.to_string_lossy(), &joined, build);
+                        if !permission_gate.is_some_and(|gate| matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))) {
+                            return executed(("capability denied: lifecycle action=build requires explicit confined build authority; no command ran".into(), crate::ExecOutcome::Denied));
+                        }
+                    }
+                    let result = ConstrainedExecutor::run_async(request).await;
+                    match result {
+                        Ok(out) => {
+                            let envelope = serde_json::json!({
+                                "exit_code": out.code,
+                                "stdout": String::from_utf8_lossy(&out.stdout),
+                                "stderr": String::from_utf8_lossy(&out.stderr),
+                                "timed_out": out.timed_out,
+                            });
+                            executed((shell::shell_envelope_output(&envelope, tool_output_lines, color, tool_offload, spill_store, Some(presentation)), shell::envelope_outcome(&envelope)))
+                        }
+                        Err(error) => executed((format!("error: {error}"), crate::ExecOutcome::Unavailable)),
+                    }
+                }
+                "run" => executed(lifecycle_run_result(args,
                     exec_confined_command(
                         &joined,
                         &effective_dir,
@@ -3289,9 +3346,9 @@ async fn execute_authorized_tool(
                         presentation,
                     )
                     .await,
-                ),
+                )),
                 other => format!(
-                    "error: unknown lifecycle action '{other}'. Use 'run' (default) or 'list'."
+                    "error: unknown lifecycle action '{other}'. Use 'run' (default), 'list', or 'build'."
                 ),
             }
         }
@@ -3980,7 +4037,7 @@ async fn execute_authorized_tool(
             // governed by the session caveats. The same first-directory-wins
             // precedence as the index means we load the copy the model was
             // actually shown.
-            let dirs = super::display::with_migration_notices(crate::Config::resolve)
+            let dirs = super::display::with_migration_notices(crate::Config::resolve_unpublished)
                 .map(|c| c.skill_search_dirs())
                 .unwrap_or_default();
             match newt_skills::load_body_from(&dirs, skill_name) {

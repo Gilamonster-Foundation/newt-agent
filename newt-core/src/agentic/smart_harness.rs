@@ -42,8 +42,9 @@ impl AdjudicationSettings {
         text: &str,
         antecedent: Option<&str>,
         task: Option<&str>,
+        tool_evidence: Option<&Value>,
     ) -> String {
-        let evidence = serde_json::json!({"reply_cid":reply.to_string(),"reply":text,"harness_antecedent":antecedent,"operator_task":task});
+        let evidence = serde_json::json!({"reply_cid":reply.to_string(),"reply":text,"harness_antecedent":antecedent,"operator_task":task,"host_tool_evidence":tool_evidence});
         format!("{}\n{}", self.instruction, evidence)
     }
 
@@ -521,7 +522,11 @@ impl SmartHarness {
         s.session.record_navigation_reply(request, &raw)?;
         let selection = self
             .admit_output(&raw)
-            .and_then(|()| Ok(serde_json::from_str::<Vec<String>>(&raw)?))
+            .and_then(|()| {
+                Ok(serde_json::from_str::<Vec<String>>(
+                    super::adjudicate::strip_code_fence(&raw),
+                )?)
+            })
             .and_then(|selected| {
                 Ok(s.session
                     .project_selection(messages, &selected, max_bytes)?)
@@ -718,6 +723,76 @@ impl SmartHarness {
         })
     }
 
+    /// Derive a bounded view of the existing occurrence journal. No model text,
+    /// return-body parsing, or permission inference contributes execution facts.
+    fn tool_evidence(session: &Session) -> anyhow::Result<Value> {
+        let Some(calls) = session.current_turn_tool_calls()? else {
+            return Ok(serde_json::json!({"scope":"unknown"}));
+        };
+        let calls = calls.collect::<Vec<_>>();
+        let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
+        for call in &calls {
+            let Some(outcome) = call.execution else {
+                continue;
+            };
+            let label = match outcome {
+                crate::ExecOutcome::Passed => "passed",
+                crate::ExecOutcome::Failed => "failed",
+                crate::ExecOutcome::Denied => "denied",
+                crate::ExecOutcome::TimedOut => "timed_out",
+                crate::ExecOutcome::Unavailable => "unavailable",
+            };
+            *outcomes.entry(label).or_default() += 1;
+        }
+        let build_calls = calls
+            .iter()
+            .filter(|call| {
+                call.call["function"]["name"] == "lifecycle"
+                    && call.call["function"]["arguments"]["action"] == "build"
+            })
+            .count();
+        let recent = calls
+            .iter()
+            .skip(calls.len().saturating_sub(6))
+            .map(|call| {
+                // Names and arguments are model-supplied. Only these fixed labels
+                // enter host guidance; the invocation CID preserves exact input.
+                let tool = match call.call["function"]["name"].as_str() {
+                    Some("run_command") => "run_command",
+                    Some("lifecycle") => "lifecycle",
+                    Some("request_permissions") => "request_permissions",
+                    _ => "other",
+                };
+                serde_json::json!({
+                    "invocation_cid":call.id, "tool":tool, "state":call.state,
+                    "execution":call.execution, "return_cid":call.returned,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "scope":"current_accounted_turn",
+            "admitted_calls":calls.len(),
+            "lifecycle_build_calls":build_calls,
+            "native_outcomes":outcomes,
+            "recent_calls":recent,
+            "omitted_calls":calls.len().saturating_sub(recent.len()),
+        }))
+    }
+
+    fn grounding_guidance(evidence: &Value) -> String {
+        format!(
+            "Host-recorded tool evidence at this recovery boundary: {evidence}\n\
+            Plans and summaries are claims, not execution receipts. These counts describe only \
+            the accounted current turn; absent historical records are unknown. A queued or \
+            returned call alone does not prove a command ran. Native outcomes describe the \
+            execution envelope, not every subcommand or overall task success. A denial does not \
+            identify an operator decision, and a direct-execution denial does not establish a \
+            distinct Build denial. No entry grants authority or cancels an earlier refusal. \
+            If the authorized next action remains untested, issue the advertised tool call; \
+            otherwise report the specific recorded blocker without inventing a receipt."
+        )
+    }
+
     /// Classify an already-recorded observation; ancestry is evidence, never a verdict.
     pub(crate) async fn classify(
         &self,
@@ -732,11 +807,13 @@ impl SmartHarness {
                 .reply
                 .ok_or_else(|| anyhow::anyhow!("cannot adjudicate an unrecorded reply"))?;
             s.session.record_model_message(reply, text)?;
+            let evidence = Self::tool_evidence(&s.session)?;
             let prompt = self.settings.classification_prompt(
                 reply,
                 text,
                 s.antecedent.as_deref(),
                 s.operator_task.as_deref(),
+                Some(&evidence),
             );
             (
                 reply,
@@ -791,9 +868,10 @@ impl SmartHarness {
             }),
             Verdict::Narration if more_rounds && s.nudges < nudge_cap => {
                 let nudge = format!(
-                    "{} {}",
+                    "{} {}\n\n{}",
                     super::compress::LOOP_GUIDANCE_PREFIX,
-                    super::workflow_guidance(&self.settings.nudge)
+                    super::workflow_guidance(&self.settings.nudge),
+                    Self::grounding_guidance(&Self::tool_evidence(&s.session)?)
                 );
                 s.session.record_host_message(&nudge, reply)?;
                 s.session.record_outcome(reply, "continue", &nudge)?;
@@ -844,6 +922,24 @@ impl SmartHarness {
         s.session.record_outcome(parent, "continue", text)?;
         s.antecedent = Some(text.to_string());
         Ok(())
+    }
+
+    /// A deterministic evidence check can correct an answer before auxiliary
+    /// adjudication. Keep its actual reply and intervention in the same ledger.
+    pub(crate) fn correct_answer(&self, answer: &str, nudge: &str) -> anyhow::Result<String> {
+        let nudge = {
+            let mut s = self.state()?;
+            let reply = s
+                .reply
+                .ok_or_else(|| anyhow::anyhow!("correction has no reply parent"))?;
+            s.session.record_model_message(reply, answer)?;
+            format!(
+                "{nudge}\n\n{}",
+                Self::grounding_guidance(&Self::tool_evidence(&s.session)?)
+            )
+        };
+        self.intervention(&nudge)?;
+        Ok(nudge)
     }
 
     /// The auxiliary classification never replaces workspace verification.
@@ -968,6 +1064,7 @@ pub(crate) fn advertise(mut tools: Value, harness: Option<&SmartHarness>) -> Val
                     tool["function"]["description"] = Value::String(
                         "Run a command in the confined workspace shell. File access must remain \
                          within fs_read/fs_write grants. Prefer dedicated file and lifecycle tools. \
+                         Use lifecycle action=build for explicit offline Cargo/compiler validation. \
                          Use shell find for recursive searches. \
                          Scoped shell Git reads and staging are supported; shell Git commits are \
                          refused to preserve harness attribution. Other commands with advertised \
@@ -1249,6 +1346,10 @@ pub fn parse_verdict(text: &str) -> Option<&'static str> {
 mod context_exceeded_tests;
 
 #[cfg(test)]
+#[path = "smart_harness_tests/execution_evidence.rs"]
+mod execution_evidence_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1329,6 +1430,7 @@ mod tests {
         assert_eq!(definition(&smart, "git"), definition(&legacy, "git"));
         let command = definition(&smart, "run_command").unwrap();
         let description = command["function"]["description"].as_str().unwrap();
+        assert!(description.contains("lifecycle action=build"));
         assert!(description.contains("Scoped shell Git reads and staging"));
         assert!(description.contains("Git commits are refused"));
         assert_eq!(advertise(legacy.clone(), None), legacy);
@@ -1767,6 +1869,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn navigation_json_envelopes_preserve_raw_reply_and_kernel_validation() {
+        for case in [
+            "bare",
+            "json",
+            "crlf",
+            "fence",
+            "outside",
+            "trailing",
+            "unclosed",
+            "wrong_language",
+            "inline",
+            "invented",
+            "duplicate",
+            "missing_pin",
+            "missing_pair",
+            "over_budget",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let session = Session::open(dir.path(), Default::default()).unwrap();
+            let unrelated = session.head().to_string();
+            let recorded = Arc::new(std::sync::Mutex::new(String::new()));
+            let capture = recorded.clone();
+            let h = SmartHarness::new(
+                session,
+                Arc::new(move |prompt| {
+                    let catalog: Value =
+                        serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+                    let cards = catalog["candidates"].as_array().unwrap();
+                    let mut selected = cards
+                        .iter()
+                        .filter(|card| {
+                            card["required"] == true
+                                || !card["pairs"].as_array().unwrap().is_empty()
+                        })
+                        .map(|card| card["cid"].clone())
+                        .collect::<Vec<_>>();
+                    selected.extend(catalog["host_pinned"].as_array().unwrap().iter().cloned());
+                    match case {
+                        "invented" => selected.push(Value::String(unrelated.clone())),
+                        "duplicate" => selected.push(selected[0].clone()),
+                        "missing_pin" => selected.clear(),
+                        "missing_pair" => {
+                            let call = &cards
+                                .iter()
+                                .find(|card| card["role"] == "assistant")
+                                .unwrap()["cid"];
+                            selected.retain(|cid| cid != call);
+                        }
+                        "over_budget" => {
+                            selected = cards.iter().map(|card| card["cid"].clone()).collect();
+                        }
+                        _ => {}
+                    }
+                    let json = serde_json::to_string(&selected).unwrap();
+                    let raw = match case {
+                        "bare" => json,
+                        "fence" => format!("```\n{json}\n```"),
+                        "crlf" => format!("```json\r\n{json}\r\n```"),
+                        "outside" => format!("Here is my selection:\n```json\n{json}\n```"),
+                        "trailing" => format!("```json\n{json}\n```\nDone."),
+                        "unclosed" => format!("```json\n{json}"),
+                        "wrong_language" => format!("```python\n{json}\n```"),
+                        "inline" => format!("```json{json}```"),
+                        _ => format!(" \n```json\n{json}\n```\n "),
+                    };
+                    *capture.lock().unwrap() = raw.clone();
+                    Box::pin(async move { Ok((raw, None)) })
+                }),
+                Default::default(),
+            )
+            .unwrap();
+            let messages = serde_json::json!([
+                {"role":"system","content":"system pin"},
+                {"role":"user","content":"retained source ".repeat(300)},
+                {"role":"assistant","content":"","tool_calls":[{"id":"read1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"read1","content":"earlier file result"},
+                {"role":"user","content":"current request"}
+            ]);
+            let result = h.project(messages.as_array().unwrap(), 1800).await;
+            if matches!(case, "bare" | "json" | "fence" | "crlf") {
+                let projected = result.unwrap_or_else(|error| panic!("{case}: {error:#}"));
+                assert_eq!(projected[0], messages[0]);
+                assert_eq!(projected.last().unwrap(), &messages[4]);
+                assert!(serde_json::to_vec(&projected).unwrap().len() <= 1800);
+            } else {
+                let error = result.expect_err(case);
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains("AdjudicationFailure"),
+                    "{case}: {diagnostic}"
+                );
+                let expected = match case {
+                    "invented" | "duplicate" => "unauthorized selection",
+                    "missing_pin" => "drops pinned input",
+                    "missing_pair" => "splits a tool exchange",
+                    "over_budget" => "projection bytes",
+                    _ => "expected value",
+                };
+                assert!(diagnostic.contains(expected), "{case}: {diagnostic}");
+            }
+            let raw = recorded.lock().unwrap().clone();
+            let store = agent_harness::store::FrameStore::open(dir.path()).unwrap();
+            let id = content_addressable::RawContentId::from_content(raw.as_bytes());
+            assert_eq!(
+                store.source(&id).unwrap(),
+                raw.as_bytes(),
+                "{case}: raw reply must be retained verbatim"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn accepted_navigation_keeps_pins_and_retains_retrievable_source_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let h = SmartHarness::new(
@@ -1877,7 +2091,7 @@ mod tests {
             "head ... tail\n{}\nerror: command exited 7",
             super::super::content_spill::tool_output_retrieval_hint(&handle.unwrap())
         );
-        invocation.observe(&display, Some(&store)).unwrap();
+        invocation.observe(&display, None, Some(&store)).unwrap();
         let rendered = tool_result(
             "run_command",
             display,
@@ -1917,5 +2131,113 @@ mod tests {
         .unwrap();
         assert_eq!(tail["complete"], true);
         assert_eq!(tail["text"], &full[full.len() - 20..]);
+    }
+
+    #[tokio::test]
+    async fn navigation_retains_generated_companions_of_selected_source_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SmartHarness::new(
+            Session::open(dir.path(), Default::default()).unwrap(),
+            Arc::new(|prompt| {
+                let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+                let cards = catalog["candidates"].as_array().unwrap();
+                assert_eq!(
+                    cards
+                        .iter()
+                        .filter(|card| card["role"] == "assistant")
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    cards.iter().filter(|card| card["role"] == "tool").count(),
+                    1,
+                    "the older generated preview is not relevance evidence"
+                );
+                assert!(
+                    catalog["host_pinned"].as_array().unwrap().is_empty(),
+                    "the older generated result must not be a required host pin"
+                );
+                let selected = cards
+                    .iter()
+                    .filter(|card| card["required"] == true || card["role"] == "assistant")
+                    .map(|card| card["cid"].clone())
+                    .collect::<Vec<_>>();
+                Box::pin(async move { Ok((serde_json::to_string(&selected).unwrap(), None)) })
+            }),
+            Default::default(),
+        )
+        .unwrap();
+        let full = "retained old tool output\n".repeat(300);
+        let mut messages =
+            vec![serde_json::json!({"role":"user","content":"older context ".repeat(400)})];
+        let mut old_delivery = Value::Null;
+        let mut source = Value::Null;
+        for (id, output) in [("older", full.as_str()), ("current", "current tool output")] {
+            h.request(&serde_json::json!({"messages":messages}), "openai")
+                .unwrap();
+            let args = serde_json::json!({"path":format!("{id}.rs")});
+            let assistant = serde_json::json!({"role":"assistant","content":"","tool_calls":[{
+                "id":id,"type":"function","function":{"name":"read_file","arguments":args}
+            }]});
+            h.observe(
+                &serde_json::to_vec(&serde_json::json!({"choices":[{"message":assistant}]}))
+                    .unwrap(),
+            )
+            .unwrap();
+            messages.push(assistant);
+            let batch = h
+                .tool_batch(
+                    &[crate::agentic::tools::ValidatedCall {
+                        call_id: id.into(),
+                        name: "read_file".into(),
+                        args,
+                    }],
+                    &messages,
+                )
+                .unwrap();
+            let invocation = batch.start(0, None).unwrap();
+            invocation.observe(output, None, None).unwrap();
+            let rendered = invocation.model_text().unwrap();
+            let delivery = serde_json::json!({"role":"tool","tool_call_id":id,"content":rendered});
+            if id == "older" {
+                let envelope: Value = serde_json::from_str(&rendered).unwrap();
+                source = envelope["sources"][0]["source_cid"].clone();
+                old_delivery = delivery.clone();
+            }
+            push_tool_return(&mut messages, delivery, Some(&invocation)).unwrap();
+        }
+        messages.push(serde_json::json!({"role":"user","content":"current operator request"}));
+        // The kept exchange needs ~3.7 KB (the older generated result alone is
+        // 3046 B); 3600 refuses on protected inputs. Below the ~9 KB full history,
+        // the older user turn must be elided, so the budget is doing work.
+        const PROJECTION_BUDGET: usize = 4200;
+        let projected = h.project(&messages, PROJECTION_BUDGET).await.unwrap();
+        assert!(
+            projected.contains(&old_delivery),
+            "selected call keeps its exact generated protocol companion"
+        );
+        assert_eq!(projected.last(), messages.last());
+        assert!(serde_json::to_vec(&projected).unwrap().len() <= PROJECTION_BUDGET);
+        let head = h.head().unwrap();
+        drop(h);
+        let restored = Session::restore(dir.path(), head, "local-session").unwrap();
+        assert!(restored
+            .restored_messages()
+            .unwrap()
+            .contains(&old_delivery));
+        let restored = SmartHarness::new(
+            restored,
+            Arc::new(|_| panic!("retrieval requires no inference")),
+            Default::default(),
+        )
+        .unwrap();
+        let read: Value = serde_json::from_str(
+            &restored
+                .read(&serde_json::json!({"cid":source,"max_bytes":128}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read["text"], &full[..128]);
+        assert_eq!(read["complete"], false);
     }
 }

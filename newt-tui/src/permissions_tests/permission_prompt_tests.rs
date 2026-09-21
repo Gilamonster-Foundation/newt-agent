@@ -2923,6 +2923,12 @@ fn delegated_grants_cannot_cross_the_parent_ceiling_or_persist_approval() {
             target: "remote__write".into(),
             reason: String::new(),
         },
+        PermissionRequest {
+            tool: "lifecycle".into(),
+            kind: DenialKind::Build,
+            target: "/ws".into(),
+            reason: "cargo test".into(),
+        },
     ];
     for choice in [
         PromptChoice::AllowOnce,
@@ -4042,3 +4048,100 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
 // Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 22:06 EDT | Date: 2026-09-17
 
 // Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 05:48 EDT | Date: 2026-09-18
+
+#[test]
+fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
+    let base = base_caveats("/ws");
+    let request = newt_core::PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Build,
+        target: "/ws".into(),
+        reason: "cargo test; workspace writes and network denied".into(),
+    };
+    for (choice, permitted) in [
+        (PromptChoice::AllowOnce, true),
+        (PromptChoice::AllowSession, false),
+        (PromptChoice::Deny, false),
+    ] {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(&mut state, base.clone(), None, None, vec![choice], prompts);
+        match gate.ask(std::slice::from_ref(&request)) {
+            newt_core::PermissionDecision::Allow(caveats) => {
+                assert!(permitted);
+                assert_eq!(
+                    caveats, base,
+                    "build is call-scoped, never a shell expansion"
+                );
+            }
+            newt_core::PermissionDecision::Deny => assert!(!permitted),
+        }
+        drop(gate);
+        assert!(state.session_grants.is_empty());
+    }
+    let build = newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/ws"));
+    assert!(ceiling_permits(&build, DenialKind::Build, "/ws"));
+    assert!(!ceiling_permits(&base, DenialKind::Build, "/ws"));
+    let mut no_writes = build;
+    no_writes.fs_write = newt_core::Scope::none();
+    assert!(!ceiling_permits(&no_writes, DenialKind::Build, "/ws"));
+}
+
+#[test]
+fn preset_build_ceiling_refuses_before_prompting() {
+    let base = base_caveats("/ws");
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    gate.preset_clamp = Some(base);
+    let request = PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Build,
+        target: "/ws".into(),
+        reason: "cargo test".into(),
+    };
+    assert!(matches!(
+        gate.ask(&[request]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 0);
+}
+
+#[test]
+fn prepared_build_fence_cannot_exceed_delegation_before_prompt() {
+    let ceiling = newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/ws"));
+    let delegation = crate::caveat_policy_tests::verified_delegation(ceiling.clone());
+    let mut prepared = ceiling.clone();
+    if let Scope::Only(roots) = &mut prepared.fs_read {
+        roots.insert("/outside".into());
+    }
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        ceiling,
+        None,
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    gate.delegation = Some(&delegation);
+    let request = PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Build,
+        target: "/ws".into(),
+        reason: "cargo test".into(),
+    };
+    assert!(matches!(
+        gate.ask_with_caveats(&prepared, &[request]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 0);
+}

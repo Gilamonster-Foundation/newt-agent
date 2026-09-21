@@ -120,6 +120,37 @@ fn buffered_input_case() {
             cancel: Arc::clone(&cancel),
         })
         .unwrap();
+    // Grounds the archive snapshot and read-only key tests in a real tty:
+    // F4 during an active turn, Enter to inspect, q back, q close must leave
+    // the mounted draft, pending read, and cancellation flag untouched.
+    #[cfg(feature = "live-spill")]
+    {
+        let archive = Arc::new(crate::completed_spill::CompletedSpillArchive::default());
+        archive.retain("operator inspection payload");
+        cockpit
+            .handle_request(SurfaceRequest::SetSpillArchive(archive))
+            .unwrap();
+        let (reply, inspected) = std::sync::mpsc::sync_channel(1);
+        cockpit
+            .handle_request(SurfaceRequest::ReadLine {
+                prompt: "inspect".into(),
+                reply,
+            })
+            .unwrap();
+        cockpit
+            .on_event(Event::Paste("unsent draft".into()))
+            .unwrap();
+        let draft = cockpit.editor.draft();
+        prefetch(b"\x1bOS\rqq");
+        cockpit.poll_keys().unwrap();
+        assert_eq!(cockpit.editor.draft(), draft);
+        assert!(cockpit.queued.is_empty());
+        assert!(matches!(
+            inspected.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
     prefetch(CTRL_C);
     {
         let _other_reader = newt_core::tty::try_watch_stdin().expect("another reader owns stdin");

@@ -55,23 +55,7 @@ pub struct ToolEvent {
     pub execution: Option<ExecOutcome>,
 }
 
-/// #2315: the class of one shell execution, read from its envelope's facts
-/// (structured denial, timeout flag, exit status, program resolution) — never
-/// re-derived from the rendered result text, which [`ToolEvent::ok`] reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecOutcome {
-    /// Ran and exited 0.
-    Passed,
-    /// Ran and exited nonzero, including a program that exists but exits 127.
-    Failed,
-    /// A structured leash denial, or the kernel refusing the program.
-    Denied,
-    /// Killed at its wall-clock ceiling (the envelope's `timed_out` flag).
-    TimedOut,
-    /// Never ran: the program does not resolve, or the dispatch itself failed.
-    Unavailable,
-}
+pub use agent_harness::ExecOutcome;
 
 impl ToolEvent {
     /// Record one tool call. `args` are digested, never stored raw: the

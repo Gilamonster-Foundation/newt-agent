@@ -154,7 +154,7 @@ pub fn session_markdown_mode(report: &mut dyn FnMut(crate::tty::Notice<'static>)
     {
         return mode;
     }
-    Config::resolve(report)
+    Config::resolve_unpublished(report)
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.markdown)

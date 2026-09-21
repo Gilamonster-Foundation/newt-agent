@@ -1829,3 +1829,6 @@ async fn headless_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
     assert!(result["usage"]["attempts"].as_u64() > Some(0), "{result}");
     assert!(result["usage"].get("ledger_head").is_none(), "{result}");
 }
+
+#[path = "headless_cli/cognition.rs"]
+mod cognition;

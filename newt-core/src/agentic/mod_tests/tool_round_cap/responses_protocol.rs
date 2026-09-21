@@ -90,15 +90,15 @@ fn cognition_maps_to_the_responses_reasoning_field_or_is_omitted() {
     use crate::role_profile::Cognition;
     // Opt-in: each level projects to the Responses `reasoning.effort` value.
     assert_eq!(
-        responses_reasoning_field(Some(Cognition::Meticulous)),
+        responses_reasoning_field(Some(Cognition::Meticulous.into())),
         Some(serde_json::json!({ "effort": "high" }))
     );
     assert_eq!(
-        responses_reasoning_field(Some(Cognition::Zen)),
+        responses_reasoning_field(Some(Cognition::Zen.into())),
         Some(serde_json::json!({ "effort": "minimal" }))
     );
     assert_eq!(
-        responses_reasoning_field(Some(Cognition::Thoughtful)),
+        responses_reasoning_field(Some(Cognition::Thoughtful.into())),
         Some(serde_json::json!({ "effort": "medium" }))
     );
     // Not opted in → the field is omitted entirely (request unchanged).
@@ -409,6 +409,8 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
             persona_tools: None,
             cognition: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: Default::default(),
             output_allowance: None,
             attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,

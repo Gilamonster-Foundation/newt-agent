@@ -235,6 +235,7 @@ fn cold_restore_refuses_a_hashed_return_without_a_start_fact() {
                     event,
                     sources: vec![],
                     kind: tools::ReturnKind::Observed,
+                    execution: None,
                 },
             },
             [session.head],

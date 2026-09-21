@@ -1343,7 +1343,7 @@ pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<
 /// | state | envelope | remedy |
 /// |---|---|---|
 /// | denied by a grant | `denied:true` + `denials[kind=exec]`, exit 126 | ask for the grant |
-/// | not carried, on the host | exit 127, no denials, host PATH resolves | ask for `exec:<abs path>` |
+/// | not carried, on the host | exit 127, no denials, host PATH resolves | build authority for project validation, or direct `exec:<abs path>` |
 /// | not on this host at all | exit 127, no denials, host PATH misses | no grant can help |
 ///
 /// Discrimination is STRUCTURED — the exit code plus the `denials` array — the
@@ -1397,7 +1397,10 @@ pub(crate) fn absent_binary_refusal(
         Some(abs) => format!(
             "error: {prog}: {ABSENT_BINARY_MARKER}.\n  \
              granted host binaries: {granted}\n  \
-             ask the operator for exec:{abs}, or run the host lane."
+             For project compiler/test validation, if lifecycle is advertised, prefer lifecycle action=build \
+             for the appropriate project phase: it requests explicit offline build authority.\n  \
+             For direct execution, ask the operator for exec:{abs}; this does not grant compiler descendants \
+             or their filesystem access. Existing permission requirements remain binding; do not retry a declined grant."
         ),
         // Deliberately NO grant coaching here: granting exec for a binary that
         // is not installed is a no-op, and teaching the model to ask for one is

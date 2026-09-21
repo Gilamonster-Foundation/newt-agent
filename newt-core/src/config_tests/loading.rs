@@ -98,6 +98,9 @@ fn malformed_toml_returns_config_error() {
 #[serial_test::serial(real_fs)]
 #[test]
 fn resolve_returns_default_when_no_file() {
+    // resolve() publishes the process-global runtime settings: hold the guard
+    // so it cannot retune a test that captured them.
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
     // Use a temp dir as cwd and clear env to ensure no candidates match.
     // Serial: mutates process-global cwd + HOME, which races any parallel
     // test that resolves paths (the unconfigured-provenance test shares
@@ -233,6 +236,9 @@ fn cli_backend_override_clears_the_unconfigured_flag() {
 #[serial_test::serial(real_fs)]
 #[test]
 fn resolve_reports_unconfigured_only_without_operator_backends() {
+    // resolve() publishes the process-global runtime settings: hold the guard
+    // so it cannot retune a test that captured them.
+    let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
     let dir = tempfile::tempdir().unwrap();
     let saved_config = std::env::var_os("NEWT_CONFIG");
     let saved_config_dir = std::env::var_os(NEWT_CONFIG_DIR_ENV);

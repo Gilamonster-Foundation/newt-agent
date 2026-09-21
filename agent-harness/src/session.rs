@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 mod tools;
 pub(crate) use tools::ToolChange;
-pub use tools::{ToolCallState, ToolCallStatus, ToolReturn};
+pub use tools::{ExecOutcome, ToolCallState, ToolCallStatus, ToolReturn};
 
 use crate::{
     projection::{Entry, Projection},
@@ -247,6 +247,8 @@ pub struct Session {
     reread_outputs: BTreeMap<String, Vec<ContentId>>,
     tool_calls: BTreeMap<ContentId, ToolCallStatus>,
     tool_order: Vec<ContentId>,
+    /// Ephemeral accounted-turn boundary, never reconstructed from historical prose.
+    turn_tool_start: Option<usize>,
     pending: BTreeSet<ContentId>,
     replies: BTreeSet<ContentId>,
     model_messages: BTreeSet<ContentId>,
@@ -326,6 +328,7 @@ impl Session {
             reread_outputs: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
             tool_order: Vec::new(),
+            turn_tool_start: None,
             pending: BTreeSet::new(),
             replies: BTreeSet::new(),
             model_messages: BTreeSet::new(),
@@ -367,12 +370,28 @@ impl Session {
         self.pending.iter().copied().collect()
     }
     pub fn start_turn(&mut self) {
+        self.turn_tool_start = Some(self.tool_order.len());
         self.transcript = self.restored_transcript.clone();
         self.navigation_elapsed = Duration::ZERO;
         self.fetched = 0;
         self.dereferences = 0;
         self.navigation_calls = 0;
         self.attempted_selections.clear();
+    }
+
+    /// Ordered host-accounted tool occurrences since the last explicit `start_turn`.
+    /// An empty view establishes zero occurrences only in that current turn, not
+    /// in historical or unaccounted conversation text. Restore requires a fresh
+    /// turn boundary; queued and uncertain calls retain their original states.
+    /// `None` means no current-turn boundary has been established. This view does
+    /// not establish whether a returned tool executed a command.
+    pub fn current_turn_tool_calls(&self) -> Result<Option<impl Iterator<Item = &ToolCallStatus>>> {
+        self.ensure_active()?;
+        Ok(self.turn_tool_start.map(|start| {
+            self.tool_order[start..]
+                .iter()
+                .map(|id| &self.tool_calls[id])
+        }))
     }
 
     /// Check execution ownership before host side effects. A failed check
@@ -1139,6 +1158,13 @@ impl Session {
 
     /// Bounded catalog cards contain source facts only. Harness interventions
     /// never become summarizer/relevance evidence.
+    ///
+    /// The catalog is the selector's only price list, and a refused selection
+    /// fails the turn, so it offers only what can be selected and charges what
+    /// the host will: a card's `bytes` include the generated entries its tool
+    /// exchange brings, the catalog's `max_bytes` is what remains after the
+    /// entries the host adds regardless and the re-read pointer, and a card a
+    /// required entry forces is `required`.
     pub fn catalog(&mut self, messages: &[Value], max_bytes: usize) -> Result<Value> {
         self.navigation_work(|session| session.catalog_inner(messages, max_bytes))
     }
@@ -1150,36 +1176,83 @@ impl Session {
         let start = entries
             .len()
             .saturating_sub(self.config.max_catalog_entries);
+        let generated = |c: &crate::navigation::Candidate| is_generated(&self.events[&c.id]);
+        // Each projected message also costs its array separator.
+        let charge = |ids: &BTreeSet<ContentId>| {
+            candidates
+                .iter()
+                .filter(|c| ids.contains(&c.id))
+                .map(|c| c.bytes + 1)
+                .sum::<usize>()
+        };
+        let mut forced = candidates
+            .iter()
+            .filter(|c| c.required)
+            .map(|c| c.id)
+            .collect();
+        complete_pairs(&candidates, &mut forced, |_| true);
+        // What the host adds whatever is proposed comes out of the budget.
+        let mut charged = candidates
+            .iter()
+            .filter(|c| c.required && generated(c))
+            .map(|c| c.id)
+            .collect();
+        complete_pairs(&candidates, &mut charged, generated);
+        // n selected messages plus the pointer need n separators, all charged
+        // to the messages, so the pointer costs only its own bytes.
+        let pointer = entries.last().map_or(0, |entry| {
+            json!({"role":"user","content":reread_pointer(entry.event)})
+                .to_string()
+                .len()
+        });
+        let max_bytes = max_bytes.saturating_sub(2 + pointer + charge(&charged));
+        let listed = |i: usize, c: &crate::navigation::Candidate| {
+            generated(c) || i >= start || forced.contains(&c.id)
+        };
         let cards = entries
             .iter()
             .zip(&candidates)
             .enumerate()
-            .filter(|(i, (_, c))| *i >= start || c.required)
-            .filter(|(_, (entry, _))| {
-                let event = &self.events[&entry.event];
-                event.body().origin != EventOrigin::Harness && event.depth() == 0
-            })
-            .map(|(index, (entry, c))| {
-                json!({
-                    "cid":entry.event,"role":entry.role,"bytes":c.bytes,
-                    "required":c.required,"pairs":c.pairs,
+            .filter(|(_, (_, c))| !generated(c))
+            .filter_map(|(index, (entry, c))| {
+                // A tool exchange is selected whole, so it is offered whole or
+                // not at all, shows one pair set, and its generated entries are
+                // charged once, to its first card.
+                let mut group = BTreeSet::from([c.id]);
+                complete_pairs(&candidates, &mut group, |_| true);
+                let members = || {
+                    candidates
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| group.contains(&m.id))
+                };
+                if !members().all(|(i, m)| listed(i, m)) {
+                    return None;
+                }
+                let pairs = members()
+                    .flat_map(|(_, m)| &m.pairs)
+                    .collect::<BTreeSet<_>>();
+                let bytes = c.bytes
+                    + 1
+                    + members()
+                        .filter(|(_, m)| generated(m) && charged.insert(m.id))
+                        .map(|(_, m)| m.bytes + 1)
+                        .sum::<usize>();
+                Some(json!({
+                    "cid":entry.event,"role":entry.role,"bytes":bytes,
+                    "required":forced.contains(&c.id),"pairs":pairs,
                     "excerpt":messages[index].get("content").and_then(Value::as_str)
                         .unwrap_or("").chars().take(160).collect::<String>()
-                })
+                }))
             })
             .collect::<Vec<_>>();
         if cards.len() > self.config.max_catalog_entries {
             return Err(Error::Budget("protected catalog entries".into()));
         }
-        let pinned = entries
+        let pinned = candidates
             .iter()
-            .zip(&candidates)
-            .filter(|(entry, c)| {
-                c.required
-                    && (self.events[&entry.event].body().origin == EventOrigin::Harness
-                        || self.events[&entry.event].depth() > 0)
-            })
-            .map(|(entry, _)| entry.event)
+            .filter(|c| c.required && generated(c))
+            .map(|c| c.id)
             .collect::<Vec<_>>();
         Ok(json!({"max_bytes":max_bytes,"candidates":cards,"host_pinned":pinned}))
     }
@@ -1215,7 +1288,7 @@ impl Session {
             .collect();
         // Tool exchanges form connected groups (one assistant message may call
         // several tools). Grow a complete group before checking its cost.
-        complete_pairs(&candidates, &mut selected);
+        complete_pairs(&candidates, &mut selected, |_| true);
         for candidate in candidates
             .iter()
             .rev()
@@ -1223,7 +1296,7 @@ impl Session {
         {
             let mut proposal = selected.clone();
             proposal.insert(candidate.id);
-            complete_pairs(&candidates, &mut proposal);
+            complete_pairs(&candidates, &mut proposal, |_| true);
             if crate::navigation::validate_selection(
                 &candidates,
                 &proposal.iter().copied().collect::<Vec<_>>(),
@@ -1277,13 +1350,26 @@ impl Session {
         // source-only relevance selection. The complete union is still validated.
         for candidate in &candidates {
             if candidate.required
-                && (self.events[&candidate.id].body().origin == EventOrigin::Harness
-                    || self.events[&candidate.id].depth() > 0)
+                && is_generated(&self.events[&candidate.id])
                 && !selected.contains(&candidate.id)
             {
                 selected.push(candidate.id);
             }
         }
+        // Generated wire companions are protocol framing, not relevance
+        // candidates. Complete only through selected sources and generated
+        // entries; an omitted source must still fail pair validation.
+        let mut completed = selected.iter().copied().collect();
+        complete_pairs(&candidates, &mut completed, |c| {
+            is_generated(&self.events[&c.id])
+        });
+        for id in completed {
+            if !selected.contains(&id) {
+                selected.push(id);
+            }
+        }
+        // Keep the original proposal's duplicates and unknown IDs: framing
+        // completion cannot repair an otherwise inadmissible selection.
         self.render_selection(messages, &entries, &candidates, &selected, max_bytes)
     }
 
@@ -1306,9 +1392,7 @@ impl Session {
             })
             .collect::<Result<BTreeSet<ContentId>>>()?;
         for id in &sources {
-            if self.events.get(id).is_none_or(|event| {
-                event.body().origin == EventOrigin::Harness || event.depth() != 0
-            }) {
+            if self.events.get(id).is_none_or(is_generated) {
                 return Err(Error::Access(
                     "harness or generated material is not relevance evidence".into(),
                 ));
@@ -1472,7 +1556,7 @@ impl Session {
             };
             let id = self.store.put(&packet)?;
             self.append(JournalEntry::Packet { packet: id, events })?;
-            let text=format!("Earlier material is retained in frame {id}. Call re_read with that CID to retrieve bounded slices; a slice reports whether more remains.");
+            let text = reread_pointer(id);
             let parent = entries
                 .last()
                 .ok_or_else(|| integrity("empty elision"))?
@@ -1897,6 +1981,26 @@ impl Session {
         Ok(event)
     }
 
+    /// Retain a quoted historical datum without inventing its original actor's
+    /// authority or execution. The fixed text-only envelope cannot carry tool
+    /// calls. Call `record_messages` to publish the completed transcript.
+    pub fn record_historical_message(&mut self, text: &str) -> Result<ContentId> {
+        self.ensure_tools_closed()?;
+        let message = json!({"role":"user", "content":text});
+        let payload = serde_json::to_vec(&message).map_err(integrity)?;
+        let event = self.event(
+            EventOrigin::Historical,
+            EventKind::Observation,
+            &payload,
+            self.last_message().into_iter().collect(),
+            BTreeSet::new(),
+            0,
+        )?;
+        self.append(JournalEntry::Observation { event })?;
+        self.transcript.push(event);
+        Ok(event)
+    }
+
     /// Explicitly admit a host-supplied wire message before inserting it in
     /// history. Arbitrary harness payloads never establish a user's origin.
     pub fn record_host_message(&mut self, text: &str, parent: ContentId) -> Result<ContentId> {
@@ -1958,6 +2062,16 @@ fn tool_contents(message: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn reread_pointer(frame: impl std::fmt::Display) -> String {
+    format!("Earlier material is retained in frame {frame}. Call re_read with that CID to retrieve bounded slices; a slice reports whether more remains.")
+}
+
+/// Harness-generated framing (system text, wire companions) as opposed to a
+/// visible source entry: depth 0 and not harness-originated.
+fn is_generated(event: &Event) -> bool {
+    event.body().origin == EventOrigin::Harness || event.depth() != 0
+}
+
 fn tool_pairs(message: &Value) -> BTreeSet<String> {
     let mut pairs = BTreeSet::new();
     for key in ["tool_call_id", "call_id"] {
@@ -1987,7 +2101,13 @@ fn tool_pairs(message: &Value) -> BTreeSet<String> {
     pairs
 }
 
-fn complete_pairs(candidates: &[crate::navigation::Candidate], selected: &mut BTreeSet<ContentId>) {
+/// Grow `selected` to whole tool exchanges. Every selected entry links, but
+/// only entries `joins` admits are added.
+fn complete_pairs(
+    candidates: &[crate::navigation::Candidate],
+    selected: &mut BTreeSet<ContentId>,
+    joins: impl Fn(&crate::navigation::Candidate) -> bool,
+) {
     loop {
         let before = selected.len();
         let pairs = candidates
@@ -1997,7 +2117,7 @@ fn complete_pairs(candidates: &[crate::navigation::Candidate], selected: &mut BT
             .collect::<BTreeSet<_>>();
         let additions = candidates
             .iter()
-            .filter(|c| c.pairs.iter().any(|p| pairs.contains(p)))
+            .filter(|c| joins(c) && c.pairs.iter().any(|p| pairs.contains(p)))
             .map(|c| c.id)
             .collect::<Vec<_>>();
         selected.extend(additions);

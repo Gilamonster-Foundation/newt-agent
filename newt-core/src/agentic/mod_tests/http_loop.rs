@@ -61,6 +61,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -494,3 +496,9 @@ mod exposure_promotion;
 #[cfg(test)]
 #[path = "http_smart_harness.rs"]
 mod smart_harness;
+
+#[path = "http_capability_grounding.rs"]
+mod capability_grounding;
+
+#[path = "http_ollama_initiative.rs"]
+mod ollama_initiative;

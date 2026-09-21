@@ -321,12 +321,7 @@ impl Cognition {
     /// endpoint explicitly advertises support.
     #[must_use]
     pub fn reasoning_effort(self) -> &'static str {
-        match self {
-            Self::Zen => "minimal",
-            Self::Rational => "low",
-            Self::Thoughtful => "medium",
-            Self::Meticulous => "high",
-        }
+        crate::model_card::ReasoningEffort::from(self).as_str()
     }
 
     /// Stable lowercase label — the front-matter / `/cognition` spelling.

@@ -802,3 +802,6 @@ fn an_arbitrary_family_card_carries_typed_identity_without_defaults() {
         None
     );
 }
+
+#[path = "resolved_capabilities/effort.rs"]
+mod effort;
