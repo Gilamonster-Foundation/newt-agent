@@ -18,6 +18,7 @@ fn http_test_entry(url: String) -> McpServerEntry {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
     }
 }
 
