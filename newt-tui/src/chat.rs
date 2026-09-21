@@ -8620,7 +8620,7 @@ fn session_body(
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)
                                             .max(20);
-                                        print!("▸  ");
+                                        print!("{}", newt_core::agentic::REPLY_MARKER);
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
@@ -8657,7 +8657,7 @@ fn session_body(
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)
                                             .max(20);
-                                        print!("▸  ");
+                                        print!("{}", newt_core::agentic::REPLY_MARKER);
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
