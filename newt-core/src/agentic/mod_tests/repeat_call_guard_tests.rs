@@ -1234,3 +1234,33 @@ fn only_test_and_check_lifecycle_phases_reset_the_brake() {
         Some(Passed)
     ));
 }
+
+/// Review round 3: operator steering is new information; it restarts the count
+/// and re-arms the steer-once latch, exactly like progress.
+#[test]
+fn operator_steering_resets_the_count_and_rearms_the_steer() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "steer");
+    // The operator types a steer; delivered at the start of the round that
+    // would otherwise be the 3rd idle one (the stop).
+    state.record_round_outcome(false, false);
+    state.note_operator_steering();
+    assert_eq!(
+        gate(&mut state, true),
+        "continue",
+        "no stop: the count restarted"
+    );
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(
+        gate(&mut state, true),
+        "steer",
+        "the steer-once latch re-armed"
+    );
+}
