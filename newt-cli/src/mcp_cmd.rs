@@ -886,14 +886,29 @@ fn select_import_entries(
         if names.is_empty() {
             bail!("no MCP servers found in {}", source.display());
         }
-        let cmds: String = names
-            .iter()
-            .map(|n| format!("\n  newt mcp import {selector} --name {n}"))
-            .collect();
-        bail!(
-            "choose a server to import; found in {}:{cmds}\nor import every server with --all",
-            source.display()
-        );
+        let (good, bad): (Vec<&str>, Vec<&str>) = names
+            .into_iter()
+            .partition(|n| validate_import_server_name(n).is_ok());
+        let sel = if selector
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/~+-".contains(c))
+        {
+            selector.to_string()
+        } else {
+            format!("'{}'", selector.replace('\'', "'\\''"))
+        };
+        let mut msg = format!("choose a server to import; found in {}:", source.display());
+        for n in good {
+            msg.push_str(&format!("\n  newt mcp import {sel} --name {n}"));
+        }
+        if !bad.is_empty() {
+            msg.push_str("\nthese names cannot be imported under that name:");
+            for n in bad {
+                msg.push_str(&format!("\n  {n:?}"));
+            }
+        }
+        msg.push_str("\nor import every server with --all");
+        bail!("{msg}");
     }
     if !report.rejected.is_empty() {
         let count = report.rejected.len();
