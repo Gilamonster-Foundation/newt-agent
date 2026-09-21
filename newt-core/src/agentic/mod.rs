@@ -6837,6 +6837,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // and nothing watching the turn as a whole.
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
+    let mut uncorrelatable_batches: u32 = 0;
     'round_loop: for round in 0..hard_tool_rounds {
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
@@ -8200,16 +8201,28 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             })
             .collect();
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
-            Ok(v) => Some(v),
+            Ok(v) => {
+                uncorrelatable_batches = 0;
+                Some(v)
+            }
             Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
-                if let Some(harness) = smart_harness {
-                    harness.reject_tools(&reason, false)?;
-                }
                 // A missing/blank/duplicate `tool_call_id`: a tool result cannot
-                // be correlated. Abort the turn — do not fabricate an id.
-                return Err(tools::uncorrelatable_tool_calls(&reason));
+                // be correlated. Never fabricate an id — re-ask, or abort once
+                // the budget is spent.
+                let reask = tools::reask_uncorrelatable(
+                    &mut uncorrelatable_batches,
+                    &reason,
+                    smart_harness,
+                    tool_events.as_deref_mut(),
+                )?;
+                if let Some(turn) = messages.last_mut() {
+                    tools::withdraw_tool_calls(turn);
+                }
+                messages.push(serde_json::json!({"role": "user", "content": reask}));
+                continue 'round_loop;
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                uncorrelatable_batches = 0;
                 if let Some(harness) = smart_harness {
                     harness.reject_tools(&reason, true)?;
                 }
@@ -9369,6 +9382,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // and nothing watching the turn as a whole.
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
+    let mut uncorrelatable_batches: u32 = 0;
     'round_loop: for round in 0..hard_tool_rounds {
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
@@ -10557,16 +10571,28 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             })
             .collect();
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
-            Ok(v) => Some(v),
+            Ok(v) => {
+                uncorrelatable_batches = 0;
+                Some(v)
+            }
             Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
-                if let Some(harness) = smart_harness {
-                    harness.reject_tools(&reason, false)?;
+                // A missing/blank/duplicate id: a tool result cannot
+                // be correlated. Never fabricate an id — re-ask, or abort once
+                // the budget is spent.
+                let reask = tools::reask_uncorrelatable(
+                    &mut uncorrelatable_batches,
+                    &reason,
+                    smart_harness,
+                    tool_events.as_deref_mut(),
+                )?;
+                if let Some(turn) = messages.last_mut() {
+                    tools::withdraw_tool_calls(turn);
                 }
-                // A missing/blank/duplicate id: a tool result cannot be
-                // correlated. Abort the turn — do not fabricate an id.
-                return Err(tools::uncorrelatable_tool_calls(&reason));
+                messages.push(serde_json::json!({"role": "user", "content": reask}));
+                continue 'round_loop;
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                uncorrelatable_batches = 0;
                 if let Some(harness) = smart_harness {
                     harness.reject_tools(&reason, true)?;
                 }
@@ -11575,6 +11601,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // and nothing watching the turn as a whole.
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
+    let mut uncorrelatable_batches: u32 = 0;
     for round in 0..max_tool_rounds {
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
@@ -12115,18 +12142,26 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             })
             .collect();
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
-            Ok(v) => v,
+            Ok(v) => {
+                uncorrelatable_batches = 0;
+                v
+            }
             Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
-                if let Some(harness) = smart_harness {
-                    harness.reject_tools(&reason, false)?;
-                }
                 // A missing/blank/duplicate call id: a `function_call_output`
-                // cannot be correlated. Abort the turn — fabricating an id only
-                // produces a provider 400 or a silent mispairing. Nothing was
-                // echoed, so no malformed follow-up is dispatched.
-                return Err(tools::uncorrelatable_tool_calls(&reason));
+                // cannot be correlated. Never fabricate an id — re-ask, or abort
+                // once the budget is spent. Nothing was echoed, so `input` needs
+                // only the plain user message.
+                let reask = tools::reask_uncorrelatable(
+                    &mut uncorrelatable_batches,
+                    &reason,
+                    smart_harness,
+                    tool_events.as_deref_mut(),
+                )?;
+                input.push(serde_json::json!({"role": "user", "content": reask}));
+                continue;
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                uncorrelatable_batches = 0;
                 if let Some(harness) = smart_harness {
                     harness.reject_tools(&reason, true)?;
                 }

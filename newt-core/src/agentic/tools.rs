@@ -199,6 +199,75 @@ pub(crate) fn uncorrelatable_tool_calls(reason: &str) -> anyhow::Error {
     .into()
 }
 
+/// Consecutive uncorrelatable batches a turn tolerates before it aborts. The
+/// third in a row is fatal; any well-formed batch resets the count.
+pub(crate) const MAX_UNCORRELATABLE_BATCHES: u32 = 3;
+
+/// Recovery for a batch whose calls cannot be correlated (missing, blank or
+/// duplicate ids), shared by every wire that requires call ids. Nothing was
+/// dispatched and no id is fabricated: while the budget lasts this returns the
+/// plain user-role message to append (there is no tool result to key it to) so
+/// the caller can `continue` the loop; once `strikes` reaches
+/// [`MAX_UNCORRELATABLE_BATCHES`] it aborts exactly as before.
+pub(crate) fn reask_uncorrelatable(
+    strikes: &mut u32,
+    reason: &str,
+    smart_harness: Option<&super::smart_harness::SmartHarness>,
+    tool_events: Option<&mut Vec<crate::ToolEvent>>,
+) -> anyhow::Result<String> {
+    *strikes += 1;
+    let recoverable = *strikes < MAX_UNCORRELATABLE_BATCHES;
+    if let Some(harness) = smart_harness {
+        harness.reject_tools(reason, recoverable)?;
+    }
+    if !recoverable {
+        return Err(uncorrelatable_tool_calls(reason));
+    }
+    // The trace must show why this round produced nothing (mirrors the
+    // content-invalid arm's not-ok "(rejected tool-call batch)" event).
+    if let Some(rec) = tool_events {
+        rec.push(crate::ToolEvent::from_call(
+            "(rejected tool-call batch)",
+            &serde_json::Value::Null,
+            false,
+            Some(0),
+        ));
+    }
+    let reason: String = reason.chars().take(200).collect();
+    Ok(format!(
+        "Your last reply's tool calls could not be correlated ({reason}), so none of them \
+         were run. Re-emit the calls you intended as native tool calls (not as text in your \
+         reply), each with its own unique, non-empty call id."
+    ))
+}
+
+/// Drop the id-less `tool_calls` from the assistant turn recorded just before
+/// validation: with no ids there is nothing to answer them with, and replaying
+/// them would send the provider a transcript it rejects.
+///
+/// Only an assistant turn is touched: if the last message is anything else the
+/// transcript is left alone (the re-ask is still sent).
+pub(crate) fn withdraw_tool_calls(assistant_turn: &mut serde_json::Value) {
+    if assistant_turn["role"] != "assistant" {
+        return;
+    }
+    if let Some(turn) = assistant_turn.as_object_mut() {
+        turn.remove("tool_calls");
+        // A tool-only reply is replayed with `content: ""` on the default path,
+        // and strict gateways reject an empty assistant turn: null and blank
+        // alike get the placeholder.
+        if turn
+            .get("content")
+            .is_none_or(|c| c.is_null() || c.as_str().is_some_and(|t| t.trim().is_empty()))
+        {
+            turn.insert(
+                "content".into(),
+                "(tool calls without ids were discarded)".into(),
+            );
+        }
+    }
+}
+
 impl BatchRejection {
     /// The human-readable reason, whichever class.
     pub(crate) fn reason(&self) -> &str {

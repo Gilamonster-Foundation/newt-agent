@@ -187,7 +187,7 @@ path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
 
 [BHV-TOOLS-002]
-description = "Missing or duplicate correlation ids terminate the turn (no fabricated outputs, no follow-up); a validated batch has non-empty, pairwise-distinct ids."
+description = "Missing or duplicate correlation ids are never dispatched and never answered with fabricated outputs: the uncorrelatable calls are withdrawn from the transcript and the model is re-asked within a bounded budget, after which the turn terminates; a validated batch has non-empty, pairwise-distinct ids."
 [BHV-TOOLS-002.status]
 lean = "spec"
 rust = "tested"
@@ -211,7 +211,25 @@ path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_blank_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/tool_round_cap/responses_protocol.rs"
-symbol = "responses_missing_call_id_aborts_without_a_followup_request"
+symbol = "responses_missing_call_id_aborts_after_the_reask_budget"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/tool_round_cap/responses_protocol.rs"
+symbol = "responses_idless_call_is_re_asked_then_recovers"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "three_idless_batches_in_a_row_abort_with_todays_error"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/openai_stream_loop.rs"
+symbol = "streamed_idless_tool_call_is_re_asked_and_the_turn_completes"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/openai_stream_loop.rs"
+symbol = "streamed_duplicate_ids_reach_the_shared_validator"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/openai_sse_strict_tests.rs"
+symbol = "stream_leaves_missing_blank_and_repeated_ids_to_the_batch_validator"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/anthropic_loop.rs"
+symbol = "idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block"
 [[BHV-TOOLS-002.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"

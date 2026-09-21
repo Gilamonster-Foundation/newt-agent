@@ -1896,31 +1896,46 @@ mod tests {
     /// strict decoding of a stream (a `DispatchError` attached as context, which
     /// the outcome used to miss and file as `harness_error`), or the batch
     /// validator's `CorrelationImpossible` arm for a complete JSON reply (the
-    /// arm Anthropic and Responses share). Nothing runs, and nothing is retried.
+    /// arm Anthropic and Responses share). Nothing runs. An id-less batch, streamed
+    /// or complete, is re-asked twice (P0 U3) before the third ends the turn; only a
+    /// stream whose id is not a string is undecodable and is not retried.
     #[tokio::test]
     async fn a_tool_call_without_an_id_classifies_as_model_error() {
         use crate::agentic::observability::ErrorClass;
-        let stream = [
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
-            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-            "[DONE]",
-        ]
-        .iter()
-        .map(|frame| format!("data: {frame}\n\n"))
-        .collect::<String>();
+        let stream_with = |id: &str| {
+            [
+                format!(r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,{id}"type":"function","function":{{"name":"read_file","arguments":"{{}}"}}}}]}}}}]}}"#),
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+                "[DONE]".to_string(),
+            ]
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>()
+        };
+        let stream = stream_with("");
+        let unreadable = stream_with(r#""id":7,"#);
         let json = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null,
             "tool_calls": [{"type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
             "finish_reason": "tool_calls"}]});
-        for (name, reply, message) in [
+        for (name, reply, message, expected_posts) in [
             (
-                "strict stream",
+                "strict stream, id absent (re-asked, then aborted)",
                 ResponseTemplate::new(200).set_body_raw(stream.into_bytes(), "text/event-stream"),
-                "has no ID",
+                "malformed provider output",
+                3,
+            ),
+            (
+                "strict stream, non-string id (undecodable, one POST)",
+                ResponseTemplate::new(200)
+                    .set_body_raw(unreadable.into_bytes(), "text/event-stream"),
+                "invalid tool-call ID",
+                1,
             ),
             (
                 "complete JSON",
                 ResponseTemplate::new(200).set_body_json(json),
                 "malformed provider output",
+                3,
             ),
         ] {
             let server = MockServer::start().await;
@@ -1942,9 +1957,19 @@ mod tests {
             assert!(err.contains(message), "{name}: {err}");
             assert_eq!(o.error_class, Some(ErrorClass::Model), "{name}");
             assert_eq!(o.end_reason, None, "{name}");
-            assert!(o.tool_events.is_empty(), "{name}: nothing ran");
+            // Nothing ran; the re-asked rounds leave only not-ok markers (P0 U3).
+            assert!(
+                o.tool_events
+                    .iter()
+                    .all(|e| e.tool == "(rejected tool-call batch)" && !e.ok),
+                "{name}: nothing ran"
+            );
             let posts = server.received_requests().await.expect("journal");
-            assert_eq!(posts.len(), 1, "{name}: exactly one POST, no retry");
+            assert_eq!(
+                posts.len(),
+                expected_posts,
+                "{name}: POSTs before the abort"
+            );
         }
     }
 

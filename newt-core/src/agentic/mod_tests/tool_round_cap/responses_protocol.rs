@@ -228,10 +228,11 @@ async fn responses_request_sets_store_false() {
 }
 
 #[tokio::test]
-async fn responses_missing_call_id_aborts_without_a_followup_request() {
+async fn responses_missing_call_id_aborts_after_the_reask_budget() {
     // RR2: a `function_call` with no `call_id` cannot be correlated to its
-    // output. The turn ABORTS — no fabricated id, no follow-up request. The
-    // mock's `.expect(1)` proves only the initial dispatch reached the server.
+    // output. No fabricated id: the batch is re-asked (P0 U3) and the turn
+    // ABORTS on the third id-less batch. `.expect(3)` proves exactly that many
+    // dispatches reached the server.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -239,7 +240,7 @@ async fn responses_missing_call_id_aborts_without_a_followup_request() {
             "status": "completed",
             "output": [{"type": "function_call", "name": "run_command", "arguments": "{}"}]
         })))
-        .expect(1)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -250,6 +251,7 @@ async fn responses_missing_call_id_aborts_without_a_followup_request() {
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
     ctx.safe_context = None;
     ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 8; // the re-asks are rounds; the default of 1 would cap-exit first
     ctx.num_ctx = Some(1_000_000); // fits → dispatches, then aborts on validation
 
     let err = openai_responses_complete(ctx, &mut NoMcp)
@@ -262,8 +264,9 @@ async fn responses_missing_call_id_aborts_without_a_followup_request() {
 }
 
 #[tokio::test]
-async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
-    // RR2: duplicate `call_id`s mis-route results — abort, no follow-up.
+async fn responses_duplicate_call_ids_abort_after_the_reask_budget() {
+    // RR2: duplicate `call_id`s mis-route results — re-asked, then abort on
+    // the third such batch (P0 U3).
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -274,7 +277,7 @@ async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
                 {"type": "function_call", "call_id": "dup", "name": "b", "arguments": "{}"}
             ]
         })))
-        .expect(1)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -285,6 +288,7 @@ async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
     ctx.safe_context = None;
     ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 8; // the re-asks are rounds; the default of 1 would cap-exit first
     ctx.num_ctx = Some(1_000_000);
 
     let err = openai_responses_complete(ctx, &mut NoMcp)
@@ -856,4 +860,74 @@ async fn a_malformed_responses_cap_exit_summary_is_ok_with_its_usage() {
         .expect("the summary is an attempt");
     assert_eq!(record.state, crate::attempts::AttemptState::Ok);
     assert_eq!(record.usage, row_usage(9).1);
+}
+
+/// P0 U3: an id-less `function_call` is re-asked on `input`; nothing was echoed
+/// for it, so no `function_call_output` is sent for the discarded call, and the
+/// well-formed retry completes the turn.
+#[tokio::test]
+async fn responses_idless_call_is_re_asked_then_recovers() {
+    struct Script(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    impl wiremock::Respond for Script {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            let mut bodies = self.0.lock().unwrap();
+            let n = bodies.len();
+            bodies.push(serde_json::from_slice(&req.body).expect("JSON"));
+            let output = match n {
+                0 => serde_json::json!([{"type": "function_call", "name": "read_file",
+                    "arguments": "{\"path\":\"no/such/file\"}"}]),
+                1 => serde_json::json!([{"type": "function_call", "call_id": "c1",
+                    "name": "read_file", "arguments": "{\"path\":\"no/such/file\"}"}]),
+                _ => serde_json::json!([{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]}]),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status": "completed", "output": output}))
+        }
+    }
+    let server = MockServer::start().await;
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(Script(bodies.clone()))
+        .mount(&server)
+        .await;
+
+    let task = "do a thing";
+    let messages = giant_prompt_messages(task);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+    ctx.safe_context = None;
+    ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 8;
+    ctx.num_ctx = Some(1_000_000);
+
+    let (reply, ..) = openai_responses_complete(ctx, &mut NoMcp)
+        .await
+        .expect("the turn completes after the re-ask");
+    assert_eq!(reply, "done");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    let second = bodies[1]["input"].as_array().expect("input");
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user", "the re-ask rides on input");
+    assert!(last["content"]
+        .as_str()
+        .unwrap()
+        .contains("could not be correlated"));
+    assert!(
+        second
+            .iter()
+            .all(|i| i["type"] != "function_call" && i["type"] != "function_call_output"),
+        "nothing is echoed or answered for the discarded call: {second:?}"
+    );
+    let third = bodies[2]["input"].as_array().expect("input");
+    let outputs: Vec<_> = third
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0]["call_id"], "c1");
 }
