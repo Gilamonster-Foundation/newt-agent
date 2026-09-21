@@ -14,6 +14,7 @@ fn marker() -> InitiativeConfig {
             decisive: 93,
             eager: 94,
         },
+        ..Default::default()
     }
 }
 
