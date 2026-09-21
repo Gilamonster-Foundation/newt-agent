@@ -1423,6 +1423,17 @@ impl Config {
         Self::resolve_runtime().map(ResolvedConfig::into_config)
     }
 
+    /// [`Config::resolve`] WITHOUT the process-global publication. For code
+    /// that only needs a config VALUE (a tool, a memory window): resolving is
+    /// a read, and a read must not rewrite the runtime settings a running turn
+    /// has already captured, nor race with whoever owns them.
+    ///
+    /// # Errors
+    /// Any config-load error `resolve` itself would surface.
+    pub fn resolve_unpublished() -> Result<Self> {
+        Self::resolve_runtime_unpublished().map(ResolvedConfig::into_config)
+    }
+
     /// [`Config::resolve_runtime_unpublished`] plus the process-global
     /// publication — the full runtime resolution, receipts kept.
     ///

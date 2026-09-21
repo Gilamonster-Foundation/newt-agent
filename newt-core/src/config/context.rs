@@ -168,7 +168,7 @@ pub fn session_compaction_trigger_policy() -> CompactionTriggerPolicy {
     {
         return policy;
     }
-    Config::resolve()
+    Config::resolve_unpublished()
         .ok()
         .and_then(|c| c.context)
         .map(|c| c.compaction_trigger_policy)

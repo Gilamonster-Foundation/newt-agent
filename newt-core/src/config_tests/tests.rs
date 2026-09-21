@@ -260,3 +260,7 @@ mod tool_exposure_tests;
 #[cfg(test)]
 #[path = "tools.rs"]
 mod tools_tests;
+
+#[cfg(test)]
+#[path = "reads_do_not_publish.rs"]
+mod reads_do_not_publish_tests;
