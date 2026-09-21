@@ -54,6 +54,12 @@ pub enum TurnEndReason {
     NarrationFinalRound,
     /// The tool-round cap ended the turn via the tools-disabled summary.
     RoundCap,
+    /// The operator-configured whole-run inference-call allowance
+    /// (`--run-allowance`, #2313) was spent before the turn finished. Unlike
+    /// [`Self::RoundCap`] there is NO model-written summary — a summary is a call
+    /// the allowance now refuses, and a summary before the round cap would break
+    /// `BHV-ROUND-002` — so the harness writes the notice itself.
+    RunAllowance,
     /// The model produced no usable content (placeholder/diagnostic reply).
     Empty,
     /// #1963: the operator interrupted the turn (Esc / Ctrl-C) before it
@@ -195,6 +201,7 @@ impl TurnMetrics {
             }
             Some(TurnEndReason::AwaitingOperator) => format!("{base} · awaiting operator"),
             Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
+            Some(TurnEndReason::RunAllowance) => format!("{base} · ⚠ run allowance exhausted"),
             Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
             Some(TurnEndReason::Cancelled) => format!("{base} · ⊘ interrupted"),
             Some(TurnEndReason::Failed) => format!("{base} · ✗ failed"),
