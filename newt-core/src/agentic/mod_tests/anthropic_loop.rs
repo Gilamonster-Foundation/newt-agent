@@ -2327,3 +2327,83 @@ async fn idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block() {
         .iter()
         .any(|e| e.tool == "(rejected tool-call batch)" && !e.ok));
 }
+
+// A call the harness RECOVERED from reply text on the Anthropic-shaped wire:
+// the internal turn already replays recovered calls as `tool_use`, so it needs
+// only the derived id and a matching `tool_result`.
+struct BareThenAnswer {
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for BareThenAnswer {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let n = bodies.len();
+        bodies.push(body_json(req));
+        if n == 0 {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text":
+                    "{\"name\": \"read_file\", \"arguments\": {\"path\": \"no/such/file\"}}"}]),
+                40,
+                9,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+                60,
+                4,
+            )
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_recovered_call_replays_as_tool_use_with_a_derived_id() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(BareThenAnswer {
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.tool_events = Some(&mut events);
+    let (reply, ..) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("a recovered call completes");
+    assert_eq!(reply, "done");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let use_id = second
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_use")
+        .and_then(|b| b["id"].as_str())
+        .expect("a tool_use block");
+    assert!(
+        use_id.starts_with("nwt-rc-") && use_id.len() == 39,
+        "{use_id}"
+    );
+    let result_id = second
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .and_then(|b| b["tool_use_id"].as_str())
+        .expect("a tool_result block");
+    assert_eq!(result_id, use_id, "the result answers the derived id");
+}
