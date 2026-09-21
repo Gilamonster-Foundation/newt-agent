@@ -50,18 +50,20 @@ fn value_readers_do_not_republish_runtime_settings() {
     );
 }
 
-/// Control: the publishing resolve really does overwrite the marker, and the
-/// unpublished one does not. Without it the test above could pass vacuously.
+/// Control: publishing really does overwrite the marker, and the unpublished
+/// resolve does not. Without it the test above could pass vacuously. Publishes
+/// a default config directly: `resolve()` reads whatever cwd and environment
+/// other tests have pinned, and can fail, which would make the control flaky.
 #[test]
-fn resolve_publishes_and_resolve_unpublished_does_not() {
+fn publishing_rewrites_the_marker_and_resolve_unpublished_does_not() {
     let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
     initiative::set_initiative_config(marker());
     let _ = crate::Config::resolve_unpublished();
     assert_eq!(published_patient_rounds(), Some(91));
-    let _ = crate::Config::resolve();
+    crate::Config::default().publish_runtime_settings();
     assert_ne!(
         published_patient_rounds(),
         Some(91),
-        "control: resolve() must publish, or this suite proves nothing"
+        "control: publishing must rewrite the marker, or this suite proves nothing"
     );
 }
