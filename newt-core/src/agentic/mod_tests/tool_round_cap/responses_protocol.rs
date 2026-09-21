@@ -228,10 +228,11 @@ async fn responses_request_sets_store_false() {
 }
 
 #[tokio::test]
-async fn responses_missing_call_id_aborts_without_a_followup_request() {
+async fn responses_missing_call_id_aborts_after_the_reask_budget() {
     // RR2: a `function_call` with no `call_id` cannot be correlated to its
-    // output. The turn ABORTS — no fabricated id, no follow-up request. The
-    // mock's `.expect(1)` proves only the initial dispatch reached the server.
+    // output. No fabricated id: the batch is re-asked (P0 U3) and the turn
+    // ABORTS on the third id-less batch. `.expect(3)` proves exactly that many
+    // dispatches reached the server.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -239,7 +240,7 @@ async fn responses_missing_call_id_aborts_without_a_followup_request() {
             "status": "completed",
             "output": [{"type": "function_call", "name": "run_command", "arguments": "{}"}]
         })))
-        .expect(1)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -250,6 +251,7 @@ async fn responses_missing_call_id_aborts_without_a_followup_request() {
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
     ctx.safe_context = None;
     ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 8; // the re-asks are rounds; the default of 1 would cap-exit first
     ctx.num_ctx = Some(1_000_000); // fits → dispatches, then aborts on validation
 
     let err = openai_responses_complete(ctx, &mut NoMcp)
@@ -262,8 +264,9 @@ async fn responses_missing_call_id_aborts_without_a_followup_request() {
 }
 
 #[tokio::test]
-async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
-    // RR2: duplicate `call_id`s mis-route results — abort, no follow-up.
+async fn responses_duplicate_call_ids_abort_after_the_reask_budget() {
+    // RR2: duplicate `call_id`s mis-route results — re-asked, then abort on
+    // the third such batch (P0 U3).
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -274,7 +277,7 @@ async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
                 {"type": "function_call", "call_id": "dup", "name": "b", "arguments": "{}"}
             ]
         })))
-        .expect(1)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -285,6 +288,7 @@ async fn responses_duplicate_call_ids_abort_without_a_followup_request() {
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
     ctx.safe_context = None;
     ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 8; // the re-asks are rounds; the default of 1 would cap-exit first
     ctx.num_ctx = Some(1_000_000);
 
     let err = openai_responses_complete(ctx, &mut NoMcp)
