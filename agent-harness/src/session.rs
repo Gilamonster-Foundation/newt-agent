@@ -230,6 +230,16 @@ pub struct PreparedRequest {
     pub projection: ContentId,
 }
 
+/// Monotonic elapsed time as the navigation budget sees it. Real by default
+/// (`Instant`); a test injects its own so the budget is exercised without
+/// sleeping. It feeds ONLY `navigation_elapsed`, never any content-addressed id.
+type NavigationClock = Box<dyn Fn() -> Duration + Send + Sync>;
+
+fn real_navigation_clock() -> NavigationClock {
+    let origin = Instant::now();
+    Box::new(move || origin.elapsed())
+}
+
 pub struct Session {
     store: FrameStore,
     writer: RunWriter,
@@ -260,6 +270,7 @@ pub struct Session {
     restored_transcript: Vec<ContentId>,
     packet_head: Option<agent_frame::PacketId>,
     navigation_elapsed: Duration,
+    navigation_clock: NavigationClock,
     fetched: usize,
     dereferences: usize,
     navigation_calls: usize,
@@ -269,6 +280,13 @@ pub struct Session {
 }
 
 impl Session {
+    /// Replace the clock the navigation budget reads (tests).
+    #[cfg(test)]
+    fn with_clock(mut self, clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
+        self.navigation_clock = Box::new(clock);
+        self
+    }
+
     pub fn new(config: SessionConfig) -> Result<Self> {
         Self::create(
             FrameStore::memory_with_max_bytes(config.max_record_bytes)?,
@@ -340,6 +358,7 @@ impl Session {
             restored_transcript: Vec::new(),
             packet_head: None,
             navigation_elapsed: Duration::ZERO,
+            navigation_clock: real_navigation_clock(),
             fetched: 0,
             dereferences: 0,
             navigation_calls: 0,
@@ -1600,9 +1619,10 @@ impl Session {
         if self.navigation_elapsed > limit {
             return Err(Error::Budget("navigation elapsed time".into()));
         }
-        let started = Instant::now();
+        let started = (self.navigation_clock)();
         let result = operation(self);
-        self.account_navigation_elapsed(started.elapsed());
+        let finished = (self.navigation_clock)();
+        self.account_navigation_elapsed(finished.saturating_sub(started));
         if self.navigation_elapsed > limit {
             return Err(Error::Budget("navigation elapsed time".into()));
         }
