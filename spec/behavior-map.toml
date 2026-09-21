@@ -219,6 +219,15 @@ symbol = "responses_idless_call_is_re_asked_then_recovers"
 path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
 symbol = "three_idless_batches_in_a_row_abort_with_todays_error"
 [[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/openai_stream_loop.rs"
+symbol = "streamed_idless_tool_call_is_re_asked_and_the_turn_completes"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/openai_stream_loop.rs"
+symbol = "streamed_duplicate_ids_reach_the_shared_validator"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/openai_sse_strict_tests.rs"
+symbol = "stream_leaves_missing_blank_and_repeated_ids_to_the_batch_validator"
+[[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/anthropic_loop.rs"
 symbol = "idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block"
 [[BHV-TOOLS-002.refs.production]]
