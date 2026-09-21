@@ -1557,6 +1557,9 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let mut imported =
         select_import_entries(imported, request.name, request.all, &source, &selector)?;
     let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
     for entry in &mut imported {
         validate_import_server_name(&entry.name)?;
         validate_imported_secret_locations(entry)?;
@@ -1564,6 +1567,10 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         // side effects of `--grant-net`: an adopted server must be connectable
         // and its persisted URL and permission host must agree byte-for-byte.
         canonicalize_import_http_url(entry)?;
+        if let Some(msg) = missing_stdio_command(entry, &path_dirs, cfg!(windows), |p| p.is_file())
+        {
+            writeln!(out, "warning: {msg}; imported anyway")?;
+        }
         let omitted = source_omissions.remove(&entry.name).unwrap_or_default()
             + sanitize_imported_secrets(entry);
         if omitted > 0 {
@@ -1815,6 +1822,61 @@ fn binary_candidates_in(
         candidates.push(v.join(command));
     }
     candidates
+}
+
+/// Absoluteness from the string under the target flavour, not the host:
+/// unix `/x`; windows `X:\` / `X:/` or a `\\` UNC prefix.
+fn is_absolute_for(command: &str, windows: bool) -> bool {
+    let b = command.as_bytes();
+    if windows {
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+            || command.starts_with("\\\\")
+    } else {
+        command.starts_with('/')
+    }
+}
+
+/// A stdio server whose `command` resolves to nothing, as a message (the
+/// command is untrusted, so Debug-quoted). Pathed commands must exist as given
+/// when absolute; bare ones must be on `path_dirs`. Relative pathed commands and
+/// UNC paths are skipped (spawn cwd differs; probing a UNC path would touch the
+/// network before import). A `~`-prefixed command ALWAYS warns: the MCP launcher
+/// (`newt-mcp-client` `spawn`) hands `command` to the OS verbatim and never
+/// expands `~`, so it fails at spawn even when the expansion exists. All I/O is
+/// injected.
+fn missing_stdio_command(
+    entry: &McpServerEntry,
+    path_dirs: &[PathBuf],
+    windows: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    let command = entry
+        .command
+        .as_deref()
+        .filter(|_| entry.transport == TransportKind::Stdio)?;
+    if command.starts_with('~') {
+        return Some(format!(
+            "MCP server `{}` command {command:?} starts with `~`, but the MCP launcher does not expand `~` at spawn; use an absolute path",
+            entry.name
+        ));
+    }
+    // Cannot judge, so never flag: a UNC path names a remote host taken from an
+    // UNTRUSTED file (probing it would open an SMB connection before import).
+    let unc = windows && command.starts_with("\\\\");
+    let found = if command.contains(['/', '\\']) {
+        unc || !is_absolute_for(command, windows) || exists(Path::new(command))
+    } else if windows {
+        // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
+        true
+    } else {
+        first_existing(&binary_candidates_in(path_dirs, None, command), exists).is_some()
+    };
+    (!found).then(|| {
+        format!(
+            "MCP server `{}` command {command:?} was not found",
+            entry.name
+        )
+    })
 }
 
 /// The first candidate that `exists`. Pure — order + existence predicate both
