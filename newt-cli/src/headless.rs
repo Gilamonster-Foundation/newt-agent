@@ -521,7 +521,18 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let smart_config = cfg.smart_harness.clone().unwrap_or_default();
     let smart_enabled = args.smart_harness || smart_config.enabled;
     if lane == HeadlessLane::Confined {
-        dc.caveats = confined_bench_caveats(&workspace);
+        // Scratch is resolved ONCE, here: it builds the fence AND becomes the
+        // child's `TMPDIR` (the brush child does not inherit newt's env, so it
+        // would otherwise write `/tmp`, which a configured fence does not grant).
+        // Not for the smart lane, whose fence is workspace-only and whose callers
+        // point temp at the workspace.
+        let scratch = resolve_fence_scratch();
+        if let (false, Some(root)) = (smart_enabled, scratch.first()) {
+            // Same single-threaded-at-this-point contract as the lane's other
+            // env writes above.
+            unsafe { std::env::set_var("NEWT_CHILD_TMPDIR", root) };
+        }
+        dc.caveats = confined_bench_caveats(&workspace, &scratch);
         if smart_enabled {
             let scoped =
                 newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
@@ -985,7 +996,7 @@ fn pick_backend(
 /// Matching at the enforcement site (`tools::tui_permits_path`) is by
 /// lexically-normalized path **prefix**, so a root entry covers everything
 /// beneath it (`/usr` grants `/usr/lib/python3/...`).
-fn confined_bench_caveats(workspace: &str) -> Caveats {
+fn confined_bench_caveats(workspace: &str, scratch: &[String]) -> Caveats {
     // The per-task extra write grants the harness may pass (same env the
     // interactive `--write` grants flow through). `split_paths` keeps a Windows
     // drive-letter grant intact rather than shattering it on `:`. Read here so
@@ -999,10 +1010,14 @@ fn confined_bench_caveats(workspace: &str) -> Caveats {
                 .collect()
         })
         .unwrap_or_default();
-    // Scratch is CONFIGURATION, resolved here at run start (`NEWT_SCRATCH_DIR` /
-    // `[scratch] dir`, via the one existing resolver), never a literal.
-    let scratch = fence_scratch_roots(&newt_core::scratch::scratch_dir(), &std::env::temp_dir());
-    confined_bench_caveats_with_grants(workspace, &scratch, &extra)
+    confined_bench_caveats_with_grants(workspace, scratch, &extra)
+}
+
+/// The fence's scratch root(s), resolved at run start. Scratch is CONFIGURATION
+/// (`NEWT_SCRATCH_DIR` / `[scratch] dir`, via the one existing resolver), never a
+/// literal; see [`fence_scratch_roots`].
+fn resolve_fence_scratch() -> Vec<String> {
+    fence_scratch_roots(&newt_core::scratch::scratch_dir(), &std::env::temp_dir())
 }
 
 /// The fence's scratch root(s): the configured scratch dir when it is ABSOLUTE
