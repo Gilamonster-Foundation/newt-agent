@@ -1836,7 +1836,9 @@ mod tests {
     /// strict decoding of a stream (a `DispatchError` attached as context, which
     /// the outcome used to miss and file as `harness_error`), or the batch
     /// validator's `CorrelationImpossible` arm for a complete JSON reply (the
-    /// arm Anthropic and Responses share). Nothing runs, and nothing is retried.
+    /// arm Anthropic and Responses share). Nothing runs. A strict stream is not
+    /// retried; a complete JSON reply is re-asked twice (P0 U3) before the third
+    /// id-less batch ends the turn.
     #[tokio::test]
     async fn a_tool_call_without_an_id_classifies_as_model_error() {
         use crate::agentic::observability::ErrorClass;
@@ -1851,16 +1853,18 @@ mod tests {
         let json = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null,
             "tool_calls": [{"type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
             "finish_reason": "tool_calls"}]});
-        for (name, reply, message) in [
+        for (name, reply, message, expected_posts) in [
             (
                 "strict stream",
                 ResponseTemplate::new(200).set_body_raw(stream.into_bytes(), "text/event-stream"),
                 "has no ID",
+                1,
             ),
             (
                 "complete JSON",
                 ResponseTemplate::new(200).set_body_json(json),
                 "malformed provider output",
+                3,
             ),
         ] {
             let server = MockServer::start().await;
@@ -1884,7 +1888,11 @@ mod tests {
             assert_eq!(o.end_reason, None, "{name}");
             assert!(o.tool_events.is_empty(), "{name}: nothing ran");
             let posts = server.received_requests().await.expect("journal");
-            assert_eq!(posts.len(), 1, "{name}: exactly one POST, no retry");
+            assert_eq!(
+                posts.len(),
+                expected_posts,
+                "{name}: POSTs before the abort"
+            );
         }
     }
 
