@@ -41,6 +41,19 @@ class BenchWriteRoots(unittest.TestCase):
         finally:
             newt_agent._OCAP = ""
 
+    def test_smart_arm_never_gets_the_broad_roots(self):
+        """The smart-harness lane refuses a write grant with a model-writable
+        ancestor (`/usr` above `/usr/local`), so asking for them would stop the
+        arm launching. It keeps its workspace-only fence."""
+        try:
+            newt_agent._OCAP = "on"
+            for raw in ("1", "on", "true"):
+                newt_agent._SMART = raw
+                self.assertNotIn("NEWT_WRITE_PATHS", newt_agent._container_env_prefix(), raw)
+        finally:
+            newt_agent._OCAP = ""
+            newt_agent._SMART = ""
+
 
 class ModelDigest(unittest.TestCase):
     """#2318: a declared digest reaches the container as NEWT_MODEL_DIGEST, and
