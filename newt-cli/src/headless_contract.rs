@@ -481,7 +481,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "outcome": i.outcome,
         "backend": { "name": i.backend_name, "kind": i.backend_kind },
         "agent": AGENT,
-        "agent_version": env!("CARGO_PKG_VERSION"),
+        "agent_version": newt_core::build_info::VERSION_WITH_COMMIT,
         "effective_config": effective_config,
         "timing": timing,
     });
@@ -1077,7 +1077,10 @@ mod tests {
         );
         assert_eq!(parsed["contract_version"], "2");
         assert_eq!(parsed["agent"], "newt-agent");
-        assert_eq!(parsed["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            parsed["agent_version"],
+            newt_core::build_info::VERSION_WITH_COMMIT
+        );
         assert_eq!(
             parsed["backend"],
             serde_json::json!({"name": "dgx", "kind": "openai"})
