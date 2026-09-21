@@ -1886,7 +1886,13 @@ mod tests {
             assert!(err.contains(message), "{name}: {err}");
             assert_eq!(o.error_class, Some(ErrorClass::Model), "{name}");
             assert_eq!(o.end_reason, None, "{name}");
-            assert!(o.tool_events.is_empty(), "{name}: nothing ran");
+            // Nothing ran; the re-asked rounds leave only not-ok markers (P0 U3).
+            assert!(
+                o.tool_events
+                    .iter()
+                    .all(|e| e.tool == "(rejected tool-call batch)" && !e.ok),
+                "{name}: nothing ran"
+            );
             let posts = server.received_requests().await.expect("journal");
             assert_eq!(
                 posts.len(),
