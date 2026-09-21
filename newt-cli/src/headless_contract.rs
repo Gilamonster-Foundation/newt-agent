@@ -271,6 +271,17 @@ const HANDBACK_MAX_FILES: usize = 200;
 /// - `last_exec_outcome`: the exec CLASS of the last shell call (no command text —
 ///   `ToolEvent` deliberately retains none);
 /// - `model_reply_present`: whether the model said anything at all.
+///
+/// `end_reason` deliberately repeats the top-level field so the object is
+/// self-contained for a dispatcher; both come from the same value. This is U7
+/// part 1 (what changed); "what was verified" and "what it is unsure of" are not
+/// covered here.
+///
+/// Blind spots of a status DELTA, which a reader must not mistake for "nothing
+/// else changed": (a) a file dirty before AND after in the same status is
+/// invisible; (b) paths git ignores (a stray under `target/`, a written `.env`)
+/// are invisible; (c) a file that was dirty at start and was reverted to clean
+/// is absent from the exit snapshot and so is not reported.
 #[must_use]
 pub fn handback(
     delta: Option<Vec<String>>,
