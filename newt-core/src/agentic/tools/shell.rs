@@ -97,9 +97,10 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
         map.extend(crate::shell_env::from_config_dir(&config_path));
     }
     // The child's temp dir, matching the write fence's scratch root. The brush
-    // engine runs `do_not_inherit_env(true)`, so newt's `TMPDIR` never reaches the
-    // child; without this its tools default to `/tmp`, which a configured fence
-    // may not grant. `NEWT_CHILD_TMPDIR` is published by the headless confined
+    // engine runs `do_not_inherit_env(true)`, so the ambient `TMPDIR` is not
+    // inherited: this seam entry is what the child sees. Without it the child's
+    // tools fall back to the platform temp dir, which a configured fence may not
+    // grant. `NEWT_CHILD_TMPDIR` is published by the headless confined
     // lane from the SAME value the fence is built from (one owner, no second
     // resolution); unset everywhere else, so other lanes are unchanged.
     if let Ok(tmp) = std::env::var("NEWT_CHILD_TMPDIR") {
