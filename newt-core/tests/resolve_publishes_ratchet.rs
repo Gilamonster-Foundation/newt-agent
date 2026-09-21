@@ -22,7 +22,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 const PUBLISHING: [&str; 2] = ["Config::resolve(", "Config::resolve_runtime("];
 
 /// Production call sites that still publish. Ratchet: only ever lowered.
-const KNOWN_PUBLISHING_RESOLVES: usize = 36;
+const KNOWN_PUBLISHING_RESOLVES: usize = 30;
 
 fn squeeze(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
