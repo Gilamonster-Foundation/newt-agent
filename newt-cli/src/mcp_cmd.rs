@@ -1829,6 +1829,18 @@ fn binary_candidates_in(
     candidates
 }
 
+/// Absoluteness from the string under the target flavour, not the host:
+/// unix `/x`; windows `X:\` / `X:/` or a `\\` UNC prefix.
+fn is_absolute_for(command: &str, windows: bool) -> bool {
+    let b = command.as_bytes();
+    if windows {
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+            || command.starts_with("\\\\")
+    } else {
+        command.starts_with('/')
+    }
+}
+
 /// A stdio server whose `command` resolves to nothing, as a message (the
 /// command is untrusted, so Debug-quoted). Pathed/`~` commands must exist as
 /// given; bare ones must be on `path_dirs`. Relative pathed commands are
@@ -1848,7 +1860,7 @@ fn missing_stdio_command(
         let rest = rest.trim_start_matches(['/', '\\']);
         home.is_some_and(|h| exists(&h.join(rest)))
     } else if command.contains(['/', '\\']) {
-        !Path::new(command).is_absolute() || exists(Path::new(command))
+        !is_absolute_for(command, windows) || exists(Path::new(command))
     } else if windows {
         // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
         true
