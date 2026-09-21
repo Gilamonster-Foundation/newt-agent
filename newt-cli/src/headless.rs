@@ -601,6 +601,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
     // uses (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
+    let read_scope = dc.caveats.fs_read.clone();
     let mut driver = TurnDriver::new(dc)
         .with_cognition(runtime.cognition)
         .with_tenacity(runtime.tenacity)
@@ -622,6 +623,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     } else {
         "off"
     };
+    // U7: the workspace's changed-path set at run start, diffed against the same
+    // probe at exit so the hand-back names what THIS run changed, not prior dirt.
+    let status_before = newt_core::agentic::snapshot_workspace(&workspace, &read_scope);
     let started = Instant::now();
     driver
         .submit(instruction.trim())
@@ -667,7 +671,19 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // the agent as having done nothing). `Err` is only a spawn/thread failure
     // with no trajectory at all.
     let o_opt = outcome.as_ref().ok();
-    let clean = matches!(&outcome, Ok(o) if o.error.is_none());
+    // A failed `head()` used to `?`-return before ANY record was written. It is
+    // now a failed run that still hands back its record (U7).
+    let head_error = match (&mut smart_manifest, &smart_harness) {
+        (Some(manifest), Some(harness)) => match harness.head() {
+            Ok(head) => {
+                manifest["head"] = serde_json::json!(head.to_string());
+                None
+            }
+            Err(e) => Some(format!("smart-harness head unavailable: {e}")),
+        },
+        _ => None,
+    };
+    let clean = head_error.is_none() && matches!(&outcome, Ok(o) if o.error.is_none());
     // ONE derivation, two renderings (#2212). `outcome` is decided first and
     // `status` is a function of it, so the trace line and the contract record
     // cannot disagree about whether the turn finished. They used to be
@@ -684,16 +700,13 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     );
     let outcome_label = headless_contract::outcome_label(terminal);
     let status = headless_contract::status_label(terminal);
-    let error = match &outcome {
+    let error = head_error.or_else(|| match &outcome {
         Ok(o) => o.error.clone(),
         Err(e) => Some(e.clone()),
-    };
+    });
     let reply_chars = o_opt.map(|o| o.reply.len()).unwrap_or(0);
     let usage = o_opt.and_then(|o| o.usage.as_ref().map(|u| u.total()));
     let halluc = o_opt.map(|o| o.hallucinations).unwrap_or(0);
-    if let (Some(manifest), Some(harness)) = (&mut smart_manifest, &smart_harness) {
-        manifest["head"] = serde_json::json!(harness.head()?.to_string());
-    }
     // The per-tool trajectory — the material for the failure taxonomy. The
     // single highest-signal field is `write_calls`: a failed task with 0 writes
     // never ACTED (the initiative target); with writes it acted but wrong. Only
@@ -764,6 +777,17 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         "resume_from": launch.continuity.parent_frame(),
         "trajectory": trajectory,
         "error": error,
+        // Harness-written, never the model's claim; solve_result only (the
+        // contract record is field-pinned). Carries no hash or id.
+        "handback": headless_contract::handback(
+            status_before.as_ref().and_then(|before| {
+                newt_core::agentic::snapshot_workspace(&workspace, &read_scope)
+                    .map(|after| newt_core::agentic::files_changed_between(before, &after))
+            }),
+            o_opt.map_or(&[][..], |o| &o.tool_events[..]),
+            &end_reason,
+            reply_chars > 0,
+        ),
     });
     headless_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
     // #2313: per-attempt usage, and the attempt ledger's chain lines ahead of
