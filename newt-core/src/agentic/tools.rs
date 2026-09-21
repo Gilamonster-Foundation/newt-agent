@@ -3303,7 +3303,7 @@ async fn execute_authorized_tool(
                     };
                     let (program, argv) = build_check_argv(&joined);
                     let request = build_tool_request(&root, &cwd, program, argv)
-                        .timeout(std::time::Duration::from_secs(30 * 60));
+                        .timeout(shell::LIFECYCLE_BUILD_TIMEOUT);
                     let build = request.caveats();
                     if let Some(harness) = smart_harness {
                         if let Err(error) = harness.validate_tool_authority(build, &root) {
