@@ -997,6 +997,7 @@ mod tests {
             parse_signal_line(&ParseSignal::RecoveredToolCall {
                 round: 1,
                 dialect: ToolCallDialect::FunctionTag,
+                calls: vec![],
             }),
             serde_json::json!({
                 "kind": "recovered_tool_call", "round": 1, "dialect": "function_tag"
