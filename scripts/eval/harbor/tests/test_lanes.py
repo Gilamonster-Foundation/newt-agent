@@ -25,6 +25,23 @@ class LaneFlag(unittest.TestCase):
         self.assertNotEqual(_lane_flag("off"), _lane_flag("on"))
 
 
+class BenchWriteRoots(unittest.TestCase):
+    """The confined lane's fence no longer includes the system roots or /home by
+    default (a default must be safe on a developer host). Disposable bench
+    containers need package installs (#1487), so the adapter ASKS for them."""
+
+    ROOTS = "/usr:/usr/local:/var:/etc:/opt:/root:/home"
+
+    def test_confined_lane_requests_the_broad_roots_and_off_lane_does_not(self):
+        try:
+            newt_agent._OCAP = "on"
+            self.assertIn(f"NEWT_WRITE_PATHS={self.ROOTS} ", newt_agent._container_env_prefix())
+            newt_agent._OCAP = ""
+            self.assertNotIn("NEWT_WRITE_PATHS", newt_agent._container_env_prefix())
+        finally:
+            newt_agent._OCAP = ""
+
+
 class ModelDigest(unittest.TestCase):
     """#2318: a declared digest reaches the container as NEWT_MODEL_DIGEST, and
     none is invented when the operator declared nothing."""
