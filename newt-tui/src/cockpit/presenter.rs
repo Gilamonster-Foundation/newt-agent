@@ -2063,6 +2063,8 @@ mod terminal_acceptance;
 
 #[cfg(all(test, feature = "live-spill"))]
 pub(crate) use terminal_acceptance::cockpit_pager_case;
+#[cfg(all(test, feature = "rich-tui"))]
+pub(crate) use terminal_acceptance::cockpit_psyche_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,

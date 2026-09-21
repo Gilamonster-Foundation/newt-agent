@@ -1013,7 +1013,7 @@ pub(crate) fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
 }
 
 /// Editable rows + provider/crew, a footer, and the two border rows.
-const PANEL_HEIGHT: u16 = ROWS.len() as u16 + 5;
+pub(crate) const PANEL_HEIGHT: u16 = ROWS.len() as u16 + 5;
 
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     let bottom = if let Mode::Command(buf) = &state.mode {
@@ -1231,6 +1231,7 @@ pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
 pub(crate) fn run(
     seed: PanelSeed,
     persist: impl FnMut(&str, &str, bool) -> SaveResult,
+    window: Option<crate::session_worker::PanelWindow>,
 ) -> io::Result<PanelOutcome> {
     let mut screen = PsycheScreen {
         state: PanelState::new(seed),
@@ -1238,7 +1239,7 @@ pub(crate) fn run(
     };
     // Scoped inside `panel::drive`, whose raw-mode guard restores exactly
     // where the old bare `disable_raw_mode()` statement did (#1889).
-    let applied = crate::panel::drive(&mut screen, PANEL_HEIGHT, None)?;
+    let applied = crate::panel::drive(&mut screen, PANEL_HEIGHT, window.as_ref())?;
 
     // Commit order (review-3 §1): the persona file was already persisted inside
     // the loop (via `persist`). Now apply the dials — but ONLY on an explicit
