@@ -246,3 +246,21 @@ fn malformed_calls_are_never_dispatched_invocation_count_is_zero() {
     );
     assert_eq!(dispatched_names, vec!["git", "list_dir"]);
 }
+
+#[test]
+fn withdraw_tool_calls_only_touches_an_assistant_turn() {
+    let calls = serde_json::json!([{"type": "function"}]);
+    let mut assistant =
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": calls});
+    withdraw_tool_calls(&mut assistant);
+    assert!(assistant.get("tool_calls").is_none());
+    assert!(
+        assistant["content"].is_string(),
+        "no null assistant content"
+    );
+
+    let mut other = serde_json::json!({"role": "user", "content": "hi", "tool_calls": calls});
+    let before = other.clone();
+    withdraw_tool_calls(&mut other);
+    assert_eq!(other, before, "a non-assistant message is left alone");
+}
