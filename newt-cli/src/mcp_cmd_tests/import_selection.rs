@@ -209,3 +209,25 @@ fn import_listing_never_renders_untrusted_names_as_commands() {
         "{err}"
     );
 }
+
+#[test]
+fn import_flags_stdio_command_that_resolves_to_nothing() {
+    let dirs = [PathBuf::from("/bin")];
+    let home = Path::new("/h");
+    let has = |p: &Path| {
+        p == Path::new("/bin/ok") || p == Path::new("/h/tool") || p == Path::new("/abs/x")
+    };
+    let msg = |cmd: &str| {
+        let e = stdio_entry("srv", Some(cmd));
+        missing_stdio_command(&e, &dirs, Some(home), has)
+    };
+    let m = msg("nope").expect("bare command not on PATH");
+    assert!(m.contains("`srv`") && m.contains(r#""nope""#), "{m}");
+    assert!(msg("ok").is_none());
+    assert!(msg("~/tool").is_none() && msg("~/gone").is_some());
+    assert!(msg("/abs/x").is_none() && msg("/abs/y").is_some());
+    assert!(msg("x\u{1b}y").unwrap().contains("\\u{1b}"));
+    let mut http = stdio_entry("h", None);
+    http.transport = TransportKind::Http;
+    assert!(missing_stdio_command(&http, &dirs, Some(home), has).is_none());
+}
