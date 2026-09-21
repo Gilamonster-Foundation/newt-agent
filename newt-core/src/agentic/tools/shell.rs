@@ -814,6 +814,10 @@ pub(super) fn confined_result(
 pub(super) const LIFECYCLE_BUILD_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
+/// The literal call the coaching shows, so a model copies a valid shape instead
+/// of inventing `phase="build"`.
+const LIFECYCLE_BUILD_CALL: &str = r#"{"action":"build","phase":"test"}"#;
+
 /// The confined shell's per-call wall clock (agent-bridle's default; newt never
 /// overrides it, and the model has no argument to raise it).
 fn run_command_wall_secs() -> u64 {
@@ -825,8 +829,9 @@ fn run_command_wall_secs() -> u64 {
 pub(super) fn run_command_limit_sentence() -> String {
     format!(
         "Each call is killed after {} seconds (wall clock, not configurable per call), so a \
-         cold build or full test run will not finish here: use `lifecycle` action=build \
-         ({}-minute limit) for those, or narrow the command (one test filter, one crate).",
+         cold build or full test run will not finish here: use `lifecycle` action=build, i.e. call \
+         the tool with {LIFECYCLE_BUILD_CALL} ({}-minute limit; `phase` is never `build`) for \
+         those, or narrow the command (one test filter, one crate).",
         run_command_wall_secs(),
         LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
     )
@@ -837,8 +842,9 @@ pub(super) fn run_command_limit_sentence() -> String {
 fn timed_out_note() -> String {
     format!(
         "\n(the command hit the {}s wall and was killed; the output above is partial. For a \
-         build or full test run use `lifecycle` action=build ({}-minute limit, confined, \
-         offline), or narrow the command.)",
+         build or full test run use `lifecycle` action=build, i.e. call the tool with \
+         {LIFECYCLE_BUILD_CALL} ({}-minute limit, confined, offline; `phase` is the phase to run, not `build`), or \
+         narrow the command.)",
         run_command_wall_secs(),
         LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
     )
