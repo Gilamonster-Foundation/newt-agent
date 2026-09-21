@@ -1537,21 +1537,10 @@ kind = "openai"
     );
 }
 
-/// #2318: a 2xx OpenAI stream that strict decoding rejects (a tool call without
-/// an id) is the model's answer, so the headless contract files it `model_error`.
-/// Its class used to be lost and the run filed as `harness_error`, which the
-/// bench excludes from capability scoring as the harness's fault.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_strictly_rejected_stream_files_as_model_error() {
+/// Drive `newt headless` against one fixed SSE reply on every POST; returns the
+/// POST count, the `solve_result` line and the contract record.
+async fn headless_against_stream(stream: String) -> (usize, serde_json::Value, serde_json::Value) {
     let server = MockServer::start().await;
-    let stream = [
-        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
-        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-        "[DONE]",
-    ]
-    .iter()
-    .map(|frame| format!("data: {frame}\n\n"))
-    .collect::<String>();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
@@ -1592,22 +1581,67 @@ kind = "openai"
         .arg(&events_path)
         .assert();
 
-    let posts: Vec<_> = server
+    let posts = server
         .received_requests()
         .await
         .expect("journal")
         .into_iter()
         .filter(|request| request.method.as_str() == "POST")
-        .collect();
-    assert_eq!(
-        posts.len(),
-        1,
-        "exactly one POST: the rejection is not retried"
-    );
-    let result = solve_result_from(&events_path);
+        .count();
+    (
+        posts,
+        solve_result_from(&events_path),
+        contract_from(&events_path),
+    )
+}
+
+/// A streamed `read_file` call; `id` is the raw JSON fragment for the id member
+/// (empty = the key is absent).
+fn streamed_read_file_call(id: &str) -> String {
+    [
+        format!(
+            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,{id}"type":"function","function":{{"name":"read_file","arguments":"{{}}"}}}}]}}}}]}}"#
+        ),
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "[DONE]".to_string(),
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect()
+}
+
+/// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool call
+/// whose id is not a string, which cannot be read at all) is the model's answer,
+/// so the headless contract files it `model_error`. Its class used to be lost
+/// and the run filed as `harness_error`, which the bench excludes from
+/// capability scoring as the harness's fault. (A MISSING id used to be the
+/// example; it is now the batch validator's, re-asked — see the next test.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strictly_rejected_stream_files_as_model_error() {
+    let (posts, result, contract) =
+        headless_against_stream(streamed_read_file_call(r#""id":7,"#)).await;
+    assert_eq!(posts, 1, "exactly one POST: the rejection is not retried");
     assert_eq!(result["tool_calls"], 0, "nothing ran: {result}");
     assert_eq!(result["end_reason"], "None", "{result}");
-    let contract = contract_from(&events_path);
+    assert_eq!(contract["outcome"], "model_error", "{contract}");
+}
+
+/// U3: a streamed tool call with NO id reaches the shared batch validator and is
+/// re-asked within its bounded budget; the third id-less batch ends the turn as
+/// the model's error, with nothing dispatched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_idless_call_is_re_asked_then_files_as_model_error() {
+    let (posts, result, contract) = headless_against_stream(streamed_read_file_call("")).await;
+    assert_eq!(posts, 3, "two re-asks, then the third id-less batch aborts");
+    // The re-asked rounds leave only not-ok rejection markers: nothing ran.
+    let trajectory = result["trajectory"].as_array().expect("trajectory");
+    assert_eq!(trajectory.len(), 2, "one marker per re-ask: {result}");
+    assert!(
+        trajectory
+            .iter()
+            .all(|e| e["tool"] == "(rejected tool-call batch)" && e["ok"] == false),
+        "nothing was dispatched: {result}"
+    );
     assert_eq!(contract["outcome"], "model_error", "{contract}");
 }
 
