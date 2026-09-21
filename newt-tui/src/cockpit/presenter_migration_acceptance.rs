@@ -4,7 +4,11 @@
 use super::*;
 use crate::cockpit::test_tty::{modes_equal, termios_of, TestTty};
 
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the mocked migration-notice ordering tests: notices reach a real cockpit without disturbing the editor or modal.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 fn migration_notices_preserve_the_cockpit_editor_and_active_modal() {
     crate::interaction_view_pty_test::drive_cockpit_migration();
@@ -95,7 +99,11 @@ pub(crate) fn cockpit_migration_case() {
     );
 }
 
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the mocked migration-notice ordering tests: notices reach a real cockpit without disturbing the editor or modal.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 fn migration_persona_list_keeps_decode_skip_notices_and_later_reads_are_quiet() {
     crate::interaction_view_pty_test::drive_persona_migration();
@@ -147,7 +155,11 @@ pub(crate) fn persona_migration_case() {
     }
 }
 
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the mocked migration-notice ordering tests: notices reach a real cockpit without disturbing the editor or modal.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 fn migration_startup_flushes_after_splash_on_success_and_error() {
     crate::interaction_view_pty_test::drive_startup_migration();
