@@ -199,6 +199,52 @@ pub(crate) fn uncorrelatable_tool_calls(reason: &str) -> anyhow::Error {
     .into()
 }
 
+/// Consecutive uncorrelatable batches a turn tolerates before it aborts. The
+/// third in a row is fatal; any well-formed batch resets the count.
+pub(crate) const MAX_UNCORRELATABLE_BATCHES: u32 = 3;
+
+/// Recovery for a batch whose calls cannot be correlated (missing, blank or
+/// duplicate ids), shared by every wire that requires call ids. Nothing was
+/// dispatched and no id is fabricated: while the budget lasts this returns the
+/// plain user-role message to append (there is no tool result to key it to) so
+/// the caller can `continue` the loop; once `strikes` reaches
+/// [`MAX_UNCORRELATABLE_BATCHES`] it aborts exactly as before.
+pub(crate) fn reask_uncorrelatable(
+    strikes: &mut u32,
+    reason: &str,
+    smart_harness: Option<&super::smart_harness::SmartHarness>,
+) -> anyhow::Result<String> {
+    *strikes += 1;
+    let recoverable = *strikes < MAX_UNCORRELATABLE_BATCHES;
+    if let Some(harness) = smart_harness {
+        harness.reject_tools(reason, recoverable)?;
+    }
+    if !recoverable {
+        return Err(uncorrelatable_tool_calls(reason));
+    }
+    Ok(
+        "Your last reply contained tool calls without call ids (each call needs a unique, \
+        non-empty id), so none of them were run. Re-emit the tool calls you intended, each \
+        with its own id."
+            .to_string(),
+    )
+}
+
+/// Drop the id-less `tool_calls` from the assistant turn recorded just before
+/// validation: with no ids there is nothing to answer them with, and replaying
+/// them would send the provider a transcript it rejects.
+pub(crate) fn withdraw_tool_calls(assistant_turn: &mut serde_json::Value) {
+    if let Some(turn) = assistant_turn.as_object_mut() {
+        turn.remove("tool_calls");
+        if turn.get("content").is_none_or(|c| c.is_null()) {
+            turn.insert(
+                "content".into(),
+                "(tool calls without ids were discarded)".into(),
+            );
+        }
+    }
+}
+
 impl BatchRejection {
     /// The human-readable reason, whichever class.
     pub(crate) fn reason(&self) -> &str {
