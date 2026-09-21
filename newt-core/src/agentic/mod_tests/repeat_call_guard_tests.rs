@@ -1057,3 +1057,109 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     .collect::<Vec<_>>();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+// ---- U4b: the no-progress brake (state machine; the loop wiring is covered by
+// the headless_cli end-to-end test). Pure: no filesystem, no clock.
+
+fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeState {
+    WorkflowRuntimeState {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after,
+            stop_after,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_write_then_idle_rounds_are_steered_once_then_stopped() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true); // the successful write arms the brake
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    state.record_round_outcome(false, false);
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    state.record_round_outcome(false, false);
+    let NoProgress::Steer(text) = state.no_progress_verdict() else {
+        panic!("2 idle rounds must steer");
+    };
+    assert!(
+        text.contains("2 rounds have passed since your last successful change"),
+        "{text}"
+    );
+    assert!(
+        matches!(state.no_progress_verdict(), NoProgress::Continue),
+        "the steer is sent ONCE per stall"
+    );
+    state.record_round_outcome(false, false);
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Stop));
+    assert!(
+        state.no_progress_notice().contains("3 consecutive rounds"),
+        "{}",
+        state.no_progress_notice()
+    );
+}
+
+#[test]
+fn a_read_only_turn_never_trips_the_brake() {
+    let mut state = no_progress_state(2, 3);
+    for _ in 0..50 {
+        state.record_round_outcome(false, false);
+        assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    }
+}
+
+#[test]
+fn a_second_write_resets_the_count_and_rearms_the_steer() {
+    let mut state = no_progress_state(2, 4);
+    state.record_round_outcome(true, true);
+    state.record_round_outcome(false, false);
+    state.record_round_outcome(false, false);
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Steer(_)));
+    state.record_round_outcome(true, true); // real progress
+    state.record_round_outcome(false, false);
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    state.record_round_outcome(false, false);
+    assert!(
+        matches!(state.no_progress_verdict(), NoProgress::Steer(_)),
+        "steers again"
+    );
+}
+
+/// The reset rule, exactly: a PASSING `lifecycle` build/test (the harness's
+/// structured lane) resets the count. A `run_command` pass never does — a shell
+/// exit code is not evidence of a passing build (`| tail` masks it: 27 of the 29
+/// rounds after run 2483-a's edit were `passed`), so it cannot be progress.
+#[test]
+fn a_passing_lifecycle_run_resets_the_count_but_stays_armed() {
+    let mut state = no_progress_state(2, 4);
+    state.record_round_outcome(true, true);
+    state.record_round_outcome(false, false);
+    state.record_round_outcome(false, false);
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Steer(_)));
+    state.note_verified_pass();
+    state.record_round_outcome(false, false);
+    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    state.record_round_outcome(false, false);
+    state.record_round_outcome(false, false);
+    assert!(
+        matches!(state.no_progress_verdict(), NoProgress::Steer(_)),
+        "still armed, steers again"
+    );
+}
+
+#[test]
+fn zero_disables_each_half_and_default_is_12_20() {
+    let mut off = no_progress_state(0, 0);
+    off.record_round_outcome(true, true);
+    for _ in 0..100 {
+        off.record_round_outcome(false, false);
+        assert!(matches!(off.no_progress_verdict(), NoProgress::Continue));
+    }
+    let mut stop_only = no_progress_state(0, 2);
+    stop_only.record_round_outcome(true, true);
+    stop_only.record_round_outcome(false, false);
+    stop_only.record_round_outcome(false, false);
+    assert!(matches!(stop_only.no_progress_verdict(), NoProgress::Stop));
+    let d = crate::initiative::NoProgressRounds::default();
+    assert_eq!((d.steer_after, d.stop_after), (12, 20));
+}
