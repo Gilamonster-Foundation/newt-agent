@@ -2228,3 +2228,182 @@ async fn an_anthropic_no_output_reissue_storm_is_one_attempt_per_try() {
         assert_eq!(record.state, crate::attempts::AttemptState::Failed);
     }
 }
+
+// -----------------------------------------------------------------------
+// P0 U3: a tool_use with no id is re-asked; the withdrawn call must not be
+// replayed as a tool_use block (that would be a provider 400 one round later).
+// -----------------------------------------------------------------------
+
+struct IdlessThenGood {
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for IdlessThenGood {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let n = bodies.len();
+        bodies.push(body_json(req));
+        match n {
+            0 => json_reply(
+                "tool_use",
+                serde_json::json!([
+                    {"type": "text", "text": "Reading."},
+                    {"type": "tool_use", "name": "read_file",
+                     "input": {"path": "no/such/file"}},
+                ]),
+                40,
+                9,
+            ),
+            1 => json_reply(
+                "tool_use",
+                serde_json::json!([{"type": "tool_use", "id": "toolu_1",
+                    "name": "read_file", "input": {"path": "no/such/file"}}]),
+                40,
+                9,
+            ),
+            _ => json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+                60,
+                4,
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(IdlessThenGood {
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.tool_events = Some(&mut events);
+    let (reply, ..) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("the turn completes after the re-ask");
+    assert_eq!(reply, "done");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let has_tool_use = |msgs: &[serde_json::Value]| {
+        msgs.iter().any(|m| {
+            m["content"]
+                .as_array()
+                .is_some_and(|b| b.iter().any(|b| b["type"] == "tool_use"))
+        })
+    };
+    assert!(
+        !has_tool_use(second),
+        "the id-less tool_use must not be replayed: {second:?}"
+    );
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user");
+    assert!(
+        last.to_string().contains("could not be correlated"),
+        "{last}"
+    );
+    assert!(
+        second.iter().any(|m| m.to_string().contains("Reading.")),
+        "the assistant's text survives the withdrawal"
+    );
+    // The good batch pairs its tool_use with a tool_result.
+    let third = bodies[2]["messages"].as_array().expect("messages");
+    assert!(has_tool_use(third));
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+    assert!(events
+        .iter()
+        .any(|e| e.tool == "(rejected tool-call batch)" && !e.ok));
+}
+
+// A call the harness RECOVERED from reply text on the Anthropic-shaped wire:
+// the internal turn already replays recovered calls as `tool_use`, so it needs
+// only the derived id and a matching `tool_result`.
+struct BareThenAnswer {
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for BareThenAnswer {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let n = bodies.len();
+        bodies.push(body_json(req));
+        if n == 0 {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text":
+                    "{\"name\": \"read_file\", \"arguments\": {\"path\": \"no/such/file\"}}"}]),
+                40,
+                9,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+                60,
+                4,
+            )
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_recovered_call_replays_as_tool_use_with_a_derived_id() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(BareThenAnswer {
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.tool_events = Some(&mut events);
+    let (reply, ..) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("a recovered call completes");
+    assert_eq!(reply, "done");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let use_id = second
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_use")
+        .and_then(|b| b["id"].as_str())
+        .expect("a tool_use block");
+    assert!(
+        use_id.starts_with("nwt-rc-") && use_id.len() == 39,
+        "{use_id}"
+    );
+    let result_id = second
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .and_then(|b| b["tool_use_id"].as_str())
+        .expect("a tool_result block");
+    assert_eq!(result_id, use_id, "the result answers the derived id");
+}

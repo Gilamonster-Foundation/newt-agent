@@ -25,6 +25,36 @@ class LaneFlag(unittest.TestCase):
         self.assertNotEqual(_lane_flag("off"), _lane_flag("on"))
 
 
+class BenchWriteRoots(unittest.TestCase):
+    """The confined lane's fence no longer includes the system roots or /home by
+    default (a default must be safe on a developer host). Disposable bench
+    containers need package installs (#1487), so the adapter ASKS for them."""
+
+    ROOTS = "/usr:/usr/local:/var:/etc:/opt:/root:/home"
+
+    def test_confined_lane_requests_the_broad_roots_and_off_lane_does_not(self):
+        try:
+            newt_agent._OCAP = "on"
+            self.assertIn(f"NEWT_WRITE_PATHS={self.ROOTS} ", newt_agent._container_env_prefix())
+            newt_agent._OCAP = ""
+            self.assertNotIn("NEWT_WRITE_PATHS", newt_agent._container_env_prefix())
+        finally:
+            newt_agent._OCAP = ""
+
+    def test_smart_arm_never_gets_the_broad_roots(self):
+        """The smart-harness lane refuses a write grant with a model-writable
+        ancestor (`/usr` above `/usr/local`), so asking for them would stop the
+        arm launching. It keeps its workspace-only fence."""
+        try:
+            newt_agent._OCAP = "on"
+            for raw in ("1", "on", "true"):
+                newt_agent._SMART = raw
+                self.assertNotIn("NEWT_WRITE_PATHS", newt_agent._container_env_prefix(), raw)
+        finally:
+            newt_agent._OCAP = ""
+            newt_agent._SMART = ""
+
+
 class ModelDigest(unittest.TestCase):
     """#2318: a declared digest reaches the container as NEWT_MODEL_DIGEST, and
     none is invented when the operator declared nothing."""
