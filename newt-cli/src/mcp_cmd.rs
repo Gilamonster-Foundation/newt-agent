@@ -1567,15 +1567,14 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|p| std::env::split_paths(&p).collect())
             .unwrap_or_default();
-        if let Some(msg) =
-            missing_stdio_command(entry, &path_dirs, crate::home_dir().as_deref(), |p| {
-                p.is_file()
-            })
-        {
-            if !request.force {
-                bail!("{msg}; fix the command or re-run with --force to import anyway");
-            }
-            writeln!(out, "warning: {msg}; imported anyway (--force)")?;
+        if let Some(msg) = missing_stdio_command(
+            entry,
+            &path_dirs,
+            crate::home_dir().as_deref(),
+            cfg!(windows),
+            |p| p.is_file(),
+        ) {
+            writeln!(out, "warning: {msg}; imported anyway")?;
         }
         let omitted = source_omissions.remove(&entry.name).unwrap_or_default()
             + sanitize_imported_secrets(entry);
@@ -1832,11 +1831,13 @@ fn binary_candidates_in(
 
 /// A stdio server whose `command` resolves to nothing, as a message (the
 /// command is untrusted, so Debug-quoted). Pathed/`~` commands must exist as
-/// given; bare ones must be on `path_dirs`. All I/O is injected.
+/// given; bare ones must be on `path_dirs`. Relative pathed commands are
+/// skipped (the server spawns from another cwd). All I/O is injected.
 fn missing_stdio_command(
     entry: &McpServerEntry,
     path_dirs: &[PathBuf],
     home: Option<&Path>,
+    windows: bool,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<String> {
     let command = entry
@@ -1847,7 +1848,10 @@ fn missing_stdio_command(
         let rest = rest.trim_start_matches(['/', '\\']);
         home.is_some_and(|h| exists(&h.join(rest)))
     } else if command.contains(['/', '\\']) {
-        exists(Path::new(command))
+        !Path::new(command).is_absolute() || exists(Path::new(command))
+    } else if windows {
+        // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
+        true
     } else {
         first_existing(&binary_candidates_in(path_dirs, None, command), exists).is_some()
     };
