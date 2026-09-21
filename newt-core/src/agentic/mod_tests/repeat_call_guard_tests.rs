@@ -1059,7 +1059,12 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
 }
 
 // ---- U4b: the no-progress brake (state machine; the loop wiring is covered by
-// the headless_cli end-to-end test). Pure: no filesystem, no clock.
+// the headless_cli end-to-end tests). Pure: no filesystem, no clock.
+//
+// The gate runs at the START of every round after the first and counts the
+// round that just completed unless it made progress, so a round that `continue`s
+// (narration nudge, id-less re-ask) is counted too. `record_round_outcome` only
+// reports progress (a write, or a passing lifecycle test/check).
 
 fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeState {
     WorkflowRuntimeState {
@@ -1071,27 +1076,32 @@ fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeSt
     }
 }
 
+/// The verdict at one round start, as a word.
+fn gate(state: &mut WorkflowRuntimeState, steer_allowed: bool) -> &'static str {
+    match state.no_progress_verdict(steer_allowed) {
+        NoProgress::Continue => "continue",
+        NoProgress::Steer(_) => "steer",
+        NoProgress::Stop => "stop",
+    }
+}
+
 #[test]
 fn a_write_then_idle_rounds_are_steered_once_then_stopped() {
     let mut state = no_progress_state(2, 3);
     state.record_round_outcome(true, true); // the successful write arms the brake
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    assert_eq!(gate(&mut state, true), "continue"); // counts the write round: progress
     state.record_round_outcome(false, false);
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    assert_eq!(gate(&mut state, true), "continue"); // 1 idle round
     state.record_round_outcome(false, false);
-    let NoProgress::Steer(text) = state.no_progress_verdict() else {
+    let NoProgress::Steer(text) = state.no_progress_verdict(true) else {
         panic!("2 idle rounds must steer");
     };
     assert!(
         text.contains("2 rounds have passed since your last successful change"),
         "{text}"
     );
-    assert!(
-        matches!(state.no_progress_verdict(), NoProgress::Continue),
-        "the steer is sent ONCE per stall"
-    );
     state.record_round_outcome(false, false);
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Stop));
+    assert_eq!(gate(&mut state, true), "stop"); // 3 idle rounds; the steer was sent once
     assert!(
         state.no_progress_notice().contains("3 consecutive rounds"),
         "{}",
@@ -1104,7 +1114,7 @@ fn a_read_only_turn_never_trips_the_brake() {
     let mut state = no_progress_state(2, 3);
     for _ in 0..50 {
         state.record_round_outcome(false, false);
-        assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+        assert_eq!(gate(&mut state, true), "continue");
     }
 }
 
@@ -1112,54 +1122,115 @@ fn a_read_only_turn_never_trips_the_brake() {
 fn a_second_write_resets_the_count_and_rearms_the_steer() {
     let mut state = no_progress_state(2, 4);
     state.record_round_outcome(true, true);
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Steer(_)));
+    assert_eq!(gate(&mut state, true), "steer");
     state.record_round_outcome(true, true); // real progress
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
-    assert!(
-        matches!(state.no_progress_verdict(), NoProgress::Steer(_)),
-        "steers again"
-    );
+    assert_eq!(gate(&mut state, true), "steer", "steers again");
 }
 
-/// The reset rule, exactly: a PASSING `lifecycle` build/test (the harness's
-/// structured lane) resets the count. A `run_command` pass never does — a shell
-/// exit code is not evidence of a passing build (`| tail` masks it: 27 of the 29
-/// rounds after run 2483-a's edit were `passed`), so it cannot be progress.
+/// The reset rule: a PASSING `lifecycle` test/check resets the count but stays
+/// armed. (Which phases qualify is `only_test_and_check_lifecycle_phases_reset`.)
 #[test]
 fn a_passing_lifecycle_run_resets_the_count_but_stays_armed() {
     let mut state = no_progress_state(2, 4);
     state.record_round_outcome(true, true);
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Steer(_)));
+    assert_eq!(gate(&mut state, true), "steer");
     state.note_verified_pass();
     state.record_round_outcome(false, false);
-    assert!(matches!(state.no_progress_verdict(), NoProgress::Continue));
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
     state.record_round_outcome(false, false);
-    assert!(
-        matches!(state.no_progress_verdict(), NoProgress::Steer(_)),
-        "still armed, steers again"
-    );
+    assert_eq!(gate(&mut state, true), "steer", "still armed, steers again");
 }
 
 #[test]
-fn zero_disables_each_half_and_default_is_12_20() {
+fn zero_disables_each_half_and_default_is_8_12() {
     let mut off = no_progress_state(0, 0);
     off.record_round_outcome(true, true);
     for _ in 0..100 {
         off.record_round_outcome(false, false);
-        assert!(matches!(off.no_progress_verdict(), NoProgress::Continue));
+        assert_eq!(gate(&mut off, true), "continue");
     }
     let mut stop_only = no_progress_state(0, 2);
     stop_only.record_round_outcome(true, true);
+    assert_eq!(gate(&mut stop_only, true), "continue");
     stop_only.record_round_outcome(false, false);
+    assert_eq!(gate(&mut stop_only, true), "continue");
     stop_only.record_round_outcome(false, false);
-    assert!(matches!(stop_only.no_progress_verdict(), NoProgress::Stop));
+    assert_eq!(gate(&mut stop_only, true), "stop");
     let d = crate::initiative::NoProgressRounds::default();
-    assert_eq!((d.steer_after, d.stop_after), (12, 20));
+    assert_eq!((d.steer_after, d.stop_after), (8, 12));
+}
+
+/// Review fix 4: a loop made of rounds that `continue` never calls
+/// `record_round_outcome`, but each is a completed model round with no change.
+#[test]
+fn rounds_that_never_reach_the_outcome_hook_still_count_toward_the_brake() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true);
+    let seen: Vec<_> = (0..5).map(|_| gate(&mut state, true)).collect();
+    assert_eq!(
+        seen,
+        ["continue", "continue", "steer", "stop", "stop"],
+        "{seen:?}"
+    );
+}
+
+/// Review fix 3: the STEER is advice (`action_nudges` may be off); the STOP is a
+/// bound and must fire regardless.
+#[test]
+fn the_stop_does_not_depend_on_nudges_being_allowed() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true);
+    let seen: Vec<_> = (0..4).map(|_| gate(&mut state, false)).collect();
+    assert_eq!(
+        seen,
+        ["continue", "continue", "continue", "stop"],
+        "no steer, but a stop: {seen:?}"
+    );
+}
+
+/// Review fix 2: only the gate phases are evidence of progress. `format`, `lint`,
+/// `clean` and `setup` pass trivially (a looping model can call them forever); a
+/// passing `run_command` never counts (a `| tail` masks the exit status).
+#[test]
+fn only_test_and_check_lifecycle_phases_reset_the_brake() {
+    use crate::ExecOutcome::{Failed, Passed};
+    for (phase, expect) in [
+        ("test", true),
+        ("check", true),
+        ("format", false),
+        ("lint", false),
+        ("clean", false),
+        ("setup", false),
+        ("bogus", false),
+    ] {
+        let args = serde_json::json!({ "phase": phase });
+        assert_eq!(
+            is_progress_verification("lifecycle", &args, Some(Passed)),
+            expect,
+            "{phase}"
+        );
+    }
+    let test = serde_json::json!({ "phase": "test" });
+    assert!(!is_progress_verification("lifecycle", &test, Some(Failed)));
+    assert!(!is_progress_verification("lifecycle", &test, None));
+    let shell = serde_json::json!({ "command": "cargo test" });
+    assert!(!is_progress_verification(
+        "run_command",
+        &shell,
+        Some(Passed)
+    ));
 }
