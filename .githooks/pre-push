@@ -15,6 +15,7 @@
 #     other OS executions are CI-only. release.yml reuses this suite before
 #     tag-only artifact assembly/publication, which this hook does not perform.
 #   - .github/workflows/harness-python.yml is a declared real-resource lane (uv + CPython), deliberately outside hook parity; `just harness-python` mirrors it.
+#   - .github/workflows/newt-tui-pty.yml is a declared real-resource lane (real PTYs and subprocesses; its cockpit steps run the `#[ignore]`d PTY tests with `--include-ignored`), deliberately outside hook parity; nothing here mirrors it.
 #   - The feature list passed to clippy and to cargo test must MATCH:
 #     `--features newt-data/kernel,newt-interaction/schema`. Linting without
 #     a feature the tests enable hides feature-gated lint regressions, which
