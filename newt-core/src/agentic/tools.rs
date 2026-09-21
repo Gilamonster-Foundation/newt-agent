@@ -233,12 +233,12 @@ pub(crate) fn reask_uncorrelatable(
             Some(0),
         ));
     }
-    Ok(
-        "Your last reply contained tool calls without call ids (each call needs a unique, \
-        non-empty id), so none of them were run. Re-emit the tool calls you intended, each \
-        with its own id."
-            .to_string(),
-    )
+    let reason: String = reason.chars().take(200).collect();
+    Ok(format!(
+        "Your last reply's tool calls could not be correlated ({reason}), so none of them \
+         were run. Re-emit the calls you intended as native tool calls (not as text in your \
+         reply), each with its own unique, non-empty call id."
+    ))
 }
 
 /// Drop the id-less `tool_calls` from the assistant turn recorded just before
@@ -253,7 +253,13 @@ pub(crate) fn withdraw_tool_calls(assistant_turn: &mut serde_json::Value) {
     }
     if let Some(turn) = assistant_turn.as_object_mut() {
         turn.remove("tool_calls");
-        if turn.get("content").is_none_or(|c| c.is_null()) {
+        // A tool-only reply is replayed with `content: ""` on the default path,
+        // and strict gateways reject an empty assistant turn: null and blank
+        // alike get the placeholder.
+        if turn
+            .get("content")
+            .is_none_or(|c| c.is_null() || c.as_str().is_some_and(|t| t.trim().is_empty()))
+        {
             turn.insert(
                 "content".into(),
                 "(tool calls without ids were discarded)".into(),
