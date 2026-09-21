@@ -8627,7 +8627,7 @@ fn session_body(
                                                 &reply,
                                                 newt_core::agentic::RenderOpts {
                                                     color: true,
-                                                    cols
+                                                    cols: newt_core::agentic::reply_cols(cols),
                                                 },
                                             )
                                         );
@@ -8662,7 +8662,10 @@ fn session_body(
                                             "{}",
                                             newt_core::agentic::render_markdown(
                                                 &plan.draft.markdown,
-                                                newt_core::agentic::RenderOpts { color, cols },
+                                                newt_core::agentic::RenderOpts {
+                                                    color,
+                                                    cols: newt_core::agentic::reply_cols(cols),
+                                                },
                                             )
                                         );
                                         println!();
