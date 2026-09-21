@@ -129,24 +129,83 @@ fn import_selection_never_silently_discards_rejected_entries() {
             issue: newt_core::mcp::McpImportIssue::UnknownField,
         }],
     };
-    assert!(
-        select_import_entries(report.clone(), None, true, Path::new("source.toml"))
-            .unwrap_err()
-            .to_string()
-            .contains("cannot import all")
-    );
+    assert!(select_import_entries(
+        report.clone(),
+        None,
+        true,
+        Path::new("source.toml"),
+        "--from-codex"
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("cannot import all"));
     assert!(select_import_entries(
         report.clone(),
         Some("rejected"),
         false,
-        Path::new("source.toml")
+        Path::new("source.toml"),
+        "--from-codex"
     )
     .unwrap_err()
     .to_string()
     .contains("unsupported fields"));
     assert_eq!(
-        select_import_entries(report, Some("valid"), false, Path::new("source.toml")).unwrap()[0]
+        select_import_entries(
+            report,
+            Some("valid"),
+            false,
+            Path::new("source.toml"),
+            "--from-codex"
+        )
+        .unwrap()[0]
             .name,
         "valid"
+    );
+}
+
+#[test]
+fn import_without_selector_lists_names_as_commands() {
+    let report = McpImportParseReport {
+        entries: vec![
+            stdio_entry("zeta", Some("z")),
+            stdio_entry("alpha", Some("a")),
+        ],
+        rejected: vec![],
+    };
+    let err = select_import_entries(report, None, false, Path::new("s.json"), "--from-claude")
+        .unwrap_err()
+        .to_string();
+    let a = err
+        .find("newt mcp import --from-claude --name alpha")
+        .expect(&err);
+    let z = err
+        .find("newt mcp import --from-claude --name zeta")
+        .expect(&err);
+    assert!(a < z, "{err}");
+    assert!(err.contains("--all"), "{err}");
+}
+
+#[test]
+fn import_listing_never_renders_untrusted_names_as_commands() {
+    let report = McpImportParseReport {
+        entries: vec![
+            stdio_entry("ok-name", Some("a")),
+            stdio_entry("x; rm -rf ~", Some("b")),
+            stdio_entry("\u{1b}[31m", Some("c")),
+        ],
+        rejected: vec![],
+    };
+    let err = select_import_entries(report, None, false, Path::new("s"), "my dir/.mcp.json")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("newt mcp import 'my dir/.mcp.json' --name ok-name"),
+        "{err}"
+    );
+    assert!(!err.contains("--name x;"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err}");
+    assert!(
+        err.contains(r#""x; rm -rf ~""#) && err.contains(r#""\u{1b}[31m""#),
+        "{err}"
     );
 }
