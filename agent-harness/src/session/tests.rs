@@ -338,16 +338,34 @@ fn packet_slots_preserve_occurrences_of_identical_units() {
     assert_eq!(receipt.payload().parts[0].source, first);
 }
 
-/// Grounds navigation's clock accounting in a real elapsed interval: primary
-/// inference and operator idle time must not spend the navigation work budget.
+/// A clock the test advances by hand: no sleeping, no wall clock. Grounds the
+/// mocked navigation-budget accounting; the real `Instant`-backed default is one
+/// line in `Session::create`.
+fn hand_clock() -> (
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    impl Fn() -> std::time::Duration + Send + Sync + 'static,
+) {
+    let ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ms.clone();
+    (ms, move || {
+        std::time::Duration::from_millis(reader.load(std::sync::atomic::Ordering::SeqCst))
+    })
+}
+
+/// Navigation's clock accounting: primary inference and operator idle time must
+/// not spend the navigation work budget. Time is injected (was: a real 25 ms
+/// sleep against a real 20 ms budget, which failed under instrumentation).
 #[test]
 fn idle_time_does_not_exhaust_navigation_work_budget() {
+    let (now, clock) = hand_clock();
     let mut session = Session::new(SessionConfig {
         max_elapsed_ms: 20,
         ..Default::default()
     })
-    .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(25));
+    .unwrap()
+    .with_clock(clock);
+    // Idle longer than the whole budget passes between calls: not charged.
+    now.fetch_add(25, std::sync::atomic::Ordering::SeqCst);
     assert!(session
         .project(&[json!({"role":"user","content":"task"})], 4096)
         .is_ok());
@@ -356,6 +374,31 @@ fn idle_time_does_not_exhaust_navigation_work_budget() {
         session.project(&[json!({"role":"user","content":"task"})], 4096),
         Err(Error::Budget(_))
     ));
+}
+
+/// The opposite direction: time that passes INSIDE a navigation operation is
+/// charged. A clock that reads 21 ms later at the end of the first `project`
+/// exhausts the 20 ms budget on that very call.
+#[test]
+fn time_inside_a_navigation_operation_is_charged_by_the_injected_clock() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = reads.clone();
+    let mut session = Session::new(SessionConfig {
+        max_elapsed_ms: 20,
+        ..Default::default()
+    })
+    .unwrap()
+    .with_clock(move || {
+        // Each read is 21 ms after the last: one operation spans 21 ms.
+        std::time::Duration::from_millis(
+            21 * counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        )
+    });
+    assert!(matches!(
+        session.project(&[json!({"role":"user","content":"task"})], 4096),
+        Err(Error::Budget(_))
+    ));
+    assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
 }
 
 #[test]
