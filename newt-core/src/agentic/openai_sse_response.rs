@@ -1,4 +1,15 @@
 //! Strict completion evidence layered on the shared SSE line parser.
+//!
+//! **Where tool-call ids are checked.** This decoder does NOT require a call id:
+//! a call with a missing, blank or repeated id decodes, with its `id` key left
+//! off or as sent, and `tools::validate_tool_call_batch` is the OWNER of every id
+//! check (non-empty, pairwise distinct). Only the chat loop reads the decoded
+//! `tool_calls`, and it validates with ids required before anything is
+//! dispatched, so an id-less streamed call is re-asked within a bounded budget
+//! and can never run. Anything that starts reading decoded calls another way
+//! must validate them the same way. What stays a strict rejection here is what
+//! cannot be read at all: a non-string id, an id that changes mid-stream, an
+//! index gap.
 
 use super::OpenAiStreamRound;
 use anyhow::Context;
@@ -208,15 +219,14 @@ struct ToolFragments {
 
 impl ToolFragments {
     fn append(&mut self, call: &Value) -> anyhow::Result<()> {
-        // A blank id is the same defect as an absent one and is judged by
-        // `validate_tool_call_batch` (a bounded re-ask), exactly as on a complete
-        // JSON reply, so it is not accumulated. A non-string id is a shape we
-        // cannot read at all (#2318).
-        let id = if call["id"].as_str() == Some("") {
-            &Value::Null
-        } else {
-            &call["id"]
-        };
+        // A blank id on a call that has NO id yet is the same defect as an absent
+        // one and is judged by `validate_tool_call_batch` (a bounded re-ask),
+        // exactly as on a complete JSON reply, so it is not accumulated. A blank
+        // id AFTER a real one is a changed id and stays a strict rejection, as
+        // does a non-string id, which is a shape we cannot read at all (#2318).
+        let blank = call["id"].as_str() == Some("");
+        anyhow::ensure!(!(blank && self.id.is_some()), "stream changed tool-call ID");
+        let id = if blank { &Value::Null } else { &call["id"] };
         anyhow::ensure!(
             id.is_null() || id.as_str().is_some(),
             "stream has invalid tool-call ID"
