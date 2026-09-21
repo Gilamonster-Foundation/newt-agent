@@ -3046,6 +3046,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 !probe_content.is_empty(),
                 native,
                 recovered.dialect,
+                Vec::new(),
             ) {
                 obs.parse_signals.push(sig);
             }
@@ -7612,11 +7613,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // loop: a local vLLM/llama.cpp server reports OpenAI-wire, so weak models
         // there drop content-emitted calls too. Recovered calls are native-shaped
         // and flow into the executor + is_hallucination path below.
-        let recovered = if native_calls.map(|t| t.is_empty()).unwrap_or(true) {
+        let mut recovered = if native_calls.map(|t| t.is_empty()).unwrap_or(true) {
             tool_recovery::recover_tool_calls(&oa_content)
         } else {
             tool_recovery::Recovery::default()
         };
+        // A recovered call has no provider id; the harness derives one from the
+        // call and the attempt that produced it (never for a provider call).
+        let recovered_identities = tool_recovery::assign_ids(
+            &mut recovered,
+            attempt_ledger.and_then(|l| l.lock().ok().and_then(|l| l.latest_primary())),
+        );
         let tool_calls: Option<&Vec<serde_json::Value>> = match native_calls {
             Some(t) if !t.is_empty() => Some(t),
             _ if !recovered.calls.is_empty() => Some(&recovered.calls),
@@ -7727,6 +7734,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 !oa_content.is_empty(),
                 native,
                 recovered.dialect,
+                recovered_identities.clone(),
             ) {
                 obs.parse_signals.push(sig);
             }
@@ -8169,8 +8177,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // may instead retain the assistant's current-turn plan across tool rounds.
         // Some proxies omit the otherwise-required role; preparation also
         // canonicalizes that field before compression can inspect tool pairs.
-        let assistant_turn =
+        let mut assistant_turn =
             prepare_openai_assistant_replay(message, &oa_content, reasoning_replay_scope, true);
+        // A recovered call was never in the provider's message, so the replayed
+        // turn has no `tool_calls` for its tool result to answer. Add them, in
+        // wire shape, with the derived ids; the original text stays in
+        // `content` as the evidence they were derived from.
+        if !recovered_identities.is_empty() {
+            assistant_turn["tool_calls"] =
+                serde_json::Value::Array(tool_recovery::wire_tool_calls(&recovered.calls));
+        }
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
         let mut round_progress = false;
@@ -10007,11 +10023,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // Recover tool calls emitted as content instead of native tool_use —
         // mirrors the OpenAI path: real Anthropic emits native blocks, but a
         // weak model behind a façade can drop content-emitted calls too.
-        let recovered = if native_calls.is_none() {
+        let mut recovered = if native_calls.is_none() {
             tool_recovery::recover_tool_calls(&oa_content)
         } else {
             tool_recovery::Recovery::default()
         };
+        let recovered_identities = tool_recovery::assign_ids(
+            &mut recovered,
+            attempt_ledger.and_then(|l| l.lock().ok().and_then(|l| l.latest_primary())),
+        );
         let tool_calls: Option<&Vec<serde_json::Value>> = match native_calls {
             Some(t) => Some(t),
             _ if !recovered.calls.is_empty() => Some(&recovered.calls),
@@ -10126,6 +10146,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 !oa_content.is_empty(),
                 native,
                 recovered.dialect,
+                recovered_identities.clone(),
             ) {
                 obs.parse_signals.push(sig);
             }
