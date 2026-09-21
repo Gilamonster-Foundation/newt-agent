@@ -210,7 +210,7 @@ pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
     print_harness_notice, print_list_item, print_newt, reply_cols, set_mouse_recovery,
     set_spill_lines, set_spill_summary, set_time_marker_secs, Fold, GaugeLevel, Hidden, Recovery,
-    ThinkingFold, NEWT_ORANGE_CT,
+    ThinkingFold, NEWT_ORANGE_CT, REPLY_MARKER,
 };
 pub use driver::{
     HeadlessCodeSearch, InstantiatedFeatures, TurnDriver, TurnDriverConfig, TurnDriverError,
@@ -8843,12 +8843,12 @@ async fn anthropic_dispatch_round(
                                         execute!(
                                             io::stdout(),
                                             SetForegroundColor(NEWT_ORANGE_CT),
-                                            Print("▸  "),
+                                            Print(display::REPLY_MARKER),
                                             ResetColor,
                                         )
                                         .ok();
                                     } else {
-                                        print!("▸  ");
+                                        print!("{}", display::REPLY_MARKER);
                                     }
                                     started = true;
                                 }
