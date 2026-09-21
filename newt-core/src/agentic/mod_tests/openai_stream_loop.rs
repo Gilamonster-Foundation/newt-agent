@@ -303,7 +303,7 @@ async fn a_primary_stream_error_event_after_usage_is_failed_with_that_usage() {
 }
 
 /// Review round 2, item 1: a complete `[DONE]` primary stream that strict
-/// decoding rejects (here a tool call without an id) was still generated and
+/// decoding rejects (here a tool call with a non-string id) was still generated and
 /// billed. Every attempt is failed WITH the usage the stream reported.
 #[tokio::test]
 async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reported_usage() {
@@ -311,7 +311,7 @@ async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reporte
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(sse(&[
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":7,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
             STREAM_USAGE,
             "[DONE]",
@@ -324,10 +324,15 @@ async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reporte
     let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let mut c = ctx(&uri, &messages, &caveats);
     c.attempt_ledger = Some(&ledger);
+    // A NON-STRING id cannot be read at all (a missing id is now the batch
+    // validator's, re-asked; see the streamed_idless_* tests).
     let error = chat_complete(c, &mut NoMcp)
         .await
-        .expect_err("a tool call without an id is rejected");
-    assert!(format!("{error:#}").contains("has no ID"), "{error:#}");
+        .expect_err("a tool call with an unreadable id is rejected");
+    assert!(
+        format!("{error:#}").contains("invalid tool-call ID"),
+        "{error:#}"
+    );
 
     let received = server.received_requests().await.expect("journal").len();
     let ledger = ledger.lock().unwrap();
@@ -913,4 +918,140 @@ async fn a_changed_response_identity_retries_once_as_one_more_attempt() {
         assert_eq!(record.state, crate::attempts::AttemptState::Failed);
         assert_eq!(record.usage, reissue_usage());
     }
+}
+
+// ---------------------------------------------------------------------------
+// U3 review: an id-less tool call on the STREAMED chat wire is re-asked too.
+// Headless streams, and the decoder used to abort on the first call with no id
+// before the shared batch validator (and its bounded re-ask) was ever reached.
+// ---------------------------------------------------------------------------
+
+/// Serves one SSE body per request (the last repeats) and records every request.
+struct StreamScript {
+    bodies: Vec<String>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+impl wiremock::Respond for StreamScript {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut seen = self.seen.lock().unwrap();
+        let i = seen.len().min(self.bodies.len() - 1);
+        seen.push(body_json(req));
+        ResponseTemplate::new(200)
+            .set_body_raw(self.bodies[i].clone().into_bytes(), "text/event-stream")
+    }
+}
+
+fn sse_frames(frames: &[&str]) -> String {
+    frames.iter().map(|f| format!("data: {f}\n\n")).collect()
+}
+
+/// A streamed `read_file` call; `id` is the raw JSON fragment for the id member
+/// (empty = the key is absent).
+fn sse_tool_call(id: &str) -> String {
+    let call = format!(
+        r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,{id}"type":"function","function":{{"name":"read_file","arguments":"{{\"path\":\"no/such/file\"}}"}}}}]}}}}]}}"#
+    );
+    sse_frames(&[
+        &call,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        STREAM_USAGE,
+        "[DONE]",
+    ])
+}
+
+fn sse_answer() -> String {
+    sse_frames(&[
+        r#"{"choices":[{"delta":{"content":"all done"}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        STREAM_USAGE,
+        "[DONE]",
+    ])
+}
+
+/// Runs the streamed loop against `script`; returns the result, the request
+/// bodies, and the tool events.
+async fn run_streamed(
+    script: Vec<String>,
+) -> (
+    anyhow::Result<String>,
+    Vec<serde_json::Value>,
+    Vec<crate::ToolEvent>,
+) {
+    let server = MockServer::start().await;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(StreamScript {
+            bodies: script,
+            seen: seen.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.tool_events = Some(&mut events);
+    let result = chat_complete(c, &mut NoMcp).await.map(|(reply, ..)| reply);
+    let bodies = seen.lock().unwrap().clone();
+    (result, bodies, events)
+}
+
+#[tokio::test]
+async fn streamed_idless_tool_call_is_re_asked_and_the_turn_completes() {
+    let (result, bodies, events) = run_streamed(vec![
+        sse_tool_call(""),
+        sse_tool_call(r#""id":"call_1","#),
+        sse_answer(),
+    ])
+    .await;
+    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user");
+    assert!(
+        last["content"].as_str().unwrap().contains("call id"),
+        "{last}"
+    );
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+}
+
+/// Three id-less streamed batches abort, with the shared helper's error.
+#[tokio::test]
+async fn three_streamed_idless_batches_abort_with_the_shared_error() {
+    let (result, bodies, _) = run_streamed(vec![sse_tool_call("")]).await;
+    let err = result.expect_err("the budget is spent");
+    assert!(
+        err.to_string().contains("malformed provider output"),
+        "{err:#}"
+    );
+    assert_eq!(bodies.len(), 3);
+}
+
+/// Two streamed calls sharing one id are the validator's to judge as well.
+#[tokio::test]
+async fn streamed_duplicate_ids_reach_the_shared_validator() {
+    let dup = sse_frames(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"dup","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}},{"index":1,"id":"dup","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        STREAM_USAGE,
+        "[DONE]",
+    ]);
+    let (result, bodies, _) = run_streamed(vec![dup, sse_answer()]).await;
+    assert_eq!(result.expect("re-asked then answered"), "all done");
+    let last = bodies[1]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .contains("repeats call id"),
+        "the validator's reason reaches the model: {last}"
+    );
 }
