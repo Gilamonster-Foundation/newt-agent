@@ -44,7 +44,7 @@ fn migration_notice_child() {
         "migration-modal" | "migration-modal-redirected" => {
             let workspace = dir.path().join("workspace");
             std::fs::create_dir_all(workspace.join(".newt")).unwrap();
-            std::fs::write(workspace.join(".newt/config.toml"), OLD).unwrap();
+            std::fs::write(workspace.join(".newt").join("config.toml"), OLD).unwrap();
             std::env::set_current_dir(&workspace).unwrap();
             let stderr_path = dir.path().join("modal-stderr.log");
             let saved_stderr = if scenario == "migration-modal-redirected" {
