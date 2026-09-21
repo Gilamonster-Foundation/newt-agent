@@ -1567,13 +1567,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         // side effects of `--grant-net`: an adopted server must be connectable
         // and its persisted URL and permission host must agree byte-for-byte.
         canonicalize_import_http_url(entry)?;
-        if let Some(msg) = missing_stdio_command(
-            entry,
-            &path_dirs,
-            crate::home_dir().as_deref(),
-            cfg!(windows),
-            |p| p.is_file(),
-        ) {
+        if let Some(msg) = missing_stdio_command(entry, &path_dirs, cfg!(windows), |p| p.is_file())
+        {
             writeln!(out, "warning: {msg}; imported anyway")?;
         }
         let omitted = source_omissions.remove(&entry.name).unwrap_or_default()
@@ -1842,13 +1837,16 @@ fn is_absolute_for(command: &str, windows: bool) -> bool {
 }
 
 /// A stdio server whose `command` resolves to nothing, as a message (the
-/// command is untrusted, so Debug-quoted). Pathed/`~` commands must exist as
-/// given; bare ones must be on `path_dirs`. Relative pathed commands are
-/// skipped (the server spawns from another cwd). All I/O is injected.
+/// command is untrusted, so Debug-quoted). Pathed commands must exist as given
+/// when absolute; bare ones must be on `path_dirs`. Relative pathed commands and
+/// UNC paths are skipped (spawn cwd differs; probing a UNC path would touch the
+/// network before import). A `~`-prefixed command ALWAYS warns: the MCP launcher
+/// (`newt-mcp-client` `spawn`) hands `command` to the OS verbatim and never
+/// expands `~`, so it fails at spawn even when the expansion exists. All I/O is
+/// injected.
 fn missing_stdio_command(
     entry: &McpServerEntry,
     path_dirs: &[PathBuf],
-    home: Option<&Path>,
     windows: bool,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<String> {
@@ -1856,20 +1854,16 @@ fn missing_stdio_command(
         .command
         .as_deref()
         .filter(|_| entry.transport == TransportKind::Stdio)?;
+    if command.starts_with('~') {
+        return Some(format!(
+            "MCP server `{}` command {command:?} starts with `~`, but the MCP launcher does not expand `~` at spawn; use an absolute path",
+            entry.name
+        ));
+    }
     // Cannot judge, so never flag: a UNC path names a remote host taken from an
     // UNTRUSTED file (probing it would open an SMB connection before import).
     let unc = windows && command.starts_with("\\\\");
-    let found = if let Some(rest) = command.strip_prefix('~') {
-        // Only `~`, `~/x` and `~\x`. `~user/x` is another user's home, which the
-        // injected `home` cannot resolve. (`newt_core::config::expand_tilde` is
-        // crate-private and reads the real home, so it cannot serve this seam.)
-        if !(rest.is_empty() || rest.starts_with(['/', '\\'])) {
-            true
-        } else {
-            let rest = rest.trim_start_matches(['/', '\\']);
-            home.is_some_and(|h| exists(&h.join(rest)))
-        }
-    } else if command.contains(['/', '\\']) {
+    let found = if command.contains(['/', '\\']) {
         unc || !is_absolute_for(command, windows) || exists(Path::new(command))
     } else if windows {
         // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
