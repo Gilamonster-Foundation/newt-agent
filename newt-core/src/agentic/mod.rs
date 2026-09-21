@@ -8212,6 +8212,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &mut uncorrelatable_batches,
                     &reason,
                     smart_harness,
+                    tool_events.as_deref_mut(),
                 )?;
                 if let Some(turn) = messages.last_mut() {
                     tools::withdraw_tool_calls(turn);
@@ -10575,6 +10576,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &mut uncorrelatable_batches,
                     &reason,
                     smart_harness,
+                    tool_events.as_deref_mut(),
                 )?;
                 if let Some(turn) = messages.last_mut() {
                     tools::withdraw_tool_calls(turn);
@@ -12146,6 +12148,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &mut uncorrelatable_batches,
                     &reason,
                     smart_harness,
+                    tool_events.as_deref_mut(),
                 )?;
                 input.push(serde_json::json!({"role": "user", "content": reask}));
                 continue;
