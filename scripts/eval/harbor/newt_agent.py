@@ -138,6 +138,12 @@ def _container_env_prefix() -> str:
         parts.append("NEWT_SELF_VERIFY=0")
     if _VERIFY_OUTCOMES.strip().lower() in ("1", "true", "on", "yes"):
         parts.append("NEWT_VERIFY_OUTCOMES=1")
+    if _OCAP.strip().lower() == "on":
+        # The confined lane's fence is workspace + /tmp by default (a default must
+        # be safe on a developer host). This container is disposable and tasks
+        # install packages (#1487), so ASK for the broad roots the fence used to
+        # list built in. Not needed, and not granted, for any other lane.
+        parts.append("NEWT_WRITE_PATHS=/usr:/usr/local:/var:/etc:/opt:/root:/home")
     if _MODEL_DIGEST.strip():
         parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
     return (" ".join(parts) + " ") if parts else ""
