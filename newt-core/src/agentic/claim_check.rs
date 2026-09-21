@@ -224,6 +224,54 @@ pub(crate) struct TurnGitEvidence {
     pub branches: Vec<String>,
 }
 
+/// Repo-relative path → two-character `git status --porcelain` code.
+pub type StatusSnapshot = std::collections::BTreeMap<String, String>;
+
+/// Parse `git status --porcelain=v1 -z` output. `-z` gives raw (unquoted) paths;
+/// a rename/copy entry (`R`/`C`) is followed by its origin path, which is skipped.
+fn parse_porcelain_z(out: &str) -> StatusSnapshot {
+    let mut snapshot = StatusSnapshot::new();
+    let mut entries = out.split('\0');
+    while let Some(entry) = entries.next() {
+        let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        if code.contains(['R', 'C']) {
+            entries.next();
+        }
+        snapshot.insert(path.to_string(), code.to_string());
+    }
+    snapshot
+}
+
+/// Paths in `after` that are absent from `before` or carry a different status:
+/// what the run changed, ignoring dirt that was there when it started. (A file
+/// already dirty and dirty in the same way stays invisible — the probe is a
+/// status delta, not a content diff.)
+#[must_use]
+pub fn files_changed_between(before: &StatusSnapshot, after: &StatusSnapshot) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(path, code)| before.get(*path) != Some(*code))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// The workspace's changed-path snapshot, or `None` off-repo / on any git failure.
+#[must_use]
+pub fn snapshot_workspace(
+    workspace: &str,
+    read_scope: &crate::Scope<String>,
+) -> Option<StatusSnapshot> {
+    // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
+    let out = git_in(
+        workspace,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        read_scope,
+    )?;
+    Some(parse_porcelain_z(&out))
+}
+
 /// `phrase` appears in `text` (already lowercased) with non-alphanumeric
 /// boundaries on both sides — `contains` with word edges, no regex dep.
 fn has_phrase(lower: &str, phrase: &str) -> bool {
@@ -361,7 +409,7 @@ pub(crate) fn collect_git_evidence(
     head_at_turn_start: Option<&str>,
 ) -> Option<TurnGitEvidence> {
     let head_now = git_head(workspace, read_scope)?;
-    let status = git_in(workspace, &["status", "--porcelain"], read_scope)?;
+    let status = snapshot_workspace(workspace, read_scope)?;
     let branches = git_in(
         workspace,
         &["branch", "--format=%(refname:short)"],
@@ -373,7 +421,7 @@ pub(crate) fn collect_git_evidence(
     .collect();
     Some(TurnGitEvidence {
         head_moved: head_at_turn_start.is_some_and(|start| start != head_now),
-        tree_dirty: !status.trim().is_empty(),
+        tree_dirty: !status.is_empty(),
         branches,
     })
 }
@@ -400,6 +448,42 @@ fn git_in(workspace: &str, args: &[&str], read_scope: &crate::Scope<String>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn porcelain_z_parses_spaces_untracked_and_renames() {
+        let out = " M src/a b.rs\0?? new.txt\0R  moved.rs\0old.rs\0";
+        let s = parse_porcelain_z(out);
+        assert_eq!(s.get("src/a b.rs").map(String::as_str), Some(" M"));
+        assert_eq!(s.get("new.txt").map(String::as_str), Some("??"));
+        assert_eq!(s.get("moved.rs").map(String::as_str), Some("R "));
+        assert!(
+            !s.contains_key("old.rs"),
+            "a rename origin is not a path of its own"
+        );
+        assert!(parse_porcelain_z("").is_empty());
+    }
+
+    /// U7: the delta ignores dirt that predates the run, but reports a path whose
+    /// status changed, and a path that appeared.
+    #[test]
+    fn files_changed_is_the_delta_not_the_dirt() {
+        let snap = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect::<StatusSnapshot>()
+        };
+        let before = snap(&[("dirty.txt", " M"), ("staged.txt", "A ")]);
+        let after = snap(&[
+            ("dirty.txt", " M"),
+            ("staged.txt", "AM"),
+            ("stray.sh", "??"),
+        ]);
+        assert_eq!(
+            files_changed_between(&before, &after),
+            ["staged.txt", "stray.sh"]
+        );
+        assert!(files_changed_between(&after, &after).is_empty());
+    }
 
     /// The #867 transcript shapes: bold-wrapped path with a parenthesized
     /// line hint, a backticked `path:line`, a URL (never a claim), and a
