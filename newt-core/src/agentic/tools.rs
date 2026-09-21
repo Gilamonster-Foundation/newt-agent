@@ -863,6 +863,20 @@ pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
     }
 }
 
+/// U5: a model that sends `\n` as two characters on a single line lands a
+/// one-line blob where it meant several lines. The edit still applies (a string
+/// literal may legitimately hold `\n`), so this only WARNS, and only when the
+/// edit introduces literal backslash-n escapes into text with no real newline.
+/// Never rewrites the model's text.
+fn literal_newline_escape_warning(old_string: &str, new_string: &str) -> Option<&'static str> {
+    (!new_string.contains('\n')
+        && new_string.matches("\\n").count() > old_string.matches("\\n").count())
+    .then_some(
+        "warning: the edit was applied, but new_string contains literal `\\n` sequences \
+             and no real newlines. If you meant line breaks, re-send with real newlines.",
+    )
+}
+
 /// Preserve execution evidence while coaching an unavailable lifecycle run.
 fn lifecycle_run_result(
     args: &serde_json::Value,
@@ -3893,7 +3907,10 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total)"), &format!("{artifact}{check}"), presentation)
+                    let escape_warning = literal_newline_escape_warning(old_string, new_string)
+                        .map(|w| format!("\n{w}"))
+                        .unwrap_or_default();
+                    receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}"), presentation)
                 }
                 Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }

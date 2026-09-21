@@ -678,3 +678,64 @@ async fn cli_exact_file_write_grant_creates_and_updates_only_the_named_object() 
         "unchanged sibling\n"
     );
 }
+
+/// P0 U5: a small model sent `\n` as two characters, on one line, and the edit
+/// landed silently, leaving a file that did not compile. The edit still applies
+/// (a string literal may legitimately hold `\n`), but the success result says
+/// what it saw so the model can re-send with real newlines.
+#[tokio::test]
+async fn edit_file_warns_when_new_string_has_literal_backslash_n_and_no_newline() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("f.rs"), "let a = 1;\nlet b = 2;\n").unwrap();
+    let caveats = caveats_rw(ws.path());
+    let out = run_tool(
+        "edit_file",
+        serde_json::json!({
+            "path": "f.rs",
+            "old_string": "let a = 1;",
+            "new_string": "let a = 1;\\n    let c = 3;"
+        }),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(
+        out.starts_with("edited f.rs"),
+        "the edit still applies: {out}"
+    );
+    assert!(
+        out.contains("literal `\\n`") && out.contains("real newlines"),
+        "a warning must accompany the success: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("f.rs")).unwrap(),
+        "let a = 1;\\n    let c = 3;\nlet b = 2;\n",
+        "the model's text is applied verbatim, never rewritten"
+    );
+}
+
+/// The warning must not fire on ordinary edits: real newlines present, no
+/// backslash-n, or the file already used the escape at that spot.
+#[tokio::test]
+async fn edit_file_does_not_warn_on_ordinary_or_pre_existing_escapes() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("f.rs"), "print(\"a\\n\");\nlet b = 2;\n").unwrap();
+    let caveats = caveats_rw(ws.path());
+    for (old, new) in [
+        ("let b = 2;", "let b = 2;\nlet c = 3;\\n"), // real newline present
+        ("let b = 2;", "let b = 9;"),                // no escape at all
+        ("print(\"a\\n\");", "print(\"b\\n\");"),    // escape already in old_string
+    ] {
+        let out = run_tool(
+            "edit_file",
+            serde_json::json!({"path": "f.rs", "old_string": old, "new_string": new}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("edited f.rs"), "{out}");
+        assert!(!out.contains("real newlines"), "spurious warning: {out}");
+    }
+}
