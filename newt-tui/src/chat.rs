@@ -7310,6 +7310,16 @@ fn session_body(
                         pending_clarification = None;
                     }
 
+                    // Pin before deriving ANY cognition value for this accepted
+                    // turn. Context/retrieval setup may block while another tab
+                    // changes a dial; wire intent and nested readers must keep
+                    // the same capture. This guard drops on every later exit.
+                    let _turn_binding =
+                        crate::session_worker::bind_turn(tabs.active().session_id());
+                    let cognition = newt_core::cognition::effective_cognition();
+                    let turn_api = choice.api;
+                    let turn_capabilities = choice.capability_decision();
+
                     // Pre-turn hardware snapshot: read the latest value the
                     // background sampler published (instant, never blocks). None
                     // unless verbose + a reachable DCGM (issue #414).
@@ -7887,24 +7897,18 @@ fn session_body(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // Psyche: the turn's cognition → `reasoning.effort` (via
-                    // ChatCtx.cognition). Effective precedence: a live `/cognition`
-                    // override wins; else the active persona's declared cognition
-                    // (installed as PERSONA_COGNITION on activation); else `None`.
-                    let cognition = newt_core::cognition::effective_cognition();
                     // Cognition always rides the Responses wire and may also
                     // project to Chat Completions when the endpoint explicitly
                     // advertises that extension. Otherwise say so once — never
                     // silently accept and ignore a live dial.
                     if cognition.is_some() && !cognition_scope_noted {
-                        let responses = std::env::var("NEWT_OPENAI_API")
-                            .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
+                        let responses = choice.kind == newt_core::BackendKind::Openai
+                            && turn_api == newt_core::OpenAiApi::Responses;
                         let capable_chat = choice.kind == newt_core::BackendKind::Openai
-                            && choice.capability_decision().chat_completions().cognition
-                                == Some(true);
+                            && turn_capabilities.chat_completions().cognition == Some(true);
                         if !responses && !capable_chat {
                             print_newt(
-                                "note: the active backend does not advertise a cognition generation policy — cognition is ignored.",
+                                "note: the active backend does not advertise cognition wire controls; the semantic selection is retained.",
                                 color,
                                 verbose,
                             );
@@ -8175,18 +8179,6 @@ fn session_body(
                     // visible throughout.
                     let _disclosure_guard =
                         newt_core::ocap::scoped_session_disclosure(session_disclosure.clone());
-                    // #1669: bind THIS TURN to the tab that is active right
-                    // now, and pin its psyche — both dropped when the turn
-                    // ends, which is what lets the next turn see a `/tab`
-                    // switch and a moved dial.
-                    //
-                    // Scoped exactly like the disclosure guard above, and for
-                    // the same reason: all three describe THIS turn. Hoisting
-                    // any of them to session start would attribute a later
-                    // tab's work to the startup tab and freeze the dials for
-                    // the life of the process.
-                    let _turn_binding =
-                        crate::session_worker::bind_turn(tabs.active().session_id());
                     let turn_smart_harness = if let Some(config) = &smart_config {
                         let launch = newt_core::config::HarnessLaunch {
                             workspace: std::path::Path::new(workspace),
@@ -8199,7 +8191,7 @@ fn session_body(
                             (&active_conversation_id, messages.len() > 2),
                             config,
                             &launch,
-                            (&inf_url, inf_kind, choice.api),
+                            (&inf_url, inf_kind, turn_api),
                             || newt_inference::smart_harness::build(config, &inf_url, inf_kind),
                         ) {
                             Ok(harness) => Some(harness),
@@ -8304,17 +8296,14 @@ fn session_body(
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         cognition,
-                                        chat_completions_capability: choice
-                                            .capability_decision().chat_completions(),
+                                        chat_completions_capability: turn_capabilities.chat_completions(),
+                                        responses_capability: turn_capabilities.responses(),
+                                        openai_api: turn_api,
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
                                         attempt_ledger: Some(&turn_attempts),
-                                        reasoning_replay_scope: choice
-                                            .capability_decision()
-                                            .reasoning_replay_scope(),
-                                        emits_leading_reasoning: choice
-                                            .capability_decision()
-                                            .emits_leading_reasoning(),
+                                        reasoning_replay_scope: turn_capabilities.reasoning_replay_scope(),
+                                        emits_leading_reasoning: turn_capabilities.emits_leading_reasoning(),
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the
@@ -9087,14 +9076,14 @@ fn session_body(
                                     };
                                     let gauge_budget = context_gauge_budget(
                                         inf_kind,
-                                        choice.api,
+                                        turn_api,
                                         eff_num_ctx,
                                         recovered_context_window.get(),
                                         eff_input_ceiling_pct,
                                         cognition,
                                         model_tune.and_then(|t| t.output_allowance),
-                                        choice.capability_decision().chat_completions(),
-                                        choice.capability_decision().reasoning_replay_scope(),
+                                        turn_capabilities.chat_completions(),
+                                        turn_capabilities.reasoning_replay_scope(),
                                         gauge_max_ok,
                                         gauge_safe,
                                     );

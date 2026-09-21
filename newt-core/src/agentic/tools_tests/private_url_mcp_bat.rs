@@ -217,6 +217,8 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             persona_tools: Some(&persona_tools),
             cognition: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: Default::default(),
             output_allowance: None,
             attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
