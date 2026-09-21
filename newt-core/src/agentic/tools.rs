@@ -213,6 +213,7 @@ pub(crate) fn reask_uncorrelatable(
     strikes: &mut u32,
     reason: &str,
     smart_harness: Option<&super::smart_harness::SmartHarness>,
+    tool_events: Option<&mut Vec<crate::ToolEvent>>,
 ) -> anyhow::Result<String> {
     *strikes += 1;
     let recoverable = *strikes < MAX_UNCORRELATABLE_BATCHES;
@@ -221,6 +222,16 @@ pub(crate) fn reask_uncorrelatable(
     }
     if !recoverable {
         return Err(uncorrelatable_tool_calls(reason));
+    }
+    // The trace must show why this round produced nothing (mirrors the
+    // content-invalid arm's not-ok "(rejected tool-call batch)" event).
+    if let Some(rec) = tool_events {
+        rec.push(crate::ToolEvent::from_call(
+            "(rejected tool-call batch)",
+            &serde_json::Value::Null,
+            false,
+            Some(0),
+        ));
     }
     Ok(
         "Your last reply contained tool calls without call ids (each call needs a unique, \
@@ -233,7 +244,13 @@ pub(crate) fn reask_uncorrelatable(
 /// Drop the id-less `tool_calls` from the assistant turn recorded just before
 /// validation: with no ids there is nothing to answer them with, and replaying
 /// them would send the provider a transcript it rejects.
+///
+/// Only an assistant turn is touched: if the last message is anything else the
+/// transcript is left alone (the re-ask is still sent).
 pub(crate) fn withdraw_tool_calls(assistant_turn: &mut serde_json::Value) {
+    if assistant_turn["role"] != "assistant" {
+        return;
+    }
     if let Some(turn) = assistant_turn.as_object_mut() {
         turn.remove("tool_calls");
         if turn.get("content").is_none_or(|c| c.is_null()) {
