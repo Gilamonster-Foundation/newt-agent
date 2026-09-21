@@ -2311,7 +2311,10 @@ async fn idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block() {
     );
     let last = second.last().unwrap();
     assert_eq!(last["role"], "user");
-    assert!(last.to_string().contains("without call ids"), "{last}");
+    assert!(
+        last.to_string().contains("could not be correlated"),
+        "{last}"
+    );
     assert!(
         second.iter().any(|m| m.to_string().contains("Reading.")),
         "the assistant's text survives the withdrawal"
