@@ -100,21 +100,22 @@ pub enum McpCmd {
     /// (created if absent). Literal or active secret-bearing values make the
     /// selected import fail; environment references survive.
     Import {
-        /// Path to a Claude JSON or Codex TOML MCP config. Omit with a built-in
-        /// source flag.
+        /// Path to a Claude JSON or Codex TOML MCP config. An alternative to
+        /// --from-claude / --from-codex: give exactly one source.
         #[arg(
             required_unless_present_any = ["from_claude", "from_codex"],
             conflicts_with_all = ["from_claude", "from_codex"]
         )]
         path: Option<PathBuf>,
-        /// Import from `~/.claude.json`.
+        /// Import from `~/.claude.json` (instead of PATH).
         #[arg(long = "from-claude", conflicts_with = "from_codex")]
         from_claude: bool,
         /// Import from `$CODEX_HOME/config.toml` or `~/.codex/config.toml`.
         #[arg(long = "from-codex")]
         from_codex: bool,
-        /// Import exactly one named server.
-        #[arg(long, value_name = "NAME", required_unless_present = "all")]
+        /// Import exactly one named server. Omit --name and --all to list the
+        /// server names found in the source.
+        #[arg(long, value_name = "NAME")]
         name: Option<String>,
         /// Import every server in the selected source.
         #[arg(long, conflicts_with = "name")]
@@ -856,6 +857,7 @@ fn select_import_entries(
     name: Option<&str>,
     all: bool,
     source: &Path,
+    selector: &str,
 ) -> anyhow::Result<Vec<McpServerEntry>> {
     report.entries.sort_by(|a, b| a.name.cmp(&b.name));
     if let Some(name) = name {
@@ -878,7 +880,20 @@ fn select_import_entries(
         ));
     }
     if !all {
-        bail!("choose exactly one selector: --name <NAME> or --all");
+        let mut names: Vec<&str> = report.entries.iter().map(|e| e.name.as_str()).collect();
+        names.extend(report.rejected.iter().filter_map(|r| r.name.as_deref()));
+        names.sort_unstable();
+        if names.is_empty() {
+            bail!("no MCP servers found in {}", source.display());
+        }
+        let cmds: String = names
+            .iter()
+            .map(|n| format!("\n  newt mcp import {selector} --name {n}"))
+            .collect();
+        bail!(
+            "choose a server to import; found in {}:{cmds}\nor import every server with --all",
+            source.display()
+        );
     }
     if !report.rejected.is_empty() {
         let count = report.rejected.len();
@@ -1510,6 +1525,13 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     }
     let (source, format) =
         resolve_import_source(request.path, request.from_claude, request.from_codex)?;
+    let selector = if request.from_claude {
+        "--from-claude".to_string()
+    } else if request.from_codex {
+        "--from-codex".to_string()
+    } else {
+        source.display().to_string()
+    };
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))?;
     let imported = parse_import_entries(&text, format)
@@ -1517,7 +1539,8 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     if imported.entries.is_empty() && imported.rejected.is_empty() {
         bail!("no MCP server entries found in {}", source.display());
     }
-    let mut imported = select_import_entries(imported, request.name, request.all, &source)?;
+    let mut imported =
+        select_import_entries(imported, request.name, request.all, &source, &selector)?;
     let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
     for entry in &mut imported {
         validate_import_server_name(&entry.name)?;
