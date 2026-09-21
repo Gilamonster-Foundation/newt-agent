@@ -40,7 +40,7 @@ fn migration_library_child() {
             std::fs::create_dir_all(&own).unwrap();
             std::fs::create_dir_all(workspace.join(".newt")).unwrap();
             let base = own.join("config.toml");
-            let overlay = workspace.join(".newt/config.toml");
+            let overlay = workspace.join(".newt").join("config.toml");
             // Memory policy is retained from project data; default_backend
             // would be stripped by the existing control-plane trust boundary.
             let invalid = format!("memory = 7\n{old}");
@@ -52,6 +52,14 @@ fn migration_library_child() {
                 std::env::set_var("NEWT_CONFIG", &base);
             }
             std::env::set_current_dir(&workspace).unwrap();
+            // The product DISCOVERS the overlay from current_dir() and joins
+            // component-wise, and Windows can respell a short tempdir name, so
+            // build the expectation from what it sees rather than from the
+            // path the test wrote.
+            let discovered = std::env::current_dir()
+                .unwrap()
+                .join(".newt")
+                .join("config.toml");
             let result = newt_core::Config::resolve_runtime_unpublished(&mut |n| notices.push(n));
             assert!(result.is_err());
             assert_eq!(
@@ -64,7 +72,7 @@ fn migration_library_child() {
                 .any(|n| n.line().contains(base.to_str().unwrap())));
             assert!(notices
                 .iter()
-                .any(|n| n.line().contains(overlay.to_str().unwrap())));
+                .any(|n| n.line().contains(discovered.to_str().unwrap())));
             assert_eq!(
                 std::fs::read_to_string(&base).unwrap(),
                 newt_core::psyche_import::migrate_config_text(old)
@@ -81,7 +89,7 @@ fn migration_library_child() {
                 1,
                 "rewritten base is quiet; in-memory overlay is reportable again"
             );
-            assert!(notices[0].line().contains(overlay.to_str().unwrap()));
+            assert!(notices[0].line().contains(discovered.to_str().unwrap()));
         }
         "persona" => {
             let old = "+++\ncognition = \"pondering\"\n+++\nKeep this body.\n";
