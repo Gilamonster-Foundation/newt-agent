@@ -213,46 +213,44 @@ fn import_listing_never_renders_untrusted_names_as_commands() {
 #[test]
 fn import_flags_stdio_command_that_resolves_to_nothing() {
     let dirs = [PathBuf::from("/bin")];
-    let home = Path::new("/h");
     let has = |p: &Path| {
         p == Path::new("/bin/ok") || p == Path::new("/h/tool") || p == Path::new("/abs/x")
     };
     let msg = |cmd: &str| {
         let e = stdio_entry("srv", Some(cmd));
-        missing_stdio_command(&e, &dirs, Some(home), false, has)
+        missing_stdio_command(&e, &dirs, false, has)
     };
     let m = msg("nope").expect("bare command not on PATH");
     assert!(m.contains("`srv`") && m.contains(r#""nope""#), "{m}");
     assert!(msg("ok").is_none());
-    assert!(msg("~/tool").is_none() && msg("~/gone").is_some());
+    // The MCP launcher passes `command` to the spawn verbatim and never expands
+    // `~`, so EVERY `~`-prefixed command warns — even when the expansion exists
+    // (`~/tool` does under the fake home) — and says so, rather than "not found".
+    for cmd in ["~/tool", "~/gone", "~bob/bin/x", "~"] {
+        let m = msg(cmd).unwrap_or_else(|| panic!("{cmd} must warn"));
+        assert!(
+            m.contains("does not expand `~`") && m.contains("absolute path"),
+            "{m}"
+        );
+        assert!(!m.contains("was not found"), "{m}");
+    }
     assert!(msg("/abs/x").is_none() && msg("/abs/y").is_some());
     assert!(msg("x\u{1b}y").unwrap().contains("\\u{1b}"));
     // Relative pathed commands depend on the spawn cwd: never flagged.
     assert!(msg("./bin/x").is_none() && msg("tools/x").is_none());
     // Absoluteness is decided from the string under the `windows` flag, not the host.
     let has_w = |p: &Path| p == Path::new("C:\\abs\\x");
-    let win = |cmd: &str| {
-        missing_stdio_command(
-            &stdio_entry("srv", Some(cmd)),
-            &dirs,
-            Some(home),
-            true,
-            has_w,
-        )
-    };
+    let win = |cmd: &str| missing_stdio_command(&stdio_entry("srv", Some(cmd)), &dirs, true, has_w);
     assert!(win("C:\\abs\\x").is_none() && win("C:\\abs\\y").is_some());
     assert!(win("C:/abs/y").is_some());
     assert!(win("/abs/y").is_none(), "no drive: relative on Windows");
     // A UNC path names a remote host from an UNTRUSTED file: probing it would
     // open an SMB connection before import. Never probed, so never flagged.
     assert!(win("\\\\host\\s\\y").is_none());
-    // `~user/…` is another user's home, which this check cannot resolve.
-    assert!(msg("~bob/bin/x").is_none());
-    assert!(msg("~/gone").is_some(), "plain ~/ is still checked");
     // Windows bare commands need PATHEXT: skipped.
     let e = stdio_entry("srv", Some("npx"));
-    assert!(missing_stdio_command(&e, &dirs, Some(home), true, has).is_none());
+    assert!(missing_stdio_command(&e, &dirs, true, has).is_none());
     let mut http = stdio_entry("h", None);
     http.transport = TransportKind::Http;
-    assert!(missing_stdio_command(&http, &dirs, Some(home), false, has).is_none());
+    assert!(missing_stdio_command(&http, &dirs, false, has).is_none());
 }
