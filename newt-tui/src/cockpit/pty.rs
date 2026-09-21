@@ -333,8 +333,12 @@ mod tests {
     /// is exercised whatever the harness did with stderr. Real pty, real
     /// descriptors: the property is about the process's own fds and no mock can
     /// stand in for that. Serial because fd 1 is process-global.
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+    /// subprocess and races libtest under load). Grounds the fd 1/2 capture, restore and size assumptions the mocked cockpit and transcript tests make; it `dup2`s a pty over the process's own stdout, so it must not share a process with libtest.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
     fn install_captures_fd1_and_a_terminal_fd2_verbatim_and_drop_restores_them() {
         let err_pty = TestPty::open();
         let _err = RedirectFd::to(2, err_pty.slave);
@@ -368,8 +372,12 @@ mod tests {
     /// where it was, so stderr bytes still reach that destination (a pipe here)
     /// and never leak into the presenter's scrollback. Grounds the mock belief
     /// that the cockpit preserves fd-2 redirection topology.
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+    /// subprocess and races libtest under load). Grounds the fd 1/2 capture, restore and size assumptions the mocked cockpit and transcript tests make; it `dup2`s a pty over the process's own stdout, so it must not share a process with libtest.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
     fn install_leaves_a_redirected_stderr_untouched() {
         // A pipe stands in for `2>log`: a non-terminal stderr.
         let mut fds = [0 as libc::c_int; 2];
@@ -431,8 +439,12 @@ mod tests {
         }
     }
 
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+    /// subprocess and races libtest under load). Grounds the fd 1/2 capture, restore and size assumptions the mocked cockpit and transcript tests make; it `dup2`s a pty over the process's own stdout, so it must not share a process with libtest.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
     fn the_slave_reports_the_size_it_was_given_and_follows_resize() {
         let cap = PtyCapture::install(100, 30).expect("openpty");
         let size = |fd: RawFd| {
@@ -456,8 +468,12 @@ mod tests {
     /// process-global, so in a parallel suite another test opening files reads
     /// as a cockpit leak (observed: 45 -> 138 with nothing leaked). A guard
     /// that fails for unrelated reasons trains people to ignore it.
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+    /// subprocess and races libtest under load). Grounds the fd 1/2 capture, restore and size assumptions the mocked cockpit and transcript tests make; it `dup2`s a pty over the process's own stdout, so it must not share a process with libtest.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
     fn repeated_enter_and_leave_cycles_restore_every_time_and_leak_nothing() {
         let err_pty = TestPty::open();
         let _err = RedirectFd::to(2, err_pty.slave);
@@ -484,8 +500,12 @@ mod tests {
     /// still hand fd 1/2 back. Terminal restoration is a safety property — a
     /// process that dies holding the real stdout leaves the operator with a
     /// terminal that echoes nothing.
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+    /// subprocess and races libtest under load). Grounds the fd 1/2 capture, restore and size assumptions the mocked cockpit and transcript tests make; it `dup2`s a pty over the process's own stdout, so it must not share a process with libtest.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
     fn a_panic_while_the_cockpit_owns_the_terminal_still_restores_it() {
         let err_pty = TestPty::open();
         let _err = RedirectFd::to(2, err_pty.slave);
@@ -514,8 +534,12 @@ mod tests {
     /// — the presenter drains the master on its own thread — so the test models
     /// exactly that: a concurrent drainer, and a write that would block without
     /// one. Bounded by a join timeout so a regression FAILS rather than hangs.
+    ///
+    /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+    /// subprocess and races libtest under load). Grounds the fd 1/2 capture, restore and size assumptions the mocked cockpit and transcript tests make; it `dup2`s a pty over the process's own stdout, so it must not share a process with libtest.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
     fn a_burst_larger_than_the_pty_buffer_does_not_deadlock_the_writer() {
         let cap = PtyCapture::install(80, 24).expect("openpty");
         let master = cap.master_fd();
