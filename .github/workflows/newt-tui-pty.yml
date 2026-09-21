@@ -94,14 +94,17 @@ jobs:
             -- --ignored --test-threads=1
 
       # The cockpit owns fd 0/1 and the terminal's modes for a whole session,
-      # so its acceptance tests are real-terminal tests even though they are not
-      # `#[ignore]`d. Running them here as well as in the unit tier costs
-      # seconds and keeps this gate honest about what "terminal lifecycle"
-      # covers.
+      # so its acceptance tests are real-terminal tests. They are `#[ignore]`d
+      # out of the per-PR unit run (they `dup2` a pty over the process's stdout
+      # or drive PTY children, and raced libtest there), so `--include-ignored`
+      # is REQUIRED here or they run nowhere. It is harmless while none are
+      # ignored. `live-spill` is enabled so the completed-spill pager test
+      # (`#[cfg(feature = "live-spill")]`) actually runs; without it that test
+      # was never compiled in this lane.
       - name: Run cockpit terminal-ownership acceptance
         run: |
-          cargo test -p newt-tui --features rich-tui cockpit:: \
-            -- --test-threads=1
+          cargo test -p newt-tui --features rich-tui,live-spill cockpit:: \
+            -- --include-ignored --test-threads=1
 
   # macOS leg. The terminal code here is POSIX, not Linux: termios restoration,
   # openpty, TIOCSWINSZ, and crossterm's "stdin if it is a tty, else /dev/tty"
@@ -126,10 +129,11 @@ jobs:
         run: |
           cargo test -p newt-core --lib tty:: -- --test-threads=1
 
+      # `--include-ignored` and `live-spill`: see the Linux leg above.
       - name: Run cockpit terminal-ownership acceptance
         run: |
-          cargo test -p newt-tui --features rich-tui cockpit:: \
-            -- --test-threads=1
+          cargo test -p newt-tui --features rich-tui,live-spill cockpit:: \
+            -- --include-ignored --test-threads=1
 
       - name: Run CLI exit and editor-resize real-PTY tests
         run: |
