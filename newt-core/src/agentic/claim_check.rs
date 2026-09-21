@@ -257,6 +257,14 @@ pub fn files_changed_between(before: &StatusSnapshot, after: &StatusSnapshot) ->
         .collect()
 }
 
+/// The plain probe `collect_git_evidence` runs at every turn finalisation: it only
+/// needs emptiness, so untracked directories stay collapsed (cheap on a big tree).
+const EVIDENCE_STATUS_ARGS: [&str; 2] = ["status", "--porcelain"];
+
+/// The hand-back snapshot: raw paths (`-z`) and every untracked FILE, so a stray
+/// script inside a new directory is named, not hidden behind `dir/`.
+const SNAPSHOT_STATUS_ARGS: [&str; 4] = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+
 /// The workspace's changed-path snapshot, or `None` off-repo / on any git failure.
 #[must_use]
 pub fn snapshot_workspace(
@@ -264,11 +272,7 @@ pub fn snapshot_workspace(
     read_scope: &crate::Scope<String>,
 ) -> Option<StatusSnapshot> {
     // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
-    let out = git_in(
-        workspace,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        read_scope,
-    )?;
+    let out = git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope)?;
     Some(parse_porcelain_z(&out))
 }
 
@@ -409,7 +413,7 @@ pub(crate) fn collect_git_evidence(
     head_at_turn_start: Option<&str>,
 ) -> Option<TurnGitEvidence> {
     let head_now = git_head(workspace, read_scope)?;
-    let status = snapshot_workspace(workspace, read_scope)?;
+    let status = git_in(workspace, &EVIDENCE_STATUS_ARGS, read_scope)?;
     let branches = git_in(
         workspace,
         &["branch", "--format=%(refname:short)"],
@@ -421,7 +425,7 @@ pub(crate) fn collect_git_evidence(
     .collect();
     Some(TurnGitEvidence {
         head_moved: head_at_turn_start.is_some_and(|start| start != head_now),
-        tree_dirty: !status.is_empty(),
+        tree_dirty: !status.trim().is_empty(),
         branches,
     })
 }
@@ -448,6 +452,16 @@ fn git_in(workspace: &str, args: &[&str], read_scope: &crate::Scope<String>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2504 review: `collect_git_evidence` runs at every turn finalisation on every
+    /// lane and only needs emptiness, so it must keep the cheap plain probe; only
+    /// the hand-back snapshot enumerates untracked files.
+    #[test]
+    fn evidence_probe_stays_plain_and_only_the_snapshot_lists_untracked() {
+        assert_eq!(EVIDENCE_STATUS_ARGS, ["status", "--porcelain"]);
+        assert!(SNAPSHOT_STATUS_ARGS.contains(&"--untracked-files=all"));
+        assert!(!EVIDENCE_STATUS_ARGS.contains(&"--untracked-files=all"));
+    }
 
     #[test]
     fn porcelain_z_parses_spaces_untracked_and_renames() {
