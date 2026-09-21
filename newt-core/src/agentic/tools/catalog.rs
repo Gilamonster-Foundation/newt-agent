@@ -11,7 +11,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Run a shell command in the workspace directory and return its output. \
+                "description": format!("{} {}", "Run a shell command in the workspace directory and return its output. \
                                 Runs in a CONFINED shell: stream redirects to a target outside your \
                                 fs_write scope are DENIED (e.g. `2>/dev/null`, `> /dev/null`) — drop \
                                 the redirect and read stdout/stderr from the result instead. Prefer the \
@@ -24,7 +24,7 @@ pub fn tool_definitions() -> serde_json::Value {
                                 filesystem additions with fs_read/fs_write absolute-path arrays; \
                                 missing authority is approved before this invocation starts. After \
                                 request_permissions grants filesystem access, retry the same command \
-                                with those paths declared so matching allow-once grants can be used.",
+                                with those paths declared so matching allow-once grants can be used.", super::shell::run_command_limit_sentence()),
                 "parameters": {
                     "type": "object",
                     "properties": {
