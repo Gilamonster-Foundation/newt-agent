@@ -473,7 +473,8 @@ pub struct CrewArgs {
 /// (local-HTTP) dispatcher, return the process exit code (0 passed, 2 needs
 /// human review, errors bubble up as `Err` → exit 1).
 pub async fn run_cli(args: CrewArgs) -> anyhow::Result<i32> {
-    let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let cfg = crate::migration_notices::read(|report| Config::resolve(report))
+        .map_err(|e| anyhow::anyhow!("config: {e}"))?;
     run_with(&cfg, args, &LocalDispatcher).await
 }
 
@@ -779,7 +780,8 @@ pub async fn execute_plan(
              intend to run them all."
         ));
     }
-    let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let cfg = crate::migration_notices::read(|report| Config::resolve(report))
+        .map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     println!(
         "executing {leaf_count} leaf/leaves autonomously (one crew each; per-leaf verify gates each)…"
@@ -1148,7 +1150,8 @@ pub async fn author_plan_to_plan(
     max_subtasks: usize,
     repo_dir: &Path,
 ) -> anyhow::Result<newt_core::plan::Plan> {
-    let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let cfg = crate::migration_notices::read(|report| Config::resolve(report))
+        .map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let model = cfg
         .backends
         .first()

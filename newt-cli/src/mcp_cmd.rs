@@ -683,8 +683,8 @@ fn cmd_list(config_path: Option<&Path>, out: &mut dyn Write) -> anyhow::Result<(
     // (resolve() returns the default config when NO file exists; it only
     // errors when a file is present but unreadable.)
     let cfg = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
     let mcp_toml = Config::user_config_dir()
         .map(|d| load_newt_mcp_toml(&d.join("mcp.toml")))
@@ -969,9 +969,9 @@ fn import_namespace_sanitization(
 ) -> anyhow::Result<bool> {
     let user_mcp = Config::user_config_dir().map(|dir| dir.join("mcp.toml"));
     let cfg = if user_mcp.as_deref() == Some(target) && !strong_explicit_target {
-        Config::resolve()?
+        crate::migration_notices::read(|report| Config::resolve(report))?
     } else if target.is_file() {
-        Config::load(target)?
+        crate::migration_notices::read(|report| Config::load(target, report))?
     } else {
         Config::default()
     };
@@ -1166,7 +1166,7 @@ fn project_replaces_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<Opti
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| Config::load(base.as_path()))
+        .then(|| crate::migration_notices::read(|report| Config::load(base.as_path(), report)))
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1204,7 +1204,7 @@ fn project_appends_to_base_mcp_servers(base: &ResolvedPath) -> anyhow::Result<bo
     let base_strategy = base
         .as_path()
         .is_file()
-        .then(|| Config::load(base.as_path()))
+        .then(|| crate::migration_notices::read(|report| Config::load(base.as_path(), report)))
         .transpose()?
         .and_then(|config| config.merge)
         .map(|merge| merge.arrays);
@@ -1275,7 +1275,7 @@ fn outranking_import_sources(
     if user_config.is_file() {
         sources.push((
             user_config.clone(),
-            Config::load(&user_config)?
+            crate::migration_notices::read(|report| Config::load(&user_config, report))?
                 .mcp_servers
                 .into_iter()
                 .map(|entry| entry.name)
@@ -1289,7 +1289,7 @@ fn outranking_import_sources(
         if source.is_file() {
             sources.push((
                 source.clone(),
-                Config::load(&source)?
+                crate::migration_notices::read(|report| Config::load(&source, report))?
                     .mcp_servers
                     .into_iter()
                     .map(|entry| entry.name)
@@ -1606,7 +1606,7 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         project_path
             .as_ref()
             .map(ResolvedPath::as_path)
-            .map(Config::load)
+            .map(|path| crate::migration_notices::read(|report| Config::load(path, report)))
             .transpose()?
             .map(|config| {
                 config

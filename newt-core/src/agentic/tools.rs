@@ -1774,7 +1774,7 @@ fn find_source_extensions(
     if opts.category == FindCategory::Any {
         return Ok(None);
     }
-    let api_cfg = crate::Config::resolve_unpublished()
+    let api_cfg = super::display::with_migration_notices(crate::Config::resolve_unpublished)
         .ok()
         .and_then(|cfg| cfg.context.map(|context| context.api_surface))
         .unwrap_or_default();
@@ -4037,7 +4037,7 @@ async fn execute_authorized_tool(
             // governed by the session caveats. The same first-directory-wins
             // precedence as the index means we load the copy the model was
             // actually shown.
-            let dirs = crate::Config::resolve_unpublished()
+            let dirs = super::display::with_migration_notices(crate::Config::resolve_unpublished)
                 .map(|c| c.skill_search_dirs())
                 .unwrap_or_default();
             match newt_skills::load_body_from(&dirs, skill_name) {

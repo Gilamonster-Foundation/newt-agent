@@ -429,14 +429,23 @@ fn run_scenario_bounded(scenario: &str, child_test: &str, budget: Duration) -> (
     .env("NEWT_NOTICE_PTY_CHILD", scenario)
     .stdin(pty.slave_stdio())
     .stdout(pty.slave_stdio())
-    .stderr(std::process::Stdio::null())
+    .stderr(if scenario.starts_with("migration-") {
+        pty.slave_stdio()
+    } else {
+        std::process::Stdio::null()
+    })
     .spawn()
     .expect("spawn the pty child");
 
     let deadline = std::time::Instant::now() + budget;
     let mut screen = String::new();
+    let mut answered = false;
     let exited = loop {
         screen.push_str(&pty.screen());
+        if scenario.starts_with("migration-modal") && !answered && screen.contains(QUESTION) {
+            pty.type_in("yes\r");
+            answered = true;
+        }
         match child.try_wait().expect("poll the pty child") {
             Some(status) => {
                 assert!(
@@ -494,3 +503,7 @@ fn protocol_mode_emits_no_prompt_bytes_and_does_not_wait() {
         "a notice reached a machine protocol channel.\n\nscreen:\n{screen:?}"
     );
 }
+
+#[cfg(test)]
+#[path = "pty_migration_notice_tests.rs"]
+mod migration;

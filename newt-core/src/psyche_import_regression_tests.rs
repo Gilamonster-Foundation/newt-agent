@@ -27,6 +27,7 @@ fn psyche_split_fix_preserves_a_concurrent_config_edit() {
             *disk.borrow_mut() = text.to_string();
             Ok(())
         },
+        &mut |_| {},
     )
     .unwrap();
     assert_eq!(
@@ -65,6 +66,7 @@ fn psyche_split_fix_skips_write_when_config_cannot_be_revalidated() {
             writes.set(writes.get() + 1);
             Ok(())
         },
+        &mut |_| {},
     )
     .unwrap();
     assert_eq!(writes.get(), 0, "unverified bytes must not be replaced");
@@ -83,7 +85,7 @@ fn psyche_split_fix_config_migration_respects_the_save_lock() {
     std::fs::write(&path, old).unwrap();
     let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
     let lock = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
-    let loaded = read_config_file(&path, true).unwrap();
+    let loaded = read_config_file(&path, true, &mut |_| {}).unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         old,
@@ -91,7 +93,7 @@ fn psyche_split_fix_config_migration_respects_the_save_lock() {
     );
     assert_eq!(loaded, migrate_config_text(old).unwrap().text);
     drop(lock);
-    assert_eq!(read_config_file(&path, true).unwrap(), loaded);
+    assert_eq!(read_config_file(&path, true, &mut |_| {}).unwrap(), loaded);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), loaded);
     assert!(
         !destination.lock_path().exists(),

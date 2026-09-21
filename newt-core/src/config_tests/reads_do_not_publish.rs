@@ -33,16 +33,18 @@ fn value_readers_do_not_republish_runtime_settings() {
         crate::process_env::remove_var(key);
     }
     initiative::set_initiative_config(marker());
+    let mut notices = Vec::new();
+    let mut report = |notice: crate::tty::Notice<'static>| notices.push(notice);
 
-    let _ = crate::agentic::thinking_mode();
+    let _ = crate::agentic::thinking_mode(&mut report);
     assert_eq!(published_patient_rounds(), Some(91), "thinking_mode");
-    let _ = crate::memory::RollingWindow::from_config();
+    let _ = crate::memory::RollingWindow::from_config(&mut report);
     assert_eq!(published_patient_rounds(), Some(91), "memory window");
-    let _ = crate::memory::SoulProvider::from_config();
+    let _ = crate::memory::SoulProvider::from_config(&mut report);
     assert_eq!(published_patient_rounds(), Some(91), "soul provider");
-    let _ = crate::config::session_markdown_mode();
+    let _ = crate::config::session_markdown_mode(&mut report);
     assert_eq!(published_patient_rounds(), Some(91), "markdown mode");
-    let _ = crate::config::session_compaction_trigger_policy();
+    let _ = crate::config::session_compaction_trigger_policy(&mut report);
     assert_eq!(
         published_patient_rounds(),
         Some(91),
@@ -58,7 +60,7 @@ fn value_readers_do_not_republish_runtime_settings() {
 fn publishing_rewrites_the_marker_and_resolve_unpublished_does_not() {
     let _guard = crate::test_guard::GlobalSettingsGuard::acquire();
     initiative::set_initiative_config(marker());
-    let _ = crate::Config::resolve_unpublished();
+    let _ = crate::Config::resolve_unpublished(&mut |_| {});
     assert_eq!(published_patient_rounds(), Some(91));
     crate::Config::default().publish_runtime_settings();
     assert_ne!(

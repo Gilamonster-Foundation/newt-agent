@@ -35,7 +35,7 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from);
     let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let resolved = newt_core::Config::resolve()
+    let resolved = crate::migration_notices::read(|report| newt_core::Config::resolve(report))
         .map_err(|error| anyhow::anyhow!("failed to resolve Newt configuration: {error}"))?;
     let oauth_policy = oauth_policy_from_config(&resolved, &workspace);
     let cfg_servers: Vec<newt_core::mcp::McpServerEntry> = resolved.mcp_servers;

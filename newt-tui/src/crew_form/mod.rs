@@ -70,7 +70,7 @@ pub fn run_edit_with_ask(
     _color: bool,
     ask: crate::SlashAsk<'_>,
 ) -> anyhow::Result<()> {
-    let cfg = Config::resolve().unwrap_or_default();
+    let cfg = crate::migration_notices::read(|report| Config::resolve(report)).unwrap_or_default();
     let dir = crews_dir();
     for line in edit_and_save(ask, &cfg, name, &dir)?.report() {
         println!("{line}");

@@ -656,9 +656,11 @@ fn setup(
     // Preserve any non-DGX fields already in the config. If the target file
     // doesn't exist yet (first run), start from defaults rather than erroring.
     let mut config = match config_path {
-        Some(p) if p.exists() => Config::load(p).map_err(anyhow::Error::from)?,
+        Some(p) if p.exists() => crate::migration_notices::read(|report| Config::load(p, report))
+            .map_err(anyhow::Error::from)?,
         Some(_) => Config::default(),
-        None => Config::resolve().map_err(anyhow::Error::from)?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))
+            .map_err(anyhow::Error::from)?,
     };
     config.dgx = Some(dgx);
     config.save(&save_path)?;
@@ -904,8 +906,8 @@ fn dgx_config(config_path: Option<&Path>) -> anyhow::Result<DgxConfig> {
 
 fn load_config(config_path: Option<&Path>) -> anyhow::Result<Config> {
     let config = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
     Ok(config)
 }

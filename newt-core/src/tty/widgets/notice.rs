@@ -161,6 +161,25 @@ impl<'a> Notice<'a> {
         Terminal::emit_line(sink, self.writer(color));
     }
 
+    /// Deliver a diagnostic at a host-selected safe point. A host that cannot
+    /// own a terminal line still owes diagnostics to its stderr writer; unlike
+    /// optional narration, protocol/pipe mode must not silence them. Pass None
+    /// when stderr is redirected, even if stdout owns a terminal.
+    pub fn diagnostic(
+        &self,
+        caps: LineCaps,
+        color: bool,
+        mut stderr: impl io::Write,
+    ) -> io::Result<()> {
+        if !protocol_mode() && caps.can_own() {
+            self.emit(caps, Sink::Stderr, color);
+            Ok(())
+        } else {
+            writeln!(stderr, "{}", self.line())?;
+            stderr.flush()
+        }
+    }
+
     /// The bytes this notice puts on a permanent line, as a closure the caller
     /// routes through whichever emit path it owns.
     ///

@@ -257,8 +257,9 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
     // publish only after selection + instantiation ACCEPT below — a worker
     // that refuses its selection (unknown/unroutable/provider error) must
     // not have published globals from a route it never ran.
-    let cfg = newt_core::Config::resolve_runtime_unpublished()
-        .context("worker: failed to resolve Newt configuration")?;
+    let cfg =
+        crate::read_with_notices(|report| newt_core::Config::resolve_runtime_unpublished(report))
+            .context("worker: failed to resolve Newt configuration")?;
     let ollama_host = std::env::var("OLLAMA_HOST").ok().filter(|h| !h.is_empty());
 
     let resolved_backend = resolve_configured_backend(&cfg, ollama_host.as_deref())?;
@@ -279,6 +280,18 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
             Ok(Arc::new(backend))
         }
     }
+}
+
+/// The protocol host owns stderr even while its stdout carries JSON-RPC.
+fn read_with_notices<T>(
+    operation: impl FnOnce(&mut dyn FnMut(newt_core::tty::Notice<'static>)) -> T,
+) -> T {
+    let mut notices = Vec::new();
+    let result = operation(&mut |notice| notices.push(notice));
+    for notice in notices {
+        let _ = notice.diagnostic(newt_core::tty::LineCaps::None, false, std::io::stderr());
+    }
+    result
 }
 
 #[cfg(test)]

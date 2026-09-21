@@ -129,7 +129,7 @@ pub async fn run_target(
             Config::user_config_path().unwrap_or_else(|| PathBuf::from("newt.toml"))
         });
     let discovery = if config_path.is_file() {
-        Config::load(&config_path)?.discovery
+        crate::migration_notices::read(|report| Config::load(&config_path, report))?.discovery
     } else {
         Discovery::default()
     };
@@ -971,7 +971,7 @@ async fn configure_custom_host(
             continue;
         }
         let discovery = if config_path.is_file() {
-            Config::load(config_path)
+            crate::migration_notices::read(|report| Config::load(config_path, report))
                 .map(|c| c.discovery)
                 .unwrap_or_default()
         } else {

@@ -132,7 +132,7 @@ input_ceiling_pct = 42
 
     let cfg = {
         let _guard = EnvGuard::install(home.path(), config_dir.path(), project.path());
-        Config::resolve().expect("resolve() folds the walked-up project config")
+        Config::resolve(&mut |_| {}).expect("resolve() folds the walked-up project config")
     };
 
     // Control-plane keys stripped on the REAL resolution path.
@@ -238,7 +238,7 @@ input_ceiling_pct = 7
 
     let cfg = {
         let _guard = EnvGuard::install(home.path(), config_dir.path(), project.path());
-        Config::resolve().expect("resolve() folds the ambient ./newt.toml base")
+        Config::resolve(&mut |_| {}).expect("resolve() folds the ambient ./newt.toml base")
     };
 
     assert!(

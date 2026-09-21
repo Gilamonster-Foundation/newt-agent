@@ -146,7 +146,7 @@ pub enum MarkdownMode {
 /// resolvers for "session override, else config, else default" is how they
 /// come to disagree.
 #[must_use]
-pub fn session_markdown_mode() -> MarkdownMode {
+pub fn session_markdown_mode(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> MarkdownMode {
     if let Some(mode) = std::env::var("NEWT_MARKDOWN")
         .ok()
         .as_deref()
@@ -154,7 +154,7 @@ pub fn session_markdown_mode() -> MarkdownMode {
     {
         return mode;
     }
-    Config::resolve_unpublished()
+    Config::resolve_unpublished(report)
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.markdown)

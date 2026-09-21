@@ -1099,13 +1099,20 @@ impl PromptWindow {
     /// cursor parked at column 0, so the question starts where the operator is
     /// looking rather than appended to spinner chrome.
     pub fn ask(&self, text: &str) -> io::Result<()> {
+        self.ensure_can_ask()?;
+        self.output.write_text(text, false)
+    }
+
+    /// Check this window's existing refusal before a modal prepares its input.
+    /// This neither writes a question nor acquires any additional authority.
+    pub(super) fn ensure_can_ask(&self) -> io::Result<()> {
         // LOUDLY, unlike `notice` below. A question that cannot be asked must
         // not report success: a caller that believed it had asked would go on
         // to block for an answer that is never coming.
         if let Some(refusal) = self.refusal {
             return Err(refusal.error("ask"));
         }
-        self.output.write_text(text, false)
+        Ok(())
     }
 
     /// The ONLY sanctioned blocking read. Stdin is already exclusively owned and
