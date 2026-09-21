@@ -13,6 +13,7 @@ fn stdio(name: &str, command: &str) -> McpServerEntry {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Trusted,
+        origin: None,
     }
 }
 
