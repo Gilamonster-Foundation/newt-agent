@@ -208,9 +208,9 @@ pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRu
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
     fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
-    print_harness_notice, print_list_item, print_newt, set_mouse_recovery, set_spill_lines,
-    set_spill_summary, set_time_marker_secs, Fold, GaugeLevel, Hidden, Recovery, ThinkingFold,
-    NEWT_ORANGE_CT,
+    print_harness_notice, print_list_item, print_newt, reply_cols, set_mouse_recovery,
+    set_spill_lines, set_spill_summary, set_time_marker_secs, Fold, GaugeLevel, Hidden, Recovery,
+    ThinkingFold, NEWT_ORANGE_CT,
 };
 pub use driver::{
     HeadlessCodeSearch, InstantiatedFeatures, TurnDriver, TurnDriverConfig, TurnDriverError,
@@ -8786,9 +8786,15 @@ async fn anthropic_dispatch_round(
             d.color,
         );
         let cols = display::term_cols();
-        let mut md = d
-            .markdown
-            .then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
+        let mut md = d.markdown.then(|| {
+            MarkdownStreamWriter::new(
+                io::stdout(),
+                RenderOpts {
+                    color: true,
+                    cols: display::reply_cols(cols),
+                },
+            )
+        });
         let mut acc = anthropic_wire::SseAccumulator::new();
         // The same bounded reasoning block the other two wires commit. Anthropic
         // streams thinking as its own SSE action rather than inline `<think>`,
