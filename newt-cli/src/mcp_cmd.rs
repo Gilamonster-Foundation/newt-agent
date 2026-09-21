@@ -1557,6 +1557,9 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
     let mut imported =
         select_import_entries(imported, request.name, request.all, &source, &selector)?;
     let mut source_omissions = newt_core::mcp::codex_mcp_omitted_field_counts(&text);
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
     for entry in &mut imported {
         validate_import_server_name(&entry.name)?;
         validate_imported_secret_locations(entry)?;
@@ -1564,9 +1567,6 @@ fn cmd_import(request: ImportRequest<'_>, out: &mut dyn Write) -> anyhow::Result
         // side effects of `--grant-net`: an adopted server must be connectable
         // and its persisted URL and permission host must agree byte-for-byte.
         canonicalize_import_http_url(entry)?;
-        let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).collect())
-            .unwrap_or_default();
         if let Some(msg) = missing_stdio_command(
             entry,
             &path_dirs,
@@ -1856,11 +1856,21 @@ fn missing_stdio_command(
         .command
         .as_deref()
         .filter(|_| entry.transport == TransportKind::Stdio)?;
+    // Cannot judge, so never flag: a UNC path names a remote host taken from an
+    // UNTRUSTED file (probing it would open an SMB connection before import).
+    let unc = windows && command.starts_with("\\\\");
     let found = if let Some(rest) = command.strip_prefix('~') {
-        let rest = rest.trim_start_matches(['/', '\\']);
-        home.is_some_and(|h| exists(&h.join(rest)))
+        // Only `~`, `~/x` and `~\x`. `~user/x` is another user's home, which the
+        // injected `home` cannot resolve. (`newt_core::config::expand_tilde` is
+        // crate-private and reads the real home, so it cannot serve this seam.)
+        if !(rest.is_empty() || rest.starts_with(['/', '\\'])) {
+            true
+        } else {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            home.is_some_and(|h| exists(&h.join(rest)))
+        }
     } else if command.contains(['/', '\\']) {
-        !is_absolute_for(command, windows) || exists(Path::new(command))
+        unc || !is_absolute_for(command, windows) || exists(Path::new(command))
     } else if windows {
         // ponytail: no PATHEXT (.exe/.cmd) lookup, so skip; try each extension to upgrade.
         true
