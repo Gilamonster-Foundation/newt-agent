@@ -123,7 +123,9 @@ structure ValidatedCall where
 /-- A whole validated batch: the calls, plus a proof their ids are all distinct.
     A missing/duplicate id cannot be represented — the exact `BHV-TOOLS-002`
     "correlation-impossible" state the Rust loop must never dispatch: it
-    re-asks within a bounded budget, then aborts. -/
+    re-asks within a bounded budget, then aborts. An id is provider-issued, or
+    derived by the harness (from the call and its causal parent) for a call it
+    recovered from reply text; never invented for a provider call. -/
 structure ValidatedBatch where
   calls : List ValidatedCall
   ids_nodup : (calls.map (·.id)).Nodup
