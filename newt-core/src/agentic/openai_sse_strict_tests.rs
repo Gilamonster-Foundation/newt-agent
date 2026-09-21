@@ -175,10 +175,6 @@ fn stream_refuses_unfinished_text_and_incomplete_tool_identity() {
         vec![json!({"choices":[{"delta":{"content":"answer"}}]})],
         vec![json!({"choices":[],"usage":{"prompt_tokens":1}})],
         vec![
-            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{
-            "name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
-        ],
-        vec![
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"one","function":{
             "name":"read_file","arguments":"{}"}}]},"finish_reason":"stop"}]}),
         ],
@@ -198,8 +194,6 @@ fn stream_refuses_duplicate_ids_index_gaps_and_nonzero_choices() {
     for calls in [
         json!([{"index":1,"id":"one","function":{"name":"read_file","arguments":"{}"}}]),
         json!([{"id":"one","function":{"name":"read_file","arguments":"{}"}}]),
-        json!([{"index":0,"id":"one","function":{"name":"read_file","arguments":"{}"}},
-            {"index":1,"id":"one","function":{"name":"read_file","arguments":"{}"}}]),
     ] {
         assert!(decode_response(&sse(
             &[json!({"choices":[{"delta":{"tool_calls":calls},
@@ -408,14 +402,6 @@ fn strict_rejections_classify_by_cause() {
     ));
     let cases: Vec<(&str, Vec<u8>, ErrorClass)> = vec![
         (
-            "empty-string tool-call id",
-            call(
-                json!({"index":0,"id":"","function":{"name":"read_file","arguments":"{}"}}),
-                "tool_calls",
-            ),
-            ErrorClass::Model,
-        ),
-        (
             "non-string tool-call id",
             call(
                 json!({"index":0,"id":7,"function":{"name":"read_file","arguments":"{}"}}),
@@ -429,14 +415,6 @@ fn strict_rejections_classify_by_cause() {
             ErrorClass::Model,
         ),
         ("invalid byte mid-stream", invalid_byte, ErrorClass::Model),
-        (
-            "tool call without id",
-            call(
-                json!({"index":0,"function":{"name":"read_file","arguments":"{}"}}),
-                "tool_calls",
-            ),
-            ErrorClass::Model,
-        ),
         (
             "tool call index gap",
             call(
@@ -599,4 +577,33 @@ fn stream_leaves_invalid_tool_calls_to_the_batch_validator() {
             ),
         }
     }
+}
+
+/// U3 review: a missing, blank or repeated tool-call id is the batch validator's
+/// to judge (a bounded re-ask), so the strict decoder passes it through rather
+/// than aborting the turn before the validator is reached. Only what cannot be
+/// read at all (a non-string id) still fails here.
+#[test]
+fn stream_leaves_missing_blank_and_repeated_ids_to_the_batch_validator() {
+    let decode = |calls: Value| {
+        decode_response(&sse(
+            &[json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})],
+            true,
+        ))
+        .expect("decodes; the validator judges the ids")
+    };
+    let f = || json!({"name":"read_file","arguments":"{}"});
+    let missing = decode(json!([{"index":0,"function":f()}]));
+    assert!(missing["choices"][0]["message"]["tool_calls"][0]
+        .get("id")
+        .is_none());
+    let blank = decode(json!([{"index":0,"id":"","function":f()}]));
+    assert!(blank["choices"][0]["message"]["tool_calls"][0]
+        .get("id")
+        .is_none());
+    let repeated = decode(json!([{"index":0,"id":"one","function":f()},
+        {"index":1,"id":"one","function":f()}]));
+    let calls = &repeated["choices"][0]["message"]["tool_calls"];
+    assert_eq!(calls[0]["id"], "one");
+    assert_eq!(calls[1]["id"], "one");
 }
