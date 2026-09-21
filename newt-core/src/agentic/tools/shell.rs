@@ -801,7 +801,47 @@ pub(super) fn confined_result(
     if let Some(refusal) = kernel_refused_binary(cmd, envelope, &caveats.fs_read) {
         return (refusal, ExecOutcome::Denied);
     }
-    (render(envelope), envelope_outcome(envelope))
+    let outcome = envelope_outcome(envelope);
+    let mut text = render(envelope);
+    if outcome == ExecOutcome::TimedOut {
+        text.push_str(&timed_out_note());
+    }
+    (text, outcome)
+}
+
+/// How long `lifecycle action=build` may run: the sanctioned lane for work that
+/// outlives the `run_command` wall.
+pub(super) const LIFECYCLE_BUILD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// The confined shell's per-call wall clock (agent-bridle's default; newt never
+/// overrides it, and the model has no argument to raise it).
+fn run_command_wall_secs() -> u64 {
+    agent_bridle::LimitsPolicy::default().default_timeout_secs
+}
+
+/// What the `run_command` description tells the model about its wall, up front.
+/// One owner with [`timed_out_note`], so the two cannot disagree (U6).
+pub(super) fn run_command_limit_sentence() -> String {
+    format!(
+        "Each call is killed after {} seconds (wall clock, not configurable per call), so a \
+         cold build or full test run will not finish here: use `lifecycle` action=build \
+         ({}-minute limit) for those, or narrow the command (one test filter, one crate).",
+        run_command_wall_secs(),
+        LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
+    )
+}
+
+/// Appended to a timed-out confined result: the limit, that the command was
+/// killed, and the lane for long builds.
+fn timed_out_note() -> String {
+    format!(
+        "\n(the command hit the {}s wall and was killed; the output above is partial. For a \
+         build or full test run use `lifecycle` action=build ({}-minute limit, confined, \
+         offline), or narrow the command.)",
+        run_command_wall_secs(),
+        LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
+    )
 }
 
 /// The host lane's result (`--unsafe-host-exec`). Same rule as the confined
