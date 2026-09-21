@@ -43,8 +43,8 @@
 //! when Landlock is absent, so a spawned command's writes are then advisory, not
 //! kernel-enforced. Combined with `fs_read = All` + `net = All`, this lane is a
 //! **bench isolation control for disposable containers, not a security sandbox**
-//! against a hostile agent. The fence is also deliberately broad on this first
-//! cut; the standard mutable roots have since moved behind an explicit grant.
+//! against a hostile agent. The fence started broad on its first cut (#1487); the
+//! standard mutable roots have since moved behind an explicit grant.
 
 use std::io::Write;
 use std::path::PathBuf;
