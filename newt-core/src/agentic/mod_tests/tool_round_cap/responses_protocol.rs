@@ -861,3 +861,73 @@ async fn a_malformed_responses_cap_exit_summary_is_ok_with_its_usage() {
     assert_eq!(record.state, crate::attempts::AttemptState::Ok);
     assert_eq!(record.usage, row_usage(9).1);
 }
+
+/// P0 U3: an id-less `function_call` is re-asked on `input`; nothing was echoed
+/// for it, so no `function_call_output` is sent for the discarded call, and the
+/// well-formed retry completes the turn.
+#[tokio::test]
+async fn responses_idless_call_is_re_asked_then_recovers() {
+    struct Script(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+    impl wiremock::Respond for Script {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            let mut bodies = self.0.lock().unwrap();
+            let n = bodies.len();
+            bodies.push(serde_json::from_slice(&req.body).expect("JSON"));
+            let output = match n {
+                0 => serde_json::json!([{"type": "function_call", "name": "read_file",
+                    "arguments": "{\"path\":\"no/such/file\"}"}]),
+                1 => serde_json::json!([{"type": "function_call", "call_id": "c1",
+                    "name": "read_file", "arguments": "{\"path\":\"no/such/file\"}"}]),
+                _ => serde_json::json!([{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]}]),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status": "completed", "output": output}))
+        }
+    }
+    let server = MockServer::start().await;
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(Script(bodies.clone()))
+        .mount(&server)
+        .await;
+
+    let task = "do a thing";
+    let messages = giant_prompt_messages(task);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+    ctx.safe_context = None;
+    ctx.max_ok_input = None;
+    ctx.max_tool_rounds = 8;
+    ctx.num_ctx = Some(1_000_000);
+
+    let (reply, ..) = openai_responses_complete(ctx, &mut NoMcp)
+        .await
+        .expect("the turn completes after the re-ask");
+    assert_eq!(reply, "done");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    let second = bodies[1]["input"].as_array().expect("input");
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user", "the re-ask rides on input");
+    assert!(last["content"]
+        .as_str()
+        .unwrap()
+        .contains("without call ids"));
+    assert!(
+        second
+            .iter()
+            .all(|i| i["type"] != "function_call" && i["type"] != "function_call_output"),
+        "nothing is echoed or answered for the discarded call: {second:?}"
+    );
+    let third = bodies[2]["input"].as_array().expect("input");
+    let outputs: Vec<_> = third
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0]["call_id"], "c1");
+}
