@@ -65,7 +65,10 @@ pub fn print_newt(msg: &str, color: bool, verbose: bool) {
     println!("{}", newt_line(msg, color, verbose));
 }
 
-/// Width of the `▸  ` reply marker printed before a reply's first line.
+/// The marker printed before a reply's first line.
+pub const REPLY_MARKER: &str = "▸  ";
+
+/// Display width of [`REPLY_MARKER`] (pinned by a test).
 pub const REPLY_MARKER_COLS: usize = 3;
 
 /// Wrap width for Markdown rendered after the reply marker (#2442).
@@ -1659,6 +1662,14 @@ mod reply_wrap_tests {
         assert!(
             REPLY_MARKER_COLS + w <= cols,
             "first line {first:?} is {w} cols"
+        );
+    }
+
+    #[test]
+    fn marker_width_matches_constant() {
+        assert_eq!(
+            crate::tty::width::str_width(REPLY_MARKER),
+            REPLY_MARKER_COLS
         );
     }
 }
