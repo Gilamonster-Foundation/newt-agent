@@ -23,7 +23,9 @@
 
 use serde_json::{json, Value};
 
-use super::observability::ToolCallDialect;
+use content_addressable::{ContentId, MerkleNode};
+
+use super::observability::{RecoveredIdentity, ToolCallDialect};
 
 /// Outcome of attempting to recover tool calls from model content.
 #[derive(Debug, Default, PartialEq)]
@@ -39,6 +41,75 @@ pub struct Recovery {
     /// Which dialect produced `calls` (W0 #1511: `recovered_tool_call{dialect}`
     /// provenance for the trace). `None` when nothing was recovered.
     pub dialect: Option<ToolCallDialect>,
+}
+
+/// What a recovered call IS, and so what its identity is minted from: the
+/// dialect that matched, the call's position among the calls recovered from one
+/// reply, and the call itself. Arguments are carried as their compact JSON text
+/// (serde_json keeps object keys ordered), so the canonical encoding never sees
+/// a float. The causal parent is the inference attempt that produced the reply.
+#[derive(serde::Serialize)]
+struct RecoveredCall<'a> {
+    dialect: ToolCallDialect,
+    ordinal: u32,
+    name: &'a str,
+    arguments: String,
+}
+
+/// Give each recovered call a harness-DERIVED id (identity is derived, not
+/// assigned): the [`MerkleNode`] id of its [`RecoveredCall`] over `parent`, and
+/// a wire locator `nwt-rc-` + 32 hex chars of that id's DIGEST (39 characters,
+/// inside every documented `tool_call_id` charset and length cap). Two identical
+/// calls in one reply differ by ordinal; the same call in a later round differs
+/// by parent, so a looping model never repeats an id. A call whose identity
+/// cannot be encoded is left id-less and the caller's bounded re-ask handles it.
+///
+/// Only calls the harness itself recovered are touched: a provider call that
+/// arrived without an id never passes through here.
+pub fn assign_ids(recovery: &mut Recovery, parent: Option<ContentId>) -> Vec<RecoveredIdentity> {
+    let Some(dialect) = recovery.dialect else {
+        return Vec::new();
+    };
+    let mut identities = Vec::new();
+    for (ordinal, call) in recovery.calls.iter_mut().enumerate() {
+        let payload = RecoveredCall {
+            dialect,
+            ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+            name: call["function"]["name"].as_str().unwrap_or_default(),
+            arguments: call["function"]["arguments"].to_string(),
+        };
+        let Ok(id) = MerkleNode::new(payload, parent).id() else {
+            continue;
+        };
+        let locator = format!("nwt-rc-{}", &id.digest_hex()[..32]);
+        call["id"] = json!(locator);
+        identities.push(RecoveredIdentity {
+            locator,
+            cid: id.to_string(),
+        });
+    }
+    identities
+}
+
+/// The Chat Completions wire shape of recovered calls, for the replayed
+/// assistant turn: `type:"function"` and STRINGIFIED arguments (recovery holds
+/// them as an object; providers send and expect a string).
+#[must_use]
+pub fn wire_tool_calls(calls: &[Value]) -> Vec<Value> {
+    calls
+        .iter()
+        .map(|call| {
+            let args = &call["function"]["arguments"];
+            let arguments = args
+                .as_str()
+                .map_or_else(|| args.to_string(), str::to_string);
+            json!({
+                "id": call["id"],
+                "type": "function",
+                "function": {"name": call["function"]["name"], "arguments": arguments},
+            })
+        })
+        .collect()
 }
 
 /// Charset-validate a recovered tool name (downstream still validates authority).
