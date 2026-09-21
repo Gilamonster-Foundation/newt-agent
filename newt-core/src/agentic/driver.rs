@@ -846,35 +846,60 @@ async fn run_one_turn(
             attempts,
             attempt_lines,
         }),
-        Err(e) => Ok(TurnOutcome {
-            reply: String::new(),
-            was_streamed: false,
-            usage: None,
-            hallucinations: 0,
-            tool_events,
-            end_reason,
-            // W0 (#1511): the class is read from the TYPED chain; an error
-            // with no dispatch classification is OURS — harness_error,
-            // fail-closed, never a guess from the message text.
-            error_class: Some(
-                crate::agentic::observability::error_class(&e)
-                    .unwrap_or(crate::agentic::observability::ErrorClass::Harness),
-            ),
-            error: Some(e.to_string()),
-            served_model: solve_obs.served_model,
-            parse_signals: solve_obs.parse_signals,
-            behavior_signals: solve_obs.behavior_signals,
-            features,
-            semantic_cognition: runtime.cognition,
-            responses_capability: solve_obs.responses_capability,
-            reasoning_effort: solve_obs.reasoning_effort,
-            output_allowance: solve_obs.output_allowance,
-            harness_reply: solve_obs.harness_reply,
-            attempts,
-            attempt_lines,
-        }),
+        Err(e) => {
+            // #2313 / U4a: an exhausted `--run-allowance` is a budget WALL, not a
+            // failure. Type it like the round cap (a clean stop, `RunAllowance`),
+            // and let the HARNESS write the notice: a model summary is a call the
+            // allowance now refuses, and a summary before the round cap would break
+            // BHV-ROUND-002.
+            let exhausted = e.chain().any(|c| {
+                c.downcast_ref::<super::run_allowance::RunAllowanceExhausted>()
+                    .is_some()
+            });
+            Ok(TurnOutcome {
+                reply: if exhausted {
+                    RUN_ALLOWANCE_NOTICE.to_string()
+                } else {
+                    String::new()
+                },
+                was_streamed: false,
+                usage: None,
+                hallucinations: 0,
+                tool_events,
+                end_reason: if exhausted {
+                    Some(crate::TurnEndReason::RunAllowance)
+                } else {
+                    end_reason
+                },
+                // W0 (#1511): the class is read from the TYPED chain; an error
+                // with no dispatch classification is OURS — harness_error,
+                // fail-closed, never a guess from the message text.
+                error_class: (!exhausted).then(|| {
+                    crate::agentic::observability::error_class(&e)
+                        .unwrap_or(crate::agentic::observability::ErrorClass::Harness)
+                }),
+                error: (!exhausted).then(|| e.to_string()),
+                served_model: solve_obs.served_model,
+                parse_signals: solve_obs.parse_signals,
+                behavior_signals: solve_obs.behavior_signals,
+                features,
+                semantic_cognition: runtime.cognition,
+                responses_capability: solve_obs.responses_capability,
+                reasoning_effort: solve_obs.reasoning_effort,
+                output_allowance: solve_obs.output_allowance,
+                harness_reply: solve_obs.harness_reply || exhausted,
+                attempts,
+                attempt_lines,
+            })
+        }
     }
 }
+
+/// The harness-written reply when `--run-allowance` runs out (no model call is
+/// possible). Points the dispatcher at the state the run left behind.
+const RUN_ALLOWANCE_NOTICE: &str = "The run allowance is exhausted: the whole-run inference-call \
+budget was spent before the task finished. Work done so far is left in the workspace; the \
+hand-back names what changed. Re-run with a larger --run-allowance to continue.";
 
 /// Errors from driving a turn.
 #[derive(Debug, thiserror::Error)]
@@ -1802,6 +1827,41 @@ mod tests {
             "content with no parseable call is signalled: {:?}",
             o.parse_signals
         );
+    }
+
+    /// U4a: a run allowance smaller than the work ends the turn as a TYPED,
+    /// clean stop (like the round cap), not an untyped `harness_error`: the
+    /// reason is `RunAllowance`, there is no error, and the harness — not a
+    /// model call the allowance now refuses — writes the reply. The partial
+    /// trajectory survives.
+    #[tokio::test]
+    async fn an_exhausted_run_allowance_ends_the_turn_typed_with_a_harness_notice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "message": {
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "list_dir", "arguments": {"path": "."}}}]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = cfg(&server.uri());
+        config.run_allowance = Some(2);
+        let mut driver = TurnDriver::new(config);
+        driver.submit("keep listing").expect("submit");
+        let TurnStatus::Completed(o) = pump_to_done(&mut driver).await else {
+            panic!("an exhausted allowance is a completed turn, not a failure");
+        };
+        assert_eq!(o.error, None, "typed stop, not an error");
+        assert_eq!(o.error_class, None);
+        assert_eq!(o.end_reason, Some(crate::TurnEndReason::RunAllowance));
+        assert!(o.harness_reply, "the notice is harness-written");
+        assert!(o.reply.contains("run allowance"), "notice: {}", o.reply);
+        assert!(!o.tool_events.is_empty(), "the partial trajectory is kept");
     }
 
     /// W0 (#1511): a non-success HTTP status is a `model_error` STRUCTURALLY —
