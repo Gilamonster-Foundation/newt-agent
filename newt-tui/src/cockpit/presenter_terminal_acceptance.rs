@@ -9,8 +9,12 @@ const CTRL_C: &[u8] = &[0x03];
 /// cursor-addressed rows must reach the operator tty, own input through resize,
 /// and disappear before the restored composer accepts its next submission.
 /// Primary-screen history must survive both unchanged and resized pager visits.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[cfg(feature = "live-spill")]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn completed_spill_pager_owns_the_terminal_through_resize_and_close() {
     crate::interaction_view_pty_test::drive_cockpit_pager();
 }
@@ -59,7 +63,11 @@ pub(crate) fn cockpit_pager_case() {
 /// real tty: crossterm may already hold input after a terminal query or poll,
 /// leaving the kernel fd empty. Both Enter and Ctrl-C must work without a
 /// subsequent key, while another stdin owner must still keep those events.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn buffered_paste_enter_and_interrupt_do_not_need_another_key() {
     crate::interaction_view_pty_test::drive_cockpit_buffered_input();
 }
@@ -180,7 +188,11 @@ fn buffered_input_case() {
 /// Grounds surface forwarding in a real foreground terminal: the external
 /// command reads operator input, receives its own interrupt/EOF, and gives
 /// the keyboard and exact terminal mode back to the mounted editor.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn bang_commands_lend_the_terminal_and_restore_the_editor() {
     crate::interaction_view_pty_test::drive_cockpit_bang();
 }
@@ -235,8 +247,12 @@ pub(crate) fn cockpit_bang_case() {
 /// Grounds the mocked modal reservation geometry: a real panel may consume
 /// resize events while the presenter is parked, so release must read the tty
 /// dimensions before restoring the preserved draft.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn panel_release_resynchronizes_terminal_size_before_restoring_draft() {
     crate::interaction_view_pty_test::drive_cockpit_resize();
 }
@@ -296,8 +312,12 @@ pub(crate) fn panel_resize_case() {
 /// process-global counter
 /// `permission_prompt_tests::headless_and_piped_sessions_never_construct_a_prompt_window`
 /// asserts is untouched.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
     crate::interaction_view_pty_test::drive_cockpit_acceptance();
 }
@@ -949,8 +969,12 @@ pub(crate) fn cockpit_acceptance_case() {
 /// capture install precisely so a `?` or a panic cannot strand the
 /// terminal), and one cockpit per process is a harness limit, not a reason
 /// to leave the unwind path unproven.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[serial_test::serial(tty_arbiter)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_panic_restores_the_real_termios_through_the_modes_guard() {
     let _tty = TestTty::install();
     // Clear crossterm's saved-mode static FIRST. It is process-global, so
