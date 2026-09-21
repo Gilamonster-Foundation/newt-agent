@@ -3,7 +3,7 @@
 use super::OpenAiStreamRound;
 use anyhow::Context;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Default)]
 pub(super) struct StrictResponse {
@@ -151,27 +151,31 @@ impl StrictResponse {
             finish != "tool_calls" || !self.calls.is_empty(),
             "stream finished tool_calls without any calls"
         );
-        let mut ids = HashSet::new();
         let mut calls = Vec::new();
         for (position, (index, call)) in self.calls.into_iter().enumerate() {
             anyhow::ensure!(
                 index == position as u64,
                 "streamed tool call indices have a gap"
             );
-            let id = call.id.context("streamed tool call has no ID")?;
-            anyhow::ensure!(ids.insert(id.clone()), "streamed tool calls reuse an ID");
-            // Only what cannot be correlated fails the response. A call's name
-            // and arguments are the loop's to judge (`validate_tool_call_batch`),
-            // as on every other wire: an invalid call becomes a keyed rejection
-            // the model can retry, so it passes through raw (#2385). A valid call
-            // is normalized exactly as the loop would.
+            // A missing or repeated id is the loop's to judge too
+            // (`validate_tool_call_batch`): the batch is re-asked within its
+            // bounded budget, exactly as on a complete JSON reply. The id key is
+            // simply left off an id-less call so the validator sees it absent.
+            // A call's name and arguments are judged there as well: an invalid
+            // call becomes a keyed rejection the model can retry, so it passes
+            // through raw (#2385). A valid call is normalized exactly as the
+            // loop would.
             let raw_arguments = Value::String(call.arguments);
             let function =
                 match crate::agentic::tools::validate_tool_call(Some(&call.name), &raw_arguments) {
                     Ok((name, arguments)) => json!({"name":name,"arguments":arguments.to_string()}),
                     Err(_) => json!({"name":call.name,"arguments":raw_arguments}),
                 };
-            calls.push(json!({"id":id, "type":"function", "function":function}));
+            let mut entry = json!({"type":"function", "function":function});
+            if let Some(id) = call.id {
+                entry["id"] = json!(id);
+            }
+            calls.push(entry);
         }
         let mut message = json!({"role":"assistant", "content":round.text});
         if !round.reasoning.is_empty() {
@@ -204,13 +208,20 @@ struct ToolFragments {
 
 impl ToolFragments {
     fn append(&mut self, call: &Value) -> anyhow::Result<()> {
-        // A blank or non-string call id is a defect in the model's output, as the
-        // same id is in a complete JSON reply, not a shape we lack (#2318).
+        // A blank id is the same defect as an absent one and is judged by
+        // `validate_tool_call_batch` (a bounded re-ask), exactly as on a complete
+        // JSON reply, so it is not accumulated. A non-string id is a shape we
+        // cannot read at all (#2318).
+        let id = if call["id"].as_str() == Some("") {
+            &Value::Null
+        } else {
+            &call["id"]
+        };
         anyhow::ensure!(
-            call["id"].is_null() || call["id"].as_str().is_some_and(|id| !id.is_empty()),
+            id.is_null() || id.as_str().is_some(),
             "stream has invalid tool-call ID"
         );
-        stable_string(&mut self.id, &call["id"], "tool-call ID")?;
+        stable_string(&mut self.id, id, "tool-call ID")?;
         anyhow::ensure!(
             call["type"].is_null() || call["type"].as_str() == Some("function"),
             Unsupported("streamed tool call is not a function".into())
