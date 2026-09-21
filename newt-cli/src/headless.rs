@@ -1669,24 +1669,38 @@ mod tests {
     #[test]
     fn fence_scratch_root_comes_from_configuration_then_temp_dir() {
         use newt_core::caveats::permits_path;
-        let temp = std::path::Path::new("/var/tmp/u1000");
+        // `fence_scratch_roots` asks the HOST whether a dir is absolute, so the
+        // "configured absolute dir" and the fallback must be absolute ON THE
+        // RUNNING HOST: `/srv/scratch` has no drive on Windows and would be
+        // "relative" there. Built from the platform temp dir, they are absolute
+        // everywhere; only the fence paths are compared as component paths.
+        let base = std::env::temp_dir();
+        let configured = base.join("newt-scratch-test");
+        let temp = base.join("newt-fallback-test");
+        let (configured_s, temp_s) = (
+            configured.to_string_lossy().into_owned(),
+            temp.to_string_lossy().into_owned(),
+        );
+        let writable = |cv: &Caveats, dir: &std::path::Path| {
+            permits_path(&cv.fs_write, &dir.join("x").to_string_lossy())
+        };
         // Configured absolute dir wins, and the temp dir is NOT also granted.
-        let roots = fence_scratch_roots("/srv/scratch", temp);
-        assert_eq!(roots, ["/srv/scratch"]);
+        let roots = fence_scratch_roots(&configured_s, &temp);
+        assert_eq!(roots, std::slice::from_ref(&configured_s));
         let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
-        assert!(permits_path(&cv.fs_write, "/srv/scratch/x"));
-        assert!(!permits_path(&cv.fs_write, "/tmp/x"));
-        assert!(!permits_path(&cv.fs_write, "/var/tmp/u1000/x"));
+        assert!(writable(&cv, &configured));
+        assert!(!writable(&cv, &temp));
+        assert!(!writable(&cv, &base), "the temp dir itself is not granted");
         // Unset (the relative `.scratch` default lives in the workspace already):
-        // fall back to the platform temp dir, still not a literal `/tmp`.
-        let roots = fence_scratch_roots(".scratch", temp);
-        assert_eq!(roots, ["/var/tmp/u1000"]);
+        // fall back to the platform temp dir, not a literal `/tmp`.
+        let roots = fence_scratch_roots(".scratch", &temp);
+        assert_eq!(roots, [temp_s]);
         let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
-        assert!(permits_path(&cv.fs_write, "/var/tmp/u1000/x"));
-        assert!(!permits_path(&cv.fs_write, "/tmp/x"));
+        assert!(writable(&cv, &temp));
+        assert!(!writable(&cv, &configured));
         // No scratch root at all: workspace + explicit grants only.
         let cv = confined_bench_caveats_with_grants("/app/task", &[], &[]);
-        assert!(!permits_path(&cv.fs_write, "/var/tmp/u1000/x"));
+        assert!(!writable(&cv, &temp));
         assert!(permits_path(&cv.fs_write, "/app/task/x"));
     }
 
