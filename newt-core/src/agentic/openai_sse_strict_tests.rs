@@ -607,3 +607,17 @@ fn stream_leaves_missing_blank_and_repeated_ids_to_the_batch_validator() {
     assert_eq!(calls[0]["id"], "one");
     assert_eq!(calls[1]["id"], "one");
 }
+
+/// A blank id on a LATER fragment, after the call already carried a real id, is
+/// still a strict rejection (the id changed): only a call that NEVER carries an
+/// id reaches the batch validator.
+#[test]
+fn stream_still_rejects_a_blank_id_after_a_real_one() {
+    let frames = [
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"one","function":{
+            "name":"read_file","arguments":"{"}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{
+            "arguments":"}"}}]},"finish_reason":"tool_calls"}]}),
+    ];
+    assert!(decode_response(&sse(&frames, true)).is_err());
+}

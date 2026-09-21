@@ -1055,3 +1055,18 @@ async fn streamed_duplicate_ids_reach_the_shared_validator() {
         "the validator's reason reaches the model: {last}"
     );
 }
+
+/// The invariant the decoder's docs name: a decoded id-less call can never be
+/// DISPATCHED (not merely decoded). The tool result is what would have run.
+#[tokio::test]
+async fn a_decoded_idless_streamed_call_is_never_dispatched() {
+    let (result, _, events) = run_streamed(vec![sse_tool_call(""), sse_answer()]).await;
+    assert_eq!(result.expect("re-asked, then answered"), "all done");
+    assert!(
+        events
+            .iter()
+            .all(|e| e.tool == "(rejected tool-call batch)" && !e.ok),
+        "no tool may run for an id-less call: {events:?}"
+    );
+    assert!(events.iter().all(|e| e.tool != "read_file"));
+}
