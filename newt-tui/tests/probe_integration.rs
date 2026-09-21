@@ -132,7 +132,12 @@ async fn fetch_context_window_reads_arch_limit() {
         .await;
 
     assert_eq!(
-        fetch_context_window(&server.uri(), "llama3:8b", newt_core::BackendKind::Ollama),
+        fetch_context_window(
+            &server.uri(),
+            "llama3:8b",
+            newt_core::BackendKind::Ollama,
+            None
+        ),
         Some(32768)
     );
 }
@@ -150,7 +155,7 @@ async fn fetch_context_window_takes_smaller_modelfile_num_ctx() {
         .await;
 
     assert_eq!(
-        fetch_context_window(&server.uri(), "m", newt_core::BackendKind::Ollama),
+        fetch_context_window(&server.uri(), "m", newt_core::BackendKind::Ollama, None),
         Some(8192)
     );
 }
@@ -167,7 +172,7 @@ async fn fetch_context_window_none_when_response_lacks_fields() {
         .await;
 
     assert_eq!(
-        fetch_context_window(&server.uri(), "m", newt_core::BackendKind::Ollama),
+        fetch_context_window(&server.uri(), "m", newt_core::BackendKind::Ollama, None),
         None
     );
 }
@@ -175,7 +180,7 @@ async fn fetch_context_window_none_when_response_lacks_fields() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_context_window_none_when_unreachable() {
     assert_eq!(
-        fetch_context_window(DEAD_ENDPOINT, "m", newt_core::BackendKind::Ollama),
+        fetch_context_window(DEAD_ENDPOINT, "m", newt_core::BackendKind::Ollama, None),
         None
     );
 }
@@ -204,7 +209,8 @@ async fn ensure_context_window_skips_when_already_known() {
         DEAD_ENDPOINT,
         "m",
         false,
-        newt_core::BackendKind::Ollama
+        newt_core::BackendKind::Ollama,
+        None
     ));
     assert_eq!(e.context_window, Some(4096));
     assert_eq!(e.safe_context, None, "safe_context must not be invented");
@@ -228,7 +234,8 @@ async fn ensure_context_window_bootstraps_safe_context_at_80_percent() {
         &server.uri(),
         "m",
         false,
-        newt_core::BackendKind::Ollama
+        newt_core::BackendKind::Ollama,
+        None
     ));
     assert_eq!(e.context_window, Some(32768));
     assert_eq!(e.safe_context, Some(32768 * 80 / 100)); // 26214
@@ -252,7 +259,8 @@ async fn ensure_context_window_preserves_existing_safe_context() {
         &server.uri(),
         "m",
         false,
-        newt_core::BackendKind::Ollama
+        newt_core::BackendKind::Ollama,
+        None
     ));
     assert_eq!(e.context_window, Some(32768));
     assert_eq!(e.safe_context, Some(1234), "tuned value must survive");
@@ -266,7 +274,8 @@ async fn ensure_context_window_false_when_fetch_fails() {
         DEAD_ENDPOINT,
         "m",
         false,
-        newt_core::BackendKind::Ollama
+        newt_core::BackendKind::Ollama,
+        None
     ));
     assert_eq!(e.context_window, None);
     assert_eq!(e.safe_context, None);
@@ -299,7 +308,8 @@ async fn refresh_context_window_updates_changed_window_and_bootstraps_when_unset
             &server.uri(),
             "m",
             false,
-            newt_core::BackendKind::Ollama
+            newt_core::BackendKind::Ollama,
+            None
         ),
         "a changed window must report dirty"
     );
@@ -332,7 +342,8 @@ async fn refresh_context_window_never_raises_existing_safe_context() {
             &server.uri(),
             "m",
             false,
-            newt_core::BackendKind::Ollama
+            newt_core::BackendKind::Ollama,
+            None
         ),
         "unchanged window is not dirty"
     );
@@ -358,7 +369,8 @@ async fn ensure_context_window_trust_declared_raises_reined_safe_context() {
         DEAD_ENDPOINT,
         "m",
         true,
-        newt_core::BackendKind::Ollama
+        newt_core::BackendKind::Ollama,
+        None
     ));
     assert_eq!(e.context_window, Some(1_048_576));
     assert_eq!(
@@ -388,7 +400,8 @@ async fn refresh_context_window_trust_declared_raises_safe_context() {
             &server.uri(),
             "m",
             true,
-            newt_core::BackendKind::Ollama
+            newt_core::BackendKind::Ollama,
+            None
         ),
         "trust-declared refresh raises safe_context → reports dirty"
     );
@@ -994,4 +1007,44 @@ fn cache_ops_are_noops_without_home() {
     let mut cache = CapabilityCache::default();
     cache.insert(mk("m"), CapabilityEntry::default());
     save_cache(&cache); // must not panic
+}
+
+// ---------------------------------------------------------------------------
+// #2466: the cache-side fetch sends the backend's API key
+// ---------------------------------------------------------------------------
+
+const KEYED_TEST_TOKEN: &str = "test-token-2466";
+
+/// #2466: a keyed `/v1/models` answers 401 without the bearer header. The
+/// cache-side fetch used to pass no key, so no window ever resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_context_window_sends_api_key_to_keyed_models_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {KEYED_TEST_TOKEN}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "m", "context_length": 262144}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let mut e = entry_with(ToolConformance::Native);
+    assert!(ensure_context_window(
+        &mut e,
+        &server.uri(),
+        "m",
+        true,
+        newt_core::BackendKind::Openai,
+        Some(KEYED_TEST_TOKEN),
+    ));
+    assert_eq!(e.context_window, Some(262144), "window must resolve");
 }

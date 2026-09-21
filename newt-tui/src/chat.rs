@@ -2282,6 +2282,7 @@ fn session_body(
                 &inf_model,
                 !real_context_discovery(&cfg, &inf_model),
                 inf_kind,
+                inf_key.as_deref(),
             );
         if updated {
             probe::save_cache(&cap_cache);
@@ -7427,6 +7428,7 @@ fn session_body(
                                 &inf_model,
                                 !real_context_discovery(&cfg, &inf_model),
                                 inf_kind,
+                                inf_key.as_deref(),
                             );
                         let cached_sc = entry.safe_context;
                         let cached_window = entry.context_window;
