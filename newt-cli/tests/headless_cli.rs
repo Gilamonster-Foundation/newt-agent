@@ -1832,3 +1832,112 @@ async fn headless_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
 
 #[path = "headless_cli/cognition.rs"]
 mod cognition;
+
+/// Answers the first chat request with a `write_file` tool call and every later
+/// one with a 500, so the run fails part-way AFTER one real write.
+struct WriteThenFail {
+    sequence: AtomicUsize,
+}
+
+impl Respond for WriteThenFail {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.sequence.fetch_add(1, Ordering::SeqCst) > 0 {
+            return ResponseTemplate::new(500).set_body_string("upstream exploded");
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "w0",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"out.txt\",\"content\":\"partial\\n\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+}
+
+/// U7: a run that dies part-way must still tell the dispatcher what it left
+/// behind. The harness (not the model) writes `handback` on the solve_result
+/// line: the workspace delta from the git probe, the end reason, and whether the
+/// model said anything at all. Grounds the mocked `handback` unit tests with a
+/// real git workspace and a real `write_file`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_fails_after_a_write_hands_back_what_it_changed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenFail {
+            sequence: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let control = tempfile::tempdir().expect("control dir outside the workspace");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    std::fs::write(workspace.path().join("dirty-before.txt"), "x\n").expect("pre-existing dirt");
+    let config_path = control.path().join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = control.path().join("task.md");
+    std::fs::write(&instruction, "Write out.txt.\n").expect("write instruction");
+    let events_path = control.path().join("events.jsonl");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .env("NEWT_HTTP_MAX_RETRIES", "0")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "4"])
+        .assert()
+        .failure();
+
+    let result: serde_json::Value = std::fs::read_to_string(&events_path)
+        .expect("read headless events")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("event line is JSON"))
+        .find(|r| r["kind"] == "solve_result")
+        .expect("a solve_result line");
+    assert_eq!(result["status"], "failed", "{result}");
+    let handback = &result["handback"];
+    assert_eq!(
+        handback["files_changed"],
+        serde_json::json!(["out.txt"]),
+        "{result}"
+    );
+    assert_eq!(handback["files_changed_source"], "git_status_delta");
+    assert_eq!(handback["files_changed_truncated"], false);
+    assert_eq!(handback["model_reply_present"], false);
+    assert!(handback["end_reason"].is_string(), "{handback}");
+}

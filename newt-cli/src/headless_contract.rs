@@ -259,6 +259,59 @@ pub fn calls_after_last_write(events: &[newt_core::ToolEvent]) -> Option<usize> 
     Some(events.len() - 1 - last)
 }
 
+/// Most paths `handback` names; the rest are counted by the truncation flag.
+const HANDBACK_MAX_FILES: usize = 200;
+
+/// U7: the harness-written account of how a run ended, on the solve_result line
+/// only (never the contract record). Everything here is the harness's own
+/// knowledge — none of it is the model's claim, and it holds no hash or id:
+/// - `files_changed`: the git status DELTA between run start and exit, or `null`
+///   with `files_changed_source: "unavailable"` when there is no repo — never an
+///   empty list that would read as "nothing changed";
+/// - `last_exec_outcome`: the exec CLASS of the last shell call (no command text —
+///   `ToolEvent` deliberately retains none);
+/// - `model_reply_present`: whether the model said anything at all.
+///
+/// `end_reason` deliberately repeats the top-level field so the object is
+/// self-contained for a dispatcher; both come from the same value. This is U7
+/// part 1 (what changed); "what was verified" and "what it is unsure of" are not
+/// covered here.
+///
+/// Blind spots of a status DELTA, which a reader must not mistake for "nothing
+/// else changed": (a) a file dirty before AND after in the same status is
+/// invisible; (b) paths git ignores (a stray under `target/`, a written `.env`)
+/// are invisible; (c) a file that was dirty at start and was reverted to clean
+/// is absent from the exit snapshot and so is not reported.
+#[must_use]
+pub fn handback(
+    delta: Option<Vec<String>>,
+    events: &[newt_core::ToolEvent],
+    end_reason: &str,
+    reply_present: bool,
+) -> serde_json::Value {
+    let (files, source, truncated) = match delta {
+        Some(mut files) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            (serde_json::json!(files), "git_status_delta", truncated)
+        }
+        None => (serde_json::Value::Null, "unavailable", false),
+    };
+    let last_exec = events
+        .iter()
+        .rev()
+        .find_map(|e| e.execution.as_ref())
+        .and_then(|x| serde_json::to_value(x).ok());
+    serde_json::json!({
+        "files_changed": files,
+        "files_changed_source": source,
+        "files_changed_truncated": truncated,
+        "last_exec_outcome": last_exec,
+        "end_reason": end_reason,
+        "model_reply_present": reply_present,
+    })
+}
+
 /// One JSONL trace line per parse signal (the ADR §5 events
 /// `recovered_tool_call{dialect}` / `no_parseable_tool_call`). These lines
 /// carry no `contract_version`, so the bench's contract scan skips them.
@@ -521,6 +574,39 @@ fn permitted_outcomes() -> Vec<&'static str> {
 mod tests {
     include!("headless_contract_cognition_tests.rs");
     use super::*;
+
+    #[test]
+    fn handback_reports_delta_caps_it_and_never_fakes_an_empty_list() {
+        let h = handback(Some(vec!["a.rs".into()]), &[], "None", false);
+        assert_eq!(h["files_changed"], serde_json::json!(["a.rs"]));
+        assert_eq!(h["files_changed_source"], "git_status_delta");
+        assert_eq!(h["model_reply_present"], false);
+        assert!(h["last_exec_outcome"].is_null());
+
+        let mut shell =
+            newt_core::ToolEvent::from_call("run_command", &serde_json::json!({}), false, None);
+        shell.execution = Some(newt_core::ExecOutcome::TimedOut);
+        let later =
+            newt_core::ToolEvent::from_call("read_file", &serde_json::json!({}), true, None);
+        let h = handback(None, &[shell, later], "None", true);
+        assert_eq!(
+            h["last_exec_outcome"], "timed_out",
+            "class only, from the last SHELL call"
+        );
+
+        let many: Vec<String> = (0..201).map(|i| format!("f{i}")).collect();
+        let h = handback(Some(many), &[], "RoundCap", true);
+        assert_eq!(h["files_changed"].as_array().unwrap().len(), 200);
+        assert_eq!(h["files_changed_truncated"], true);
+
+        // No repo: null + "unavailable", never [] (which reads as "nothing changed").
+        let h = handback(None, &[], "None", false);
+        assert!(h["files_changed"].is_null());
+        assert_eq!(h["files_changed_source"], "unavailable");
+        // A clean repo IS an empty list, distinguishable from unavailable.
+        let h = handback(Some(vec![]), &[], "None", false);
+        assert_eq!(h["files_changed"], serde_json::json!([]));
+    }
     use newt_core::{BehaviorSignal, ToolCallDialect};
 
     /// Every `TurnEndReason`, and a compile-time guard that this list stays
