@@ -800,9 +800,13 @@ impl PermissionPromptState {
     /// ([`newt_core::ocap_store::approved_grants`] is a pure re-listing), so
     /// it can never itself widen past what the signature covers. Call once,
     /// at session start, after `ocap_policy` is set.
-    pub(crate) fn fold_ocap_approvals(&mut self) {
-        self.durable_grants
-            .extend(newt_core::ocap_store::approved_grants(&self.ocap_policy));
+    /// Returns the number of grants folded in, for the session-start
+    /// permission-log line (#2532 review, item 3).
+    pub(crate) fn fold_ocap_approvals(&mut self) -> usize {
+        let grants = newt_core::ocap_store::approved_grants(&self.ocap_policy);
+        let count = grants.len();
+        self.durable_grants.extend(grants);
+        count
     }
 
     pub(crate) fn recalled_caveats(

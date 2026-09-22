@@ -1098,15 +1098,76 @@ fn fold_ocap_grants(
     caveats: &mut Caveats,
     store: &newt_core::ocap_store::PolicySet,
 ) -> Vec<String> {
-    let grants = newt_core::ocap_store::approved_grants(store);
+    // Defence in depth (#2532 review, should-fix 2): `load_store` only checks
+    // the signature, not danger — `sign_ocap` refuses a High-danger target
+    // today, but a differently-signed store (an older build, a script with
+    // the key) is not re-checked here. Filter through the SAME production
+    // danger predicate `sign_ocap` already blesses against, so headless can
+    // never admit a signed `/`/`$HOME`/interpreter grant the TUI would drop
+    // (`recalled_grants`, `permissions.rs`).
+    let is_high_danger = newt_tui::ocap_high_danger_predicate();
+    let grants: Vec<_> = newt_core::ocap_store::approved_grants(store)
+        .into_iter()
+        .filter(|(kind, target)| !is_high_danger(denial_kind_to_capability_class(*kind), target))
+        .collect();
     if grants.is_empty() {
         return Vec::new();
     }
+    // Contract honesty (#2532 review, item 3): a grant onto an axis that is
+    // already `Scope::All` (or already covers this exact target) changes
+    // nothing — recording it plainly as "admitted" implies the operator's
+    // signature is why the tool can act, when the confined lane already
+    // allowed it. Check "would this actually widen?" BEFORE folding (the
+    // same `CaveatsExt::permits_*` the enforcement path checks against) and
+    // label a no-op instead of dropping it, so the store entry is still
+    // visible on the contract but not mistaken for the reason access worked.
+    let already_permitted: Vec<_> = grants
+        .iter()
+        .map(|(kind, target)| grant_already_permitted(caveats, *kind, target))
+        .collect();
     *caveats = newt_core::widen_caveats(caveats, &grants);
     grants
         .into_iter()
-        .map(|(kind, target)| format!("{}:{target}", ocap_grant_axis_label(kind)))
+        .zip(already_permitted)
+        .map(|((kind, target), no_op)| {
+            let label = format!("{}:{target}", ocap_grant_axis_label(kind));
+            if no_op {
+                format!("{label} (no-op: already permitted)")
+            } else {
+                label
+            }
+        })
         .collect()
+}
+
+/// Would folding this grant change anything? Mirrors [`CaveatsExt`]'s
+/// per-axis check so the contract only records a grant that actually widened
+/// a fenced axis (see [`fold_ocap_grants`]).
+fn grant_already_permitted(caveats: &Caveats, kind: newt_core::DenialKind, target: &str) -> bool {
+    use newt_core::caveats::CaveatsExt;
+    match kind {
+        newt_core::DenialKind::FsRead => caveats.permits_fs_read(target),
+        newt_core::DenialKind::FsWrite => caveats.permits_fs_write(target),
+        newt_core::DenialKind::Exec => caveats.permits_exec(target),
+        newt_core::DenialKind::Net => caveats.permits_net(target),
+        _ => false,
+    }
+}
+
+/// Map an [`approved_grants`](newt_core::ocap_store::approved_grants) axis
+/// back to the [`CapabilityClass`](newt_core::ocap_store::CapabilityClass)
+/// `ocap_high_danger_predicate` expects. `FsRead` and `FsWrite` both fold to
+/// `Fs` — the predicate already classifies fs as a write (the conservative
+/// reading of a durable fs grant); the axes this function never sees
+/// (`RemoteTool`/`GitWrite`/`Build`) are not produced by `approved_grants`.
+fn denial_kind_to_capability_class(
+    kind: newt_core::DenialKind,
+) -> newt_core::ocap_store::CapabilityClass {
+    match kind {
+        newt_core::DenialKind::Exec => newt_core::ocap_store::CapabilityClass::Exec,
+        newt_core::DenialKind::Net => newt_core::ocap_store::CapabilityClass::Net,
+        _ => newt_core::ocap_store::CapabilityClass::Fs,
+    }
 }
 
 /// The contract-record axis label for a folded grant — `newt_core::DenialKind`
@@ -1135,9 +1196,14 @@ fn resolve_ocap_store() -> (newt_core::ocap_store::PolicySet, Vec<String>) {
     let Some(config_path) = newt_core::Config::user_config_path() else {
         return (newt_core::ocap_store::PolicySet::default(), Vec::new());
     };
+    // Read-only: `load_user_key` errors (never mints) when the key is absent,
+    // so a headless run on a fresh host/CI/scratch `--config-dir` never
+    // writes an identity.pem as a side effect of checking for approves — "no
+    // key" folds down to "no approves", already `load_store`'s rule for a
+    // missing/invalid root key.
     let root_vk = newt_identity::default_key_path()
         .ok()
-        .and_then(|p| newt_identity::load_or_generate(&p).ok())
+        .and_then(|p| newt_identity::load_user_key(&p).ok())
         .map(|user| user.public().as_bytes());
     newt_core::ocap_store::load_store(&config_path, root_vk)
 }
@@ -1847,7 +1913,13 @@ mod tests {
         assert_eq!(open.fs_read, Scope::All);
         let admitted = fold_ocap_grants(&mut open, &store);
         assert_eq!(open.fs_read, Scope::All, "an open axis must stay open");
-        assert_eq!(admitted, vec!["fs_read:/opt/canvas-token".to_string()]);
+        // #2532 review, item 3: the axis was already open, so this changed
+        // nothing — still listed (store provenance stays visible), labeled a
+        // no-op rather than implying the signature widened anything.
+        assert_eq!(
+            admitted,
+            vec!["fs_read:/opt/canvas-token (no-op: already permitted)".to_string()]
+        );
         // Smart-lane fenced axis: the grant must actually widen it — this is
         // the canvas gap the brief names (an MCP child's token file, outside
         // the workspace).
@@ -1858,6 +1930,44 @@ mod tests {
         assert!(fenced.permits_fs_read("/opt/canvas-token"));
         // Read-only entry: fs_write must NOT gain the grant.
         assert!(!fenced.permits_fs_write("/opt/canvas-token"));
+    }
+
+    /// #2532 review, should-fix 2, RED FIRST: `load_store` verifies only the
+    /// SIGNATURE (`verify_approves`), never danger — `sign_ocap` refuses a
+    /// High-danger target today, but a `PolicySet` reaching `fold_ocap_grants`
+    /// from any other path (an older build, a script holding the key) is not
+    /// re-checked. Before the fix, a validly-signed `/` fs entry folded
+    /// straight into headless caveats though the TUI's `recalled_grants`
+    /// drops any `DangerTier::High` target (`permissions.rs`). This test
+    /// forces exactly that shape past `sign_approves`'s own refusal (`|_, _|
+    /// false` as the `is_high_danger` predicate, mirroring the disposable-key
+    /// signing helper other tests in this module already use) and pins that
+    /// `fold_ocap_grants` still refuses it.
+    #[test]
+    fn fold_ocap_grants_refuses_a_signed_high_danger_root() {
+        use newt_core::ocap_store::PolicyFile;
+        let key = newt_identity::UserKey::generate();
+        let mut file = PolicyFile::parse("[[fs]]\npath = '/'\nwrite = true\n").expect("parse");
+        let (signed, refused) = newt_core::ocap_store::sign_approves(
+            &mut file,
+            |_, _| false,
+            |p| key.sign(p).to_bytes(),
+        );
+        assert_eq!(signed, 1, "the forged signature must still verify");
+        assert!(refused.is_empty());
+        let (store, warnings) = newt_core::ocap_store::build_store(&[(
+            newt_core::ocap_store::Verdict::Approve,
+            Some(file.to_toml().expect("serialize")),
+        )]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut caveats =
+            newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/app/task"));
+        let admitted = fold_ocap_grants(&mut caveats, &store);
+        assert!(
+            admitted.is_empty(),
+            "a High-danger root must never be admitted, signature or not: {admitted:?}"
+        );
+        assert!(!caveats.permits_fs_write("/etc/shadow"));
     }
 
     /// An unsigned/unverified `approve.toml` is never even IN the `PolicySet`

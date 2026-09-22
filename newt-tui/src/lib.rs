@@ -2126,6 +2126,30 @@ fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
     )
 }
 
+/// Contract honesty (#2532 review, item 3): the ONE `ocap-store-folded` line
+/// written to the #263 permission log at session start when
+/// `fold_ocap_approvals` actually widened something — so `/permissions` (and
+/// the audit trail) can show provenance for a caveat the operator did not
+/// grant THIS session, matching headless's contract-record receipt for the
+/// same fold. `target` carries the count rather than a single axis/target,
+/// since the fold is many grants folded in one step; `scope: "durable-store"`
+/// distinguishes it from a `session`/`durable` (`/permissions`-promoted)
+/// grant. Only called when `folded_count > 0` — a log line for zero folds is
+/// noise, not audit.
+fn ocap_store_folded_record(
+    conversation_id: &str,
+    folded_count: usize,
+) -> newt_core::PermissionRecord {
+    newt_core::PermissionRecord::new(
+        conversation_id,
+        "session",
+        newt_core::DenialKind::Exec,
+        &format!("{folded_count} durable grant(s)"),
+        "allow",
+        "durable-store",
+    )
+}
+
 /// Process-environment synchronization for tests.
 ///
 /// `cargo test` runs tests of this binary concurrently while the environment

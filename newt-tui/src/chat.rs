@@ -2001,7 +2001,20 @@ fn session_body(
         // pre-answer `evaluate_request` already gave it. `load_store` already
         // dropped any unsigned/bad-signature entry loudly above, so this can
         // never fold in anything unverified.
-        permission_state.fold_ocap_approvals();
+        let folded = permission_state.fold_ocap_approvals();
+        if folded > 0 {
+            if let Some(path) = permission_log_path.as_deref() {
+                if let Err(e) =
+                    ocap_store_folded_record(&active_conversation_id, folded).append_jsonl(path)
+                {
+                    print_newt(
+                        &format!("warning: permission log write failed: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+        }
     }
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
