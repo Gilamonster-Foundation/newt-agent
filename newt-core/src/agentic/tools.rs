@@ -462,6 +462,30 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
     crate::caveats::permits_path(scope, full_path)
 }
 
+/// #2516/#2533: a routed call's result note is always APPENDED, never
+/// prepended. `tool_result_ok` classifies a result by its PREFIX
+/// (`error:`, `capability denied:`, …); prepending a note would shift
+/// that prefix off the front of the string and make a failed/denied
+/// routed call read as `ok: true` — the exact bug #2516 round 1 fixed
+/// for the git route and #2533 round 1 reintroduced for the build
+/// route. One helper, used by every route, makes the mistake
+/// unrepresentable instead of relying on each site to remember. Not
+/// platform-gated — every route on every OS goes through this.
+fn append_routed_note(text: String, note: impl std::fmt::Display) -> String {
+    format!("{text}\n{note}")
+}
+
+/// Does `just` have a justfile to find, starting at `dir`? `just` itself
+/// walks up from the cwd through every ancestor looking for `justfile` /
+/// `Justfile` (that's how a subcrate's `just check` finds the workspace
+/// root's), so the routed check must do the same or it refuses to route a
+/// `just` call the shell path would have run fine. Not platform-gated —
+/// `std::path::Path::ancestors` and `.exists()` are portable.
+fn justfile_findable_from(dir: &std::path::Path) -> bool {
+    dir.ancestors()
+        .any(|d| d.join("justfile").exists() || d.join("Justfile").exists())
+}
+
 /// The root in `scope` that lexically authorises `full_path`, if any.
 ///
 /// `Some(Some(root))` — permitted, and `root` is the granted file or directory
@@ -471,28 +495,6 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
 /// exactly (same normalisation + `starts_with`), so the object-bound read
 /// resolves beneath the very root the gate approved.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-/// #2516/#2533: a routed call's result note is always APPENDED, never
-/// prepended. `tool_result_ok` classifies a result by its PREFIX
-/// (`error:`, `capability denied:`, …); prepending a note would shift
-/// that prefix off the front of the string and make a failed/denied
-/// routed call read as `ok: true` — the exact bug #2516 round 1 fixed
-/// for the git route and #2533 round 1 reintroduced for the build
-/// route. One helper, used by every route, makes the mistake
-/// unrepresentable instead of relying on each site to remember.
-fn append_routed_note(text: String, note: impl std::fmt::Display) -> String {
-    format!("{text}\n{note}")
-}
-
-/// Does `just` have a justfile to find, starting at `dir`? `just` itself
-/// walks up from the cwd through every ancestor looking for `justfile` /
-/// `Justfile` (that's how a subcrate's `just check` finds the workspace
-/// root's), so the routed check must do the same or it refuses to route a
-/// `just` call the shell path would have run fine.
-fn justfile_findable_from(dir: &std::path::Path) -> bool {
-    dir.ancestors()
-        .any(|d| d.join("justfile").exists() || d.join("Justfile").exists())
-}
-
 fn authorizing_root<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_path: &str,

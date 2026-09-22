@@ -16,20 +16,16 @@ pub fn tool_definitions() -> serde_json::Value {
                                 fs_write scope are DENIED (e.g. `2>/dev/null`, `> /dev/null`) — drop \
                                 the redirect and read stdout/stderr from the result instead. Prefer the \
                                 dedicated tools over shelling out: `find`/`read_file`/`list_dir` over \
-                                `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` over raw \
-                                build/test/lint commands (use lifecycle action=build for explicitly \
-                                authorized offline compiler/test subprocesses). Do NOT pass `git` (or another tool's name) as \
+                                `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` for \
+                                build/test/lint — bare `cargo build/check/test/clippy`/`just <recipe>` \
+                                route there automatically; anything else needs lifecycle. Do NOT pass \
+                                `git` (or another tool's name) as \
                                 the command here — `git` is a separate tool; invoke it directly. Shelling \
                                 out to a name that has a dedicated tool is rejected. Declare needed \
                                 filesystem additions with fs_read/fs_write absolute-path arrays; \
                                 missing authority is approved before this invocation starts. After \
                                 request_permissions grants filesystem access, retry the same command \
-                                with those paths declared so matching allow-once grants can be used. \
-                                A `cargo build|check|test|clippy [args…]` is silently routed to the \
-                                confined build lane instead of the shell — same argv, offline and \
-                                time-limited. `just` routes ONLY as a bare `just <recipe>` with no \
-                                flags or extra arguments (e.g. `just test newt-core` does NOT route — \
-                                it runs on the normal exec path instead).", super::shell::run_command_limit_sentence()),
+                                with those paths declared so matching allow-once grants can be used.", super::shell::run_command_limit_sentence()),
                 "parameters": {
                     "type": "object",
                     "properties": {
