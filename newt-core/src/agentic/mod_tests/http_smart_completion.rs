@@ -928,3 +928,168 @@ async fn responses_missing_spill_failure_allows_operator_continuation() {
 async fn responses_malformed_spill_failure_allows_operator_continuation() {
     bad_spill_return("responses", true, true).await;
 }
+
+// ---- U4b follow-up: the no-progress stop under the smart harness ------------
+
+/// One `write_file` (arms the brake), then `list_dir` forever; from request
+/// `idless_at` on, the call carries NO id, so the loop re-asks instead of
+/// running it (#2500).
+struct WriteThenIdle {
+    n: std::sync::atomic::AtomicUsize,
+    idless_at: Option<usize>,
+}
+
+impl wiremock::Respond for WriteThenIdle {
+    fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+        let n = self.n.fetch_add(1, Ordering::SeqCst);
+        let (name, arguments) = if n == 0 {
+            ("write_file", r#"{"path":"out.txt","content":"x\n"}"#)
+        } else {
+            ("list_dir", r#"{"path":"."}"#)
+        };
+        let mut call = serde_json::json!({
+            "type": "function",
+            "function": {"name": name, "arguments": arguments}
+        });
+        if self.idless_at.is_none_or(|k| n < k) {
+            call["id"] = serde_json::json!(format!("c{n}"));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                "finish_reason": "tool_calls"}]
+        }))
+    }
+}
+
+/// The `control` of every outcome the smart harness journalled, oldest first.
+fn journalled_outcomes(
+    directory: &std::path::Path,
+    mut head: content_addressable::ContentId,
+) -> Vec<String> {
+    let store = agent_harness::store::FrameStore::open(directory).unwrap();
+    let mut controls = Vec::new();
+    loop {
+        let record = agent_harness::forensics::inspect_from_store(&store, head, Default::default())
+            .unwrap()
+            .unwrap();
+        // `JournalEntry` is externally tagged: an Outcome node serializes as
+        // `{"outcome": {..., "control": ...}}`, not a top-level `control`.
+        if let Some(control) = record
+            .record
+            .get("outcome")
+            .and_then(|outcome| outcome.get("control"))
+            .and_then(|c| c.as_str())
+        {
+            controls.push(control.to_string());
+        }
+        match record.parents.first() {
+            Some(parent) => head = *parent,
+            None => break,
+        }
+    }
+    controls.reverse();
+    controls
+}
+
+/// Runs write-then-idle under the smart harness with `stop_after` idle rounds;
+/// returns the end reason, the requests served, and the journalled outcomes.
+async fn brake_under_smart_harness(
+    stop_after: usize,
+    idless_at: Option<usize>,
+) -> (
+    anyhow::Result<(String, bool)>,
+    Option<crate::TurnEndReason>,
+    Vec<serde_json::Value>,
+    Vec<String>,
+) {
+    let _launch = ConfinedLaunch::new();
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after,
+        },
+        ..Default::default()
+    });
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(WriteThenIdle {
+            n: std::sync::atomic::AtomicUsize::new(0),
+            idless_at,
+        })
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let harness = SmartHarness::new(
+        agent_harness::Session::open(directory.path(), agent_harness::SessionConfig::default())
+            .unwrap(),
+        Arc::new(|_| panic!("no adjudication is expected")),
+        AdjudicationSettings::default(),
+    )
+    .unwrap();
+    let mut reason = None;
+    let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    let uri = server.uri();
+    let current = msgs();
+    let mut context = ctx(&uri, &current, &caveats);
+    context.workspace = workspace.path().to_str().unwrap();
+    context.smart_harness = Some(&harness);
+    context.end_reason = Some(&mut reason);
+    context.kind = BackendKind::Openai;
+    context.max_tool_rounds = 20;
+    let result = chat_complete(context, &mut NoMcp)
+        .await
+        .map(|(text, streamed, _, _)| (text, streamed));
+    let requests: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    let head = harness.head().unwrap();
+    let outcomes = journalled_outcomes(directory.path(), head);
+    (result, reason, requests, outcomes)
+}
+
+/// The Reviewer's follow-up on #2507: the stop now runs under the smart harness
+/// (nudges are off there, but a stop is a bound), so it must end the turn typed,
+/// record the harness outcome as `incomplete` like a cap exit, and issue no
+/// tools-disabled summary request.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_no_progress_stop_ends_a_smart_harness_turn_typed_and_incomplete() {
+    let (result, reason, requests, outcomes) = brake_under_smart_harness(2, None).await;
+    let (text, _) = result.expect("the stop is a typed end, not an error");
+    assert_eq!(reason, Some(crate::TurnEndReason::NoProgress));
+    assert!(text.starts_with("Stopped:"), "harness notice: {text}");
+    assert_eq!(requests.len(), 3, "write, two idle rounds, then the stop");
+    assert!(
+        requests.iter().all(|r| r.get("tools").is_some()),
+        "no tools-disabled summary request"
+    );
+    assert_eq!(
+        outcomes.last().map(String::as_str),
+        Some("incomplete"),
+        "outcomes: {outcomes:?}"
+    );
+}
+
+/// The edge: a stop right after an id-less re-ask round. That round already
+/// recorded outcome `continue` for its reply (and did not clear it), so the
+/// stop's `incomplete` outcome lands on the SAME reply. The session accepts
+/// `continue` then `incomplete`, so the typed stop must not become an `Err`.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
+    let (result, reason, _requests, outcomes) = brake_under_smart_harness(1, Some(1)).await;
+    let (text, _) = result.expect("the stop must not turn into an error after a re-ask");
+    assert_eq!(reason, Some(crate::TurnEndReason::NoProgress));
+    assert!(text.starts_with("Stopped:"), "{text}");
+    assert!(
+        outcomes.iter().any(|c| c == "continue")
+            && outcomes.last().map(String::as_str) == Some("incomplete"),
+        "the re-ask's continue, then the stop's incomplete: {outcomes:?}"
+    );
+}
