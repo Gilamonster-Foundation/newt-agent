@@ -2004,9 +2004,10 @@ fn session_body(
         let folded = permission_state.fold_ocap_approvals();
         if folded > 0 {
             if let Some(path) = permission_log_path.as_deref() {
-                if let Err(e) =
-                    ocap_store_folded_record(&active_conversation_id, folded).append_jsonl(path)
-                {
+                if let Err(e) = newt_core::permission_journal::append_record(
+                    path,
+                    ocap_store_folded_record(&active_conversation_id, folded),
+                ) {
                     print_newt(
                         &format!("warning: permission log write failed: {e}"),
                         color,
