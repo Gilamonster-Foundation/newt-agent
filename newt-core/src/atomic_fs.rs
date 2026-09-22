@@ -204,7 +204,22 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
             lock_path.display()
         );
     }
-    anyhow::bail!("could not acquire {} — {CONTENDED}", lock_path.display())
+    match current_owner(lock_path) {
+        Some(owner) => anyhow::bail!(
+            "could not acquire {} — {CONTENDED} (held by pid {})",
+            lock_path.display(),
+            owner.pid
+        ),
+        None => anyhow::bail!("could not acquire {} — {CONTENDED}", lock_path.display()),
+    }
+}
+
+/// The owner recorded in `lock_path` right now, for the refusal message.
+/// Best-effort: a lock that vanished or was rewritten between the last
+/// failed retry and this read reports `None` rather than lying about who
+/// holds it.
+fn current_owner(lock_path: &Path) -> Option<LockOwner> {
+    LockOwner::decode(&std::fs::read_to_string(lock_path).ok()?)
 }
 
 /// The refusal [`acquire_lock`] returns when another LIVE owner holds the lock
@@ -345,11 +360,18 @@ fn try_native_exclusive_lock(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 fn reclaimable_lock(lock_path: &Path) -> bool {
-    match std::fs::read_to_string(lock_path)
-        .ok()
-        .and_then(|body| LockOwner::decode(&body))
-    {
+    let Ok(body) = std::fs::read_to_string(lock_path) else {
+        return false;
+    };
+    match LockOwner::decode(&body) {
         Some(owner) => !crate::store::pid_is_alive(owner.pid),
+        // This version only ever writes an owner body; an empty file is
+        // `create_new` succeeding and the writer dying before `write_all` —
+        // a dead owner by construction, not a candidate for the legacy
+        // age wait, which exists for pre-owner-tracking lock formats that
+        // are never empty either. A non-empty but undecodable body has
+        // unknown provenance and keeps the conservative age fallback.
+        None if body.is_empty() => true,
         None => std::fs::metadata(lock_path)
             .and_then(|metadata| metadata.modified())
             .ok()
@@ -721,6 +743,30 @@ mod tests {
         assert!(!is_lock_contended(&anyhow::anyhow!(
             "no space left on device"
         )));
+    }
+
+    /// **Red for #2487.** A lock file killed between `create_new` and
+    /// `write_all` is empty — no `pid:nonce` body, so `LockOwner::decode`
+    /// returns `None` and reclamation falls back to the 30s legacy-age path.
+    /// Within the ~2s retry budget that reads as CONTENDED — "another live
+    /// process" — even though no process anywhere holds it and the body is
+    /// unmistakably a crash artifact of the *current* write sequence, never a
+    /// value this version writes on purpose. Reproduces the report: a stale
+    /// 0-byte lock, no live owner, nothing to retry into.
+    #[test]
+    fn empty_crash_artifact_lock_is_reclaimed_not_reported_live() {
+        let dir = TempDir::new().unwrap();
+        let lock = lock_path_for(&dir.path().join("config.toml"));
+        // Simulates `create_new` succeeding and the process dying before
+        // `write_all` — exactly what a kill/OOM/panic between those two
+        // calls in `acquire_lock` leaves on disk. Freshly written, so the
+        // legacy 30s age check does not consider it stale.
+        std::fs::File::create(&lock).unwrap();
+
+        let guard = acquire_lock(&lock).expect(
+            "an empty lock from this version's own write sequence is a dead owner, not a live one",
+        );
+        drop(guard);
     }
 
     #[test]
