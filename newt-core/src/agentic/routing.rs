@@ -119,6 +119,17 @@ const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')']
 /// literal glob would misbehave — so such a command gates instead of routing.
 const GLOB: &[char] = &['*', '?', '[', ']'];
 
+/// Tokens the SHELL would transform before a program ever sees them — a
+/// quote, an escape, a `~` expansion, or a glob (`GLOB` above). The build
+/// route runs the model's argv **literally** (no shell in between), so any
+/// operand carrying one of these routes with the WRONG argv: `cargo test
+/// "a b"` would see two literal tokens `"a` and `b"` instead of one quoted
+/// string, `--manifest-path ~/x` would see a literal `~` instead of $HOME,
+/// `cargo build --bin *` would see a literal `*` instead of the shell's
+/// expansion. #2533 round 2: refuse to route rather than run a silently
+/// different command with `ok: true`.
+const BUILD_UNSAFE: &[char] = &['"', '\'', '\\', '~', '*', '?', '[', ']'];
+
 /// The route/gate table — pure DATA, read by [`RouteTable::classify`].
 #[derive(Debug, Clone)]
 pub(crate) struct RouteTable {
@@ -401,6 +412,12 @@ fn branch_list_route(rest: &[&str]) -> RouteDecision {
 /// handles them: [`RouteTable::classify_call`] refuses to route a call
 /// carrying either, rather than dropping them.
 fn build_lane_route(program: &str, rest: &[&str]) -> RouteDecision {
+    // See `BUILD_UNSAFE`: a quoted, escaped, `~`-relative or globbed operand
+    // cannot be routed faithfully (there is no shell downstream to expand
+    // it), so gate the whole call to exec rather than run a mangled argv.
+    if rest.iter().any(|tok| tok.contains(BUILD_UNSAFE)) {
+        return RouteDecision::Exec;
+    }
     match program {
         "cargo" => cargo_build_route(rest),
         "just" => just_build_route(rest),

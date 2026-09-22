@@ -1443,3 +1443,172 @@ async fn confined_shell_env_carries_the_fence_scratch_root_as_tmpdir() {
         Some("/srv/scratch")
     );
 }
+
+/// #2533 round 2 (verify-routing-f11b item 1): the #2516 round-1 bug class
+/// (a prepended routed note shifts an `error:`/failure prefix off the front
+/// of the string, so the tool-result classifier reads a failure as success)
+/// reappeared for the build route. RED before the fix: `run_confined_build_lane`
+/// renders a failing command as `error: command exited N\n<output>`; the build
+/// route PREPENDED `[routed …]` in front of that, so `tool_result_ok` saw the
+/// note text first and returned `true` for a build that failed. Calling
+/// `build_exec` directly (bypassing the `cargo`/`just` routing table, which
+/// this test does not need) with a command that fails proves the ledgered
+/// `ok` bit follows the exit code even through the routed note.
+#[tokio::test]
+async fn failed_routed_build_ledgers_not_ok() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "build_exec",
+        &serde_json::json!({ "argv": ["false"] }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        None, // permission_gate
+        None,
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await;
+
+    if crate::confined_exec::kernel_fs_fence_available() {
+        assert!(
+            !super::tool_result_ok(&out),
+            "a routed build whose command failed must not read ok:true; got: {out}"
+        );
+        assert!(
+            out.contains("routed `false` to the confined build lane"),
+            "the routed note must still be present, appended after the failure \
+             text, not prepended in front of it; got: {out}"
+        );
+    }
+
+    // The passing case must still read ok:true — the fix must not flip both.
+    let out_ok = execute_tool(
+        "build_exec",
+        &serde_json::json!({ "argv": ["true"] }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    if crate::confined_exec::kernel_fs_fence_available() {
+        assert!(
+            super::tool_result_ok(&out_ok),
+            "a routed build that PASSED must still read ok:true; got: {out_ok}"
+        );
+    }
+}
+
+/// #2533 round 2 (item 2): a quoted, `~`-relative, or globbed operand cannot
+/// be routed faithfully — there is no shell downstream of the build lane to
+/// expand it — so the classifier must gate the whole call to exec rather than
+/// run a silently mangled argv. `cargo test -p newt-core` (no such token)
+/// must still route.
+#[test]
+fn build_route_refuses_unsafe_argv_shapes() {
+    use super::super::routing::{RouteDecision, RouteTable};
+    let table = RouteTable::builtin();
+
+    for cmd in [
+        r#"cargo test "a b""#,
+        "cargo test --manifest-path ~/x",
+        "cargo build --bin *",
+        r#"cargo test 'a b'"#,
+        r"cargo test a\ b",
+    ] {
+        assert_eq!(
+            table.classify(cmd),
+            RouteDecision::Exec,
+            "{cmd:?} carries a token the shell would transform; it must gate to exec"
+        );
+    }
+
+    assert!(
+        matches!(
+            table.classify("cargo test -p newt-core"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                ..
+            }
+        ),
+        "a bare, unquoted argv must still route"
+    );
+}
+
+/// #2533 round 2 (item 3): `just` itself searches the cwd AND every parent
+/// directory for a justfile, so a workspace whose justfile sits one level up
+/// must still route-and-run through the build lane's exec fallback — not
+/// error — exactly as the shell path would have found it.
+#[tokio::test]
+async fn just_with_justfile_one_level_up_falls_back_to_exec_not_error() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("justfile"),
+        "check:\n\techo up-one-level\n",
+    )
+    .unwrap();
+    let sub = root.path().join("crates/foo");
+    std::fs::create_dir_all(&sub).unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "build_exec",
+        &serde_json::json!({ "argv": ["just", "check"] }),
+        &sub.to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !out.starts_with("error: no justfile"),
+        "a justfile one level up must be found, not reported missing; got: {out}"
+    );
+}

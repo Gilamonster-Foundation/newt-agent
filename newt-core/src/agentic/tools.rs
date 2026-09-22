@@ -471,6 +471,28 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
 /// exactly (same normalisation + `starts_with`), so the object-bound read
 /// resolves beneath the very root the gate approved.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+/// #2516/#2533: a routed call's result note is always APPENDED, never
+/// prepended. `tool_result_ok` classifies a result by its PREFIX
+/// (`error:`, `capability denied:`, …); prepending a note would shift
+/// that prefix off the front of the string and make a failed/denied
+/// routed call read as `ok: true` — the exact bug #2516 round 1 fixed
+/// for the git route and #2533 round 1 reintroduced for the build
+/// route. One helper, used by every route, makes the mistake
+/// unrepresentable instead of relying on each site to remember.
+fn append_routed_note(text: String, note: impl std::fmt::Display) -> String {
+    format!("{text}\n{note}")
+}
+
+/// Does `just` have a justfile to find, starting at `dir`? `just` itself
+/// walks up from the cwd through every ancestor looking for `justfile` /
+/// `Justfile` (that's how a subcrate's `just check` finds the workspace
+/// root's), so the routed check must do the same or it refuses to route a
+/// `just` call the shell path would have run fine.
+fn justfile_findable_from(dir: &std::path::Path) -> bool {
+    dir.ancestors()
+        .any(|d| d.join("justfile").exists() || d.join("Justfile").exists())
+}
+
 fn authorizing_root<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_path: &str,
@@ -3289,7 +3311,7 @@ async fn execute_authorized_tool(
                 // dispatch's `error:` prefix off the front of the string and
                 // make an errored routed call read as ok:true.
                 if let Some(original) = &routed_git_command {
-                    out = format!("{out}\n[routed: `{original}` → git {op} {args}]");
+                    out = append_routed_note(out, format!("[routed: `{original}` → git {op} {args}]"));
                 }
                 // #1056: a LOCAL git WRITE denied by the projected authority is
                 // NOT a dead end (the trap that stranded the model between the git
@@ -3597,17 +3619,40 @@ async fn execute_authorized_tool(
             let Some((program, rest)) = argv.split_first() else {
                 return host_return("error: routed build command had no argv".into());
             };
-            // `just` only makes sense with a justfile present — the pure
+            // `just` only makes sense with a justfile somewhere — the pure
             // router cannot see the filesystem, so the check lives here.
-            if program == "just" && !std::path::Path::new(workspace).join("justfile").exists()
-                && !std::path::Path::new(workspace).join("Justfile").exists()
-            {
-                return host_return(format!(
-                    "error: no justfile in {workspace}; `just {}` was not routed",
-                    rest.first().map(String::as_str).unwrap_or("")
-                ));
-            }
+            // `just` itself searches the cwd AND every parent directory
+            // (that's how a subcrate's `just check` finds the workspace
+            // root's justfile), so a workspace-only check errors on a repo
+            // whose justfile sits one level up, where the shell path would
+            // have found and run it. #2533 round 2: fall back to the normal
+            // exec path instead — the routed argv is the literal command,
+            // so it runs exactly as the shell would have.
             let display = argv.join(" ");
+            if program == "just" && !justfile_findable_from(std::path::Path::new(workspace)) {
+                let filesystem_requests =
+                    match declared_filesystem_requests(args, &display, workspace) {
+                        Ok(requests) => requests,
+                        Err(error) => return host_return(error),
+                    };
+                return executed(
+                    exec_confined_command(
+                        &display,
+                        workspace,
+                        color,
+                        tool_output_lines,
+                        caveats,
+                        &filesystem_requests,
+                        exec_floor,
+                        permission_gate,
+                        tool_offload,
+                        spill_store,
+                        live_tool_output.clone(),
+                        presentation,
+                    )
+                    .await,
+                );
+            }
             let (text, outcome) = run_confined_build_lane(
                 workspace,
                 std::path::Path::new(workspace),
@@ -3625,7 +3670,12 @@ async fn execute_authorized_tool(
             )
             .await;
             executed((
-                format!("[routed `{display}` to the confined build lane — 30 min limit, network denied]\n{text}"),
+                append_routed_note(
+                    text,
+                    format!(
+                        "[routed `{display}` to the confined build lane — 30 min limit, network denied/offline]"
+                    ),
+                ),
                 outcome,
             ))
         }

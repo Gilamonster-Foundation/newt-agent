@@ -24,7 +24,12 @@ pub fn tool_definitions() -> serde_json::Value {
                                 filesystem additions with fs_read/fs_write absolute-path arrays; \
                                 missing authority is approved before this invocation starts. After \
                                 request_permissions grants filesystem access, retry the same command \
-                                with those paths declared so matching allow-once grants can be used.", super::shell::run_command_limit_sentence()),
+                                with those paths declared so matching allow-once grants can be used. \
+                                A `cargo build|check|test|clippy [args…]` is silently routed to the \
+                                confined build lane instead of the shell — same argv, offline and \
+                                time-limited. `just` routes ONLY as a bare `just <recipe>` with no \
+                                flags or extra arguments (e.g. `just test newt-core` does NOT route — \
+                                it runs on the normal exec path instead).", super::shell::run_command_limit_sentence()),
                 "parameters": {
                     "type": "object",
                     "properties": {
