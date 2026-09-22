@@ -652,15 +652,38 @@ impl GitEngine {
             tip_tree = cur_tree;
             produced += 1;
         }
-        // #2518: `checkout_between_trees` assumes no untracked file
-        // sits where an added path needs to land, but its `clean` precondition
-        // (above) only counts UNIGNORED untracked files — an ignored one (a
-        // local `.env`, a generated config) is invisible to that check and
-        // would otherwise be silently overwritten by the reset below. Refuse
-        // before moving anything if the new tree adds a path that already
-        // exists on disk (file, dir, or symlink).
+        self.guard_move_ref_and_sync_tree(
+            old_head_tree,
+            tip_tree,
+            "rebase",
+            short_oid(&tip),
+            || Ok(write_ref(&self.repo.git_dir, &head_ref, &tip)?),
+        )?;
+        Ok(RebaseReport {
+            new_head: short_oid(&tip),
+            produced,
+            dropped,
+        })
+    }
+
+    /// Shared ref-moving tail for `rebase` and `checkout`: refuse if the new
+    /// tree would overwrite an ignored file the `clean` precondition can't
+    /// see (#2518), then move the ref via `move_ref`, then reset the
+    /// worktree + index to `new_tree` LAST so tree == HEAD after the ref
+    /// moves. `op`/`new_head` label the error text if that final reset fails
+    /// partway (ref already moved; `GitError::Refused` is used anyway — a
+    /// moved ref plus a half-updated tree is the least-bad state to report
+    /// through the same variant as an outright refusal).
+    fn guard_move_ref_and_sync_tree(
+        &self,
+        old_tree: Option<ObjectId>,
+        new_tree: ObjectId,
+        op: &str,
+        new_head: String,
+        move_ref: impl FnOnce() -> Result<(), GitError>,
+    ) -> Result<(), GitError> {
         if let Some(wt) = self.repo.work_tree.clone() {
-            let changes = diff_trees(&self.repo.odb, old_head_tree.as_ref(), Some(&tip_tree), "")?;
+            let changes = diff_trees(&self.repo.odb, old_tree.as_ref(), Some(&new_tree), "")?;
             for change in &changes {
                 if change.status != DiffStatus::Added {
                     continue;
@@ -670,35 +693,20 @@ impl GitEngine {
                 };
                 if wt.join(path).symlink_metadata().is_ok() {
                     return Err(GitError::Refused(format!(
-                        "rebase: refusing — {path} already exists on disk and would be overwritten by the rebased tree"
+                        "{op}: refusing — {path} already exists on disk and would be overwritten by the checked-out tree"
                     )));
                 }
             }
         }
-        // Advance the branch ref to the new tip.
-        write_ref(&self.repo.git_dir, &head_ref, &tip)?;
-        // Reset the worktree + index LAST — mirrors `stash`'s own ordering —
-        // so tree == HEAD after the ref move. If this fails the ref has
-        // already moved: HEAD is now the new tip, but `checkout_between_trees`
-        // writes files in a loop and returns the first error, so the worktree
-        // may be only PARTIALLY updated, and `write_index` runs after that
-        // loop — the index was never rewritten either. `GitError::Refused`
-        // otherwise means "no side effects"; this is the one deliberate
-        // exception, because a moved ref plus a half-updated tree is still
-        // the least-bad state to report through the same variant.
-        if let Some(old_tree) = old_head_tree {
-            checkout_between_trees(&self.repo, Some(&old_tree), &tip_tree).map_err(|e| {
-                GitError::Refused(format!(
-                    "rebase: HEAD moved to {} but the working tree may be partially updated and the index was not rewritten; run status before continuing: {e}",
-                    short_oid(&tip)
-                ))
-            })?;
-        }
-        Ok(RebaseReport {
-            new_head: short_oid(&tip),
-            produced,
-            dropped,
-        })
+        move_ref()?;
+        // `None` (an unborn HEAD) is the empty tree to grit, so every path in
+        // `new_tree` is written; skipping the reset here would leave tree != HEAD.
+        checkout_between_trees(&self.repo, old_tree.as_ref(), &new_tree).map_err(|e| {
+            GitError::Refused(format!(
+                "{op}: HEAD moved to {new_head} but the working tree may be partially updated and the index still reflects the previous HEAD; run status before continuing: {e}"
+            ))
+        })?;
+        Ok(())
     }
 
     /// `git branch <name>` — create `refs/heads/<name>` at the current HEAD commit.
@@ -721,9 +729,10 @@ impl GitEngine {
     ///
     /// newt is local-only and has no working-tree updater, so this only moves
     /// HEAD when the target branch is at the SAME commit as the current HEAD
-    /// (always true for a freshly-created branch). Switching to a branch at a
-    /// different commit is *refused* rather than silently leaving the worktree
-    /// stale — no side effects on refusal.
+    /// (always true for a freshly-created branch), or resets the worktree +
+    /// index to the target commit's tree (#2485, same guarded tail as
+    /// `rebase`) when the tree is clean. A dirty tree, or an ignored file in
+    /// the way, refuses with no side effects.
     pub fn checkout(
         &self,
         caps: &GitCaveats,
@@ -752,11 +761,29 @@ impl GitEngine {
             }
         };
         if target != head {
-            return Err(GitError::Refused(format!(
-                "refusing to switch to '{name}': it points at a different commit \
-                 than HEAD and newt cannot update the working tree (local-only). \
-                 Commit or stash first, or create a new branch at HEAD."
-            )));
+            // #2485: same ref-moving invariant as `rebase` — only switch if
+            // the tree can be synced to the target commit without side
+            // effects, via the same guarded tail.
+            let pre_status = self.status(caps)?;
+            if !pre_status.clean {
+                return Err(GitError::Refused(format!(
+                    "refusing to switch to '{name}': working tree is not clean \
+                     ({} staged, {} unstaged, {} untracked); commit or stash first",
+                    pre_status.staged.len(),
+                    pre_status.unstaged.len(),
+                    pre_status.untracked.len()
+                )));
+            }
+            let old_tree = self.head_tree()?;
+            let new_tree = self.commit_tree(&target.expect("target set above"))?;
+            self.guard_move_ref_and_sync_tree(
+                old_tree,
+                new_tree,
+                "checkout",
+                name.to_string(),
+                || Ok(write_symbolic_ref(&self.repo.git_dir, "HEAD", &refname)?),
+            )?;
+            return Ok(format!("switched to branch '{name}'"));
         }
         write_symbolic_ref(&self.repo.git_dir, "HEAD", &refname)?;
         Ok(if created {
