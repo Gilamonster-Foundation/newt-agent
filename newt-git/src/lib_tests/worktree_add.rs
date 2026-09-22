@@ -35,10 +35,29 @@ fn worktree_add_creates_a_worktree_git_accepts() {
         .output()
         .unwrap();
     let listing = String::from_utf8_lossy(&out.stdout);
-    let git_reported_wt = listing
-        .lines()
-        .find_map(|l| l.strip_prefix("worktree "))
-        .map(|s| PathBuf::from(s).canonicalize().unwrap());
+    // Keep git's own raw-string spelling around (not just the canonicalized
+    // form used for the equality check below): #2531 round 5's Windows CI
+    // failure removed cleanly by every OTHER means (`list`, `status` and
+    // `rev-parse` run against `wt` all agreed it was a worktree) yet `worktree
+    // remove wt` still refused with "is not a working tree" — i.e. `remove`'s
+    // internal path match disagreed with what `wt` canonicalizes to, even
+    // though `list`'s registry read (this block) and `wt` did agree once
+    // canonicalized. Feeding `remove` git's OWN reported spelling, instead of
+    // our recomputed one, sidesteps that disagreement rather than guessing at
+    // its cause blind (no Windows box to reproduce it on).
+    // Porcelain output is one block per worktree (main tree first, blank-line
+    // separated); a bare `.find_map` over "worktree " lines picks the FIRST
+    // one — the main tree, not ours — and that bug hid behind the assertion's
+    // `listing.contains("feat-x")` fallback below. Find the block that is
+    // actually ours (its `branch` line names our new ref) instead.
+    let git_reported_wt_raw = listing
+        .split("\n\n")
+        .find(|block| block.contains("branch refs/heads/feat/x"))
+        .and_then(|block| block.lines().find_map(|l| l.strip_prefix("worktree ")))
+        .map(PathBuf::from);
+    let git_reported_wt = git_reported_wt_raw
+        .as_deref()
+        .map(|p| p.canonicalize().unwrap());
     assert!(
         git_reported_wt == Some(wt.canonicalize().unwrap()) || listing.contains("feat-x"),
         "{listing}"
@@ -65,8 +84,12 @@ fn worktree_add_creates_a_worktree_git_accepts() {
     // git accepts the admin dir we built well enough to remove it cleanly.
     // #2531 round 5, finding 4: capture `.output()`, not `.status()` — a
     // bare bool told us nothing the last time this failed on Windows only.
+    // #2531 round 6: pass git the spelling IT reported above, not `wt` —
+    // see the `git_reported_wt_raw` comment; asking git to remove the exact
+    // string it already recognizes as a worktree can't disagree with itself.
+    let remove_arg = git_reported_wt_raw.as_deref().unwrap_or(&wt);
     let removed = git_cmd(p)
-        .args(["worktree", "remove", wt.to_str().unwrap()])
+        .args(["worktree", "remove", remove_arg.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
