@@ -83,6 +83,18 @@ pub(crate) enum SurfaceRequest {
         prompt: String,
         reply: SyncSender<anyhow::Result<ReadOutcome>>,
     },
+    /// "Present this pending clarification and read the answer" (#2524 item
+    /// 7). Carries a rendered `batch`/`hint` STRING rather than the
+    /// `PromptIntake`, matching `ReadLine`'s own choice: the far side only
+    /// ever draws it, never re-derives the batch text.
+    PresentClarification {
+        batch: String,
+        hint: String,
+        prompt: String,
+        color: bool,
+        verbose: bool,
+        reply: SyncSender<anyhow::Result<ReadOutcome>>,
+    },
     /// Rebuild the editor after a `/vi` · `/emacs` switch.
     Reload {
         reply: SyncSender<anyhow::Result<()>>,
@@ -264,6 +276,7 @@ impl SurfaceRequest {
         matches!(
             self,
             Self::ReadLine { .. }
+                | Self::PresentClarification { .. }
                 | Self::Reload { .. }
                 | Self::Interact { .. }
                 | Self::RunBang { .. }
@@ -355,6 +368,38 @@ impl crate::chat::InputSurface for RemoteSurface {
     fn reload(&mut self) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.ask(|reply| SurfaceRequest::Reload { reply }, rx, tx)?
+    }
+
+    /// #2524 item 7: explicit proxying rather than the trait default.
+    ///
+    /// The default body (`print_newt` + `self.read_line`) would print on the
+    /// SESSION thread and read on the SESSION thread's own `read_line`
+    /// override — i.e. straight back into `ReadLine`, never reaching the far
+    /// side's `present_clarification` at all, so RichTUI's modal chrome would
+    /// never draw. Forwarding its OWN request keeps the far side able to
+    /// choose: `pump_surface` dispatches this to `surface.present_clarification`
+    /// there, same as `ReadLine` dispatches to `surface.read_line`.
+    fn present_clarification(
+        &mut self,
+        batch: &str,
+        hint: &str,
+        prompt: &str,
+        color: bool,
+        verbose: bool,
+    ) -> anyhow::Result<ReadOutcome> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.ask(
+            |reply| SurfaceRequest::PresentClarification {
+                batch: batch.to_string(),
+                hint: hint.to_string(),
+                prompt: prompt.to_string(),
+                color,
+                verbose,
+                reply,
+            },
+            rx,
+            tx,
+        )?
     }
 
     fn add_history(&mut self, entry: &str) {
@@ -486,6 +531,17 @@ pub(crate) fn pump_surface(
                 // A dropped reply means the session vanished mid-read; the
                 // next `recv` ends the loop, so there is nothing to do here.
                 let _ = reply.send(surface.read_line(&prompt));
+            }
+            SurfaceRequest::PresentClarification {
+                batch,
+                hint,
+                prompt,
+                color,
+                verbose,
+                reply,
+            } => {
+                let _ = reply
+                    .send(surface.present_clarification(&batch, &hint, &prompt, color, verbose));
             }
             SurfaceRequest::Reload { reply } => {
                 let _ = reply.send(surface.reload());
@@ -867,6 +923,9 @@ mod tests {
             surface.save_history();
             surface.reload().expect("served");
             surface.read_line("› ").expect("served");
+            surface
+                .present_clarification("1: pick a lane", "/discuss", "› ", false, false)
+                .expect("served");
             let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             surface.turn_started(flag());
             surface.turn_ended();
@@ -1029,6 +1088,7 @@ mod tests {
     #[derive(Default)]
     struct CountingSurface {
         read_line: usize,
+        present_clarification: usize,
         add_history: usize,
         save_history: usize,
         reload: usize,
@@ -1052,11 +1112,12 @@ mod tests {
         /// the smaller number for both — a rich build that dropped a
         /// forwarding impl must still fail here.
         const METHODS: usize =
-            12 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
+            13 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
 
         fn each(&self) -> Vec<(&'static str, usize)> {
             [
                 ("read_line", self.read_line),
+                ("present_clarification", self.present_clarification),
                 ("add_history", self.add_history),
                 ("save_history", self.save_history),
                 ("reload", self.reload),
@@ -1128,6 +1189,17 @@ mod tests {
 
         fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
             self.read_line += 1;
+            Ok(ReadOutcome::Eof)
+        }
+        fn present_clarification(
+            &mut self,
+            _batch: &str,
+            _hint: &str,
+            _prompt: &str,
+            _color: bool,
+            _verbose: bool,
+        ) -> anyhow::Result<ReadOutcome> {
+            self.present_clarification += 1;
             Ok(ReadOutcome::Eof)
         }
         fn add_history(&mut self, _entry: &str) {
