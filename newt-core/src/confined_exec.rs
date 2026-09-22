@@ -1112,18 +1112,18 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
         }
     }
     // System C toolchain headers: world-readable OS files with zero
-    // disclosure value, missing only because the sandbox backend's base
-    // list was tuned for *running* binaries, not *compiling* C (P0 U6e /
-    // NOTE-build-lane-read-fence.md). macOS is covered by the SDK/Developer
-    // roots added above instead.
+    // disclosure value (P0 U6e) — this is a read-then-disclose fence, and
+    // headers carry nothing worth disclosing. macOS is covered by the
+    // SDK/Developer roots added above instead.
     #[cfg(not(target_os = "macos"))]
     {
         roots.push("/usr/include".to_string());
         roots.push("/usr/local/include".to_string());
     }
     // The exact `~/.local/bin` root only — never a wider `~/.local` or
-    // `$HOME` grant (see NOTE-build-lane-read-fence.md: this is a
-    // deliberate, narrow exception to "never $HOME broadly").
+    // `$HOME` grant. `$XDG_BIN_HOME`, if set, overrides it; XDG_BIN_HOME is
+    // a proposed, not ratified, XDG variable, so this is deliberately not
+    // presented as a standard default.
     if let Some(path) = operator_tool_home("XDG_BIN_HOME", ".local/bin") {
         roots.push(path);
     }
@@ -1137,8 +1137,6 @@ mod tests {
     /// Regression for the P0 U6e build-lane read fence: the lane could not
     /// compile any crate with a C build script (`stdc-predef.h: Permission
     /// denied`) or resolve `just` from `~/.local/bin` (`Permission denied`).
-    /// See `docs/security/ocap-deviations.md` review note
-    /// `NOTE-build-lane-read-fence.md`.
     ///
     /// Deterministic (holds `process_env::lock`, pins `HOME` to a fake path,
     /// clears `XDG_BIN_HOME` for the default case) rather than reading the
@@ -1150,11 +1148,37 @@ mod tests {
     /// ancestor-or-equal check, not string equality: a root of `$HOME` itself
     /// would pass an equality check against `$HOME/.newt` but must fail this
     /// one, since it would still disclose everything under it.
+    /// RAII guard that restores an env var to its value at construction on
+    /// drop, so a failed assertion mid-test does not leak the fake `HOME` (or
+    /// a cleared `XDG_BIN_HOME`) into every later test in the process.
+    struct EnvRestore {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                saved: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            crate::process_env::set_or_remove(
+                self.key,
+                self.saved.as_deref().and_then(|v| v.to_str()),
+            );
+        }
+    }
+
     #[test]
     fn build_tool_read_roots_include_c_headers_and_local_bin() {
         let _env = crate::process_env::lock();
-        let saved_home = std::env::var_os("HOME");
-        let saved_xdg_bin = std::env::var_os("XDG_BIN_HOME");
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_xdg_bin = EnvRestore::capture("XDG_BIN_HOME");
         let fake_home = Path::new("/fake-home-for-build-tool-read-roots-test");
         crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
         crate::process_env::remove_var("XDG_BIN_HOME");
@@ -1198,12 +1222,6 @@ mod tests {
         let roots_relative = build_tool_read_roots(Path::new("/workspace"));
         assert!(!roots_relative.iter().any(|r| r == "relative/bin"));
         assert!(!roots_relative.contains(&local_bin));
-
-        crate::process_env::set_or_remove("HOME", saved_home.as_deref().and_then(|v| v.to_str()));
-        crate::process_env::set_or_remove(
-            "XDG_BIN_HOME",
-            saved_xdg_bin.as_deref().and_then(|v| v.to_str()),
-        );
     }
 
     #[test]
