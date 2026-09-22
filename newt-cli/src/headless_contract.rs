@@ -275,7 +275,7 @@ pub fn calls_after_last_write(events: &[newt_core::ToolEvent]) -> Option<usize> 
 }
 
 /// Most paths `handback` names; the rest are counted by the truncation flag.
-const HANDBACK_MAX_FILES: usize = 200;
+pub(crate) const HANDBACK_MAX_FILES: usize = 200;
 
 /// U7: the harness-written account of how a run ended, on the solve_result line
 /// only (never the contract record). Everything here is the harness's own
@@ -297,12 +297,28 @@ const HANDBACK_MAX_FILES: usize = 200;
 /// invisible; (b) paths git ignores (a stray under `target/`, a written `.env`)
 /// are invisible; (c) a file that was dirty at start and was reverted to clean
 /// is absent from the exit snapshot and so is not reported.
+///
+/// #2537: two more fields answer "was it committed, or just left dirty",
+/// which `files_changed` alone cannot — it is a status DELTA, not a
+/// commit-truth check, so it reads the same whether a change landed as a
+/// commit or is still sitting in the working tree.
+/// - `uncommitted_files`: the workspace's CURRENT staged+unstaged+untracked
+///   paths at hand-back time, bounded the same way as `files_changed`
+///   (`null` and `"unavailable"` off-repo, never a fake `[]`; capped at
+///   `HANDBACK_MAX_FILES` with a truncated flag).
+/// - `commits`: the commit id(s) created on the task branch during this run,
+///   from newt-git's own `status`/`log` (never a shelled-out `git`). Present
+///   only when at least one commit landed — nothing to commit (a clean repo,
+///   or no repo at all) omits the field rather than writing an empty list or
+///   inventing an id.
 #[must_use]
 pub fn handback(
     delta: Option<Vec<String>>,
     events: &[newt_core::ToolEvent],
     end_reason: &str,
     reply_present: bool,
+    uncommitted: Option<Vec<String>>,
+    commits: Option<Vec<String>>,
 ) -> serde_json::Value {
     let (files, source, truncated) = match delta {
         Some(mut files) => {
@@ -312,19 +328,39 @@ pub fn handback(
         }
         None => (serde_json::Value::Null, "unavailable", false),
     };
+    let (uncommitted_files, uncommitted_source, uncommitted_truncated) = match uncommitted {
+        Some(mut files) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            (serde_json::json!(files), "git_status", truncated)
+        }
+        None => (serde_json::Value::Null, "unavailable", false),
+    };
     let last_exec = events
         .iter()
         .rev()
         .find_map(|e| e.execution.as_ref())
         .and_then(|x| serde_json::to_value(x).ok());
-    serde_json::json!({
+    let mut record = serde_json::json!({
         "files_changed": files,
         "files_changed_source": source,
         "files_changed_truncated": truncated,
+        "uncommitted_files": uncommitted_files,
+        "uncommitted_files_source": uncommitted_source,
+        "uncommitted_files_truncated": uncommitted_truncated,
         "last_exec_outcome": last_exec,
         "end_reason": end_reason,
         "model_reply_present": reply_present,
-    })
+    });
+    conditional_stanza(
+        &mut record,
+        "commits",
+        commits.filter(|c| !c.is_empty()).map(|mut c| {
+            c.truncate(HANDBACK_MAX_FILES);
+            serde_json::json!(c)
+        }),
+    );
+    record
 }
 
 /// One JSONL trace line per parse signal (the ADR §5 events
@@ -597,7 +633,7 @@ mod tests {
 
     #[test]
     fn handback_reports_delta_caps_it_and_never_fakes_an_empty_list() {
-        let h = handback(Some(vec!["a.rs".into()]), &[], "None", false);
+        let h = handback(Some(vec!["a.rs".into()]), &[], "None", false, None, None);
         assert_eq!(h["files_changed"], serde_json::json!(["a.rs"]));
         assert_eq!(h["files_changed_source"], "git_status_delta");
         assert_eq!(h["model_reply_present"], false);
@@ -608,24 +644,77 @@ mod tests {
         shell.execution = Some(newt_core::ExecOutcome::TimedOut);
         let later =
             newt_core::ToolEvent::from_call("read_file", &serde_json::json!({}), true, None);
-        let h = handback(None, &[shell, later], "None", true);
+        let h = handback(None, &[shell, later], "None", true, None, None);
         assert_eq!(
             h["last_exec_outcome"], "timed_out",
             "class only, from the last SHELL call"
         );
 
         let many: Vec<String> = (0..201).map(|i| format!("f{i}")).collect();
-        let h = handback(Some(many), &[], "RoundCap", true);
+        let h = handback(Some(many), &[], "RoundCap", true, None, None);
         assert_eq!(h["files_changed"].as_array().unwrap().len(), 200);
         assert_eq!(h["files_changed_truncated"], true);
 
         // No repo: null + "unavailable", never [] (which reads as "nothing changed").
-        let h = handback(None, &[], "None", false);
+        let h = handback(None, &[], "None", false, None, None);
         assert!(h["files_changed"].is_null());
         assert_eq!(h["files_changed_source"], "unavailable");
         // A clean repo IS an empty list, distinguishable from unavailable.
-        let h = handback(Some(vec![]), &[], "None", false);
+        let h = handback(Some(vec![]), &[], "None", false, None, None);
         assert_eq!(h["files_changed"], serde_json::json!([]));
+    }
+
+    /// #2537 item 2: a run that ends with modified-but-uncommitted files must
+    /// NAME them, bounded the same way `files_changed` already is (null +
+    /// "unavailable" off-repo, never a fake empty list; capped at 200 with a
+    /// truncated flag). Red before the field existed: this assertion could
+    /// not even compile against the old 4-arg `handback`.
+    #[test]
+    fn handback_names_uncommitted_files_bounded_like_files_changed() {
+        let h = handback(
+            None,
+            &[],
+            "None",
+            false,
+            Some(vec!["dirty.rs".into()]),
+            None,
+        );
+        assert_eq!(h["uncommitted_files"], serde_json::json!(["dirty.rs"]));
+        assert_eq!(h["uncommitted_files_source"], "git_status");
+        assert_eq!(h["uncommitted_files_truncated"], false);
+
+        // Off-repo: null + "unavailable", never [] read as "nothing dirty".
+        let h = handback(None, &[], "None", false, None, None);
+        assert!(h["uncommitted_files"].is_null());
+        assert_eq!(h["uncommitted_files_source"], "unavailable");
+
+        // A clean repo IS an empty list, distinguishable from unavailable.
+        let h = handback(None, &[], "None", false, Some(vec![]), None);
+        assert_eq!(h["uncommitted_files"], serde_json::json!([]));
+
+        let many: Vec<String> = (0..201).map(|i| format!("d{i}")).collect();
+        let h = handback(None, &[], "None", false, Some(many), None);
+        assert_eq!(h["uncommitted_files"].as_array().unwrap().len(), 200);
+        assert_eq!(h["uncommitted_files_truncated"], true);
+    }
+
+    /// #2537 item 3: when the run committed on the task branch, the hand-back
+    /// carries the commit id(s) it produced, so "the work landed" is
+    /// verifiable. Nothing to commit (repo with no new commits, or no repo at
+    /// all) omits the `commits` field entirely rather than an empty list or a
+    /// lie.
+    #[test]
+    fn handback_carries_commit_ids_or_omits_the_field() {
+        let h = handback(None, &[], "None", false, None, Some(vec!["abc123".into()]));
+        assert_eq!(h["commits"], serde_json::json!(["abc123"]));
+
+        // Nothing committed: field is ABSENT, not an empty array.
+        let h = handback(None, &[], "None", false, None, Some(vec![]));
+        assert!(h.get("commits").is_none());
+
+        // No repo at all: also absent.
+        let h = handback(None, &[], "None", false, None, None);
+        assert!(h.get("commits").is_none());
     }
     use newt_core::{BehaviorSignal, ToolCallDialect};
 
