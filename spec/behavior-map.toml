@@ -1350,7 +1350,7 @@ path = "newt-tui/src/cockpit/presenter.rs"
 symbol = "escape_during_turn"
 
 [BHV-ROUTE-001]
-description = "A routed run_command(\"git …\") call never drops an operand: the router routes ONLY the exact shapes it can honor faithfully (bare status/log/diff, log limit, diff staged) and gates everything else to exec instead of silently answering a different question with ok:true."
+description = "A routed run_command(\"git …\") call never drops an operand: the router routes ONLY the exact shapes it can honor faithfully (bare status/log/diff, log limit, diff staged) and gates everything else to exec instead of silently answering a different question with ok:true. An unroutable shape is refused naming the supported ops."
 [BHV-ROUTE-001.status]
 lean = "none"
 rust = "tested"

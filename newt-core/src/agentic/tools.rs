@@ -3157,8 +3157,14 @@ async fn execute_authorized_tool(
                 // reader of the transcript (or the model) can otherwise not
                 // tell the tool ran a translated op instead of the literal
                 // shell command it typed.
+                //
+                // The note is APPENDED, never prepended.
+                // `tool_result_ok` classifies by PREFIX (`error:`, `capability
+                // denied:`, …) — prepending the note would shift an errored
+                // dispatch's `error:` prefix off the front of the string and
+                // make an errored routed call read as ok:true.
                 if let Some(original) = &routed_git_command {
-                    out = format!("[routed: `{original}` → git {op} {args}]\n{out}");
+                    out = format!("{out}\n[routed: `{original}` → git {op} {args}]");
                 }
                 // #1056: a LOCAL git WRITE denied by the projected authority is
                 // NOT a dead end (the trap that stranded the model between the git
