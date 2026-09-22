@@ -631,6 +631,23 @@ fn record_turn_disposition(
     }
 }
 
+/// Decide whether an operator line that starts with `/` should be routed to
+/// a pending clarification batch instead of the slash registry (#2515).
+///
+/// The batch's own text advertises `/discuss <what's on your mind>` as its
+/// escape hatch, and the parser (`newt_core::agentic::discussion_request`,
+/// checked inside `resolve_with_operator_answer`) already understands it —
+/// including bare `/discuss` with no trailing text. The bug was that the
+/// chat loop sent every `/`-prefixed line to the slash registry BEFORE that
+/// parser ever saw it, so `discuss` (unregistered there) read as an unknown
+/// command. Only `/discuss` (and its `/chat` alias) diverts, and only while a
+/// batch is pending: every other `/word` — `/help`, `/new`, `/exit` — keeps
+/// going to the registry even with a batch pending, matching what the batch
+/// text promises.
+fn line_answers_pending_clarification(task: &str, has_pending: bool) -> bool {
+    has_pending && newt_core::agentic::discussion_request(task).is_some()
+}
+
 /// Comprehend an accepted prompt. A direct answer to a pending clarification
 /// is resolved against that manifest, not reclassified in isolation.
 ///
@@ -693,6 +710,77 @@ fn comprehend_accepted_prompt(
     apply_operating_mode_to_intake(mode, &mut intake);
     (intake, mode)
 }
+
+/// What a clarification-reply classifier read a non-explicit reply as
+/// selecting — offered, never applied. See [`classify_clarification_reply`].
+struct ClassifiedProposal {
+    /// Displayed ordinal (1-based), matching what the batch showed.
+    ordinal: usize,
+    summary: String,
+}
+
+/// Ask a bounded, tool-less side call to read a clarification reply that
+/// carried no explicit ordinal against the pending batch, and return what it
+/// proposed, if anything (#2517, "confirm-then-lock").
+///
+/// This only classifies. Committing the proposal onto the intake is
+/// [`newt_core::agentic::PromptIntake::propose_answer`]'s job, and LOCKING it
+/// is the operator's, via their own next explicit confirmation inside
+/// [`newt_core::agentic::PromptIntake::resolve_with_operator_answer`] — never
+/// this call's output directly. A malformed, empty, or failed response is
+/// "no proposal": fail-closed, the same posture every other classifier in
+/// this harness takes (see the `#1749` adjudicator above this call site).
+///
+/// `call` is injected so this is unit-testable without a live backend;
+/// production passes the same adjudicator side-call `/discuss` uses.
+fn classify_clarification_reply(
+    intake: &newt_core::agentic::PromptIntake,
+    reply: &str,
+    call: impl FnOnce(String) -> anyhow::Result<String>,
+) -> Option<ClassifiedProposal> {
+    let batch = intake.clarification_batch();
+    let prompt = format!(
+        "The operator was asked to lock one of these pending decisions by \
+         replying with an explicit ordinal (e.g. `1: ...`). Their reply did \
+         not include one. Decide, ONLY if unambiguous, which single pending \
+         item they most likely meant — do not guess if it could be more than \
+         one, and do not use any tools.\n\n\
+         Pending batch:\n{batch}\n\n\
+         Operator's reply: {reply}\n\n\
+         Respond with EXACTLY two lines and nothing else:\n\
+         PROPOSAL: <ordinal number, or `none` if it is not clearly one item>\n\
+         SUMMARY: <a short restatement of that item, or leave blank if none>"
+    );
+    let response = call(prompt).ok()?;
+    let mut ordinal = None;
+    let mut summary = String::new();
+    for line in response.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("PROPOSAL:")
+            .or_else(|| line.strip_prefix("proposal:"))
+        {
+            let rest = rest.trim();
+            if !rest.eq_ignore_ascii_case("none") {
+                ordinal = rest.parse::<usize>().ok();
+            }
+        } else if let Some(rest) = line
+            .strip_prefix("SUMMARY:")
+            .or_else(|| line.strip_prefix("summary:"))
+        {
+            summary = rest.trim().to_string();
+        }
+    }
+    let ordinal = ordinal?;
+    if summary.is_empty() {
+        summary = format!("option {ordinal}");
+    }
+    Some(ClassifiedProposal { ordinal, summary })
+}
+
+#[cfg(test)]
+#[path = "chat_tests/clarification_classifier.rs"]
+mod clarification_classifier_tests;
 
 /// Rebuild an outstanding clarification from its durable operator-receipt
 /// lineage. A prompt that reached model work cannot be pending: `Ask` exits
@@ -1994,6 +2082,28 @@ fn session_body(
             print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
         }
         permission_state.ocap_policy = policy;
+        // #2524 item 1: fold the just-verified approve-store entries into the
+        // recalled durable grants so a signed `[[fs]]`/`[[exec]]`/`[[net]]`
+        // grant reaches `recalled_caveats` (and hence `startup_caveats` below,
+        // which a spawned MCP child inherits) — not just the prompt-time
+        // pre-answer `evaluate_request` already gave it. `load_store` already
+        // dropped any unsigned/bad-signature entry loudly above, so this can
+        // never fold in anything unverified.
+        let folded = permission_state.fold_ocap_approvals();
+        if folded > 0 {
+            if let Some(path) = permission_log_path.as_deref() {
+                if let Err(e) = newt_core::permission_journal::append_record(
+                    path,
+                    ocap_store_folded_record(&active_conversation_id, folded),
+                ) {
+                    print_newt(
+                        &format!("warning: permission log write failed: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+        }
     }
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
@@ -3297,7 +3407,10 @@ fn session_body(
                     println!();
                     continue;
                 }
-                if model_input_origin.is_operator() && task.starts_with('/') {
+                if model_input_origin.is_operator()
+                    && task.starts_with('/')
+                    && !line_answers_pending_clarification(&task, pending_clarification.is_some())
+                {
                     // Per-command help, intercepted before ANY command runs so
                     // every command answers `--help`/`-h`/`help` (and `/help
                     // <cmd>`) uniformly — even the ones handled inline below.
@@ -7304,6 +7417,112 @@ fn session_body(
                             println!();
                             continue;
                         };
+                        // #2517: the `/discuss` escape hatch. The operator
+                        // wants to talk the batch through, not answer it — run
+                        // one bounded, tool-less side call and show the reply,
+                        // then re-queue the SAME batch unchanged. Nothing here
+                        // locks, rejects, or loses the pending decisions; only
+                        // `/new` does that, and this is deliberately gentler.
+                        if let Some(discuss_text) = prompt_intake.take_pending_discussion() {
+                            let batch = prompt_intake.clarification_batch();
+                            let side_call = build_adjudicator(
+                                &cfg,
+                                &inf_url,
+                                &inf_model,
+                                inf_kind,
+                                &inf_key,
+                                Some(mem_budget),
+                                color,
+                            );
+                            let discuss_prompt = format!(
+                                "The operator is deciding how to answer a pending \
+                                 clarification batch and asked to talk it through before \
+                                 committing to an answer. Help them think it out loud in a \
+                                 short reply. Do not choose an answer on their behalf, do not \
+                                 use any tools, and remind them to reply with `N: value` once \
+                                 they are ready.\n\n\
+                                 Pending batch:\n{batch}\n\n\
+                                 Operator's message: {}",
+                                if discuss_text.is_empty() {
+                                    "(no specific question — please re-explain the batch)"
+                                } else {
+                                    discuss_text.as_str()
+                                }
+                            );
+                            match tokio::task::block_in_place(|| {
+                                rt.block_on(side_call(discuss_prompt))
+                            }) {
+                                Ok((reply, _usage)) => {
+                                    print_newt(&reply, color, verbose);
+                                    println!();
+                                }
+                                Err(e) => {
+                                    print_newt(
+                                        &format!("warning: discussion side call failed: {e}"),
+                                        color,
+                                        verbose,
+                                    );
+                                    println!();
+                                }
+                            }
+                            pending_clarification = Some(PendingClarification {
+                                parent: Box::new(parent),
+                                intake: prompt_intake,
+                            });
+                            print_newt(&batch, color, verbose);
+                            println!();
+                            continue;
+                        }
+                        // #2517 "confirm-then-lock": the reply carried no
+                        // explicit ordinal and read as neither a question nor
+                        // a discussion request — the two shapes a classifier
+                        // can actually help with (`Incomplete`/`OutOfRange`
+                        // already named an explicit ordinal, so the operator
+                        // stated something concrete; a guess would second-
+                        // guess it instead of helping). One bounded, tool-
+                        // less side call OFFERS a reading; nothing locks
+                        // here — `PromptIntake::resolve_with_operator_answer`
+                        // only locks a proposal on the operator's own next
+                        // explicit confirmation, never on this call's output
+                        // directly. This is the same fail-closed shape as the
+                        // adjudicator above: the model proposes, the harness
+                        // (via the operator) is the only thing that commits.
+                        let classifiable_rejection = matches!(
+                            prompt_intake.last_rejection(),
+                            Some(
+                                newt_core::agentic::ClarificationRejection::NoOrdinals
+                                    | newt_core::agentic::ClarificationRejection::ReadsAsQuestion
+                            )
+                        );
+                        if adjudication_enabled && classifiable_rejection {
+                            if let Some(proposal) =
+                                classify_clarification_reply(&prompt_intake, &task, |prompt| {
+                                    let side_call = build_adjudicator(
+                                        &cfg,
+                                        &inf_url,
+                                        &inf_model,
+                                        inf_kind,
+                                        &inf_key,
+                                        Some(mem_budget),
+                                        color,
+                                    );
+                                    tokio::task::block_in_place(|| rt.block_on(side_call(prompt)))
+                                        .map(|(text, _usage)| text)
+                                })
+                            {
+                                prompt_intake = prompt_intake
+                                    .propose_answer(proposal.ordinal, proposal.summary);
+                                if let Some(notice) = prompt_intake.proposed_answer_notice() {
+                                    pending_clarification = Some(PendingClarification {
+                                        parent: Box::new(parent),
+                                        intake: prompt_intake,
+                                    });
+                                    print_newt(&notice, color, verbose);
+                                    println!();
+                                    continue;
+                                }
+                            }
+                        }
                         let clarification = prompt_intake.clarification_batch();
                         // #1689 item 1: when a reply was REFUSED, say why
                         // before repeating the batch. The gate never calls the
@@ -7313,7 +7532,7 @@ fn session_body(
                         // also names `/new` as the way out, because the usual
                         // reason a reply keeps failing is that the operator
                         // disagrees that a decision was needed at all.
-                        let rejection = prompt_intake.last_rejection().map(|r| r.explain());
+                        let rejection = prompt_intake.last_rejection_explanation();
                         pending_clarification = Some(PendingClarification {
                             parent: Box::new(parent),
                             intake: prompt_intake,
@@ -7325,6 +7544,17 @@ fn session_body(
                         print_newt(&clarification, color, verbose);
                         println!();
                         continue;
+                    }
+
+                    // Addendum item 6: the one moment that changes state —
+                    // an answer locking a pending decision — printed nothing.
+                    // Every refusal explains itself; the lock should too, so
+                    // the operator can catch a wrong lock before the model
+                    // spends a round on it.
+                    if let Some(pending) = pending_clarification.as_ref() {
+                        for line in prompt_intake.newly_locked_lines(&pending.intake) {
+                            print_newt(&line, color, verbose);
+                        }
                     }
 
                     // The successor receipt and its resolved manifest are now

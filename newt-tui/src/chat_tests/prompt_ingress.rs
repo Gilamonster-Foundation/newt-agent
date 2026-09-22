@@ -604,3 +604,58 @@ fn durable_pending_clarification_rehydrates_its_lineage_after_resume() {
         "a fully explicit answer must clear the recovered pending state"
     );
 }
+
+/// #2515: `/discuss` (the clarification batch's own advertised escape
+/// hatch) must reach the pending clarification, not the slash registry —
+/// and only while something is actually pending. This is the input-routing
+/// decision that was wrong before the fix: it lived as an inline
+/// `task.starts_with('/')` check with no way to exercise it without driving
+/// the whole REPL loop.
+#[test]
+fn discuss_routes_to_pending_clarification_only_when_something_is_pending() {
+    assert!(line_answers_pending_clarification(
+        "/discuss why does this need a decision at all?",
+        true
+    ));
+    assert!(!line_answers_pending_clarification(
+        "/discuss why does this need a decision at all?",
+        false
+    ));
+}
+
+/// The `/chat` alias behaves identically to `/discuss`.
+#[test]
+fn chat_alias_routes_to_pending_clarification() {
+    assert!(line_answers_pending_clarification("/chat go on", true));
+    assert!(!line_answers_pending_clarification("/chat go on", false));
+}
+
+/// A bare `/discuss` (no trailing text) still counts — the operator may just
+/// want the batch re-explained.
+#[test]
+fn bare_discuss_routes_to_pending_clarification() {
+    assert!(line_answers_pending_clarification("/discuss", true));
+}
+
+/// Every other `/word` keeps going to the slash registry even with a batch
+/// pending — the batch text promises `/new` keeps working, and nothing here
+/// should quietly swallow `/help` or `/exit` too.
+#[test]
+fn other_slash_commands_never_divert_to_pending_clarification() {
+    for line in ["/help", "/new", "/exit"] {
+        assert!(
+            !line_answers_pending_clarification(line, true),
+            "{line} must still reach the slash registry with a batch pending"
+        );
+    }
+}
+
+/// `/discussion-of-x` is not the command — the prefix must be followed by
+/// whitespace or end of input, matching `discussion_request`'s own rule.
+#[test]
+fn discuss_prefix_must_not_be_glued_to_more_text() {
+    assert!(!line_answers_pending_clarification(
+        "/discussion-of-x",
+        true
+    ));
+}

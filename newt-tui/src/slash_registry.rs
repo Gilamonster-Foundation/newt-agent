@@ -716,6 +716,18 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2515: the clarification gate's own escape hatch. Reaches
+        // `dispatch_slash_with_ask` only when NOTHING is pending — the chat
+        // loop intercepts it earlier and routes it to the pending batch
+        // instead (`chat.rs`, the `discussion_request` check ahead of the
+        // slash-registry branch).
+        "discuss",
+        &["chat"],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::None_,
+    ),
+    cmd(
         // The one that is obviously distinct: `/start` SWITCHES without
         // finalizing — it skips close-time note extraction, leaves the
         // outgoing conversation OPEN and resumable, and takes a title.

@@ -786,6 +786,29 @@ impl PermissionPromptState {
             })
     }
 
+    /// Fold this session's VERIFIED OCAP approve-store entries (#2524 item 1:
+    /// `~/.newt/ocap/approve.toml`, signed by the operator's root key) into
+    /// the recalled durable grants — the same `durable_grants` set the v1
+    /// `/permissions` promotion writes, so a signed store entry reaches
+    /// [`Self::recalled_caveats`] (and hence a spawned MCP child's caveats,
+    /// `chat.rs`'s `startup_caveats`) exactly like a promoted durable grant.
+    ///
+    /// `self.ocap_policy` must already be the output of
+    /// [`newt_core::ocap_store::load_store`], which drops any unsigned or
+    /// bad-signature `approve.toml` entry loudly at load (fail-closed); this
+    /// only re-shapes whatever survived that check
+    /// ([`newt_core::ocap_store::approved_grants`] is a pure re-listing), so
+    /// it can never itself widen past what the signature covers. Call once,
+    /// at session start, after `ocap_policy` is set.
+    /// Returns the number of grants folded in, for the session-start
+    /// permission-log line (#2532 review, item 3).
+    pub(crate) fn fold_ocap_approvals(&mut self) -> usize {
+        let grants = newt_core::ocap_store::approved_grants(&self.ocap_policy);
+        let count = grants.len();
+        self.durable_grants.extend(grants);
+        count
+    }
+
     pub(crate) fn recalled_caveats(
         &self,
         base: &newt_core::Caveats,
@@ -1934,6 +1957,10 @@ mod permission_prompt_tests;
 #[cfg(test)]
 #[path = "permissions_tests/session_promotion.rs"]
 mod session_promotion;
+
+#[cfg(test)]
+#[path = "permissions_tests/ocap_grant_fold.rs"]
+mod ocap_grant_fold;
 
 /// **A0 byte goldens (#1823, epic #1803): the plain permission-prompt
 /// rendering, frozen verbatim.** These strings ARE the current contract —
