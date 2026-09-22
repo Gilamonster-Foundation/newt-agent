@@ -996,11 +996,18 @@ mod tests {
         let lock_path = dir.path().join("config.toml.lock");
         let stale = dir.path().join("config.toml.lock.stale-orphan.tmp");
         std::fs::write(&stale, b"orphan").unwrap();
-        std::thread::sleep(Duration::from_millis(30));
+        // Aged explicitly, not by sleeping, so scheduler latency and mtime
+        // granularity cannot decide the outcome.
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
         let fresh = dir.path().join("config.toml.lock.fresh-orphan.tmp");
         std::fs::write(&fresh, b"orphan").unwrap();
 
-        sweep_lock_tmp_orphans_older_than(&lock_path, Duration::from_millis(20));
+        sweep_lock_tmp_orphans_older_than(&lock_path, Duration::from_secs(30));
 
         assert!(
             !stale.exists(),
