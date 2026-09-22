@@ -24,7 +24,7 @@ fn add_then_commit_advances_history() {
     assert_eq!(c.summary, "add new file");
     assert_eq!(c.author_name, "Bot");
 
-    let log = eng.log(&caps, 10).unwrap();
+    let log = eng.log(&caps, 10, None, &[]).unwrap();
     assert_eq!(log.len(), 2);
     assert_eq!(log[0].summary, "add new file");
     assert!(eng.status(&caps).unwrap().clean, "clean after commit");

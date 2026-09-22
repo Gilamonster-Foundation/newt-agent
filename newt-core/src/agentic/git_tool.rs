@@ -164,7 +164,23 @@ pub fn git_tool_definition() -> serde_json::Value {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "For op=add: the paths to stage."
+                        "description": "For op=add: the paths to stage. For op=log/diff: an optional pathspec filter."
+                    },
+                    "revision": {
+                        "type": "string",
+                        "description": "For op=log: a single rev to start from instead of HEAD, or an A..B range (first-parent walk from B, stopping before A)."
+                    },
+                    "rev": {
+                        "type": "string",
+                        "description": "For op=diff: a revision to diff against the worktree, or an A..B range (equivalent to rev=A, rev2=B)."
+                    },
+                    "rev2": {
+                        "type": "string",
+                        "description": "For op=diff: paired with rev for a rev-vs-rev diff (git diff rev rev2)."
+                    },
+                    "stat": {
+                        "type": "boolean",
+                        "description": "For op=diff: include per-file insertion/deletion counts (default false)."
                     },
                     "message": {
                         "type": "string",

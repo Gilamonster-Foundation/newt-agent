@@ -72,6 +72,43 @@ fn repo_with_commit() -> tempfile::TempDir {
     dir
 }
 
+/// A temp repo with three commits: `c1` adds `a.txt`, `c2` adds `b.txt`, `c3`
+/// modifies `a.txt`. Returns the dir plus each commit's real `git rev-parse`
+/// oid, oldest first, so revision/range/pathspec tests can assert against
+/// real git's own idea of the history shape.
+fn rev_parse(dir: &Path, rev: &str) -> String {
+    String::from_utf8(
+        git_cmd(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+fn repo_with_history() -> (tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut ids = Vec::new();
+    git(p, &["init", "-q", "-b", "main"]);
+    std::fs::write(p.join("a.txt"), "hello\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c1: add a.txt"]);
+    ids.push(rev_parse(p, "HEAD"));
+    std::fs::write(p.join("b.txt"), "world\n").unwrap();
+    git(p, &["add", "b.txt"]);
+    git(p, &["commit", "-q", "-m", "c2: add b.txt"]);
+    ids.push(rev_parse(p, "HEAD"));
+    std::fs::write(p.join("a.txt"), "hello again\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c3: modify a.txt"]);
+    ids.push(rev_parse(p, "HEAD"));
+    (dir, ids)
+}
+
 use newt_core::agentic::GitTool as _;
 
 fn tool(dir: &Path) -> LocalGitTool {
@@ -245,6 +282,9 @@ mod engine_write;
 #[cfg(test)]
 #[path = "git_scope.rs"]
 mod git_scope;
+#[cfg(test)]
+#[path = "log_diff_operands.rs"]
+mod log_diff_operands;
 #[cfg(test)]
 #[path = "rebase.rs"]
 mod rebase;

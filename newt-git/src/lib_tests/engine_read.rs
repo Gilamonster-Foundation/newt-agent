@@ -32,7 +32,10 @@ fn head_snapshot_is_full_oid_cheap_identity_and_read_gated() {
     let dir = repo_with_commit();
     let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let snapshot = eng.head_snapshot(&GitCaveats::read_only()).unwrap();
-    let commit = eng.log(&GitCaveats::read_only(), 1).unwrap().remove(0);
+    let commit = eng
+        .log(&GitCaveats::read_only(), 1, None, &[])
+        .unwrap()
+        .remove(0);
 
     assert_eq!(snapshot.branch.as_deref(), Some("main"));
     assert_eq!(snapshot.head.as_deref(), Some(commit.id.as_str()));
@@ -46,7 +49,7 @@ fn head_snapshot_is_full_oid_cheap_identity_and_read_gated() {
 fn log_returns_the_commit() {
     let dir = repo_with_commit();
     let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
-    let log = eng.log(&GitCaveats::top(), 10).unwrap();
+    let log = eng.log(&GitCaveats::top(), 10, None, &[]).unwrap();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].summary, "first commit");
     assert_eq!(log[0].author_name, "Tester");
@@ -75,6 +78,8 @@ fn diff_worktree_lists_the_change() {
     let dir = repo_with_commit();
     std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
     let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
-    let d = eng.diff(&GitCaveats::top(), DiffSpec::Worktree).unwrap();
+    let d = eng
+        .diff(&GitCaveats::top(), DiffSpec::Worktree, &[], false)
+        .unwrap();
     assert!(d.files.iter().any(|f| f.path == "a.txt"));
 }
