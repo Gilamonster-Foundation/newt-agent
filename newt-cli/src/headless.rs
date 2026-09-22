@@ -677,6 +677,17 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // U7: the workspace's changed-path set at run start, diffed against the same
     // probe at exit so the hand-back names what THIS run changed, not prior dirt.
     let status_before = newt_core::agentic::snapshot_workspace(&workspace, &read_scope);
+    // #2537: HEAD before the run, via newt-git's OWN embedded engine (never a
+    // shelled-out `git`) — the baseline the hand-back diffs against to name
+    // commit(s) this run actually produced. `None` off-repo or when the read
+    // scope can't open the legacy engine (bounded fs_read); the hand-back
+    // then reports "unavailable"/omits `commits`, never a guess.
+    let head_before = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope)
+        .ok()
+        .and_then(|e| {
+            e.head_snapshot(&newt_core::git_caveats::GitCaveats::read_only())
+                .ok()
+        });
     let started = Instant::now();
     driver
         .submit(instruction.trim())
@@ -782,6 +793,25 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         }
         None => (0, 0, None, "None".to_string(), serde_json::Value::Null),
     };
+    // #2537: hand-back commit truth. Re-open the embedded engine at exit
+    // (the working tree may have changed under an already-open handle) and
+    // ask its OWN `status`/`log` — never a shelled-out `git` — for what this
+    // run left dirty and what it committed. `None` for both when the
+    // workspace is not a repo (or the engine can't be opened under this
+    // run's fs_read scope); a repo with nothing dirty reports `Some(vec![])`
+    // for `uncommitted_at_exit`, distinguishable from "unavailable".
+    let git_caveats = newt_core::git_caveats::GitCaveats::read_only();
+    let git_engine = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok();
+    let uncommitted_at_exit = git_engine
+        .as_ref()
+        .and_then(|e| uncommitted_paths(e, &git_caveats));
+    let commits_this_run = git_engine.as_ref().and_then(|engine| {
+        commits_since(
+            engine,
+            &git_caveats,
+            head_before.as_ref().and_then(|h| h.head.as_deref()),
+        )
+    });
     let mut record = serde_json::json!({
         "kind": "solve_result",
         "task_file": instruction_file.to_string_lossy(),
@@ -838,6 +868,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             o_opt.map_or(&[][..], |o| &o.tool_events[..]),
             &end_reason,
             reply_chars > 0,
+            uncommitted_at_exit.clone(),
+            commits_this_run.clone(),
         ),
     });
     headless_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
@@ -1249,6 +1281,54 @@ fn confined_bench_caveats_with_grants(
         max_calls: CountBound::Unlimited,
         valid_for_generation: Scope::All,
     }
+}
+
+/// #2537: the workspace's CURRENT staged+unstaged+untracked paths, sorted
+/// and deduplicated — the hand-back's "uncommitted at exit" list. `None`
+/// only when `engine.status` itself fails (the caller already turns "no
+/// repo at all" into `None` by `GitEngine::open` failing first).
+fn uncommitted_paths(
+    engine: &newt_git::GitEngine,
+    caveats: &newt_core::git_caveats::GitCaveats,
+) -> Option<Vec<String>> {
+    let s = engine.status(caveats).ok()?;
+    let mut paths: Vec<String> = s
+        .staged
+        .iter()
+        .chain(s.unstaged.iter())
+        .map(|f| f.path.clone())
+        .chain(s.untracked)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+/// #2537: commit id(s) created since `before_oid`, on whatever ref is
+/// currently checked out — works the same under a detached HEAD, since
+/// [`newt_git::GitEngine::head_snapshot`] reads it either way. `Some(vec![])`
+/// when HEAD did not move (nothing to commit); `None` when either endpoint
+/// could not be resolved (no prior HEAD to diff from — an unborn repo, or
+/// the engine could not be opened at all).
+fn commits_since(
+    engine: &newt_git::GitEngine,
+    caveats: &newt_core::git_caveats::GitCaveats,
+    before_oid: Option<&str>,
+) -> Option<Vec<String>> {
+    let before_oid = before_oid?;
+    let after_oid = engine.head_snapshot(caveats).ok()?.head?;
+    if after_oid == before_oid {
+        return Some(Vec::new());
+    }
+    engine
+        .log(
+            caveats,
+            headless_contract::HANDBACK_MAX_FILES,
+            Some(&format!("{before_oid}..{after_oid}")),
+            &[],
+        )
+        .ok()
+        .map(|commits| commits.into_iter().map(|c| c.id).collect())
 }
 
 #[cfg(test)]

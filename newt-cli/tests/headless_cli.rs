@@ -2101,6 +2101,153 @@ async fn a_run_that_fails_after_a_write_hands_back_what_it_changed() {
     assert_eq!(handback["files_changed_truncated"], false);
     assert_eq!(handback["model_reply_present"], false);
     assert!(handback["end_reason"].is_string(), "{handback}");
+    // #2537: `uncommitted_files` is the CURRENT dirty set at exit, unlike
+    // `files_changed` (a delta from run start) — so it also names the dirt
+    // that existed before the run started, since none of it was committed.
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["dirty-before.txt", "out.txt"]),
+        "{result}"
+    );
+    assert_eq!(handback["uncommitted_files_source"], "git_status");
+    // No commit ever landed (repo has no HEAD at all) — the field is absent.
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// A `solve_result.handback` line for a no-tool-call reply against `workspace`
+/// (fixture must contain the config+instruction the caller already wrote).
+async fn handback_from_a_no_op_run(
+    server: &MockServer,
+    workspace: &std::path::Path,
+    control: &std::path::Path,
+) -> serde_json::Value {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "done, nothing to change"}, "finish_reason": "stop"}]
+        })))
+        .mount(server)
+        .await;
+    let config_path = control.join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = control.join("task.md");
+    std::fs::write(&instruction, "Just answer, don't touch anything.\n")
+        .expect("write instruction");
+    let events_path = control.join("events.jsonl");
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+    std::fs::read_to_string(&events_path)
+        .expect("read headless events")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("event line is JSON"))
+        .find(|r| r["kind"] == "solve_result")
+        .expect("a solve_result line")["handback"]
+        .clone()
+}
+
+/// #2537 item 4, edge case 1: a workspace that is not a git repository at all
+/// must hand back a sensible "unavailable" — never an error, and never a
+/// fabricated empty list that would read as "nothing changed".
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_unavailable_off_a_non_git_workspace() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("non-git workspace");
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert!(handback["uncommitted_files"].is_null(), "{handback}");
+    assert_eq!(handback["uncommitted_files_source"], "unavailable");
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// #2537 item 4, edge case 2: a run that touches nothing in a clean repo
+/// reports an empty uncommitted list (distinguishable from "unavailable")
+/// and no `commits` field, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_a_clean_repo_when_the_run_touched_nothing() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!([]),
+        "{handback}"
+    );
+    assert_eq!(handback["uncommitted_files_source"], "git_status");
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// #2537 item 4, edge case 3: a detached HEAD must not crash or misreport —
+/// the same clean/no-commits result as a normal branch checkout.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_stays_sane_under_a_detached_head() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("rev-parse");
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    git(&["checkout", "-q", "--detach", &head]);
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!([]),
+        "{handback}"
+    );
+    assert_eq!(handback["uncommitted_files_source"], "git_status");
+    assert!(handback.get("commits").is_none(), "{handback}");
 }
 
 /// One `write_file`, then `list_dir` forever: after a real write every further
