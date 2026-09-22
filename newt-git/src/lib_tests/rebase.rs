@@ -251,7 +251,11 @@ fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
     git(p, &["add", ".gitignore", "a.txt"]);
     git(p, &["commit", "-q", "-m", "c1"]);
     let onto = String::from_utf8_lossy(
-        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        &git_cmd(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
     )
     .trim()
     .to_string();
@@ -259,7 +263,11 @@ fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
     git(p, &["add", "-f", "x.env"]);
     git(p, &["commit", "-q", "-m", "c2 adds x.env"]);
     let c2 = String::from_utf8_lossy(
-        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        &git_cmd(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
     )
     .trim()
     .to_string();
@@ -269,7 +277,11 @@ fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
     // invisible to `status` and NOT what c2 tracked.
     std::fs::write(p.join("x.env"), "LOCAL\n").unwrap();
     let head_before = String::from_utf8_lossy(
-        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        &git_cmd(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
     )
     .trim()
     .to_string();
@@ -294,7 +306,11 @@ fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
     );
     // No side effects: ref unmoved, local file untouched.
     let head_after = String::from_utf8_lossy(
-        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        &git_cmd(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
     )
     .trim()
     .to_string();
