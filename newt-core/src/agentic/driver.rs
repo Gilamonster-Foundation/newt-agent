@@ -1947,6 +1947,9 @@ mod tests {
 
             let mut config = cfg(&server.uri());
             config.kind = BackendKind::Openai;
+            // Pin the wire: the constructor default reads `NEWT_OPENAI_API`,
+            // which a concurrent test may hold at `responses` (a 404 here).
+            config.openai_api = crate::OpenAiApi::ChatCompletions;
             let mut driver = TurnDriver::new(config);
             driver.submit("do a thing").expect("submit");
             let status = pump_to_done(&mut driver).await;
