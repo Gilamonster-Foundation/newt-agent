@@ -1212,6 +1212,83 @@ fn routing_disabled_requires_exactly_1_and_is_independent_of_ocap() {
     );
 }
 
+/// F11 (verify-routing-f11b): the fix for the model that never calls
+/// `lifecycle` and instead runs `run_command "cargo test …"`, which times
+/// out under the 60s exec wall (2485-r5/r6 measured 6 headless replays never
+/// reaching `lifecycle`, even after the fix landed). A recognised build
+/// invocation now routes to the confined build lane's own
+/// gate/`leq`-authority path — proven here by a gate that DENIES and records
+/// the request, so the test stays in the fully-mocked unit tier (no real
+/// `cargo` subprocess): the denial message alone proves the call reached the
+/// build lane (not the 60s `run_command` exec path) and that it carries the
+/// model's LITERAL argv, never a resolved phase command.
+#[tokio::test]
+async fn routed_cargo_test_reaches_the_confined_build_lane() {
+    struct RecordingDenyGate {
+        seen: Option<super::PermissionRequest>,
+    }
+    impl super::PermissionGate for RecordingDenyGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.seen = requests.first().cloned();
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Cancelled
+        }
+    }
+
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = caveats_no_exec(ws.path());
+    let mut gate = RecordingDenyGate { seen: None };
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo test -p newt-core" }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        Some(&mut gate),
+        None,
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo test -p newt-core` to the confined build lane")
+            && out.contains("30 min limit")
+            && out.contains("network denied"),
+        "rendered result must say it ran in the build lane with its limit; got: {out}"
+    );
+    assert!(
+        out.contains("capability denied") && out.contains("build authority"),
+        "denied gate must refuse via the same build-authority path lifecycle action=build \
+         uses, not silently run; got: {out}"
+    );
+    let reason = gate
+        .seen
+        .expect("the build-lane gate/leq path must be consulted")
+        .reason;
+    assert!(
+        reason.contains("cargo test -p newt-core"),
+        "the permission reason must show the model's LITERAL argv, not a resolved \
+         phase command; got: {reason}"
+    );
+}
+
 /// TDD: a routed read goes through the SAME fs floor — routing is NOT a
 /// bypass. An out-of-scope `cat /etc/shadow` routes to `read_file` and is
 /// denied by `fs_read` exactly as a direct `read_file` would be (the denial
