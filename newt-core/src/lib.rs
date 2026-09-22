@@ -44,6 +44,7 @@ pub mod owned_hosts;
 pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
+pub mod grant_tree;
 pub mod grounding;
 /// The initiative dial: how much the agent looks before acting (split from
 /// [`tenacity`]), with the per-model-family defaults.
