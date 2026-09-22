@@ -194,3 +194,29 @@ fn status_report_serde_roundtrip() {
     let back: StatusReport = serde_json::from_str(&json).unwrap();
     assert_eq!(s, back);
 }
+/// An unborn HEAD (an orphan branch with nothing committed yet) has no old
+/// tree. The switch must still populate the worktree from the target branch:
+/// before the fix the tail skipped the reset when `old_tree` was `None`, so
+/// HEAD moved while the worktree stayed empty (tree != HEAD).
+#[test]
+fn checkout_from_an_unborn_head_populates_the_tree() {
+    let dir = repo_with_commit();
+    let p = dir.path();
+    git(p, &["branch", "-q", "other"]);
+    git(p, &["checkout", "-q", "--orphan", "fresh"]);
+    git(p, &["rm", "-rfq", "."]);
+    assert!(!p.join("a.txt").exists(), "precondition: empty worktree");
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let msg = eng.checkout(&GitCaveats::top(), "other", false).unwrap();
+    assert_eq!(msg, "switched to branch 'other'");
+    assert!(
+        p.join("a.txt").exists(),
+        "the target tree must be checked out"
+    );
+    let status = git_cmd(p).args(["status", "--porcelain"]).output().unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "tree must equal HEAD after the switch: {:?}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
