@@ -1057,3 +1057,210 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     .collect::<Vec<_>>();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+// ---- U4b: the no-progress brake (state machine; the loop wiring is covered by
+// the headless_cli end-to-end tests). Pure: no filesystem, no clock.
+//
+// The gate runs at the START of every round after the first and counts the
+// round that just completed unless it made progress, so a round that `continue`s
+// (narration nudge, id-less re-ask) is counted too. `record_round_outcome` only
+// reports progress (a write, or a passing lifecycle test/check).
+
+fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeState {
+    WorkflowRuntimeState {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after,
+            stop_after,
+        },
+        ..Default::default()
+    }
+}
+
+/// The verdict at one round start, as a word.
+fn gate(state: &mut WorkflowRuntimeState, steer_allowed: bool) -> &'static str {
+    match state.no_progress_verdict(steer_allowed) {
+        NoProgress::Continue => "continue",
+        NoProgress::Steer(_) => "steer",
+        NoProgress::Stop => "stop",
+    }
+}
+
+#[test]
+fn a_write_then_idle_rounds_are_steered_once_then_stopped() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true); // the successful write arms the brake
+    assert_eq!(gate(&mut state, true), "continue"); // counts the write round: progress
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue"); // 1 idle round
+    state.record_round_outcome(false, false);
+    let NoProgress::Steer(text) = state.no_progress_verdict(true) else {
+        panic!("2 idle rounds must steer");
+    };
+    assert!(
+        text.contains("2 rounds have passed since your last successful change"),
+        "{text}"
+    );
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "stop"); // 3 idle rounds; the steer was sent once
+    assert!(
+        state.no_progress_notice().contains("3 consecutive rounds"),
+        "{}",
+        state.no_progress_notice()
+    );
+}
+
+#[test]
+fn a_read_only_turn_never_trips_the_brake() {
+    let mut state = no_progress_state(2, 3);
+    for _ in 0..50 {
+        state.record_round_outcome(false, false);
+        assert_eq!(gate(&mut state, true), "continue");
+    }
+}
+
+#[test]
+fn a_second_write_resets_the_count_and_rearms_the_steer() {
+    let mut state = no_progress_state(2, 4);
+    state.record_round_outcome(true, true);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "steer");
+    state.record_round_outcome(true, true); // real progress
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "steer", "steers again");
+}
+
+/// The reset rule: a PASSING `lifecycle` test/check resets the count but stays
+/// armed. (Which phases qualify is `only_test_and_check_lifecycle_phases_reset`.)
+#[test]
+fn a_passing_lifecycle_run_resets_the_count_but_stays_armed() {
+    let mut state = no_progress_state(2, 4);
+    state.record_round_outcome(true, true);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "steer");
+    state.note_verified_pass();
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "steer", "still armed, steers again");
+}
+
+#[test]
+fn zero_disables_each_half_and_default_is_8_12() {
+    let mut off = no_progress_state(0, 0);
+    off.record_round_outcome(true, true);
+    for _ in 0..100 {
+        off.record_round_outcome(false, false);
+        assert_eq!(gate(&mut off, true), "continue");
+    }
+    let mut stop_only = no_progress_state(0, 2);
+    stop_only.record_round_outcome(true, true);
+    assert_eq!(gate(&mut stop_only, true), "continue");
+    stop_only.record_round_outcome(false, false);
+    assert_eq!(gate(&mut stop_only, true), "continue");
+    stop_only.record_round_outcome(false, false);
+    assert_eq!(gate(&mut stop_only, true), "stop");
+    let d = crate::initiative::NoProgressRounds::default();
+    assert_eq!((d.steer_after, d.stop_after), (8, 12));
+}
+
+/// Review fix 4: a loop made of rounds that `continue` never calls
+/// `record_round_outcome`, but each is a completed model round with no change.
+#[test]
+fn rounds_that_never_reach_the_outcome_hook_still_count_toward_the_brake() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true);
+    let seen: Vec<_> = (0..5).map(|_| gate(&mut state, true)).collect();
+    assert_eq!(
+        seen,
+        ["continue", "continue", "steer", "stop", "stop"],
+        "{seen:?}"
+    );
+}
+
+/// Review fix 3: the STEER is advice (`action_nudges` may be off); the STOP is a
+/// bound and must fire regardless.
+#[test]
+fn the_stop_does_not_depend_on_nudges_being_allowed() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true);
+    let seen: Vec<_> = (0..4).map(|_| gate(&mut state, false)).collect();
+    assert_eq!(
+        seen,
+        ["continue", "continue", "continue", "stop"],
+        "no steer, but a stop: {seen:?}"
+    );
+}
+
+/// Review fix 2: only the gate phases are evidence of progress. `format`, `lint`,
+/// `clean` and `setup` pass trivially (a looping model can call them forever); a
+/// passing `run_command` never counts (a `| tail` masks the exit status).
+#[test]
+fn only_test_and_check_lifecycle_phases_reset_the_brake() {
+    use crate::ExecOutcome::{Failed, Passed};
+    for (phase, expect) in [
+        ("test", true),
+        ("check", true),
+        ("format", false),
+        ("lint", false),
+        ("clean", false),
+        ("setup", false),
+        ("bogus", false),
+    ] {
+        let args = serde_json::json!({ "phase": phase });
+        assert_eq!(
+            is_progress_verification("lifecycle", &args, Some(Passed)),
+            expect,
+            "{phase}"
+        );
+    }
+    let test = serde_json::json!({ "phase": "test" });
+    assert!(!is_progress_verification("lifecycle", &test, Some(Failed)));
+    assert!(!is_progress_verification("lifecycle", &test, None));
+    let shell = serde_json::json!({ "command": "cargo test" });
+    assert!(!is_progress_verification(
+        "run_command",
+        &shell,
+        Some(Passed)
+    ));
+}
+
+/// Review round 3: operator steering is new information; it restarts the count
+/// and re-arms the steer-once latch, exactly like progress.
+#[test]
+fn operator_steering_resets_the_count_and_rearms_the_steer() {
+    let mut state = no_progress_state(2, 3);
+    state.record_round_outcome(true, true);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "steer");
+    // The operator types a steer; delivered at the start of the round that
+    // would otherwise be the 3rd idle one (the stop).
+    state.record_round_outcome(false, false);
+    state.note_operator_steering();
+    assert_eq!(
+        gate(&mut state, true),
+        "continue",
+        "no stop: the count restarted"
+    );
+    state.record_round_outcome(false, false);
+    assert_eq!(gate(&mut state, true), "continue");
+    state.record_round_outcome(false, false);
+    assert_eq!(
+        gate(&mut state, true),
+        "steer",
+        "the steer-once latch re-armed"
+    );
+}

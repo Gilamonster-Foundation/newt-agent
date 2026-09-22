@@ -1994,3 +1994,243 @@ async fn a_run_that_fails_after_a_write_hands_back_what_it_changed() {
     assert_eq!(handback["model_reply_present"], false);
     assert!(handback["end_reason"].is_string(), "{handback}");
 }
+
+/// One `write_file`, then `list_dir` forever: after a real write every further
+/// round changes nothing and verifies nothing. Records each request body.
+struct WriteThenGrind {
+    sequence: AtomicUsize,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Respond for WriteThenGrind {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("chat body");
+        self.requests.lock().expect("capture").push(body);
+        let n = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let (name, arguments) = if n == 0 {
+            ("write_file", "{\"path\":\"out.txt\",\"content\":\"x\\n\"}")
+        } else {
+            ("list_dir", "{\"path\":\".\"}")
+        };
+        if request.url.path() == "/v1/responses" {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": format!("resp_{n}"), "status": "completed", "model": "m",
+                "output": [{"type": "function_call", "id": format!("fc_{n}"),
+                    "call_id": format!("c{n}"), "name": name, "arguments": arguments,
+                    "status": "completed"}]
+            }));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": format!("c{n}"), "type": "function",
+                        "function": {"name": name, "arguments": arguments}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+}
+
+/// U4b: a successful write followed by N rounds that change and verify nothing
+/// is steered at `steer_after` and ends, typed, at `stop_after` — filed like the
+/// round cap (`timeout` / `incomplete`), with a harness-written notice and NO
+/// model summary call. The thresholds are configuration (`[initiative.no_progress]`).
+async fn assert_write_then_no_progress_stops(api: &str) {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenGrind {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(WriteThenGrind {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config_path = control.path().join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n\n[initiative.no_progress]\nsteer_after = 2\nstop_after = 3\n",
+            server.uri()
+        ),
+    )
+    .expect("config");
+    let instruction = control.path().join("task.md");
+    std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
+    let events_path = control.path().join("events.jsonl");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["--backend-api", api])
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "40"])
+        .assert()
+        .success();
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
+        .expect("events")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    let result = lines
+        .iter()
+        .find(|r| r["kind"] == "solve_result")
+        .expect("solve_result");
+    assert_eq!(result["end_reason"], "Some(NoProgress)", "{result}");
+    assert_eq!(result["status"], "incomplete");
+    assert!(
+        result["reply_chars"].as_u64().unwrap() > 0,
+        "harness notice: {result}"
+    );
+    let contract = lines
+        .iter()
+        .find(|r| r.get("contract_version").is_some())
+        .expect("contract");
+    assert_eq!(contract["outcome"], "timeout");
+
+    let requests = requests.lock().expect("capture");
+    assert_eq!(
+        requests.len(),
+        4,
+        "write, then three grinding rounds; no summary call"
+    );
+    assert!(
+        requests.iter().all(|r| r.get("tools").is_some()),
+        "no tools-disabled summary"
+    );
+    // Chat bodies carry `messages`; Responses bodies carry `input`.
+    let last_messages = requests[3]
+        .get("messages")
+        .or_else(|| requests[3].get("input"))
+        .expect("messages or input")
+        .to_string();
+    assert!(
+        last_messages.contains("rounds have passed since your last successful change"),
+        "the steer must precede the final round: {last_messages}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_then_no_progress_is_steered_then_stopped_like_a_cap() {
+    assert_write_then_no_progress_stops("chat").await;
+}
+
+/// Review fix 5 (RED first): the Responses loop had no brake at all, so the same
+/// stall ran to the round cap on that wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_then_no_progress_is_stopped_on_the_responses_wire_too() {
+    assert_write_then_no_progress_stops("responses").await;
+}
+
+/// A `write_file` (with an id), then only tool calls that carry NO id: each such
+/// batch is re-asked (not run, not recorded as a round outcome), and a third in
+/// a row would abort the run.
+struct WriteThenIdless {
+    sequence: AtomicUsize,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Respond for WriteThenIdless {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("chat body");
+        self.requests.lock().expect("capture").push(body);
+        let n = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let call = if n == 0 {
+            serde_json::json!({"id": "c0", "type": "function", "function": {
+                "name": "write_file", "arguments": "{\"path\":\"out.txt\",\"content\":\"x\\n\"}"}})
+        } else {
+            serde_json::json!({"type": "function", "function": {
+                "name": "list_dir", "arguments": "{\"path\":\".\"}"}})
+        };
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "m",
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                "finish_reason": "tool_calls"}]
+        }))
+    }
+}
+
+/// The interaction of the brake with #2500's id-less re-ask: a re-ask round
+/// `continue`s past `record_round_outcome`, but it is a completed model round that
+/// changed nothing. The gate counts it, and it does not reset the brake, so the
+/// brake (`stop_after = 2`) ends the run BEFORE the third id-less batch would
+/// abort it. Were re-asks uncounted, the run would fail with the correlation
+/// error instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idless_reask_round_is_counted_by_the_brake_and_does_not_reset_it() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenIdless {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config_path = control.path().join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n\n[initiative.no_progress]\nsteer_after = 0\nstop_after = 2\n",
+            server.uri()
+        ),
+    )
+    .expect("config");
+    let instruction = control.path().join("task.md");
+    std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
+    let events_path = control.path().join("events.jsonl");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "40"])
+        .assert()
+        .success();
+
+    let result = solve_result_from(&events_path);
+    assert_eq!(result["end_reason"], "Some(NoProgress)", "{result}");
+    assert_eq!(result["status"], "incomplete");
+    assert!(
+        result["error"].is_null(),
+        "not the correlation abort: {result}"
+    );
+    assert_eq!(
+        requests.lock().expect("capture").len(),
+        3,
+        "the write, then two re-asked rounds; the stop precedes a third"
+    );
+}

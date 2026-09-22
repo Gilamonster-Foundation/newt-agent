@@ -441,6 +441,7 @@ mod reads_do_not_publish {
                 decisive: 93,
                 eager: 94,
             },
+            ..Default::default()
         });
 
         let _ = resolve_edit_mode();

@@ -158,6 +158,30 @@ impl InitiativeRounds {
     }
 }
 
+/// `[initiative.no_progress]`: the no-progress brake (U4b). After a turn's first
+/// successful workspace write, `steer_after` consecutive completed rounds that
+/// change nothing and run no passing `lifecycle` test/check inject one steer, and
+/// `stop_after` end the turn (`TurnEndReason::NoProgress`). `0` disables that
+/// half. Data, not constants: a task that legitimately polls long builds retunes
+/// it in config. The defaults, 8 / 12, are sized to the dispatcher's
+/// `--max-rounds 15-20` (a larger `stop_after` could never fire inside such a
+/// run); a run with a bigger cap can raise them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NoProgressRounds {
+    pub steer_after: usize,
+    pub stop_after: usize,
+}
+
+impl Default for NoProgressRounds {
+    fn default() -> Self {
+        Self {
+            steer_after: 8,
+            stop_after: 12,
+        }
+    }
+}
+
 /// The `[initiative]` config section: a baseline level, per-model-family
 /// defaults, and the round count behind each level. Pure data: a new family's
 /// default is one map entry.
@@ -180,6 +204,8 @@ pub struct InitiativeConfig {
     pub families: BTreeMap<String, Initiative>,
     /// The number behind each level.
     pub rounds: InitiativeRounds,
+    /// The no-progress brake's thresholds.
+    pub no_progress: NoProgressRounds,
 }
 
 impl InitiativeConfig {
@@ -309,6 +335,16 @@ pub fn set_initiative_config(config: InitiativeConfig) {
 #[must_use]
 pub fn initiative_config() -> Option<InitiativeConfig> {
     INITIATIVE_CONFIG.lock().ok().and_then(|s| s.clone())
+}
+
+/// The installed `[initiative.no_progress]` thresholds, or the built-in 8/12.
+#[must_use]
+pub fn installed_no_progress() -> NoProgressRounds {
+    INITIATIVE_CONFIG
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|c| c.no_progress))
+        .unwrap_or_default()
 }
 
 fn installed_rounds() -> InitiativeRounds {

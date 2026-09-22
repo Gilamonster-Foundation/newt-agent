@@ -147,6 +147,7 @@ pub fn terminal(
         Some(
             reason @ (TurnEndReason::RoundCap
             | TurnEndReason::RunAllowance
+            | TurnEndReason::NoProgress
             | TurnEndReason::Empty
             | TurnEndReason::Cancelled
             | TurnEndReason::AwaitingOperator
@@ -196,7 +197,10 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // `RunAllowance` (#2313, `--run-allowance`) is a budget wall just like the
         // round cap: same bucket, no new vocabulary value.
         Terminal::StoppedShort(
-            TurnEndReason::RoundCap | TurnEndReason::RunAllowance | TurnEndReason::Cancelled,
+            TurnEndReason::RoundCap
+            | TurnEndReason::RunAllowance
+            | TurnEndReason::NoProgress
+            | TurnEndReason::Cancelled,
         ) => "timeout",
         // #2315: the model delivered an answer the harness's own verification
         // did not confirm. That is a real attempt at a terminal state; whether
@@ -637,6 +641,7 @@ mod tests {
         TurnEndReason::RepairExhausted,
         TurnEndReason::VerificationIncomplete,
         TurnEndReason::RunAllowance,
+        TurnEndReason::NoProgress,
     ];
 
     fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
@@ -698,6 +703,7 @@ mod tests {
             TurnEndReason::RepairExhausted => 8,
             TurnEndReason::VerificationIncomplete => 9,
             TurnEndReason::RunAllowance => 10,
+            TurnEndReason::NoProgress => 11,
         }
     }
 
@@ -1011,10 +1017,12 @@ mod tests {
     /// value in the pinned outcome vocabulary.
     #[test]
     fn a_run_allowance_exit_files_like_a_round_cap() {
-        let t = terminal(true, None, Some(TurnEndReason::RunAllowance), false);
-        assert_eq!(outcome_label(t), "timeout");
-        assert_eq!(status_label(t), "incomplete");
-        assert!(permitted_outcomes().contains(&outcome_label(t)));
+        for reason in [TurnEndReason::RunAllowance, TurnEndReason::NoProgress] {
+            let t = terminal(true, None, Some(reason), false);
+            assert_eq!(outcome_label(t), "timeout", "{reason:?}");
+            assert_eq!(status_label(t), "incomplete", "{reason:?}");
+            assert!(permitted_outcomes().contains(&outcome_label(t)));
+        }
     }
 
     #[test]

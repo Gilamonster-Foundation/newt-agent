@@ -60,6 +60,12 @@ pub enum TurnEndReason {
     /// the allowance now refuses, and a summary before the round cap would break
     /// `BHV-ROUND-002` — so the harness writes the notice itself.
     RunAllowance,
+    /// U4b: after at least one successful workspace write, the configured number
+    /// of consecutive rounds (`[initiative.no_progress] stop_after`) changed
+    /// nothing and ran no passing build or test. A budget wall filed like
+    /// [`Self::RoundCap`], with a harness-written notice and no model summary
+    /// (BHV-ROUND-002).
+    NoProgress,
     /// The model produced no usable content (placeholder/diagnostic reply).
     Empty,
     /// #1963: the operator interrupted the turn (Esc / Ctrl-C) before it
@@ -202,6 +208,7 @@ impl TurnMetrics {
             Some(TurnEndReason::AwaitingOperator) => format!("{base} · awaiting operator"),
             Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
             Some(TurnEndReason::RunAllowance) => format!("{base} · ⚠ run allowance exhausted"),
+            Some(TurnEndReason::NoProgress) => format!("{base} · ⚠ stopped: no progress"),
             Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
             Some(TurnEndReason::Cancelled) => format!("{base} · ⊘ interrupted"),
             Some(TurnEndReason::Failed) => format!("{base} · ✗ failed"),

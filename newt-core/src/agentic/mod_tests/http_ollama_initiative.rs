@@ -17,6 +17,7 @@ fn configure() {
             decisive: 3,
             eager: 2,
         },
+        ..Default::default()
     });
 }
 
