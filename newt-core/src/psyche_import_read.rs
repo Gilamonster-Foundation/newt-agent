@@ -1,10 +1,27 @@
 //! Filesystem migration with caller-owned diagnostic delivery.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::tty::{Level, Notice};
 
 use super::{migrate_config_text, migrate_persona_text, Migration};
+
+/// A config lock-contention warning fires at most once per process. A single
+/// command (e.g. `mcp import`, which re-reads the same authoritative config
+/// while already holding its transaction lock) can hit lock contention on
+/// the same target more than once; the operator needs to be told once that
+/// this run's config changes were not durably saved, not the identical
+/// sentence per attempt.
+static LOCK_CONTENTION_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Reset the once-per-process dedupe. Test-only: the real "once per process"
+/// promise needs a fresh process to observe, but the unit suite runs many
+/// scenarios in one process and each must see its own first occurrence.
+#[cfg(test)]
+pub(crate) fn reset_lock_contention_warned_for_test() {
+    LOCK_CONTENTION_REPORTED.store(false, Ordering::Relaxed);
+}
 
 /// Read and atomically migrate a persona. The caller owns presentation of the
 /// report, including when a later persona parse fails.
@@ -38,13 +55,21 @@ pub fn read_config_file(
     });
     let (locked, lock_failure) = match locked.transpose() {
         Ok(locked) => (locked, None),
-        Err(error) => (
+        // Surface the lock-contention text at most once per process: a
+        // single command that re-reads the same already-locked config more
+        // than once (e.g. `mcp import`'s namespace-sanitization pass
+        // re-loading a target it already holds the transaction lock on)
+        // would otherwise repeat the identical sentence per attempt,
+        // whether it lands in the fallback notice below or merged into a
+        // migration notice above.
+        Err(error) if !LOCK_CONTENTION_REPORTED.swap(true, Ordering::Relaxed) => (
             None,
             Some(format!(
                 "cannot lock config {} for migration: {error:#}",
                 path.display()
             )),
         ),
+        Err(_) => (None, None),
     };
     let destination = locked.as_ref().map(|(destination, _)| destination);
     // Display the caller's path; operate on the resolved one. Canonicalization
@@ -74,10 +99,13 @@ pub fn read_config_file(
     );
     if let Some(error) = lock_failure.filter(|_| !reported) {
         let loaded = match &result {
-            Ok(_) => "loaded original text in memory; the file was not rewritten".to_string(),
-            Err(read_error) => {
-                format!("could not read original text: {read_error}; the file was not rewritten")
+            Ok(_) => {
+                "loaded original text in memory; config changes from this command were not saved"
+                    .to_string()
             }
+            Err(read_error) => format!(
+                "could not read original text: {read_error}; config changes from this command were not saved"
+            ),
         };
         report(Notice::new(
             Level::Warn,
