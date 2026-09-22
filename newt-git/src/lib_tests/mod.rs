@@ -310,5 +310,8 @@ mod tool_dispatch;
 #[cfg(test)]
 #[path = "tool_surface.rs"]
 mod tool_surface;
+#[cfg(test)]
+#[path = "worktree_add.rs"]
+mod worktree_add;
 #[path = "worktree_cwd.rs"]
 mod worktree_cwd;

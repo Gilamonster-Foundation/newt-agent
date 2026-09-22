@@ -979,6 +979,113 @@ impl GitEngine {
         Ok(format!("deleted branch '{name}'"))
     }
 
+    /// `git worktree add -b <branch> <dir> <base>` — a new linked worktree on a
+    /// fresh branch, built from grit-lib primitives (grit-lib itself has no
+    /// worktree-creation mutator yet — its own `worktree.rs` module doc says
+    /// `add`/`remove` "remain in the CLI for now and will move here in Phase
+    /// 1.2"; **replace this method with grit-lib's `add` when it ships**).
+    ///
+    /// Requires `refs` to permit the new branch name AND `stage` (this both
+    /// creates a ref and populates a working tree, same authority class as
+    /// `checkout`). `dir` is resolved against this repository's work tree when
+    /// relative; refuses if it already exists, escapes the work tree, or
+    /// collides with an existing worktree admin id. On any failure after the
+    /// branch ref is written, the branch ref, admin dir and worktree dir
+    /// created so far are removed — no half-made worktree survives a refusal.
+    ///
+    /// Returns the absolute worktree path.
+    pub fn worktree_add(
+        &self,
+        caps: &GitCaveats,
+        branch: &str,
+        base: &str,
+        dir: &Path,
+    ) -> Result<PathBuf, GitError> {
+        let refname = format!("refs/heads/{branch}");
+        if !caps.permits_ref(&refname) || !caps.permits_stage() {
+            return Err(GitError::Denied("refs"));
+        }
+        if resolve_ref(&self.repo.git_dir, &refname).is_ok() {
+            return Err(GitError::Refused(format!(
+                "branch '{branch}' already exists"
+            )));
+        }
+        let work_tree = self.repo.work_tree.clone().ok_or(GitError::Unsupported(
+            "cannot add a worktree to a bare repository",
+        ))?;
+        let wt_path = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            work_tree.join(dir)
+        };
+        if !wt_path.starts_with(&work_tree) {
+            return Err(GitError::Refused(format!(
+                "worktree dir '{}' escapes the repository work tree",
+                dir.display()
+            )));
+        }
+        if wt_path.exists() {
+            return Err(GitError::Refused(format!(
+                "worktree dir '{}' already exists",
+                wt_path.display()
+            )));
+        }
+        let base_oid = self.resolve_one(base)?;
+        let base_tree = self.commit_tree(&base_oid)?;
+
+        let common = grit_lib::worktree::common_git_dir(&self.repo.git_dir);
+        let id = unique_worktree_admin_id(&common, &wt_path);
+        let admin = common.join("worktrees").join(&id);
+
+        std::fs::create_dir_all(&admin).map_err(GitError::Io)?;
+        std::fs::create_dir_all(&wt_path).map_err(GitError::Io)?;
+        // Undo everything created so far on any failure below — no half-made
+        // worktree is left for a caller to trip over.
+        let unwind = |branch_written: bool| {
+            let _ = std::fs::remove_dir_all(&admin);
+            let _ = std::fs::remove_dir_all(&wt_path);
+            if branch_written {
+                let _ = delete_ref(&self.repo.git_dir, &refname);
+            }
+        };
+        if let Err(e) = write_ref(&self.repo.git_dir, &refname, &base_oid) {
+            unwind(false);
+            return Err(GitError::Engine(e));
+        }
+        let steps = || -> Result<(), grit_lib::error::Error> {
+            // `admin` is always exactly `<common>/worktrees/<id>` (built above),
+            // so the relative path back up is always `../..` — matching git's
+            // own `commondir` contents for a linked worktree.
+            std::fs::write(admin.join("commondir"), "../..\n")?;
+            std::fs::write(
+                admin.join("gitdir"),
+                format!("{}\n", wt_path.join(".git").display()),
+            )?;
+            std::fs::write(
+                wt_path.join(".git"),
+                format!("gitdir: {}\n", admin.display()),
+            )?;
+            write_symbolic_ref(&admin, "HEAD", &refname)?;
+            Ok(())
+        };
+        if let Err(e) = steps() {
+            unwind(true);
+            return Err(GitError::Engine(e));
+        }
+        let admin_repo = match Repository::open(&admin, Some(&wt_path)) {
+            Ok(r) => r,
+            Err(e) => {
+                unwind(true);
+                return Err(GitError::Engine(e));
+            }
+        };
+        if let Err(e) = checkout_between_trees(&admin_repo, None, &base_tree) {
+            unwind(true);
+            return Err(GitError::Engine(e));
+        }
+        Ok(wt_path)
+    }
+
     // --- stash (#992): pure-Rust, no git binary. `push` builds the standard
     // 2-parent stash commit from primitives; list/pop/apply/drop reuse grit-lib's
     // reflog + `apply_stash`. Scope: TRACKED changes (untracked left in place).
@@ -1638,6 +1745,28 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                  branch|branch-list|checkout|branch-delete|stash|stash-list|stash-pop|stash-apply|stash-drop)"
             )),
         }
+    }
+}
+
+/// Pick an unused `worktrees/<id>/` admin-dir name for a new worktree at
+/// `wt_path`, starting from grit's sanitized basename and appending a
+/// numeric suffix on collision (git's own `worktree_basename` + dedupe
+/// behaviour for `git worktree add`).
+fn unique_worktree_admin_id(common: &Path, wt_path: &Path) -> String {
+    let base = grit_lib::worktree::sanitize_worktree_id_component(
+        &grit_lib::worktree::worktree_path_basename(wt_path),
+    );
+    let worktrees_dir = common.join("worktrees");
+    if !worktrees_dir.join(&base).exists() {
+        return base;
+    }
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{base}{n}");
+        if !worktrees_dir.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
