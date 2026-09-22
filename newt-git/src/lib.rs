@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use grit_lib::diff::{
-    diff_index_to_tree, diff_index_to_worktree_with_options, diff_trees, DiffEntry,
-    DiffIndexToWorktreeOptions, DiffStatus,
+    count_changes, diff_index_to_tree, diff_index_to_worktree_with_options, diff_tree_to_worktree,
+    diff_trees, DiffEntry, DiffIndexToWorktreeOptions, DiffStatus,
 };
 use grit_lib::index::{entry_from_stat, Index, IndexEntry, MODE_REGULAR};
 use grit_lib::merge_base::resolve_commit_specs;
@@ -29,6 +29,7 @@ use grit_lib::merge_trees::{
     merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
+use grit_lib::pathspec::matches_pathspec_list;
 use grit_lib::porcelain::checkout::checkout_between_trees;
 use grit_lib::porcelain::stash::apply_stash;
 use grit_lib::porcelain::status::{collect_untracked_and_ignored, IgnoredMode};
@@ -38,6 +39,10 @@ use grit_lib::refs::{
     write_symbolic_ref,
 };
 use grit_lib::repo::Repository;
+use grit_lib::rev_list::{rev_list, RevListOptions};
+use grit_lib::rev_parse::{
+    split_double_dot_range, split_triple_dot_range, try_parse_double_dot_log_range,
+};
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::write_tree::write_tree_from_index;
 
@@ -178,15 +183,32 @@ pub struct CommitInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffReport {
     pub files: Vec<FileChange>,
+    /// Present only when the caller asked for `--stat`: added/removed line
+    /// counts per changed file, in the same order as `files`.
+    pub stat: Option<Vec<FileStat>>,
+}
+
+/// One file's `--stat` line-change counts. Binary files are counted as 0/0,
+/// matching git's "Bin" case rather than fabricating a text line count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStat {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
 }
 
 /// Which diff to compute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffSpec {
     /// Unstaged: worktree vs index.
     Worktree,
     /// Staged: index vs HEAD tree.
     Staged,
+    /// One revision vs the worktree (`git diff <rev>`). May itself be an
+    /// `A..B` range spec, which is equivalent to `RevRange(A, B)`.
+    Rev(String),
+    /// Two revisions (`git diff A B` / `git diff A..B`).
+    RevRange(String, String),
 }
 
 /// An embedded git engine bound to one repository.
@@ -330,32 +352,73 @@ impl GitEngine {
         })
     }
 
-    /// `git log` — a first-parent walk from HEAD, up to `limit` commits. Requires `read`.
-    pub fn log(&self, caps: &GitCaveats, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+    /// `git log`, up to `limit` commits. Requires `read`.
+    ///
+    /// `revision` selects the walk: `None` starts at HEAD; a single rev starts
+    /// there instead; an `A..B` range walks from `B`, excluding everything
+    /// reachable from `A` — real reachability, via grit-lib's `rev_list`, not
+    /// a first-parent-chain scan (a branch cut from `main` and then advanced
+    /// past its fork point is walked correctly; the left side need not be a
+    /// first-parent ancestor of the right). `paths` (when non-empty) keeps
+    /// only commits whose tree differs from all their parents' at a matching
+    /// path (grit-lib's own history simplification, matching real `git log
+    /// -- <path>` — not limited to the first-parent diff).
+    pub fn log(
+        &self,
+        caps: &GitCaveats,
+        limit: usize,
+        revision: Option<&str>,
+        paths: &[String],
+    ) -> Result<Vec<CommitInfo>, GitError> {
         if !caps.permits_read() {
             return Err(GitError::Denied("read"));
         }
-        let mut out = Vec::new();
-        let mut next = self.head_oid()?;
-        while let Some(oid) = next {
-            if out.len() >= limit {
-                break;
-            }
-            let obj = self.repo.odb.read(&oid)?;
-            let commit = parse_commit(&obj.data)?;
-            out.push(commit_info(&oid, &commit));
-            next = commit.parents.first().cloned();
-        }
-        Ok(out)
+        let (positive, negative) = match revision {
+            None => (vec!["HEAD".to_string()], Vec::new()),
+            Some(rev) => match split_double_dot_range(rev) {
+                Some((left, right)) => {
+                    let left = if left.is_empty() { "HEAD" } else { left };
+                    let right = if right.is_empty() { "HEAD" } else { right };
+                    (vec![right.to_string()], vec![left.to_string()])
+                }
+                None => {
+                    self.reject_symmetric_or_ambiguous(rev)?;
+                    (vec![rev.to_string()], Vec::new())
+                }
+            },
+        };
+        let options = RevListOptions {
+            max_count: Some(limit),
+            paths: paths.to_vec(),
+            ..Default::default()
+        };
+        let result = rev_list(&self.repo, &positive, &negative, &options)?;
+        result
+            .commits
+            .iter()
+            .map(|oid| {
+                let obj = self.repo.odb.read(oid)?;
+                let commit = parse_commit(&obj.data)?;
+                Ok(commit_info(oid, &commit))
+            })
+            .collect()
     }
 
-    /// `git diff` for the given `spec`. Requires `read`.
-    pub fn diff(&self, caps: &GitCaveats, spec: DiffSpec) -> Result<DiffReport, GitError> {
+    /// `git diff` for the given `spec`. Requires `read`. `paths` (when
+    /// non-empty) filters the result to matching pathspecs; `stat` computes
+    /// per-file `--stat` insertion/deletion counts.
+    pub fn diff(
+        &self,
+        caps: &GitCaveats,
+        spec: DiffSpec,
+        paths: &[String],
+        stat: bool,
+    ) -> Result<DiffReport, GitError> {
         if !caps.permits_read() {
             return Err(GitError::Denied("read"));
         }
         let index = self.repo.load_index()?;
-        let entries = match spec {
+        let mut entries = match spec {
             DiffSpec::Worktree => match self.repo.work_tree.clone() {
                 Some(wt) => self.worktree_changes(&index, &wt)?,
                 None => Vec::new(),
@@ -364,10 +427,84 @@ impl GitEngine {
                 let tree = self.head_tree()?;
                 diff_index_to_tree(&self.repo.odb, &index, tree.as_ref(), false)?
             }
+            DiffSpec::Rev(rev) => match try_parse_double_dot_log_range(&self.repo, &rev)? {
+                Some((a, b)) => self.diff_rev_range(&a.to_hex(), &b.to_hex())?,
+                None => {
+                    self.reject_symmetric_or_ambiguous(&rev)?;
+                    let oid = self.resolve_one(&rev)?;
+                    let tree = self.commit_tree(&oid)?;
+                    match self.repo.work_tree.clone() {
+                        Some(wt) => {
+                            diff_tree_to_worktree(&self.repo.odb, Some(&tree), &wt, &index)?
+                        }
+                        None => Vec::new(),
+                    }
+                }
+            },
+            DiffSpec::RevRange(a, b) => self.diff_rev_range(&a, &b)?,
+        };
+        if !paths.is_empty() {
+            entries.retain(|e| matches_pathspec_list(e.path(), paths));
+        }
+        let stat = if stat {
+            Some(self.diff_stat(&entries)?)
+        } else {
+            None
         };
         Ok(DiffReport {
             files: entries.iter().map(file_change).collect(),
+            stat,
         })
+    }
+
+    /// Tree-vs-tree diff between two revision specs.
+    fn diff_rev_range(&self, a: &str, b: &str) -> Result<Vec<DiffEntry>, GitError> {
+        let oid_a = self.resolve_one(a)?;
+        let oid_b = self.resolve_one(b)?;
+        let tree_a = self.commit_tree(&oid_a)?;
+        let tree_b = self.commit_tree(&oid_b)?;
+        Ok(diff_trees(
+            &self.repo.odb,
+            Some(&tree_a),
+            Some(&tree_b),
+            "",
+        )?)
+    }
+
+    /// `--stat` counts per changed file. Reads both blob sides (missing side
+    /// treated as empty, matching Added/Deleted); binary files count 0/0.
+    fn diff_stat(&self, entries: &[DiffEntry]) -> Result<Vec<FileStat>, GitError> {
+        let zero = grit_lib::diff::zero_oid();
+        entries
+            .iter()
+            .map(|e| {
+                let old = if e.old_oid == zero {
+                    Vec::new()
+                } else {
+                    self.repo.odb.read(&e.old_oid)?.data
+                };
+                let new = if e.new_oid == zero {
+                    Vec::new()
+                } else {
+                    self.repo.odb.read(&e.new_oid)?.data
+                };
+                let (insertions, deletions) = if grit_lib::merge_file::is_binary(&old)
+                    || grit_lib::merge_file::is_binary(&new)
+                {
+                    (0, 0)
+                } else {
+                    count_changes(
+                        &String::from_utf8_lossy(&old),
+                        &String::from_utf8_lossy(&new),
+                    )
+                };
+                Ok(FileStat {
+                    path: e.path().to_string(),
+                    insertions,
+                    deletions,
+                })
+            })
+            .collect()
     }
 
     /// `git add` — stage worktree files into the index. Requires `stage`.
@@ -494,6 +631,32 @@ impl GitEngine {
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
         }
         Ok(commit_info(&oid, &commit))
+    }
+
+    /// Refuse a `log`/`diff` operand this engine cannot answer honestly: an
+    /// `A...B` symmetric-diff (no merge-base support here — real git resolves
+    /// it to a merge base, which this engine does not compute for this path)
+    /// or a bare `spec` that is simultaneously a resolvable revision AND an
+    /// existing worktree path (the same shape real git refuses without an
+    /// explicit `--` to disambiguate; answering the revision silently would
+    /// hide that the caller may have meant the path).
+    fn reject_symmetric_or_ambiguous(&self, spec: &str) -> Result<(), GitError> {
+        if split_triple_dot_range(spec).is_some() {
+            return Err(GitError::Refused(
+                "symmetric ranges are not supported — put -- before paths, or use A..B".to_string(),
+            ));
+        }
+        let is_path = self
+            .repo
+            .work_tree
+            .as_ref()
+            .is_some_and(|wt| wt.join(spec).exists());
+        if is_path && self.resolve_one(spec).is_ok() {
+            return Err(GitError::Refused(format!(
+                "ambiguous argument '{spec}': both revision and filename — put -- before paths"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve a commit spec (short oid / ref / id) to an `ObjectId`.
@@ -1308,14 +1471,22 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             "status" => Ok(render_status(&eng.status(caps).map_err(s)?)),
             "log" => {
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-                Ok(render_log(&eng.log(caps, limit).map_err(s)?))
+                let revision = args.get("revision").and_then(|v| v.as_str());
+                let paths = str_array(args, "paths");
+                Ok(render_log(&eng.log(caps, limit, revision, &paths).map_err(s)?))
             }
             "diff" => {
-                let spec = match args.get("spec").and_then(|v| v.as_str()) {
-                    Some("staged") => DiffSpec::Staged,
+                let rev = args.get("rev").and_then(|v| v.as_str());
+                let rev2 = args.get("rev2").and_then(|v| v.as_str());
+                let spec = match (args.get("spec").and_then(|v| v.as_str()), rev, rev2) {
+                    (Some("staged"), ..) => DiffSpec::Staged,
+                    (_, Some(a), Some(b)) => DiffSpec::RevRange(a.to_string(), b.to_string()),
+                    (_, Some(a), None) => DiffSpec::Rev(a.to_string()),
                     _ => DiffSpec::Worktree,
                 };
-                Ok(render_diff(&eng.diff(caps, spec).map_err(s)?))
+                let paths = str_array(args, "paths");
+                let stat = args.get("stat").and_then(|v| v.as_bool()).unwrap_or(false);
+                Ok(render_diff(&eng.diff(caps, spec, &paths, stat).map_err(s)?))
             }
             "add" => {
                 let paths = str_array(args, "paths");
@@ -1880,11 +2051,23 @@ fn render_diff(d: &DiffReport) -> String {
     if d.files.is_empty() {
         return "no changes".to_string();
     }
-    d.files
+    let files = d
+        .files
         .iter()
         .map(|f| format!("{} {}", f.status, f.path))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    match &d.stat {
+        Some(stat) => {
+            let lines = stat
+                .iter()
+                .map(|s| format!("{} | +{} -{}", s.path, s.insertions, s.deletions))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{files}\n\n{lines}")
+        }
+        None => files,
+    }
 }
 
 #[cfg(test)]

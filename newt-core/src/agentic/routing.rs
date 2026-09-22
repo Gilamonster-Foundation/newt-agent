@@ -199,44 +199,140 @@ impl RouteTable {
 
 /// Translate `status` / `log` / `diff` operands into the embedded git tool's
 /// args — same rule as [`branch_list_route`]: only list shapes whose
-/// namespace the embedded op can preserve; a range, path filter, or unmodeled
-/// flag GATES as exec rather than silently running the bare op on a request
-/// that asked for something narrower (item 1 of the routing-honesty job:
-/// `git log A..B` used to answer with the last 20 commits from HEAD, and
-/// `git diff --cached` used to answer with the unstaged diff instead).
+/// namespace the embedded op can preserve; an unmodeled flag GATES as exec
+/// rather than silently running the bare op on a request that asked for
+/// something narrower (item 1 of the routing-honesty job: `git log A..B`
+/// used to answer with the last 20 commits from HEAD, and `git diff --cached`
+/// used to answer with the unstaged diff instead).
+///
+/// A revision/pathspec/`--stat` shape now routes too (the engine serves
+/// them); a near-miss that changes the *presentation* the engine cannot
+/// reproduce (`--word-diff`, `-p` with a range, `--oneline`, …) still gates.
 fn git_read_route(sub: &str, rest: &[&str]) -> RouteDecision {
-    match (sub, rest) {
-        ("status", []) => RouteDecision::Route {
+    match sub {
+        "status" if rest.is_empty() => RouteDecision::Route {
             tool: "git",
             args: json!({ "op": "status" }),
         },
-        ("log", []) => RouteDecision::Route {
-            tool: "git",
-            args: json!({ "op": "log" }),
-        },
-        ("log", [flag]) => match parse_log_limit(flag) {
-            Some(limit) => RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "limit": limit }),
-            },
-            None => RouteDecision::Exec,
-        },
-        ("log", ["-n", n]) => match n.parse::<u64>() {
-            Ok(limit) => RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "limit": limit }),
-            },
-            Err(_) => RouteDecision::Exec,
-        },
-        ("diff", []) => RouteDecision::Route {
-            tool: "git",
-            args: json!({ "op": "diff" }),
-        },
-        ("diff", ["--cached"]) | ("diff", ["--staged"]) => RouteDecision::Route {
-            tool: "git",
-            args: json!({ "op": "diff", "spec": "staged" }),
-        },
+        "log" => log_route(rest),
+        "diff" => diff_route(rest),
         _ => RouteDecision::Exec,
+    }
+}
+
+/// `git log`'s routable shapes: bare, `-N`/`-n N` limit, a single revision or
+/// `A..B` range, and an optional `-- <paths>` pathspec tail, any of which may
+/// combine. Any other flag (`--oneline`, `-p`, `--author=…`, …) gates.
+fn log_route(rest: &[&str]) -> RouteDecision {
+    let mut limit = None;
+    let mut i = 0;
+    if let Some(&"-n") = rest.first() {
+        let Some(n) = rest.get(1).and_then(|n| n.parse::<u64>().ok()) else {
+            return RouteDecision::Exec;
+        };
+        limit = Some(n);
+        i = 2;
+    } else if let Some(flag) = rest.first() {
+        if let Some(n) = parse_log_limit(flag) {
+            limit = Some(n);
+            i = 1;
+        }
+    }
+    let revision = match rest.get(i) {
+        Some(tok) if *tok != "--" && !tok.starts_with('-') => {
+            i += 1;
+            Some(*tok)
+        }
+        _ => None,
+    };
+    let paths = match rest.get(i) {
+        Some(&"--") => &rest[i + 1..],
+        None => &[][..],
+        Some(_) => return RouteDecision::Exec,
+    };
+    if paths.iter().any(|p| p.is_empty()) {
+        return RouteDecision::Exec;
+    }
+    let mut args = serde_json::Map::new();
+    args.insert("op".into(), json!("log"));
+    if let Some(limit) = limit {
+        args.insert("limit".into(), json!(limit));
+    }
+    if let Some(rev) = revision {
+        args.insert("revision".into(), json!(rev));
+    }
+    if !paths.is_empty() {
+        args.insert("paths".into(), json!(paths));
+    }
+    RouteDecision::Route {
+        tool: "git",
+        args: Value::Object(args),
+    }
+}
+
+/// `git diff`'s routable shapes: bare, `--cached`/`--staged`, zero/one/two
+/// revisions, an optional `--stat`, and an optional `-- <paths>` pathspec
+/// tail, any of which may combine. Any other flag (`--word-diff`, `-p`,
+/// `--name-only`, …) gates.
+fn diff_route(rest: &[&str]) -> RouteDecision {
+    let stat = rest.contains(&"--stat");
+    let rest: Vec<&str> = rest.iter().copied().filter(|t| *t != "--stat").collect();
+    let rest = rest.as_slice();
+    if let [flag] = rest {
+        if *flag == "--cached" || *flag == "--staged" {
+            let mut args = serde_json::Map::new();
+            args.insert("op".into(), json!("diff"));
+            args.insert("spec".into(), json!("staged"));
+            if stat {
+                args.insert("stat".into(), json!(true));
+            }
+            return RouteDecision::Route {
+                tool: "git",
+                args: Value::Object(args),
+            };
+        }
+    }
+    let mut i = 0;
+    let mut revs: Vec<&str> = Vec::new();
+    while revs.len() < 2 {
+        match rest.get(i) {
+            Some(tok) if *tok != "--" && !tok.starts_with('-') => {
+                revs.push(tok);
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let paths = match rest.get(i) {
+        Some(&"--") => &rest[i + 1..],
+        None => &[][..],
+        Some(_) => return RouteDecision::Exec,
+    };
+    if paths.iter().any(|p| p.is_empty()) {
+        return RouteDecision::Exec;
+    }
+    let mut args = serde_json::Map::new();
+    args.insert("op".into(), json!("diff"));
+    match revs.as_slice() {
+        [] => {}
+        [a] => {
+            args.insert("rev".into(), json!(a));
+        }
+        [a, b] => {
+            args.insert("rev".into(), json!(a));
+            args.insert("rev2".into(), json!(b));
+        }
+        _ => unreachable!("capped at 2 by the while loop"),
+    }
+    if stat {
+        args.insert("stat".into(), json!(true));
+    }
+    if !paths.is_empty() {
+        args.insert("paths".into(), json!(paths));
+    }
+    RouteDecision::Route {
+        tool: "git",
+        args: Value::Object(args),
     }
 }
 
@@ -470,25 +566,27 @@ mod tests {
     }
 
     /// Item 1 of the routing-honesty job: a routed call must never drop an
-    /// operand. `git status -s` used to silently route as bare `status`
-    /// (changed on purpose here — it now gates, since the embedded op has no
-    /// way to honor `-s`'s short format). `git log`/`git diff` get an EXACT
-    /// translation table for the shapes the embedded tool can honour
-    /// (`limit`, `spec: staged`); every other operand gates to exec instead
-    /// of silently answering a different question with `ok: true`.
+    /// operand. `git status -s` gates (no embedded way to honor `-s`'s short
+    /// format). `git log`/`git diff` get an EXACT translation table for the
+    /// shapes the embedded tool can honour; every other operand gates to
+    /// exec instead of silently answering a different question with
+    /// `ok: true`.
     #[test]
     fn git_read_routes_never_drop_an_operand() {
         assert_eq!(classify("git status -s"), RouteDecision::Exec);
         assert_eq!(classify("git status --porcelain"), RouteDecision::Exec);
-        assert_eq!(classify("git log A..B"), RouteDecision::Exec);
-        assert_eq!(classify("git log --oneline"), RouteDecision::Exec);
-        assert_eq!(classify("git diff --stat x"), RouteDecision::Exec);
-        assert_eq!(classify("git diff HEAD~1"), RouteDecision::Exec);
         assert_eq!(
             classify("git diff --cached"),
             RouteDecision::Route {
                 tool: "git",
                 args: json!({ "op": "diff", "spec": "staged" }),
+            }
+        );
+        assert_eq!(
+            classify("git diff --cached --stat"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "diff", "spec": "staged", "stat": true }),
             }
         );
         assert_eq!(
@@ -512,6 +610,123 @@ mod tests {
                 args: json!({ "op": "log", "limit": 5 }),
             }
         );
+    }
+
+    /// The engine now serves a revision/range, an optional pathspec tail, and
+    /// (for diff) `--stat` — this job's whole point (#2482). Each shape
+    /// routes to the exact args the engine needs; nothing is dropped.
+    #[test]
+    fn git_read_routes_now_serve_revisions_pathspecs_and_stat() {
+        assert_eq!(
+            classify("git log A..B"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "revision": "A..B" }),
+            }
+        );
+        assert_eq!(
+            classify("git log HEAD~3"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "revision": "HEAD~3" }),
+            }
+        );
+        assert_eq!(
+            classify("git log -5 A..B -- src/lib.rs"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({
+                    "op": "log",
+                    "limit": 5,
+                    "revision": "A..B",
+                    "paths": ["src/lib.rs"],
+                }),
+            }
+        );
+        assert_eq!(
+            classify("git log -- src/lib.rs docs/"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "paths": ["src/lib.rs", "docs/"] }),
+            }
+        );
+        assert_eq!(
+            classify("git diff HEAD~1"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "diff", "rev": "HEAD~1" }),
+            }
+        );
+        assert_eq!(
+            classify("git diff A B"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "diff", "rev": "A", "rev2": "B" }),
+            }
+        );
+        assert_eq!(
+            classify("git diff A..B"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "diff", "rev": "A..B" }),
+            }
+        );
+        assert_eq!(
+            classify("git diff --stat"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "diff", "stat": true }),
+            }
+        );
+        assert_eq!(
+            classify("git diff --stat HEAD~1 -- src/lib.rs"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({
+                    "op": "diff",
+                    "rev": "HEAD~1",
+                    "stat": true,
+                    "paths": ["src/lib.rs"],
+                }),
+            }
+        );
+        // `A...B` (symmetric diff) and a bare token that also names a
+        // worktree path are both still positionally routed as a `revision` /
+        // `rev` — the router stays pure (no fs access) and unchanged; it is
+        // the embedded git engine that now tells these two apart from an
+        // ordinary revision and refuses them honestly instead of silently
+        // answering the wrong question or failing with "could not resolve
+        // commit".
+        assert_eq!(
+            classify("git log HEAD~1...HEAD"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "revision": "HEAD~1...HEAD" }),
+            }
+        );
+        assert_eq!(
+            classify("git log src/lib.rs"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "revision": "src/lib.rs" }),
+            }
+        );
+    }
+
+    /// Near-misses that must STAY refused: the engine has no way to honor a
+    /// presentation flag, more than two revisions, or an empty pathspec, so
+    /// answering with a routed call would silently answer a different
+    /// question.
+    #[test]
+    fn git_read_routes_still_gate_unservable_shapes() {
+        assert_eq!(classify("git log --oneline"), RouteDecision::Exec);
+        assert_eq!(classify("git log -p"), RouteDecision::Exec);
+        assert_eq!(classify("git log -p A..B"), RouteDecision::Exec);
+        assert_eq!(classify("git diff --word-diff"), RouteDecision::Exec);
+        assert_eq!(classify("git diff --name-only"), RouteDecision::Exec);
+        assert_eq!(classify("git diff A B C"), RouteDecision::Exec);
+        assert_eq!(classify("git log --all"), RouteDecision::Exec);
+        assert_eq!(classify("git diff --numstat"), RouteDecision::Exec);
     }
 
     #[test]

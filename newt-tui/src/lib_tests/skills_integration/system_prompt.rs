@@ -120,6 +120,10 @@ fn default_soul_no_longer_hardcodes_a_plan_path() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn registered_agents_provider_block_reaches_prompt() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect (Config::resolve().publish_runtime_settings());
+    // hold the guard for the whole test, not just its assertions.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     // A registered AgentsProvider should compose its instruction block into
     // the assembled system prompt via build_system_prompt_additions.
     let dir = tempfile::TempDir::new().unwrap();

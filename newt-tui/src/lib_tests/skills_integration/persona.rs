@@ -228,6 +228,9 @@ fn seeded_personal_assistant_binds_gila_skill() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn persona_set_starts_fresh_conversation_with_overlay() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect; hold the guard for the whole test.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().to_str().unwrap();
     let persona_dir = tmp.path().join("personas");
@@ -253,7 +256,6 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
         .unwrap();
     newt_core::agentic::PlanModeControl::set_plan_mode(&mode_states.plan, true).unwrap();
 
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let message = {
         let mut ctx = ConversationResetContext {
             memory: &mut memory,
@@ -298,6 +300,9 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn new_conversation_preserves_active_persona() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect; hold the guard for the whole test.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().to_str().unwrap();
     let mut memory = newt_core::MemoryManager::new();
