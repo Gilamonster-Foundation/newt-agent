@@ -138,6 +138,7 @@ fn run(terminal: &mut InlineTerm, batch: &str, hint: &str) -> io::Result<ReadOut
     }
 }
 
+#[cfg(unix)]
 /// Present the modal on the terminal `terminal` already occupies (the
 /// cockpit's saved real terminal — the presenter owns row reservation and
 /// cleanup; this loop owns input until dismissal). The `_inline`
