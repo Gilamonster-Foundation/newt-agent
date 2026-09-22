@@ -2017,11 +2017,83 @@ pub(crate) fn permission_panel_lines(
     rows
 }
 
+/// Parse the flat, pre-chain `PermissionRecord` lines out of a JSONL body
+/// (one JSON object per line, no [`newt_core::event_journal::JournalLine`]
+/// envelope). Unparseable lines are dropped — they are not part of a chain
+/// to report a break against, since this body predates the chain entirely.
+fn flat_permission_records(body: &str) -> Vec<newt_core::PermissionRecord> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// One `/permissions audit` row; chained and unchained history share it.
+fn audit_row(rec: &newt_core::PermissionRecord) -> String {
+    format!(
+        "  {:<7} {:<9} {:<8} {} via {}",
+        rec.decision, rec.scope, rec.kind, rec.target, rec.tool
+    )
+}
+
+/// Render up to `limit` flat records as unchained-history rows, newest last
+/// (append order) — matches the labelling the chained rows below it use.
+fn push_unchained(out: &mut Vec<String>, records: &[newt_core::PermissionRecord], limit: usize) {
+    let show = if limit == 0 { records.len() } else { limit };
+    for rec in records.iter().take(show) {
+        out.push(format!("{} (unchained)", audit_row(rec)));
+    }
+}
+
+/// Report what the chain proves before anything it contains is presented as
+/// evidence — one header row per [`newt_core::permission_journal::ChainBreak`],
+/// mirroring `newt ocap denials`' `render_integrity`
+/// (`newt-cli/src/ocap_cmd.rs`).
+fn push_chain_breaks(
+    out: &mut Vec<String>,
+    breaks: &[newt_core::permission_journal::ChainBreak],
+    anchored: bool,
+) {
+    use newt_core::permission_journal::ChainBreak;
+    if breaks.is_empty() {
+        return;
+    }
+    let anchor = if anchored {
+        "anchored to the stored head"
+    } else {
+        "no stored head ref, so removal from the END was NOT checked"
+    };
+    out.push(format!(
+        "!! CHAIN BROKEN — this permission log does not verify ({} problem(s); {anchor}).",
+        breaks.len()
+    ));
+    for br in breaks {
+        out.push(match br {
+            ChainBreak::Edited { index } => {
+                format!("!!   record {index}: edited — its bytes no longer match its own address")
+            }
+            ChainBreak::Unreadable { index } => {
+                format!("!!   record {index}: its address does not parse")
+            }
+            ChainBreak::BrokenLink { index } => format!(
+                "!!   record {index}: broken link — a record before it was deleted or reordered"
+            ),
+            ChainBreak::NotAChain { index } => {
+                format!("!!   record {index}: not a single-parent chain link")
+            }
+            ChainBreak::Truncated { expected_head } => format!(
+                "!!   truncated — the chain no longer reaches the stored head {expected_head}"
+            ),
+        });
+    }
+}
+
 /// Parse the permission log into human-readable audit rows (newest-first).
 ///
-/// Malformed lines are skipped so a corrupt log never blocks the `/permissions
-/// audit` path. An empty or unreadable log returns a one-line user-facing
-/// message instead.
+/// #2529 round 2 (items 1–4): a tampered chain never renders like genuine
+/// history, and a pre-chain body — whether rotated aside to `.pre-chain` or
+/// still sitting unrotated in the log itself — is shown as unchained history
+/// rather than silently vanishing.
 pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -> Vec<String> {
     let body = match std::fs::read_to_string(log_path) {
         Ok(body) => body,
@@ -2033,28 +2105,69 @@ pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -
         }
     };
 
-    let records: Vec<newt_core::PermissionRecord> = body
-        .lines()
-        .filter_map(|line| serde_json::from_str::<newt_core::PermissionRecord>(line).ok())
-        .collect();
+    let mut out = Vec::new();
+    let chained = newt_core::permission_journal::read_jsonl(&body);
 
+    // Item 4: not yet rotated — the whole file is still a flat pre-chain
+    // body. Detected on read, not by a write-time flag.
+    if chained.is_empty() && !body.trim().is_empty() {
+        let unchained = flat_permission_records(&body);
+        if !unchained.is_empty() {
+            out.push(
+                "pre-chain migration: this log has not been rotated onto the chain yet — \
+                 the lines below carry no integrity guarantee"
+                    .to_string(),
+            );
+            push_unchained(&mut out, &unchained, limit);
+            return out;
+        }
+    }
+
+    // Item 3: an unparseable line is a chain break, not a silent skip.
+    let raw_lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+    let unparseable = raw_lines.saturating_sub(chained.len());
+    let head = newt_core::permission_journal::read_head(log_path);
+    let mut breaks = newt_core::permission_journal::verify_chain(&chained, head.as_deref());
+    breaks.extend((0..unparseable).map(|_| {
+        newt_core::permission_journal::ChainBreak::Unreadable {
+            index: chained.len(),
+        }
+    }));
+    // Item 2: a header row per break, before any record renders.
+    push_chain_breaks(&mut out, &breaks, head.is_some());
+
+    // Item 1: a rotated pre-chain sibling exists — say so, and render its
+    // lines (within `limit`) as unchained history.
+    let pre_chain_path = newt_core::permission_journal::pre_chain_path(log_path);
+    if let Ok(pre_body) = std::fs::read_to_string(&pre_chain_path) {
+        let unchained = flat_permission_records(&pre_body);
+        if !unchained.is_empty() {
+            out.push(format!(
+                "pre-chain migration: {} holds the earlier lines",
+                pre_chain_path.display()
+            ));
+            push_unchained(&mut out, &unchained, limit);
+        }
+    }
+
+    let records = newt_core::permission_journal::records(&chained);
     if records.is_empty() {
-        return vec!["no permission log entries yet".to_string()];
+        if out.is_empty() {
+            out.push("no permission log entries yet".to_string());
+        }
+        return out;
     }
 
     let show = if limit == 0 { records.len() } else { limit };
     let shown = records.len().min(show);
-    let mut lines = vec![format!(
+    out.push(format!(
         "permission audit: {shown} of {} (newest first)",
         records.len()
-    )];
+    ));
     for rec in records.iter().rev().take(show) {
-        lines.push(format!(
-            "  {:<7} {:<9} {:<8} {} via {}",
-            rec.decision, rec.scope, rec.kind, rec.target, rec.tool
-        ));
+        out.push(audit_row(rec));
     }
-    lines
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,6 +2236,30 @@ fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
         "*",
         "full-access",
         "session",
+    )
+}
+
+/// Contract honesty (#2532 review, item 3): the ONE `ocap-store-folded` line
+/// written to the #263 permission log at session start when
+/// `fold_ocap_approvals` actually widened something — so `/permissions` (and
+/// the audit trail) can show provenance for a caveat the operator did not
+/// grant THIS session, matching headless's contract-record receipt for the
+/// same fold. `target` carries the count rather than a single axis/target,
+/// since the fold is many grants folded in one step; `scope: "durable-store"`
+/// distinguishes it from a `session`/`durable` (`/permissions`-promoted)
+/// grant. Only called when `folded_count > 0` — a log line for zero folds is
+/// noise, not audit.
+fn ocap_store_folded_record(
+    conversation_id: &str,
+    folded_count: usize,
+) -> newt_core::PermissionRecord {
+    newt_core::PermissionRecord::new(
+        conversation_id,
+        "session",
+        newt_core::DenialKind::Exec,
+        &format!("{folded_count} durable grant(s)"),
+        "allow",
+        "durable-store",
     )
 }
 

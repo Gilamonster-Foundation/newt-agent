@@ -151,6 +151,43 @@ pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Opti
     request_policy.evaluate(class_for(kind)?, target)
 }
 
+/// Fold a VERIFIED store's `approve.toml` entries into `(DenialKind, target)`
+/// grants — the shape [`crate::widen_caveats`] / a session's `durable_grants`
+/// set already consumes (#2524 item 1). Only the `Approve` verdict grants
+/// anything (deny/ask/passkey never widen); callers MUST pass a `set` that has
+/// already gone through [`verify_approves`] with a real verifier, so an
+/// unsigned or bad-signature entry is never here to begin with — this
+/// function does no signature checking itself, it only re-shapes what
+/// survived verification.
+///
+/// A read-only `[[fs]]` entry (`write = false`/absent) yields one `FsRead`
+/// grant; `write = true` yields both `FsRead` and `FsWrite` (a write grant
+/// implies read, matching [`lock_fs_to_workspace`]'s convention). `exec`/`net`
+/// entries map 1:1 onto their axis. This NEVER widens past what the signature
+/// covers: it is a pure re-listing of exactly the verified entries, and the
+/// caller composes the result with [`crate::widen_caveats`] (which only
+/// inserts into an already-`Only` scope — an axis already `All` is untouched,
+/// so folding can never turn a fenced axis open).
+pub fn approved_grants(set: &PolicySet) -> Vec<(DenialKind, String)> {
+    let Some(approve) = set.files.get(&Verdict::Approve) else {
+        return Vec::new();
+    };
+    let mut grants = Vec::new();
+    for entry in &approve.exec {
+        grants.push((DenialKind::Exec, entry.target.clone()));
+    }
+    for entry in &approve.fs {
+        grants.push((DenialKind::FsRead, entry.path.clone()));
+        if entry.write {
+            grants.push((DenialKind::FsWrite, entry.path.clone()));
+        }
+    }
+    for entry in &approve.net {
+        grants.push((DenialKind::Net, entry.host.clone()));
+    }
+    grants
+}
+
 /// Bless an `approve.toml` (pure; the write half of #1207): re-sign EVERY entry
 /// with the operator's root key — the ceremony behind `newt doctor --sign-ocap`,
 /// where a present human explicitly vouches for the file as it stands (that
@@ -373,6 +410,53 @@ mod tests {
         let (set, warnings) = build_store(&[(Verdict::Approve, None), (Verdict::Deny, None)]);
         assert!(warnings.is_empty());
         assert_eq!(evaluate_request(&set, DenialKind::Exec, "anything"), None);
+    }
+
+    /// #2524 item 1: `approved_grants` re-shapes exactly the Approve verdict's
+    /// entries, one `FsRead` per `[[fs]]` entry plus a second `FsWrite` only
+    /// when `write = true` (a write grant implies read); it never reads
+    /// deny/ask/passkey (those never grant anything).
+    #[test]
+    fn approved_grants_lists_approve_entries_and_never_the_narrowing_verdicts() {
+        let (set, warnings) = build_store(&[
+            (
+                Verdict::Approve,
+                Some(
+                    "[[exec]]\ntarget = \"cargo\"\n\
+                     [[fs]]\npath = \"/ro\"\n\
+                     [[fs]]\npath = \"/rw\"\nwrite = true\n\
+                     [[net]]\nhost = \"example.test\"\n"
+                        .to_string(),
+                ),
+            ),
+            (
+                Verdict::Deny,
+                Some("[[exec]]\ntarget = \"rm\"\n".to_string()),
+            ),
+        ]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut grants = approved_grants(&set);
+        grants.sort();
+        let mut expected = vec![
+            (DenialKind::Exec, "cargo".to_string()),
+            (DenialKind::FsRead, "/ro".to_string()),
+            (DenialKind::FsRead, "/rw".to_string()),
+            (DenialKind::FsWrite, "/rw".to_string()),
+            (DenialKind::Net, "example.test".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(grants, expected, "must never include the denied `rm`");
+    }
+
+    #[test]
+    fn approved_grants_of_an_empty_or_approve_less_store_is_empty() {
+        assert!(approved_grants(&PolicySet::default()).is_empty());
+        let (set, warnings) = build_store(&[(
+            Verdict::Deny,
+            Some("[[exec]]\ntarget = \"rm\"\n".to_string()),
+        )]);
+        assert!(warnings.is_empty());
+        assert!(approved_grants(&set).is_empty());
     }
 
     /// The pure verifier double: accepts exactly one signature value.

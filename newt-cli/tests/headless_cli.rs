@@ -1629,6 +1629,114 @@ fn streamed_read_file_call(id: &str) -> String {
     .collect()
 }
 
+/// A streamed `lifecycle` call with the given raw (already-JSON) arguments.
+fn streamed_lifecycle_call(args_json: &str) -> String {
+    let escaped = args_json.replace('\\', "\\\\").replace('"', "\\\"");
+    [
+        format!(
+            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"lifecycle","arguments":"{escaped}"}}}}]}}}}]}}"#
+        ),
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "[DONE]".to_string(),
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect()
+}
+
+/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
+/// `lifecycle action=build` does headless, where `permission_gate` is
+/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
+/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
+/// fs_write fenced to the workspace/scratch) already dominate what
+/// `build_tool_request` calibrates for the build (fenced reads, a
+/// workspace-scoped write root, network denied), so `build.leq(caveats)`
+/// is true and the `permission_gate.is_some_and(...)` check — the only
+/// place a `None` gate could matter — is never reached at all. The
+/// absent-gate case this review item worried about does not occur in
+/// practice under headless's actual default caveats.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed_lifecycle_call(r#"{"phase":"test","action":"build"}"#),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    // An empty `Cargo.toml` is enough for the Rust language pack's `detect`
+    // marker (tooling.rs), so `phase=test` resolves to a real command
+    // instead of the "no command configured" no-op.
+    std::fs::write(workspace.path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
+    let config_path = workspace.path().join("headless.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "strict"
+
+[[backends]]
+name = "strict"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write headless config");
+    std::fs::write(&instruction_path, "Verify the change builds.\n")
+        .expect("write headless instruction");
+
+    let _ = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert();
+
+    let result = solve_result_from(&events_path);
+    let trajectory = result["trajectory"].as_array().expect("trajectory");
+    assert!(
+        !trajectory.is_empty(),
+        "at least one dispatched call: {result}"
+    );
+    for entry in trajectory {
+        assert_eq!(entry["tool"], "lifecycle", "{entry}");
+        assert_eq!(entry["ok"], false, "{entry}");
+    }
+    // MEASURED (not the brief's assumption): with headless's default caveats
+    // (`confined_bench_caveats` — fs_read/exec/net = Scope::All, only
+    // fs_write fenced to the workspace/scratch), `build.leq(caveats)` is
+    // already TRUE — the calibrated build caveats (fenced reads,
+    // workspace-scoped writes, denied network) are a subset of what headless
+    // already grants. So the `!build.leq(caveats)` gate check never fires and
+    // `permission_gate` is never consulted: the command actually RUNS.
+    // "denied" never appears; the FIRST call's real execution classifies as
+    // "failed" (this workspace's empty `Cargo.toml` makes the real `cargo
+    // test` fail to compile) — a genuine command outcome, not a capability
+    // refusal. Later identical retries are deduplicated and carry no
+    // `execution` (not re-run), which is why only entry 0 is checked here.
+    // The pinned property is "never denied for want of a gate"; whether the
+    // confined lane can run at all is per platform (Windows reports
+    // `unavailable`), so the concrete "failed" is asserted on Linux only.
+    assert_ne!(trajectory[0]["execution"], "denied", "{}", trajectory[0]);
+    #[cfg(target_os = "linux")]
+    assert_eq!(trajectory[0]["execution"], "failed", "{}", trajectory[0]);
+}
+
 /// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool call
 /// whose id is not a string, which cannot be read at all) is the model's answer,
 /// so the headless contract files it `model_error`. Its class used to be lost
@@ -2232,5 +2340,172 @@ async fn an_idless_reask_round_is_counted_by_the_brake_and_does_not_reset_it() {
         requests.lock().expect("capture").len(),
         3,
         "the write, then two re-asked rounds; the stop precedes a third"
+    );
+}
+
+/// #2524 item 1, end-to-end: a signed `~/.newt/ocap/approve.toml` `[[fs]]`
+/// read grant for a path OUTSIDE the workspace is admitted into a real
+/// `newt headless` run's caveats and is visible on the contract record's
+/// `effective_config.durable_grants` (the observability requirement).
+/// Isolated via `common::newt()` (a throwaway `$HOME`); the signing key and
+/// store live ONLY under that throwaway `.newt/`, never the real one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_contract() {
+    const CLAIM: &str = "FINAL-CLAIM-2524-ocap-grant";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": CLAIM}, "finish_reason": "stop"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = common::newt();
+    let home = cmd.home().to_path_buf();
+    common::isolate_loopback_chat(&mut *cmd, &home);
+    let config_dir = cmd.config_dir();
+
+    // The disposable ROOT identity + a signed approve entry for a path
+    // outside the workspace — never the real `~/.newt/identity.pem`.
+    let key = newt_identity::UserKey::generate();
+    let identity_path = config_dir.join("identity.pem");
+    key.save(&identity_path).expect("save disposable root key");
+    let ocap_dir = config_dir.join("ocap");
+    std::fs::create_dir_all(&ocap_dir).expect("ocap dir");
+    let granted_path = home.join("outside-canvas-token");
+    std::fs::write(&granted_path, "token\n").expect("write outside file");
+    let mut file = newt_core::ocap_store::PolicyFile::parse(&format!(
+        // A TOML literal string: a Windows path's `\U…` is not an escape.
+        "[[fs]]\npath = '{}'\n",
+        granted_path.display()
+    ))
+    .expect("parse approve.toml");
+    let (signed, refused) = newt_core::ocap_store::sign_approves(
+        &mut file,
+        |_, _| false,
+        |payload| key.sign(payload).to_bytes(),
+    );
+    assert_eq!(signed, 1);
+    assert!(refused.is_empty());
+    std::fs::write(
+        ocap_dir.join("approve.toml"),
+        file.to_toml().expect("serialize approve.toml"),
+    )
+    .expect("write approve.toml");
+
+    let workspace = home.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let config_path = home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = home.join("task.md");
+    std::fs::write(&instruction, "Finish without calling a tool.\n").expect("instruction");
+    let events_path = home.join("events.jsonl");
+
+    // The default `--confined` lane (no `--smart-harness`, which needs an
+    // auxiliary model this test has no business provisioning): `fs_read`
+    // starts `Scope::All` there, so this proves the OBSERVABILITY half (the
+    // admitted grant is on the contract record) with a real binary; the
+    // fenced-widening half is proved by the mocked unit test
+    // `fold_ocap_grants_widens_a_fenced_axis_but_never_touches_an_open_one`
+    // (`newt-cli/src/headless.rs`), which exercises the same fenced axis the
+    // smart lane narrows to, without needing a live auxiliary.
+    cmd.arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(&workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+
+    let contract = contract_from(&events_path);
+    let durable_grants = contract["effective_config"]["durable_grants"]
+        .as_array()
+        .expect("durable_grants stanza present when a grant was admitted");
+    // #2532 review, item 3: this grant folds into fs_read's already-`All`
+    // confined-lane axis, so it changed nothing — the contract labels it a
+    // no-op rather than implying the signature is why the read worked.
+    assert_eq!(
+        durable_grants,
+        &vec![serde_json::json!(format!(
+            "fs_read:{} (no-op: already permitted)",
+            granted_path.display()
+        ))],
+        "{contract}"
+    );
+}
+
+/// #2532 review, should-fix 1, RED FIRST: a headless run with NO existing
+/// `identity.pem` in its config dir must leave none behind — reading the OCAP
+/// store must never mint the operator's root key as a side effect. Before the
+/// fix, `resolve_ocap_store` called `newt_identity::load_or_generate`, which
+/// writes a fresh key on first read; a headless run on a bare host/CI/scratch
+/// `--config-dir` would silently root every later `sign-ocap` on that host in
+/// a key nobody chose.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_reading_the_ocap_store_never_mints_an_identity_key() {
+    const CLAIM: &str = "FINAL-CLAIM-2532-no-mint";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": CLAIM}, "finish_reason": "stop"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = common::newt();
+    let home = cmd.home().to_path_buf();
+    common::isolate_loopback_chat(&mut *cmd, &home);
+    let config_dir = cmd.config_dir();
+    let identity_path = config_dir.join("identity.pem");
+    assert!(!identity_path.exists(), "no key before the run");
+
+    let workspace = home.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let config_path = home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = home.join("task.md");
+    std::fs::write(&instruction, "Finish without calling a tool.\n").expect("instruction");
+    let events_path = home.join("events.jsonl");
+
+    cmd.arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(&workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+
+    assert!(
+        !identity_path.exists(),
+        "reading the OCAP store must never mint identity.pem"
+    );
+    let contract = contract_from(&events_path);
+    assert!(
+        contract["effective_config"]["durable_grants"].is_null(),
+        "no key on disk means no approves, not a freshly-minted empty store: {contract}"
     );
 }

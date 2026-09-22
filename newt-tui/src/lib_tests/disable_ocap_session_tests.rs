@@ -113,12 +113,11 @@ fn ocap_disabled_record_is_the_issue_shape_and_appends() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("permission-log.jsonl");
-    rec.append_jsonl(&path).unwrap();
+    newt_core::permission_journal::append_record(&path, rec.clone()).unwrap();
     let body = std::fs::read_to_string(&path).unwrap();
-    let lines: Vec<&str> = body.lines().collect();
+    let lines = newt_core::permission_journal::read_jsonl(&body);
     assert_eq!(lines.len(), 1);
-    let parsed: newt_core::PermissionRecord = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(parsed, rec);
+    assert_eq!(newt_core::permission_journal::records(&lines)[0], rec);
 }
 
 /// `--full-access`: the banner is unmissable and names the mechanism —
@@ -153,12 +152,11 @@ fn full_access_record_is_the_session_shape_and_appends() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("permission-log.jsonl");
-    rec.append_jsonl(&path).unwrap();
+    newt_core::permission_journal::append_record(&path, rec.clone()).unwrap();
     let body = std::fs::read_to_string(&path).unwrap();
-    let lines: Vec<&str> = body.lines().collect();
+    let lines = newt_core::permission_journal::read_jsonl(&body);
     assert_eq!(lines.len(), 1);
-    let parsed: newt_core::PermissionRecord = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(parsed, rec);
+    assert_eq!(newt_core::permission_journal::records(&lines)[0], rec);
 }
 
 /// `--full-access` / NEWT_FULL_ACCESS=1: `policy_for` builds the session

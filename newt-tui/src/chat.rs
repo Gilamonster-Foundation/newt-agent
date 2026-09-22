@@ -1994,6 +1994,28 @@ fn session_body(
             print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
         }
         permission_state.ocap_policy = policy;
+        // #2524 item 1: fold the just-verified approve-store entries into the
+        // recalled durable grants so a signed `[[fs]]`/`[[exec]]`/`[[net]]`
+        // grant reaches `recalled_caveats` (and hence `startup_caveats` below,
+        // which a spawned MCP child inherits) — not just the prompt-time
+        // pre-answer `evaluate_request` already gave it. `load_store` already
+        // dropped any unsigned/bad-signature entry loudly above, so this can
+        // never fold in anything unverified.
+        let folded = permission_state.fold_ocap_approvals();
+        if folded > 0 {
+            if let Some(path) = permission_log_path.as_deref() {
+                if let Err(e) = newt_core::permission_journal::append_record(
+                    path,
+                    ocap_store_folded_record(&active_conversation_id, folded),
+                ) {
+                    print_newt(
+                        &format!("warning: permission log write failed: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+        }
     }
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
@@ -2033,7 +2055,10 @@ fn session_body(
     if newt_core::agentic::ocap_disabled() {
         print_newt(&ocap_disabled_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
-            if let Err(e) = ocap_disabled_record(&active_conversation_id).append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(
+                path,
+                ocap_disabled_record(&active_conversation_id),
+            ) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
@@ -2048,7 +2073,10 @@ fn session_body(
     if newt_core::agentic::full_access_requested() {
         print_newt(&full_access_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
-            if let Err(e) = full_access_record(&active_conversation_id).append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(
+                path,
+                full_access_record(&active_conversation_id),
+            ) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
