@@ -2033,10 +2033,8 @@ pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -
         }
     };
 
-    let records: Vec<newt_core::PermissionRecord> = body
-        .lines()
-        .filter_map(|line| serde_json::from_str::<newt_core::PermissionRecord>(line).ok())
-        .collect();
+    let records =
+        newt_core::permission_journal::records(&newt_core::permission_journal::read_jsonl(&body));
 
     if records.is_empty() {
         return vec!["no permission log entries yet".to_string()];

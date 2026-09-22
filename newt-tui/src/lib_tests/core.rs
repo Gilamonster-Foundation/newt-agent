@@ -1535,13 +1535,38 @@ fn slash_workspace_returns_true() {
 fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("permission-log.jsonl");
-    std::fs::write(
+    newt_core::permission_journal::append_record(
         &path,
-        "\
-{\"ts_claim\":\"t0\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"exec\",\"target\":\"/bin/echo\",\"decision\":\"allow\",\"scope\":\"session\"}\n\
-this is not json\n\
-{\"ts_claim\":\"t1\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"net\",\"target\":\"https://example.com\",\"decision\":\"deny\",\"scope\":\"once\"}\n\
-",
+        newt_core::PermissionRecord::new(
+            "c",
+            "run_command",
+            newt_core::DenialKind::Exec,
+            "/bin/echo",
+            "allow",
+            "session",
+        ),
+    )
+    .unwrap();
+    // An interrupted append mid-chain: skipped by the reader, but not hidden
+    // from the chain — the record after it loses its parent.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(f, "this is not json").unwrap();
+    }
+    newt_core::permission_journal::append_record(
+        &path,
+        newt_core::PermissionRecord::new(
+            "c",
+            "run_command",
+            newt_core::DenialKind::Net,
+            "https://example.com",
+            "deny",
+            "once",
+        ),
     )
     .unwrap();
 
