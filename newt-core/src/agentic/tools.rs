@@ -2734,10 +2734,13 @@ async fn execute_authorized_tool(
 
     if remote_call {
         let Some(gate) = permission_gate else {
-            return host_return(format!(
-                "MCP tool `{name}` requires OCAP permission, but no interactive permission gate is available. \
-                 Enable permission prompts in an interactive session, then retry."
-            ));
+            return host_return(executed((
+                format!(
+                    "MCP tool `{name}` requires OCAP permission, but no interactive permission gate is available. \
+                     Enable permission prompts in an interactive session, then retry."
+                ),
+                crate::ExecOutcome::Denied,
+            )));
         };
         let request = PermissionRequest {
             tool: name.to_string(),
@@ -2749,10 +2752,13 @@ async fn execute_authorized_tool(
             .then_some(McpGrant::HumanApproved);
         return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,
-            Err(_) => host_return(format!(
-                "MCP tool `{name}` was not run: OCAP permission was denied or cancelled. \
-                 Respect that decision; do not retry it through another tool."
-            )),
+            Err(_) => host_return(executed((
+                format!(
+                    "MCP tool `{name}` was not run: OCAP permission was denied or cancelled. \
+                     Respect that decision; do not retry it through another tool."
+                ),
+                crate::ExecOutcome::Denied,
+            ))),
         };
     }
 
@@ -4217,6 +4223,22 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
         || r.starts_with("capability denied:")
         || r.starts_with("unknown tool")
         || r.starts_with("no command configured"))
+}
+
+/// #2419: ground the ledgered `ok` bit in the dispatch OUTCOME before falling
+/// back to `tool_result_ok`'s text prefixes. A pre-dispatch MCP permission
+/// refusal (missing gate, denied/cancelled) sets `execution = Some(Denied)`
+/// without ever reaching the connector; that is authoritative non-success
+/// regardless of how the refusal happens to be worded, so no future refusal
+/// string can silently re-classify as `ok = true` by omitting a recognized
+/// prefix. Every other outcome (including `None`, the common case for
+/// built-ins that never touch the execution slot) keeps the existing
+/// text-based classification unchanged.
+pub(crate) fn tool_ok(result: &str, execution: Option<crate::ExecOutcome>) -> bool {
+    if execution == Some(crate::ExecOutcome::Denied) {
+        return false;
+    }
+    tool_result_ok(result)
 }
 
 // Private-source recovery is a composition invariant, not only a renderer
