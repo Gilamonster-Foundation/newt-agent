@@ -17,17 +17,30 @@ fn worktree_add_creates_a_worktree_git_accepts() {
             Path::new(".worktrees/feat-x"),
         )
         .unwrap();
-    assert_eq!(wt, p.join(".worktrees/feat-x"));
+    // Compare canonicalized PathBufs, not path strings: on Windows the
+    // engine's returned path can be a `\\?\`-verbatim form while
+    // `p.join(...)` is not, and casing/short-name forms differ too. Both
+    // sides exist on disk by now, so both can be canonicalized.
+    assert_eq!(
+        wt.canonicalize().unwrap(),
+        p.join(".worktrees/feat-x").canonicalize().unwrap()
+    );
 
-    // Real git agrees this is a worktree on the new branch.
+    // Real git agrees this is a worktree on the new branch. git's own
+    // porcelain output may print the path in yet another form (short names,
+    // forward vs. back slashes), so parse its "worktree <path>" line into a
+    // PathBuf and canonicalize that too rather than substring-matching text.
     let out = git_cmd(p)
         .args(["worktree", "list", "--porcelain"])
         .output()
         .unwrap();
     let listing = String::from_utf8_lossy(&out.stdout);
+    let git_reported_wt = listing
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree "))
+        .map(|s| PathBuf::from(s).canonicalize().unwrap());
     assert!(
-        listing.contains(&wt.canonicalize().unwrap().to_string_lossy().into_owned())
-            || listing.contains("feat-x"),
+        git_reported_wt == Some(wt.canonicalize().unwrap()) || listing.contains("feat-x"),
         "{listing}"
     );
     assert!(listing.contains("refs/heads/feat/x"), "{listing}");
@@ -171,6 +184,141 @@ fn worktree_add_refuses_a_dir_outside_the_work_tree() {
         .worktree_add(&GitCaveats::top(), "feat/outside", "HEAD", outside.path())
         .unwrap_err();
     assert!(matches!(err, GitError::Refused(_)), "{err}");
+}
+
+#[test]
+fn worktree_add_refuses_a_dotdot_escape() {
+    // #2531 round 2, finding 1: `dir` containment was checked lexically
+    // (`starts_with`), so `.worktrees/../../x` passed and create_dir_all
+    // made a dir OUTSIDE the workspace.
+    let dir = repo_with_commit();
+    let p = dir.path();
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let err = eng
+        .worktree_add(
+            &GitCaveats::top(),
+            "feat/escape",
+            "HEAD",
+            Path::new("../../etc/newt-worktree-escape"),
+        )
+        .unwrap_err();
+    assert!(matches!(err, GitError::Refused(_)), "{err}");
+    assert!(!p
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("etc/newt-worktree-escape")
+        .exists());
+    let branch_exists = git_cmd(p)
+        .args(["rev-parse", "--verify", "--quiet", "refs/heads/feat/escape"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!branch_exists, "no branch on a refused worktree-add");
+}
+
+#[test]
+fn worktree_add_refuses_a_symlinked_parent_escape() {
+    // #2531 round 2, finding 1: a `dir` whose existing parent is a symlink
+    // out of the work tree passes the lexical `starts_with` check.
+    let dir = repo_with_commit();
+    let p = dir.path();
+    let outside = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), p.join("escape-link")).unwrap();
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let err = eng
+        .worktree_add(
+            &GitCaveats::top(),
+            "feat/symlink-escape",
+            "HEAD",
+            Path::new("escape-link/sub"),
+        )
+        .unwrap_err();
+    assert!(matches!(err, GitError::Refused(_)), "{err}");
+    assert!(!outside.path().join("sub").exists());
+    let branch_exists = git_cmd(p)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/feat/symlink-escape",
+        ])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!branch_exists, "no branch on a refused worktree-add");
+}
+
+#[test]
+fn worktree_add_dedupes_admin_id_on_collision_without_touching_existing_dir() {
+    // #2531 round 2, finding 2: probe-by-exists then create_dir_all let two
+    // concurrent adds claim the same admin id. Pre-create an EMPTY
+    // `worktrees/task` admin dir out of band (as a racing add would have
+    // claimed it) and assert this add gets `task1` and leaves it untouched.
+    let dir = repo_with_commit();
+    let p = dir.path();
+    let common = p.join(".git");
+    let preexisting = common.join("worktrees").join("task");
+    std::fs::create_dir_all(&preexisting).unwrap();
+
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let wt = eng
+        .worktree_add(&GitCaveats::top(), "feat/task", "HEAD", Path::new("task"))
+        .unwrap();
+    assert_eq!(
+        wt.canonicalize().unwrap(),
+        p.join("task").canonicalize().unwrap()
+    );
+
+    assert!(
+        common.join("worktrees").join("task1").exists(),
+        "collision must be resolved with a numeric suffix"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&preexisting)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        entries.is_empty(),
+        "pre-existing admin dir must be left untouched: {entries:?}"
+    );
+}
+
+#[test]
+fn worktree_add_leaves_no_prunable_worktree() {
+    // Oracle addition: real git must see nothing stale to prune, and the
+    // new worktree's HEAD must match the base it was created from.
+    let dir = repo_with_commit();
+    let p = dir.path();
+    let base_head = rev_parse(p, "HEAD");
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let wt = eng
+        .worktree_add(
+            &GitCaveats::top(),
+            "feat/oracle",
+            "HEAD",
+            Path::new(".worktrees/oracle"),
+        )
+        .unwrap();
+
+    let prune = git_cmd(p)
+        .args(["worktree", "prune", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        prune.stdout.is_empty() && prune.stderr.is_empty(),
+        "stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&prune.stdout),
+        String::from_utf8_lossy(&prune.stderr)
+    );
+
+    let wt_head = git_cmd(&wt)
+        .args(["log", "-1", "--format=%H"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&wt_head.stdout).trim(), base_head);
 }
 
 #[test]

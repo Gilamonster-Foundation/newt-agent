@@ -1010,6 +1010,15 @@ impl GitEngine {
                 "branch '{branch}' already exists"
             )));
         }
+        if dir
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(GitError::Refused(format!(
+                "worktree dir '{}' must not contain '..'",
+                dir.display()
+            )));
+        }
         let work_tree = self.repo.work_tree.clone().ok_or(GitError::Unsupported(
             "cannot add a worktree to a bare repository",
         ))?;
@@ -1019,6 +1028,25 @@ impl GitEngine {
             work_tree.join(dir)
         };
         if !wt_path.starts_with(&work_tree) {
+            return Err(GitError::Refused(format!(
+                "worktree dir '{}' escapes the repository work tree",
+                dir.display()
+            )));
+        }
+        // The lexical `starts_with` above is fooled by a symlink anywhere in
+        // `dir`'s existing parent chain (`wt_path` itself doesn't exist yet,
+        // so it can't be canonicalized directly) — canonicalize the deepest
+        // existing ancestor instead and re-check containment against it.
+        let canonical_work_tree = work_tree.canonicalize().map_err(GitError::Io)?;
+        let mut existing_ancestor = wt_path.as_path();
+        while !existing_ancestor.exists() {
+            match existing_ancestor.parent() {
+                Some(parent) => existing_ancestor = parent,
+                None => break,
+            }
+        }
+        let canonical_ancestor = existing_ancestor.canonicalize().map_err(GitError::Io)?;
+        if !canonical_ancestor.starts_with(&canonical_work_tree) {
             return Err(GitError::Refused(format!(
                 "worktree dir '{}' escapes the repository work tree",
                 dir.display()
@@ -1034,10 +1062,7 @@ impl GitEngine {
         let base_tree = self.commit_tree(&base_oid)?;
 
         let common = grit_lib::worktree::common_git_dir(&self.repo.git_dir);
-        let id = unique_worktree_admin_id(&common, &wt_path);
-        let admin = common.join("worktrees").join(&id);
-
-        std::fs::create_dir_all(&admin).map_err(GitError::Io)?;
+        let admin = claim_worktree_admin_dir(&common, &wt_path).map_err(GitError::Io)?;
         std::fs::create_dir_all(&wt_path).map_err(GitError::Io)?;
         // Undo everything created so far on any failure below — no half-made
         // worktree is left for a caller to trip over.
@@ -1748,25 +1773,30 @@ impl newt_core::agentic::GitTool for LocalGitTool {
     }
 }
 
-/// Pick an unused `worktrees/<id>/` admin-dir name for a new worktree at
-/// `wt_path`, starting from grit's sanitized basename and appending a
+/// Atomically claim an unused `worktrees/<id>/` admin dir for a new worktree
+/// at `wt_path`, starting from grit's sanitized basename and appending a
 /// numeric suffix on collision (git's own `worktree_basename` + dedupe
-/// behaviour for `git worktree add`).
-fn unique_worktree_admin_id(common: &Path, wt_path: &Path) -> String {
+/// behaviour for `git worktree add`). Uses `create_dir` (not `_all`) as the
+/// claim itself — a probe-then-create would let two concurrent adds race
+/// onto the same id.
+fn claim_worktree_admin_dir(common: &Path, wt_path: &Path) -> std::io::Result<PathBuf> {
+    let worktrees_dir = common.join("worktrees");
+    std::fs::create_dir_all(&worktrees_dir)?;
     let base = grit_lib::worktree::sanitize_worktree_id_component(
         &grit_lib::worktree::worktree_path_basename(wt_path),
     );
-    let worktrees_dir = common.join("worktrees");
-    if !worktrees_dir.join(&base).exists() {
-        return base;
-    }
-    let mut n = 1u32;
+    let mut candidate = base.clone();
+    let mut n = 0u32;
     loop {
-        let candidate = format!("{base}{n}");
-        if !worktrees_dir.join(&candidate).exists() {
-            return candidate;
+        let admin = worktrees_dir.join(&candidate);
+        match std::fs::create_dir(&admin) {
+            Ok(()) => return Ok(admin),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                candidate = format!("{base}{n}");
+            }
+            Err(e) => return Err(e),
         }
-        n += 1;
     }
 }
 
