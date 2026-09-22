@@ -235,23 +235,23 @@ fn checkout_refuses_a_racily_clean_edit() {
     git(p, &["commit", "-q", "-m", "c2"]);
     git(p, &["checkout", "-q", "main"]);
     let eng = GitEngine::open(p, &Scope::All).unwrap();
-    std::fs::write(p.join("a.txt"), "dirty\n").unwrap(); // same size as "hello\n"
-                                                         // The index caches the edited file's stat against the OLD blob, and the
-                                                         // index file is stamped in the same instant: exactly a same-tick race.
+    // A same-size edit, backdated so writing the index cannot smudge the
+    // entry as racy on its own.
+    std::fs::write(p.join("a.txt"), "dirty\n").unwrap();
+    let edited = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    let set_mtime = |path: &std::path::Path| {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(edited).unwrap();
+    };
+    set_mtime(&p.join("a.txt"));
+    // The index caches the edited file's stat against the OLD blob, and the
+    // index file is stamped with the same instant: a same-tick race.
     let mut index = eng.repo.load_index().unwrap();
     let entry = index.get_mut(b"a.txt", 0).unwrap();
     *entry = grit_lib::index::entry_from_stat(&p.join("a.txt"), b"a.txt", entry.oid, entry.mode)
         .unwrap();
     eng.repo.write_index(&mut index).unwrap();
-    let edited = std::fs::metadata(p.join("a.txt"))
-        .unwrap()
-        .modified()
-        .unwrap();
-    let index_file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(p.join(".git/index"))
-        .unwrap();
-    index_file.set_modified(edited).unwrap();
+    set_mtime(&p.join(".git/index"));
     let err = eng
         .checkout(&GitCaveats::top(), "ahead", false)
         .unwrap_err();
