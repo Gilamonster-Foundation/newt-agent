@@ -522,8 +522,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let smart_enabled = args.smart_harness || smart_config.enabled;
     if lane == HeadlessLane::Confined {
         // Scratch is resolved ONCE, here: it builds the fence AND becomes the
-        // child's `TMPDIR` (the brush child does not inherit newt's env, so it
-        // would otherwise write `/tmp`, which a configured fence does not grant).
+        // child's `TMPDIR` (the brush child does not inherit newt's ambient env;
+        // the seam delivers this value, and without it the child's tools would
+        // fall back to the platform temp dir, which a configured fence need not
+        // grant).
         // Not for the smart lane, whose fence is workspace-only and whose callers
         // point temp at the workspace.
         let scratch = resolve_fence_scratch();
