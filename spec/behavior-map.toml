@@ -1465,3 +1465,37 @@ symbol = "fold_ocap_approvals"
 [[BHV-OCAP-001.refs.production]]
 path = "newt-cli/src/headless.rs"
 symbol = "fold_ocap_grants"
+
+# ─────────────────────────────── Tool event `ok` classification ──────────────
+
+[BHV-TOOLOK-001]
+description = "The ledgered `ok` bit is the dispatch OUTCOME whenever one exists: `ExecOutcome::Passed` is `ok = true`, `Failed`/`Denied`/`TimedOut`/`Unavailable` are `ok = false`, every variant named explicitly (no `_ =>`). The rendered text's prefix classifier (`tool_result_ok`) is used ONLY when no outcome was recorded (`execution = None`) — so a `run_command` that exits 0 with `error:`-shaped stdout is `ok = true`, and a non-zero exit whose render lacks a recognized failure prefix is still `ok = false` (#2482 item 6, follow-up to #2521/#2419)."
+[BHV-TOOLOK-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "passed_with_error_shaped_stdout_is_ok"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "failed_without_error_shaped_text_is_not_ok"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "every_exec_outcome_variant_is_classified"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "none_execution_falls_back_to_text_classifier"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "missing_permission_gate_mcp_refusal_records_not_ok_on_the_chat_wire"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tool_ok"
