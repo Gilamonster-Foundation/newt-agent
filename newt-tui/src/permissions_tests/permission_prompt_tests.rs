@@ -2819,10 +2819,8 @@ fn decisions_are_recorded_to_the_session_log() {
     }]);
     let _ = gate.ask(&[exec_request("rm")]);
     let body = std::fs::read_to_string(&log).unwrap();
-    let records: Vec<newt_core::PermissionRecord> = body
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let records =
+        newt_core::permission_journal::records(&newt_core::permission_journal::read_jsonl(&body));
     assert_eq!(records.len(), 3);
     assert!(records.iter().all(|r| r.conversation_id == "conv-test"));
     assert_eq!(

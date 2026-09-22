@@ -473,6 +473,41 @@ pub fn append_to<T: Serialize>(
     Ok(line)
 }
 
+/// Where a pre-chain journal is moved to when a migrating journal adopts the
+/// chain. Shared by every adopter ([`crate::denial_journal`],
+/// [`crate::permission_journal`], …) so "one encoding, not two" is one
+/// function, not one copy per journal.
+#[must_use]
+pub fn pre_chain_path(path: &Path) -> PathBuf {
+    path.with_extension("pre-chain")
+}
+
+/// Move a pre-chain journal aside, once, so a newly adopted chain starts from
+/// a clean file. The bytes are kept — an operator can still read them — but
+/// they are not mixed into a chain they were never part of. Skipped once a
+/// head ref exists (the steady state after the first chained append), and
+/// skipped when the first line already parses as `JournalLine<T>` (already a
+/// chain, just missing its ref).
+///
+/// # Errors
+///
+/// Propagates a filesystem failure from the rename itself.
+pub fn rotate_pre_chain<T: DeserializeOwned>(path: &Path) -> std::io::Result<()> {
+    if read_head(path).is_some() {
+        return Ok(());
+    }
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Some(first) = body.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(());
+    };
+    if serde_json::from_str::<JournalLine<T>>(first).is_ok() {
+        return Ok(()); // Already a chain, just missing its ref.
+    }
+    std::fs::rename(path, pre_chain_path(path))
+}
+
 /// Mint and durably record one event, best effort.
 ///
 /// Returns `None` when there was nowhere to write or the write failed. Like

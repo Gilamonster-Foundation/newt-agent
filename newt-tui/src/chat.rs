@@ -2033,7 +2033,10 @@ fn session_body(
     if newt_core::agentic::ocap_disabled() {
         print_newt(&ocap_disabled_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
-            if let Err(e) = ocap_disabled_record(&active_conversation_id).append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(
+                path,
+                ocap_disabled_record(&active_conversation_id),
+            ) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
@@ -2048,7 +2051,10 @@ fn session_body(
     if newt_core::agentic::full_access_requested() {
         print_newt(&full_access_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
-            if let Err(e) = full_access_record(&active_conversation_id).append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(
+                path,
+                full_access_record(&active_conversation_id),
+            ) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
