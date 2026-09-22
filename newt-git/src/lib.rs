@@ -1148,7 +1148,18 @@ impl GitEngine {
             unwind(true);
             return Err(GitError::Engine(e));
         }
-        Ok(wt_path)
+        // #2531 round 5, finding 4: `wt_path` traces back to
+        // `self.repo.work_tree`, canonicalized by grit_lib — verbatim on
+        // Windows, same root cause as the two file writes above. Returning
+        // it verbatim to the caller means a subsequent `git worktree
+        // remove <this path>` (or any other git CLI invocation the caller
+        // makes with it) hands git a `\\?\C:\...` argument it does not
+        // parse as the path it registered internally in plain form, so git
+        // reports the path as no worktree it knows about. Strip it at this
+        // one return boundary — internal admin/containment logic above
+        // already ran on the canonical form, so this affects nothing but
+        // what the caller sees.
+        Ok(strip_windows_verbatim_prefix(&wt_path))
     }
 
     // --- stash (#992): pure-Rust, no git binary. `push` builds the standard

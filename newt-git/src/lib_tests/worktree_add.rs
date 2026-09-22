@@ -63,12 +63,17 @@ fn worktree_add_creates_a_worktree_git_accepts() {
     );
 
     // git accepts the admin dir we built well enough to remove it cleanly.
+    // #2531 round 5, finding 4: capture `.output()`, not `.status()` — a
+    // bare bool told us nothing the last time this failed on Windows only.
     let removed = git_cmd(p)
         .args(["worktree", "remove", wt.to_str().unwrap()])
-        .status()
-        .unwrap()
-        .success();
-    assert!(removed, "git worktree remove must accept our admin dir");
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "git worktree remove must accept our admin dir: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
 }
 
 #[test]
@@ -279,16 +284,38 @@ fn worktree_add_dedupes_admin_id_on_collision_without_touching_existing_dir() {
     let common = p.join(".git");
     let preexisting = common.join("worktrees").join("task");
     std::fs::create_dir_all(&preexisting).unwrap();
-    // #2531 round 4, finding 3: an EMPTY pre-created dir once vanished out
-    // from under this test on Linux (coverage job, once in ~40 local runs,
-    // never reproduced) — `read_dir(preexisting)` came back `NotFound`.
-    // Unexplained; no code path in `worktree_add`/`claim_worktree_admin_dir`
-    // removes anything but its OWN candidate on failure. A real concurrent
-    // `git worktree add` claims `create_dir` and then writes its `gitdir`
-    // file within microseconds, so model that instead of a bare empty dir —
-    // this only strengthens the fixture and cannot explain why an empty one
-    // disappeared, so it does not close the finding.
-    std::fs::write(preexisting.join("gitdir"), "gitdir: nowhere\n").unwrap();
+    // #2531 round 5, finding 1 (was round 4's "unexplained" vanish): a
+    // pre-created admin dir whose `gitdir` file points nowhere is EXACTLY
+    // `git worktree prune`'s removal criterion — verified directly:
+    //   $ git worktree prune --dry-run -v
+    //   Removing worktrees/task: gitdir file points to non-existent location
+    // Round 4's fixture wrote that shape on purpose (to model a real racing
+    // `git worktree add`), which explains its own vanish: something ran a
+    // real `git` prune-triggering operation between fixture setup and the
+    // assertion in CI's coverage job (round 3's original "unexplained" case
+    // was the same defect, just with an empty dir instead — no `gitdir` file
+    // at all is prunable too). Fix is the FIXTURE, not the product: give the
+    // pre-existing admin dir a live sibling worktree — a real directory with
+    // its own `.git` gitfile pointing back at the admin dir — which prune
+    // has no reason to touch (confirmed empirically: this exact shape
+    // survives `git worktree prune --dry-run -v` with nothing removed).
+    // The admin `gitdir` file is a PLAIN path with no `gitdir: ` prefix —
+    // that prefix belongs only on the WORKTREE's own `.git` file; getting
+    // this backwards is what made round 4's own probe of this shape look
+    // prunable at first (see RESULT-2531-5.md for the measurement).
+    let sibling_wt = p.join("task-sibling");
+    std::fs::create_dir_all(&sibling_wt).unwrap();
+    std::fs::write(
+        preexisting.join("gitdir"),
+        format!("{}\n", sibling_wt.join(".git").display()),
+    )
+    .unwrap();
+    std::fs::write(
+        sibling_wt.join(".git"),
+        format!("gitdir: {}\n", preexisting.display()),
+    )
+    .unwrap();
+    let preexisting_gitdir = std::fs::read_to_string(preexisting.join("gitdir")).unwrap();
 
     let eng = GitEngine::open(p, &Scope::All).unwrap();
     let wt = eng
@@ -305,7 +332,7 @@ fn worktree_add_dedupes_admin_id_on_collision_without_touching_existing_dir() {
     );
     assert_eq!(
         std::fs::read_to_string(preexisting.join("gitdir")).unwrap(),
-        "gitdir: nowhere\n",
+        preexisting_gitdir,
         "pre-existing admin dir's own file must be left untouched"
     );
     let entries: Vec<_> = std::fs::read_dir(&preexisting)
