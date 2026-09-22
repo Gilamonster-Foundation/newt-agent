@@ -1629,6 +1629,114 @@ fn streamed_read_file_call(id: &str) -> String {
     .collect()
 }
 
+/// A streamed `lifecycle` call with the given raw (already-JSON) arguments.
+fn streamed_lifecycle_call(args_json: &str) -> String {
+    let escaped = args_json.replace('\\', "\\\\").replace('"', "\\\"");
+    [
+        format!(
+            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"lifecycle","arguments":"{escaped}"}}}}]}}}}]}}"#
+        ),
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "[DONE]".to_string(),
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect()
+}
+
+/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
+/// `lifecycle action=build` does headless, where `permission_gate` is
+/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
+/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
+/// fs_write fenced to the workspace/scratch) already dominate what
+/// `build_tool_request` calibrates for the build (fenced reads, a
+/// workspace-scoped write root, network denied), so `build.leq(caveats)`
+/// is true and the `permission_gate.is_some_and(...)` check — the only
+/// place a `None` gate could matter — is never reached at all. The
+/// absent-gate case this review item worried about does not occur in
+/// practice under headless's actual default caveats.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed_lifecycle_call(r#"{"phase":"test","action":"build"}"#),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    // An empty `Cargo.toml` is enough for the Rust language pack's `detect`
+    // marker (tooling.rs), so `phase=test` resolves to a real command
+    // instead of the "no command configured" no-op.
+    std::fs::write(workspace.path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
+    let config_path = workspace.path().join("headless.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "strict"
+
+[[backends]]
+name = "strict"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write headless config");
+    std::fs::write(&instruction_path, "Verify the change builds.\n")
+        .expect("write headless instruction");
+
+    let _ = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert();
+
+    let result = solve_result_from(&events_path);
+    let trajectory = result["trajectory"].as_array().expect("trajectory");
+    assert!(
+        !trajectory.is_empty(),
+        "at least one dispatched call: {result}"
+    );
+    for entry in trajectory {
+        assert_eq!(entry["tool"], "lifecycle", "{entry}");
+        assert_eq!(entry["ok"], false, "{entry}");
+    }
+    // MEASURED (not the brief's assumption): with headless's default caveats
+    // (`confined_bench_caveats` — fs_read/exec/net = Scope::All, only
+    // fs_write fenced to the workspace/scratch), `build.leq(caveats)` is
+    // already TRUE — the calibrated build caveats (fenced reads,
+    // workspace-scoped writes, denied network) are a subset of what headless
+    // already grants. So the `!build.leq(caveats)` gate check never fires and
+    // `permission_gate` is never consulted: the command actually RUNS.
+    // "denied" never appears; the FIRST call's real execution classifies as
+    // "failed" (this workspace's empty `Cargo.toml` makes the real `cargo
+    // test` fail to compile) — a genuine command outcome, not a capability
+    // refusal. Later identical retries are deduplicated and carry no
+    // `execution` (not re-run), which is why only entry 0 is checked here.
+    // The pinned property is "never denied for want of a gate"; whether the
+    // confined lane can run at all is per platform (Windows reports
+    // `unavailable`), so the concrete "failed" is asserted on Linux only.
+    assert_ne!(trajectory[0]["execution"], "denied", "{}", trajectory[0]);
+    #[cfg(target_os = "linux")]
+    assert_eq!(trajectory[0]["execution"], "failed", "{}", trajectory[0]);
+}
+
 /// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool call
 /// whose id is not a string, which cannot be read at all) is the model's answer,
 /// so the headless contract files it `model_error`. Its class used to be lost

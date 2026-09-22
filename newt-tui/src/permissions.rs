@@ -965,7 +965,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             scope,
         );
         if let Some(path) = self.log_path.as_deref() {
-            if let Err(e) = rec.append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(path, rec.clone()) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     self.color,

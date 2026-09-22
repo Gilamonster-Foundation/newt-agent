@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use grit_lib::diff::{
-    count_changes, diff_index_to_tree, diff_index_to_worktree, diff_tree_to_worktree, diff_trees,
-    DiffEntry, DiffStatus,
+    count_changes, diff_index_to_tree, diff_index_to_worktree_with_options, diff_tree_to_worktree,
+    diff_trees, DiffEntry, DiffIndexToWorktreeOptions, DiffStatus,
 };
-use grit_lib::index::{entry_from_stat, IndexEntry, MODE_REGULAR};
+use grit_lib::index::{entry_from_stat, Index, IndexEntry, MODE_REGULAR};
 use grit_lib::merge_base::resolve_commit_specs;
 use grit_lib::merge_file::MergeFavor;
 use grit_lib::merge_trees::{
@@ -235,6 +235,33 @@ impl GitEngine {
         })
     }
 
+    /// Index vs worktree, hashing "racily clean" entries (mtime not older
+    /// than the index file's) instead of trusting their cached stat, as git
+    /// does. Without it a same-size edit made in the index write's timestamp
+    /// tick reads as clean, and `rebase`/`checkout` would overwrite it. (An edit
+    /// landing between this check and their reset is still lost, as in git.)
+    fn worktree_changes(&self, index: &Index, wt: &Path) -> Result<Vec<DiffEntry>, GitError> {
+        // The same resolver `load_index` uses, so `GIT_INDEX_FILE` is honoured.
+        let index_mtime = self
+            .repo
+            .index_path_for_env()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as u32, d.subsec_nanos()));
+        let options = DiffIndexToWorktreeOptions {
+            index_mtime,
+            ..DiffIndexToWorktreeOptions::default()
+        };
+        Ok(diff_index_to_worktree_with_options(
+            &self.repo.odb,
+            index,
+            wt,
+            options,
+        )?)
+    }
+
     fn head_tree(&self) -> Result<Option<ObjectId>, GitError> {
         match self.head_oid()? {
             Some(oid) => {
@@ -298,7 +325,7 @@ impl GitEngine {
         let staged = diff_index_to_tree(&self.repo.odb, &index, tree.as_ref(), false)?;
         let (unstaged, untracked) = match self.repo.work_tree.clone() {
             Some(wt) => {
-                let unstaged = diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?;
+                let unstaged = self.worktree_changes(&index, &wt)?;
                 let untracked = collect_untracked_and_ignored(
                     &self.repo,
                     &index,
@@ -393,7 +420,7 @@ impl GitEngine {
         let index = self.repo.load_index()?;
         let mut entries = match spec {
             DiffSpec::Worktree => match self.repo.work_tree.clone() {
-                Some(wt) => diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?,
+                Some(wt) => self.worktree_changes(&index, &wt)?,
                 None => Vec::new(),
             },
             DiffSpec::Staged => {
@@ -1002,7 +1029,7 @@ impl GitEngine {
 
         let index = self.repo.load_index()?;
         let staged = diff_index_to_tree(&self.repo.odb, &index, Some(&head_tree), false)?;
-        let unstaged = diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?;
+        let unstaged = self.worktree_changes(&index, &wt)?;
         if staged.is_empty() && unstaged.is_empty() {
             return Ok("No local changes to save".into());
         }
