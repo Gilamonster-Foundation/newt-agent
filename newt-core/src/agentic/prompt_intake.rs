@@ -319,6 +319,12 @@ pub struct PromptIntake {
     /// wrong instead of re-emitting the identical block, which is the whole
     /// difference between a blocked session and one that looks hung.
     last_rejection: Option<ClarificationRejection>,
+    /// Free text the operator wants to talk through before locking anything,
+    /// set by a `/discuss …` reply to a pending clarification. Not a decision
+    /// answer: no ordinal is resolved and no state locks. The harness reads
+    /// this to run one bounded, tool-less side call and show the operator the
+    /// model's answer, then clears it — the batch stays pending underneath.
+    pending_discussion: Option<String>,
 }
 
 impl PromptIntake {
@@ -383,6 +389,7 @@ impl PromptIntake {
                 post_lock_disposition: PromptDisposition::Explain,
                 source: DispositionSource::Inferred,
                 last_rejection: None,
+                pending_discussion: None,
             };
             debug_assert!(intake.validate().is_ok());
             return intake;
@@ -410,6 +417,7 @@ impl PromptIntake {
             post_lock_disposition,
             source: DispositionSource::Inferred,
             last_rejection: None,
+            pending_discussion: None,
         };
         debug_assert!(intake.validate().is_ok());
         intake
@@ -489,6 +497,12 @@ impl PromptIntake {
             let question = truncate_chars(&decision.question, MAX_CLARIFICATION_BYTES);
             rendered.push_str(&format!("{}. {}\n", ordinal + 1, question));
         }
+        // #2517: named on every batch, not only after a rejection — the
+        // operator's first reaction to a locked-format prompt is often to
+        // want to talk about it, not to retype it correctly.
+        rendered.push_str(
+            "(`/discuss <what's on your mind>` talks it through first — nothing here is lost.)\n",
+        );
         rendered.trim_end().to_string()
     }
 
@@ -500,6 +514,14 @@ impl PromptIntake {
     /// response to a rejected answer.
     pub fn last_rejection(&self) -> Option<&ClarificationRejection> {
         self.last_rejection.as_ref()
+    }
+
+    /// Take the pending `/discuss` text, if a reply asked to talk it through
+    /// instead of answering. Clears it: the harness runs one bounded side
+    /// call in response, and a stale discussion must never replay itself on
+    /// the next unrelated rejection.
+    pub fn take_pending_discussion(&mut self) -> Option<String> {
+        self.pending_discussion.take()
     }
 
     /// The absolute `decisions` indices that are still pending, in order.
@@ -550,6 +572,17 @@ impl PromptIntake {
             return self.clone();
         }
         let mut resolved = self.clone();
+        // #2517: the escape hatch. A `/discuss …` reply is never an answer —
+        // it asks to talk the batch through before committing to one. This is
+        // checked before the ordinal parser so a discussion request can never
+        // itself be misread as a malformed answer and rejected; nothing locks
+        // and the batch stays exactly as pending as it was.
+        if let Some(text) = discussion_request(answer) {
+            resolved.last_rejection = None;
+            resolved.pending_discussion = Some(text);
+            debug_assert!(resolved.validate().is_ok());
+            return resolved;
+        }
         // #1689 item 4: the same mapping `clarification_batch` renders from.
         let pending = resolved.pending_indices();
 
@@ -1565,7 +1598,8 @@ impl ClarificationRejection {
         };
         format!(
             "that reply did not lock the batch: {detail}.\n\
-             (`/new` abandons this prompt and starts a fresh conversation.)"
+             (`/discuss <what's on your mind>` talks it through without losing the batch; \
+             `/new` abandons this prompt and starts a fresh conversation.)"
         )
     }
 }
@@ -1643,6 +1677,27 @@ fn explicit_answer_outcome(
 #[cfg(test)]
 fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>> {
     explicit_answer_outcome(answer, pending).ok()
+}
+
+/// Recognize the `/discuss` escape hatch and return the text to discuss, if
+/// any. `/discuss` alone (or with only whitespace after it) still counts —
+/// the operator may simply want the batch re-explained.
+///
+/// #2517: the strict `N: value` gate has no answer for an operator who
+/// disagrees with the question rather than merely mistyping the reply; the
+/// only prior way out was `/new`, which throws the whole prompt away. This
+/// gives "I want to talk about this first" its own recognized shape instead
+/// of forcing it through the ordinal parser, where it always read as
+/// [`ClarificationRejection::NoOrdinals`] or [`ClarificationRejection::ReadsAsQuestion`].
+fn discussion_request(answer: &str) -> Option<String> {
+    let rest = answer
+        .strip_prefix("/discuss")
+        .or_else(|| answer.strip_prefix("/chat"))?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        // `/discussion-of-x` or `/chatty` — not the command.
+        return None;
+    }
+    Some(rest.trim().to_string())
 }
 
 fn looks_like_unresolved_question(answer: &str) -> bool {

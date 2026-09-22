@@ -191,3 +191,70 @@ fn every_displayed_ordinal_is_one_the_resolver_accepts() {
          rendered:\n{rendered}\nanswer:\n{answer}"
     );
 }
+
+/// #2517: `/discuss` is the escape hatch — it must not be treated as a
+/// malformed answer, must not lock or reject anything, and must hand the
+/// harness the text to run through a side call.
+#[test]
+fn discuss_leaves_the_batch_untouched_and_surfaces_the_text() {
+    let mut resolved = one_decision()
+        .resolve_with_operator_answer("/discuss why does this need a decision at all?");
+    assert_eq!(
+        resolved.manifest.pending_decision_count(),
+        1,
+        "a discussion request locks nothing"
+    );
+    assert!(
+        resolved.last_rejection().is_none(),
+        "a discussion request is not a rejection"
+    );
+    assert_eq!(
+        resolved.take_pending_discussion().as_deref(),
+        Some("why does this need a decision at all?")
+    );
+    // Taken once, gone — it must not replay on the next unrelated turn.
+    assert!(resolved.take_pending_discussion().is_none());
+}
+
+/// Bare `/discuss` (no text after it) still counts — the operator may just
+/// want the batch re-explained rather than have a specific question typed.
+#[test]
+fn bare_discuss_still_counts_as_a_discussion_request() {
+    let mut resolved = one_decision().resolve_with_operator_answer("/discuss");
+    assert_eq!(resolved.manifest.pending_decision_count(), 1);
+    assert_eq!(resolved.take_pending_discussion().as_deref(), Some(""));
+}
+
+/// `/chat` is accepted as a synonym, but a command that merely starts with
+/// the same letters (`/discussion-of-x`, `/chatty`) is not — it must fall
+/// through to the ordinary ordinal parser rather than being swallowed.
+#[test]
+fn only_the_exact_command_word_triggers_discussion() {
+    let resolved = one_decision().resolve_with_operator_answer("/chat what about the fallback?");
+    assert_eq!(resolved.manifest.pending_decision_count(), 1);
+    assert!(resolved.last_rejection().is_none());
+
+    let resolved = one_decision().resolve_with_operator_answer("/discussion-of-tradeoffs");
+    assert_eq!(
+        resolved.last_rejection(),
+        Some(&ClarificationRejection::NoOrdinals),
+        "a word that merely starts with /discuss is not the command"
+    );
+}
+
+/// Every rejection and the un-rejected batch both name `/discuss` — the
+/// point of the hatch is that an operator finds it without already knowing
+/// it exists.
+#[test]
+fn discuss_is_named_everywhere_the_operator_would_look() {
+    let rendered = one_decision().clarification_batch();
+    assert!(rendered.contains("/discuss"), "{rendered}");
+
+    let rejection = one_decision()
+        .resolve_with_operator_answer("drain before rotation")
+        .last_rejection()
+        .expect("must record why")
+        .explain();
+    assert!(rejection.contains("/discuss"), "{rejection}");
+    assert!(rejection.contains("/new"), "{rejection}");
+}

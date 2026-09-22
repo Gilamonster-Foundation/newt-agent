@@ -7282,6 +7282,62 @@ fn session_body(
                             println!();
                             continue;
                         };
+                        // #2517: the `/discuss` escape hatch. The operator
+                        // wants to talk the batch through, not answer it — run
+                        // one bounded, tool-less side call and show the reply,
+                        // then re-queue the SAME batch unchanged. Nothing here
+                        // locks, rejects, or loses the pending decisions; only
+                        // `/new` does that, and this is deliberately gentler.
+                        if let Some(discuss_text) = prompt_intake.take_pending_discussion() {
+                            let batch = prompt_intake.clarification_batch();
+                            let side_call = build_adjudicator(
+                                &cfg,
+                                &inf_url,
+                                &inf_model,
+                                inf_kind,
+                                &inf_key,
+                                Some(mem_budget),
+                                color,
+                            );
+                            let discuss_prompt = format!(
+                                "The operator is deciding how to answer a pending \
+                                 clarification batch and asked to talk it through before \
+                                 committing to an answer. Help them think it out loud in a \
+                                 short reply. Do not choose an answer on their behalf, do not \
+                                 use any tools, and remind them to reply with `N: value` once \
+                                 they are ready.\n\n\
+                                 Pending batch:\n{batch}\n\n\
+                                 Operator's message: {}",
+                                if discuss_text.is_empty() {
+                                    "(no specific question — please re-explain the batch)"
+                                } else {
+                                    discuss_text.as_str()
+                                }
+                            );
+                            match tokio::task::block_in_place(|| {
+                                rt.block_on(side_call(discuss_prompt))
+                            }) {
+                                Ok((reply, _usage)) => {
+                                    print_newt(&reply, color, verbose);
+                                    println!();
+                                }
+                                Err(e) => {
+                                    print_newt(
+                                        &format!("warning: discussion side call failed: {e}"),
+                                        color,
+                                        verbose,
+                                    );
+                                    println!();
+                                }
+                            }
+                            pending_clarification = Some(PendingClarification {
+                                parent: Box::new(parent),
+                                intake: prompt_intake,
+                            });
+                            print_newt(&batch, color, verbose);
+                            println!();
+                            continue;
+                        }
                         let clarification = prompt_intake.clarification_batch();
                         // #1689 item 1: when a reply was REFUSED, say why
                         // before repeating the batch. The gate never calls the
