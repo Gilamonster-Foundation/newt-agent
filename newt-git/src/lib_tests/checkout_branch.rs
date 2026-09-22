@@ -22,17 +22,57 @@ fn checkout_switches_to_existing_branch_at_same_commit() {
     let msg = eng.checkout(&GitCaveats::top(), "feat/z", false).unwrap();
     assert_eq!(msg, "switched to branch 'feat/z'");
 }
+/// #2485: switching to a branch at a different commit, with a clean tree,
+/// now moves HEAD and resets tree == that branch's tree — same guarded tail
+/// `rebase` uses (#2518's ignored-file guard, `checkout_between_trees`).
 #[test]
-fn checkout_refuses_existing_branch_at_a_different_commit() {
+fn checkout_switches_to_a_different_commit_on_a_clean_tree() {
     let dir = repo_with_commit();
     let p = dir.path();
-    // 'ahead' is one commit past main; switching there would need a worktree
-    // update, which newt does not do — it must refuse with no side effects.
+    git(p, &["checkout", "-q", "-b", "ahead"]);
+    std::fs::write(p.join("a.txt"), "v2\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c2"]);
+    let ahead_head = String::from_utf8_lossy(
+        &git_cmd(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    git(p, &["checkout", "-q", "main"]);
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let msg = eng.checkout(&GitCaveats::top(), "ahead", false).unwrap();
+    assert_eq!(msg, "switched to branch 'ahead'");
+    let head_ref = git_cmd(p)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(), "ahead");
+    let head_oid = git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&head_oid.stdout).trim(), ahead_head);
+    let status = git_cmd(p).args(["status", "--porcelain"]).output().unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "tree must be clean after the switch: {:?}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v2\n");
+}
+/// #2485: a dirty tree refuses the switch with no side effects — same
+/// clean-tree precondition as `rebase`.
+#[test]
+fn checkout_refuses_a_different_commit_on_a_dirty_tree() {
+    let dir = repo_with_commit();
+    let p = dir.path();
     git(p, &["checkout", "-q", "-b", "ahead"]);
     std::fs::write(p.join("a.txt"), "v2\n").unwrap();
     git(p, &["add", "a.txt"]);
     git(p, &["commit", "-q", "-m", "c2"]);
     git(p, &["checkout", "-q", "main"]);
+    std::fs::write(p.join("a.txt"), "dirty\n").unwrap();
     let eng = GitEngine::open(p, &Scope::All).unwrap();
     let err = eng
         .checkout(&GitCaveats::top(), "ahead", false)
@@ -43,6 +83,51 @@ fn checkout_refuses_existing_branch_at_a_different_commit() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "main");
+    assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "dirty\n");
+}
+/// #2517/#2518 (RECON item 2): the same ignored-file guard `rebase` needs
+/// applies to `checkout` — an ignored file invisible to `status`'s clean
+/// check must not be silently overwritten by the switch.
+#[test]
+fn checkout_refuses_when_the_target_tree_would_overwrite_an_ignored_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    std::fs::write(p.join(".gitignore"), "x.env\n").unwrap();
+    std::fs::write(p.join("a.txt"), "v1\n").unwrap();
+    git(p, &["add", ".gitignore", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c1"]);
+    let main_head = String::from_utf8_lossy(
+        &git_cmd(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    git(p, &["checkout", "-q", "-b", "adds-env"]);
+    std::fs::write(p.join("x.env"), "TRACKED\n").unwrap();
+    git(p, &["add", "-f", "x.env"]);
+    git(p, &["commit", "-q", "-m", "c2 adds x.env"]);
+    git(p, &["checkout", "-q", "main"]);
+    // A local, ignored x.env now sits on disk — invisible to `status` and
+    // NOT what the target branch tracks.
+    std::fs::write(p.join("x.env"), "LOCAL\n").unwrap();
+
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let err = eng
+        .checkout(&GitCaveats::top(), "adds-env", false)
+        .unwrap_err();
+    assert!(matches!(err, GitError::Refused(_)), "{err}");
+    assert!(err.to_string().contains("x.env"), "{err}");
+    let out = git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), main_head);
+    assert_eq!(
+        std::fs::read_to_string(p.join("x.env")).unwrap(),
+        "LOCAL\n",
+        "the local ignored file must be untouched"
+    );
 }
 #[test]
 fn checkout_missing_branch_without_create_is_refused() {
@@ -111,4 +196,30 @@ fn status_report_serde_roundtrip() {
     let json = serde_json::to_string(&s).unwrap();
     let back: StatusReport = serde_json::from_str(&json).unwrap();
     assert_eq!(s, back);
+}
+/// An unborn HEAD (an orphan branch with nothing committed yet) has no old
+/// tree. The switch must still populate the worktree from the target branch:
+/// before the fix the tail skipped the reset when `old_tree` was `None`, so
+/// HEAD moved while the worktree stayed empty (tree != HEAD).
+#[test]
+fn checkout_from_an_unborn_head_populates_the_tree() {
+    let dir = repo_with_commit();
+    let p = dir.path();
+    git(p, &["branch", "-q", "other"]);
+    git(p, &["checkout", "-q", "--orphan", "fresh"]);
+    git(p, &["rm", "-rfq", "."]);
+    assert!(!p.join("a.txt").exists(), "precondition: empty worktree");
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let msg = eng.checkout(&GitCaveats::top(), "other", false).unwrap();
+    assert_eq!(msg, "switched to branch 'other'");
+    assert!(
+        p.join("a.txt").exists(),
+        "the target tree must be checked out"
+    );
+    let status = git_cmd(p).args(["status", "--porcelain"]).output().unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "tree must equal HEAD after the switch: {:?}",
+        String::from_utf8_lossy(&status.stdout)
+    );
 }

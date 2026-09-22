@@ -4002,7 +4002,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // digested (never stored raw), duration is a display claim.
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
-            let ok = tools::tool_result_ok(&result);
+            let ok = tools::tool_ok(&result, execution.get().copied());
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
@@ -8661,7 +8661,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // the Ollama path) — digested args, duration as a display claim.
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
-            let ok = tools::tool_result_ok(&result);
+            let ok = tools::tool_ok(&result, execution.get().copied());
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
@@ -11044,7 +11044,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 print_debug(&format!("tool result: {excerpt:?}"), color);
             }
             // 17.6 + 27.3 — mirrors the OpenAI path.
-            let ok = tools::tool_result_ok(&result);
+            let ok = tools::tool_ok(&result, execution.get().copied());
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
@@ -12650,7 +12650,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
-            let ok = tools::tool_result_ok(&result);
+            let ok = tools::tool_ok(&result, execution.get().copied());
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }

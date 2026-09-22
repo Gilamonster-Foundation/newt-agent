@@ -1,5 +1,26 @@
 use super::*;
 
+/// #2466: a `/model`/`/backend` switch must not leave the PREVIOUS model's
+/// gauge on screen — `gauge_for_cap_switch` is the pure rule the loop applies
+/// each turn via the re-derived `cap_id`.
+#[test]
+fn gauge_resets_on_cap_switch_but_survives_same_model() {
+    let a = probe::cap_key(newt_core::Serving::Multiplexer, "backend-a", "model-a");
+    let b = probe::cap_key(newt_core::Serving::Multiplexer, "backend-b", "model-b");
+    let gauge = Some((31_000, Some(160_000)));
+
+    assert_eq!(
+        gauge_for_cap_switch(gauge, &a, &a),
+        gauge,
+        "same model, same backend → the gauge carries over"
+    );
+    assert_eq!(
+        gauge_for_cap_switch(gauge, &a, &b),
+        None,
+        "a switched cap_id must clear the old model's gauge"
+    );
+}
+
 #[test]
 fn hard_recovery_caps_future_declared_windows_without_raising_tighter_ones() {
     assert_eq!(

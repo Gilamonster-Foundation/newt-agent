@@ -92,7 +92,7 @@ pub(crate) enum SurfaceRequest {
     SetRuntimeContext {
         model: String,
         endpoint: String,
-        gauge: Option<(u32, u32)>,
+        gauge: Option<(u32, Option<u32>)>,
         session: String,
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
@@ -369,7 +369,7 @@ impl crate::chat::InputSurface for RemoteSurface {
         &mut self,
         model: &str,
         endpoint: &str,
-        gauge: Option<(u32, u32)>,
+        gauge: Option<(u32, Option<u32>)>,
         session: &str,
     ) {
         self.notify(SurfaceRequest::SetRuntimeContext {
@@ -633,7 +633,7 @@ mod tests {
                 let mut surface = RemoteSurface::new(to_ui);
                 in_flight.store(true, Ordering::Release);
                 // Stand in for a turn: publish status, then park for input.
-                surface.set_runtime_context("m", "http://h", Some((1, 2)), "s");
+                surface.set_runtime_context("m", "http://h", Some((1, Some(2))), "s");
                 let outcome = surface.read_line("› ");
                 release.store(true, Ordering::Release);
                 outcome
@@ -856,7 +856,7 @@ mod tests {
 
         {
             let mut surface = RemoteSurface::new(to_ui);
-            surface.set_runtime_context("m", "http://h", Some((1, 2)), "s");
+            surface.set_runtime_context("m", "http://h", Some((1, Some(2))), "s");
             surface.set_background_jobs(Vec::new());
             surface.set_tabs(vec![a_cell(1, true)]);
             #[cfg(feature = "live-spill")]
@@ -1140,7 +1140,13 @@ mod tests {
             self.reload += 1;
             Ok(())
         }
-        fn set_runtime_context(&mut self, _m: &str, _e: &str, _g: Option<(u32, u32)>, _s: &str) {
+        fn set_runtime_context(
+            &mut self,
+            _m: &str,
+            _e: &str,
+            _g: Option<(u32, Option<u32>)>,
+            _s: &str,
+        ) {
             self.runtime_context += 1;
         }
         fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {

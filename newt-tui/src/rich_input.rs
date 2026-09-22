@@ -633,7 +633,7 @@ fn footer_line(
     editor: &Editor,
     model: &str,
     endpoint: &str,
-    gauge: Option<(u32, u32)>,
+    gauge: Option<(u32, Option<u32>)>,
     active: bool,
 ) -> Line<'static> {
     // ONE accent, shared with the chevron: two constants for one signal is how
@@ -659,18 +659,21 @@ fn footer_line(
     }
     // Step 24.6 (#559): the context-budget gauge — `used/budget` (e.g.
     // `899k/1024k`) colored by fill, so the operator sees context pressure
-    // BEFORE compression fires. Hidden until the budget is known.
+    // BEFORE compression fires. Hidden until a turn has reported usage.
+    // #2466: `budget: None` means no context window is known — shown as
+    // `used/?` (unlevelled: no window means no fill fraction to color)
+    // rather than the learned ratchet passed off as a real window.
     if let Some((used, budget)) = gauge {
-        if budget > 0 {
+        if budget != Some(0) {
             let g = newt_core::agentic::fmt_token_gauge(used, budget);
-            let c = match newt_core::agentic::gauge_level(used, budget) {
-                newt_core::agentic::GaugeLevel::Ok => {
+            let c = match budget.map(|b| newt_core::agentic::gauge_level(used, b)) {
+                Some(newt_core::agentic::GaugeLevel::Ok) | None => {
                     crate::theme::style(crate::theme::Role::GaugeOk)
                 }
-                newt_core::agentic::GaugeLevel::Warn => {
+                Some(newt_core::agentic::GaugeLevel::Warn) => {
                     crate::theme::style(crate::theme::Role::GaugeWarn)
                 }
-                newt_core::agentic::GaugeLevel::Critical => {
+                Some(newt_core::agentic::GaugeLevel::Critical) => {
                     crate::theme::style(crate::theme::Role::GaugeCritical)
                 }
             };
@@ -779,7 +782,7 @@ fn background_frame() -> usize {
 struct RichStatus<'a> {
     model: &'a str,
     endpoint: &'a str,
-    gauge: Option<(u32, u32)>,
+    gauge: Option<(u32, Option<u32>)>,
     /// #1671: the conversation's display name — title, `#shortid`, or
     /// "ephemeral". Empty hides the span.
     session: &'a str,
@@ -1234,7 +1237,7 @@ pub(crate) struct RichSurface {
     model: String,
     endpoint: String,
     /// Context-budget gauge `(used, budget)` for the header (Step 24.6, #559).
-    gauge: Option<(u32, u32)>,
+    gauge: Option<(u32, Option<u32>)>,
     /// Harness tasks rendered by this surface while their shared state is live.
     background_jobs: Vec<BackgroundJob>,
     /// #1669 PR-B: the open tabs, refreshed each loop head. Fewer than two →
@@ -1493,7 +1496,7 @@ impl RichSurface {
 pub(crate) struct Chrome<'a> {
     pub(crate) model: &'a str,
     pub(crate) endpoint: &'a str,
-    pub(crate) gauge: Option<(u32, u32)>,
+    pub(crate) gauge: Option<(u32, Option<u32>)>,
     pub(crate) session: &'a str,
     /// The header's prose beside the name. Empty until a caller supplies one,
     /// which keeps this change to LAYOUT rather than smuggling in new content.
@@ -1610,7 +1613,7 @@ impl InputSurface for RichSurface {
         &mut self,
         model: &str,
         endpoint: &str,
-        gauge: Option<(u32, u32)>,
+        gauge: Option<(u32, Option<u32>)>,
         session: &str,
     ) {
         // Refresh the status-header model @ endpoint each turn (#527) so a

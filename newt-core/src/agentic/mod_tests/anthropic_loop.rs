@@ -530,6 +530,135 @@ async fn tool_use_round_trip_replays_blocks_verbatim() {
 }
 
 // -----------------------------------------------------------------------
+// #2419: a pre-dispatch MCP permission refusal — no interactive gate at all
+// — must record `ok = false` in the turn's ToolEvent ledger, and the
+// connector must receive zero calls. This is the loop-level twin of the
+// unit-level `execute_mcp_authority` tests: it proves shared event
+// construction in the ACTUAL provider loop, not just the classifier.
+// -----------------------------------------------------------------------
+
+struct TwoRoundToolThenTextResponder {
+    calls: Arc<AtomicUsize>,
+}
+impl Respond for TwoRoundToolThenTextResponder {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            json_reply(
+                "tool_use",
+                serde_json::json!([{"type": "tool_use", "id": "toolu_1",
+                    "name": "my_server__get_thing", "input": {}}]),
+                40,
+                9,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "acknowledged the refusal"}]),
+                60,
+                4,
+            )
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn missing_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(TwoRoundToolThenTextResponder {
+            calls: calls.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "tool-result-text",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    // No permission gate installed at all — the missing-gate refusal path.
+    context.permission_gate = None;
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    context.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
+        .await
+        .expect("the loop must still complete after the refusal");
+
+    assert_eq!(reply, "acknowledged the refusal");
+    assert_eq!(
+        mcp.seen.lock().unwrap().len(),
+        0,
+        "the connector must receive zero calls when no gate is available"
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "the refused call is still one ledgered event"
+    );
+    assert!(
+        !events[0].ok,
+        "a refusal the host never dispatched must not ledger ok=true: {:?}",
+        events[0]
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn denied_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(TwoRoundToolThenTextResponder {
+            calls: calls.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "tool-result-text",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let uri = server.uri();
+    // Fixture permission that targets a DIFFERENT tool name, so the request
+    // for `my_server__get_thing` always falls through to `Deny`.
+    let mut permission = FixtureMcpPermission::new("not_this_tool", &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    context.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
+        .await
+        .expect("the loop must still complete after the refusal");
+
+    assert_eq!(reply, "acknowledged the refusal");
+    assert_eq!(
+        mcp.seen.lock().unwrap().len(),
+        0,
+        "a denied gate must never reach the connector"
+    );
+    assert_eq!(events.len(), 1);
+    assert!(
+        !events[0].ok,
+        "a denied grant must not ledger ok=true: {:?}",
+        events[0]
+    );
+}
+
+// -----------------------------------------------------------------------
 // 4: parallel tool_use → ONE user message carries both tool_results
 // -----------------------------------------------------------------------
 

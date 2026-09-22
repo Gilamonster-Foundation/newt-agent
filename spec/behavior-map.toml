@@ -371,6 +371,41 @@ symbol = "tests::transport_sets_store_false_for_stateless_no_retention"
 path = "newt-core/src/responses_wire.rs"
 symbol = "STORE_RESPONSE_SERVER_SIDE"
 
+# ───────────────────────── Embedded git engine (#2485) ────────────────────────
+# RECON item 2 (p0-git-tool-honesty): a ref-moving history op (rebase) must
+# leave the working tree consistent with the ref it just moved, or refuse
+# before moving it — never move the ref and leave the tree stale.
+
+[BHV-GIT-001]
+description = "A ref-moving git op (e.g. rebase, checkout) leaves the working tree equal to the new HEAD, or refuses before moving the ref; it never advances the ref while leaving the tree stale."
+[BHV-GIT-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/rebase.rs"
+symbol = "rebase_drops_a_commit"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/rebase.rs"
+symbol = "rebase_refuses_on_a_dirty_tree"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/checkout_branch.rs"
+symbol = "checkout_switches_to_a_different_commit_on_a_clean_tree"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/checkout_branch.rs"
+symbol = "checkout_refuses_a_different_commit_on_a_dirty_tree"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/checkout_branch.rs"
+symbol = "checkout_refuses_when_the_target_tree_would_overwrite_an_ignored_file"
+[[BHV-GIT-001.refs.production]]
+path = "newt-git/src/lib.rs"
+symbol = "rebase"
+[[BHV-GIT-001.refs.production]]
+path = "newt-git/src/lib.rs"
+symbol = "checkout"
+
 # ─────────────────────── Chat-loop dispatch recovery (#1533) ──────────────────
 # The temporal contract for the chat loops' dispatch recovery, machine-checked by
 # spec/tla/ChatRecovery.tla (TLC, MaxRounds 1 & 2). A dispatch RECOVERY retries
