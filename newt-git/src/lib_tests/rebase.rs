@@ -160,6 +160,46 @@ fn rebase_drops_a_commit() {
         !names.contains("c.txt"),
         "dropped commit's file gone: {names}"
     );
+    // #2485 (RECON item 2): a ref-moving op leaves tree == HEAD, or refuses.
+    // After dropping c3, the ref moved but the file its commit added must
+    // NOT still sit in the working tree as an unstaged leftover.
+    let status = git_status_porcelain(dir.path());
+    assert!(status.is_empty(), "worktree must be clean: {status:?}");
+    assert!(
+        !dir.path().join("c.txt").exists(),
+        "c.txt must be gone from the working tree, not just from HEAD's tree"
+    );
+}
+/// #2485 (RECON item 2): rebase refuses on a dirty tree rather than moving
+/// the ref out from under uncommitted changes.
+#[test]
+fn rebase_refuses_on_a_dirty_tree() {
+    let (dir, oids) = repo_with_three();
+    let p = dir.path();
+    // Dirty the tree: an unstaged edit to a tracked file.
+    std::fs::write(p.join("a.txt"), "dirty\n").unwrap();
+    let t = tool(p);
+    let err = t
+        .dispatch(
+            "rebase",
+            &serde_json::json!({
+                "onto": oids[0],
+                "plan": [
+                    {"commit": oids[1], "action": "pick"},
+                    {"commit": oids[2], "action": "drop"},
+                ]
+            }),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("clean working tree"),
+        "refusal must name the reason: {err}"
+    );
+    // No side effects: HEAD unchanged, dirty edit untouched.
+    assert_eq!(commit_count(p), 3, "refusal must not move the ref");
+    assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "dirty\n");
 }
 /// #1709 family: a rebase that produced ZERO commits (an all-drop plan) is
 /// a successful history operation but NOT an attribution epoch. It must

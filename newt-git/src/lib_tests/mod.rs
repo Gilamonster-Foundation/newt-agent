@@ -110,6 +110,16 @@ fn head_message(dir: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Real `git status --porcelain` — ground truth for "the working tree ==
+/// HEAD" (#2485), independent of the embedded engine's own status scan.
+fn git_status_porcelain(dir: &Path) -> String {
+    let out = git_cmd(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[cfg(test)]
 mod ambient_environment {
     use super::*;
