@@ -1576,6 +1576,27 @@ impl InputSurface for RichSurface {
         Ok(self.read_turn()?)
     }
 
+    /// #2524 item 7: draw the pending clarification inside `modal::frame`
+    /// chrome around a free-text reader
+    /// (`clarification_modal::present`), rather than the trait default's
+    /// print-then-`read_line`. `prompt`/`color`/`verbose` go unused, like
+    /// `read_line`'s own `_prompt` above: this surface always renders its
+    /// native chrome instead of the PS1 token prompt or a printed line.
+    fn present_clarification(
+        &mut self,
+        batch: &str,
+        hint: &str,
+        _prompt: &str,
+        _color: bool,
+        _verbose: bool,
+    ) -> anyhow::Result<ReadOutcome> {
+        if self.pending_end_quit.replace(false) {
+            return Ok(ReadOutcome::EndAndQuit);
+        }
+        let _guard = RawPasteGuard::enter()?;
+        Ok(crate::clarification_modal::present(batch, hint)?)
+    }
+
     fn add_history(&mut self, entry: &str) {
         self.unsaved.push(entry.to_string());
     }
