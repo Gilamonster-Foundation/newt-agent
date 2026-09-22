@@ -37,6 +37,15 @@ pub use crate::event_journal::{head_path, read_head, verify_chain, ChainBreak};
 /// address that covers both.
 pub type PermissionLine = JournalLine<PermissionRecord>;
 
+/// Where a pre-chain journal is moved to when this log adopts the chain.
+/// Thin, `PermissionRecord`-specialized wrapper over
+/// [`event_journal::pre_chain_path`], shared with every other migrating
+/// journal (see [`crate::denial_journal::pre_chain_path`]).
+#[must_use]
+pub fn pre_chain_path(path: &Path) -> std::path::PathBuf {
+    event_journal::pre_chain_path(path)
+}
+
 /// Append one decision as a chained line, rotating a pre-chain flat log aside
 /// on first use and advancing the head ref beside it.
 ///

@@ -1532,7 +1532,7 @@ fn slash_workspace_returns_true() {
 }
 
 #[test]
-fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
+fn permission_audit_lines_lists_newest_entries_and_reports_bad_lines_as_breaks() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("permission-log.jsonl");
     newt_core::permission_journal::append_record(
@@ -1547,8 +1547,8 @@ fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
         ),
     )
     .unwrap();
-    // An interrupted append mid-chain: skipped by the reader, but not hidden
-    // from the chain — the record after it loses its parent.
+    // An interrupted append mid-chain: not readable as a chain line, and must
+    // surface as tamper evidence rather than vanish — item 3, #2529 round 2.
     {
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -1571,23 +1571,111 @@ fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
     .unwrap();
 
     let lines = permission_audit_lines(&path, 5);
-    assert_eq!(
-        lines.first(),
-        Some(&"permission audit: 2 of 2 (newest first)".to_string())
+    assert!(
+        lines[0].starts_with("!! CHAIN BROKEN"),
+        "an unparseable line must be reported, not silently dropped: {lines:?}"
     );
-    assert!(lines[1].contains("deny"));
-    assert!(lines[1].contains("once"));
-    assert!(lines[1].contains("net"));
-    assert!(lines[1].contains("https://example.com"));
-    assert!(lines[2].contains("allow"));
+    let audit_header = lines
+        .iter()
+        .position(|l| l == "permission audit: 2 of 2 (newest first)")
+        .expect("audit header must still be present");
+    assert!(lines[audit_header + 1].contains("deny"));
+    assert!(lines[audit_header + 1].contains("once"));
+    assert!(lines[audit_header + 1].contains("net"));
+    assert!(lines[audit_header + 1].contains("https://example.com"));
+    assert!(lines[audit_header + 2].contains("allow"));
 
     let limited = permission_audit_lines(&path, 1);
     assert_eq!(
-        limited,
-        vec![
+        limited[limited.len() - 2..],
+        [
             "permission audit: 1 of 2 (newest first)".to_string(),
             "  deny    once      net      https://example.com via run_command".to_string()
         ]
+    );
+}
+
+/// Item 1, #2529 round 2: a rotated pre-chain sibling exists — say so, and
+/// render its lines (within `limit`) as unchained history rather than
+/// silently omitting them.
+#[test]
+fn permission_audit_lines_surfaces_the_pre_chain_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permission-log.jsonl");
+    let pre_chain = newt_core::permission_journal::pre_chain_path(&path);
+    let legacy = newt_core::PermissionRecord::new(
+        "c",
+        "run_command",
+        newt_core::DenialKind::Exec,
+        "/bin/legacy",
+        "allow",
+        "once",
+    );
+    std::fs::write(
+        &pre_chain,
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+    )
+    .unwrap();
+    newt_core::permission_journal::append_record(
+        &path,
+        newt_core::PermissionRecord::new(
+            "c",
+            "run_command",
+            newt_core::DenialKind::Exec,
+            "/bin/new",
+            "allow",
+            "once",
+        ),
+    )
+    .unwrap();
+
+    let lines = permission_audit_lines(&path, 5);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("pre-chain migration")
+                && l.contains(&pre_chain.display().to_string())),
+        "must name the pre-chain sibling: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("/bin/legacy") && l.contains("unchained")),
+        "must render the unchained legacy record: {lines:?}"
+    );
+}
+
+/// Item 4, #2529 round 2: a log never appended-to since the upgrade is still
+/// a flat `PermissionRecord` body (not yet rotated) — read it as unchained
+/// history, never report it as empty.
+#[test]
+fn permission_audit_lines_reads_an_unrotated_flat_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permission-log.jsonl");
+    let legacy = newt_core::PermissionRecord::new(
+        "c",
+        "run_command",
+        newt_core::DenialKind::Exec,
+        "/bin/legacy",
+        "allow",
+        "once",
+    );
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+    )
+    .unwrap();
+
+    let lines = permission_audit_lines(&path, 5);
+    assert!(
+        !lines.iter().any(|l| l == "no permission log entries yet"),
+        "a flat pre-chain body must not read as empty: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("/bin/legacy") && l.contains("unchained")),
+        "must render the unrotated legacy record: {lines:?}"
     );
 }
 
