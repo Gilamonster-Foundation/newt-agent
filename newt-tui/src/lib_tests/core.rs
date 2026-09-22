@@ -1549,13 +1549,15 @@ fn permission_audit_lines_lists_newest_entries_and_reports_bad_lines_as_breaks()
     .unwrap();
     // An interrupted append mid-chain: not readable as a chain line, and must
     // surface as tamper evidence rather than vanish — item 3, #2529 round 2.
+    // Simulated as a snapshot rewrite (read the legacy bytes, add the garbage
+    // line, write the whole file back once) rather than a real append-mode
+    // writer, so this fixture isn't mistaken for a second journal writer by
+    // the `content_addressable_ratchet` scan (it looks for `append(true)` +
+    // `serde_json::to_string` together — see that test's `journal_tier`).
     {
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        use std::io::Write as _;
-        writeln!(f, "this is not json").unwrap();
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        contents.push_str("this is not json\n");
+        std::fs::write(&path, contents).unwrap();
     }
     newt_core::permission_journal::append_record(
         &path,
