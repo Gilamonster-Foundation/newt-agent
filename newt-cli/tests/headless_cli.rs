@@ -1729,6 +1729,11 @@ kind = "openai"
     // test` fail to compile) — a genuine command outcome, not a capability
     // refusal. Later identical retries are deduplicated and carry no
     // `execution` (not re-run), which is why only entry 0 is checked here.
+    // The pinned property is "never denied for want of a gate"; whether the
+    // confined lane can run at all is per platform (Windows reports
+    // `unavailable`), so the concrete "failed" is asserted on Linux only.
+    assert_ne!(trajectory[0]["execution"], "denied", "{}", trajectory[0]);
+    #[cfg(target_os = "linux")]
     assert_eq!(trajectory[0]["execution"], "failed", "{}", trajectory[0]);
 }
 
