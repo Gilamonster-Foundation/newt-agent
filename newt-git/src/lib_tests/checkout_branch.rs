@@ -223,3 +223,41 @@ fn checkout_from_an_unborn_head_populates_the_tree() {
         String::from_utf8_lossy(&status.stdout)
     );
 }
+/// A same-size edit made in the same timestamp tick as the index write is
+/// "racily clean": size and mtime still match the index entry, so a stat-only
+/// check calls the tree clean and the switch overwrites the edit. Git guards
+/// this by hashing entries whose mtime is not older than the index file's.
+/// Forced deterministically here by pinning both mtimes to one instant.
+#[test]
+fn checkout_refuses_a_racily_clean_edit() {
+    let dir = repo_with_commit();
+    let p = dir.path();
+    git(p, &["checkout", "-q", "-b", "ahead"]);
+    std::fs::write(p.join("a.txt"), "v2\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c2"]);
+    git(p, &["checkout", "-q", "main"]);
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    // A same-size edit, backdated so writing the index cannot smudge the
+    // entry as racy on its own.
+    std::fs::write(p.join("a.txt"), "dirty\n").unwrap();
+    let edited = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    let set_mtime = |path: &std::path::Path| {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(edited).unwrap();
+    };
+    set_mtime(&p.join("a.txt"));
+    // The index caches the edited file's stat against the OLD blob, and the
+    // index file is stamped with the same instant: a same-tick race.
+    let mut index = eng.repo.load_index().unwrap();
+    let entry = index.get_mut(b"a.txt", 0).unwrap();
+    *entry = grit_lib::index::entry_from_stat(&p.join("a.txt"), b"a.txt", entry.oid, entry.mode)
+        .unwrap();
+    eng.repo.write_index(&mut index).unwrap();
+    set_mtime(&p.join(".git/index"));
+    let err = eng
+        .checkout(&GitCaveats::top(), "ahead", false)
+        .unwrap_err();
+    assert!(matches!(err, GitError::Refused(_)), "{err}");
+    assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "dirty\n");
+}
