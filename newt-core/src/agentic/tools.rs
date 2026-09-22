@@ -1012,6 +1012,99 @@ fn lifecycle_build_request(
     }
 }
 
+/// Run `program argv` through the confined build lane — `build_tool_request`'s
+/// calibrated fence, the same `leq`/permission-gate re-check `lifecycle
+/// action=build` performs, and [`shell::LIFECYCLE_BUILD_TIMEOUT`] (30 min).
+///
+/// The shared core of `lifecycle action=build` (a *resolved phase* command)
+/// and the P4 build route (`super::routing`, `build_exec`: the model's
+/// *literal argv*, verbatim — never re-resolved, so no operand is ever
+/// dropped). `display` is the command text shown in the permission reason.
+#[allow(clippy::too_many_arguments)]
+async fn run_confined_build_lane(
+    workspace: &str,
+    cwd: &std::path::Path,
+    program: &str,
+    argv: Vec<String>,
+    display: &str,
+    smart_harness: Option<&super::smart_harness::SmartHarness>,
+    caveats: &crate::caveats::Caveats,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    tool_output_lines: usize,
+    color: bool,
+    tool_offload: bool,
+    spill_store: Option<&dyn super::content_spill::SpillStore>,
+    presentation: &mut dyn ToolPresentation,
+) -> (String, crate::ExecOutcome) {
+    use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
+    // The command is attacker-influenced (repo-configured phase, or a
+    // model-typed argv). `cwd` may be nested, but never an outside root or
+    // symlink escape.
+    let root = match std::path::Path::new(workspace).canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return (
+                format!("error: build workspace: {error}"),
+                crate::ExecOutcome::Unavailable,
+            )
+        }
+    };
+    let cwd = match cwd.canonicalize() {
+        Ok(cwd) if cwd.starts_with(&root) => cwd,
+        _ => {
+            return (
+                "capability denied: build directory must remain inside the workspace".into(),
+                crate::ExecOutcome::Denied,
+            )
+        }
+    };
+    let request =
+        build_tool_request(&root, &cwd, program, argv).timeout(shell::LIFECYCLE_BUILD_TIMEOUT);
+    let build = request.caveats();
+    if let Some(harness) = smart_harness {
+        if let Err(error) = harness.validate_tool_authority(build, &root) {
+            return (
+                format!("Error: frame isolation: {error}"),
+                crate::ExecOutcome::Denied,
+            );
+        }
+    }
+    if !build.leq(caveats) {
+        let permission = lifecycle_build_request(&root.to_string_lossy(), display, build);
+        let allowed = permission_gate.is_some_and(|gate| {
+            matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
+        });
+        if !allowed {
+            return (
+                "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".into(),
+                crate::ExecOutcome::Denied,
+            );
+        }
+    }
+    match ConstrainedExecutor::run_async(request).await {
+        Ok(out) => {
+            let envelope = serde_json::json!({
+                "exit_code": out.code,
+                "stdout": String::from_utf8_lossy(&out.stdout),
+                "stderr": String::from_utf8_lossy(&out.stderr),
+                "timed_out": out.timed_out,
+            });
+            (
+                shell::shell_envelope_output(
+                    &envelope,
+                    tool_output_lines,
+                    color,
+                    tool_offload,
+                    spill_store,
+                    Some(presentation),
+                ),
+                shell::envelope_outcome(&envelope),
+            )
+        }
+        Err(error) => (format!("error: {error}"), crate::ExecOutcome::Unavailable),
+    }
+}
+
 /// The interpreter + argv for the configured build-check string, per platform.
 #[cfg(windows)]
 fn build_check_argv(cmd: &str) -> (&'static str, Vec<String>) {
@@ -3443,45 +3536,25 @@ async fn execute_authorized_tool(
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {
-                    use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
-                    // The configured command is attacker-influenced. Its cwd
-                    // may be nested, but never an outside root or symlink escape.
-                    let root = match std::path::Path::new(workspace).canonicalize() {
-                        Ok(root) => root,
-                        Err(error) => return host_return(format!("error: build workspace: {error}")),
-                    };
-                    let cwd = match effective_path.canonicalize() {
-                        Ok(cwd) if cwd.starts_with(&root) => cwd,
-                        _ => return host_return("capability denied: lifecycle build directory must remain inside the workspace".into()),
-                    };
                     let (program, argv) = build_check_argv(&joined);
-                    let request = build_tool_request(&root, &cwd, program, argv)
-                        .timeout(shell::LIFECYCLE_BUILD_TIMEOUT);
-                    let build = request.caveats();
-                    if let Some(harness) = smart_harness {
-                        if let Err(error) = harness.validate_tool_authority(build, &root) {
-                            return host_return(format!("Error: frame isolation: {error}"));
-                        }
-                    }
-                    if !build.leq(caveats) {
-                        let permission = lifecycle_build_request(&root.to_string_lossy(), &joined, build);
-                        if !permission_gate.is_some_and(|gate| matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))) {
-                            return executed(("capability denied: lifecycle action=build requires explicit confined build authority; no command ran".into(), crate::ExecOutcome::Denied));
-                        }
-                    }
-                    let result = ConstrainedExecutor::run_async(request).await;
-                    match result {
-                        Ok(out) => {
-                            let envelope = serde_json::json!({
-                                "exit_code": out.code,
-                                "stdout": String::from_utf8_lossy(&out.stdout),
-                                "stderr": String::from_utf8_lossy(&out.stderr),
-                                "timed_out": out.timed_out,
-                            });
-                            executed((shell::shell_envelope_output(&envelope, tool_output_lines, color, tool_offload, spill_store, Some(presentation)), shell::envelope_outcome(&envelope)))
-                        }
-                        Err(error) => executed((format!("error: {error}"), crate::ExecOutcome::Unavailable)),
-                    }
+                    executed(
+                        run_confined_build_lane(
+                            workspace,
+                            effective_path,
+                            program,
+                            argv,
+                            &joined,
+                            smart_harness,
+                            caveats,
+                            permission_gate,
+                            tool_output_lines,
+                            color,
+                            tool_offload,
+                            spill_store,
+                            presentation,
+                        )
+                        .await,
+                    )
                 }
                 "run" => executed(lifecycle_run_result(args,
                     exec_confined_command(
@@ -3504,6 +3577,57 @@ async fn execute_authorized_tool(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default), 'list', or 'build'."
                 ),
             }
+        }
+
+        // facade P4 build route (§4, `super::routing::build_lane_route`):
+        // reached ONLY via a routed `run_command`, never advertised or
+        // callable directly — a recognised `cargo build|check|test|clippy` /
+        // `just <recipe>` argv runs through the SAME confined build lane
+        // (`run_confined_build_lane`) `lifecycle action=build` uses, verbatim
+        // — never a re-resolved phase command, so no operand is ever
+        // dropped (the operand-dropping class #2482 fixed for git routes).
+        "build_exec" => {
+            let argv: Vec<String> = args
+                .get("argv")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|tok| tok.as_str().map(str::to_string))
+                .collect();
+            let Some((program, rest)) = argv.split_first() else {
+                return host_return("error: routed build command had no argv".into());
+            };
+            // `just` only makes sense with a justfile present — the pure
+            // router cannot see the filesystem, so the check lives here.
+            if program == "just" && !std::path::Path::new(workspace).join("justfile").exists()
+                && !std::path::Path::new(workspace).join("Justfile").exists()
+            {
+                return host_return(format!(
+                    "error: no justfile in {workspace}; `just {}` was not routed",
+                    rest.first().map(String::as_str).unwrap_or("")
+                ));
+            }
+            let display = argv.join(" ");
+            let (text, outcome) = run_confined_build_lane(
+                workspace,
+                std::path::Path::new(workspace),
+                program,
+                rest.to_vec(),
+                &display,
+                smart_harness,
+                caveats,
+                permission_gate,
+                tool_output_lines,
+                color,
+                tool_offload,
+                spill_store,
+                presentation,
+            )
+            .await;
+            executed((
+                format!("[routed `{display}` to the confined build lane — 30 min limit, network denied]\n{text}"),
+                outcome,
+            ))
         }
 
         "read_file" => {
