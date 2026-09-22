@@ -1825,7 +1825,7 @@ fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>
 /// gives "I want to talk about this first" its own recognized shape instead
 /// of forcing it through the ordinal parser, where it always read as
 /// [`ClarificationRejection::NoOrdinals`] or [`ClarificationRejection::ReadsAsQuestion`].
-fn discussion_request(answer: &str) -> Option<String> {
+pub fn discussion_request(answer: &str) -> Option<String> {
     let rest = answer
         .strip_prefix("/discuss")
         .or_else(|| answer.strip_prefix("/chat"))?;

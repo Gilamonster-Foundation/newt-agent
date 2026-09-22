@@ -232,7 +232,7 @@ pub use observability::{
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
-    AdjudicationCandidate, AdjudicationRefusal, AdjudicationVerdict, AtomicAsk,
+    discussion_request, AdjudicationCandidate, AdjudicationRefusal, AdjudicationVerdict, AtomicAsk,
     ClarificationRejection, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
     DispositionSource, PromptComprehensionManifest, PromptDisposition, PromptIntake,
     MAX_ADJUDICATION_BATCH,

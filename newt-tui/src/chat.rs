@@ -615,6 +615,23 @@ fn record_turn_disposition(
     }
 }
 
+/// Decide whether an operator line that starts with `/` should be routed to
+/// a pending clarification batch instead of the slash registry (#2515).
+///
+/// The batch's own text advertises `/discuss <what's on your mind>` as its
+/// escape hatch, and the parser (`newt_core::agentic::discussion_request`,
+/// checked inside `resolve_with_operator_answer`) already understands it —
+/// including bare `/discuss` with no trailing text. The bug was that the
+/// chat loop sent every `/`-prefixed line to the slash registry BEFORE that
+/// parser ever saw it, so `discuss` (unregistered there) read as an unknown
+/// command. Only `/discuss` (and its `/chat` alias) diverts, and only while a
+/// batch is pending: every other `/word` — `/help`, `/new`, `/exit` — keeps
+/// going to the registry even with a batch pending, matching what the batch
+/// text promises.
+fn line_answers_pending_clarification(task: &str, has_pending: bool) -> bool {
+    has_pending && newt_core::agentic::discussion_request(task).is_some()
+}
+
 /// Comprehend an accepted prompt. A direct answer to a pending clarification
 /// is resolved against that manifest, not reclassified in isolation.
 ///
@@ -3346,7 +3363,10 @@ fn session_body(
                     println!();
                     continue;
                 }
-                if model_input_origin.is_operator() && task.starts_with('/') {
+                if model_input_origin.is_operator()
+                    && task.starts_with('/')
+                    && !line_answers_pending_clarification(&task, pending_clarification.is_some())
+                {
                     // Per-command help, intercepted before ANY command runs so
                     // every command answers `--help`/`-h`/`help` (and `/help
                     // <cmd>`) uniformly — even the ones handled inline below.

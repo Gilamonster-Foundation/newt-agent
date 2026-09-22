@@ -9094,6 +9094,19 @@ fn dispatch_slash_with_ask(
             commands::crew::dispatch(arg1, arg2, color, verbose, ask.unwrap_or(&fallback))
         }
         "setup" => commands::setup::dispatch(arg1, color, verbose),
+        // #2515: `/discuss` (and its `/chat` alias) is normally intercepted
+        // in the chat loop and routed to the pending clarification before
+        // dispatch ever sees it. Reaching here means there is no batch to
+        // discuss, so this is the answer for that case — never "unknown
+        // command" again.
+        "discuss" | "chat" => {
+            print_newt(
+                "there is no pending decision to discuss right now",
+                color,
+                verbose,
+            );
+            Ok(true)
+        }
         other => {
             print_newt(&slash_registry::fallthrough_message(other), color, verbose);
             Ok(true)

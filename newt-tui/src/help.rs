@@ -790,6 +790,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
+        "  /discuss [text]          - talk through a pending clarification batch instead of answering it (alias: /chat); \
+         says so if nothing is pending",
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
         "  /end                     - the same, recorded as ended by /end rather than /new (it no longer exits — use /exit)",
         "  /restart                 - the same, recorded as a restart",
