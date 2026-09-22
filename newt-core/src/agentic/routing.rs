@@ -88,6 +88,12 @@ const SHELL_ROUTES: &[ShellRoute] = &[
     },
 ];
 
+/// `cargo` subcommands that route to the confined build lane (`build_exec`,
+/// `tools.rs`) — pure DATA. Deliberately excludes `run`/`install`/`publish`
+/// and anything else that changes what's installed or reaches the network;
+/// those stay on the exec path.
+const CARGO_BUILD_SUBCOMMANDS: &[&str] = &["build", "check", "test", "clippy"];
+
 /// The git subcommands that are **read-only** and route to the embedded `git`
 /// tool's read path — pure DATA.
 ///
@@ -137,13 +143,24 @@ impl RouteTable {
     #[must_use]
     pub(crate) fn classify_call(&self, call: &Value) -> RouteDecision {
         let decision = self.classify(call.get("command").and_then(Value::as_str).unwrap_or(""));
-        let scoped_git_read = matches!(
+        // A scoped git read and a build-lane route both discard the rest of
+        // the call object once routed — neither has anywhere to put a `cwd`
+        // or `timeout` the model also sent — so both require the call be
+        // *bare* (`command` only). A call carrying anything else stays Exec
+        // rather than silently dropping that field.
+        let requires_bare_call = matches!(
             &decision,
             RouteDecision::Route { tool: "git", args }
                 if args.get("op").and_then(Value::as_str)
                     .is_some_and(super::git_tool::is_scoped_read_op)
+        ) || matches!(
+            &decision,
+            RouteDecision::Route {
+                tool: "build_exec",
+                ..
+            }
         );
-        if scoped_git_read
+        if requires_bare_call
             && !call
                 .as_object()
                 .is_some_and(|args| args.keys().all(|key| key == "command"))
@@ -186,6 +203,16 @@ impl RouteTable {
                 }
                 _ => RouteDecision::Exec,
             };
+        }
+
+        // A recognised build/test invocation routes to the confined build
+        // lane — the model's literal argv runs verbatim (see
+        // `build_lane_route`'s doc comment): F11's fix for the model that
+        // never calls `lifecycle` and instead times out under
+        // `run_command`'s 60s wall.
+        if program == "cargo" || program == "just" {
+            let rest: Vec<&str> = tokens.collect();
+            return build_lane_route(program, &rest);
         }
 
         // Whole-command reaches that map onto governed built-ins.
@@ -361,6 +388,62 @@ fn branch_list_route(rest: &[&str]) -> RouteDecision {
     RouteDecision::Route {
         tool: "git",
         args: json!({ "op": "branch-list", "scope": scope }),
+    }
+}
+
+/// A `run_command` reach that maps onto the confined **build lane**
+/// (`build_exec` in `tools.rs`, sharing `run_confined_build_lane` with
+/// `lifecycle action=build`) rather than a governed read built-in. Unlike
+/// every other route in this table, the routed call runs the model's
+/// **literal argv verbatim** — never a re-resolved phase command — so no
+/// operand (`-p x`, a test filter, …) is ever silently dropped. `cwd`/
+/// `timeout` on the call are handled the same way the scoped git-read route
+/// handles them: [`RouteTable::classify_call`] refuses to route a call
+/// carrying either, rather than dropping them.
+fn build_lane_route(program: &str, rest: &[&str]) -> RouteDecision {
+    match program {
+        "cargo" => cargo_build_route(rest),
+        "just" => just_build_route(rest),
+        _ => RouteDecision::Exec,
+    }
+}
+
+/// `cargo build|check|test|clippy [args…]`. `--config`/`-Z…` change what
+/// cargo does (config override / unstable flags outside the calibrated
+/// fence) and never route — same "never widen, never drop" posture as the
+/// git read routes.
+fn cargo_build_route(rest: &[&str]) -> RouteDecision {
+    let Some((sub, rest)) = rest.split_first() else {
+        return RouteDecision::Exec;
+    };
+    if !CARGO_BUILD_SUBCOMMANDS.contains(sub) {
+        return RouteDecision::Exec;
+    }
+    if rest
+        .iter()
+        .any(|tok| *tok == "--config" || tok.starts_with("--config=") || tok.starts_with("-Z"))
+    {
+        return RouteDecision::Exec;
+    }
+    let mut argv = vec!["cargo".to_string(), (*sub).to_string()];
+    argv.extend(rest.iter().map(|t| (*t).to_string()));
+    RouteDecision::Route {
+        tool: "build_exec",
+        args: json!({ "argv": argv }),
+    }
+}
+
+/// `just <recipe>` — a single non-flag recipe name, no other operands.
+/// Whether a justfile actually exists is a filesystem fact this pure
+/// classifier cannot see; the dispatch site (`tools.rs`'s `build_exec` arm)
+/// checks it before running and refuses if there is none.
+fn just_build_route(rest: &[&str]) -> RouteDecision {
+    match rest {
+        [recipe] if !recipe.starts_with('-') => RouteDecision::Route {
+            tool: "build_exec",
+            args: json!({ "argv": ["just", recipe] }),
+        },
+        _ => RouteDecision::Exec,
     }
 }
 
@@ -942,6 +1025,103 @@ mod tests {
     fn unknown_programs_gate() {
         for cmd in ["echo hi", "grep foo bar", "bash script.sh", ""] {
             assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd:?}");
+        }
+    }
+
+    /// F11: `cargo build|check|test|clippy` routes to `build_exec` carrying
+    /// the model's LITERAL argv — never a resolved phase command, so no
+    /// operand (`-p newt-core`, a test filter, …) is dropped.
+    #[test]
+    fn cargo_build_commands_route_with_literal_argv() {
+        assert_eq!(
+            classify("cargo test -p newt-core"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "test", "-p", "newt-core"] }),
+            }
+        );
+        for (cmd, argv) in [
+            ("cargo build", json!(["cargo", "build"])),
+            ("cargo check", json!(["cargo", "check"])),
+            (
+                "cargo clippy --workspace",
+                json!(["cargo", "clippy", "--workspace"]),
+            ),
+            (
+                "cargo test -p x --lib -- --test-threads=1",
+                json!([
+                    "cargo",
+                    "test",
+                    "-p",
+                    "x",
+                    "--lib",
+                    "--",
+                    "--test-threads=1"
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args: json!({ "argv": argv }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    /// `just <recipe>` routes the same way; anything more than a bare recipe
+    /// name gates rather than guessing.
+    #[test]
+    fn just_recipe_routes_with_literal_argv() {
+        assert_eq!(
+            classify("just test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["just", "test"] }),
+            }
+        );
+        for cmd in ["just", "just test extra", "just -n test", "just --list"] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// Near-misses that change what runs, or reach outside the calibrated
+    /// fence, must NEVER route: `cargo run`/`install`/`publish` execute or
+    /// publish something; `--config`/`-Z…` are config overrides / unstable
+    /// flags. `cargo test | tail` is compound and already gated by
+    /// `SHELL_META`, exercised here for this route specifically.
+    #[test]
+    fn cargo_near_misses_never_route() {
+        for cmd in [
+            "cargo run",
+            "cargo install ripgrep",
+            "cargo publish",
+            "cargo test --config net.offline=false",
+            "cargo build -Zunstable-options",
+            "cargo test | tail",
+            "cargo",
+            "cargo frobnicate",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// A build-lane route drops the rest of the call object (there is
+    /// nowhere to put `cwd`/`timeout`), so `classify_call` must refuse to
+    /// route a non-bare call — same rule as the scoped git-read route.
+    #[test]
+    fn build_route_call_requires_bare_call() {
+        let table = RouteTable::builtin();
+        assert_eq!(
+            table.classify_call(&json!({"command": "cargo test"})),
+            classify("cargo test")
+        );
+        for extra in [json!({"cwd": "sub"}), json!({"timeout": 5})] {
+            let mut call = extra;
+            call["command"] = json!("cargo test");
+            assert_eq!(table.classify_call(&call), RouteDecision::Exec, "{call}");
         }
     }
 
