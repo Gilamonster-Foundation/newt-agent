@@ -325,7 +325,60 @@ pub struct PromptIntake {
     /// this to run one bounded, tool-less side call and show the operator the
     /// model's answer, then clears it — the batch stays pending underneath.
     pending_discussion: Option<String>,
+    /// A classifier's read of an operator reply that carried no explicit
+    /// ordinal, offered but not yet acted on (#2517 — "confirm-then-lock").
+    ///
+    /// Single-shot: [`Self::resolve_with_operator_answer`] either locks it
+    /// (the very next reply is a bare affirmation) or discards it (anything
+    /// else — including a reply that looks like a NEW attempt at an answer).
+    /// It never survives a second turn and never locks on its own; only an
+    /// operator confirmation following it can. This is what keeps a
+    /// classifier's guess from becoming the same silent inference the
+    /// harness has always refused to do from a bare "continue" — the guess
+    /// is shown, named, and requires its own explicit yes.
+    proposed_answer: Option<ProposedAnswer>,
 }
+
+/// A single classifier-proposed decision, named for display in
+/// [`PromptIntake::proposed_answer_notice`] and resolved back to a `decisions`
+/// index in [`PromptIntake::resolve_with_operator_answer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProposedAnswer {
+    /// Absolute index into `manifest.decisions` — NOT the displayed ordinal,
+    /// which shifts as other decisions lock (same reasoning as
+    /// `pending_indices`).
+    index: usize,
+    /// A short, human-readable label for what the classifier read the reply
+    /// as choosing, shown back to the operator so a wrong guess is obvious
+    /// before it can be confirmed.
+    summary: String,
+}
+
+/// Exact-match affirmations that confirm a pending classifier proposal.
+/// Deliberately a closed, exact-match list rather than a substring scan —
+/// the classifier already did the semantic work; this step is a narrow,
+/// auditable lexical check, not a second round of inference.
+const CONFIRMATION_WORDS: &[&str] = &[
+    "y",
+    "yes",
+    "yes.",
+    "yep",
+    "yeah",
+    "yup",
+    "correct",
+    "right",
+    "confirm",
+    "confirmed",
+    "ok",
+    "okay",
+    "sure",
+    "do it",
+    "go ahead",
+    "proceed",
+    "that one",
+    "that's right",
+    "sounds right",
+];
 
 impl PromptIntake {
     /// Analyze a new operator prompt before any model-visible work begins,
@@ -390,6 +443,7 @@ impl PromptIntake {
                 source: DispositionSource::Inferred,
                 last_rejection: None,
                 pending_discussion: None,
+                proposed_answer: None,
             };
             debug_assert!(intake.validate().is_ok());
             return intake;
@@ -418,6 +472,7 @@ impl PromptIntake {
             source: DispositionSource::Inferred,
             last_rejection: None,
             pending_discussion: None,
+            proposed_answer: None,
         };
         debug_assert!(intake.validate().is_ok());
         intake
@@ -524,6 +579,44 @@ impl PromptIntake {
         self.pending_discussion.take()
     }
 
+    /// Offer a classifier's read of a non-explicit reply, naming which
+    /// PENDING decision (displayed ordinal, 1-based) it believes the operator
+    /// meant and a short label for what that choice was. Ignored — returns an
+    /// unchanged clone — if `ordinal` is not currently pending: a stale or
+    /// out-of-range proposal must never silently attach to the wrong item.
+    ///
+    /// This only OFFERS; nothing locks until [`Self::resolve_with_operator_answer`]
+    /// sees the operator's own next reply confirm it (#2517).
+    pub fn propose_answer(&self, ordinal: usize, summary: impl Into<String>) -> Self {
+        let mut proposed = self.clone();
+        let pending = proposed.pending_indices();
+        let Some(index) = ordinal.checked_sub(1).and_then(|i| pending.get(i).copied()) else {
+            return proposed;
+        };
+        proposed.proposed_answer = Some(ProposedAnswer {
+            index,
+            summary: summary.into(),
+        });
+        proposed
+    }
+
+    /// One line naming the classifier's proposal and how to confirm or
+    /// override it, or `None` if nothing is proposed. Shown in place of the
+    /// ordinary rejection — a proposal is progress, not a refusal.
+    pub fn proposed_answer_notice(&self) -> Option<String> {
+        let proposal = self.proposed_answer.as_ref()?;
+        let ordinal = self
+            .pending_indices()
+            .iter()
+            .position(|&i| i == proposal.index)
+            .map_or(0, |p| p + 1);
+        Some(format!(
+            "I read that as choosing {ordinal}: \"{}\" — reply `yes` to lock it, \
+             or answer explicitly (`{ordinal}: …`) if that's not right.",
+            proposal.summary
+        ))
+    }
+
     /// The absolute `decisions` indices that are still pending, in order.
     ///
     /// #1689 item 4. This is the ONE mapping between a displayed ordinal and a
@@ -572,6 +665,29 @@ impl PromptIntake {
             return self.clone();
         }
         let mut resolved = self.clone();
+        // #2517: a classifier's proposal is single-shot — it is consumed here
+        // whether or not this reply confirms it, so it can never leak into a
+        // later, unrelated turn. A narrow, exact-match affirmation locks
+        // EXACTLY the proposed decision (never inferred fresh from this
+        // reply); anything else falls through and `answer` is resolved as an
+        // ordinary reply against the batch, proposal already gone.
+        if let Some(proposal) = resolved.proposed_answer.take() {
+            let normalized = answer.trim().to_ascii_lowercase();
+            if CONFIRMATION_WORDS.contains(&normalized.as_str()) {
+                if let Some(decision) = resolved.manifest.decisions.get_mut(proposal.index) {
+                    decision.status = DecisionStatus::Locked;
+                    decision.source = Some(DecisionSource::Operator);
+                }
+                resolved.last_rejection = None;
+                resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
+                    resolved.post_lock_disposition
+                } else {
+                    PromptDisposition::Ask
+                };
+                debug_assert!(resolved.validate().is_ok());
+                return resolved;
+            }
+        }
         // #2517: the escape hatch. A `/discuss …` reply is never an answer —
         // it asks to talk the batch through before committing to one. This is
         // checked before the ordinal parser so a discussion request can never

@@ -309,3 +309,76 @@ fn discuss_is_named_everywhere_the_operator_would_look() {
     assert!(rejection.contains("/discuss"), "{rejection}");
     assert!(rejection.contains("/new"), "{rejection}");
 }
+
+/// #2517 "confirm-then-lock": a classifier's proposal is OFFERED, not
+/// applied — it must not lock anything by itself.
+#[test]
+fn a_proposal_does_not_lock_until_confirmed() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    assert_eq!(
+        proposed.manifest.pending_decision_count(),
+        1,
+        "a proposal alone locks nothing"
+    );
+    let notice = proposed
+        .proposed_answer_notice()
+        .expect("a proposal must produce a notice");
+    assert!(notice.contains("drain before rotation"), "{notice}");
+    assert!(notice.contains("yes"), "{notice}");
+}
+
+/// An exact affirmation confirms the SPECIFIC proposed decision, not a fresh
+/// inference from the affirmation's own text.
+#[test]
+fn an_affirmation_locks_exactly_the_proposed_decision() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    for affirmation in ["yes", "Yes", " y ", "confirmed", "sounds right"] {
+        let resolved = proposed.resolve_with_operator_answer(affirmation);
+        assert_eq!(
+            resolved.manifest.pending_decision_count(),
+            0,
+            "`{affirmation}` must confirm the pending proposal"
+        );
+        assert!(resolved.last_rejection().is_none());
+        assert!(resolved.proposed_answer_notice().is_none());
+    }
+}
+
+/// A proposal is single-shot: anything OTHER than an affirmation discards it
+/// rather than leaving it to be confirmed by a later, unrelated reply.
+#[test]
+fn a_non_affirmation_discards_the_proposal_instead_of_confirming_it() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    let resolved = proposed.resolve_with_operator_answer("actually let's talk about this more");
+    assert_eq!(resolved.manifest.pending_decision_count(), 1);
+    assert!(
+        resolved.proposed_answer_notice().is_none(),
+        "a non-affirmation must discard the proposal, not carry it forward"
+    );
+    // The discarded proposal must not resurface on a LATER unrelated turn.
+    let later = resolved.resolve_with_operator_answer("yes");
+    assert_eq!(
+        later.manifest.pending_decision_count(),
+        1,
+        "a stale, already-discarded proposal must not be confirmable later"
+    );
+}
+
+/// An explicit ordinal answer overrides a live proposal outright — the
+/// operator's own explicit statement always outranks the classifier's guess.
+#[test]
+fn an_explicit_ordinal_overrides_a_live_proposal() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    let resolved =
+        proposed.resolve_with_operator_answer("1: stamp actions with the conversation id");
+    assert_eq!(resolved.manifest.pending_decision_count(), 0);
+    assert!(resolved.proposed_answer_notice().is_none());
+}
+
+/// An out-of-range ordinal is refused as a proposal rather than attaching to
+/// the wrong (or no) decision.
+#[test]
+fn proposing_an_out_of_range_ordinal_is_a_no_op() {
+    let proposed = one_decision().propose_answer(7, "not a real option");
+    assert!(proposed.proposed_answer_notice().is_none());
+}

@@ -678,6 +678,77 @@ fn comprehend_accepted_prompt(
     (intake, mode)
 }
 
+/// What a clarification-reply classifier read a non-explicit reply as
+/// selecting — offered, never applied. See [`classify_clarification_reply`].
+struct ClassifiedProposal {
+    /// Displayed ordinal (1-based), matching what the batch showed.
+    ordinal: usize,
+    summary: String,
+}
+
+/// Ask a bounded, tool-less side call to read a clarification reply that
+/// carried no explicit ordinal against the pending batch, and return what it
+/// proposed, if anything (#2517, "confirm-then-lock").
+///
+/// This only classifies. Committing the proposal onto the intake is
+/// [`newt_core::agentic::PromptIntake::propose_answer`]'s job, and LOCKING it
+/// is the operator's, via their own next explicit confirmation inside
+/// [`newt_core::agentic::PromptIntake::resolve_with_operator_answer`] — never
+/// this call's output directly. A malformed, empty, or failed response is
+/// "no proposal": fail-closed, the same posture every other classifier in
+/// this harness takes (see the `#1749` adjudicator above this call site).
+///
+/// `call` is injected so this is unit-testable without a live backend;
+/// production passes the same adjudicator side-call `/discuss` uses.
+fn classify_clarification_reply(
+    intake: &newt_core::agentic::PromptIntake,
+    reply: &str,
+    call: impl FnOnce(String) -> anyhow::Result<String>,
+) -> Option<ClassifiedProposal> {
+    let batch = intake.clarification_batch();
+    let prompt = format!(
+        "The operator was asked to lock one of these pending decisions by \
+         replying with an explicit ordinal (e.g. `1: ...`). Their reply did \
+         not include one. Decide, ONLY if unambiguous, which single pending \
+         item they most likely meant — do not guess if it could be more than \
+         one, and do not use any tools.\n\n\
+         Pending batch:\n{batch}\n\n\
+         Operator's reply: {reply}\n\n\
+         Respond with EXACTLY two lines and nothing else:\n\
+         PROPOSAL: <ordinal number, or `none` if it is not clearly one item>\n\
+         SUMMARY: <a short restatement of that item, or leave blank if none>"
+    );
+    let response = call(prompt).ok()?;
+    let mut ordinal = None;
+    let mut summary = String::new();
+    for line in response.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("PROPOSAL:")
+            .or_else(|| line.strip_prefix("proposal:"))
+        {
+            let rest = rest.trim();
+            if !rest.eq_ignore_ascii_case("none") {
+                ordinal = rest.parse::<usize>().ok();
+            }
+        } else if let Some(rest) = line
+            .strip_prefix("SUMMARY:")
+            .or_else(|| line.strip_prefix("summary:"))
+        {
+            summary = rest.trim().to_string();
+        }
+    }
+    let ordinal = ordinal?;
+    if summary.is_empty() {
+        summary = format!("option {ordinal}");
+    }
+    Some(ClassifiedProposal { ordinal, summary })
+}
+
+#[cfg(test)]
+#[path = "chat_tests/clarification_classifier.rs"]
+mod clarification_classifier_tests;
+
 /// Rebuild an outstanding clarification from its durable operator-receipt
 /// lineage. A prompt that reached model work cannot be pending: `Ask` exits
 /// before inference, so every descendant while it remains pending must be an
@@ -7337,6 +7408,56 @@ fn session_body(
                             print_newt(&batch, color, verbose);
                             println!();
                             continue;
+                        }
+                        // #2517 "confirm-then-lock": the reply carried no
+                        // explicit ordinal and read as neither a question nor
+                        // a discussion request — the two shapes a classifier
+                        // can actually help with (`Incomplete`/`OutOfRange`
+                        // already named an explicit ordinal, so the operator
+                        // stated something concrete; a guess would second-
+                        // guess it instead of helping). One bounded, tool-
+                        // less side call OFFERS a reading; nothing locks
+                        // here — `PromptIntake::resolve_with_operator_answer`
+                        // only locks a proposal on the operator's own next
+                        // explicit confirmation, never on this call's output
+                        // directly. This is the same fail-closed shape as the
+                        // adjudicator above: the model proposes, the harness
+                        // (via the operator) is the only thing that commits.
+                        let classifiable_rejection = matches!(
+                            prompt_intake.last_rejection(),
+                            Some(
+                                newt_core::agentic::ClarificationRejection::NoOrdinals
+                                    | newt_core::agentic::ClarificationRejection::ReadsAsQuestion
+                            )
+                        );
+                        if adjudication_enabled && classifiable_rejection {
+                            if let Some(proposal) =
+                                classify_clarification_reply(&prompt_intake, &task, |prompt| {
+                                    let side_call = build_adjudicator(
+                                        &cfg,
+                                        &inf_url,
+                                        &inf_model,
+                                        inf_kind,
+                                        &inf_key,
+                                        Some(mem_budget),
+                                        color,
+                                    );
+                                    tokio::task::block_in_place(|| rt.block_on(side_call(prompt)))
+                                        .map(|(text, _usage)| text)
+                                })
+                            {
+                                prompt_intake = prompt_intake
+                                    .propose_answer(proposal.ordinal, proposal.summary);
+                                if let Some(notice) = prompt_intake.proposed_answer_notice() {
+                                    pending_clarification = Some(PendingClarification {
+                                        parent: Box::new(parent),
+                                        intake: prompt_intake,
+                                    });
+                                    print_newt(&notice, color, verbose);
+                                    println!();
+                                    continue;
+                                }
+                            }
                         }
                         let clarification = prompt_intake.clarification_batch();
                         // #1689 item 1: when a reply was REFUSED, say why
