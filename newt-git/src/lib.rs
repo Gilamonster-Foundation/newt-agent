@@ -216,11 +216,16 @@ impl GitEngine {
     /// Index vs worktree, hashing "racily clean" entries (mtime not older
     /// than the index file's) instead of trusting their cached stat, as git
     /// does. Without it a same-size edit made in the index write's timestamp
-    /// tick reads as clean, and `rebase`/`checkout` would overwrite it.
+    /// tick reads as clean, and `rebase`/`checkout` would overwrite it. (An edit
+    /// landing between this check and their reset is still lost, as in git.)
     fn worktree_changes(&self, index: &Index, wt: &Path) -> Result<Vec<DiffEntry>, GitError> {
-        let index_mtime = std::fs::metadata(self.repo.git_dir.join("index"))
-            .and_then(|m| m.modified())
+        // The same resolver `load_index` uses, so `GIT_INDEX_FILE` is honoured.
+        let index_mtime = self
+            .repo
+            .index_path_for_env()
             .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| (d.as_secs() as u32, d.subsec_nanos()));
         let options = DiffIndexToWorktreeOptions {
