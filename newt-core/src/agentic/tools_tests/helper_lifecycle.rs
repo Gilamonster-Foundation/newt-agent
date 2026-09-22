@@ -75,6 +75,54 @@ fn lifecycle_timed_out_run_puts_build_call_first() {
     );
 }
 
+/// F12 (verify-lane-steering round 2): a model that learned "use lifecycle
+/// action=build" sends `phase="build"` instead — `build` is an action, not
+/// a phase, so `Phase::from_key` rejects it and it fell into the generic
+/// "unknown lifecycle phase" refusal with no pointer to the real call. The
+/// refusal must carry the same `{"phase":...,"action":"build"}` suggestion
+/// as the timed-out-run coaching (`lifecycle_run_result`) — one JSON source,
+/// not a second copy of the shape.
+#[tokio::test]
+async fn lifecycle_phase_build_points_at_action_build() {
+    let caveats = crate::caveats::Caveats::top();
+    let args = serde_json::json!({ "phase": "build" });
+    let out = execute_tool(
+        "lifecycle",
+        &args,
+        ".",
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        out.starts_with("error: unknown lifecycle phase 'build'"),
+        "{out}"
+    );
+    let suggestion = out
+        .lines()
+        .find_map(|line| line.strip_prefix("Suggested lifecycle call: "))
+        .expect("must point at the real action=build call: {out}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(suggestion).unwrap(),
+        serde_json::json!({"phase": "test", "action": "build"})
+    );
+}
+
 /// #894 regression for the concrete drift that motivated the registry: the
 /// `lifecycle` tool (#891) is advertised + dispatched, so it MUST be a real
 /// name — otherwise every legitimate `lifecycle` call is miscounted as a

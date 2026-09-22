@@ -952,10 +952,7 @@ fn lifecycle_run_result(
     args: &serde_json::Value,
     mut result: (String, crate::ExecOutcome),
 ) -> (String, crate::ExecOutcome) {
-    let mut suggestion = serde_json::json!({"phase": args["phase"], "action": "build"});
-    if let Some(dir) = args.get("dir").and_then(serde_json::Value::as_str) {
-        suggestion["dir"] = dir.into();
-    }
+    let suggestion = build_call_suggestion(args, args["phase"].as_str().unwrap_or(""));
     match result.1 {
         crate::ExecOutcome::Unavailable => {
             result.0.push_str(&format!(
@@ -981,6 +978,18 @@ fn lifecycle_run_result(
         _ => {}
     }
     result
+}
+
+/// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
+/// source shared by the timed-out/unavailable `action=run` coaching
+/// (`lifecycle_run_result`) and F12's `phase="build"` refusal below, which
+/// cannot reuse `args["phase"]` verbatim since that IS the bad value.
+fn build_call_suggestion(args: &serde_json::Value, phase: &str) -> serde_json::Value {
+    let mut suggestion = serde_json::json!({"phase": phase, "action": "build"});
+    if let Some(dir) = args.get("dir").and_then(serde_json::Value::as_str) {
+        suggestion["dir"] = dir.into();
+    }
+    suggestion
 }
 
 /// A call-scoped grant for the existing lifecycle surface, not an exec-axis
@@ -3390,6 +3399,18 @@ async fn execute_authorized_tool(
                     .map(|p| p.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
+                // F12 (verify-lane-steering round 2): `build` is an action,
+                // not a phase — a model that learned "use lifecycle
+                // action=build" often sends `phase="build"` instead. Point
+                // it at the real call rather than leaving it in the
+                // valid-phases dead end.
+                if phase_key == "build" {
+                    let suggestion = build_call_suggestion(args, "test");
+                    return format!(
+                        "error: unknown lifecycle phase '{phase_key}'. Valid phases: {valid}.\n\
+                         Suggested lifecycle call: {suggestion}"
+                    );
+                }
                 return format!(
                     "error: unknown lifecycle phase '{phase_key}'. Valid phases: {valid}."
                 );
