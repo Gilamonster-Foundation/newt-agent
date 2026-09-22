@@ -533,8 +533,19 @@ impl GitEngine {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
         }
+        // #2485: a ref-moving op must leave the working tree == HEAD, or
+        // refuse. Require a clean tree up front so the `checkout_between_trees`
+        // reset below (old HEAD tree → new tip tree) never discards
+        // uncommitted work — the same clean-tree precondition `stash` relies
+        // on for its own tree reset.
+        if !self.status(caps)?.clean {
+            return Err(GitError::Unsupported(
+                "rebase needs a clean working tree; commit or stash first",
+            ));
+        }
         let head_ref = read_head(&self.repo.git_dir)?
             .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
+        let old_head_tree = self.head_tree()?;
         let onto_oid = self.resolve_one(onto)?;
 
         // The commit currently being assembled (a `pick`/`reword` opens it;
@@ -632,10 +643,22 @@ impl GitEngine {
                 None => msg,
             };
             tip = self.write_commit_on(cur_parent, cur_tree, &msg, author)?;
+            tip_tree = cur_tree;
             produced += 1;
         }
-        // The single mutating step: advance the branch ref to the new tip.
+        // Advance the branch ref to the new tip.
         write_ref(&self.repo.git_dir, &head_ref, &tip)?;
+        // Reset the worktree + index LAST — mirrors `stash`'s own ordering —
+        // so tree == HEAD after the ref move. If this fails the ref has
+        // already moved; say so rather than leaving a silent half-update.
+        if let Some(old_tree) = old_head_tree {
+            checkout_between_trees(&self.repo, Some(&old_tree), &tip_tree).map_err(|e| {
+                GitError::Refused(format!(
+                    "rebase: HEAD moved to {} but the working tree was NOT updated: {e}",
+                    short_oid(&tip)
+                ))
+            })?;
+        }
         Ok(RebaseReport {
             new_head: short_oid(&tip),
             produced,
