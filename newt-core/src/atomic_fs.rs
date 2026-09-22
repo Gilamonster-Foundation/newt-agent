@@ -168,6 +168,7 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    sweep_lock_tmp_orphans(lock_path);
     let owner = LockOwner::current();
     let encoded = owner.encode();
     let mut denied = false;
@@ -212,6 +213,49 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
     }
 }
 
+/// Remove `<lock>.*.tmp` orphans left by [`publish_lock`] crashing between
+/// its temp-file write and the `hard_link`/fallback publish. Best-effort and
+/// scoped to files older than the contention retry budget, so an in-flight
+/// writer's own temp file is never touched; errors are swallowed since a
+/// stray orphan blocks nothing and this sweep must never block acquisition.
+fn sweep_lock_tmp_orphans(lock_path: &Path) {
+    sweep_lock_tmp_orphans_older_than(lock_path, LOCK_RETRY_DELAY * LOCK_RETRIES);
+}
+
+/// [`sweep_lock_tmp_orphans`] with the age budget as a seam, so a test can
+/// use a millisecond-scale budget instead of the real ~2s retry budget.
+fn sweep_lock_tmp_orphans_older_than(lock_path: &Path, budget: Duration) {
+    let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    let Some(file_name) = lock_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let prefix = format!("{file_name}.");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let is_old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > budget);
+        if is_old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Publish `encoded` at `lock_path` so it is never observable empty.
 ///
 /// Writes the owner body to a private temp file first, `fsync`s it, then
@@ -225,6 +269,16 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
 /// directory); if a future target lacks hard-link support, fall back to the
 /// old `create_new` + `write_all` path instead of failing outright.
 fn publish_lock(lock_path: &Path, encoded: &str) -> std::io::Result<()> {
+    publish_lock_with_link(lock_path, encoded, |src, dst| std::fs::hard_link(src, dst))
+}
+
+/// [`publish_lock`] with the `hard_link` call as a seam, so a test can inject
+/// a link failure without a real vfat/FUSE/SMB mount.
+fn publish_lock_with_link(
+    lock_path: &Path,
+    encoded: &str,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = lock_path.parent().filter(|p| !p.as_os_str().is_empty());
     let tmp_name = lock_path
         .file_name()
@@ -246,15 +300,22 @@ fn publish_lock(lock_path: &Path, encoded: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(error);
     }
-    let link_result = std::fs::hard_link(&tmp_path, lock_path);
+    let link_result = link(&tmp_path, lock_path);
     match &link_result {
         Ok(()) => {
             let _ = std::fs::remove_file(&tmp_path);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-            // hard_link isn't available on this target/filesystem — fall
-            // back to the old direct create_new path, same contention
-            // semantics, just without the empty-window guarantee.
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            // hard_link failed for any reason other than "the lock is
+            // already held" — not just Unsupported. vfat/exFAT/FUSE(sshfs)
+            // return EPERM (which io::ErrorKind maps to PermissionDenied,
+            // the same kind ordinary contention/Windows DELETE_PENDING
+            // reports) and some Windows FAT/SMB errors map to Uncategorized.
+            // Treating only Unsupported as "no hard-link support" left those
+            // targets either misdiagnosed as contention or failing outright.
+            // Fall back to the old direct create_new path, same contention
+            // semantics, just without the empty-window guarantee; the
+            // fallback's own error (if any) is the verdict callers see.
             let _ = std::fs::remove_file(&tmp_path);
             return std::fs::OpenOptions::new()
                 .write(true)
@@ -319,6 +380,13 @@ fn reclaim_lock_once(lock_path: &Path) -> anyhow::Result<bool> {
     if !reclaimable_lock(lock_path) {
         return Ok(false);
     }
+    // Pre-existing race, not introduced here: this removes by PATH, so if the
+    // dead owner's guard already unlinked it and a third process published a
+    // live lock in the gap between the read above and this unlink, we delete
+    // the LIVE lock instead. The lease only serializes reclaimers against each
+    // other, not against owner-drop + publish. Narrowing this needs a re-read
+    // (or dev/ino compare) under the lease immediately before unlinking —
+    // tracked as a follow-up, not fixed here.
     match std::fs::remove_file(lock_path) {
         Ok(()) => {
             sync_parent(lock_path)?;
@@ -898,6 +966,50 @@ mod tests {
         atomic_write(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// #2525 review item 1: a link failure other than `AlreadyExists` — the
+    /// EPERM a vfat/exFAT/FUSE(sshfs) target maps to `PermissionDenied`, or an
+    /// Uncategorized Windows FAT/SMB error — must fall back to the old
+    /// create_new path, not be treated as contention or fail outright. Seam
+    /// (`publish_lock_with_link`) stands in for the real mount so this stays
+    /// in the fully-mocked unit tier.
+    #[test]
+    fn hard_link_failure_other_than_unsupported_falls_back_to_create_new() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("config.toml.lock");
+        publish_lock_with_link(&lock_path, "owner-body", |_src, _dst| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect("falls back instead of surfacing the injected link error");
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "owner-body");
+    }
+
+    /// #2525 review item 2: a crash between the temp-file write and the
+    /// `hard_link`/fallback publish leaves a `<lock>.*.tmp` orphan behind.
+    /// Once past the contention retry budget it is safe to call dead and
+    /// must be swept; a fresh one still within budget (an in-flight writer)
+    /// must survive.
+    #[test]
+    fn sweep_lock_tmp_orphans_removes_only_ones_past_the_retry_budget() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("config.toml.lock");
+        let stale = dir.path().join("config.toml.lock.stale-orphan.tmp");
+        std::fs::write(&stale, b"orphan").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let fresh = dir.path().join("config.toml.lock.fresh-orphan.tmp");
+        std::fs::write(&fresh, b"orphan").unwrap();
+
+        sweep_lock_tmp_orphans_older_than(&lock_path, Duration::from_millis(20));
+
+        assert!(
+            !stale.exists(),
+            "orphan past the retry budget must be swept"
+        );
+        assert!(
+            fresh.exists(),
+            "orphan within the retry budget must survive"
+        );
     }
 
     #[test]
