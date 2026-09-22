@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// Fixed, content-free marker appended inside the protected active-prompt
@@ -196,6 +197,12 @@ pub struct DecisionLock {
     /// An intake-bound overflow is not a decision the operator can answer in
     /// place. The operator must split the request before execution can resume.
     overflow: bool,
+    /// The operator-supplied text this lock resolved to, when one is known —
+    /// a classifier proposal's summary, or the `value` half of an explicit
+    /// `N: value` reply (#2515 items 5/6 round 2). `None` when the reply gave
+    /// no text (a bare `1:`) or the lock has another source; display falls
+    /// back to `question` in that case.
+    answer: Option<String>,
 }
 
 impl DecisionLock {
@@ -221,6 +228,12 @@ impl DecisionLock {
     /// assumption, so the two never share a representation.
     pub fn assumption(&self) -> Option<&str> {
         self.assumption.as_deref()
+    }
+
+    /// The confirmed answer text for a lock, falling back to the question
+    /// when no answer text is known (#2515 items 5/6 round 2).
+    pub fn answer_or_question(&self) -> &str {
+        self.answer.as_deref().unwrap_or(&self.question)
     }
 }
 
@@ -444,6 +457,7 @@ impl PromptIntake {
                         source: None,
                         assumption: None,
                         overflow: false,
+                        answer: None,
                     }],
                 },
                 disposition: PromptDisposition::Ask,
@@ -656,13 +670,18 @@ impl PromptIntake {
         Some(text)
     }
 
-    /// Addendum item 6: one "locked N: question" line per decision that was
+    /// Addendum item 6: one "locked N: answer" line per decision that was
     /// `Pending` in `previous` and is `Locked` in `self` — the confirmation
     /// printed for the one moment that changes state, so a wrong lock is
     /// visible before the turn proceeds. The ordinal is `previous`'s own
     /// displayed numbering (the same mapping [`Self::clarification_batch`]
     /// rendered when the operator answered it), never renumbered against
     /// `self`, where a lock has already removed the item from "pending".
+    ///
+    /// #2515 items 5/6 round 2: names the ANSWER a proposal or an explicit
+    /// `N: value` supplied, not the question, so the confirmation reads as
+    /// "what you got" rather than "what was asked" — falling back to the
+    /// question only when no answer text is known ([`DecisionLock::answer_or_question`]).
     pub fn newly_locked_lines(&self, previous: &Self) -> Vec<String> {
         previous
             .pending_indices()
@@ -671,7 +690,7 @@ impl PromptIntake {
             .filter_map(|(position, &index)| {
                 let decision = self.manifest.decisions.get(index)?;
                 (decision.status == DecisionStatus::Locked)
-                    .then(|| format!("locked {}: {}", position + 1, decision.question))
+                    .then(|| format!("locked {}: {}", position + 1, decision.answer_or_question()))
             })
             .collect()
     }
@@ -725,23 +744,23 @@ impl PromptIntake {
         }
         let mut resolved = self.clone();
         // Addendum item 5: cleared up front so a stale proposal from an
-        // EARLIER rejection never survives into this one's explanation.
+        // EARLIER rejection's explanation never survives into this one's.
         resolved.last_rejection_proposal = None;
-        // #2517: a classifier's proposal is single-shot — it is consumed here
-        // whether or not this reply confirms it, so it can never leak into a
-        // later, unrelated turn. A narrow, exact-match affirmation locks
-        // EXACTLY the proposed decision (never inferred fresh from this
-        // reply); anything else falls through and `answer` is resolved as an
-        // ordinary reply against the batch, proposal already gone — but is
-        // remembered below so a refusal that follows can still say it was
-        // there (addendum item 5).
+        // #2515 items 5/6 round 2: a classifier's proposal now survives a
+        // refusal — it is cleared ONLY on lock, on an explicit reply that
+        // gives real ordinals (a "new attempt", Ok or Incomplete/OutOfRange),
+        // or by `propose_answer` replacing it outright. A bare confirmation
+        // word locks it on ANY turn it is still outstanding, not only the
+        // very next one.
         let outstanding_proposal = resolved.proposed_answer.clone();
-        if let Some(proposal) = resolved.proposed_answer.take() {
+        if let Some(proposal) = outstanding_proposal.clone() {
             let normalized = answer.trim().to_ascii_lowercase();
             if CONFIRMATION_WORDS.contains(&normalized.as_str()) {
+                resolved.proposed_answer = None;
                 if let Some(decision) = resolved.manifest.decisions.get_mut(proposal.index) {
                     decision.status = DecisionStatus::Locked;
                     decision.source = Some(DecisionSource::Operator);
+                    decision.answer = Some(proposal.summary);
                 }
                 resolved.last_rejection = None;
                 resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
@@ -757,7 +776,7 @@ impl PromptIntake {
         // it asks to talk the batch through before committing to one. This is
         // checked before the ordinal parser so a discussion request can never
         // itself be misread as a malformed answer and rejected; nothing locks
-        // and the batch stays exactly as pending as it was.
+        // and the batch stays exactly as pending as it was, proposal included.
         if let Some(text) = discussion_request(answer) {
             resolved.last_rejection = None;
             resolved.pending_discussion = Some(text);
@@ -769,10 +788,15 @@ impl PromptIntake {
 
         match explicit_answer_outcome(answer, &pending) {
             Ok(indices) => {
-                for index in indices {
+                // A real ordinal reply is a new attempt — whatever it names,
+                // an outstanding proposal is no longer the operator's most
+                // recent word on the batch.
+                resolved.proposed_answer = None;
+                for (index, value) in indices {
                     let decision = &mut resolved.manifest.decisions[index];
                     decision.status = DecisionStatus::Locked;
                     decision.source = Some(DecisionSource::Operator);
+                    decision.answer = value;
                 }
                 resolved.last_rejection = None;
             }
@@ -782,14 +806,20 @@ impl PromptIntake {
                 // Addendum item 5: only the two kinds a bare, non-ordinal
                 // reply produces (`NoOrdinals`/`ReadsAsQuestion`) are the ones
                 // a classifier proposal was offered against — `Incomplete`
-                // and `OutOfRange` mean the operator DID give ordinals, so
-                // there is nothing ambiguous for the proposal to still apply
-                // to.
+                // and `OutOfRange` mean the operator DID give ordinals (a new
+                // attempt), so the proposal is discarded same as the Ok arm;
+                // there is nothing ambiguous for it to still apply to.
                 if matches!(
                     rejection,
                     ClarificationRejection::NoOrdinals | ClarificationRejection::ReadsAsQuestion
                 ) {
+                    // The proposal is a non-ordinal reply's refusal too, so it
+                    // stays in `resolved.proposed_answer` (never taken above)
+                    // for a later `yes` to confirm; mirrored here only for
+                    // THIS turn's refusal text.
                     resolved.last_rejection_proposal = outstanding_proposal;
+                } else {
+                    resolved.proposed_answer = None;
                 }
                 resolved.last_rejection = Some(rejection);
             }
@@ -957,6 +987,7 @@ impl PromptIntake {
                 source: None,
                 assumption: None,
                 overflow: false,
+                answer: None,
             });
         }
         widened.disposition = PromptDisposition::Ask;
@@ -1600,6 +1631,7 @@ fn extract_decisions(asks: &[AtomicAsk]) -> (Vec<DecisionLock>, bool) {
                 source,
                 assumption: None,
                 overflow: false,
+                answer: None,
             });
         }
     }
@@ -1615,6 +1647,7 @@ fn overflow_decision() -> DecisionLock {
         source: None,
         assumption: None,
         overflow: true,
+        answer: None,
     }
 }
 
@@ -1806,17 +1839,21 @@ impl ClarificationRejection {
 const ORDINAL_SEPARATORS: [char; 3] = [':', '.', ')'];
 
 /// Resolve explicit operator answers, or say why the reply was refused.
+/// The `Option<String>` alongside each index is the trimmed `value` text
+/// after the ordinal's separator, `None` when the reply gave none (a bare
+/// `1:`) — used to name the locked ANSWER rather than just the question
+/// (#2515 items 5/6 round 2).
 ///
 /// #1689 items 1 and 2.
 fn explicit_answer_outcome(
     answer: &str,
     pending: &[usize],
-) -> Result<Vec<usize>, ClarificationRejection> {
+) -> Result<Vec<(usize, Option<String>)>, ClarificationRejection> {
     let answer = answer.trim();
     if answer.is_empty() {
         return Err(ClarificationRejection::NoOrdinals);
     }
-    let mut resolved = BTreeSet::new();
+    let mut resolved = BTreeMap::new();
     let mut saw_ordinal = false;
     let mut out_of_range = None;
     for line in answer.lines() {
@@ -1828,7 +1865,7 @@ fn explicit_answer_outcome(
         // rejecting a perfectly explicit ordinal over punctuation choice.
         // `.` is guarded against a decimal number ("3.14"): a digit
         // immediately after the dot means it was never a list marker.
-        let Some((ordinal, _value)) = ORDINAL_SEPARATORS.iter().find_map(|sep| {
+        let Some((ordinal, value)) = ORDINAL_SEPARATORS.iter().find_map(|sep| {
             let (ordinal, value) = line.split_once(*sep)?;
             if *sep == '.' && value.starts_with(|c: char| c.is_ascii_digit()) {
                 return None;
@@ -1846,13 +1883,15 @@ fn explicit_answer_outcome(
         // bare `1:` was already accepted — the pending item's own question is
         // the value, not the reply's text.
         saw_ordinal = true;
+        let value = value.trim();
+        let value = (!value.is_empty()).then(|| value.to_string());
         let Some(pending_ordinal) = ordinal.checked_sub(1) else {
             out_of_range = Some(ordinal);
             continue;
         };
         match pending.get(pending_ordinal) {
             Some(index) => {
-                resolved.insert(*index);
+                resolved.insert(*index, value);
             }
             None => out_of_range = Some(ordinal),
         }
@@ -1891,7 +1930,9 @@ fn explicit_answer_outcome(
 /// explained instead of silently repeated.
 #[cfg(test)]
 fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>> {
-    explicit_answer_outcome(answer, pending).ok()
+    explicit_answer_outcome(answer, pending)
+        .ok()
+        .map(|resolved| resolved.into_iter().map(|(index, _value)| index).collect())
 }
 
 /// Recognize the `/discuss` escape hatch and return the text to discuss, if

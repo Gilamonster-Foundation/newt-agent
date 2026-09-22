@@ -344,23 +344,62 @@ fn an_affirmation_locks_exactly_the_proposed_decision() {
     }
 }
 
-/// A proposal is single-shot: anything OTHER than an affirmation discards it
-/// rather than leaving it to be confirmed by a later, unrelated reply.
+/// #2515 items 5/6 round 2 (RED FIRST — failed before the fix: the second
+/// `yes` used to leave `pending_decision_count() == 1` and
+/// `last_rejection().is_some()`, matching the live TUI defect measured in
+/// `REVIEW-items5-6.md` — a proposal was consumed unconditionally by the
+/// FIRST reply regardless of outcome, so a refusal silently dropped it and a
+/// later `yes` had nothing left to confirm, even though the harness's own
+/// refusal text still claimed it was "still waiting".
+///
+/// A non-affirmation, non-ordinal reply (`NoOrdinals`/`ReadsAsQuestion`) is a
+/// REFUSAL, not a discard: the proposal must survive it, and a later `yes`
+/// must still lock the SAME decision the proposal named.
 #[test]
-fn a_non_affirmation_discards_the_proposal_instead_of_confirming_it() {
+fn a_refusal_does_not_discard_a_live_proposal() {
     let proposed = one_decision().propose_answer(1, "drain before rotation");
-    let resolved = proposed.resolve_with_operator_answer("actually let's talk about this more");
-    assert_eq!(resolved.manifest.pending_decision_count(), 1);
+    let refused = proposed.resolve_with_operator_answer("actually let's talk about this more");
+    assert_eq!(refused.manifest.pending_decision_count(), 1);
+    assert!(refused.last_rejection().is_some(), "must be refused");
     assert!(
-        resolved.proposed_answer_notice().is_none(),
-        "a non-affirmation must discard the proposal, not carry it forward"
+        refused.proposed_answer_notice().is_some(),
+        "the proposal must still be on the table after a refusal"
     );
-    // The discarded proposal must not resurface on a LATER unrelated turn.
-    let later = resolved.resolve_with_operator_answer("yes");
+
+    // Sequence: propose -> refusal -> yes locks the SAME decision.
+    let locked = refused.resolve_with_operator_answer("yes");
     assert_eq!(
-        later.manifest.pending_decision_count(),
-        1,
-        "a stale, already-discarded proposal must not be confirmable later"
+        locked.manifest.pending_decision_count(),
+        0,
+        "`yes` must confirm the proposal that survived the refusal"
+    );
+    assert!(locked.last_rejection().is_none());
+}
+
+/// Sequence: propose -> a SECOND, different refusal -> yes still locks. The
+/// proposal must survive more than one intervening refusal, not just one.
+#[test]
+fn a_proposal_survives_more_than_one_refusal() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    let refused_once = proposed.resolve_with_operator_answer("hm not sure");
+    let refused_twice = refused_once.resolve_with_operator_answer("still thinking");
+    assert!(refused_twice.proposed_answer_notice().is_some());
+    let locked = refused_twice.resolve_with_operator_answer("yes");
+    assert_eq!(locked.manifest.pending_decision_count(), 0);
+}
+
+/// Sequence: propose -> `/new` (a fresh `analyze`) -> yes locks nothing. A
+/// fresh intake starts with no proposal at all — `/new` abandons the batch
+/// entirely, and a bare `yes` against it is an ordinary unresolved answer.
+#[test]
+fn abandoning_the_batch_leaves_nothing_for_a_later_yes_to_confirm() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    assert!(proposed.proposed_answer_notice().is_some());
+    let fresh = PromptIntake::analyze("a whole new task");
+    let resolved = fresh.resolve_with_operator_answer("yes");
+    assert!(
+        resolved.last_rejection().is_some(),
+        "a bare `yes` against a fresh intake with no proposal must not lock anything"
     );
 }
 
@@ -458,4 +497,42 @@ fn a_refused_reply_reports_no_newly_locked_lines() {
     let batch = one_decision();
     let resolved = batch.resolve_with_operator_answer("not sure");
     assert!(resolved.newly_locked_lines(&batch).is_empty());
+}
+
+/// #2515 items 5/6 round 2 (RED FIRST — failed before the fix: the line
+/// echoed the QUESTION even when an explicit `N: value` reply supplied a
+/// different ANSWER). One arm: an explicit `N: value` reply names the value,
+/// not the question, when the two differ.
+#[test]
+fn locking_an_explicit_answer_names_the_value_not_the_question() {
+    let batch = one_decision();
+    let resolved = batch.resolve_with_operator_answer("1: keep the index");
+    let lines = resolved.newly_locked_lines(&batch);
+    assert_eq!(lines, vec!["locked 1: keep the index".to_string()]);
+}
+
+/// A bare `1:` with no value text has nothing to name — falls back to the
+/// question, same as before this change.
+#[test]
+fn locking_a_bare_ordinal_falls_back_to_the_question() {
+    let batch = one_decision();
+    let resolved = batch.resolve_with_operator_answer("1:");
+    let lines = resolved.newly_locked_lines(&batch);
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("drain before rotation, or stamp actions"),
+        "a bare ordinal must fall back to the question text: {}",
+        lines[0]
+    );
+}
+
+/// The other arm: a confirmed proposal names the proposal's summary, not the
+/// question.
+#[test]
+fn locking_a_confirmed_proposal_names_the_proposal_not_the_question() {
+    let batch = one_decision();
+    let proposed = batch.propose_answer(1, "keep the index");
+    let resolved = proposed.resolve_with_operator_answer("yes");
+    let lines = resolved.newly_locked_lines(&batch);
+    assert_eq!(lines, vec!["locked 1: keep the index".to_string()]);
 }
