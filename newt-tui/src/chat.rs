@@ -7488,7 +7488,7 @@ fn session_body(
                         // also names `/new` as the way out, because the usual
                         // reason a reply keeps failing is that the operator
                         // disagrees that a decision was needed at all.
-                        let rejection = prompt_intake.last_rejection().map(|r| r.explain());
+                        let rejection = prompt_intake.last_rejection_explanation();
                         pending_clarification = Some(PendingClarification {
                             parent: Box::new(parent),
                             intake: prompt_intake,
@@ -7500,6 +7500,17 @@ fn session_body(
                         print_newt(&clarification, color, verbose);
                         println!();
                         continue;
+                    }
+
+                    // Addendum item 6: the one moment that changes state —
+                    // an answer locking a pending decision — printed nothing.
+                    // Every refusal explains itself; the lock should too, so
+                    // the operator can catch a wrong lock before the model
+                    // spends a round on it.
+                    if let Some(pending) = pending_clarification.as_ref() {
+                        for line in prompt_intake.newly_locked_lines(&pending.intake) {
+                            print_newt(&line, color, verbose);
+                        }
                     }
 
                     // The successor receipt and its resolved manifest are now

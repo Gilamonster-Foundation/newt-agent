@@ -382,3 +382,80 @@ fn proposing_an_out_of_range_ordinal_is_a_no_op() {
     let proposed = one_decision().propose_answer(7, "not a real option");
     assert!(proposed.proposed_answer_notice().is_none());
 }
+
+/// Addendum item 5: a refusal issued while a classifier's proposal is
+/// outstanding must say so — the proposal is silently consumed by
+/// `resolve_with_operator_answer` on the very next reply, so a reply that
+/// fails to parse (`ReadsAsQuestion`/`NoOrdinals`) used to drop it with
+/// nothing said, leaving the operator unable to tell it was still on the
+/// table.
+#[test]
+fn reads_as_question_refusal_mentions_an_outstanding_proposal() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    assert!(proposed.proposed_answer_notice().is_some());
+
+    let resolved = proposed.resolve_with_operator_answer("yes?");
+    let explanation = resolved
+        .last_rejection_explanation()
+        .expect("a reply that fails to parse must record why");
+    assert!(explanation.contains("still waiting"), "{explanation}");
+    assert!(
+        explanation.contains("drain before rotation"),
+        "{explanation}"
+    );
+}
+
+/// The `NoOrdinals` shape of the same bug: a reply with no question mark and
+/// no ordinal still silently drops the proposal today.
+#[test]
+fn no_ordinals_refusal_mentions_an_outstanding_proposal() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+
+    let resolved = proposed.resolve_with_operator_answer("sounds fine");
+    let explanation = resolved
+        .last_rejection_explanation()
+        .expect("a reply with no ordinal must record why");
+    assert!(explanation.contains("still waiting"), "{explanation}");
+}
+
+/// With no proposal outstanding, the refusal is unchanged — no dangling
+/// mention of a proposal that was never made.
+#[test]
+fn refusal_is_unchanged_with_no_proposal_outstanding() {
+    let resolved = one_decision().resolve_with_operator_answer("drain before rotation");
+    let explanation = resolved.last_rejection_explanation().unwrap();
+    assert!(!explanation.contains("still waiting"), "{explanation}");
+    assert_eq!(
+        explanation,
+        resolved.last_rejection().unwrap().explain(),
+        "no proposal outstanding means the explanation is exactly the rejection's own text"
+    );
+}
+
+/// A proposal that WAS confirmed leaves nothing pending, so the explanation
+/// after it is `None`, same as any other locked, non-rejected reply.
+#[test]
+fn confirmed_proposal_locks_and_leaves_no_rejection() {
+    let proposed = one_decision().propose_answer(1, "drain before rotation");
+    let resolved = proposed.resolve_with_operator_answer("yes");
+    assert!(resolved.last_rejection_explanation().is_none());
+}
+
+/// Addendum item 6: locking a decision prints one line naming what locked,
+/// keyed to the ordinal the operator answered against.
+#[test]
+fn locking_a_decision_reports_which_one_locked() {
+    let batch = one_decision();
+    let resolved = batch.resolve_with_operator_answer("1: drain before rotation");
+    let lines = resolved.newly_locked_lines(&batch);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("locked 1: "), "{}", lines[0]);
+}
+
+/// A refused reply locks nothing, so nothing is reported as newly locked.
+#[test]
+fn a_refused_reply_reports_no_newly_locked_lines() {
+    let batch = one_decision();
+    let resolved = batch.resolve_with_operator_answer("not sure");
+    assert!(resolved.newly_locked_lines(&batch).is_empty());
+}

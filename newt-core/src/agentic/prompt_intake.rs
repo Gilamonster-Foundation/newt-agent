@@ -337,6 +337,14 @@ pub struct PromptIntake {
     /// harness has always refused to do from a bare "continue" — the guess
     /// is shown, named, and requires its own explicit yes.
     proposed_answer: Option<ProposedAnswer>,
+    /// The proposal that was outstanding when the LAST refusal happened, if
+    /// any (#2517 follow-up, addendum item 5). A classifier's proposal is
+    /// consumed unconditionally by the next reply (see
+    /// [`Self::resolve_with_operator_answer`]), so a reply that fails to
+    /// parse as an ordinal — `NoOrdinals` / `ReadsAsQuestion` — silently drops
+    /// it with nothing said. This mirrors it into the refusal text instead of
+    /// letting the operator lose track of whether it is still on the table.
+    last_rejection_proposal: Option<ProposedAnswer>,
 }
 
 /// A single classifier-proposed decision, named for display in
@@ -444,6 +452,7 @@ impl PromptIntake {
                 last_rejection: None,
                 pending_discussion: None,
                 proposed_answer: None,
+                last_rejection_proposal: None,
             };
             debug_assert!(intake.validate().is_ok());
             return intake;
@@ -473,6 +482,7 @@ impl PromptIntake {
             last_rejection: None,
             pending_discussion: None,
             proposed_answer: None,
+            last_rejection_proposal: None,
         };
         debug_assert!(intake.validate().is_ok());
         intake
@@ -605,16 +615,65 @@ impl PromptIntake {
     /// ordinary rejection — a proposal is progress, not a refusal.
     pub fn proposed_answer_notice(&self) -> Option<String> {
         let proposal = self.proposed_answer.as_ref()?;
-        let ordinal = self
-            .pending_indices()
-            .iter()
-            .position(|&i| i == proposal.index)
-            .map_or(0, |p| p + 1);
+        let ordinal = self.proposal_ordinal(proposal);
         Some(format!(
             "I read that as choosing {ordinal}: \"{}\" — reply `yes` to lock it, \
              or answer explicitly (`{ordinal}: …`) if that's not right.",
             proposal.summary
         ))
+    }
+
+    /// The displayed ordinal (1-based) a proposal's absolute `decisions`
+    /// index currently maps to. Shared by [`Self::proposed_answer_notice`]
+    /// and [`Self::last_rejection_explanation`] so the two can never disagree
+    /// about which numbered item a proposal names.
+    fn proposal_ordinal(&self, proposal: &ProposedAnswer) -> usize {
+        self.pending_indices()
+            .iter()
+            .position(|&i| i == proposal.index)
+            .map_or(0, |p| p + 1)
+    }
+
+    /// Why the last clarification reply was refused, PLUS a reminder that a
+    /// classifier's proposal is still on the table when one was outstanding
+    /// at the time (addendum item 5) — `None` when nothing was refused.
+    ///
+    /// This is the one place refusal text is assembled; the harness prints
+    /// this instead of calling [`ClarificationRejection::explain`] directly,
+    /// so the proposal reminder can never be added at one call site and
+    /// missed at another.
+    pub fn last_rejection_explanation(&self) -> Option<String> {
+        let rejection = self.last_rejection.as_ref()?;
+        let mut text = rejection.explain();
+        if let Some(proposal) = self.last_rejection_proposal.as_ref() {
+            let ordinal = self.proposal_ordinal(proposal);
+            text.push_str(&format!(
+                "\n(the reading I proposed is still waiting — reply `yes` to take it: \
+                 {ordinal}: \"{}\".)",
+                proposal.summary
+            ));
+        }
+        Some(text)
+    }
+
+    /// Addendum item 6: one "locked N: question" line per decision that was
+    /// `Pending` in `previous` and is `Locked` in `self` — the confirmation
+    /// printed for the one moment that changes state, so a wrong lock is
+    /// visible before the turn proceeds. The ordinal is `previous`'s own
+    /// displayed numbering (the same mapping [`Self::clarification_batch`]
+    /// rendered when the operator answered it), never renumbered against
+    /// `self`, where a lock has already removed the item from "pending".
+    pub fn newly_locked_lines(&self, previous: &Self) -> Vec<String> {
+        previous
+            .pending_indices()
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &index)| {
+                let decision = self.manifest.decisions.get(index)?;
+                (decision.status == DecisionStatus::Locked)
+                    .then(|| format!("locked {}: {}", position + 1, decision.question))
+            })
+            .collect()
     }
 
     /// The absolute `decisions` indices that are still pending, in order.
@@ -665,12 +724,18 @@ impl PromptIntake {
             return self.clone();
         }
         let mut resolved = self.clone();
+        // Addendum item 5: cleared up front so a stale proposal from an
+        // EARLIER rejection never survives into this one's explanation.
+        resolved.last_rejection_proposal = None;
         // #2517: a classifier's proposal is single-shot — it is consumed here
         // whether or not this reply confirms it, so it can never leak into a
         // later, unrelated turn. A narrow, exact-match affirmation locks
         // EXACTLY the proposed decision (never inferred fresh from this
         // reply); anything else falls through and `answer` is resolved as an
-        // ordinary reply against the batch, proposal already gone.
+        // ordinary reply against the batch, proposal already gone — but is
+        // remembered below so a refusal that follows can still say it was
+        // there (addendum item 5).
+        let outstanding_proposal = resolved.proposed_answer.clone();
         if let Some(proposal) = resolved.proposed_answer.take() {
             let normalized = answer.trim().to_ascii_lowercase();
             if CONFIRMATION_WORDS.contains(&normalized.as_str()) {
@@ -713,7 +778,21 @@ impl PromptIntake {
             }
             // #1689 item 1: carry WHY, so the harness can say something other
             // than the identical block a second time.
-            Err(rejection) => resolved.last_rejection = Some(rejection),
+            Err(rejection) => {
+                // Addendum item 5: only the two kinds a bare, non-ordinal
+                // reply produces (`NoOrdinals`/`ReadsAsQuestion`) are the ones
+                // a classifier proposal was offered against — `Incomplete`
+                // and `OutOfRange` mean the operator DID give ordinals, so
+                // there is nothing ambiguous for the proposal to still apply
+                // to.
+                if matches!(
+                    rejection,
+                    ClarificationRejection::NoOrdinals | ClarificationRejection::ReadsAsQuestion
+                ) {
+                    resolved.last_rejection_proposal = outstanding_proposal;
+                }
+                resolved.last_rejection = Some(rejection);
+            }
         }
 
         resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
