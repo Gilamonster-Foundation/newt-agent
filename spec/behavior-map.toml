@@ -1348,3 +1348,23 @@ tier = "unit"
 [[BHV-ESC-002.refs.production]]
 path = "newt-tui/src/cockpit/presenter.rs"
 symbol = "escape_during_turn"
+
+[BHV-ROUTE-001]
+description = "A routed run_command(\"git …\") call never drops an operand: the router routes ONLY the exact shapes it can honor faithfully (bare status/log/diff, log limit, diff staged) and gates everything else to exec instead of silently answering a different question with ok:true."
+[BHV-ROUTE-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_read_routes_never_drop_an_operand"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/helper_shell_routing.rs"
+symbol = "git_run_command_refusal_names_the_supported_ops"
+tier = "unit"
+[[BHV-ROUTE-001.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "git_read_route"
