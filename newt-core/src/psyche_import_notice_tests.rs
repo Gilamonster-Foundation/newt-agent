@@ -132,8 +132,10 @@ fn migration_notice_initial_read_error_never_runs_the_writer() {
 /// supply a report. Real destination locks preserve both current bytes and the
 /// primary read error; neither outcome may silently disappear.
 #[test]
+#[serial_test::serial(lock_contention_notice)]
 fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
     for missing in [false, true] {
+        crate::psyche_import::reset_lock_contention_warned_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let current = "# current operator bytes\n";
@@ -156,7 +158,10 @@ fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
         let message = notices[0].line();
         assert!(message.contains("cannot lock config"), "{message}");
         assert!(message.contains(path.to_str().unwrap()), "{message}");
-        assert!(message.contains("the file was not rewritten"), "{message}");
+        assert!(
+            message.contains("config changes from this command were not saved"),
+            "{message}"
+        );
         assert!(!message.contains("migrated config"), "{message}");
         assert!(
             message.contains(if missing {
@@ -167,4 +172,35 @@ fn migration_lock_failure_reports_nonmigrating_and_unreadable_originals() {
             "{message}"
         );
     }
+}
+
+/// #2487 review round 2, item 2: a single command that re-reads the same
+/// locked config more than once (e.g. `mcp import`'s namespace-sanitization
+/// pass re-loading the config it already holds the transaction lock on) must
+/// warn about the lock contention ONCE per process, not once per attempt.
+/// RED before the fix: two lock-contention reads produced two notices.
+#[test]
+#[serial_test::serial(lock_contention_notice)]
+fn lock_contention_warning_fires_once_per_process_not_once_per_attempt() {
+    crate::psyche_import::reset_lock_contention_warned_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // No old psyche labels here — the ONLY notice either read can produce is
+    // the lock-contention fallback, so `second.is_empty()` below isolates
+    // that signal instead of conflating it with the (legitimate, per-read)
+    // migration notice `OLD` would also trigger.
+    std::fs::write(&path, "# current operator bytes\n").unwrap();
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path).unwrap();
+    let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path()).unwrap();
+
+    let mut first = Vec::new();
+    read_config_file(&path, true, &mut |n| first.push(n)).unwrap();
+    assert_eq!(first.len(), 1, "first attempt reports the contention");
+
+    let mut second = Vec::new();
+    read_config_file(&path, true, &mut |n| second.push(n)).unwrap();
+    assert!(
+        second.is_empty(),
+        "a second attempt in the same process must not repeat the warning: {second:?}"
+    );
 }
