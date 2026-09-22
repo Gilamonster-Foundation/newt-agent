@@ -538,6 +538,7 @@ fn build_entry(
         request_timeout_secs: timeout_secs,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
+        origin: None,
     })
 }
 
@@ -889,14 +890,7 @@ fn select_import_entries(
         let (good, bad): (Vec<&str>, Vec<&str>) = names
             .into_iter()
             .partition(|n| validate_import_server_name(n).is_ok());
-        let sel = if selector
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/~+-".contains(c))
-        {
-            selector.to_string()
-        } else {
-            format!("'{}'", selector.replace('\'', "'\\''"))
-        };
+        let sel = newt_core::mcp::shell_quote_arg(selector);
         let mut msg = format!("choose a server to import; found in {}:", source.display());
         for n in good {
             msg.push_str(&format!("\n  newt mcp import {sel} --name {n}"));
@@ -924,33 +918,7 @@ fn select_import_entries(
 /// Keep them one portable path component: no separators, traversal aliases,
 /// controls, or Windows-reserved punctuation.
 fn validate_import_server_name(name: &str) -> anyhow::Result<()> {
-    let mut chars = name.chars();
-    let safe_shape = name.len() <= 128
-        && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'));
-    // Tool calls use `server__tool` on the wire. Reject names that contain that
-    // separator either now or after the default hyphen-to-underscore mapping;
-    // otherwise `split_once("__")` routes the call to the wrong server.
-    let unambiguous_namespace = newt_core::mcp::runtime_server_prefix_is_unambiguous(name, false)
-        && newt_core::mcp::runtime_server_prefix_is_unambiguous(name, true);
-    // Windows treats these basenames as devices even when an extension follows
-    // (`CON.json`, `LPT1.meta.json`, ...), so they are not portable token names.
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    let windows_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || stem
-            .strip_prefix("COM")
-            .or_else(|| stem.strip_prefix("LPT"))
-            .is_some_and(|number| {
-                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            });
-    // Win32 strips trailing dots when resolving a path component, so a name
-    // ending in `.` can alias a different token-store filename.
-    let safe = safe_shape && unambiguous_namespace && !windows_device && !name.ends_with('.');
-    if !safe {
+    if !newt_core::mcp::is_portable_import_name(name) {
         bail!(
             "MCP server name is not a portable single-component identifier; rename it before importing"
         );

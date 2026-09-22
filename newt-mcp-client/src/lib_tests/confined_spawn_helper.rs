@@ -80,6 +80,7 @@ fn resolve_env_grants_includes_the_entry_env() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
     };
     let grants = resolve_env_grants(&entry).unwrap();
     assert!(

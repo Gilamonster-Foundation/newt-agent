@@ -646,6 +646,7 @@ async fn probe_stdio(
             request_timeout_secs: args.timeout_secs,
             // Operator-typed on the CLI — newt-owned, trusted config.
             trust: McpTrust::Trusted,
+            origin: None,
         };
         let cmdline = render_cmdline(command, &candidate);
         eprintln!("probing `{cmdline}` …");
@@ -712,6 +713,7 @@ async fn probe_url(
         request_timeout_secs: args.timeout_secs,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
+        origin: None,
     };
     eprintln!("probing {url} …");
     // step-1.1: admission gate (operator-typed entry is trusted → admits).
@@ -1082,6 +1084,7 @@ mod tests {
                 login_argv: Vec::new(),
                 request_timeout_secs: None,
                 trust: McpTrust::Trusted,
+                origin: None,
             },
             description: "Scrybe Markdown editor".into(),
             tools: vec!["open".into(), "edit".into()],

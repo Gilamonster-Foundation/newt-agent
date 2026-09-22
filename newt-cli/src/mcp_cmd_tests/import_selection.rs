@@ -38,6 +38,7 @@ fn import_sanitizer_preserves_only_safe_secret_references() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Untrusted,
+        origin: None,
     };
 
     let omitted = sanitize_imported_secrets(&mut entry);
@@ -66,6 +67,7 @@ fn import_validator_rejects_literal_url_and_arg_credentials_without_echoing_them
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Untrusted,
+            origin: None,
         },
         stdio_entry("argument", Some("mcp-server")),
         stdio_entry("header", Some("mcp-server")),
@@ -96,6 +98,7 @@ fn import_validator_rejects_literal_url_and_arg_credentials_without_echoing_them
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Untrusted,
+            origin: None,
         },
     ] {
         if unsafe_ref.name == "arg-reference" {

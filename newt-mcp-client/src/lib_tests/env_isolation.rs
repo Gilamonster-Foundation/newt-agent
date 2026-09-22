@@ -21,6 +21,7 @@ async fn stdio_spawn_does_not_leak_secret_env() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
     };
     // top() = advisory leash: `sh` is permitted (exec unrestricted) and the
     // env is still scrubbed to the explicit grants, so this validates the
@@ -81,6 +82,7 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
         request_timeout_secs: None,
         login_argv: Vec::new(),
         trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
     };
     for (parent, override_value, expected) in [
         (Some("UTC-14"), None, "x:UTC-14"),

@@ -1639,6 +1639,7 @@ mod tests {
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: newt_core::mcp::McpTrust::Trusted,
+            origin: None,
         }
     }
 
@@ -1766,10 +1767,10 @@ mod tests {
         }
 
         assert!(!credential_stage_reached.get());
-        assert_eq!(
+        assert!(matches!(
             newt_core::mcp::admit(&entry).unwrap_err(),
-            newt_core::mcp::AdmissionDenied::UntrustedNotApproved
-        );
+            newt_core::mcp::AdmissionDenied::UntrustedNotApproved { .. }
+        ));
     }
 
     #[test]
