@@ -2268,7 +2268,8 @@ async fn a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_c
     let granted_path = home.join("outside-canvas-token");
     std::fs::write(&granted_path, "token\n").expect("write outside file");
     let mut file = newt_core::ocap_store::PolicyFile::parse(&format!(
-        "[[fs]]\npath = \"{}\"\n",
+        // A TOML literal string: a Windows path's `\U…` is not an escape.
+        "[[fs]]\npath = '{}'\n",
         granted_path.display()
     ))
     .expect("parse approve.toml");
