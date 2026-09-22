@@ -1103,6 +1103,13 @@ mod turn_tuning_ratchet_tests;
 #[path = "chat_tests/plan_approval.rs"]
 mod plan_approval_tests;
 
+/// #2524 item 7: the shared trait default `read_line`/`present_clarification`
+/// reproduces today's byte-for-byte, tested against a fake `InputSurface`
+/// that never overrides it.
+#[cfg(test)]
+#[path = "chat_tests/present_clarification.rs"]
+mod present_clarification_tests;
+
 /// #1963: persist a turn that did NOT reach a normal completion — cancelled
 /// by the operator (Esc/Ctrl-C) or ended in a backend/loop error — through
 /// exactly the same durable path [`save_turn_if_persistent`]'s Ok-arm caller
