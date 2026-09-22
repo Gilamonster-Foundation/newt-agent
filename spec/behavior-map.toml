@@ -1385,7 +1385,7 @@ path = "newt-tui/src/cockpit/presenter.rs"
 symbol = "escape_during_turn"
 
 [BHV-ROUTE-001]
-description = "A routed run_command(\"git …\") call never drops an operand: the router routes ONLY the exact shapes it can honor faithfully (bare status/log/diff, log limit, diff staged) and gates everything else to exec instead of silently answering a different question with ok:true. An unroutable shape is refused naming the supported ops."
+description = "A routed run_command(\"git …\") call never drops an operand: the router routes ONLY the exact shapes it can honor faithfully (bare status/log/diff, log limit, diff staged, a log/diff revision or A..B range, an optional -- pathspec, diff --stat) and gates everything else to exec instead of silently answering a different question with ok:true. An unroutable shape is refused naming the supported ops."
 [BHV-ROUTE-001.status]
 lean = "none"
 rust = "tested"
@@ -1397,9 +1397,27 @@ path = "newt-core/src/agentic/routing.rs"
 symbol = "tests::git_read_routes_never_drop_an_operand"
 tier = "unit"
 [[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_read_routes_now_serve_revisions_pathspecs_and_stat"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_read_routes_still_gate_unservable_shapes"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/tools_tests/helper_shell_routing.rs"
 symbol = "git_run_command_refusal_names_the_supported_ops"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/log_diff_operands.rs"
+symbol = "log_revision_range_excludes_left_bound"
 tier = "unit"
 [[BHV-ROUTE-001.refs.production]]
 path = "newt-core/src/agentic/routing.rs"
 symbol = "git_read_route"
+[[BHV-ROUTE-001.refs.production]]
+path = "newt-git/src/lib.rs"
+symbol = "log"
+[[BHV-ROUTE-001.refs.production]]
+path = "newt-git/src/lib.rs"
+symbol = "diff"

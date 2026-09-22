@@ -358,7 +358,7 @@ fn handle_git(args: &Value, granted: &Caveats) -> anyhow::Result<Value> {
         "status" => serde_json::to_value(eng.status(&caps).map_err(gerr)?)?,
         "log" => {
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-            serde_json::to_value(eng.log(&caps, limit).map_err(gerr)?)?
+            serde_json::to_value(eng.log(&caps, limit, None, &[]).map_err(gerr)?)?
         }
         "diff" => {
             let spec = if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
@@ -366,7 +366,7 @@ fn handle_git(args: &Value, granted: &Caveats) -> anyhow::Result<Value> {
             } else {
                 DiffSpec::Worktree
             };
-            serde_json::to_value(eng.diff(&caps, spec).map_err(gerr)?)?
+            serde_json::to_value(eng.diff(&caps, spec, &[], false).map_err(gerr)?)?
         }
         "add" => {
             let paths: Vec<String> = args

@@ -321,7 +321,12 @@ impl newt_core::roadmap_eval::GitFacts for LocalGitFacts {
             return false;
         };
         engine
-            .log(&newt_core::git_caveats::GitCaveats::read_only(), 1000)
+            .log(
+                &newt_core::git_caveats::GitCaveats::read_only(),
+                1000,
+                None,
+                &[],
+            )
             .map(|commits| {
                 commits
                     .iter()

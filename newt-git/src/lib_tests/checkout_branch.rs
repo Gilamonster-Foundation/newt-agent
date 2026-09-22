@@ -179,9 +179,12 @@ fn read_ops_fail_closed_without_read_capability() {
     let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let no = GitCaveats::none();
     assert!(matches!(eng.status(&no), Err(GitError::Denied("read"))));
-    assert!(matches!(eng.log(&no, 1), Err(GitError::Denied("read"))));
     assert!(matches!(
-        eng.diff(&no, DiffSpec::Worktree),
+        eng.log(&no, 1, None, &[]),
+        Err(GitError::Denied("read"))
+    ));
+    assert!(matches!(
+        eng.diff(&no, DiffSpec::Worktree, &[], false),
         Err(GitError::Denied("read"))
     ));
 }
