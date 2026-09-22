@@ -132,6 +132,33 @@ fn rebase_squashes_two_commits_into_one() {
         names.contains("b.txt") && names.contains("c.txt"),
         "got: {names}"
     );
+    // #2518 (RECON item 2): the trailing-squash case used to read a stale
+    // `tip_tree` (only set when the loop closed a commit on a later pick,
+    // never on the final close) — tree == HEAD is what closes that gap.
+    let status = git_status_porcelain(dir.path());
+    assert!(status.is_empty(), "worktree must be clean: {status:?}");
+    let head_tree = String::from_utf8_lossy(
+        &git_cmd(dir.path())
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let worktree_tree = String::from_utf8_lossy(
+        &git_cmd(dir.path())
+            .args(["write-tree"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        head_tree, worktree_tree,
+        "the checked-out tree must match HEAD's tree"
+    );
 }
 #[test]
 fn rebase_drops_a_commit() {
@@ -197,9 +224,86 @@ fn rebase_refuses_on_a_dirty_tree() {
         err.contains("clean working tree"),
         "refusal must name the reason: {err}"
     );
+    // #2518 review Q2/Q3: the refusal names which condition bit tripped it —
+    // one unstaged edit, nothing staged or untracked.
+    assert!(
+        err.contains("0 staged, 1 unstaged, 0 untracked"),
+        "refusal must name the condition counts: {err}"
+    );
     // No side effects: HEAD unchanged, dirty edit untouched.
     assert_eq!(commit_count(p), 3, "refusal must not move the ref");
     assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "dirty\n");
+}
+/// #2517 review Q1: `checkout_between_trees`'s contract assumes "no untracked
+/// file sits where an added path needs to land" — an *ignored* file (e.g.
+/// `x.env`) is invisible to `status`'s clean check (which uses
+/// `IgnoredMode::No`), so a rebase whose new tree ADDS that same path would
+/// silently overwrite it. Must refuse instead, leaving the ref unmoved and
+/// the local file untouched — real git's "untracked working tree files
+/// would be overwritten" behavior.
+#[test]
+fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    std::fs::write(p.join(".gitignore"), "x.env\n").unwrap();
+    std::fs::write(p.join("a.txt"), "v1\n").unwrap();
+    git(p, &["add", ".gitignore", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c1"]);
+    let onto = String::from_utf8_lossy(
+        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+    )
+    .trim()
+    .to_string();
+    std::fs::write(p.join("x.env"), "TRACKED\n").unwrap();
+    git(p, &["add", "-f", "x.env"]);
+    git(p, &["commit", "-q", "-m", "c2 adds x.env"]);
+    let c2 = String::from_utf8_lossy(
+        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+    )
+    .trim()
+    .to_string();
+    git(p, &["rm", "-q", "x.env"]);
+    git(p, &["commit", "-q", "-m", "c3 removes x.env"]);
+    // HEAD (c3) has no x.env; a local, ignored x.env now sits on disk —
+    // invisible to `status` and NOT what c2 tracked.
+    std::fs::write(p.join("x.env"), "LOCAL\n").unwrap();
+    let head_before = String::from_utf8_lossy(
+        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+    )
+    .trim()
+    .to_string();
+
+    let t = tool(p);
+    let err = t
+        .dispatch(
+            "rebase",
+            &serde_json::json!({
+                "onto": onto,
+                "plan": [
+                    {"commit": c2, "action": "pick"},
+                ]
+            }),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("x.env"),
+        "refusal must name the path it would overwrite: {err}"
+    );
+    // No side effects: ref unmoved, local file untouched.
+    let head_after = String::from_utf8_lossy(
+        &git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head_before, head_after, "refusal must not move the ref");
+    assert_eq!(
+        std::fs::read_to_string(p.join("x.env")).unwrap(),
+        "LOCAL\n",
+        "the local ignored file must be untouched"
+    );
 }
 /// #1709 family: a rebase that produced ZERO commits (an all-drop plan) is
 /// a successful history operation but NOT an attribution epoch. It must

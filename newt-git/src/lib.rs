@@ -18,7 +18,7 @@ use newt_core::git_caveats::GitCaveats;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry, DiffStatus};
+use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, diff_trees, DiffEntry, DiffStatus};
 use grit_lib::index::{entry_from_stat, IndexEntry, MODE_REGULAR};
 use grit_lib::merge_base::resolve_commit_specs;
 use grit_lib::merge_file::MergeFavor;
@@ -538,10 +538,14 @@ impl GitEngine {
         // reset below (old HEAD tree → new tip tree) never discards
         // uncommitted work — the same clean-tree precondition `stash` relies
         // on for its own tree reset.
-        if !self.status(caps)?.clean {
-            return Err(GitError::Unsupported(
-                "rebase needs a clean working tree; commit or stash first",
-            ));
+        let pre_status = self.status(caps)?;
+        if !pre_status.clean {
+            return Err(GitError::Refused(format!(
+                "rebase needs a clean working tree ({} staged, {} unstaged, {} untracked); commit or stash first",
+                pre_status.staged.len(),
+                pre_status.unstaged.len(),
+                pre_status.untracked.len()
+            )));
         }
         let head_ref = read_head(&self.repo.git_dir)?
             .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
@@ -646,15 +650,44 @@ impl GitEngine {
             tip_tree = cur_tree;
             produced += 1;
         }
+        // #2518: `checkout_between_trees` assumes no untracked file
+        // sits where an added path needs to land, but its `clean` precondition
+        // (above) only counts UNIGNORED untracked files — an ignored one (a
+        // local `.env`, a generated config) is invisible to that check and
+        // would otherwise be silently overwritten by the reset below. Refuse
+        // before moving anything if the new tree adds a path that already
+        // exists on disk (file, dir, or symlink).
+        if let Some(wt) = self.repo.work_tree.clone() {
+            let changes = diff_trees(&self.repo.odb, old_head_tree.as_ref(), Some(&tip_tree), "")?;
+            for change in &changes {
+                if change.status != DiffStatus::Added {
+                    continue;
+                }
+                let Some(path) = &change.new_path else {
+                    continue;
+                };
+                if wt.join(path).symlink_metadata().is_ok() {
+                    return Err(GitError::Refused(format!(
+                        "rebase: refusing — {path} already exists on disk and would be overwritten by the rebased tree"
+                    )));
+                }
+            }
+        }
         // Advance the branch ref to the new tip.
         write_ref(&self.repo.git_dir, &head_ref, &tip)?;
         // Reset the worktree + index LAST — mirrors `stash`'s own ordering —
         // so tree == HEAD after the ref move. If this fails the ref has
-        // already moved; say so rather than leaving a silent half-update.
+        // already moved: HEAD is now the new tip, but `checkout_between_trees`
+        // writes files in a loop and returns the first error, so the worktree
+        // may be only PARTIALLY updated, and `write_index` runs after that
+        // loop — the index was never rewritten either. `GitError::Refused`
+        // otherwise means "no side effects"; this is the one deliberate
+        // exception, because a moved ref plus a half-updated tree is still
+        // the least-bad state to report through the same variant.
         if let Some(old_tree) = old_head_tree {
             checkout_between_trees(&self.repo, Some(&old_tree), &tip_tree).map_err(|e| {
                 GitError::Refused(format!(
-                    "rebase: HEAD moved to {} but the working tree was NOT updated: {e}",
+                    "rebase: HEAD moved to {} but the working tree may be partially updated and the index was not rewritten; run status before continuing: {e}",
                     short_oid(&tip)
                 ))
             })?;
