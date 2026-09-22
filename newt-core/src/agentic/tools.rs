@@ -946,22 +946,39 @@ fn literal_newline_escape_warning(old_string: &str, new_string: &str) -> Option<
     )
 }
 
-/// Preserve execution evidence while coaching an unavailable lifecycle run.
+/// Preserve execution evidence while coaching an unavailable or timed-out
+/// lifecycle run.
 fn lifecycle_run_result(
     args: &serde_json::Value,
     mut result: (String, crate::ExecOutcome),
 ) -> (String, crate::ExecOutcome) {
-    if result.1 == crate::ExecOutcome::Unavailable {
-        let mut suggestion = serde_json::json!({"phase": args["phase"], "action": "build"});
-        if let Some(dir) = args.get("dir").and_then(serde_json::Value::as_str) {
-            suggestion["dir"] = dir.into();
+    let mut suggestion = serde_json::json!({"phase": args["phase"], "action": "build"});
+    if let Some(dir) = args.get("dir").and_then(serde_json::Value::as_str) {
+        suggestion["dir"] = dir.into();
+    }
+    match result.1 {
+        crate::ExecOutcome::Unavailable => {
+            result.0.push_str(&format!(
+                "\nThis was lifecycle action=run. For compiler/test validation, action=build \
+                 requests explicit approval for toolchain/cache reads and workspace writes, \
+                 with network denied. Existing permission requirements and denials remain binding; \
+                 do not retry a declined grant.\nSuggested lifecycle call: {suggestion}"
+            ));
         }
-        result.0.push_str(&format!(
-            "\nThis was lifecycle action=run. For compiler/test validation, action=build \
-             requests explicit approval for toolchain/cache reads and workspace writes, \
-             with network denied. Existing permission requirements and denials remain binding; \
-             do not retry a declined grant.\nSuggested lifecycle call: {suggestion}"
-        ));
+        // #F11 (verify-lane-steering): the confined shell already appends
+        // the build-lane suggestion at the END of a timed-out envelope
+        // (`timed_out_note`, shell.rs), after possibly-truncated partial
+        // output. Measured (newt main a996fb9e): a model that hit the 60s
+        // wall on `lifecycle phase=test` (default action=run) never reached
+        // it there and retried the same losing call. `action=build` stays
+        // the default's escalation, not the default itself — it demands
+        // explicit permission-gate approval and denies network, so flipping
+        // the default would silently change what a bare `phase=test` call
+        // is authorized to do. Put the exact next call FIRST instead.
+        crate::ExecOutcome::TimedOut => {
+            result.0 = format!("Suggested lifecycle call: {suggestion}\n{}", result.0);
+        }
+        _ => {}
     }
     result
 }

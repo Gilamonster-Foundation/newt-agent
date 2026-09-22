@@ -37,7 +37,6 @@ fn lifecycle_run_coaching_preserves_denials_and_executed_outcomes() {
     for outcome in [
         crate::ExecOutcome::Denied,
         crate::ExecOutcome::Failed,
-        crate::ExecOutcome::TimedOut,
         crate::ExecOutcome::Passed,
     ] {
         let original = ("original tool result".to_string(), outcome);
@@ -46,6 +45,34 @@ fn lifecycle_run_coaching_preserves_denials_and_executed_outcomes() {
             original,
         );
     }
+}
+
+/// F11: `lifecycle action=run` (the default) times out on the same 60s wall
+/// as `run_command`. The confined shell already appends the build-lane
+/// suggestion at the END of a (possibly truncated) envelope — measured
+/// (newt main a996fb9e) not to steer the model. Put the exact next call
+/// FIRST, ahead of the partial output, not just at the end.
+#[test]
+fn lifecycle_timed_out_run_puts_build_call_first() {
+    let args = serde_json::json!({"phase": "test"});
+    let original = (
+        "partial output\n(the command hit the 60s wall and was killed...)".to_string(),
+        crate::ExecOutcome::TimedOut,
+    );
+    let (text, outcome) = lifecycle_run_result(&args, original.clone());
+    assert_eq!(outcome, crate::ExecOutcome::TimedOut);
+    let first_line = text.lines().next().expect("non-empty result");
+    let suggestion = first_line
+        .strip_prefix("Suggested lifecycle call: ")
+        .expect("build call must be the first line of a timed-out run result");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(suggestion).unwrap(),
+        serde_json::json!({"phase": "test", "action": "build"})
+    );
+    assert!(
+        text.ends_with(&original.0),
+        "original (partial) output must be preserved: {text}"
+    );
 }
 
 /// #894 regression for the concrete drift that motivated the registry: the
