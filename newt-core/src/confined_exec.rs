@@ -1111,12 +1111,125 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
             roots.push(path);
         }
     }
+    // System C toolchain headers: world-readable OS files with zero
+    // disclosure value (P0 U6e) — this is a read-then-disclose fence, and
+    // headers carry nothing worth disclosing. macOS is covered by the
+    // SDK/Developer roots added above instead.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        roots.push("/usr/include".to_string());
+        roots.push("/usr/local/include".to_string());
+    }
+    // The exact `~/.local/bin` root only — never a wider `~/.local` or
+    // `$HOME` grant. `$XDG_BIN_HOME`, if set, overrides it; XDG_BIN_HOME is
+    // a proposed, not ratified, XDG variable, so this is deliberately not
+    // presented as a standard default.
+    if let Some(path) = operator_tool_home("XDG_BIN_HOME", ".local/bin") {
+        roots.push(path);
+    }
     roots
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RAII guard that restores an env var to its value at construction on
+    /// drop, so a failed assertion mid-test does not leak the fake `HOME` (or
+    /// a cleared `XDG_BIN_HOME`) into every later test in the process.
+    struct EnvRestore {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                saved: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            crate::process_env::set_or_remove(
+                self.key,
+                self.saved.as_deref().and_then(|v| v.to_str()),
+            );
+        }
+    }
+
+    /// Regression for the P0 U6e build-lane read fence: the lane could not
+    /// compile any crate with a C build script (`stdc-predef.h: Permission
+    /// denied`) or resolve `just` from `~/.local/bin` (`Permission denied`).
+    ///
+    /// Deterministic (holds `process_env::lock`, pins `HOME` to a fake path,
+    /// clears `XDG_BIN_HOME` for the default case) rather than reading the
+    /// ambient environment — a runner with `XDG_BIN_HOME` set or no `HOME`
+    /// must not flip or skip this assertion.
+    ///
+    /// The forbidden check reuses [`crate::caveats::permits_path`] — the same
+    /// containment logic the fence itself enforces — so it is an
+    /// ancestor-or-equal check, not string equality: a root of `$HOME` itself
+    /// would pass an equality check against `$HOME/.newt` but must fail this
+    /// one, since it would still disclose everything under it.
+    #[test]
+    fn build_tool_read_roots_include_c_headers_and_local_bin() {
+        let _env = crate::process_env::lock();
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_xdg_bin = EnvRestore::capture("XDG_BIN_HOME");
+        // Built from temp_dir so it is absolute on every platform: a bare
+        // `/fake-…` has no drive prefix on Windows, and operator_tool_home
+        // (correctly) drops a non-absolute root.
+        let fake_home = std::env::temp_dir().join("fake-home-for-build-tool-read-roots-test");
+        let abs_bin_home = std::env::temp_dir()
+            .join("abs-bin-home")
+            .to_string_lossy()
+            .into_owned();
+        crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
+        crate::process_env::remove_var("XDG_BIN_HOME");
+
+        let roots = build_tool_read_roots(Path::new("/workspace"));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(roots.iter().any(|r| r == "/usr/include"));
+            assert!(roots.iter().any(|r| r == "/usr/local/include"));
+        }
+        let local_bin = fake_home.join(".local/bin").to_string_lossy().into_owned();
+        assert!(roots.contains(&local_bin));
+
+        // Ancestor-or-equal, not equality: no root may CONTAIN these HOME
+        // subtrees (or HOME itself) via the same prefix logic the fs fence
+        // enforces in production.
+        let read_scope = Scope::only(roots.clone());
+        for forbidden in [
+            fake_home.clone(),
+            fake_home.join(".newt"),
+            fake_home.join(".config"),
+            fake_home.join(".local/share"),
+            fake_home.join(".ssh"),
+        ] {
+            let forbidden = forbidden.to_string_lossy().into_owned();
+            assert!(
+                !crate::caveats::permits_path(&read_scope, &forbidden),
+                "a build-lane root must not grant read over {forbidden}"
+            );
+        }
+
+        // An absolute XDG_BIN_HOME override replaces the default.
+        crate::process_env::set_var("XDG_BIN_HOME", &abs_bin_home);
+        let roots_abs = build_tool_read_roots(Path::new("/workspace"));
+        assert!(roots_abs.contains(&abs_bin_home));
+        assert!(!roots_abs.contains(&local_bin));
+
+        // A relative XDG_BIN_HOME must be skipped, per operator_tool_home,
+        // not silently fall back to the default `~/.local/bin`.
+        crate::process_env::set_var("XDG_BIN_HOME", "relative/bin");
+        let roots_relative = build_tool_read_roots(Path::new("/workspace"));
+        assert!(!roots_relative.iter().any(|r| r == "relative/bin"));
+        assert!(!roots_relative.contains(&local_bin));
+    }
 
     #[test]
     fn already_cancelled_request_never_attempts_spawn() {
