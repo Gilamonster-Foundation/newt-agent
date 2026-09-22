@@ -1111,12 +1111,67 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
             roots.push(path);
         }
     }
+    // System C toolchain headers: world-readable OS files with zero
+    // disclosure value, missing only because the sandbox backend's base
+    // list was tuned for *running* binaries, not *compiling* C (P0 U6e /
+    // NOTE-build-lane-read-fence.md). macOS is covered by the SDK/Developer
+    // roots added above instead.
+    #[cfg(not(target_os = "macos"))]
+    {
+        roots.push("/usr/include".to_string());
+        roots.push("/usr/local/include".to_string());
+    }
+    // The exact `~/.local/bin` root only — never a wider `~/.local` or
+    // `$HOME` grant (see NOTE-build-lane-read-fence.md: this is a
+    // deliberate, narrow exception to "never $HOME broadly").
+    if let Some(path) = operator_tool_home("XDG_BIN_HOME", ".local/bin") {
+        roots.push(path);
+    }
     roots
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the P0 U6e build-lane read fence: the lane could not
+    /// compile any crate with a C build script (`stdc-predef.h: Permission
+    /// denied`) or resolve `just` from `~/.local/bin` (`Permission denied`).
+    /// See `docs/security/ocap-deviations.md` review note
+    /// `NOTE-build-lane-read-fence.md`.
+    #[test]
+    fn build_tool_read_roots_include_c_headers_and_local_bin() {
+        let roots = build_tool_read_roots(Path::new("/workspace"));
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(roots.iter().any(|r| r == "/usr/include"));
+            assert!(roots.iter().any(|r| r == "/usr/local/include"));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let local_bin = PathBuf::from(home).join(".local/bin");
+            assert!(roots.iter().any(|r| r == &local_bin.to_string_lossy()));
+        }
+        // The widening must never grant these HOME subtrees or HOME itself.
+        for forbidden in [".local", ".newt", ".config"] {
+            if let Some(home) = std::env::var_os("HOME") {
+                let bad = PathBuf::from(&home)
+                    .join(forbidden)
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(
+                    !roots.iter().any(|r| *r == bad),
+                    "must not grant {bad} as a whole root"
+                );
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().into_owned();
+            assert!(
+                !roots.iter().any(|r| *r == home),
+                "must not grant $HOME itself"
+            );
+        }
+    }
 
     #[test]
     fn already_cancelled_request_never_attempts_spawn() {
