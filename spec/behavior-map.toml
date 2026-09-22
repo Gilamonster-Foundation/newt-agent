@@ -1421,3 +1421,43 @@ symbol = "log"
 [[BHV-ROUTE-001.refs.production]]
 path = "newt-git/src/lib.rs"
 symbol = "diff"
+
+# ─────────────────────────────── OCAP durable grants ─────────────────────────
+
+[BHV-OCAP-001]
+description = "A durable grant (`~/.newt/ocap/approve.toml` `[[fs]]`/`[[exec]]`/`[[net]]`) reaches a session's caveats ONLY when its signature verifies against the operator's root key; an unsigned or bad-signature entry never widens caveats, folds nothing, and is dropped with a visible warning rather than silently honored (#2524 item 1)."
+[BHV-OCAP-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-tui/src/permissions_tests/ocap_grant_fold.rs"
+symbol = "fold_ocap_approvals_widens_recalled_caveats_like_a_durable_grant"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-tui/src/permissions_tests/ocap_grant_fold.rs"
+symbol = "folding_never_resurrects_an_unverified_approve"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/src/headless.rs"
+symbol = "tests::fold_ocap_grants_widens_a_fenced_axis_but_never_touches_an_open_one"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/src/headless.rs"
+symbol = "tests::fold_ocap_grants_of_an_empty_store_admits_nothing"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/tests/headless_cli.rs"
+symbol = "a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_contract"
+tier = "unit"
+[[BHV-OCAP-001.refs.production]]
+path = "newt-core/src/ocap_store.rs"
+symbol = "approved_grants"
+[[BHV-OCAP-001.refs.production]]
+path = "newt-tui/src/permissions.rs"
+symbol = "fold_ocap_approvals"
+[[BHV-OCAP-001.refs.production]]
+path = "newt-cli/src/headless.rs"
+symbol = "fold_ocap_grants"
