@@ -688,7 +688,7 @@ pub(super) fn git_run_command_refusal(command: &str) -> String {
          answering with the bare op instead would silently answer a different \
          question. Embedded ops: {}. For log/diff, use the tool's `limit` / \
          `revision` / `rev` / `rev2` / `spec: staged` / `paths` / `stat` \
-         parameters instead of shell operands.",
+         parameters instead of shell operands — put `--` before paths.",
         ops.join(", ")
     )
 }

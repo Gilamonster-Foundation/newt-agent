@@ -179,3 +179,109 @@ fn diff_stat_defaults_to_none() {
         .unwrap();
     assert!(d.stat.is_none());
 }
+
+/// `A..B` is reachability, not a first-parent-chain scan: fork a branch from
+/// `main`, advance `main` past the fork, then commit on the branch. Real
+/// `git log main..HEAD` (the most common shape #2520 exists for) must not
+/// walk past the fork into main's post-fork history.
+#[test]
+fn log_revision_range_is_reachability_not_first_parent_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    git(p, &["init", "-q", "-b", "main"]);
+    std::fs::write(p.join("a.txt"), "1\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "root"]);
+    git(p, &["checkout", "-q", "-b", "topic"]);
+    std::fs::write(p.join("b.txt"), "topic\n").unwrap();
+    git(p, &["add", "b.txt"]);
+    git(p, &["commit", "-q", "-m", "topic commit"]);
+    let topic_head = rev_parse(p, "HEAD");
+    git(p, &["checkout", "-q", "main"]);
+    std::fs::write(p.join("c.txt"), "main advanced\n").unwrap();
+    git(p, &["add", "c.txt"]);
+    git(p, &["commit", "-q", "-m", "main advances past the fork"]);
+    git(p, &["checkout", "-q", "topic"]);
+
+    let want: Vec<String> = String::from_utf8(
+        git_cmd(p)
+            .args(["log", "--format=%H", "main..HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .lines()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        want,
+        vec![topic_head],
+        "fixture sanity: main..HEAD is exactly the topic commit"
+    );
+
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
+    let log = eng
+        .log(&GitCaveats::top(), 10, Some("main..HEAD"), &[])
+        .unwrap();
+    let got: Vec<String> = log.iter().map(|c| c.id.clone()).collect();
+    assert_eq!(got, want, "must not walk past the fork into main's history");
+}
+
+/// `A...B` (symmetric diff) is refused by name, not answered with
+/// `"could not resolve commit"` (there is no such single revision).
+#[test]
+fn log_symmetric_range_is_refused_by_name_not_a_resolve_failure() {
+    let (dir, _ids) = repo_with_history();
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
+    let err = eng
+        .log(&GitCaveats::top(), 10, Some("HEAD~1...HEAD"), &[])
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("symmetric ranges are not supported"), "{msg}");
+}
+
+/// Same refusal for `diff A...B`.
+#[test]
+fn diff_symmetric_range_is_refused_by_name() {
+    let (dir, ids) = repo_with_history();
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
+    let err = eng
+        .diff(
+            &GitCaveats::top(),
+            DiffSpec::Rev(format!("{}...{}", ids[0], ids[2])),
+            &[],
+            false,
+        )
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("symmetric ranges are not supported"));
+}
+
+/// A bare revision token that is ALSO an existing worktree path is ambiguous
+/// — real git refuses rather than silently picking the revision reading.
+#[test]
+fn log_revision_that_is_also_an_existing_path_is_refused_as_ambiguous() {
+    let (dir, _ids) = repo_with_history();
+    // A branch literally named after the on-disk path `a.txt`.
+    git(dir.path(), &["branch", "a.txt"]);
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
+    let err = eng
+        .log(&GitCaveats::top(), 10, Some("a.txt"), &[])
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("ambiguous"), "{msg}");
+}
+
+/// A revision token that resolves but has no same-named worktree path is
+/// unaffected by the ambiguity check.
+#[test]
+fn log_revision_that_only_resolves_is_not_flagged_ambiguous() {
+    let (dir, ids) = repo_with_history();
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
+    let log = eng
+        .log(&GitCaveats::top(), 10, Some(ids[1].as_str()), &[])
+        .unwrap();
+    assert_eq!(log[0].id, ids[1]);
+}

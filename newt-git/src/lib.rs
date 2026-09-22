@@ -39,7 +39,10 @@ use grit_lib::refs::{
     write_symbolic_ref,
 };
 use grit_lib::repo::Repository;
-use grit_lib::rev_parse::try_parse_double_dot_log_range;
+use grit_lib::rev_list::{rev_list, RevListOptions};
+use grit_lib::rev_parse::{
+    split_double_dot_range, split_triple_dot_range, try_parse_double_dot_log_range,
+};
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::write_tree::write_tree_from_index;
 
@@ -322,16 +325,17 @@ impl GitEngine {
         })
     }
 
-    /// `git log` — a first-parent walk, up to `limit` commits. Requires `read`.
+    /// `git log`, up to `limit` commits. Requires `read`.
     ///
     /// `revision` selects the walk: `None` starts at HEAD; a single rev starts
-    /// there instead; an `A..B` range walks first-parent from `B`, stopping
-    /// before `A` (first-parent only, matching this engine's existing
-    /// simplification — a range whose left side isn't a first-parent ancestor
-    /// of the right side degenerates to walking to `limit`/root, same as real
-    /// `git log --first-parent` would for a non-ancestor left bound).
-    /// `paths` (when non-empty) keeps only commits whose diff against their
-    /// first parent touches a matching path.
+    /// there instead; an `A..B` range walks from `B`, excluding everything
+    /// reachable from `A` — real reachability, via grit-lib's `rev_list`, not
+    /// a first-parent-chain scan (a branch cut from `main` and then advanced
+    /// past its fork point is walked correctly; the left side need not be a
+    /// first-parent ancestor of the right). `paths` (when non-empty) keeps
+    /// only commits whose tree differs from all their parents' at a matching
+    /// path (grit-lib's own history simplification, matching real `git log
+    /// -- <path>` — not limited to the first-parent diff).
     pub fn log(
         &self,
         caps: &GitCaveats,
@@ -342,47 +346,35 @@ impl GitEngine {
         if !caps.permits_read() {
             return Err(GitError::Denied("read"));
         }
-        let (start, stop) = match revision {
-            None => (self.head_oid()?, None),
-            Some(rev) => match try_parse_double_dot_log_range(&self.repo, rev)? {
-                Some((a, b)) => (Some(b), Some(a)),
-                None => (Some(self.resolve_one(rev)?), None),
+        let (positive, negative) = match revision {
+            None => (vec!["HEAD".to_string()], Vec::new()),
+            Some(rev) => match split_double_dot_range(rev) {
+                Some((left, right)) => {
+                    let left = if left.is_empty() { "HEAD" } else { left };
+                    let right = if right.is_empty() { "HEAD" } else { right };
+                    (vec![right.to_string()], vec![left.to_string()])
+                }
+                None => {
+                    self.reject_symmetric_or_ambiguous(rev)?;
+                    (vec![rev.to_string()], Vec::new())
+                }
             },
         };
-        let mut out = Vec::new();
-        let mut next = start;
-        while let Some(oid) = next {
-            if out.len() >= limit || stop == Some(oid) {
-                break;
-            }
-            let obj = self.repo.odb.read(&oid)?;
-            let commit = parse_commit(&obj.data)?;
-            if paths.is_empty() || self.commit_touches_paths(&commit, paths)? {
-                out.push(commit_info(&oid, &commit));
-            }
-            next = commit.parents.first().cloned();
-        }
-        Ok(out)
-    }
-
-    /// Whether `commit`'s diff against its first parent (or, for a root
-    /// commit, against the empty tree) touches any of `paths`.
-    fn commit_touches_paths(
-        &self,
-        commit: &CommitData,
-        paths: &[String],
-    ) -> Result<bool, GitError> {
-        let parent_tree = match commit.parents.first() {
-            Some(p) => {
-                let obj = self.repo.odb.read(p)?;
-                Some(parse_commit(&obj.data)?.tree)
-            }
-            None => None,
+        let options = RevListOptions {
+            max_count: Some(limit),
+            paths: paths.to_vec(),
+            ..Default::default()
         };
-        let entries = diff_trees(&self.repo.odb, parent_tree.as_ref(), Some(&commit.tree), "")?;
-        Ok(entries
+        let result = rev_list(&self.repo, &positive, &negative, &options)?;
+        result
+            .commits
             .iter()
-            .any(|e| matches_pathspec_list(e.path(), paths)))
+            .map(|oid| {
+                let obj = self.repo.odb.read(oid)?;
+                let commit = parse_commit(&obj.data)?;
+                Ok(commit_info(oid, &commit))
+            })
+            .collect()
     }
 
     /// `git diff` for the given `spec`. Requires `read`. `paths` (when
@@ -411,6 +403,7 @@ impl GitEngine {
             DiffSpec::Rev(rev) => match try_parse_double_dot_log_range(&self.repo, &rev)? {
                 Some((a, b)) => self.diff_rev_range(&a.to_hex(), &b.to_hex())?,
                 None => {
+                    self.reject_symmetric_or_ambiguous(&rev)?;
                     let oid = self.resolve_one(&rev)?;
                     let tree = self.commit_tree(&oid)?;
                     match self.repo.work_tree.clone() {
@@ -611,6 +604,32 @@ impl GitEngine {
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
         }
         Ok(commit_info(&oid, &commit))
+    }
+
+    /// Refuse a `log`/`diff` operand this engine cannot answer honestly: an
+    /// `A...B` symmetric-diff (no merge-base support here — real git resolves
+    /// it to a merge base, which this engine does not compute for this path)
+    /// or a bare `spec` that is simultaneously a resolvable revision AND an
+    /// existing worktree path (the same shape real git refuses without an
+    /// explicit `--` to disambiguate; answering the revision silently would
+    /// hide that the caller may have meant the path).
+    fn reject_symmetric_or_ambiguous(&self, spec: &str) -> Result<(), GitError> {
+        if split_triple_dot_range(spec).is_some() {
+            return Err(GitError::Refused(
+                "symmetric ranges are not supported — put -- before paths, or use A..B".to_string(),
+            ));
+        }
+        let is_path = self
+            .repo
+            .work_tree
+            .as_ref()
+            .is_some_and(|wt| wt.join(spec).exists());
+        if is_path && self.resolve_one(spec).is_ok() {
+            return Err(GitError::Refused(format!(
+                "ambiguous argument '{spec}': both revision and filename — put -- before paths"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve a commit spec (short oid / ref / id) to an `ObjectId`.

@@ -168,7 +168,7 @@ pub fn git_tool_definition() -> serde_json::Value {
                     },
                     "revision": {
                         "type": "string",
-                        "description": "For op=log: a single rev to start from instead of HEAD, or an A..B range (first-parent walk from B, stopping before A)."
+                        "description": "For op=log: a single rev to start from instead of HEAD, or an A..B range (walks from B, excluding everything reachable from A)."
                     },
                     "rev": {
                         "type": "string",

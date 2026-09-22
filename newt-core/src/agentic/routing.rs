@@ -690,6 +690,27 @@ mod tests {
                 }),
             }
         );
+        // `A...B` (symmetric diff) and a bare token that also names a
+        // worktree path are both still positionally routed as a `revision` /
+        // `rev` — the router stays pure (no fs access) and unchanged; it is
+        // the embedded git engine that now tells these two apart from an
+        // ordinary revision and refuses them honestly instead of silently
+        // answering the wrong question or failing with "could not resolve
+        // commit".
+        assert_eq!(
+            classify("git log HEAD~1...HEAD"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "revision": "HEAD~1...HEAD" }),
+            }
+        );
+        assert_eq!(
+            classify("git log src/lib.rs"),
+            RouteDecision::Route {
+                tool: "git",
+                args: json!({ "op": "log", "revision": "src/lib.rs" }),
+            }
+        );
     }
 
     /// Near-misses that must STAY refused: the engine has no way to honor a
