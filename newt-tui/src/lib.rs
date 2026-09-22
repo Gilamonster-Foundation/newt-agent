@@ -2028,15 +2028,20 @@ fn flat_permission_records(body: &str) -> Vec<newt_core::PermissionRecord> {
         .collect()
 }
 
+/// One `/permissions audit` row; chained and unchained history share it.
+fn audit_row(rec: &newt_core::PermissionRecord) -> String {
+    format!(
+        "  {:<7} {:<9} {:<8} {} via {}",
+        rec.decision, rec.scope, rec.kind, rec.target, rec.tool
+    )
+}
+
 /// Render up to `limit` flat records as unchained-history rows, newest last
 /// (append order) — matches the labelling the chained rows below it use.
 fn push_unchained(out: &mut Vec<String>, records: &[newt_core::PermissionRecord], limit: usize) {
     let show = if limit == 0 { records.len() } else { limit };
     for rec in records.iter().take(show) {
-        out.push(format!(
-            "  {:<7} {:<9} {:<8} {} via {} (unchained)",
-            rec.decision, rec.scope, rec.kind, rec.target, rec.tool
-        ));
+        out.push(format!("{} (unchained)", audit_row(rec)));
     }
 }
 
@@ -2160,10 +2165,7 @@ pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -
         records.len()
     ));
     for rec in records.iter().rev().take(show) {
-        out.push(format!(
-            "  {:<7} {:<9} {:<8} {} via {}",
-            rec.decision, rec.scope, rec.kind, rec.target, rec.tool
-        ));
+        out.push(audit_row(rec));
     }
     out
 }
