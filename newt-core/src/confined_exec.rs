@@ -1139,38 +1139,71 @@ mod tests {
     /// denied`) or resolve `just` from `~/.local/bin` (`Permission denied`).
     /// See `docs/security/ocap-deviations.md` review note
     /// `NOTE-build-lane-read-fence.md`.
+    ///
+    /// Deterministic (holds `process_env::lock`, pins `HOME` to a fake path,
+    /// clears `XDG_BIN_HOME` for the default case) rather than reading the
+    /// ambient environment — a runner with `XDG_BIN_HOME` set or no `HOME`
+    /// must not flip or skip this assertion.
+    ///
+    /// The forbidden check reuses [`crate::caveats::permits_path`] — the same
+    /// containment logic the fence itself enforces — so it is an
+    /// ancestor-or-equal check, not string equality: a root of `$HOME` itself
+    /// would pass an equality check against `$HOME/.newt` but must fail this
+    /// one, since it would still disclose everything under it.
     #[test]
     fn build_tool_read_roots_include_c_headers_and_local_bin() {
+        let _env = crate::process_env::lock();
+        let saved_home = std::env::var_os("HOME");
+        let saved_xdg_bin = std::env::var_os("XDG_BIN_HOME");
+        let fake_home = Path::new("/fake-home-for-build-tool-read-roots-test");
+        crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
+        crate::process_env::remove_var("XDG_BIN_HOME");
+
         let roots = build_tool_read_roots(Path::new("/workspace"));
         #[cfg(not(target_os = "macos"))]
         {
             assert!(roots.iter().any(|r| r == "/usr/include"));
             assert!(roots.iter().any(|r| r == "/usr/local/include"));
         }
-        if let Some(home) = std::env::var_os("HOME") {
-            let local_bin = PathBuf::from(home).join(".local/bin");
-            assert!(roots.iter().any(|r| r == &local_bin.to_string_lossy()));
-        }
-        // The widening must never grant these HOME subtrees or HOME itself.
-        for forbidden in [".local", ".newt", ".config"] {
-            if let Some(home) = std::env::var_os("HOME") {
-                let bad = PathBuf::from(&home)
-                    .join(forbidden)
-                    .to_string_lossy()
-                    .into_owned();
-                assert!(
-                    !roots.iter().any(|r| *r == bad),
-                    "must not grant {bad} as a whole root"
-                );
-            }
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = home.to_string_lossy().into_owned();
+        let local_bin = fake_home.join(".local/bin").to_string_lossy().into_owned();
+        assert!(roots.contains(&local_bin));
+
+        // Ancestor-or-equal, not equality: no root may CONTAIN these HOME
+        // subtrees (or HOME itself) via the same prefix logic the fs fence
+        // enforces in production.
+        let read_scope = Scope::only(roots.clone());
+        for forbidden in [
+            fake_home.to_path_buf(),
+            fake_home.join(".newt"),
+            fake_home.join(".config"),
+            fake_home.join(".local/share"),
+            fake_home.join(".ssh"),
+        ] {
+            let forbidden = forbidden.to_string_lossy().into_owned();
             assert!(
-                !roots.iter().any(|r| *r == home),
-                "must not grant $HOME itself"
+                !crate::caveats::permits_path(&read_scope, &forbidden),
+                "a build-lane root must not grant read over {forbidden}"
             );
         }
+
+        // An absolute XDG_BIN_HOME override replaces the default.
+        crate::process_env::set_var("XDG_BIN_HOME", "/abs/bin-home");
+        let roots_abs = build_tool_read_roots(Path::new("/workspace"));
+        assert!(roots_abs.iter().any(|r| r == "/abs/bin-home"));
+        assert!(!roots_abs.contains(&local_bin));
+
+        // A relative XDG_BIN_HOME must be skipped, per operator_tool_home,
+        // not silently fall back to the default `~/.local/bin`.
+        crate::process_env::set_var("XDG_BIN_HOME", "relative/bin");
+        let roots_relative = build_tool_read_roots(Path::new("/workspace"));
+        assert!(!roots_relative.iter().any(|r| r == "relative/bin"));
+        assert!(!roots_relative.contains(&local_bin));
+
+        crate::process_env::set_or_remove("HOME", saved_home.as_deref().and_then(|v| v.to_str()));
+        crate::process_env::set_or_remove(
+            "XDG_BIN_HOME",
+            saved_xdg_bin.as_deref().and_then(|v| v.to_str()),
+        );
     }
 
     #[test]
