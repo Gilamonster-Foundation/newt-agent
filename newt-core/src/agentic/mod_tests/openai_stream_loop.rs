@@ -490,24 +490,50 @@ async fn a_body_read_failure_keeps_the_usage_its_bytes_reported() {
 ///
 /// An empty REPLY is not an empty BILL. The round was paid for before the
 /// operator pressed anything, so its usage has to survive the cancelled arm.
+///
+/// The interrupt is tripped from the tool call's own execution, not from the
+/// HTTP fixture: `cancellable()` races the interrupt poll against the
+/// in-flight request itself (deliberately — see its doc comment, and
+/// `an_anthropic_stream_cancelled_mid_flight_is_never_ok`, which pins the
+/// opposite outcome for a flag flipped *during* that same race), so flipping
+/// the flag inside `Respond::respond` (as this test used to) races the same
+/// primitive and is exactly the ordering the Windows CI flake exposed. A tool
+/// call's `McpTools::call` runs strictly after round 1's response — and its
+/// usage — was already recorded, and strictly before the round-boundary
+/// `is_cancelled` check that decides whether round 2 is dispatched. That is
+/// real happens-before from single-task control flow, not a timing race.
 #[tokio::test]
 async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
     let server = MockServer::start().await;
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(CancelOnProbe {
-            flag: cancel.clone(),
-        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "srv__cancel_after_billing", "arguments": "{}"}
+                }]
+            }}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 7},
+        })))
         .mount(&server)
         .await;
 
     let messages = msgs();
     let caveats = Caveats::top();
     let uri = server.uri();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut permission = super::anthropic_loop_tests::FixtureMcpPermission::new(
+        "srv__cancel_after_billing",
+        &caveats,
+    );
     let mut ctx = ctx(&uri, &messages, &caveats);
-    ctx.cancel = Some(cancel.as_ref());
-    let (reply, streamed, usage, _hallu) = chat_complete(ctx, &mut NoMcp)
+    ctx.cancel = Some(&cancel);
+    ctx.permission_gate = Some(&mut permission);
+    let mut mcp = CancelAfterBilling { flag: &cancel };
+    let (reply, streamed, usage, _hallu) = chat_complete(ctx, &mut mcp)
         .await
         .expect("an interrupt is not an error");
 
@@ -522,15 +548,22 @@ async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
     );
 }
 
-/// Answers the probe and trips the interrupt flag while doing it: by the time
-/// the loop would accept the answer, the operator has hit Esc.
-struct CancelOnProbe {
-    flag: Arc<std::sync::atomic::AtomicBool>,
+/// An MCP tool whose execution trips the interrupt flag — deterministically
+/// after the round that called it was already billed.
+struct CancelAfterBilling<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
 }
-impl Respond for CancelOnProbe {
-    fn respond(&self, _req: &Request) -> ResponseTemplate {
+#[async_trait::async_trait]
+impl McpTools for CancelAfterBilling<'_> {
+    fn handles(&self, name: &str) -> bool {
+        name == "srv__cancel_after_billing"
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn call(&mut self, _leased: &crate::agentic::mcp::LeasedMcpCall<'_>) -> String {
         self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        probe_reply("the probe already answered")
+        "the operator interrupted right after this".to_string()
     }
 }
 
