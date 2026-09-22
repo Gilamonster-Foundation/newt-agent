@@ -238,9 +238,16 @@ pub fn fmt_tokens_compact(n: u32) -> String {
     }
 }
 
-/// `used/budget` gauge in `k`, e.g. `"899k/1024k"`.
-pub fn fmt_token_gauge(used: u32, budget: u32) -> String {
-    format!("{}/{}", fmt_tokens_k(used), fmt_tokens_k(budget))
+/// `used/budget` gauge in `k`, e.g. `"899k/1024k"`. `budget: None` means no
+/// context window is known for the active model (issue #2466): rather than
+/// presenting the learned ratchet (`max_ok_input`) as if it were the window,
+/// the denominator renders as `?` so the operator sees "unmeasured", not a
+/// false ceiling.
+pub fn fmt_token_gauge(used: u32, budget: Option<u32>) -> String {
+    match budget {
+        Some(b) => format!("{}/{}", fmt_tokens_k(used), fmt_tokens_k(b)),
+        None => format!("{}/?", fmt_tokens_k(used)),
+    }
 }
 
 /// Fill-level band for the gauge — color-type-agnostic so each caller maps it to

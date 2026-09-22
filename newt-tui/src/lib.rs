@@ -8657,7 +8657,7 @@ fn handle_context_command(
 /// store (Step 26.3); other features instrument as they land (26.4+).
 #[allow(clippy::too_many_arguments)] // gauge + counters + policy + features + one impact tuple per feature
 fn context_stats_text(
-    gauge: Option<(u32, u32)>,
+    gauge: Option<(u32, Option<u32>)>,
     counters: &newt_core::CompressCounters,
     compaction_policy: newt_core::CompactionTriggerPolicy,
     compaction_policy_source: &str,
@@ -8669,15 +8669,21 @@ fn context_stats_text(
     scheduled_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
-    // Live send-budget fill (None until a turn has reported usage).
+    // Live send-budget fill (None until a turn has reported usage). #2466:
+    // `budget: None` means no context window is known — no percentage to
+    // report, just `used/?`.
     match gauge {
-        Some((used, budget)) if budget > 0 => {
+        Some((used, Some(budget))) if budget > 0 => {
             let pct = (u64::from(used) * 100 / u64::from(budget)) as u32;
             lines.push(format!(
                 "  budget: {} ({pct}% of the send window)",
-                newt_core::agentic::fmt_token_gauge(used, budget)
+                newt_core::agentic::fmt_token_gauge(used, Some(budget))
             ));
         }
+        Some((used, None)) => lines.push(format!(
+            "  budget: {} (no context window known)",
+            newt_core::agentic::fmt_token_gauge(used, None)
+        )),
         _ => lines.push("  budget: not yet measured (no completed turn)".to_string()),
     }
     lines.push(format!(

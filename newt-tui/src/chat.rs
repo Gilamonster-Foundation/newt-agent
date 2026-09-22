@@ -297,6 +297,22 @@ fn cap_context_window_by_recovery(
     }
 }
 
+/// #2466: the gauge is per-model (window or ratchet), so it must not survive
+/// a `/model`/`/backend` switch — a `cap_id` change is the one signal every
+/// such switch produces (`session_cap_id`'s doc comment). Pure so the reset
+/// rule is unit-testable apart from the turn loop's mutable state.
+fn gauge_for_cap_switch(
+    token_gauge: Option<(u32, Option<u32>)>,
+    previous_cap_id: &probe::CapKey,
+    new_cap_id: &probe::CapKey,
+) -> Option<(u32, Option<u32>)> {
+    if previous_cap_id == new_cap_id {
+        token_gauge
+    } else {
+        None
+    }
+}
+
 /// Match the agentic loop's initial send-budget calculation for the visible
 /// next-turn gauge. A hard 400 may discover a smaller full window during the
 /// turn, so retain both the original declared ceiling and the newly observed
@@ -1222,7 +1238,7 @@ pub(crate) trait InputSurface {
         &mut self,
         _model: &str,
         _endpoint: &str,
-        _gauge: Option<(u32, u32)>,
+        _gauge: Option<(u32, Option<u32>)>,
         _session: &str,
     ) {
     }
@@ -1907,7 +1923,7 @@ fn session_body(
     // Step 24.6 (#559): the latest context-budget gauge `(used, budget)`, set
     // after each turn from the turn's input tokens + the resolved send budget,
     // and shown in the rich header for the NEXT prompt. `None` until known.
-    let mut token_gauge: Option<(u32, u32)> = None;
+    let mut token_gauge: Option<(u32, Option<u32>)> = None;
     // `/context size <N>` session override (#588): clamps the per-turn send
     // budget (eff_safe_context / eff_max_ok_input) to a user-chosen ceiling so
     // a too-tight auto-sized window can be widened for experimentation without
@@ -7347,7 +7363,10 @@ fn session_body(
                     // rebudget below keys the CURRENT serving principal — never the
                     // previous model's evidence, and never poisoning a sibling
                     // instance that happens to share a model name.
-                    cap_id = session_cap_id(choice.route_serving(), &choice.name, &inf_model);
+                    let new_cap_id =
+                        session_cap_id(choice.route_serving(), &choice.name, &inf_model);
+                    token_gauge = gauge_for_cap_switch(token_gauge, &cap_id, &new_cap_id);
+                    cap_id = new_cap_id;
 
                     // Per-model tuning: explicit config overrides global defaults.
                     let model_tune = cfg.find_model_tuning(&inf_model);
@@ -9095,7 +9114,17 @@ fn session_body(
                                         gauge_safe,
                                     );
                                     if let Some(budget) = gauge_budget {
-                                        token_gauge = Some((input_tokens, budget));
+                                        // #2466: the gauge denominator is only
+                                        // a real WINDOW when the server or a
+                                        // hard-400 recovery declared one — a
+                                        // budget resolved purely from the
+                                        // learned ratchet (`gauge_max_ok`/
+                                        // `gauge_safe`) is not a window and
+                                        // must render as `used/?`.
+                                        let window_known = eff_num_ctx.is_some()
+                                            || recovered_context_window.get().is_some();
+                                        token_gauge =
+                                            Some((input_tokens, window_known.then_some(budget)));
                                     }
                                 }
                             }
