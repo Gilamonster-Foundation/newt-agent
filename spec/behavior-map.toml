@@ -1466,7 +1466,40 @@ symbol = "fold_ocap_approvals"
 path = "newt-cli/src/headless.rs"
 symbol = "fold_ocap_grants"
 
-# ─────────────────────────────── Tool event `ok` classification ──────────────
+[BHV-ROUTE-002]
+description = "A recognised build command issued through run_command runs in the build lane: run_command(\"cargo build|check|test|clippy …\") and run_command(\"just <recipe>\") route to the confined build lane (the same leq/permission-gate re-check and 30-minute LIFECYCLE_BUILD_TIMEOUT as lifecycle action=build), running the model's LITERAL argv verbatim — never a re-resolved phase command, so no operand is ever dropped. cargo run/install/publish and any --config/-Z flag stay on the exec path; a call carrying cwd or timeout alongside command is refused rather than silently dropping that field."
+[BHV-ROUTE-002.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cargo_build_commands_route_with_literal_argv"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::just_recipe_routes_with_literal_argv"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cargo_near_misses_never_route"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::build_route_call_requires_bare_call"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "routed_cargo_test_reaches_the_confined_build_lane"
+tier = "unit"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "build_lane_route"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "run_confined_build_lane"
 
 [BHV-TOOLOK-001]
 description = "The ledgered `ok` bit is the dispatch OUTCOME whenever one exists: `ExecOutcome::Passed` is `ok = true`, `Failed`/`Denied`/`TimedOut`/`Unavailable` are `ok = false`, every variant named explicitly (no `_ =>`). The rendered text's prefix classifier (`tool_result_ok`) is used ONLY when no outcome was recorded (`execution = None`) — so a `run_command` that exits 0 with `error:`-shaped stdout is `ok = true`, and a non-zero exit whose render lacks a recognized failure prefix is still `ok = false` (#2482 item 6, follow-up to #2521/#2419)."

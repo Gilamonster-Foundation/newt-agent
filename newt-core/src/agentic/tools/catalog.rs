@@ -16,9 +16,10 @@ pub fn tool_definitions() -> serde_json::Value {
                                 fs_write scope are DENIED (e.g. `2>/dev/null`, `> /dev/null`) — drop \
                                 the redirect and read stdout/stderr from the result instead. Prefer the \
                                 dedicated tools over shelling out: `find`/`read_file`/`list_dir` over \
-                                `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` over raw \
-                                build/test/lint commands (use lifecycle action=build for explicitly \
-                                authorized offline compiler/test subprocesses). Do NOT pass `git` (or another tool's name) as \
+                                `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` for \
+                                build/test/lint — bare `cargo build/check/test/clippy`/`just <recipe>` \
+                                route there automatically; anything else needs lifecycle. Do NOT pass \
+                                `git` (or another tool's name) as \
                                 the command here — `git` is a separate tool; invoke it directly. Shelling \
                                 out to a name that has a dedicated tool is rejected. Declare needed \
                                 filesystem additions with fs_read/fs_write absolute-path arrays; \
