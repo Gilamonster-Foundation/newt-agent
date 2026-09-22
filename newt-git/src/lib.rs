@@ -18,7 +18,9 @@ use newt_core::git_caveats::GitCaveats;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, diff_trees, DiffEntry, DiffStatus};
+use grit_lib::diff::{
+    diff_index_to_tree, diff_index_to_worktree, diff_trees, DiffEntry, DiffStatus,
+};
 use grit_lib::index::{entry_from_stat, IndexEntry, MODE_REGULAR};
 use grit_lib::merge_base::resolve_commit_specs;
 use grit_lib::merge_file::MergeFavor;
