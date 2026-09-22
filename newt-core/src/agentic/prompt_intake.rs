@@ -1604,6 +1604,12 @@ impl ClarificationRejection {
     }
 }
 
+/// Punctuation a human uses to number a choice, tried in this order. `:` is
+/// tried first because it can never be mistaken for a decimal point or a
+/// parenthetical close, so it stays the unambiguous default when a line could
+/// match more than one.
+const ORDINAL_SEPARATORS: [char; 3] = [':', '.', ')'];
+
 /// Resolve explicit operator answers, or say why the reply was refused.
 ///
 /// #1689 items 1 and 2.
@@ -1621,15 +1627,29 @@ fn explicit_answer_outcome(
     for line in answer.lines() {
         let line = line.trim();
         let line = line.strip_prefix("decision ").unwrap_or(line);
-        let Some((ordinal, value)) = line.split_once(':') else {
+        // #2517 follow-up: a human numbering a choice reaches for `.` or `)`
+        // at least as often as `:` — "1. Widen the local surface", "1) …".
+        // Try each separator the operator might reasonably use rather than
+        // rejecting a perfectly explicit ordinal over punctuation choice.
+        // `.` is guarded against a decimal number ("3.14"): a digit
+        // immediately after the dot means it was never a list marker.
+        let Some((ordinal, _value)) = ORDINAL_SEPARATORS.iter().find_map(|sep| {
+            let (ordinal, value) = line.split_once(*sep)?;
+            if *sep == '.' && value.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            Some((ordinal, value))
+        }) else {
             continue;
         };
-        if value.trim().is_empty() {
-            continue;
-        }
         let Ok(ordinal) = ordinal.trim().parse::<usize>() else {
             continue;
         };
+        // An empty value is fine now that the separator itself (not the text
+        // after it) is what makes this a real ordinal rather than free text:
+        // "1." and "1)" alone are explicit enough to lock, the same way a
+        // bare `1:` was already accepted — the pending item's own question is
+        // the value, not the reply's text.
         saw_ordinal = true;
         let Some(pending_ordinal) = ordinal.checked_sub(1) else {
             out_of_range = Some(ordinal);

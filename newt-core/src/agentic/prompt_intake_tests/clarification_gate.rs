@@ -46,6 +46,57 @@ fn an_ordinal_answer_survives_a_question_mark() {
     assert!(resolved.last_rejection().is_none());
 }
 
+/// #2517 follow-up: `.` and `)` are numbering punctuation just as much as
+/// `:` — a human replying `1. Widen the local surface` (the actual shape the
+/// bug report showed the gate rejecting) must lock the batch, not be told no
+/// ordinal was found.
+#[test]
+fn a_dot_or_paren_numbered_reply_locks_like_a_colon() {
+    for reply in ["1. Widen the local surface", "1) Widen the local surface"] {
+        let resolved = one_decision().resolve_with_operator_answer(reply);
+        assert_eq!(
+            resolved.manifest.pending_decision_count(),
+            0,
+            "`{reply}` is as explicit an ordinal as `1: …`"
+        );
+        assert!(resolved.last_rejection().is_none());
+    }
+}
+
+/// A bare `1.` or `1)` with nothing after it still locks — the ordinal
+/// itself is the explicit signal, not the trailing text.
+#[test]
+fn a_bare_numbered_ordinal_with_no_trailing_text_still_locks() {
+    for reply in ["1.", "1)"] {
+        let resolved = one_decision().resolve_with_operator_answer(reply);
+        assert_eq!(resolved.manifest.pending_decision_count(), 0, "`{reply}`");
+        assert!(resolved.last_rejection().is_none());
+    }
+}
+
+/// A decimal number must never be misread as a `.`-numbered ordinal — "3.14"
+/// alone is not the operator saying "lock item 3".
+#[test]
+fn a_decimal_number_is_not_mistaken_for_a_dot_numbered_ordinal() {
+    let intake = PromptIntake::analyze(
+        "Should we use SQLite or Postgres for the cache?\n\
+         Pick either the polling or the streaming transport.\n\
+         Choose the retention window.",
+    );
+    let expected = intake.manifest.pending_decision_count();
+    assert!(expected >= 3, "fixture needs at least three decisions");
+    let resolved = intake.resolve_with_operator_answer("1: sqlite\n2: polling\n3.14");
+    assert_eq!(
+        resolved.manifest.pending_decision_count(),
+        expected,
+        "a bare decimal must not silently lock the third decision"
+    );
+    match resolved.last_rejection().expect("must record why") {
+        ClarificationRejection::Incomplete { answered, .. } => assert_eq!(*answered, 2),
+        other => panic!("expected Incomplete, got {other:?}"),
+    }
+}
+
 /// …but a reply carrying NO ordinals and reading as a question is still
 /// refused — and now says so.
 #[test]
