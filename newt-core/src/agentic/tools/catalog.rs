@@ -661,6 +661,37 @@ pub(super) fn run_command_redirect(command: &str) -> Option<&'static str> {
     DIRECT_TOOL_NAMES.iter().copied().find(|&t| t == first)
 }
 
+/// The refusal text for a `run_command("git …")` that [`run_command_redirect`]
+/// bounced to `"git"` but [`super::super::routing::RouteTable`] did NOT
+/// silently route (item 1 of the routing-honesty job, #2485-recon): either the
+/// subcommand has no embedded op (`show`, `reset`, …), or it has one but this
+/// shape carries an operand the embedded op cannot honor (`git log A..B`,
+/// `git diff --stat x`) — in neither case may the model be told the call
+/// merely needs re-dispatching, because a bare re-dispatch would answer a
+/// DIFFERENT question (the last 20 commits, or the unstaged diff) with
+/// `ok: true`. The supported-ops list is generated from
+/// [`super::super::git_tool::git_tool_definition`]'s `op` enum — one owner,
+/// not a second hand-maintained list.
+pub(super) fn git_run_command_refusal(command: &str) -> String {
+    let def = super::super::git_tool::git_tool_definition();
+    let ops: Vec<&str> = def["function"]["parameters"]["properties"]["op"]["enum"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .collect();
+    format!(
+        "error: 'git' is a tool, not a shell command — call it as a separate tool \
+         invocation, not as a command argument to run_command. '{command}' is not \
+         served: either its subcommand has no embedded op, or this shape carries an \
+         operand (a range, a path, a format flag) the embedded op cannot honor, and \
+         answering with the bare op instead would silently answer a different \
+         question. Embedded ops: {}. For log/diff, use the tool's `limit` / \
+         `spec: staged` parameters instead of shell operands.",
+        ops.join(", ")
+    )
+}
+
 /// Shell separators that sequence, pipeline, or redirect sub-commands. A
 /// composed command is split on these so each sub-command is examined
 /// independently. This is a deliberately COARSE over-split (e.g. `|` inside a

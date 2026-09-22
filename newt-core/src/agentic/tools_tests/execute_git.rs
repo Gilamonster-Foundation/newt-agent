@@ -21,6 +21,9 @@ impl crate::agentic::GitTool for StubGit {
                 Err("capability denied: git commit not permitted".to_string())
             }
             "commit" => Ok("committed abc123: msg".to_string()),
+            // A dispatch failure for a routed read op, so the
+            // `[routed: …]` annotation wraps an errored result.
+            "log" => Err("error: no such object HEAD".to_string()),
             // #1191: data-loss ops the gate guards — if we reach here, the
             // gate ALLOWED (the refusal path returns before dispatch).
             "stash-drop" => Ok("dropped stash@{0}".to_string()),
@@ -170,6 +173,41 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
             "{out}"
         );
     }
+}
+
+// #2516: a routed `run_command("git log")` whose embedded dispatch
+// errors must still classify as `tool_result_ok == false`. Before the fix,
+// `[routed: …]` was PREPENDED to the result, so `tool_result_ok`'s
+// prefix check (`error:`, `capability denied:`, …) never saw the `error:`
+// that starts the un-annotated output — an errored routed call read as ok.
+#[tokio::test]
+async fn routed_git_dispatch_error_is_not_masked_by_the_routed_note() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+    let out = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "git log"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        ToolCollaborators {
+            git_tool: Some(&StubGit),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .expect("legacy fixture has no durable writer")
+    .unwrap();
+    assert!(out.contains("[routed:"), "must still carry the note: {out}");
+    assert!(
+        !super::super::tool_result_ok(&out),
+        "an errored routed call must not read as ok:true: {out}"
+    );
 }
 
 async fn run_git(op: &str, caveats: &Caveats, git: Option<&dyn crate::agentic::GitTool>) -> String {

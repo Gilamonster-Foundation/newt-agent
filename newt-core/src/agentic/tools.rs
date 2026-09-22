@@ -81,8 +81,8 @@ pub(crate) use catalog::{
     known_builtin_tool_name, merged_tool_definitions, resolve_tool_alias, AliasOutcome,
 };
 use catalog::{
-    disposition_tool_denied_message, is_mcp_tool_name, run_command_creates_shell_git_commit,
-    run_command_redirect, unknown_tool_message,
+    disposition_tool_denied_message, git_run_command_refusal, is_mcp_tool_name,
+    run_command_creates_shell_git_commit, run_command_redirect, unknown_tool_message,
 };
 pub use catalog::{
     filter_advertised_tools, filter_tools_for_disposition, persona_tool_allowed, tool_allowed,
@@ -2781,6 +2781,11 @@ async fn execute_authorized_tool(
     // L3 boundary (the confined shell below, the fs fence) STAYS. It is a switch
     // DISTINCT from `--disable-ocap` (§7-F5): the routing escape never disables
     // confinement.
+    // Item 3 of the routing-honesty job (#2485-recon): the audit line above is
+    // a `tracing::debug!` only — invisible to the model and to a transcript
+    // reader. Keep the original `run_command("git …")` text so a routed git
+    // call's own result can say what it was rewritten to, not just the log.
+    let mut routed_git_command: Option<String> = None;
     let routed: Option<(&'static str, serde_json::Value)> =
         if name == "run_command" && !routing_disabled() {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -2798,6 +2803,10 @@ async fn execute_authorized_tool(
                 tracing::debug!(target: "newt::routing", "{line}");
             }
             match decision {
+                super::routing::RouteDecision::Route { tool: "git", args } => {
+                    routed_git_command = Some(command.to_string());
+                    Some(("git", args))
+                }
                 super::routing::RouteDecision::Route { tool, args } => Some((tool, args)),
                 super::routing::RouteDecision::Exec => None,
             }
@@ -3143,6 +3152,20 @@ async fn execute_authorized_tool(
                     // sees WHY (e.g. "denied: commit" on a read-only session).
                     Err(e) => format!("error: {e}"),
                 };
+                // Item 3 (#2485-recon): a `run_command("git …")` routed here
+                // says so in its OWN result, not only in the debug log — a
+                // reader of the transcript (or the model) can otherwise not
+                // tell the tool ran a translated op instead of the literal
+                // shell command it typed.
+                //
+                // The note is APPENDED, never prepended.
+                // `tool_result_ok` classifies by PREFIX (`error:`, `capability
+                // denied:`, …) — prepending the note would shift an errored
+                // dispatch's `error:` prefix off the front of the string and
+                // make an errored routed call read as ok:true.
+                if let Some(original) = &routed_git_command {
+                    out = format!("{out}\n[routed: `{original}` → git {op} {args}]");
+                }
                 // #1056: a LOCAL git WRITE denied by the projected authority is
                 // NOT a dead end (the trap that stranded the model between the git
                 // tool and `run_command git`). Route it through the gate like
@@ -3220,6 +3243,9 @@ async fn execute_authorized_tool(
             if let Some(tool) = run_command_redirect(cmd)
                 .filter(|tool| smart_harness.is_none() || !matches!(*tool, "git" | "find"))
             {
+                if tool == "git" {
+                    return host_return(git_run_command_refusal(cmd));
+                }
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
