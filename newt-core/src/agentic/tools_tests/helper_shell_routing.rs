@@ -134,6 +134,26 @@ fn run_command_redirect_passes_composed_commands_through() {
     assert_eq!(run_command_redirect("git status"), Some("git"));
 }
 
+/// Item 2 of the routing-honesty job (#2485-recon): a `git` subcommand that
+/// `run_command_redirect` bounces but the router did NOT silently route (an
+/// unimplemented op, or a supported op with an unhonored operand) must get an
+/// honest refusal — naming the ops the embedded tool actually supports —
+/// instead of the old dead-end "'git' is a tool, not a shell command" with no
+/// hint of what to do about it.
+#[test]
+fn git_run_command_refusal_names_the_supported_ops() {
+    let msg = git_run_command_refusal("git log A..B");
+    assert!(msg.contains("git log A..B"), "{msg}");
+    assert!(msg.contains("status"), "{msg}");
+    assert!(msg.contains("log"), "{msg}");
+    assert!(msg.contains("diff"), "{msg}");
+    // Not the old dead-end text with no supported-ops list.
+    assert!(
+        !msg.contains("do not pass 'git' as a command argument"),
+        "{msg}"
+    );
+}
+
 /// #1709 family: a COMPOSED `run_command` that creates a git commit bypasses
 /// `LocalGitTool::finalize_commit_message` and would land an unattributed
 /// commit. The guard `run_command_creates_shell_git_commit` detects it so the
