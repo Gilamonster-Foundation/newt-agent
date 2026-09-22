@@ -305,6 +305,19 @@ mod tests {
         );
     }
 
+    /// #2532 review, should-fix 1: `load_user_key` is the read-only sibling
+    /// `resolve_ocap_store` must use instead of `load_or_generate` —  a
+    /// missing key errors, and never mints one. Pins the property directly at
+    /// its source; `newt-cli`'s `headless_reading_the_ocap_store_never_mints_an_identity_key`
+    /// is the real-binary end-to-end evidence for the caller that depends on it.
+    #[test]
+    fn load_user_key_errors_and_never_mints_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.pem");
+        assert!(load_user_key(&path).is_err());
+        assert!(!path.exists(), "load_user_key must never write a key");
+    }
+
     #[test]
     #[cfg(unix)]
     fn load_or_generate_writes_a_0600_key() {

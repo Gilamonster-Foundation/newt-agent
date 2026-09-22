@@ -87,6 +87,12 @@ pub struct ContractInputs<'a> {
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
+    /// The signed OCAP `approve.toml` durable grants admitted into this run's
+    /// caveats (#2524 item 1), as `"<axis>:<target>"` labels (e.g.
+    /// `"fs_read:/opt/canvas-token"`) — empty when none were configured or
+    /// none applied. Observability requirement: every folded-in grant must be
+    /// visible on the contract record, not just effective silently.
+    pub durable_grants: &'a [String],
     /// The self-verify gate's receipt entry (#2315); `None` omits it, and so
     /// does a record with no turn outcome (`features` is `None`), whose gate
     /// never ran.
@@ -535,6 +541,11 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         &mut effective_config,
         "smart_harness",
         i.smart_harness.cloned(),
+    );
+    conditional_stanza(
+        &mut effective_config,
+        "durable_grants",
+        (!i.durable_grants.is_empty()).then(|| serde_json::json!(i.durable_grants)),
     );
     let mut record = serde_json::json!({
         "contract_version": CONTRACT_VERSION,
@@ -990,6 +1001,7 @@ mod tests {
             verification: None,
             scratchpad_seed: None,
             required: &[],
+            durable_grants: &[],
         }
     }
 
@@ -1304,6 +1316,27 @@ mod tests {
         assert_eq!(record["effective_config"]["smart_harness"], manifest);
         assert_eq!(record["contract_version"], "2");
         assert!(permitted_outcomes().contains(&record["outcome"].as_str().unwrap()));
+    }
+
+    /// #2524 item 1 observability requirement: every OCAP durable grant
+    /// admitted into the run's caveats must be visible on the contract
+    /// record, and an empty admission list must not fabricate a stanza.
+    #[test]
+    fn durable_grants_are_listed_when_admitted_and_omitted_when_none() {
+        let i = inputs();
+        assert!(
+            contract_record(&i)["effective_config"]
+                .get("durable_grants")
+                .is_none(),
+            "no admitted grants must mean no stanza, not an empty array"
+        );
+        let mut with_grants = inputs();
+        let admitted = vec!["fs_read:/opt/canvas-token".to_string()];
+        with_grants.durable_grants = &admitted;
+        assert_eq!(
+            contract_record(&with_grants)["effective_config"]["durable_grants"],
+            serde_json::json!(["fs_read:/opt/canvas-token"])
+        );
     }
 
     /// `model_digest` appears ONLY when operator-supplied — never fabricated.
