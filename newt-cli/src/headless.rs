@@ -121,6 +121,18 @@ pub struct HeadlessArgs {
 /// and the content id of the entries it actually holds — the receipt's `seed`.
 /// Refused here, before any backend work, when the JSON is not an object of
 /// string values or names an empty key (which `state_set` would also refuse).
+/// F16: the model was never told its absolute workspace root — only the
+/// tool schemas said paths are "relative to the workspace root", never what
+/// that root *is*. Observed cost: replay 2488-r6 invented `cwd=/workspace`
+/// (a test-fixture path, not a real one) and burned 30 minutes treating the
+/// resulting "could not find Cargo.toml" as an external blocker. Seed the
+/// driver's transcript with one system message naming the real root, the
+/// same fact `newt-tui`'s interactive loop already states via its
+/// `Workspace: {path}` line (`newt-tui/src/lib.rs`).
+fn workspace_root_system_message(workspace: &str) -> newt_core::MemMessage {
+    newt_core::MemMessage::system(format!("Workspace root: {workspace}"))
+}
+
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
     use newt_core::ScratchpadStore;
     let entries: std::collections::BTreeMap<String, String> = serde_json::from_str(json)
@@ -640,10 +652,11 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // uses (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
     let read_scope = dc.caveats.fs_read.clone();
-    let mut driver = TurnDriver::new(dc)
-        .with_cognition(runtime.cognition)
-        .with_tenacity(runtime.tenacity)
-        .with_initiative(runtime.initiative);
+    let mut driver =
+        TurnDriver::with_transcript(dc, vec![workspace_root_system_message(&workspace)])
+            .with_cognition(runtime.cognition)
+            .with_tenacity(runtime.tenacity)
+            .with_initiative(runtime.initiative);
     if runtime.crew {
         driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
             // The crew runner needs an owned flattened Config; the
@@ -1257,6 +1270,20 @@ mod tests {
         assert!(seed_scratchpad(r#"{"a": 1}"#).is_err(), "non-string value");
         assert!(seed_scratchpad(r#"["a"]"#).is_err(), "not an object");
         assert!(seed_scratchpad(r#"{" ": "v"}"#).is_err(), "blank key");
+    }
+
+    /// F16 (red first): the seeded message names the real root and is a
+    /// `system` message, so it precedes the task in the wire transcript
+    /// exactly like newt-tui's `Workspace: {path}` line.
+    #[test]
+    fn workspace_root_system_message_names_the_real_root() {
+        let msg = workspace_root_system_message("/home/dev/proj");
+        assert_eq!(msg.role, newt_core::memory::Role::System);
+        assert!(
+            msg.content.contains("/home/dev/proj"),
+            "message must name the real workspace root, got: {}",
+            msg.content
+        );
     }
 
     #[test]
