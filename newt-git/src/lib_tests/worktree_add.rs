@@ -227,6 +227,23 @@ fn worktree_add_refuses_a_symlinked_parent_escape() {
     let outside = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), p.join("escape-link")).unwrap();
+    // #2531 round 4, finding 2: on Windows this test had no `#[cfg(windows)]`
+    // counterpart at all, so `escape-link` was never created — the ancestor
+    // walk in `worktree_add` then found `p` itself as the nearest EXISTING
+    // ancestor (trivially contained) and returned `Ok`. That read as the
+    // containment check being broken; it was the fixture never exercising
+    // it. `symlink_dir` needs `SeCreateSymbolicLinkPrivilege` (an elevated
+    // process or Developer Mode), which CI runners commonly lack — skip
+    // rather than assert on a link this process could not create.
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_dir(outside.path(), p.join("escape-link")).is_err() {
+        eprintln!(
+            "skipping worktree_add_refuses_a_symlinked_parent_escape: \
+             could not create a Windows symlink (needs Developer Mode or \
+             an elevated process)"
+        );
+        return;
+    }
     let eng = GitEngine::open(p, &Scope::All).unwrap();
     let err = eng
         .worktree_add(
@@ -262,6 +279,16 @@ fn worktree_add_dedupes_admin_id_on_collision_without_touching_existing_dir() {
     let common = p.join(".git");
     let preexisting = common.join("worktrees").join("task");
     std::fs::create_dir_all(&preexisting).unwrap();
+    // #2531 round 4, finding 3: an EMPTY pre-created dir once vanished out
+    // from under this test on Linux (coverage job, once in ~40 local runs,
+    // never reproduced) — `read_dir(preexisting)` came back `NotFound`.
+    // Unexplained; no code path in `worktree_add`/`claim_worktree_admin_dir`
+    // removes anything but its OWN candidate on failure. A real concurrent
+    // `git worktree add` claims `create_dir` and then writes its `gitdir`
+    // file within microseconds, so model that instead of a bare empty dir —
+    // this only strengthens the fixture and cannot explain why an empty one
+    // disappeared, so it does not close the finding.
+    std::fs::write(preexisting.join("gitdir"), "gitdir: nowhere\n").unwrap();
 
     let eng = GitEngine::open(p, &Scope::All).unwrap();
     let wt = eng
@@ -276,13 +303,19 @@ fn worktree_add_dedupes_admin_id_on_collision_without_touching_existing_dir() {
         common.join("worktrees").join("task1").exists(),
         "collision must be resolved with a numeric suffix"
     );
+    assert_eq!(
+        std::fs::read_to_string(preexisting.join("gitdir")).unwrap(),
+        "gitdir: nowhere\n",
+        "pre-existing admin dir's own file must be left untouched"
+    );
     let entries: Vec<_> = std::fs::read_dir(&preexisting)
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert!(
-        entries.is_empty(),
-        "pre-existing admin dir must be left untouched: {entries:?}"
+    assert_eq!(
+        entries.len(),
+        1,
+        "pre-existing admin dir must gain no files beyond its own: {entries:?}"
     );
 }
 
@@ -332,4 +365,49 @@ fn worktree_add_fails_closed_without_refs_or_stage() {
         Err(GitError::Denied("refs"))
     ));
     assert!(!p.join(".worktrees/ro").exists());
+}
+
+// -- #2531 round 4, finding 1: strip a Windows `\\?\` verbatim prefix back
+// to the plain form before writing it into a file git reads (the gitfile /
+// admin gitdir). Pure string transform, testable on Linux.
+
+#[test]
+fn strip_verbatim_prefix_rewrites_a_plain_drive_path() {
+    assert_eq!(
+        strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Users\shawn\work\.worktrees\x")),
+        PathBuf::from(r"C:\Users\shawn\work\.worktrees\x"),
+    );
+}
+
+#[test]
+fn strip_verbatim_prefix_rewrites_a_unc_path() {
+    assert_eq!(
+        strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\repo\x")),
+        PathBuf::from(r"\\server\share\repo\x"),
+    );
+}
+
+#[test]
+fn strip_verbatim_prefix_leaves_a_non_verbatim_path_unchanged() {
+    let plain = Path::new(r"C:\Users\shawn\work\.worktrees\x");
+    assert_eq!(strip_windows_verbatim_prefix(plain), plain.to_path_buf());
+}
+
+#[test]
+fn strip_verbatim_prefix_leaves_an_unrepresentable_verbatim_form_unchanged() {
+    // No plain equivalent exists for a verbatim device path (or a
+    // non-drive-letter remainder) — keep the prefix rather than emit a path
+    // Windows would resolve differently. The dunce rule only rewrites the
+    // two shapes that DO have an exact plain equivalent.
+    let device = Path::new(r"\\?\Volume{f5e9e3a1-0000-0000-0000-100000000000}\x");
+    assert_eq!(strip_windows_verbatim_prefix(device), device.to_path_buf());
+}
+
+#[test]
+fn strip_verbatim_prefix_is_a_no_op_on_a_unix_style_path() {
+    let unix_path = Path::new("/home/shawn/work/.worktrees/x");
+    assert_eq!(
+        strip_windows_verbatim_prefix(unix_path),
+        unix_path.to_path_buf()
+    );
 }

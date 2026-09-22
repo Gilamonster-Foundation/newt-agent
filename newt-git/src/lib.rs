@@ -1109,13 +1109,26 @@ impl GitEngine {
             // so the relative path back up is always `../..` — matching git's
             // own `commondir` contents for a linked worktree.
             std::fs::write(admin.join("commondir"), "../..\n")?;
+            // #2531 round 4: `wt_path`/`admin` trace back to
+            // `self.repo.work_tree`/`git_dir`, both canonicalized by
+            // grit_lib — verbatim (`\\?\...`) on Windows. Git for Windows
+            // does not follow a verbatim path out of a gitfile, so strip it
+            // for everything written INTO a file git reads; the canonical
+            // form above is kept for the containment checks, which is the
+            // only place it needs to be canonical.
             std::fs::write(
                 admin.join("gitdir"),
-                format!("{}\n", wt_path.join(".git").display()),
+                format!(
+                    "{}\n",
+                    strip_windows_verbatim_prefix(&wt_path.join(".git")).display()
+                ),
             )?;
             std::fs::write(
                 wt_path.join(".git"),
-                format!("gitdir: {}\n", admin.display()),
+                format!(
+                    "gitdir: {}\n",
+                    strip_windows_verbatim_prefix(&admin).display()
+                ),
             )?;
             write_symbolic_ref(&admin, "HEAD", &refname)?;
             Ok(())
@@ -1825,6 +1838,37 @@ fn claim_worktree_admin_dir(common: &Path, wt_path: &Path) -> std::io::Result<Pa
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Strip a Windows `\\?\` verbatim prefix down to the plain form Git for
+/// Windows will actually follow when it reads the path back out of a file
+/// (a `gitdir:` gitfile, or a linked worktree's admin `gitdir`) — the
+/// "dunce" rule. `self.repo.git_dir`/`work_tree` are canonicalized by
+/// `grit_lib::Repository::open` (`Path::canonicalize`), which on Windows
+/// always returns the verbatim form; that form is fine for OUR containment
+/// checks (`starts_with`) but is not a path Git's own porcelain parses back
+/// out of a written file, so anything built from those fields must be
+/// stripped again at the point it is written into such a file.
+///
+/// Only the two representable shapes are rewritten — `\\?\C:\...` to
+/// `C:\...` and `\\?\UNC\server\share\...` to `\\server\share\...` — because
+/// those are the only verbatim forms with an equivalent plain form at all
+/// (a long path or a device path has none, and must keep the prefix or
+/// become unrepresentable). Any other path, including every non-Windows
+/// path, is returned unchanged — a no-op on Linux/macOS, where this prefix
+/// never occurs.
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn canonical_read_scope(session: &Caveats) -> Scope<String> {
