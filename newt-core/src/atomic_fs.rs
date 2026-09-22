@@ -15,6 +15,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const LOCK_RETRIES: u32 = 100;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 const LEGACY_LOCK_STALE: Duration = Duration::from_secs(30);
+/// How long an empty lock must sit before it is reclaimed. This version
+/// never observes its own lock empty (see [`publish_lock`]), so an empty
+/// lock on disk can only be a crash artifact of an OLDER build's
+/// `create_new` + `write_all` sequence — but that older build's own writer
+/// is also empty for the instant between those two calls, so the grace must
+/// outlast any real write window (microseconds) while staying well inside
+/// the `LOCK_RETRIES` * `LOCK_RETRY_DELAY` contention budget (~2s), so a
+/// contender still gets a live/dead answer within that budget instead of
+/// exhausting it waiting out the grace.
+const EMPTY_LOCK_GRACE: Duration = Duration::from_millis(200);
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A durable replacement failure that records whether the destination name
@@ -158,24 +168,13 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    sweep_lock_tmp_orphans(lock_path);
     let owner = LockOwner::current();
     let encoded = owner.encode();
     let mut denied = false;
     for _ in 0..LOCK_RETRIES {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(mut file) => {
-                if let Err(error) = (|| -> std::io::Result<()> {
-                    file.write_all(encoded.as_bytes())?;
-                    file.sync_all()
-                })() {
-                    drop(file);
-                    let _ = std::fs::remove_file(lock_path);
-                    return Err(error.into());
-                }
+        match publish_lock(lock_path, &encoded) {
+            Ok(()) => {
                 return Ok(LockGuard {
                     path: lock_path.to_path_buf(),
                     owner,
@@ -204,7 +203,142 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
             lock_path.display()
         );
     }
-    anyhow::bail!("could not acquire {} — {CONTENDED}", lock_path.display())
+    match current_owner(lock_path) {
+        Some(owner) => anyhow::bail!(
+            "could not acquire {} — {CONTENDED} (held by pid {})",
+            lock_path.display(),
+            owner.pid
+        ),
+        None => anyhow::bail!("could not acquire {} — {CONTENDED}", lock_path.display()),
+    }
+}
+
+/// Remove `<lock>.*.tmp` orphans left by [`publish_lock`] crashing between
+/// its temp-file write and the `hard_link`/fallback publish. Best-effort and
+/// scoped to files older than the contention retry budget, so an in-flight
+/// writer's own temp file is never touched; errors are swallowed since a
+/// stray orphan blocks nothing and this sweep must never block acquisition.
+fn sweep_lock_tmp_orphans(lock_path: &Path) {
+    sweep_lock_tmp_orphans_older_than(lock_path, LOCK_RETRY_DELAY * LOCK_RETRIES);
+}
+
+/// [`sweep_lock_tmp_orphans`] with the age budget as a seam, so a test can
+/// use a millisecond-scale budget instead of the real ~2s retry budget.
+fn sweep_lock_tmp_orphans_older_than(lock_path: &Path, budget: Duration) {
+    let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    let Some(file_name) = lock_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let prefix = format!("{file_name}.");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let is_old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > budget);
+        if is_old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Publish `encoded` at `lock_path` so it is never observable empty.
+///
+/// Writes the owner body to a private temp file first, `fsync`s it, then
+/// atomically publishes it with `hard_link` — which fails with
+/// `AlreadyExists` exactly when `create_new` would have, so callers get the
+/// same contention semantics. Unlike `create_new` + `write_all`, there is no
+/// window between "the lock file exists" and "the lock file has content": a
+/// lock this function writes carries its final body from the instant it
+/// becomes visible under `lock_path`. `hard_link` needs the source and
+/// destination on the same filesystem, which they are (`lock_path`'s own
+/// directory); if a future target lacks hard-link support, fall back to the
+/// old `create_new` + `write_all` path instead of failing outright.
+fn publish_lock(lock_path: &Path, encoded: &str) -> std::io::Result<()> {
+    publish_lock_with_link(lock_path, encoded, |src, dst| std::fs::hard_link(src, dst))
+}
+
+/// [`publish_lock`] with the `hard_link` call as a seam, so a test can inject
+/// a link failure without a real vfat/FUSE/SMB mount.
+fn publish_lock_with_link(
+    lock_path: &Path,
+    encoded: &str,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let dir = lock_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp_name = lock_path
+        .file_name()
+        .map(|name| format!("{}.{}.tmp", name.to_string_lossy(), unique_suffix()))
+        .unwrap_or_else(|| format!("lock.{}.tmp", unique_suffix()));
+    let tmp_path = match dir {
+        Some(dir) => dir.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(encoded.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    let link_result = link(&tmp_path, lock_path);
+    match &link_result {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            // hard_link failed for any reason other than "the lock is
+            // already held" — not just Unsupported. vfat/exFAT/FUSE(sshfs)
+            // return EPERM (which io::ErrorKind maps to PermissionDenied,
+            // the same kind ordinary contention/Windows DELETE_PENDING
+            // reports) and some Windows FAT/SMB errors map to Uncategorized.
+            // Treating only Unsupported as "no hard-link support" left those
+            // targets either misdiagnosed as contention or failing outright.
+            // Fall back to the old direct create_new path, same contention
+            // semantics, just without the empty-window guarantee; the
+            // fallback's own error (if any) is the verdict callers see.
+            let _ = std::fs::remove_file(&tmp_path);
+            return std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(lock_path)
+                .and_then(|mut file| {
+                    file.write_all(encoded.as_bytes())?;
+                    file.sync_all()
+                });
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+    link_result
+}
+
+/// The owner recorded in `lock_path` right now, for the refusal message.
+/// Best-effort: a lock that vanished or was rewritten between the last
+/// failed retry and this read reports `None` rather than lying about who
+/// holds it.
+fn current_owner(lock_path: &Path) -> Option<LockOwner> {
+    LockOwner::decode(&std::fs::read_to_string(lock_path).ok()?)
 }
 
 /// The refusal [`acquire_lock`] returns when another LIVE owner holds the lock
@@ -246,6 +380,13 @@ fn reclaim_lock_once(lock_path: &Path) -> anyhow::Result<bool> {
     if !reclaimable_lock(lock_path) {
         return Ok(false);
     }
+    // Pre-existing race, not introduced here: this removes by PATH, so if the
+    // dead owner's guard already unlinked it and a third process published a
+    // live lock in the gap between the read above and this unlink, we delete
+    // the LIVE lock instead. The lease only serializes reclaimers against each
+    // other, not against owner-drop + publish. Narrowing this needs a re-read
+    // (or dev/ino compare) under the lease immediately before unlinking —
+    // tracked as a follow-up, not fixed here.
     match std::fs::remove_file(lock_path) {
         Ok(()) => {
             sync_parent(lock_path)?;
@@ -345,11 +486,25 @@ fn try_native_exclusive_lock(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 fn reclaimable_lock(lock_path: &Path) -> bool {
-    match std::fs::read_to_string(lock_path)
-        .ok()
-        .and_then(|body| LockOwner::decode(&body))
-    {
+    let Ok(body) = std::fs::read_to_string(lock_path) else {
+        return false;
+    };
+    match LockOwner::decode(&body) {
         Some(owner) => !crate::store::pid_is_alive(owner.pid),
+        // This version publishes the lock's body atomically (see
+        // `publish_lock`) and never observes it empty, so an empty file can
+        // only be a crash artifact left by an OLDER build's `create_new` +
+        // `write_all` — but that older build's writer is ALSO empty for the
+        // instant between those two calls, so an empty lock isn't
+        // immediately a dead one: give it the same ~2s contention budget a
+        // live writer gets before calling it dead. A non-empty but
+        // undecodable body has unknown provenance and keeps the
+        // conservative 30s legacy age fallback.
+        None if body.is_empty() => std::fs::metadata(lock_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > EMPTY_LOCK_GRACE),
         None => std::fs::metadata(lock_path)
             .and_then(|metadata| metadata.modified())
             .ok()
@@ -694,6 +849,25 @@ mod tests {
     ///
     /// Costs the full retry budget (~2s) by construction: exhausting it is the
     /// event under test.
+    /// A lock this version writes is never observed empty: `publish_lock`
+    /// only makes `lock_path` exist via `hard_link` from a temp file that
+    /// already carries the full `pid:nonce` body, so there is no window
+    /// where the path exists with zero bytes (unlike the old direct
+    /// `create_new` + `write_all` sequence).
+    #[test]
+    fn a_lock_acquired_by_this_version_is_never_observed_empty() {
+        let dir = TempDir::new().unwrap();
+        let lock = lock_path_for(&dir.path().join("config.toml"));
+        let guard = acquire_lock(&lock).unwrap();
+        let body = std::fs::read_to_string(&lock).unwrap();
+        assert!(
+            !body.is_empty(),
+            "the lock must carry its final body from the instant it becomes visible"
+        );
+        assert!(LockOwner::decode(&body).is_some(), "{body:?}");
+        drop(guard);
+    }
+
     #[test]
     fn contention_is_recognised_and_nothing_else_is() {
         let dir = TempDir::new().unwrap();
@@ -723,6 +897,67 @@ mod tests {
         )));
     }
 
+    /// **Red for #2487.** A lock file killed between `create_new` and
+    /// `write_all` is empty — no `pid:nonce` body, so `LockOwner::decode`
+    /// returns `None` and reclamation falls back to the 30s legacy-age path.
+    /// Within the ~2s retry budget that reads as CONTENDED — "another live
+    /// process" — even though no process anywhere holds it and the body is
+    /// unmistakably a crash artifact of the *current* write sequence, never a
+    /// value this version writes on purpose. Reproduces the report: a stale
+    /// 0-byte lock, no live owner, nothing to retry into. `acquire_lock`
+    /// itself retries for ~2s (well past `EMPTY_LOCK_GRACE`), so this level
+    /// grounds the end-to-end behavior; the two tests below pin the grace
+    /// boundary `reclaimable_lock` actually applies.
+    #[test]
+    fn empty_crash_artifact_lock_is_reclaimed_not_reported_live() {
+        let dir = TempDir::new().unwrap();
+        let lock = lock_path_for(&dir.path().join("config.toml"));
+        // Simulates `create_new` succeeding and the process dying before
+        // `write_all` — exactly what a kill/OOM/panic between those two
+        // calls in `acquire_lock` leaves on disk. Freshly written, so the
+        // legacy 30s age check does not consider it stale.
+        std::fs::File::create(&lock).unwrap();
+
+        let guard = acquire_lock(&lock).expect(
+            "an empty lock from this version's own write sequence is a dead owner, not a live one",
+        );
+        drop(guard);
+    }
+
+    /// A fresh empty lock (age well under [`EMPTY_LOCK_GRACE`]) is NOT
+    /// reclaimable yet — this is the safety half of the item-1 fix: a LIVE
+    /// writer's own lock is also empty for the instant between its
+    /// `create_new` and `write_all` (see [`publish_lock`]'s fallback path,
+    /// and any older build's direct write), and a contender must not delete
+    /// that window's lock out from under it.
+    #[test]
+    fn fresh_empty_lock_is_not_reclaimed_within_the_grace() {
+        let dir = TempDir::new().unwrap();
+        let lock = lock_path_for(&dir.path().join("config.toml"));
+        std::fs::File::create(&lock).unwrap();
+        assert!(
+            !reclaimable_lock(&lock),
+            "a fresh empty lock must not read as a dead owner yet"
+        );
+    }
+
+    /// Past [`EMPTY_LOCK_GRACE`], an empty lock IS reclaimable — the crash
+    /// case this fix targets.
+    #[test]
+    fn aged_empty_lock_past_the_grace_is_reclaimed() {
+        let dir = TempDir::new().unwrap();
+        let lock = lock_path_for(&dir.path().join("config.toml"));
+        let file = std::fs::File::create(&lock).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now() - EMPTY_LOCK_GRACE - Duration::from_millis(50),
+        )
+        .unwrap();
+        assert!(
+            reclaimable_lock(&lock),
+            "an empty lock older than the grace is a crash artifact, not a live writer"
+        );
+    }
+
     #[test]
     fn atomic_write_replaces_and_leaves_no_tmp() {
         let dir = TempDir::new().unwrap();
@@ -731,6 +966,57 @@ mod tests {
         atomic_write(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// #2525 review item 1: a link failure other than `AlreadyExists` — the
+    /// EPERM a vfat/exFAT/FUSE(sshfs) target maps to `PermissionDenied`, or an
+    /// Uncategorized Windows FAT/SMB error — must fall back to the old
+    /// create_new path, not be treated as contention or fail outright. Seam
+    /// (`publish_lock_with_link`) stands in for the real mount so this stays
+    /// in the fully-mocked unit tier.
+    #[test]
+    fn hard_link_failure_other_than_unsupported_falls_back_to_create_new() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("config.toml.lock");
+        publish_lock_with_link(&lock_path, "owner-body", |_src, _dst| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect("falls back instead of surfacing the injected link error");
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "owner-body");
+    }
+
+    /// #2525 review item 2: a crash between the temp-file write and the
+    /// `hard_link`/fallback publish leaves a `<lock>.*.tmp` orphan behind.
+    /// Once past the contention retry budget it is safe to call dead and
+    /// must be swept; a fresh one still within budget (an in-flight writer)
+    /// must survive.
+    #[test]
+    fn sweep_lock_tmp_orphans_removes_only_ones_past_the_retry_budget() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("config.toml.lock");
+        let stale = dir.path().join("config.toml.lock.stale-orphan.tmp");
+        std::fs::write(&stale, b"orphan").unwrap();
+        // Aged explicitly, not by sleeping, so scheduler latency and mtime
+        // granularity cannot decide the outcome.
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let fresh = dir.path().join("config.toml.lock.fresh-orphan.tmp");
+        std::fs::write(&fresh, b"orphan").unwrap();
+
+        sweep_lock_tmp_orphans_older_than(&lock_path, Duration::from_secs(30));
+
+        assert!(
+            !stale.exists(),
+            "orphan past the retry budget must be swept"
+        );
+        assert!(
+            fresh.exists(),
+            "orphan within the retry budget must survive"
+        );
     }
 
     #[test]
