@@ -699,13 +699,13 @@ impl GitEngine {
             }
         }
         move_ref()?;
-        if let Some(old_tree) = old_tree {
-            checkout_between_trees(&self.repo, Some(&old_tree), &new_tree).map_err(|e| {
-                GitError::Refused(format!(
-                    "{op}: HEAD moved to {new_head} but the working tree may be partially updated and the index was not rewritten; run status before continuing: {e}"
-                ))
-            })?;
-        }
+        // `None` (an unborn HEAD) is the empty tree to grit, so every path in
+        // `new_tree` is written; skipping the reset here would leave tree != HEAD.
+        checkout_between_trees(&self.repo, old_tree.as_ref(), &new_tree).map_err(|e| {
+            GitError::Refused(format!(
+                "{op}: HEAD moved to {new_head} but the working tree may be partially updated and the index still reflects the previous HEAD; run status before continuing: {e}"
+            ))
+        })?;
         Ok(())
     }
 
