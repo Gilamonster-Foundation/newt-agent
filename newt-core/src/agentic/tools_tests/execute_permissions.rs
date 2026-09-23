@@ -648,7 +648,7 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
         &denied,
         &[],
         None,
-        Some(&mut gate),
+        &mut Some(&mut gate),
         false,
         None,
         Some(sink.clone()),

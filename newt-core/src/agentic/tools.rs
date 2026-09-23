@@ -1004,6 +1004,89 @@ fn lifecycle_run_result(
     result
 }
 
+/// F19: labels a `lifecycle action=run` result that was escalated into the
+/// build lane after hitting the 60s wall, so the transcript says plainly why
+/// this ran through `action=build`'s authority instead of leaving the model
+/// to infer it from a suggestion it already ignored once.
+fn escalated_after_timeout(
+    mut result: (String, crate::ExecOutcome),
+) -> (String, crate::ExecOutcome) {
+    result.0 = format!(
+        "This was lifecycle action=run; it hit the 60s wall, so it was re-run once in the \
+         action=build lane (same permission-gate re-check, network denied).\n{}",
+        result.0
+    );
+    result
+}
+
+/// `lifecycle action=run`, with F19's timeout escalation: on the 60s wall, one
+/// re-run through the SAME build lane `action=build` uses (`run_confined_build_lane`
+/// — same `leq`/permission-gate re-check, never bypassed). A dedicated fn (not
+/// inlined in the `lifecycle` dispatch arm) so `permission_gate`'s two sequential
+/// reborrows each end cleanly at their own `.await`, rather than the borrow
+/// checker unifying them against the enclosing dispatch fn's much larger
+/// lifetime graph.
+#[allow(clippy::too_many_arguments)]
+async fn lifecycle_run_with_escalation(
+    args: &serde_json::Value,
+    joined: &str,
+    effective_dir: &str,
+    effective_path: &std::path::Path,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    mut permission_gate: Option<&mut dyn PermissionGate>,
+    tool_offload: bool,
+    spill_store: Option<&dyn super::content_spill::SpillStore>,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    smart_harness: Option<&super::smart_harness::SmartHarness>,
+    presentation: &mut dyn ToolPresentation,
+) -> (String, crate::ExecOutcome) {
+    let first = exec_confined_command(
+        joined,
+        effective_dir,
+        color,
+        tool_output_lines,
+        caveats,
+        &[],
+        exec_floor,
+        &mut permission_gate,
+        tool_offload,
+        spill_store,
+        live_tool_output,
+        presentation,
+    )
+    .await;
+    // F19: nine `action=run` calls died at the 60s wall before one
+    // `action=build` call passed (measured, replay 2483-r7) — the model kept
+    // retrying `run` even though the timeout note already named the
+    // escalation. Route it instead of asking the model to remember: one
+    // re-run, not a loop.
+    if !matches!(first.1, crate::ExecOutcome::TimedOut) {
+        return lifecycle_run_result(args, first);
+    }
+    let (program, argv) = build_check_argv(joined);
+    let escalated = run_confined_build_lane(
+        workspace,
+        effective_path,
+        program,
+        argv,
+        joined,
+        smart_harness,
+        caveats,
+        &mut permission_gate,
+        tool_output_lines,
+        color,
+        tool_offload,
+        spill_store,
+        presentation,
+    )
+    .await;
+    escalated_after_timeout(escalated)
+}
+
 /// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
 /// source shared by the timed-out/unavailable `action=run` coaching
 /// (`lifecycle_run_result`) and F12's `phase="build"` refusal below, which
@@ -1053,7 +1136,9 @@ async fn run_confined_build_lane(
     display: &str,
     smart_harness: Option<&super::smart_harness::SmartHarness>,
     caveats: &crate::caveats::Caveats,
-    permission_gate: Option<&mut dyn PermissionGate>,
+    // F19: double indirection — see the matching comment on
+    // `exec_confined_command`'s parameter in `shell.rs`.
+    permission_gate: &mut Option<&mut dyn PermissionGate>,
     tool_output_lines: usize,
     color: bool,
     tool_offload: bool,
@@ -1095,7 +1180,7 @@ async fn run_confined_build_lane(
     }
     if !build.leq(caveats) {
         let permission = lifecycle_build_request(&root.to_string_lossy(), display, build);
-        let allowed = permission_gate.is_some_and(|gate| {
+        let allowed = permission_gate.as_deref_mut().is_some_and(|gate| {
             matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
         });
         if !allowed {
@@ -3453,7 +3538,7 @@ async fn execute_authorized_tool(
                     caveats,
                     &filesystem_requests,
                     exec_floor,
-                    permission_gate,
+                    &mut permission_gate,
                     tool_offload,
                     spill_store,
                     live_tool_output.clone(),
@@ -3570,7 +3655,7 @@ async fn execute_authorized_tool(
                             &joined,
                             smart_harness,
                             caveats,
-                            permission_gate,
+                            &mut permission_gate,
                             tool_output_lines,
                             color,
                             tool_offload,
@@ -3580,23 +3665,26 @@ async fn execute_authorized_tool(
                         .await,
                     )
                 }
-                "run" => executed(lifecycle_run_result(args,
-                    exec_confined_command(
+                "run" => executed(
+                    lifecycle_run_with_escalation(
+                        args,
                         &joined,
                         &effective_dir,
+                        effective_path,
+                        workspace,
                         color,
                         tool_output_lines,
                         caveats,
-                        &[],
                         exec_floor,
                         permission_gate,
                         tool_offload,
                         spill_store,
                         live_tool_output.clone(),
+                        smart_harness,
                         presentation,
                     )
                     .await,
-                )),
+                ),
                 other => format!(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default), 'list', or 'build'."
                 ),
@@ -3646,7 +3734,7 @@ async fn execute_authorized_tool(
                         caveats,
                         &filesystem_requests,
                         exec_floor,
-                        permission_gate,
+                        &mut permission_gate,
                         tool_offload,
                         spill_store,
                         live_tool_output.clone(),
@@ -3663,7 +3751,7 @@ async fn execute_authorized_tool(
                 &display,
                 smart_harness,
                 caveats,
-                permission_gate,
+                &mut permission_gate,
                 tool_output_lines,
                 color,
                 tool_offload,

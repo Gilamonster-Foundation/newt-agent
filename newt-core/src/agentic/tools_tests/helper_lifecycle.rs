@@ -123,6 +123,36 @@ async fn lifecycle_phase_build_points_at_action_build() {
     );
 }
 
+/// F19 (red first): measured in replay 2483-r7 — nine `lifecycle action=run`
+/// calls died at the 60s wall before one `action=build` call passed. The
+/// timeout note already named the exact next call (F11); the model kept
+/// retrying `run` anyway. `escalated_after_timeout` is what labels the
+/// ONE re-run this fix routes into the build lane instead — it must say
+/// plainly that the call escalated and why, and must preserve whatever the
+/// build-lane re-run actually returned (pass, fail, or a fresh refusal),
+/// never silently fall back to the original timeout text.
+#[test]
+fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
+    for (build_result, outcome) in [
+        ("  ✓ build check passed".to_string(), crate::ExecOutcome::Passed),
+        (
+            "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".to_string(),
+            crate::ExecOutcome::Denied,
+        ),
+    ] {
+        let (text, out) = escalated_after_timeout((build_result.clone(), outcome));
+        assert_eq!(out, outcome, "the build lane's own outcome is preserved");
+        assert!(
+            text.contains("action=run") && text.contains("60s wall"),
+            "must say plainly it escalated and why: {text}"
+        );
+        assert!(
+            text.ends_with(&build_result),
+            "the build lane's real result must survive verbatim: {text}"
+        );
+    }
+}
+
 /// #894 regression for the concrete drift that motivated the registry: the
 /// `lifecycle` tool (#891) is advertised + dispatched, so it MUST be a real
 /// name — otherwise every legitimate `lifecycle` call is miscounted as a
