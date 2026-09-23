@@ -338,3 +338,27 @@ fn a_capability_question_with_a_request_opener_reaches_act_for_2324() {
         PromptDisposition::Act
     );
 }
+
+/// "refactor" is an instruction to change code. It was absent from the action
+/// list, so "refactor the largest file in this repo" (the operator's standing
+/// acceptance prompt) fell through to the research needle "largest" — a
+/// read-only, 3-round turn that could never refactor anything (live
+/// 2026-09-23). An action needle anywhere wins over a research one.
+#[test]
+fn refactor_is_an_action_even_when_the_target_is_named_by_size() {
+    for prompt in [
+        "refactor the largest file in this repo",
+        "Refactor newt-core/src/agentic/mod.rs",
+    ] {
+        assert_eq!(
+            PromptIntake::analyze(prompt).disposition(),
+            PromptDisposition::Act,
+            "{prompt}"
+        );
+    }
+    // The evidence question that motivated "largest" stays Research.
+    assert_eq!(
+        PromptIntake::analyze("What are the 10 largest Rust files in this workspace").disposition(),
+        PromptDisposition::Research
+    );
+}
