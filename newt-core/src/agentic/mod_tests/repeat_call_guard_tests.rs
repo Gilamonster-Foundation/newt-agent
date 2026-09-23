@@ -1219,14 +1219,24 @@ fn only_test_and_check_lifecycle_phases_reset_the_brake() {
     ] {
         let args = serde_json::json!({ "phase": phase });
         assert_eq!(
-            is_progress_verification("lifecycle", &args, Some(Passed)),
+            is_progress_verification("lifecycle", &args, Some(Passed), "/test-ws"),
             expect,
             "{phase}"
         );
     }
     let test = serde_json::json!({ "phase": "test" });
-    assert!(!is_progress_verification("lifecycle", &test, Some(Failed)));
-    assert!(!is_progress_verification("lifecycle", &test, None));
+    assert!(!is_progress_verification(
+        "lifecycle",
+        &test,
+        Some(Failed),
+        "/test-ws"
+    ));
+    assert!(!is_progress_verification(
+        "lifecycle",
+        &test,
+        None,
+        "/test-ws"
+    ));
     // #2524 follow-up (F23 "tail-pipe-routes"): a build piped ONLY to
     // `tail`/`head` now DOES route (`build_piped_to_trim_route`) — the
     // build's own exit code decides the outcome, the trim only touches the
@@ -1238,7 +1248,8 @@ fn only_test_and_check_lifecycle_phases_reset_the_brake() {
     assert!(is_progress_verification(
         "run_command",
         &tail_piped,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
     ));
     // A pipe to anything ELSE still never routes (`classify` refuses any
     // other compound command), so its exit code is still the LAST pipeline
@@ -1247,7 +1258,8 @@ fn only_test_and_check_lifecycle_phases_reset_the_brake() {
     assert!(!is_progress_verification(
         "run_command",
         &grep_piped,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
     ));
 }
 
@@ -1264,14 +1276,21 @@ fn a_routed_build_exec_pass_resets_the_brake_but_a_failure_does_not() {
     assert!(is_progress_verification(
         "run_command",
         &routed,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
     ));
     assert!(!is_progress_verification(
         "run_command",
         &routed,
-        Some(Failed)
+        Some(Failed),
+        "/test-ws"
     ));
-    assert!(!is_progress_verification("run_command", &routed, None));
+    assert!(!is_progress_verification(
+        "run_command",
+        &routed,
+        None,
+        "/test-ws"
+    ));
     // A call the routing table would never route (extra fields beyond the
     // bare command — `classify_call`'s own "must be bare" rule) stays
     // excluded even when the underlying argv looks build-shaped.
@@ -1279,7 +1298,8 @@ fn a_routed_build_exec_pass_resets_the_brake_but_a_failure_does_not() {
     assert!(!is_progress_verification(
         "run_command",
         &not_bare,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
     ));
 }
 
@@ -1307,7 +1327,7 @@ fn only_a_routed_build_or_just_gate_recipe_resets_the_brake() {
     ] {
         let args = serde_json::json!({ "command": command });
         assert_eq!(
-            is_progress_verification("run_command", &args, Some(Passed)),
+            is_progress_verification("run_command", &args, Some(Passed), "/test-ws"),
             expect,
             "{command}"
         );
@@ -1328,19 +1348,22 @@ fn a_routed_toolchain_selected_gate_pass_still_resets_the_brake() {
     assert!(is_progress_verification(
         "run_command",
         &routed,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
     ));
     assert!(!is_progress_verification(
         "run_command",
         &routed,
-        Some(Failed)
+        Some(Failed),
+        "/test-ws"
     ));
     // The same non-gate exclusion still applies past the toolchain token.
     let non_gate = serde_json::json!({ "command": "cargo +stable build -p newt-core" });
     assert!(!is_progress_verification(
         "run_command",
         &non_gate,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
     ));
     // An invalid `+` token never routes at all (routing.rs's own refusal),
     // so it never reaches this function with a build_exec route either.
@@ -1348,7 +1371,34 @@ fn a_routed_toolchain_selected_gate_pass_still_resets_the_brake() {
     assert!(!is_progress_verification(
         "run_command",
         &invalid,
-        Some(Passed)
+        Some(Passed),
+        "/test-ws"
+    ));
+}
+
+/// F24 (red first): a routed pass through a `cd <workspace root> &&` no-op
+/// prefix counts as verification exactly like the bare command would —
+/// #2548's gate check reads the routed `argv`, which no longer carries the
+/// stripped `cd`, so this composes for free once the classifier strips it;
+/// pinned here as its own regression rather than left to infer.
+#[test]
+fn a_routed_noop_cd_prefixed_gate_pass_still_resets_the_brake() {
+    use crate::ExecOutcome::Passed;
+    let routed = serde_json::json!({ "command": "cd /ws/root && cargo test -p newt-core" });
+    assert!(is_progress_verification(
+        "run_command",
+        &routed,
+        Some(Passed),
+        "/ws/root"
+    ));
+    // A subdirectory `cd` is not the workspace root — stays compound, never
+    // reaches a build_exec route, never counts.
+    let sub = serde_json::json!({ "command": "cd /ws/root/sub && cargo test -p newt-core" });
+    assert!(!is_progress_verification(
+        "run_command",
+        &sub,
+        Some(Passed),
+        "/ws/root"
     ));
 }
 

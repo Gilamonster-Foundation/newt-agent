@@ -4010,7 +4010,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied()) {
+            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
                 workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
@@ -5050,6 +5050,7 @@ fn is_progress_verification(
     name: &str,
     args: &serde_json::Value,
     execution: Option<crate::ExecOutcome>,
+    workspace: &str,
 ) -> bool {
     if execution != Some(crate::ExecOutcome::Passed) {
         return false;
@@ -5067,7 +5068,7 @@ fn is_progress_verification(
     let routing::RouteDecision::Route {
         tool: "build_exec",
         args: routed,
-    } = routing::RouteTable::builtin().classify_call(args)
+    } = routing::RouteTable::builtin().classify_call(args, std::path::Path::new(workspace))
     else {
         return false;
     };
@@ -8730,7 +8731,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied()) {
+            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
                 workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
@@ -11113,7 +11114,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied()) {
+            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
                 workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
@@ -12715,7 +12716,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied()) {
+            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
                 workflow_runtime.note_verified_pass();
             }
             ledger_note_attribution(attribution, model, name, &args, ok);

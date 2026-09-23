@@ -2417,7 +2417,7 @@ pub(crate) fn tool_presentation(
 
     if name == "run_command" && !routing_disabled() {
         if let super::routing::RouteDecision::Route { tool, args } =
-            super::routing::RouteTable::builtin().classify_call(raw_args)
+            super::routing::RouteTable::builtin().classify_call(raw_args, workspace)
         {
             let detail = tool_call_detail(tool, &args, workspace);
             return (tool.to_string(), detail);
@@ -3076,7 +3076,9 @@ async fn execute_authorized_tool(
         && name == "run_command"
         && !routing_disabled()
     {
-        match super::routing::RouteTable::builtin().classify_call(args) {
+        match super::routing::RouteTable::builtin()
+            .classify_call(args, std::path::Path::new(workspace))
+        {
             super::routing::RouteDecision::Route { tool: "git", args }
                 if args
                     .get("op")
@@ -3202,7 +3204,8 @@ async fn execute_authorized_tool(
     let routed: Option<(&'static str, serde_json::Value)> =
         if name == "run_command" && !routing_disabled() {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let decision = super::routing::RouteTable::builtin().classify_call(args);
+            let decision = super::routing::RouteTable::builtin()
+                .classify_call(args, std::path::Path::new(workspace));
             let decision = match decision {
                 super::routing::RouteDecision::Route {
                     tool: "git" | "find",
@@ -3929,6 +3932,14 @@ async fn execute_authorized_tool(
             // (`build_piped_to_trim_route`) — the build's own exit code
             // still decides `outcome`; only the rendered text is cut.
             let trim = OutputTrim::from_json(args.get("trim"));
+            // F24: a leading `cd <workspace root> &&` the classifier
+            // recognised and dropped as a no-op (`strip_noop_cd_prefix`) —
+            // say so, rather than silently running a different-looking
+            // command than the one the model typed.
+            let cd_dropped = args
+                .get("cd_dropped")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let (text, outcome) = run_confined_build_lane(
                 workspace,
                 std::path::Path::new(workspace),
@@ -3947,14 +3958,20 @@ async fn execute_authorized_tool(
                 presentation,
             )
             .await;
+            let cd_clause = if cd_dropped {
+                "; the leading `cd` to the workspace root was dropped as a no-op"
+            } else {
+                ""
+            };
             let note = match trim {
                 Some(trim) => format!(
                     "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline; {}]",
+                     denied/offline; {}{cd_clause}]",
                     trim.note_clause()
                 ),
                 None => format!(
-                    "[routed `{display}` to the confined build lane — 30 min limit, network denied/offline]"
+                    "[routed `{display}` to the confined build lane — 30 min limit, network \
+                     denied/offline{cd_clause}]"
                 ),
             };
             executed((append_routed_note(text, note), outcome))

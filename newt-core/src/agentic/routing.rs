@@ -35,6 +35,7 @@
 //! `[tui.permissions]` override), never a logic change.
 
 use serde_json::{json, Value};
+use std::path::Path;
 
 /// What to do with a shell command the model passed to `run_command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,10 +160,15 @@ impl RouteTable {
     }
 
     /// Classify a complete call without discarding argument semantics on the
-    /// newly scoped Git read route. Other routes retain their existing policy.
+    /// newly scoped Git read route. Other routes retain their existing
+    /// policy. `cwd` is the session's workspace root (F24's `cd`-prefix
+    /// no-op check) — the caller's own value, never read from the process.
     #[must_use]
-    pub(crate) fn classify_call(&self, call: &Value) -> RouteDecision {
-        let decision = self.classify(call.get("command").and_then(Value::as_str).unwrap_or(""));
+    pub(crate) fn classify_call(&self, call: &Value, cwd: &Path) -> RouteDecision {
+        let decision = self.classify(
+            call.get("command").and_then(Value::as_str).unwrap_or(""),
+            cwd,
+        );
         // A scoped git read and a build-lane route both discard the rest of
         // the call object once routed — neither has anywhere to put a `cwd`
         // or `timeout` the model also sent — so both require the call be
@@ -192,13 +198,43 @@ impl RouteTable {
     }
 
     /// Classify a `run_command` shell-command string. **Pure** — no fs, no env,
-    /// no I/O — so it is a direct table lookup (TDD: data-driven decision).
+    /// no I/O — the cwd is a value the CALLER already has (the session
+    /// workspace); this never reads the process cwd — so it is a direct
+    /// table lookup (TDD: data-driven decision).
     #[must_use]
-    pub(crate) fn classify(&self, command: &str) -> RouteDecision {
-        let command = command.trim();
-        if command.is_empty() {
+    pub(crate) fn classify(&self, command: &str, cwd: &Path) -> RouteDecision {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
             return RouteDecision::Exec;
         }
+        // F24 (r10 evidence): almost every `run_command` began with `cd
+        // <workspace root> && …` — the session's OWN cwd, so every command
+        // was compound and never reached #2533/#2548/#2549's routing at
+        // all. Strip that exact no-op prefix BEFORE any other check (the
+        // tail-pipe attempt, the SHELL_META refusal), so `<rest>` is
+        // classified exactly as if it had been sent alone.
+        let (effective, cd_dropped) = strip_noop_cd_prefix(trimmed, cwd);
+        let decision = self.classify_stripped(effective);
+        if !cd_dropped {
+            return decision;
+        }
+        // Say so in the routed args, so the dispatch site's routed note can
+        // tell the operator the `cd` was recognised and dropped as a no-op,
+        // not silently ignored.
+        let RouteDecision::Route { tool, mut args } = decision else {
+            return decision;
+        };
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("cd_dropped".to_string(), Value::Bool(true));
+        }
+        RouteDecision::Route { tool, args }
+    }
+
+    /// The classification table lookup itself, over an ALREADY-stripped
+    /// command (no leading no-op `cd`). Split out of [`Self::classify`] so
+    /// the `cd`-prefix handling has exactly one seam to annotate the
+    /// result, rather than every early return needing to remember it.
+    fn classify_stripped(&self, command: &str) -> RouteDecision {
         // F23 / #2524 "tail-pipe-routes": recognise EXACTLY `<clean build
         // argv> [2>&1] | tail -N` (or `head -N`) BEFORE the blanket
         // compound-command refusal below — the model pipes ONLY to cut
@@ -255,6 +291,58 @@ impl RouteTable {
         };
         let rest: Vec<&str> = tokens.collect();
         build_shell_route(route.tool, &rest)
+    }
+}
+
+/// Strip a leading `cd <dir> && ` when `<dir>` lexically normalizes to the
+/// SAME path as `cwd` (F24) — a no-op the model writes out of habit, not an
+/// intentional chain. Returns `(effective_command, true)` when stripped,
+/// `(command, false)` otherwise. Deliberately narrow, matching the brief's
+/// own boundary:
+/// - exactly ONE `cd <dir> && ` prefix — a second `cd`, `;`/`||` instead of
+///   `&&`, or no `&&` at all leaves `command` untouched (the `&&`-free or
+///   wrong-separator forms don't even reach `strip_once`'s match);
+/// - `<dir>` must be a plain, unquoted, non-glob, metacharacter-free token
+///   (checked against the SAME [`SHELL_META`]/[`GLOB`]/[`BUILD_UNSAFE`]
+///   tables the rest of this module already refuses on) — `cd -`, `cd ~`,
+///   a quoted dir, or one carrying its own `&&`/`;` never qualifies;
+/// - `<dir>` must normalize to EXACTLY `cwd` — a subdirectory (`cd
+///   newt-git`) or an unrelated absolute path stays compound.
+///
+/// Deliberately NOT `tools/shell.rs`'s [`super::tools::split_leading_cd`]
+/// (search-first: that function exists and is already reused elsewhere) —
+/// it folds a leading `cd` into a NEW resolved cwd for the confined shell's
+/// own dispatch, a different job with a wider grammar this one must NOT
+/// inherit: it accepts `;` as well as `&&` (this brief's boundary excludes
+/// `;` explicitly) and UNQUOTES a quoted path (this boundary refuses a
+/// quoted `cd` outright, never routing it). Widening it to also report
+/// which connective matched, just for this one caller, would leave its
+/// existing behaviour and tests to verify unchanged for no shared benefit;
+/// its own doc names the reason it folds `;` and quotes: `exec_confined_
+/// command`'s cwd resolution, not `run_command` routing's identity check.
+fn strip_noop_cd_prefix<'a>(command: &'a str, cwd: &Path) -> (&'a str, bool) {
+    let Some(after_cd) = command.strip_prefix("cd ") else {
+        return (command, false);
+    };
+    let Some((dir, rest)) = after_cd.split_once("&&") else {
+        return (command, false);
+    };
+    let dir = dir.trim();
+    if dir.is_empty()
+        || dir == "-"
+        || dir.starts_with('~')
+        || dir.contains(SHELL_META)
+        || dir.contains(GLOB)
+        || dir.contains(BUILD_UNSAFE)
+    {
+        return (command, false);
+    }
+    let normalized_dir = crate::caveats::lexically_normalize(dir);
+    let normalized_cwd = crate::caveats::lexically_normalize(&cwd.to_string_lossy());
+    if normalized_dir == normalized_cwd {
+        (rest.trim_start(), true)
+    } else {
+        (command, false)
     }
 }
 
@@ -799,8 +887,19 @@ pub(crate) fn audit_line(original: &str, decision: &RouteDecision) -> Option<Str
 mod tests {
     use super::*;
 
+    /// A cwd no test command's `cd <dir> &&` prefix (if any) could ever
+    /// lexically match, so the F24 no-op strip never fires for a test that
+    /// doesn't ask for it explicitly (via [`classify_at`]).
+    fn no_cd_match() -> &'static Path {
+        Path::new("/never-matches-a-test-cwd")
+    }
+
     fn classify(cmd: &str) -> RouteDecision {
-        RouteTable::builtin().classify(cmd)
+        RouteTable::builtin().classify(cmd, no_cd_match())
+    }
+
+    fn classify_at(cmd: &str, cwd: &Path) -> RouteDecision {
+        RouteTable::builtin().classify(cmd, cwd)
     }
 
     /// TDD: `cat <path>` is a silent Rewrite to the governed `read_file`
@@ -1038,19 +1137,26 @@ mod tests {
         let table = RouteTable::builtin();
         for command in ["git branch", "git branch --all", "git branch --remotes"] {
             assert_eq!(
-                table.classify_call(&json!({"command": command})),
+                table.classify_call(&json!({"command": command}), no_cd_match()),
                 classify(command)
             );
             for extra in [json!({"cwd": "elsewhere"}), json!({"timeout": 5})] {
                 let mut call = extra;
                 call["command"] = json!(command);
-                assert_eq!(table.classify_call(&call), RouteDecision::Exec, "{call}");
+                assert_eq!(
+                    table.classify_call(&call, no_cd_match()),
+                    RouteDecision::Exec,
+                    "{call}"
+                );
             }
         }
         // This repair does not alter the existing routes' argument policy.
         for command in ["git status", "cat file", "ls"] {
             assert_eq!(
-                table.classify_call(&json!({"command": command, "cwd": "elsewhere"})),
+                table.classify_call(
+                    &json!({"command": command, "cwd": "elsewhere"}),
+                    no_cd_match()
+                ),
                 classify(command)
             );
         }
@@ -1362,13 +1468,17 @@ mod tests {
     fn build_route_call_requires_bare_call() {
         let table = RouteTable::builtin();
         assert_eq!(
-            table.classify_call(&json!({"command": "cargo test"})),
+            table.classify_call(&json!({"command": "cargo test"}), no_cd_match()),
             classify("cargo test")
         );
         for extra in [json!({"cwd": "sub"}), json!({"timeout": 5})] {
             let mut call = extra;
             call["command"] = json!("cargo test");
-            assert_eq!(table.classify_call(&call), RouteDecision::Exec, "{call}");
+            assert_eq!(
+                table.classify_call(&call, no_cd_match()),
+                RouteDecision::Exec,
+                "{call}"
+            );
         }
     }
 
@@ -1466,5 +1576,111 @@ mod tests {
         ] {
             assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
         }
+    }
+
+    /// F24 (r10 evidence, red first): almost every `run_command` in
+    /// 2483-r10/2488-r10 began with `cd <workspace root> && …` — the
+    /// session's OWN cwd, written out of habit — which made every command
+    /// compound and never reached #2533/#2548/#2549's routing at all. The
+    /// no-op prefix must be recognised and dropped so `<rest>` routes
+    /// exactly as if it had been sent alone.
+    #[test]
+    fn a_noop_cd_to_the_workspace_root_is_dropped_before_classification() {
+        let root = Path::new("/ws/root");
+        assert_eq!(
+            classify_at("cd /ws/root && cargo test -j 4 -p newt-git", root),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test", "-j", "4", "-p", "newt-git"],
+                    "cd_dropped": true,
+                }),
+            }
+        );
+        // Composes with #2549: the tail-pipe route still fires on the
+        // stripped command.
+        assert_eq!(
+            classify_at("cd /ws/root && cargo test | tail -20", root),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test"],
+                    "trim": {"mode": "tail", "n": 20},
+                    "cd_dropped": true,
+                }),
+            }
+        );
+        // A trailing slash, or an un-normalized `.`/`..` segment, still
+        // lexically resolves to the same root.
+        assert_eq!(
+            classify_at("cd /ws/root/ && cargo test", root),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({"argv": ["cargo", "test"], "cd_dropped": true}),
+            }
+        );
+        assert_eq!(
+            classify_at("cd /ws/other/../root && cargo test", root),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({"argv": ["cargo", "test"], "cd_dropped": true}),
+            }
+        );
+    }
+
+    /// Everything the brief named as staying compound — a subdirectory, an
+    /// unrelated path, the wrong separator, two `cd`s, `cd -`/`cd ~`, and a
+    /// `cd` whose own dir token carries a metacharacter/quote/glob.
+    #[test]
+    fn cd_prefix_stays_compound_unless_it_exactly_matches_the_workspace_root() {
+        let root = Path::new("/ws/root");
+        for cmd in [
+            // A subdirectory — not the root itself.
+            "cd /ws/root/sub && cargo test",
+            "cd sub && cargo test",
+            // An unrelated absolute path.
+            "cd /elsewhere && cargo test",
+            // Wrong separator: `;`/`||` are not `&&`.
+            "cd /ws/root; cargo test",
+            "cd /ws/root || cargo test",
+            // Two `cd`s.
+            "cd /ws/root && cd /ws/root && cargo test",
+            // `cd -` / `cd ~` name no literal directory to compare.
+            "cd - && cargo test",
+            "cd ~ && cargo test",
+            // A quoted, glob, or metacharacter-carrying dir token.
+            "cd \"/ws/root\" && cargo test",
+            "cd /ws/roo* && cargo test",
+            "cd /ws/root$X && cargo test",
+            // A non-routable `<rest>` still refuses, even past a genuinely
+            // matching `cd` — the strip changes what's classified, not
+            // whether it routes.
+            "cd /ws/root && rm -rf x",
+        ] {
+            assert_eq!(classify_at(cmd, root), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// The routed note must say the `cd` was dropped as a no-op — the
+    /// dispatch-level assertion lives in `tools_tests`; this pins the
+    /// classifier's own contribution (the `cd_dropped` flag in the routed
+    /// args) directly, including that a call WITHOUT the prefix carries no
+    /// such flag at all.
+    #[test]
+    fn cd_dropped_flag_is_only_set_when_a_noop_cd_was_actually_stripped() {
+        let root = Path::new("/ws/root");
+        let RouteDecision::Route { args, .. } = classify_at("cd /ws/root && cargo test", root)
+        else {
+            panic!("must route");
+        };
+        assert_eq!(args["cd_dropped"], true);
+
+        let RouteDecision::Route { args, .. } = classify_at("cargo test", root) else {
+            panic!("must route");
+        };
+        assert!(
+            args.get("cd_dropped").is_none(),
+            "a call with no cd prefix must carry no cd_dropped flag: {args}"
+        );
     }
 }
