@@ -840,10 +840,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
         let k = key();
+        // A platform-absolute path: `/ws` has no drive on Windows. Compare the
+        // PARSED entry, since TOML escapes Windows backslashes in the text.
+        let ws = dir.path().join("ws");
+        let raw = ws.join("x").join("..").join("y");
         persist_approve(
             &config,
             ApproveEntry::Fs {
-                path: "/ws/x/../y".to_string(),
+                path: raw.to_string_lossy().into_owned(),
                 write: false,
             },
             |_, _| false,
@@ -851,8 +855,13 @@ mod tests {
         )
         .unwrap();
         let text = std::fs::read_to_string(dir.path().join("ocap").join("approve.toml")).unwrap();
-        assert!(text.contains("/ws/y"), "{text}");
-        assert!(!text.contains(".."), "{text}");
+        let file = PolicyFile::parse(&text).unwrap();
+        assert_eq!(file.fs.len(), 1, "{text}");
+        assert_eq!(
+            std::path::Path::new(&file.fs[0].path),
+            ws.join("y").as_path(),
+            "{text}"
+        );
     }
 
     /// #2524 round 2 item 4: `persist_approve` and `newt doctor --sign-ocap`
