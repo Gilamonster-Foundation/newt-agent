@@ -616,8 +616,13 @@ struct PendingClarification {
 /// The answer shape a pending clarification wants, shown beside the batch
 /// rather than folded into it (#2524 item 7). Named once so RichTUI's modal
 /// hint and the lean default's (unused) hint parameter never drift apart.
-const CLARIFICATION_HINT: &str =
-    "reply with an ordinal to lock one (e.g. `2: ...`) · /discuss to talk it through";
+///
+/// #2540 round 2 item 3 (measured live): `modal::frame`'s legend is ONE row
+/// with no wrap, and the longer wording clipped mid-word at the box edge
+/// ("…/discuss to talk it thr") on an ordinary terminal width. Shortened
+/// rather than taught to wrap — wrapping is a `modal::frame` change every
+/// other modal's legend would also have to accept.
+const CLARIFICATION_HINT: &str = "ordinal locks it · /discuss to talk it through";
 
 /// The disposition each accepted turn was comprehended with, before any
 /// operating-mode narrowing, keyed by its submitted prompt (#2332).
