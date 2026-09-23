@@ -520,6 +520,19 @@ fn parse_trim_spec(spec: &str) -> Option<Value> {
         ["-n", n] => *n,
         _ => return None,
     };
+    // PR #2549 round 2: `u32::from_str` tolerates a leading `+` (unsigned
+    // parsers reject `-`, not `+`), so `tail -n +40` / `head -n +40` — GNU's
+    // "start AT line 40", a real and DIFFERENT flag shape from "last/first
+    // 40 lines" — parsed as if it meant `-n 40`, showing the wrong output
+    // slice under a false "as `| tail -40` asked" provenance claim.
+    // `head -n +N` isn't even documented by GNU head, so treating it as `-n
+    // N` had no basis either way. Check the STRING, not `parse`'s leniency:
+    // every byte must be an ASCII digit — refuses `+40`, a stray `-` inside
+    // the `-n` form, and any other non-digit that `u32::from_str` might
+    // someday tolerate.
+    if n_str.is_empty() || !n_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let n: u32 = n_str.parse().ok()?;
     if n == 0 {
         return None;
@@ -1439,6 +1452,17 @@ mod tests {
             // An operand `build_lane_route` itself would already refuse
             // (near-miss subcommand) — still refused with the pipe.
             "cargo run | tail -40",
+            // PR #2549 round 2: GNU's `-n +N` means "start AT line N", a
+            // real and DIFFERENT shape from `-n N` ("last/first N lines").
+            // `u32::from_str` tolerates a leading `+`, so this must be an
+            // explicit string check, not left to `parse`'s leniency.
+            "cargo test | tail -n +40",
+            "cargo test | head -n +40",
+            "cargo test | tail -+40",
+            // Two pipes with nothing between them (`||`) splits into THREE
+            // parts on `split_single_pipe`'s own code path — refused the
+            // same way as any other multi-pipe shape, exercised explicitly.
+            "cargo test || tail -40",
         ] {
             assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
         }
