@@ -1005,27 +1005,40 @@ fn lifecycle_run_result(
 }
 
 /// F19: labels a `lifecycle action=run` result that was escalated into the
-/// build lane after hitting the 60s wall, so the transcript says plainly why
+/// build lane after hitting its wall, so the transcript says plainly why
 /// this ran through `action=build`'s authority instead of leaving the model
-/// to infer it from a suggestion it already ignored once.
+/// to infer it from a suggestion it already ignored once. `wall` is the
+/// clock that actually applied to the timed-out first run (#2541 round 3
+/// item 3: `escalates` only reaches this path when that wall was the
+/// DEFAULT, never the build lane's — see `escalates` — so this is always
+/// `shell::run_command_wall_secs()`'s value, derived rather than a literal).
 fn escalated_after_timeout(
     mut result: (String, crate::ExecOutcome),
+    wall: std::time::Duration,
 ) -> (String, crate::ExecOutcome) {
     result.0 = format!(
-        "This was lifecycle action=run; it hit the 60s wall, so it was re-run once in the \
+        "This was lifecycle action=run; it hit the {}s wall, so it was re-run once in the \
          action=build lane (same permission-gate re-check, network denied).\n{}",
+        wall.as_secs(),
         result.0
     );
     result
 }
 
-/// F19/#2541 round 2 item 3: the ONE decision the escalation makes, isolated
-/// from formatting so it is table-testable on its own — only a genuine
-/// timeout justifies spending the build lane's authority on a second run;
-/// every other outcome (`Denied`, `Unavailable`, `Failed`, `Passed`) already
-/// says everything a retry could add.
-fn escalates(outcome: crate::ExecOutcome) -> bool {
-    matches!(outcome, crate::ExecOutcome::TimedOut)
+/// F19/#2541 round 2 item 3, round 3 item 2: the ONE decision the escalation
+/// makes, isolated from formatting so it is table-testable on its own — only
+/// a genuine timeout justifies spending the build lane's authority on a
+/// second run, AND only when the wall that killed the first run was the
+/// DEFAULT `run_command` wall. `wall` is `shell::dispatch_wall(joined)` for
+/// the command that just ran: since #2543, a cargo/just phase already gets
+/// the 30-minute build wall in the run lane, so a `TimedOut` there means it
+/// ran the full 30 minutes and died — re-running the identical command for
+/// another 30 minutes in the build lane (whose only difference is the
+/// offline/calibrated fence) adds no new information. Every other outcome
+/// (`Denied`, `Unavailable`, `Failed`, `Passed`) already says everything a
+/// retry could add, regardless of wall.
+fn escalates(outcome: crate::ExecOutcome, wall: std::time::Duration) -> bool {
+    outcome == crate::ExecOutcome::TimedOut && wall != shell::LIFECYCLE_BUILD_TIMEOUT
 }
 
 /// #2541 round 2 item 1: compose the escalation's outcome with `first`'s
@@ -1034,29 +1047,34 @@ fn escalates(outcome: crate::ExecOutcome) -> bool {
 /// build lane actually executed (any outcome but `Denied`/`Unavailable` — a
 /// frame-isolation refusal is `Denied` too, see `run_confined_build_lane`),
 /// its own result already speaks for the whole call, so `first` is dropped
-/// exactly as before. When it refused to run, `first`'s result (through
-/// `lifecycle_run_result`, which prepends the build-lane suggestion for a
-/// `TimedOut` — this is the arm item 4 asked about: this call site is what
-/// keeps it alive) is kept with the refusal appended, never silently lost.
+/// exactly as before.
+///
+/// When it refused to run (round 3 item 4): `first`'s RAW evidence is kept —
+/// never through `lifecycle_run_result`, whose `TimedOut` arm prepends
+/// "Suggested lifecycle call: action=build". That suggestion is exactly the
+/// call the gate just declined; opening a refused escalation by recommending
+/// it is wrong. Instead this says plainly that build authority was declined
+/// for this call, not to retry it, and to narrow the command.
 fn escalation_result(
-    args: &serde_json::Value,
     first: (String, crate::ExecOutcome),
     escalated: (String, crate::ExecOutcome),
+    wall: std::time::Duration,
 ) -> (String, crate::ExecOutcome) {
     if matches!(
         escalated.1,
         crate::ExecOutcome::Denied | crate::ExecOutcome::Unavailable
     ) {
-        let kept = lifecycle_run_result(args, first);
         return (
             format!(
-                "{}\n\nThe action=build escalation did not run:\n{}",
-                kept.0, escalated.0
+                "{}\n\nThe action=build escalation did not run:\n{}\n\nBuild authority was \
+                 declined for this call — do not retry it; narrow the command instead (one \
+                 crate, one test filter).",
+                first.0, escalated.0
             ),
             escalated.1,
         );
     }
-    escalated_after_timeout(escalated)
+    escalated_after_timeout(escalated, wall)
 }
 
 /// `lifecycle action=run`, with F19's timeout escalation: on the 60s wall, one
@@ -1103,8 +1121,12 @@ async fn lifecycle_run_with_escalation(
     // `action=build` call passed (measured, replay 2483-r7) — the model kept
     // retrying `run` even though the timeout note already named the
     // escalation. Route it instead of asking the model to remember: one
-    // re-run, not a loop.
-    if !escalates(first.1) {
+    // re-run, not a loop. #2541 round 3 item 2: the wall that actually
+    // applied to THIS command — since #2543 a cargo/just phase already ran
+    // under the build wall in the run lane, so `escalates` must see which
+    // wall killed it, not assume the default.
+    let wall = shell::dispatch_wall(joined);
+    if !escalates(first.1, wall) {
         return lifecycle_run_result(args, first);
     }
     let (program, argv) = build_check_argv(joined);
@@ -1121,14 +1143,19 @@ async fn lifecycle_run_with_escalation(
         color,
         tool_offload,
         spill_store,
-        // #2541 round 2 item 5: names the escalation in the permission
-        // prompt reason, so the operator sees WHY a build-authority prompt
-        // appeared out of an `action=run` call instead of `action=build`.
-        Some("lifecycle action=run hit the confined shell's 60s wall"),
+        // #2541 round 2 item 5, round 3 item 3: names the escalation in the
+        // permission prompt reason, so the operator sees WHY a
+        // build-authority prompt appeared out of an `action=run` call
+        // instead of `action=build` — the wall is derived, not a literal
+        // (this arm only runs when `wall` was the default, per `escalates`).
+        Some(&format!(
+            "lifecycle action=run hit the confined shell's {}s wall",
+            wall.as_secs()
+        )),
         presentation,
     )
     .await;
-    escalation_result(args, first, escalated)
+    escalation_result(first, escalated, wall)
 }
 
 /// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
