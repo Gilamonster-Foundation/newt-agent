@@ -486,18 +486,34 @@ fn no_key_notice_names_the_actual_path_not_the_literal_word() {
 /// as the raw string that hides how dangerous the request is.
 #[test]
 fn danger_target_is_normalized_before_classification() {
+    // Platform-absolute paths, not POSIX literals (`/ws/..` has no drive on
+    // Windows — same class of failure as #2545). Compare as `Path`, not
+    // string, since a Windows root renders with backslashes.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let ws = root.join("ws");
+
+    let climbing = ws.join("..");
     assert_eq!(
-        normalized_danger_target(DenialKind::FsWrite, "/ws/.."),
-        "/",
+        std::path::Path::new(&normalized_danger_target(
+            DenialKind::FsWrite,
+            &climbing.to_string_lossy()
+        )),
+        root,
         "a climbing fs target must be classified against its normalized form"
     );
+    let contained = ws.join("x").join("..").join("y");
     assert_eq!(
-        normalized_danger_target(DenialKind::FsRead, "/ws/x/../y"),
-        "/ws/y",
+        std::path::Path::new(&normalized_danger_target(
+            DenialKind::FsRead,
+            &contained.to_string_lossy()
+        )),
+        ws.join("y").as_path(),
         "an internally-contained relative segment normalizes too"
     );
     // A relative/climbing target that fails to normalize falls back to the
-    // raw string — persist_approve's own check refuses it downstream.
+    // raw string — persist_approve's own check refuses it downstream. This
+    // one is relative on every platform, so no tempdir is needed.
     assert_eq!(
         normalized_danger_target(DenialKind::FsWrite, "../../"),
         "../../"
@@ -511,24 +527,26 @@ fn danger_target_is_normalized_before_classification() {
 }
 
 /// The end-to-end wiring: a broad root reached only via a climbing relative
-/// segment (`/ws/..` normalizes cleanly to `/`, under a danger table rooted
-/// at `/`) must still be refused as high-danger, exactly as a direct `/`
-/// request would be — before this fix the raw `/ws/..` string did not
-/// classify as High at all, silently reaching the writer instead of being
-/// refused at the gate.
+/// segment (`<root>/ws/..` normalizes cleanly to `<root>`, under a danger
+/// table rooted at `<root>`) must still be refused as high-danger, exactly
+/// as a direct `<root>` request would be — before this fix the raw climbing
+/// string did not classify as High at all, silently reaching the writer
+/// instead of being refused at the gate. Platform-absolute (built from the
+/// fixture's own tempdir, not a POSIX `/` literal — same class as #2545).
 #[test]
 fn allow_permanent_refuses_a_climbing_path_that_normalizes_to_a_broad_root() {
-    let (_dir, config, key_path, _root) = fixture();
+    let (dir, config, key_path, _root) = fixture();
+    let broad_root = dir.path().to_path_buf();
+    let climbing = broad_root.join("ws").join("..");
     let mut state = PermissionPromptState::default();
-    let climbing = "/ws/..";
-    let request = req(DenialKind::FsWrite, climbing);
+    let request = req(DenialKind::FsWrite, &climbing.to_string_lossy());
     match gate_with_danger(
         &mut state,
         &config,
         Some(key_path),
         None,
         PromptChoice::AllowPermanent,
-        danger::DangerTable::builtin().with_fs_root(std::path::PathBuf::from("/")),
+        danger::DangerTable::builtin().with_fs_root(broad_root),
     )
     .ask(std::slice::from_ref(&request))
     {
