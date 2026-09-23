@@ -234,3 +234,44 @@ async fn inferred_overflows_cannot_permanently_refuse_the_next_small_driver_prom
             .any(|message| message["role"] == "user" && message["content"] == task));
     }
 }
+
+/// F14 regression: llama.cpp's numberless `500 "Context size has been
+/// exceeded."` that outlasts every recovery attempt ended the turn with
+/// `end_reason: None` (headless printed `"None"`). The driver's error fold
+/// must type it `Failed`, keeping the `context_exceeded` class.
+#[tokio::test]
+async fn an_exhausted_context_overflow_ends_failed_not_untyped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({"error":{"message":"Context size has been exceeded."}})),
+        )
+        .mount(&server)
+        .await;
+    let mut config = TurnDriverConfig::new(
+        server.uri(),
+        "calibration-fixture",
+        BackendKind::Openai,
+        "driver-calibration-test-no-workspace",
+    );
+    config.openai_api = crate::OpenAiApi::ChatCompletions;
+    config.num_ctx = Some(65_536);
+    let task = "What is 2 + 2?";
+    let driver = TurnDriver::with_transcript(config, vec![MemMessage::user(task)]);
+    let result = run_one_turn(
+        &driver.config,
+        &driver.runtime.clone(),
+        driver.transcript(),
+        task,
+    )
+    .await
+    .unwrap();
+    assert!(result.error.is_some());
+    assert_eq!(result.end_reason, Some(crate::TurnEndReason::Failed));
+    assert_eq!(
+        result.error_class,
+        Some(crate::agentic::observability::ErrorClass::ContextExceeded)
+    );
+}
