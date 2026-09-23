@@ -337,6 +337,33 @@ fn strip_noop_cd_prefix<'a>(command: &'a str, cwd: &Path) -> (&'a str, bool) {
     {
         return (command, false);
     }
+    // PR #2550 round 2: "lexically equal to cwd" is not the same question as
+    // "would `cd <dir>` actually succeed and land in `workspace`" — three
+    // shapes answer yes to the first and no to the second, so the strip must
+    // refuse them or it can run a command the original never would have:
+    // - unquoted internal whitespace (`cd /a b && x`) fails in bash with
+    //   "too many arguments" — `&&` never runs `x` — yet the ONLY correctly
+    //   quoted spelling is already refused by `BUILD_UNSAFE`'s `"`, so a
+    //   broken command would route while the correct one would not;
+    // - a `..` component climbs through whatever's actually there on disk
+    //   (a missing intermediate fails the real `cd`; a symlinked one lands
+    //   somewhere purely lexical normalization never sees) — checked on the
+    //   PRE-normalized `dir`, not `lexically_normalize(dir)`: normalization
+    //   FOLDS a resolvable `..` away (`/ws/root/x/..` → `/ws/root`, zero
+    //   `ParentDir` components left), which is exactly what would hide this
+    //   refusal if checked after. A trailing `/.` (`CurDir`) is unaffected
+    //   either way — it was never a `ParentDir` to begin with — and stays
+    //   eligible;
+    // - a relative `dir` only "matches" a relative `cwd`, which this
+    //   function has no way to confirm every caller always avoids.
+    if !Path::new(dir).is_absolute()
+        || dir.contains(char::is_whitespace)
+        || Path::new(dir)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return (command, false);
+    }
     let normalized_dir = crate::caveats::lexically_normalize(dir);
     let normalized_cwd = crate::caveats::lexically_normalize(&cwd.to_string_lossy());
     if normalized_dir == normalized_cwd {
@@ -1610,8 +1637,12 @@ mod tests {
                 }),
             }
         );
-        // A trailing slash, or an un-normalized `.`/`..` segment, still
-        // lexically resolves to the same root.
+        // A trailing slash, or a trailing `/.` (`CurDir`, always resolvable
+        // with no filesystem dependency), still lexically resolves to the
+        // same root. A `..` climb does NOT — see the negative-case test
+        // below (PR #2550 round 2): "lexically equal to cwd" is not the
+        // same question as "would the original `cd` actually succeed and
+        // land in `workspace`".
         assert_eq!(
             classify_at("cd /ws/root/ && cargo test", root),
             RouteDecision::Route {
@@ -1620,7 +1651,7 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_at("cd /ws/other/../root && cargo test", root),
+            classify_at("cd /ws/root/. && cargo test", root),
             RouteDecision::Route {
                 tool: "build_exec",
                 args: json!({"argv": ["cargo", "test"], "cd_dropped": true}),
@@ -1656,9 +1687,35 @@ mod tests {
             // matching `cd` — the strip changes what's classified, not
             // whether it routes.
             "cd /ws/root && rm -rf x",
+            // PR #2550 round 2: "lexically equal to cwd" is not the same
+            // question as "would the original `cd` actually succeed and
+            // land in `workspace`" — three shapes answer yes to the first
+            // and no to the second.
+            //
+            // A `..` climb: `lexically_normalize` folds it without ever
+            // touching the filesystem, so it lexically equals the root —
+            // but the real `cd` depends on what's actually at the
+            // intermediate path (missing dir fails; a symlink lands
+            // elsewhere), never verifiable purely lexically.
+            "cd /ws/root/x/.. && cargo test",
+            // Unquoted internal whitespace: bash's real `cd` sees TWO
+            // arguments and fails with "too many arguments" — `&&` never
+            // runs `cargo test` — yet the only CORRECTLY quoted spelling is
+            // already refused by `BUILD_UNSAFE`'s `"`, so without this
+            // refusal the broken command would route while the correct one
+            // would not.
+            "cd /ws root && cargo test",
         ] {
             assert_eq!(classify_at(cmd, root), RouteDecision::Exec, "{cmd}");
         }
+        // A relative `dir` must never strip, even when it lexically equals
+        // a (hypothetically) relative `cwd` — this function has no way to
+        // confirm every caller always passes an absolute workspace, so it
+        // refuses the shape outright rather than trust that.
+        assert_eq!(
+            classify_at("cd ws/root && cargo test", Path::new("ws/root")),
+            RouteDecision::Exec
+        );
     }
 
     /// The routed note must say the `cd` was dropped as a no-op — the
