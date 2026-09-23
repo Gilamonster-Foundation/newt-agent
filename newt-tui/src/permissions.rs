@@ -398,7 +398,9 @@ pub(crate) fn production_danger_table() -> danger::DangerTable {
 /// predicate, so the blessing ceremony can never launder an interpreter or a
 /// broad fs root into `approve.toml`. Fs classifies as a WRITE — the
 /// conservative reading of a durable fs grant, and the table's High tier is
-/// about broad roots on either axis.
+/// about broad roots on either axis. So this write-time fence is a SUPERSET of
+/// the recall-time check (`recalled_grants` classifies by the grant's own
+/// kind): anything recall would refuse, the writer already refused.
 pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::CapabilityClass, &str) -> bool
 {
     let table = production_danger_table();
