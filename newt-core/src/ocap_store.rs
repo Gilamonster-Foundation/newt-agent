@@ -213,7 +213,7 @@ pub fn sign_approves(
         |class: CapabilityClass, what: &str, payload: Vec<u8>, sig: &mut Option<String>| {
             match PolicySet::validate_approve(class, what, &is_high_danger) {
                 Ok(()) => {
-                    *sig = Some(agent_bridle::policy::hex_encode(&sign(&payload)));
+                    *sig = Some(sign_entry(&payload, &sign));
                     signed += 1;
                 }
                 Err(reason) => refused.push(reason),
@@ -235,6 +235,115 @@ pub fn sign_approves(
         bless(CapabilityClass::Net, &host, payload, &mut e.sig);
     }
     (signed, refused)
+}
+
+/// One capability + target the interactive gate's `AllowPermanent` answer
+/// wants to persist (#2535/#2524 PR1 — every "permanently allow" kind, not
+/// just net).
+#[derive(Debug, Clone)]
+pub enum ApproveEntry {
+    Exec { target: String },
+    Fs { path: String, write: bool },
+    Net { host: String },
+}
+
+impl ApproveEntry {
+    pub fn class(&self) -> CapabilityClass {
+        match self {
+            Self::Exec { .. } => CapabilityClass::Exec,
+            Self::Fs { .. } => CapabilityClass::Fs,
+            Self::Net { .. } => CapabilityClass::Net,
+        }
+    }
+
+    /// The target string this entry is keyed on (command, path, or host).
+    pub fn target(&self) -> &str {
+        match self {
+            Self::Exec { target } => target,
+            Self::Fs { path, .. } => path,
+            Self::Net { host } => host,
+        }
+    }
+}
+
+/// Sign one canonical entry payload — the single seam both [`sign_approves`]
+/// (bulk re-bless) and [`persist_approve`] (one freshly-answered grant) route
+/// through, so there is exactly one place that turns bytes into a hex `sig`.
+pub fn sign_entry(payload: &[u8], sign: &impl Fn(&[u8]) -> [u8; 64]) -> String {
+    agent_bridle::policy::hex_encode(&sign(payload))
+}
+
+/// Append ONE operator-answered grant to `approve.toml` under the config file
+/// lock, signed in-session at the moment of the answer (#2535/#2524 PR1: the
+/// writer behind "allow permanently" for every kind, not just net).
+///
+/// Refuses — no lock taken, no write — a high-danger target per
+/// `is_high_danger` (the same [`PolicySet::validate_approve`] invariant
+/// `sign_approves`/`newt doctor --sign-ocap` already enforce, now checked
+/// BEFORE the entry ever reaches disk rather than after). On success returns
+/// the whole updated [`PolicyFile`] so the caller can fold it straight into a
+/// live [`PolicySet`] without a re-read.
+pub fn persist_approve(
+    config_path: &Path,
+    entry: ApproveEntry,
+    is_high_danger: impl Fn(CapabilityClass, &str) -> bool,
+    sign: impl Fn(&[u8]) -> [u8; 64],
+) -> anyhow::Result<PolicyFile> {
+    PolicySet::validate_approve(entry.class(), entry.target(), &is_high_danger)
+        .map_err(anyhow::Error::msg)?;
+
+    let dir = config_path.with_file_name("ocap");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(Verdict::Approve.filename());
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path)?;
+    let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path())?;
+    let text = match std::fs::read_to_string(destination.as_path()) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut file = PolicyFile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
+
+    match entry {
+        ApproveEntry::Exec { target } => {
+            let e = ExecEntry {
+                target,
+                ..Default::default()
+            };
+            let sig = sign_entry(&e.signing_payload(), &sign);
+            file.exec.push(ExecEntry {
+                sig: Some(sig),
+                ..e
+            });
+        }
+        ApproveEntry::Fs { path, write } => {
+            let e = FsEntry {
+                path,
+                write,
+                ..Default::default()
+            };
+            let sig = sign_entry(&e.signing_payload(), &sign);
+            file.fs.push(FsEntry {
+                sig: Some(sig),
+                ..e
+            });
+        }
+        ApproveEntry::Net { host } => {
+            let e = NetEntry {
+                host,
+                ..Default::default()
+            };
+            let sig = sign_entry(&e.signing_payload(), &sign);
+            file.net.push(NetEntry {
+                sig: Some(sig),
+                ..e
+            });
+        }
+    }
+
+    let toml = file.to_toml().map_err(|e| anyhow::anyhow!(e))?;
+    destination.atomic_write(toml.as_bytes())?;
+    Ok(file)
 }
 
 #[cfg(test)]
