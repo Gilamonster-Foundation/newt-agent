@@ -410,7 +410,17 @@ impl Config {
     /// Durably grant a net host by appending it to `[tui.permissions] net` in the
     /// config file at `path`, comment-preserving (see [`Config::with_net_host`]).
     /// A missing file is treated as empty (the table is created). Creates parent
-    /// dirs as needed. Used by the interactive gate's "allow permanently" choice.
+    /// dirs as needed.
+    ///
+    /// **P-1 (#2535/#2524 PR1): retired as a durable WRITER.** The interactive
+    /// gate's "allow permanently" now signs every kind (including net) into
+    /// `~/.newt/ocap/approve.toml` via [`crate::ocap_store::persist_approve`]
+    /// instead — see `newt-tui`'s `PromptChoice::AllowPermanent` arm.
+    /// `[tui.permissions] net` is still READ as legacy input (an already
+    /// hand-edited or previously-written config keeps working), so this
+    /// method stays for that migration path and its own regression test; it
+    /// is no longer called from the permanent-allow flow. A ratchet candidate
+    /// for full removal once no config in the wild still relies on the read.
     pub fn append_permission_net_host(path: &Path, host: &str) -> Result<()> {
         Self::update_permissions_file(path, |text| Self::with_net_host(text, host))
     }
