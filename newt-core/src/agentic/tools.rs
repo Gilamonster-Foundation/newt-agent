@@ -1019,6 +1019,46 @@ fn escalated_after_timeout(
     result
 }
 
+/// F19/#2541 round 2 item 3: the ONE decision the escalation makes, isolated
+/// from formatting so it is table-testable on its own — only a genuine
+/// timeout justifies spending the build lane's authority on a second run;
+/// every other outcome (`Denied`, `Unavailable`, `Failed`, `Passed`) already
+/// says everything a retry could add.
+fn escalates(outcome: crate::ExecOutcome) -> bool {
+    matches!(outcome, crate::ExecOutcome::TimedOut)
+}
+
+/// #2541 round 2 item 1: compose the escalation's outcome with `first`'s
+/// evidence — `first`'s partial output is the ONLY record of which test hung,
+/// and it must survive even when the escalation itself never ran. When the
+/// build lane actually executed (any outcome but `Denied`/`Unavailable` — a
+/// frame-isolation refusal is `Denied` too, see `run_confined_build_lane`),
+/// its own result already speaks for the whole call, so `first` is dropped
+/// exactly as before. When it refused to run, `first`'s result (through
+/// `lifecycle_run_result`, which prepends the build-lane suggestion for a
+/// `TimedOut` — this is the arm item 4 asked about: this call site is what
+/// keeps it alive) is kept with the refusal appended, never silently lost.
+fn escalation_result(
+    args: &serde_json::Value,
+    first: (String, crate::ExecOutcome),
+    escalated: (String, crate::ExecOutcome),
+) -> (String, crate::ExecOutcome) {
+    if matches!(
+        escalated.1,
+        crate::ExecOutcome::Denied | crate::ExecOutcome::Unavailable
+    ) {
+        let kept = lifecycle_run_result(args, first);
+        return (
+            format!(
+                "{}\n\nThe action=build escalation did not run:\n{}",
+                kept.0, escalated.0
+            ),
+            escalated.1,
+        );
+    }
+    escalated_after_timeout(escalated)
+}
+
 /// `lifecycle action=run`, with F19's timeout escalation: on the 60s wall, one
 /// re-run through the SAME build lane `action=build` uses (`run_confined_build_lane`
 /// — same `leq`/permission-gate re-check, never bypassed). A dedicated fn (not
@@ -1064,7 +1104,7 @@ async fn lifecycle_run_with_escalation(
     // retrying `run` even though the timeout note already named the
     // escalation. Route it instead of asking the model to remember: one
     // re-run, not a loop.
-    if !matches!(first.1, crate::ExecOutcome::TimedOut) {
+    if !escalates(first.1) {
         return lifecycle_run_result(args, first);
     }
     let (program, argv) = build_check_argv(joined);
@@ -1081,10 +1121,14 @@ async fn lifecycle_run_with_escalation(
         color,
         tool_offload,
         spill_store,
+        // #2541 round 2 item 5: names the escalation in the permission
+        // prompt reason, so the operator sees WHY a build-authority prompt
+        // appeared out of an `action=run` call instead of `action=build`.
+        Some("lifecycle action=run hit the confined shell's 60s wall"),
         presentation,
     )
     .await;
-    escalated_after_timeout(escalated)
+    escalation_result(args, first, escalated)
 }
 
 /// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
@@ -1102,20 +1146,28 @@ fn build_call_suggestion(args: &serde_json::Value, phase: &str) -> serde_json::V
 /// A call-scoped grant for the existing lifecycle surface, not an exec-axis
 /// wildcard. The command stays visible at the decision point; no shell grant
 /// (including exec:cargo) silently acquires compiler/test descendant authority.
+/// `escalation_note`, when `Some`, is #2541 round 2 item 5: a build-authority
+/// prompt that arrived because a DIFFERENT call (`action=run`) escalated
+/// needs to say so, or the operator sees a `lifecycle action=build` request
+/// they never asked for.
 fn lifecycle_build_request(
     workspace: &str,
     command: &str,
     build: &crate::Caveats,
+    escalation_note: Option<&str>,
 ) -> PermissionRequest {
     let reads = match &build.fs_read {
         crate::Scope::Only(roots) => roots.iter().cloned().collect::<Vec<_>>().join("\n"),
         crate::Scope::All => unreachable!("build reads are calibrated"),
     };
+    let escalation = escalation_note
+        .map(|note| format!("\nThis is an escalation: {note}."))
+        .unwrap_or_default();
     PermissionRequest {
         tool: "lifecycle".into(),
         kind: DenialKind::Build,
         target: workspace.into(),
-        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites and scratch within the workspace; network denied. Compiler, build-script and test subprocesses inherit the same kernel fence."),
+        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites and scratch within the workspace; network denied. Compiler, build-script and test subprocesses inherit the same kernel fence.{escalation}"),
     }
 }
 
@@ -1143,6 +1195,11 @@ async fn run_confined_build_lane(
     color: bool,
     tool_offload: bool,
     spill_store: Option<&dyn super::content_spill::SpillStore>,
+    // #2541 round 2 item 5: `Some` names the reason a call OTHER than
+    // `action=build` is spending build authority (currently only F19's
+    // `action=run` timeout escalation); `None` for a direct `action=build` /
+    // `build_exec` call, whose reason speaks for itself.
+    escalation_note: Option<&str>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
@@ -1179,7 +1236,8 @@ async fn run_confined_build_lane(
         }
     }
     if !build.leq(caveats) {
-        let permission = lifecycle_build_request(&root.to_string_lossy(), display, build);
+        let permission =
+            lifecycle_build_request(&root.to_string_lossy(), display, build, escalation_note);
         let allowed = permission_gate.as_deref_mut().is_some_and(|gate| {
             matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
         });
@@ -3660,6 +3718,7 @@ async fn execute_authorized_tool(
                             color,
                             tool_offload,
                             spill_store,
+                            None,
                             presentation,
                         )
                         .await,
@@ -3756,6 +3815,7 @@ async fn execute_authorized_tool(
                 color,
                 tool_offload,
                 spill_store,
+                None,
                 presentation,
             )
             .await;
