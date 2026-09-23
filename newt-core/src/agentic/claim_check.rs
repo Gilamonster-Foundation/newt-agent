@@ -389,14 +389,49 @@ pub fn nested_current_paths(snapshots: &[NestedRepoSnapshot]) -> (Vec<String>, V
 }
 
 /// The workspace's changed-path snapshot, or `None` off-repo / on any git failure.
+///
+/// F26 v2: `workspace` may be a plain SUBDIRECTORY of a larger repo (no
+/// `.git` of its own) rather than a repo root. Git's normal upward discovery
+/// (unceilinged — see `git_hardening::hardened_git`'s doc comment for why a
+/// ceiling was tried and reverted) would otherwise hand this the ENCLOSING
+/// repo's full status: the wrong answer (the workspace itself changed
+/// nothing) and a leak of every path above the workspace. Compare `git
+/// rev-parse --show-toplevel` against `workspace`:
+/// - equal → today's behaviour, unchanged.
+/// - `workspace` strictly below it → scope the status to the workspace
+///   subtree (pathspec `.`, so nothing outside it is even considered) and
+///   strip the `git rev-parse --show-prefix` prefix so every reported path
+///   stays workspace-relative. A nested git repo INSIDE the workspace
+///   collapses to a single opaque `<dir>/` placeholder in that scoped
+///   status (git never descends into an embedded repo) — dropped here
+///   since [`snapshot_nested_repos`] is the real way to see inside one.
 #[must_use]
 pub fn snapshot_workspace(
     workspace: &str,
     read_scope: &crate::Scope<String>,
 ) -> Option<StatusSnapshot> {
-    // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
-    let out = git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope)?;
-    Some(parse_porcelain_z(&out))
+    let toplevel = git_in(workspace, &["rev-parse", "--show-toplevel"], read_scope)?;
+    let toplevel = super::lexical_normalize(std::path::Path::new(toplevel.trim()));
+    let root = super::lexical_normalize(std::path::Path::new(workspace));
+    if toplevel == root {
+        // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
+        let out = git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope)?;
+        return Some(parse_porcelain_z(&out));
+    }
+    let prefix = git_in(workspace, &["rev-parse", "--show-prefix"], read_scope)?;
+    let prefix = prefix.trim();
+    let mut args: Vec<&str> = SNAPSHOT_STATUS_ARGS.to_vec();
+    args.extend(["--", "."]);
+    let out = git_in(workspace, &args, read_scope)?;
+    Some(
+        parse_porcelain_z(&out)
+            .into_iter()
+            .filter_map(|(path, code)| {
+                let rel = path.strip_prefix(prefix)?;
+                (!rel.ends_with('/')).then(|| (rel.to_string(), code))
+            })
+            .collect(),
+    )
 }
 
 /// `phrase` appears in `text` (already lowercased) with non-alphanumeric
@@ -1108,14 +1143,16 @@ mod tests {
         assert!(snapshot_workspace(&root.path().to_string_lossy(), &crate::Scope::All).is_some());
     }
 
-    /// F26 (red first): a plain folder with no `.git` of its own, sitting
+    /// F26 v2 (red first): a plain folder with no `.git` of its own, sitting
     /// INSIDE a larger git repo, must never have `git`'s normal upward
     /// discovery hand it the ENCLOSING repo's status — that both answers
     /// the wrong question (the outer repo's ~200 paths, not the workspace's)
     /// and leaks everything above the workspace boundary. `snapshot_workspace`
-    /// on the plain subfolder must see NO repo (so the caller falls through
-    /// to the nested-repos path), and the nested probe must report only the
-    /// inner repo actually inside the workspace.
+    /// on the plain subfolder now scopes to the workspace and reports
+    /// nothing from `outer.txt`; a nested repo it contains (`inner`)
+    /// collapses to an opaque placeholder in that scoped status, which is
+    /// filtered — [`snapshot_nested_repos`] is the real way to see inside
+    /// one, and it still reports `inner` correctly.
     #[test]
     fn snapshot_workspace_never_discovers_an_enclosing_repo_above_the_workspace() {
         let outer = tempfile::tempdir().expect("outer root");
@@ -1136,9 +1173,11 @@ mod tests {
         std::fs::write(inner.join("i.txt"), "one\ntwo\n").unwrap(); // uncommitted
 
         let workspace_str = workspace.to_string_lossy().into_owned();
+        let scoped = snapshot_workspace(&workspace_str, &crate::Scope::All)
+            .expect("workspace is inside a repo, so a (scoped) status must resolve");
         assert!(
-            snapshot_workspace(&workspace_str, &crate::Scope::All).is_none(),
-            "a plain subfolder must never resolve to the enclosing repo"
+            scoped.is_empty(),
+            "nothing from outer.txt or the opaque inner/ placeholder should surface: {scoped:?}"
         );
         let snapshots = snapshot_nested_repos(&workspace_str, &crate::Scope::All);
         assert_eq!(snapshots.len(), 1, "{snapshots:?}");
@@ -1148,5 +1187,35 @@ mod tests {
             .as_ref()
             .expect("inner's probe must succeed");
         assert_eq!(status.get("i.txt").map(String::as_str), Some(" M"));
+    }
+
+    /// F26 v2, new: a workspace that is a plain SUBDIRECTORY of a repo (no
+    /// nested repo involved this time) must report only the edit INSIDE the
+    /// workspace, with a workspace-relative path — never the edit made
+    /// outside it at the outer root.
+    #[test]
+    fn snapshot_workspace_scoped_to_a_subdirectory_reports_only_its_own_edit() {
+        let outer = tempfile::tempdir().expect("outer root");
+        init_repo(outer.path());
+        std::fs::write(outer.path().join("outside.txt"), "one\n").unwrap();
+        let workspace = outer.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("inside.txt"), "one\n").unwrap();
+        git_in_dir(outer.path(), &["add", "-A"]);
+        git_in_dir(outer.path(), &["commit", "-q", "-m", "init"]);
+
+        // Edit one file outside the workspace, one inside it.
+        std::fs::write(outer.path().join("outside.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(workspace.join("inside.txt"), "one\ntwo\n").unwrap();
+
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let scoped = snapshot_workspace(&workspace_str, &crate::Scope::All)
+            .expect("workspace is inside a repo");
+        assert_eq!(
+            scoped.get("inside.txt").map(String::as_str),
+            Some(" M"),
+            "{scoped:?}"
+        );
+        assert_eq!(scoped.len(), 1, "outside.txt must not surface: {scoped:?}");
     }
 }
