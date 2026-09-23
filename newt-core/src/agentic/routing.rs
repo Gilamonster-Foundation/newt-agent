@@ -1611,6 +1611,9 @@ mod tests {
     /// compound and never reached #2533/#2548/#2549's routing at all. The
     /// no-op prefix must be recognised and dropped so `<rest>` routes
     /// exactly as if it had been sent alone.
+    // `/ws/root` is not absolute on Windows (no drive), so the strip refuses there;
+    // routing to the build lane is moot on Windows anyway (it fails closed).
+    #[cfg(not(windows))]
     #[test]
     fn a_noop_cd_to_the_workspace_root_is_dropped_before_classification() {
         let root = Path::new("/ws/root");
@@ -1723,6 +1726,9 @@ mod tests {
     /// classifier's own contribution (the `cd_dropped` flag in the routed
     /// args) directly, including that a call WITHOUT the prefix carries no
     /// such flag at all.
+    // `/ws/root` is not absolute on Windows (no drive), so the strip refuses there;
+    // routing to the build lane is moot on Windows anyway (it fails closed).
+    #[cfg(not(windows))]
     #[test]
     fn cd_dropped_flag_is_only_set_when_a_noop_cd_was_actually_stripped() {
         let root = Path::new("/ws/root");

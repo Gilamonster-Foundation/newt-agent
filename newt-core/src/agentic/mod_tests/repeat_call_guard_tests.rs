@@ -1381,6 +1381,8 @@ fn a_routed_toolchain_selected_gate_pass_still_resets_the_brake() {
 /// #2548's gate check reads the routed `argv`, which no longer carries the
 /// stripped `cd`, so this composes for free once the classifier strips it;
 /// pinned here as its own regression rather than left to infer.
+// `/ws/root`-style roots are not absolute on Windows; see routing.rs's F24 tests.
+#[cfg(not(windows))]
 #[test]
 fn a_routed_noop_cd_prefixed_gate_pass_still_resets_the_brake() {
     use crate::ExecOutcome::Passed;
