@@ -79,6 +79,20 @@ impl FreeTextInput {
                     KeyCode::Enter => {
                         Step::Done(ReadOutcome::Line(std::mem::take(&mut self.answer)))
                     }
+                    // #2540 round 2 item 1: dismiss to the ordinary read — the
+                    // SAME shape the trait default's `present_clarification`
+                    // produces (`print_newt(batch); self.read_line(prompt)`),
+                    // an empty answer that resolves as a fresh operator turn
+                    // rather than trapping the operator inside a batch they
+                    // want out of.
+                    KeyCode::Esc => Step::Done(ReadOutcome::Line(String::new())),
+                    // #2540 round 2 item 1: Ctrl-U clears the whole line, the
+                    // same accelerator the mounted editor and the permission
+                    // modal's own free-text mode both honor.
+                    KeyCode::Char('u') if ctrl => {
+                        self.answer.clear();
+                        Step::Continue
+                    }
                     KeyCode::Backspace => {
                         self.answer.pop();
                         Step::Continue
@@ -143,11 +157,25 @@ fn run(terminal: &mut InlineTerm, batch: &str, hint: &str) -> io::Result<ReadOut
 /// cockpit's saved real terminal — the presenter owns row reservation and
 /// cleanup; this loop owns input until dismissal). The `_inline`
 /// sibling this is, is [`present`] below.
+///
+/// #2540 round 2 item 1/5 (BLOCKING, measured live): this used to trust the
+/// cockpit's ambient terminal state and read with no guard of its own — the
+/// ONE difference from `interaction_view::present_in`, whose `ModalReader`
+/// holds its OWN `RawModeGuard` for the read loop's lifetime
+/// (`interaction_view::terminal::ModalReader::new`). Without it, keys arrived
+/// as raw, undecoded bytes: a paste showed as literal `^[[200~…^[[201~`,
+/// Enter as a literal `^M`, Esc/Ctrl-C/Ctrl-U did nothing — the modal could
+/// neither be answered nor left. Entering the SAME guard here, the same way
+/// the working modal does, is the fix: `RawModeGuard` composes under nesting
+/// (its own doc), so this is harmless if the cockpit's ambient guard was
+/// already up, and load-bearing if it was not. RAII restores on every exit
+/// path (return, `?`, panic) — item 5.
 pub(crate) fn present_in(
     terminal: &mut InlineTerm,
     batch: &str,
     hint: &str,
 ) -> io::Result<ReadOutcome> {
+    let _raw = RawModeGuard::enter()?;
     run(terminal, batch, hint)
 }
 
@@ -274,5 +302,34 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(input.answer, "/dis");
+    }
+
+    /// #2540 round 2 item 1: Esc dismisses to the ordinary read — the same
+    /// empty-answer shape the trait default's `present_clarification`
+    /// produces by falling straight through to `read_line`.
+    #[test]
+    fn esc_dismisses_with_an_empty_answer() {
+        let mut input = FreeTextInput {
+            answer: "partial".to_string(),
+        };
+        let step = input.event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(step, Step::Done(ReadOutcome::Line(a)) if a.is_empty()));
+    }
+
+    /// #2540 round 2 item 1: Ctrl-U clears the whole line, not just one char.
+    #[test]
+    fn ctrl_u_clears_the_whole_answer() {
+        let mut input = FreeTextInput {
+            answer: "/discuss why the plan changed".to_string(),
+        };
+        let step = input.event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(step, Step::Continue));
+        assert_eq!(input.answer, "");
     }
 }
