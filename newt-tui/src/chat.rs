@@ -2073,9 +2073,13 @@ fn session_body(
     // Unsigned/tampered approve entries are dropped loudly at load, fail-closed
     // to the prompt; deny/ask load unsigned (narrowing is fail-safe).
     if let Some(config_path) = user_permission_config_path.as_deref() {
+        // Read-only (mirrors headless's `resolve_ocap_store`, #2532): a
+        // missing/invalid root key folds to "no approves" — `load_store`'s
+        // existing rule — rather than minting an identity.pem as a side
+        // effect of merely checking for signed durable grants.
         let root_vk = key_path
             .as_deref()
-            .and_then(|p| newt_identity::load_or_generate(p).ok())
+            .and_then(|p| newt_identity::load_user_key(p).ok())
             .map(|user| user.public().as_bytes());
         let (policy, warnings) = newt_core::ocap_store::load_store(config_path, root_vk);
         for w in warnings {
@@ -2126,9 +2130,9 @@ fn session_body(
     if prompt_permissions_enabled {
         print_newt(
             "prompted permissions ON — capability denials will ask: allow once / session / deny / \
-             permanently deny (a net host also offers allow-permanently, which adds it to \
-             [tui.permissions] net). Decisions recorded; /permissions lists them; permanent \
-             denials persist in ~/.newt/permission-denials.jsonl",
+             permanently deny (exec/fs/net also offer allow-permanently, which signs a durable \
+             grant into ~/.newt/ocap/approve.toml). Decisions recorded; /permissions lists them; \
+             permanent denials persist in ~/.newt/permission-denials.jsonl",
             color,
             verbose,
         );
