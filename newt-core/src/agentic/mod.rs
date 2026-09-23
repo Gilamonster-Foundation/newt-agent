@@ -5015,21 +5015,45 @@ pub fn is_workspace_write_call(name: &str) -> bool {
 }
 
 /// U4b: did this completed call PASS a progress-evidencing check — a `lifecycle`
-/// run of a gate phase (`test`/`check`, [`crate::tooling::Phase::is_gate`])?
-/// Deliberately not `run_command`: a shell exit code is not evidence of a passing
-/// build, and recognising build commands would be an invented classifier.
+/// run of a gate phase (`test`/`check`, [`crate::tooling::Phase::is_gate`]), or a
+/// `run_command` ROUTED to the confined build lane (#2533/#2543's
+/// `routing::RouteTable`: a clean, unpiped `cargo build|check|test|clippy` /
+/// `just <recipe>` argv, spawned directly with no shell in between)?
+///
+/// A bare `run_command` is still deliberately excluded: a shell exit code is
+/// not evidence of a passing build (`| tail` masks it — see
+/// `note_verified_pass`'s doc), and recognising build commands by keyword
+/// would be an invented classifier. The routed case is different in kind, not
+/// degree: `routing::RouteTable::classify_call` (the SAME check
+/// `dispatch_run_command` already ran to decide the call's real destination)
+/// is re-derived here, so this counts ONLY a call that actually reached
+/// `build_exec`'s direct child spawn — never a compound command (`; echo …`,
+/// `| tail`), which `classify_call` refuses to route (r9 recon item 4: the
+/// exact evidence was `cargo test -p newt-git …` routed and passed three
+/// times through `build_exec`, and none of the three counted before this).
 fn is_progress_verification(
     name: &str,
     args: &serde_json::Value,
     execution: Option<crate::ExecOutcome>,
 ) -> bool {
-    name == "lifecycle"
-        && execution == Some(crate::ExecOutcome::Passed)
-        && args
+    if execution != Some(crate::ExecOutcome::Passed) {
+        return false;
+    }
+    if name == "lifecycle" {
+        return args
             .get("phase")
             .and_then(|v| v.as_str())
             .and_then(crate::tooling::Phase::from_key)
-            .is_some_and(crate::tooling::Phase::is_gate)
+            .is_some_and(crate::tooling::Phase::is_gate);
+    }
+    name == "run_command"
+        && matches!(
+            routing::RouteTable::builtin().classify_call(args),
+            routing::RouteDecision::Route {
+                tool: "build_exec",
+                ..
+            }
+        )
 }
 
 /// #2374: built-in tools that never touch workspace files: harness state,
