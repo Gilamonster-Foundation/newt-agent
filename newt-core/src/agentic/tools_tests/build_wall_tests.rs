@@ -93,3 +93,21 @@ fn the_wall_is_the_default_timeout_not_just_the_ceiling() {
     let ordinary = super::shell::shell_limits(default_wall());
     assert_eq!(ordinary.default_timeout_secs, default_wall().as_secs());
 }
+
+/// Pins the known gap: only the LEADING program counts, so a `cd x &&`
+/// prefix keeps the default wall (the model should pass `cwd=` instead).
+#[test]
+fn a_cd_prefix_keeps_the_default_wall() {
+    assert_eq!(
+        super::shell::dispatch_wall("cd newt-git && cargo test"),
+        default_wall()
+    );
+}
+
+#[test]
+fn an_env_prefix_still_gets_the_build_wall() {
+    assert_eq!(
+        super::shell::dispatch_wall("RUSTC_WRAPPER= cargo test -p newt-git"),
+        build_wall()
+    );
+}
