@@ -312,19 +312,8 @@ fn bridle_registry(
     use std::sync::Arc;
     let shell: Arc<dyn agent_bridle::Tool> = match engine {
         crate::ShellEngine::SafeSubset => {
-            // F20: `timeout_secs` (set on `dispatch_args` by
-            // `dispatch_bridled_shell` below, per-call) is clamped to
-            // `max_timeout_secs` by `ShellTool`'s own parse — so a build-tool
-            // wall wider than agent-bridle's 300s default needs the ceiling
-            // raised too, or the clamp silently discards it. `default_timeout_secs`
-            // is untouched: an ordinary call with no override still gets 60s.
-            let limits = agent_bridle::LimitsPolicy {
-                max_timeout_secs: wall
-                    .as_secs()
-                    .max(agent_bridle::LimitsPolicy::default().max_timeout_secs),
-                ..agent_bridle::LimitsPolicy::default()
-            };
-            let mut tool = agent_bridle::ShellTool::with_config(limits)
+            // F20: the wall rides on the limits — see `shell_limits`.
+            let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
                 .with_sandbox_policy(b1_run_command_sandbox_policy());
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
@@ -347,13 +336,7 @@ fn bridle_registry(
             // harness; the real binary path remains Brush unchanged.
             #[cfg(test)]
             let shell = {
-                let limits = agent_bridle::LimitsPolicy {
-                    max_timeout_secs: wall
-                        .as_secs()
-                        .max(agent_bridle::LimitsPolicy::default().max_timeout_secs),
-                    ..agent_bridle::LimitsPolicy::default()
-                };
-                let mut tool = agent_bridle::ShellTool::with_config(limits)
+                let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
                     .with_sandbox_policy(b1_run_command_sandbox_policy());
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
@@ -882,6 +865,19 @@ fn run_command_wall_secs() -> u64 {
 /// #2533's routing refuses to route anything compound. Only the wall clock
 /// changes: fs/net/exec authority is unaffected (`dispatch_bridled_shell`
 /// passes `caveats` through unchanged).
+/// `ShellTool` limits for a call whose wall is `wall`. The model's args carry
+/// no `timeout_secs`, so `ShellTool` falls back to `default_timeout_secs`:
+/// that field IS the wall. `max_timeout_secs` is raised with it or the clamp
+/// would cut a build wall back to 300s.
+pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPolicy {
+    let default = agent_bridle::LimitsPolicy::default();
+    agent_bridle::LimitsPolicy {
+        default_timeout_secs: wall.as_secs(),
+        max_timeout_secs: wall.as_secs().max(default.max_timeout_secs),
+        ..default
+    }
+}
+
 pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
     match leading_program(cmd) {
         Some(program) if crate::agentic::routing::is_build_tool_program(program) => {
