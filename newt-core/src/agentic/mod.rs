@@ -349,6 +349,18 @@ use trim::{
     protected_prompt_head_len, PromptTracker,
 };
 
+/// Type the turn's end reason as [`crate::TurnEndReason::Failed`] before a
+/// context-window-overflow recovery bound is exhausted and the error
+/// propagates. Without this, an overflow (numbered 400 or llama.cpp's
+/// numberless 500) that survives every recovery attempt leaves the loop with
+/// `end_reason: None` — an untyped end indistinguishable from a driver-level
+/// crash (eval F14).
+fn mark_overflow_exhausted(end_reason: &mut Option<&mut Option<crate::TurnEndReason>>) {
+    if let Some(slot) = end_reason {
+        **slot = Some(crate::TurnEndReason::Failed);
+    }
+}
+
 /// Retry policy selected from endpoint locality.
 ///
 /// Local inference keeps the patient seven-attempt policy needed while a DGX
@@ -2907,6 +2919,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                         round_est_raw,
                                         None,
                                     )?;
+                                    mark_overflow_exhausted(&mut end_reason);
                                     return Err(e.context(format!(
                                         "context re-projection failed: {error}"
                                     )));
@@ -2927,6 +2940,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             if outcome.fired {
@@ -2975,6 +2989,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             context_recovery::record(
@@ -2998,6 +3013,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             round_est_raw,
                             None,
                         )?;
+                        mark_overflow_exhausted(&mut end_reason);
                     }
                     return Err(e);
                 }
@@ -7615,6 +7631,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                         round_est_raw,
                                         None,
                                     )?;
+                                    mark_overflow_exhausted(&mut end_reason);
                                     return Err(e.context(format!(
                                         "context re-projection failed: {error}"
                                     )));
@@ -7635,6 +7652,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             if outcome.fired {
@@ -7683,6 +7701,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             context_recovery::record(
@@ -7706,6 +7725,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             round_est_raw,
                             None,
                         )?;
+                        mark_overflow_exhausted(&mut end_reason);
                     }
                     return Err(e);
                 }
@@ -10049,6 +10069,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                         round_est_raw,
                                         None,
                                     )?;
+                                    mark_overflow_exhausted(&mut end_reason);
                                     return Err(e.context(format!(
                                         "context re-projection failed: {error}"
                                     )));
@@ -10069,6 +10090,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             if outcome.fired {
@@ -10117,6 +10139,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             context_recovery::record(
@@ -10140,6 +10163,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             round_est_raw,
                             None,
                         )?;
+                        mark_overflow_exhausted(&mut end_reason);
                     }
                     return Err(e);
                 }
@@ -12125,6 +12149,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                         round_est_raw,
                                         None,
                                     )?;
+                                    mark_overflow_exhausted(&mut end_reason);
                                     return Err(match other.rejection() {
                                         Some(reason) => e.context(reason.to_string()),
                                         None => e,
@@ -12146,6 +12171,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                     round_est_raw,
                                     None,
                                 )?;
+                                mark_overflow_exhausted(&mut end_reason);
                                 return Err(e);
                             }
                             context_recovery::record(
@@ -12169,6 +12195,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             round_est_raw,
                             None,
                         )?;
+                        mark_overflow_exhausted(&mut end_reason);
                     }
                     return Err(e);
                 }
