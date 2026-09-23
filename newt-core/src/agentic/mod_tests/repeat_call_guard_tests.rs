@@ -1204,7 +1204,7 @@ fn the_stop_does_not_depend_on_nudges_being_allowed() {
 
 /// Review fix 2: only the gate phases are evidence of progress. `format`, `lint`,
 /// `clean` and `setup` pass trivially (a looping model can call them forever); a
-/// passing `run_command` never counts (a `| tail` masks the exit status).
+/// PIPED `run_command` never counts (`| tail` masks the exit status).
 #[test]
 fn only_test_and_check_lifecycle_phases_reset_the_brake() {
     use crate::ExecOutcome::{Failed, Passed};
@@ -1227,12 +1227,79 @@ fn only_test_and_check_lifecycle_phases_reset_the_brake() {
     let test = serde_json::json!({ "phase": "test" });
     assert!(!is_progress_verification("lifecycle", &test, Some(Failed)));
     assert!(!is_progress_verification("lifecycle", &test, None));
-    let shell = serde_json::json!({ "command": "cargo test" });
+    // r9 recon item 4 / #2543: a piped run_command is NEVER routed
+    // (`routing::RouteTable::classify` refuses any compound command), so its
+    // exit code is still the LAST pipeline stage's (`tail`'s, not cargo's) —
+    // excluded exactly as before.
+    let piped = serde_json::json!({ "command": "cargo test -p newt-git | tail -20" });
     assert!(!is_progress_verification(
         "run_command",
-        &shell,
+        &piped,
         Some(Passed)
     ));
+}
+
+/// r9 recon item 4 (red first): a `run_command` call that #2533/#2543's
+/// routing sends to `build_exec` — a clean, unpiped `cargo test -p newt-git`
+/// argv, spawned directly with no shell in between — now counts as a
+/// verified pass exactly like a `lifecycle` gate phase does. Measured live in
+/// 2483-r9: this exact command routed and passed three times through
+/// `build_exec` and never reset the no-progress brake before this fix.
+#[test]
+fn a_routed_build_exec_pass_resets_the_brake_but_a_failure_does_not() {
+    use crate::ExecOutcome::{Failed, Passed};
+    let routed = serde_json::json!({ "command": "cargo test -p newt-git" });
+    assert!(is_progress_verification(
+        "run_command",
+        &routed,
+        Some(Passed)
+    ));
+    assert!(!is_progress_verification(
+        "run_command",
+        &routed,
+        Some(Failed)
+    ));
+    assert!(!is_progress_verification("run_command", &routed, None));
+    // A call the routing table would never route (extra fields beyond the
+    // bare command — `classify_call`'s own "must be bare" rule) stays
+    // excluded even when the underlying argv looks build-shaped.
+    let not_bare = serde_json::json!({ "command": "cargo test -p newt-git", "cwd": "." });
+    assert!(!is_progress_verification(
+        "run_command",
+        &not_bare,
+        Some(Passed)
+    ));
+}
+
+/// #2548 round 2 should-fix (red first): a routed `build_exec` pass counts
+/// ONLY when the argv's subcommand/recipe is a gate — mirroring
+/// `Phase::is_gate` exactly, the same "test"/"check" vocabulary the
+/// `lifecycle` side already uses. `cargo build` (an incremental no-op when
+/// already built), `cargo clippy`, `just fmt` and `just clean` all route to
+/// `build_exec` too, but pass trivially or say nothing about behaviour —
+/// a model alternating `edit_file` with a trivially-passing `just fmt` must
+/// not reset the brake, exactly like the `lifecycle` table never counted
+/// `lint`/`format`/`clean`/`setup`.
+#[test]
+fn only_a_routed_build_or_just_gate_recipe_resets_the_brake() {
+    use crate::ExecOutcome::Passed;
+    for (command, expect) in [
+        ("cargo test -p newt-git", true),
+        ("cargo check -p newt-git", true),
+        ("cargo build -p newt-git", false),
+        ("cargo clippy -p newt-git", false),
+        ("just test", true),
+        ("just check", true),
+        ("just fmt", false),
+        ("just clean", false),
+    ] {
+        let args = serde_json::json!({ "command": command });
+        assert_eq!(
+            is_progress_verification("run_command", &args, Some(Passed)),
+            expect,
+            "{command}"
+        );
+    }
 }
 
 /// Review round 3: operator steering is new information; it restarts the count
