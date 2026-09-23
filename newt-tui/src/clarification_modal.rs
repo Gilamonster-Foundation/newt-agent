@@ -304,9 +304,11 @@ mod tests {
         assert_eq!(input.answer, "/dis");
     }
 
-    /// #2540 round 2 item 1: Esc dismisses to the ordinary read — the same
-    /// empty-answer shape the trait default's `present_clarification`
-    /// produces by falling straight through to `read_line`.
+    /// #2540 round 2 item 1: Esc ends the modal read with an empty answer.
+    /// The chat loop skips an empty line and, with the batch still pending,
+    /// shows the same batch again: Esc leaves nothing locked and loses
+    /// nothing, but it does not leave the gate (only an answer, `/discuss`,
+    /// `/new` or `/exit` does).
     #[test]
     fn esc_dismisses_with_an_empty_answer() {
         let mut input = FreeTextInput {
