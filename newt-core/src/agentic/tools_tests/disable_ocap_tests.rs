@@ -1618,6 +1618,7 @@ async fn just_with_justfile_one_level_up_falls_back_to_exec_not_error() {
 /// output comfortably exceeds any trim window this test uses. Offline, no
 /// deps — `cargo check` never touches the network for a dependency-free
 /// crate.
+#[cfg(not(windows))]
 fn write_failing_scratch_crate(dir: &std::path::Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -1634,6 +1635,7 @@ fn write_failing_scratch_crate(dir: &std::path::Path) {
 /// A scratch crate whose `cargo check` genuinely PASSES but still emits
 /// substantial output: 10 unused-variable warnings (compiles clean, exit 0
 /// — a warning is not a failure), each its own diagnostic block.
+#[cfg(not(windows))]
 fn write_passing_scratch_crate(dir: &std::path::Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
