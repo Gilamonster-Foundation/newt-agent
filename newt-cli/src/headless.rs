@@ -677,6 +677,14 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // U7: the workspace's changed-path set at run start, diffed against the same
     // probe at exit so the hand-back names what THIS run changed, not prior dirt.
     let status_before = newt_core::agentic::snapshot_workspace(&workspace, &read_scope);
+    // Multi-repo recon PR2: the workspace root itself is not a repo (a bare
+    // folder of checkouts) — probe first-level nested repos instead, so the
+    // hand-back can still say what changed rather than "unavailable". Only
+    // computed when `status_before` is `None`; a repo root's fast path is
+    // untouched.
+    let nested_before = status_before
+        .is_none()
+        .then(|| newt_core::agentic::snapshot_nested_repos(&workspace, &read_scope));
     // #2537: HEAD before the run, via newt-git's OWN embedded engine (never a
     // shelled-out `git`) — the baseline the hand-back diffs against to name
     // commit(s) this run actually produced. `None` off-repo or when the read
@@ -802,9 +810,17 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // for `uncommitted_at_exit`, distinguishable from "unavailable".
     let git_caveats = newt_core::git_caveats::GitCaveats::read_only();
     let git_engine = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok();
+    let is_root_repo = git_engine.is_some();
     let uncommitted_at_exit = git_engine
         .as_ref()
         .and_then(|e| uncommitted_paths(e, &git_caveats));
+    let uncommitted_delta = uncommitted_repo_file_list(
+        uncommitted_at_exit,
+        is_root_repo,
+        &nested_before,
+        &workspace,
+        &read_scope,
+    );
     let commits_this_run = git_engine.as_ref().and_then(|engine| {
         commits_since(
             engine,
@@ -861,14 +877,11 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         // Harness-written, never the model's claim; solve_result only (the
         // contract record is field-pinned). Carries no hash or id.
         "handback": headless_contract::handback(
-            status_before.as_ref().and_then(|before| {
-                newt_core::agentic::snapshot_workspace(&workspace, &read_scope)
-                    .map(|after| newt_core::agentic::files_changed_between(before, &after))
-            }),
+            files_changed_delta(&status_before, &nested_before, &workspace, &read_scope),
             o_opt.map_or(&[][..], |o| &o.tool_events[..]),
             &end_reason,
             reply_chars > 0,
-            uncommitted_at_exit.clone(),
+            uncommitted_delta,
             commits_this_run.clone(),
         ),
     });
@@ -1281,6 +1294,92 @@ fn confined_bench_caveats_with_grants(
         max_calls: CountBound::Unlimited,
         valid_for_generation: Scope::All,
     }
+}
+
+/// Multi-repo recon PR2: the hand-back's `files_changed` input — the
+/// workspace root's own status DELTA when it IS a repo (unchanged), or the
+/// union of nested-repo deltas when it is not. `nested_before` is the
+/// pre-run probe (`None` when the root itself is a repo, `Some([])` when the
+/// root is not a repo AND has no nested repos either — both cases stay
+/// `"unavailable"`, matching `snapshot_workspace`'s own `None`-means-off-repo
+/// convention rather than fabricating an empty `"nested-repos"` list for
+/// nothing to report).
+fn files_changed_delta(
+    status_before: &Option<newt_core::agentic::StatusSnapshot>,
+    nested_before: &Option<Vec<newt_core::agentic::NestedRepoSnapshot>>,
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> Option<headless_contract::RepoFileList> {
+    if let Some(before) = status_before {
+        let after = newt_core::agentic::snapshot_workspace(workspace, read_scope)?;
+        return Some(headless_contract::RepoFileList::Root(
+            newt_core::agentic::files_changed_between(before, &after),
+        ));
+    }
+    let before = nested_before.as_ref()?;
+    if before.is_empty() {
+        return None;
+    }
+    let after = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+    let (files, unprobed) = newt_core::agentic::nested_files_changed_between(before, &after);
+    let by_repo = after
+        .iter()
+        .map(|repo| {
+            let before_status = before
+                .iter()
+                .find(|b| b.repo == repo.repo)
+                .and_then(|b| b.status.as_ref());
+            let files = match (before_status, repo.status.as_ref()) {
+                (Some(b), Some(a)) => newt_core::agentic::files_changed_between(b, a),
+                _ => Vec::new(),
+            };
+            (repo.repo.clone(), files)
+        })
+        .collect();
+    Some(headless_contract::RepoFileList::Nested {
+        files,
+        by_repo,
+        unprobed,
+    })
+}
+
+/// Multi-repo recon PR2: the hand-back's `uncommitted_files` input — the
+/// workspace root's CURRENT dirty set (via the embedded git engine,
+/// unchanged) when it IS a repo, or the union of each nested repo's own
+/// current dirty set (freshly probed at hand-back time — this is a CURRENT
+/// state, not a delta, so it needs no "before") when it is not.
+fn uncommitted_repo_file_list(
+    uncommitted_at_exit: Option<Vec<String>>,
+    is_root_repo: bool,
+    nested_before: &Option<Vec<newt_core::agentic::NestedRepoSnapshot>>,
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> Option<headless_contract::RepoFileList> {
+    if is_root_repo {
+        return uncommitted_at_exit.map(headless_contract::RepoFileList::Root);
+    }
+    let before = nested_before.as_ref()?;
+    if before.is_empty() {
+        return None;
+    }
+    let snapshots = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+    let (files, unprobed) = newt_core::agentic::nested_current_paths(&snapshots);
+    let by_repo = snapshots
+        .iter()
+        .map(|repo| {
+            let files = repo
+                .status
+                .as_ref()
+                .map(|s| s.keys().cloned().collect())
+                .unwrap_or_default();
+            (repo.repo.clone(), files)
+        })
+        .collect();
+    Some(headless_contract::RepoFileList::Nested {
+        files,
+        by_repo,
+        unprobed,
+    })
 }
 
 /// #2537: the workspace's CURRENT staged+unstaged+untracked paths, sorted

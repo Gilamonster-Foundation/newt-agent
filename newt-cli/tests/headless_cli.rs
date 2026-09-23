@@ -2211,6 +2211,120 @@ async fn handback_reports_a_clean_repo_when_the_run_touched_nothing() {
     assert!(handback.get("commits").is_none(), "{handback}");
 }
 
+/// Multi-repo recon PR2 (red first, end to end): a bare folder holding two
+/// git repos, one with a real uncommitted edit — the hand-back must name
+/// that repo and file, never a bare "unavailable" (RECON.md row 5's
+/// measured gap).
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_nested_repos_at_a_bare_multi_repo_root() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("bare multi-repo root");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    let repo_a = workspace.path().join("repoA");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    git(&repo_a, &["init", "-q"]);
+    git(&repo_a, &["config", "user.email", "t@example.com"]);
+    git(&repo_a, &["config", "user.name", "t"]);
+    std::fs::write(repo_a.join("a.txt"), "one\n").unwrap();
+    git(&repo_a, &["add", "a.txt"]);
+    git(&repo_a, &["commit", "-q", "-m", "init"]);
+    std::fs::write(repo_a.join("a.txt"), "one\ntwo\n").unwrap(); // uncommitted edit
+    let repo_b = workspace.path().join("repoB");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    git(&repo_b, &["init", "-q"]);
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files_source"], "nested-repos",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["repoA/a.txt"]),
+        "{handback}"
+    );
+    let by_repo = handback["uncommitted_files_by_repo"]
+        .as_array()
+        .expect("per-repo breakdown present");
+    assert!(
+        by_repo
+            .iter()
+            .any(|r| r["repo"] == "repoA" && r["files"] == serde_json::json!(["a.txt"])),
+        "{handback}"
+    );
+    assert!(
+        by_repo
+            .iter()
+            .any(|r| r["repo"] == "repoB" && r["files"] == serde_json::json!([])),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_unprobed").is_none(),
+        "both repos probed cleanly: {handback}"
+    );
+}
+
+/// A root that IS itself a git repo is byte-identical to today: the nested
+/// path is never reached, `files_changed_source`/`uncommitted_files_source`
+/// stay `"git_status_delta"`/`"git_status"`, and no per-repo/unprobed field
+/// appears at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_real_repo_root_is_unaffected_by_nested_repo_support() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["files_changed_source"], "git_status_delta",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status",
+        "{handback}"
+    );
+    assert!(
+        handback.get("files_changed_by_repo").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("files_changed_unprobed").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_by_repo").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_unprobed").is_none(),
+        "{handback}"
+    );
+}
+
 /// #2537 item 4, edge case 3: a detached HEAD must not crash or misreport —
 /// the same clean/no-commits result as a normal branch checkout.
 #[tokio::test(flavor = "multi_thread")]

@@ -277,6 +277,88 @@ pub fn calls_after_last_write(events: &[newt_core::ToolEvent]) -> Option<usize> 
 /// Most paths `handback` names; the rest are counted by the truncation flag.
 pub(crate) const HANDBACK_MAX_FILES: usize = 200;
 
+/// [`handback`]'s `files_changed` AND `uncommitted_files` inputs share this
+/// shape — both are "a list of paths, sourced either from the workspace
+/// root's own git status or from probing nested repos" — one type, not two
+/// near-identical enums (multi-repo recon PR2).
+pub enum RepoFileList {
+    /// The workspace root's own probe (today's single-repo case, unchanged):
+    /// a status DELTA for `files_changed` (source `"git_status_delta"`), or
+    /// the CURRENT dirty set for `uncommitted_files` (source `"git_status"`).
+    Root(Vec<String>),
+    /// A non-repo workspace root, probed per first-level nested repo
+    /// (`claim_check::nested_files_changed_between` for the delta,
+    /// `claim_check::nested_current_paths` for the current set): the union
+    /// of every probed repo's paths (already prefixed `<repo>/` by the
+    /// caller), the same union broken out per repo, and the repos that could
+    /// not be probed. Source renders `"nested-repos"` either way.
+    Nested {
+        files: Vec<String>,
+        by_repo: Vec<(String, Vec<String>)>,
+        unprobed: Vec<String>,
+    },
+}
+
+/// One conversion, shared by `handback`'s `files_changed` and
+/// `uncommitted_files` stanzas — the ONE place that knows how a
+/// [`RepoFileList`] renders, so the two fields cannot drift in how they cap,
+/// truncate, or name a source.
+struct RepoFileListStanza {
+    value: serde_json::Value,
+    source: &'static str,
+    truncated: bool,
+    by_repo: Option<Vec<(String, Vec<String>)>>,
+    unprobed: Vec<String>,
+}
+
+fn repo_file_list_stanza(
+    list: Option<RepoFileList>,
+    root_source: &'static str,
+) -> RepoFileListStanza {
+    match list {
+        Some(RepoFileList::Root(mut files)) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            RepoFileListStanza {
+                value: serde_json::json!(files),
+                source: root_source,
+                truncated,
+                by_repo: None,
+                unprobed: Vec::new(),
+            }
+        }
+        Some(RepoFileList::Nested {
+            mut files,
+            by_repo,
+            unprobed,
+        }) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            RepoFileListStanza {
+                value: serde_json::json!(files),
+                source: "nested-repos",
+                truncated,
+                by_repo: Some(by_repo),
+                unprobed,
+            }
+        }
+        None => RepoFileListStanza {
+            value: serde_json::Value::Null,
+            source: "unavailable",
+            truncated: false,
+            by_repo: None,
+            unprobed: Vec::new(),
+        },
+    }
+}
+
+fn by_repo_json(by_repo: Vec<(String, Vec<String>)>) -> serde_json::Value {
+    serde_json::json!(by_repo
+        .into_iter()
+        .map(|(repo, files)| serde_json::json!({"repo": repo, "files": files}))
+        .collect::<Vec<_>>())
+}
+
 /// U7: the harness-written account of how a run ended, on the solve_result line
 /// only (never the contract record). Everything here is the harness's own
 /// knowledge — none of it is the model's claim, and it holds no hash or id:
@@ -311,31 +393,51 @@ pub(crate) const HANDBACK_MAX_FILES: usize = 200;
 ///   only when at least one commit landed — nothing to commit (a clean repo,
 ///   or no repo at all) omits the field rather than writing an empty list or
 ///   inventing an id.
+///
+/// Multi-repo recon PR2: at a workspace root that is NOT itself a git repo,
+/// `files_changed` used to fall straight to `"unavailable"` — read by an
+/// operator as "nothing changed" even when a nested checkout (a bare folder
+/// holding several repos) has a real uncommitted edit. [`RepoFileList::
+/// Nested`] carries that case instead: the union of every probed nested
+/// repo's changed files, prefixed `<repo>/`, source `"nested-repos"`, plus a
+/// per-repo breakdown (`files_changed_by_repo`) and the repos that could not
+/// be probed (`files_changed_unprobed`, present only when non-empty) — named
+/// rather than silently folded into the union or dropped. This does NOT
+/// touch the pinned contract record (`contract_version`, #2218's
+/// unknown-field question) — `handback` is solely on the free-form
+/// `solve_result` line, so these are new OPTIONAL fields on an
+/// already-free-form object, not a versioned shape change.
 #[must_use]
 pub fn handback(
-    delta: Option<Vec<String>>,
+    delta: Option<RepoFileList>,
     events: &[newt_core::ToolEvent],
     end_reason: &str,
     reply_present: bool,
-    uncommitted: Option<Vec<String>>,
+    uncommitted: Option<RepoFileList>,
     commits: Option<Vec<String>>,
 ) -> serde_json::Value {
-    let (files, source, truncated) = match delta {
-        Some(mut files) => {
-            let truncated = files.len() > HANDBACK_MAX_FILES;
-            files.truncate(HANDBACK_MAX_FILES);
-            (serde_json::json!(files), "git_status_delta", truncated)
-        }
-        None => (serde_json::Value::Null, "unavailable", false),
-    };
-    let (uncommitted_files, uncommitted_source, uncommitted_truncated) = match uncommitted {
-        Some(mut files) => {
-            let truncated = files.len() > HANDBACK_MAX_FILES;
-            files.truncate(HANDBACK_MAX_FILES);
-            (serde_json::json!(files), "git_status", truncated)
-        }
-        None => (serde_json::Value::Null, "unavailable", false),
-    };
+    let stanza = repo_file_list_stanza(delta, "git_status_delta");
+    let (files, source, truncated, by_repo, unprobed) = (
+        stanza.value,
+        stanza.source,
+        stanza.truncated,
+        stanza.by_repo,
+        stanza.unprobed,
+    );
+    let uncommitted_stanza = repo_file_list_stanza(uncommitted, "git_status");
+    let (
+        uncommitted_files,
+        uncommitted_source,
+        uncommitted_truncated,
+        uncommitted_by_repo,
+        uncommitted_unprobed,
+    ) = (
+        uncommitted_stanza.value,
+        uncommitted_stanza.source,
+        uncommitted_stanza.truncated,
+        uncommitted_stanza.by_repo,
+        uncommitted_stanza.unprobed,
+    );
     let last_exec = events
         .iter()
         .rev()
@@ -352,6 +454,26 @@ pub fn handback(
         "end_reason": end_reason,
         "model_reply_present": reply_present,
     });
+    conditional_stanza(
+        &mut record,
+        "files_changed_by_repo",
+        by_repo.map(by_repo_json),
+    );
+    conditional_stanza(
+        &mut record,
+        "files_changed_unprobed",
+        (!unprobed.is_empty()).then_some(unprobed),
+    );
+    conditional_stanza(
+        &mut record,
+        "uncommitted_files_by_repo",
+        uncommitted_by_repo.map(by_repo_json),
+    );
+    conditional_stanza(
+        &mut record,
+        "uncommitted_files_unprobed",
+        (!uncommitted_unprobed.is_empty()).then_some(uncommitted_unprobed),
+    );
     conditional_stanza(
         &mut record,
         "commits",
@@ -633,7 +755,14 @@ mod tests {
 
     #[test]
     fn handback_reports_delta_caps_it_and_never_fakes_an_empty_list() {
-        let h = handback(Some(vec!["a.rs".into()]), &[], "None", false, None, None);
+        let h = handback(
+            Some(RepoFileList::Root(vec!["a.rs".into()])),
+            &[],
+            "None",
+            false,
+            None,
+            None,
+        );
         assert_eq!(h["files_changed"], serde_json::json!(["a.rs"]));
         assert_eq!(h["files_changed_source"], "git_status_delta");
         assert_eq!(h["model_reply_present"], false);
@@ -651,7 +780,14 @@ mod tests {
         );
 
         let many: Vec<String> = (0..201).map(|i| format!("f{i}")).collect();
-        let h = handback(Some(many), &[], "RoundCap", true, None, None);
+        let h = handback(
+            Some(RepoFileList::Root(many)),
+            &[],
+            "RoundCap",
+            true,
+            None,
+            None,
+        );
         assert_eq!(h["files_changed"].as_array().unwrap().len(), 200);
         assert_eq!(h["files_changed_truncated"], true);
 
@@ -660,7 +796,14 @@ mod tests {
         assert!(h["files_changed"].is_null());
         assert_eq!(h["files_changed_source"], "unavailable");
         // A clean repo IS an empty list, distinguishable from unavailable.
-        let h = handback(Some(vec![]), &[], "None", false, None, None);
+        let h = handback(
+            Some(RepoFileList::Root(vec![])),
+            &[],
+            "None",
+            false,
+            None,
+            None,
+        );
         assert_eq!(h["files_changed"], serde_json::json!([]));
     }
 
@@ -676,7 +819,7 @@ mod tests {
             &[],
             "None",
             false,
-            Some(vec!["dirty.rs".into()]),
+            Some(RepoFileList::Root(vec!["dirty.rs".into()])),
             None,
         );
         assert_eq!(h["uncommitted_files"], serde_json::json!(["dirty.rs"]));
@@ -689,11 +832,25 @@ mod tests {
         assert_eq!(h["uncommitted_files_source"], "unavailable");
 
         // A clean repo IS an empty list, distinguishable from unavailable.
-        let h = handback(None, &[], "None", false, Some(vec![]), None);
+        let h = handback(
+            None,
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Root(vec![])),
+            None,
+        );
         assert_eq!(h["uncommitted_files"], serde_json::json!([]));
 
         let many: Vec<String> = (0..201).map(|i| format!("d{i}")).collect();
-        let h = handback(None, &[], "None", false, Some(many), None);
+        let h = handback(
+            None,
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Root(many)),
+            None,
+        );
         assert_eq!(h["uncommitted_files"].as_array().unwrap().len(), 200);
         assert_eq!(h["uncommitted_files_truncated"], true);
     }
@@ -716,6 +873,54 @@ mod tests {
         let h = handback(None, &[], "None", false, None, None);
         assert!(h.get("commits").is_none());
     }
+
+    /// Multi-repo recon PR2 (red first): `RepoFileList::Nested` renders the
+    /// new `"nested-repos"` source for BOTH `files_changed` and
+    /// `uncommitted_files`, the union prefixed `<repo>/`, a per-repo
+    /// breakdown, and the unprobed list — present only when non-empty.
+    #[test]
+    fn handback_renders_the_nested_repos_source_and_per_repo_breakdown() {
+        let h = handback(
+            Some(RepoFileList::Nested {
+                files: vec!["repoA/a.txt".into()],
+                by_repo: vec![
+                    ("repoA".into(), vec!["a.txt".into()]),
+                    ("repoB".into(), vec![]),
+                ],
+                unprobed: vec!["repoC".into()],
+            }),
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Nested {
+                files: vec!["repoA/a.txt".into()],
+                by_repo: vec![("repoA".into(), vec!["a.txt".into()])],
+                unprobed: vec![],
+            }),
+            None,
+        );
+        assert_eq!(h["files_changed"], serde_json::json!(["repoA/a.txt"]));
+        assert_eq!(h["files_changed_source"], "nested-repos");
+        assert_eq!(
+            h["files_changed_by_repo"],
+            serde_json::json!([
+                {"repo": "repoA", "files": ["a.txt"]},
+                {"repo": "repoB", "files": []},
+            ])
+        );
+        assert_eq!(h["files_changed_unprobed"], serde_json::json!(["repoC"]));
+
+        assert_eq!(h["uncommitted_files"], serde_json::json!(["repoA/a.txt"]));
+        assert_eq!(h["uncommitted_files_source"], "nested-repos");
+        assert_eq!(
+            h["uncommitted_files_by_repo"],
+            serde_json::json!([{"repo": "repoA", "files": ["a.txt"]}])
+        );
+        // Empty unprobed list is ABSENT, not a fake `[]` — same convention
+        // as `commits`.
+        assert!(h.get("uncommitted_files_unprobed").is_none(), "{h}");
+    }
+
     use newt_core::{BehaviorSignal, ToolCallDialect};
 
     /// Every `TurnEndReason`, and a compile-time guard that this list stays

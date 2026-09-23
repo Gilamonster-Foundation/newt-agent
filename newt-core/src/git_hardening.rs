@@ -116,6 +116,18 @@ pub fn hardened_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat");
+    // F26: without a ceiling, `git status`/`rev-parse` walks UP from `cwd`
+    // until it finds a `.git` — so a plain folder inside a larger repo
+    // (no `.git` of its own) silently reports the ENCLOSING repo's status,
+    // leaking every path above the workspace into a hand-back. Stop the
+    // search at cwd's parent: cwd itself is still discovered normally, but
+    // nothing above it is. A `cwd` with no parent (filesystem root) has
+    // nothing above to leak, so it is left unset.
+    if let Ok(absolute_cwd) = std::path::absolute(cwd) {
+        if let Some(parent) = absolute_cwd.parent() {
+            c.env("GIT_CEILING_DIRECTORIES", parent);
+        }
+    }
     Ok(c)
 }
 

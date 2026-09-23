@@ -265,6 +265,129 @@ const EVIDENCE_STATUS_ARGS: [&str; 2] = ["status", "--porcelain"];
 /// script inside a new directory is named, not hidden behind `dir/`.
 const SNAPSHOT_STATUS_ARGS: [&str; 4] = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
 
+/// One first-level subdirectory of a NON-repo workspace root that is its own
+/// git repo (multi-repo recon PR2 — a bare folder of several checkouts).
+/// `status` is `None` when the probe itself could not run — outside the
+/// fs-read fence, or any git failure — so the caller can name the repo
+/// without inventing a file list for it.
+#[derive(Debug, Clone)]
+pub struct NestedRepoSnapshot {
+    /// The repo's directory name, relative to the workspace root (e.g.
+    /// `"repoA"`) — the prefix `nested_files_changed_between` uses.
+    pub repo: String,
+    pub status: Option<StatusSnapshot>,
+}
+
+/// Does `dir` look like a git repo root — a `.git` entry directly inside it
+/// (directory, or a worktree/submodule pointer file)? Deliberately NOT
+/// `workspace_key.rs`'s `discover_git_dir`: that walks UP from a start point
+/// and resolves worktree pointer files to their real gitdir, answering "is
+/// this path INSIDE a repo"; this answers a narrower question — "is this
+/// EXACT directory a repo root" — for filtering a directory LISTING, where
+/// walking up would find the SAME repo from every subdirectory of a large
+/// checkout and misclassify each as its own nested repo.
+fn is_repo_root(dir: &std::path::Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// Probe each first-level subdirectory of `workspace` that is its own git
+/// repo — the bare-folder-of-checkouts case `snapshot_workspace` cannot see
+/// (it only probes `workspace` itself). Reuses
+/// [`crate::tooling::first_level_subdirs`] (never a second directory
+/// lister). Only called by the caller when `workspace` itself is NOT a repo;
+/// this function does not check that.
+///
+/// The fs-read fence is checked PER REPO via [`crate::caveats::permits_path`]
+/// (prefix containment, the same check every other fs-read site uses) before
+/// even attempting the probe. In practice `git_in`'s own gate
+/// (`check_git_read_scope`'s "metadata" class) is coarser than this: a
+/// BOUNDED `fs_read` (`Scope::Only`) refuses every metadata git read
+/// uniformly, not per path — the SAME all-or-nothing rule
+/// [`snapshot_workspace`] is already subject to today, verified by
+/// `snapshot_nested_repos_names_every_repo_as_unprobed_under_a_bounded_scope`.
+/// The `permits_path` check is kept anyway as the documented, narrower
+/// intent (defense in depth against `git_in`'s gate ever becoming
+/// path-aware) — either way, a repo whose probe does not succeed is
+/// returned with `status: None` rather than silently skipped, so the
+/// hand-back can name it as unprobed instead of making it invisible.
+#[must_use]
+pub fn snapshot_nested_repos(
+    workspace: &str,
+    read_scope: &crate::Scope<String>,
+) -> Vec<NestedRepoSnapshot> {
+    crate::tooling::first_level_subdirs(std::path::Path::new(workspace))
+        .into_iter()
+        .filter(|dir| is_repo_root(dir))
+        .filter_map(|dir| {
+            let repo = dir.file_name()?.to_string_lossy().into_owned();
+            let dir_str = dir.to_string_lossy().into_owned();
+            let status = crate::caveats::permits_path(read_scope, &dir_str)
+                .then(|| git_in(&dir_str, &SNAPSHOT_STATUS_ARGS, read_scope))
+                .flatten()
+                .map(|out| parse_porcelain_z(&out));
+            Some(NestedRepoSnapshot { repo, status })
+        })
+        .collect()
+}
+
+/// The nested-repo equivalent of [`files_changed_between`]: for each repo
+/// present in `after` with a successful probe, diffed against the SAME repo
+/// in `before` (matched by directory name) — `<repo>/<path>` for every
+/// changed file, sorted. Returns `(files, unprobed)`: `unprobed` names every
+/// repo excluded from `files` — a probe failure at either end, or a repo
+/// `after` found that `before` never saw (nothing trustworthy to diff
+/// against) — so it is reported, never silently dropped.
+#[must_use]
+pub fn nested_files_changed_between(
+    before: &[NestedRepoSnapshot],
+    after: &[NestedRepoSnapshot],
+) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut unprobed = Vec::new();
+    for repo_after in after {
+        let Some(after_status) = &repo_after.status else {
+            unprobed.push(repo_after.repo.clone());
+            continue;
+        };
+        let before_status = before
+            .iter()
+            .find(|b| b.repo == repo_after.repo)
+            .and_then(|b| b.status.as_ref());
+        let Some(before_status) = before_status else {
+            unprobed.push(repo_after.repo.clone());
+            continue;
+        };
+        for path in files_changed_between(before_status, after_status) {
+            files.push(format!("{}/{path}", repo_after.repo));
+        }
+    }
+    files.sort();
+    (files, unprobed)
+}
+
+/// The nested-repo equivalent of a single repo's CURRENT dirty set (not a
+/// delta) — every path in each successfully-probed repo's own status
+/// snapshot, prefixed `<repo>/`. Returns `(files, unprobed)`, same shape and
+/// same reason as [`nested_files_changed_between`]: a repo whose probe
+/// failed is named, never silently absorbed into an empty list.
+#[must_use]
+pub fn nested_current_paths(snapshots: &[NestedRepoSnapshot]) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut unprobed = Vec::new();
+    for repo in snapshots {
+        match &repo.status {
+            Some(status) => {
+                for path in status.keys() {
+                    files.push(format!("{}/{path}", repo.repo));
+                }
+            }
+            None => unprobed.push(repo.repo.clone()),
+        }
+    }
+    files.sort();
+    (files, unprobed)
+}
+
 /// The workspace's changed-path snapshot, or `None` off-repo / on any git failure.
 #[must_use]
 pub fn snapshot_workspace(
@@ -821,5 +944,209 @@ mod tests {
         let text = "see newt-core/Cargo.toml and also Cargo.toml".to_string();
         let out = annotate_against_workspace(text.clone(), ws);
         assert_eq!(out, text, "ambiguous-but-real is still a verify: {out}");
+    }
+
+    /// Multi-repo recon PR2 fixtures: a `git()` runner scoped to `dir`, and a
+    /// bare tempdir root holding two independent git repos (`repoA`,
+    /// `repoB`), one with a real uncommitted edit — the exact r9-r12 shape
+    /// (a bare folder of several checkouts) `snapshot_workspace` alone
+    /// cannot see into.
+    fn git_in_dir(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git")
+                .status
+                .success(),
+            "git {args:?} in {}",
+            dir.display()
+        );
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git_in_dir(dir, &["init", "-q"]);
+        git_in_dir(dir, &["config", "user.email", "t@example.com"]);
+        git_in_dir(dir, &["config", "user.name", "t"]);
+    }
+
+    /// A bare root holding `repoA` (committed file `a.txt`, then edited
+    /// uncommitted) and `repoB` (clean).
+    fn bare_multi_repo_fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("bare multi-repo root");
+        let repo_a = root.path().join("repoA");
+        init_repo(&repo_a);
+        std::fs::write(repo_a.join("a.txt"), "one\n").unwrap();
+        git_in_dir(&repo_a, &["add", "a.txt"]);
+        git_in_dir(&repo_a, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo_a.join("a.txt"), "one\ntwo\n").unwrap(); // uncommitted edit
+        init_repo(&root.path().join("repoB"));
+        root
+    }
+
+    /// F24-recon row 5 / PR2 (red first): the bare-root shape reports EACH
+    /// nested repo, never a bare "unavailable". `repoA`'s uncommitted edit
+    /// is visible in its own status snapshot; `repoB` (clean) is present
+    /// with an empty one.
+    #[test]
+    fn snapshot_nested_repos_probes_each_first_level_git_child() {
+        let root = bare_multi_repo_fixture();
+        assert!(
+            snapshot_workspace(&root.path().to_string_lossy(), &crate::Scope::All).is_none(),
+            "the bare root itself is not a repo"
+        );
+        let snapshots = snapshot_nested_repos(&root.path().to_string_lossy(), &crate::Scope::All);
+        assert_eq!(snapshots.len(), 2, "{snapshots:?}");
+        let repo_a = snapshots
+            .iter()
+            .find(|s| s.repo == "repoA")
+            .expect("repoA probed");
+        let status_a = repo_a.status.as_ref().expect("repoA's probe must succeed");
+        assert_eq!(status_a.get("a.txt").map(String::as_str), Some(" M"));
+        let repo_b = snapshots
+            .iter()
+            .find(|s| s.repo == "repoB")
+            .expect("repoB probed");
+        assert_eq!(
+            repo_b
+                .status
+                .as_ref()
+                .expect("repoB's probe must succeed")
+                .len(),
+            0,
+            "repoB is clean"
+        );
+    }
+
+    /// A plain (non-git) first-level subdirectory is not a candidate at all
+    /// — never listed, never reported as unprobed. Only a `.git`-bearing
+    /// directory counts as a nested repo.
+    #[test]
+    fn snapshot_nested_repos_ignores_non_repo_subdirs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("just_a_folder")).unwrap();
+        let snapshots = snapshot_nested_repos(&root.path().to_string_lossy(), &crate::Scope::All);
+        assert!(snapshots.is_empty(), "{snapshots:?}");
+    }
+
+    /// A nested repo that fails to probe (outside the fs-read fence, or any
+    /// other `git_in` failure) is named, not silently skipped — `status:
+    /// None`, distinguishable from "not a repo at all" (which never appears
+    /// in the list). Measured: `check_git_read_scope`'s "metadata" class
+    /// (what `git_in` uses) is all-or-nothing on `Scope::Only` — the SAME
+    /// gate `snapshot_workspace` is already subject to today — so a bounded
+    /// scope refuses every nested repo's probe uniformly, not per-path; this
+    /// pins that behaviour is inherited, not silently different, for the
+    /// nested case.
+    #[test]
+    fn snapshot_nested_repos_names_every_repo_as_unprobed_under_a_bounded_scope() {
+        let root = bare_multi_repo_fixture();
+        let scope = crate::Scope::only([root.path().to_string_lossy().into_owned()]);
+        let snapshots = snapshot_nested_repos(&root.path().to_string_lossy(), &scope);
+        assert_eq!(snapshots.len(), 2, "{snapshots:?}");
+        for repo in &snapshots {
+            assert!(
+                repo.status.is_none(),
+                "{}: a bounded fs_read scope refuses every metadata git read, \
+                 the same as snapshot_workspace — named, not probed",
+                repo.repo
+            );
+        }
+        // Confirms the SAME gate the single-repo path is already subject to,
+        // not a nested-only regression.
+        assert!(snapshot_workspace(&root.path().join("repoA").to_string_lossy(), &scope).is_none());
+    }
+
+    /// `nested_files_changed_between` (the delta): repoA's edit, made AFTER
+    /// `before` was captured, is reported prefixed `repoA/`; repoB (clean at
+    /// both ends) contributes nothing.
+    #[test]
+    fn nested_files_changed_between_prefixes_by_repo_and_ignores_clean_repos() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_a = root.path().join("repoA");
+        init_repo(&repo_a);
+        std::fs::write(repo_a.join("a.txt"), "one\n").unwrap();
+        git_in_dir(&repo_a, &["add", "a.txt"]);
+        git_in_dir(&repo_a, &["commit", "-q", "-m", "init"]);
+        init_repo(&root.path().join("repoB"));
+
+        let workspace = root.path().to_string_lossy().into_owned();
+        let before = snapshot_nested_repos(&workspace, &crate::Scope::All);
+        std::fs::write(repo_a.join("a.txt"), "one\ntwo\n").unwrap();
+        let after = snapshot_nested_repos(&workspace, &crate::Scope::All);
+        let (files, unprobed) = nested_files_changed_between(&before, &after);
+        assert_eq!(files, vec!["repoA/a.txt".to_string()], "{files:?}");
+        assert!(unprobed.is_empty(), "{unprobed:?}");
+    }
+
+    /// `nested_current_paths` (the CURRENT set, not a delta): repoA's
+    /// uncommitted edit is visible with no "before" needed at all — this is
+    /// what feeds `uncommitted_files` in the nested case.
+    #[test]
+    fn nested_current_paths_lists_every_probed_repos_dirty_files() {
+        let root = bare_multi_repo_fixture();
+        let snapshots = snapshot_nested_repos(&root.path().to_string_lossy(), &crate::Scope::All);
+        let (files, unprobed) = nested_current_paths(&snapshots);
+        assert_eq!(files, vec!["repoA/a.txt".to_string()], "{files:?}");
+        assert!(unprobed.is_empty(), "{unprobed:?}");
+    }
+
+    /// A root that IS a repo takes the existing `snapshot_workspace` path
+    /// untouched — `snapshot_nested_repos` is simply never reached by the
+    /// caller in that case (the byte-identical-to-today claim is pinned at
+    /// the `headless_contract`/`headless_cli` level, where the actual
+    /// `files_changed_source` string is asserted); this test only confirms
+    /// the pure claim_check-level behaviour is unaffected: `snapshot_workspace`
+    /// still succeeds on a repo root exactly as before this PR touched
+    /// anything.
+    #[test]
+    fn a_repo_root_still_probes_via_snapshot_workspace_unaffected_by_nesting() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        assert!(snapshot_workspace(&root.path().to_string_lossy(), &crate::Scope::All).is_some());
+    }
+
+    /// F26 (red first): a plain folder with no `.git` of its own, sitting
+    /// INSIDE a larger git repo, must never have `git`'s normal upward
+    /// discovery hand it the ENCLOSING repo's status — that both answers
+    /// the wrong question (the outer repo's ~200 paths, not the workspace's)
+    /// and leaks everything above the workspace boundary. `snapshot_workspace`
+    /// on the plain subfolder must see NO repo (so the caller falls through
+    /// to the nested-repos path), and the nested probe must report only the
+    /// inner repo actually inside the workspace.
+    #[test]
+    fn snapshot_workspace_never_discovers_an_enclosing_repo_above_the_workspace() {
+        let outer = tempfile::tempdir().expect("outer root");
+        init_repo(outer.path());
+        std::fs::write(outer.path().join("outer.txt"), "outer\n").unwrap();
+        git_in_dir(outer.path(), &["add", "outer.txt"]);
+        git_in_dir(outer.path(), &["commit", "-q", "-m", "outer init"]);
+
+        // `workspace`: a plain subfolder of the outer repo, itself not a
+        // repo, holding one nested repo (`inner`).
+        let workspace = outer.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let inner = workspace.join("inner");
+        init_repo(&inner);
+        std::fs::write(inner.join("i.txt"), "one\n").unwrap();
+        git_in_dir(&inner, &["add", "i.txt"]);
+        git_in_dir(&inner, &["commit", "-q", "-m", "inner init"]);
+        std::fs::write(inner.join("i.txt"), "one\ntwo\n").unwrap(); // uncommitted
+
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        assert!(
+            snapshot_workspace(&workspace_str, &crate::Scope::All).is_none(),
+            "a plain subfolder must never resolve to the enclosing repo"
+        );
+        let snapshots = snapshot_nested_repos(&workspace_str, &crate::Scope::All);
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        assert_eq!(snapshots[0].repo, "inner");
+        let status = snapshots[0]
+            .status
+            .as_ref()
+            .expect("inner's probe must succeed");
+        assert_eq!(status.get("i.txt").map(String::as_str), Some(" M"));
     }
 }
