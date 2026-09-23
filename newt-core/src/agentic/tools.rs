@@ -29,7 +29,9 @@ use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
 use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
-use output_budget::{max_output_tokens, paginate_read, paginate_unspillable};
+#[cfg(test)]
+use output_budget::paginate_read;
+use output_budget::{paginate_unspillable, read_file_page};
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
@@ -4051,8 +4053,10 @@ async fn execute_authorized_tool(
                     let offset = args["offset"].as_u64().map(|n| n as usize);
                     let limit = args["limit"].as_u64().map(|n| n as usize);
                     // #726: char backstop now derives from the shared token
-                    // budget so read_file and run_command share one cap.
-                    paginate_read(&contents, offset, limit, max_output_tokens())
+                    // budget so read_file and run_command share one cap —
+                    // held under the spill cap when offload is on, so a big
+                    // file pages with `offset=` instead of becoming a handle.
+                    read_file_page(&contents, offset, limit, tool_offload)
                 }
                 Err(tool_output) => tool_output,
             }

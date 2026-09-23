@@ -214,14 +214,31 @@ pub(super) fn paginate_read(
     let end = start0 + window.len(); // 1-based last line shown == end
     let mut body = window.join("\n");
     let char_capped = body.len() > max_chars;
+    // The last line shown WHOLE, when the char cap cut on a line boundary.
+    let mut whole_through = None;
     if char_capped {
         let mut cut = max_chars;
         while cut > 0 && !body.is_char_boundary(cut) {
             cut -= 1;
         }
-        body.truncate(cut);
+        // Cut on the last whole line when there is one, so the footer can name
+        // the exact line to resume from. A single line longer than the cap
+        // (minified, base64) has no boundary and is cut mid-line as before.
+        match body[..cut].rfind('\n') {
+            Some(newline) => {
+                body.truncate(newline);
+                whole_through = Some(start0 + body.lines().count());
+            }
+            None => body.truncate(cut),
+        }
     }
-    let footer = if char_capped {
+    let footer = if let Some(last) = whole_through {
+        Some(format!(
+            "payload truncated to {max_chars} chars (~{max_output_tokens} tokens) at line \
+             {last} of {total}; call read_file with offset={} to continue",
+            last + 1
+        ))
+    } else if char_capped {
         Some(format!(
             "payload truncated to {max_chars} chars (~{max_output_tokens} tokens) from line \
              {start}; call read_file with a higher offset (and/or smaller limit) to continue"
@@ -238,6 +255,23 @@ pub(super) fn paginate_read(
     match footer {
         Some(f) => format!("{body}\n\n[{f}]"),
         None => body,
+    }
+}
+
+/// The page `read_file` returns. With content offload on, a page over the
+/// spill cap is replaced by a teaser + `spill:` handle — the model asked for
+/// text and got a handle to redeem — so the page is held under that cap and
+/// ends with the `offset=` to continue from instead.
+pub(super) fn read_file_page(
+    contents: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    tool_offload: bool,
+) -> String {
+    if tool_offload {
+        paginate_unspillable(contents, offset, limit)
+    } else {
+        paginate_read(contents, offset, limit, max_output_tokens())
     }
 }
 

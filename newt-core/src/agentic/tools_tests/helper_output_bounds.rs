@@ -310,3 +310,52 @@ fn shell_envelope_without_streams_commits_the_exit_result() {
         "⚙  run_command: exit 3\n▒ error: command exited 3\n…\n"
     );
 }
+
+// ---- read_file never produces a spill handle (live 2026-09-23) ----
+//
+// read_file's page cap (~30k chars) exceeded the model-facing spill cap (16k),
+// so every large-file read reached the model as a teaser + `spill:` handle:
+// "the tool truncated the payload … and only the spill address was returned,
+// not the actual text" (ornith-1.5-35b, refactoring newt-core/src/agentic/mod.rs).
+// A page the model can continue with `offset=N` beats a handle it must redeem.
+
+#[test]
+fn a_char_capped_page_ends_on_a_whole_line_and_names_the_exact_resume_offset() {
+    let body: String = (1..=3_000)
+        .map(|n| format!("line {n:05} {}", "y".repeat(30)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out = paginate_read(&body, None, None, 1_000);
+    let (page, footer) = out
+        .rsplit_once("\n\n[")
+        .expect("a truncated page has a footer");
+    let last = page.lines().last().unwrap();
+    assert!(last.ends_with(&"y".repeat(30)), "no half line: {last:?}");
+    let shown: usize = last[5..10].parse().unwrap();
+    assert!(
+        footer.contains(&format!("offset={}", shown + 1)),
+        "resume exactly after line {shown}: {footer}"
+    );
+}
+
+#[test]
+fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
+    let body = (1..=5_000)
+        .map(|n| format!("line {n} {}", "z".repeat(40)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cap = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
+    let on = read_file_page(&body, None, None, true);
+    assert!(
+        on.chars().count() <= cap,
+        "{} chars would spill",
+        on.chars().count()
+    );
+    assert!(on.contains("offset="), "says how to continue");
+    // Offload off: nothing would spill, so the ordinary (larger) cap applies.
+    let off = read_file_page(&body, None, None, false);
+    assert!(
+        off.chars().count() > cap,
+        "offload off keeps the full budget"
+    );
+}
