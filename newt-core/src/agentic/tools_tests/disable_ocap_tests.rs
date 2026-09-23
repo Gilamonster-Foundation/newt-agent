@@ -1548,7 +1548,7 @@ fn build_route_refuses_unsafe_argv_shapes() {
         r"cargo test a\ b",
     ] {
         assert_eq!(
-            table.classify(cmd, cwd),
+            table.classify(cmd, cwd, &crate::caveats::Scope::All),
             RouteDecision::Exec,
             "{cmd:?} carries a token the shell would transform; it must gate to exec"
         );
@@ -1556,7 +1556,7 @@ fn build_route_refuses_unsafe_argv_shapes() {
 
     assert!(
         matches!(
-            table.classify("cargo test -p newt-core", cwd),
+            table.classify("cargo test -p newt-core", cwd, &crate::caveats::Scope::All),
             RouteDecision::Route {
                 tool: "build_exec",
                 ..
@@ -1842,12 +1842,16 @@ async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() 
     );
 }
 
-/// F24 (r10 evidence, red first): almost every `run_command` in
-/// 2483-r10/2488-r10 began with `cd <workspace root> && …` — the session's
-/// OWN cwd — which made every command compound and never routed at all. A
-/// routed `cd <root> && cargo check` must run through the SAME build lane
-/// as a bare `cargo check`, and the routed note must say the `cd` was
-/// recognised and dropped as a no-op.
+/// F24/PR1 (r10-r12 evidence, red first): almost every `run_command` began
+/// with `cd <dir> && …` — the session's OWN workspace root, or a real
+/// subdirectory (see `a_cd_prefixed_subdirectory_routes_and_says_so` below)
+/// — which made every command compound and never routed at all. A routed
+/// `cd <root> && cargo check` must run through the SAME build lane as a
+/// bare `cargo check`; the workspace root resolves to `cwd="."`, so PR1's
+/// routed-note clause (which names the folded directory) stays empty for
+/// this case — nothing to say beyond the routed note itself.
+// `write_passing_scratch_crate` (a real build-lane dispatch) is
+// `#[cfg(not(windows))]`; see its own doc for why.
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_noop_cd_to_the_workspace_root_still_routes_and_says_so() {
@@ -1888,9 +1892,63 @@ async fn a_noop_cd_to_the_workspace_root_still_routes_and_says_so() {
          the displayed argv: {out}"
     );
     assert!(
-        out.contains("the leading `cd` to the workspace root was dropped as a no-op"),
-        "the routed note must say the cd was recognised and dropped, not \
-         silently ignored: {out}"
+        !out.contains("cwd="),
+        "the workspace root resolves to cwd=\".\" — nothing to name: {out}"
+    );
+    assert!(
+        !out.contains("error: command exited"),
+        "a genuinely passing build must not be reported as failed: {out}"
+    );
+}
+
+/// PR1 (red first): a `cd <subdir> && cargo check` — not just the
+/// workspace root — now routes too, and the routed note names WHICH
+/// directory it actually ran in.
+// `write_passing_scratch_crate` (a real build-lane dispatch) is
+// `#[cfg(not(windows))]`; see its own doc for why.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_cd_prefixed_subdirectory_routes_and_says_so() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    write_passing_scratch_crate(&sub);
+    let caveats = Caveats::top();
+    let root_str = root.path().to_string_lossy();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cd sub && cargo check" }),
+        &root_str,
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo check`") && out.contains("confined build lane"),
+        "the cd-prefixed subdirectory call must route too: {out}"
+    );
+    assert!(
+        out.contains("cwd=sub"),
+        "the routed note must name the folded directory: {out}"
     );
     assert!(
         !out.contains("error: command exited"),
