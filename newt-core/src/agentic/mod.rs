@@ -5074,13 +5074,22 @@ fn is_progress_verification(
     // `argv[0]` is the program (`cargo`/`just`); `argv[1]` is cargo's
     // subcommand or the just recipe name — the SAME slot `Phase::from_key`
     // reads for `lifecycle`, so one function decides "is this a gate" for
-    // both call shapes.
-    routed
-        .get("argv")
-        .and_then(|v| v.as_array())
-        .and_then(|argv| argv.get(1))
-        .and_then(|v| v.as_str())
-        .and_then(crate::tooling::Phase::from_key)
+    // both call shapes. #2524 follow-up: `cargo_build_route` keeps a
+    // leading `+toolchain` selector (`cargo +stable test`) in `argv`, so
+    // that slot may be `argv[1]` (`+stable`) instead of the subcommand —
+    // skip it with the SAME `is_toolchain_selector` `cargo_build_route`
+    // itself checks, shared rather than re-derived, so the two can never
+    // disagree about what counts as a selector.
+    let Some(argv) = routed.get("argv").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let sub = match argv.get(1).and_then(|v| v.as_str()) {
+        Some(token) if routing::is_toolchain_selector(token) => {
+            argv.get(2).and_then(|v| v.as_str())
+        }
+        other => other,
+    };
+    sub.and_then(crate::tooling::Phase::from_key)
         .is_some_and(crate::tooling::Phase::is_gate)
 }
 

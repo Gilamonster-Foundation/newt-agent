@@ -601,7 +601,13 @@ fn cargo_build_route(rest: &[&str]) -> RouteDecision {
 /// smuggle one past `BUILD_UNSAFE`/`SHELL_META`. A bare `+`, an empty name,
 /// or anything else refuses — see [`cargo_build_route`], which refuses the
 /// WHOLE call on a `false` here rather than silently dropping the token.
-fn is_toolchain_selector(token: &str) -> bool {
+///
+/// `pub(crate)` (#2524 follow-up / #2548 interaction): `mod.rs`'s
+/// `is_progress_verification` reads `routed argv[1]` as the gate
+/// subcommand — for a routed `cargo +stable test`, that slot is `+stable`,
+/// not `test`, so a genuine pass would silently never count without also
+/// skipping the selector there. ONE rule, shared, not re-derived.
+pub(crate) fn is_toolchain_selector(token: &str) -> bool {
     match token.strip_prefix('+') {
         Some(name) if !name.is_empty() => name
             .chars()
