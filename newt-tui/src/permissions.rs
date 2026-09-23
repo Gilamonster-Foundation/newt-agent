@@ -138,11 +138,19 @@ fn permission_policy(
             key: "s",
             label: "session allow",
         });
-        if req.kind == DenialKind::Net && terminal {
+        // #2535/#2524 PR1: every durable-store kind offers permanent allow
+        // now, not just net — `persist_approve` signs whichever of
+        // exec/fs/net the answer names into `approve.toml`.
+        if terminal
+            && matches!(
+                req.kind,
+                DenialKind::Exec | DenialKind::FsRead | DenialKind::FsWrite | DenialKind::Net
+            )
+        {
             actions.push(OfferedAction {
                 action: PromptChoice::AllowPermanent,
                 key: "A",
-                label: "Allow permanently (adds host to config)",
+                label: "Allow permanently (signs a durable grant)",
             });
         }
     }
@@ -507,6 +515,64 @@ fn lost_to_web_message(mine: PromptChoice, winner: PromptChoice) -> String {
         winner.as_str(),
         mine.as_str()
     )
+}
+
+/// The durable `approve.toml` entry a `[A]llow permanently` answer for
+/// `(kind, target)` would write, or the refusal reason for a shape the store
+/// must never accept (#2535/#2524 PR1).
+///
+/// `None` for a kind the durable store has no vocabulary for (`RemoteTool`,
+/// `GitWrite`, `Build`) — those keep the session-only fallback. `Some(Err)`
+/// for an exec target that names a path (contains a separator) without being
+/// absolute: `agent-bridle-core`'s `ExecEntry.target` matches verbatim, so a
+/// relative path like `./build.sh` would silently mean "whatever `./` is at
+/// match time", never what the operator approved.
+fn approve_entry_for(
+    kind: newt_core::DenialKind,
+    target: &str,
+) -> Option<Result<newt_core::ocap_store::ApproveEntry, String>> {
+    use newt_core::ocap_store::ApproveEntry;
+    match kind {
+        newt_core::DenialKind::Exec => {
+            let is_path = target.contains('/') || target.contains('\\');
+            if is_path && !std::path::Path::new(target).is_absolute() {
+                return Some(Err(format!(
+                    "permanent allow refused: `{target}` is a relative path — grant a \
+                     bare command name or an absolute path instead"
+                )));
+            }
+            Some(Ok(ApproveEntry::Exec {
+                target: target.to_string(),
+            }))
+        }
+        newt_core::DenialKind::FsRead => Some(Ok(ApproveEntry::Fs {
+            path: target.to_string(),
+            write: false,
+        })),
+        newt_core::DenialKind::FsWrite => Some(Ok(ApproveEntry::Fs {
+            path: target.to_string(),
+            write: true,
+        })),
+        newt_core::DenialKind::Net => Some(Ok(ApproveEntry::Net {
+            host: target.to_string(),
+        })),
+        newt_core::DenialKind::RemoteTool
+        | newt_core::DenialKind::GitWrite
+        | newt_core::DenialKind::Build => None,
+    }
+}
+
+/// Operator-facing axis name for the "permanently allowed" notice.
+fn axis_label(kind: newt_core::DenialKind) -> &'static str {
+    match kind {
+        newt_core::DenialKind::Exec => "exec",
+        newt_core::DenialKind::FsRead => "fs (read)",
+        newt_core::DenialKind::FsWrite => "fs (write)",
+        newt_core::DenialKind::Net => "net",
+        newt_core::DenialKind::RemoteTool => "remote tool",
+        newt_core::DenialKind::GitWrite => "git write",
+        newt_core::DenialKind::Build => "build",
+    }
 }
 
 fn decision_scope(choice: PromptChoice) -> &'static str {
@@ -1817,14 +1883,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                         .insert((req.kind, req.target.clone()));
                 }
                 PromptChoice::AllowPermanent => {
-                    // Only net has a durable per-target config allowlist.
-                    if req.kind != newt_core::DenialKind::Net {
-                        self.record(req, "allow", scope);
-                        self.state
-                            .session_grants
-                            .insert((req.kind, req.target.clone()));
-                        continue;
-                    }
+                    // The danger refusal must run BEFORE any write attempt for
+                    // ALL FOUR durable-store kinds — a real bug fix (#2535):
+                    // this used to run only for net.
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
                         self.record(req, "deny", "permanent-allow-refused-high-danger");
                         self.notice(
@@ -1833,42 +1894,86 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                         );
                         return Deny;
                     }
-                    let persistent_scope = match self.config_path.as_deref() {
-                        Some(path) => {
-                            match newt_core::Config::append_permission_net_host(path, &req.target) {
-                                Ok(()) => "permanent",
+                    let entry = match approve_entry_for(req.kind, &req.target) {
+                        None => {
+                            // Kinds outside the durable store's vocabulary
+                            // (RemoteTool/GitWrite/Build) keep the prior
+                            // session-only behavior.
+                            self.record(req, "allow", scope);
+                            self.state
+                                .session_grants
+                                .insert((req.kind, req.target.clone()));
+                            continue;
+                        }
+                        Some(Err(reason)) => {
+                            self.record(req, "deny", "permanent-allow-refused-relative-exec-path");
+                            self.notice(window.as_ref(), &reason);
+                            return Deny;
+                        }
+                        Some(Ok(entry)) => entry,
+                    };
+                    // #2535 item 6: a delegated session never establishes its
+                    // own root — reading `key_path` under one anyway would be
+                    // the dangerous shape this repo's OCAP doctrine calls out
+                    // (a key visible on disk, deliberately not rooted in).
+                    let root = if self.delegation.is_some() {
+                        None
+                    } else {
+                        self.key_path
+                            .as_deref()
+                            .and_then(|p| newt_identity::load_user_key(p).ok())
+                    };
+                    let persistent_scope = match (root, self.config_path.as_deref()) {
+                        (Some(root), Some(config_path)) => {
+                            match newt_core::ocap_store::persist_approve(
+                                config_path,
+                                entry,
+                                ocap_high_danger_predicate(),
+                                |payload| root.sign(payload).to_bytes(),
+                            ) {
+                                Ok(file) => {
+                                    self.state
+                                        .ocap_policy
+                                        .files
+                                        .insert(newt_core::ocap_store::Verdict::Approve, file);
+                                    self.state.fold_ocap_approvals();
+                                    let approve_path = config_path
+                                        .with_file_name("ocap")
+                                        .join(newt_core::ocap_store::Verdict::Approve.filename());
+                                    self.notice(
+                                        window.as_ref(),
+                                        &format!(
+                                            "permanently allowed: {} `{}` (signed → {})",
+                                            axis_label(req.kind),
+                                            req.target,
+                                            approve_path.display()
+                                        ),
+                                    );
+                                    "permanent"
+                                }
                                 Err(e) => {
                                     self.notice(
                                         window.as_ref(),
                                         &format!(
-                                            "warning: could not persist net grant to config: {e} \
-                                             (granted for this session only)"
+                                            "warning: could not persist permanent grant: {e} \
+                                         (granted for this session only)"
                                         ),
                                     );
                                     "permanent-persist-failed"
                                 }
                             }
                         }
-                        None => {
+                        _ => {
                             self.notice(
                                 window.as_ref(),
-                                "no effective writable config target — net grant is session-only; \
-                                 select a trusted config with --config to save permanent grants",
+                                "permanent allow unavailable (no root key in this session): \
+                                 granted for this session only — run `newt doctor` or restore \
+                                 ~/.newt/identity.pem",
                             );
                             "session"
                         }
                     };
                     self.record(req, "allow", persistent_scope);
-                    if persistent_scope == "permanent" {
-                        self.notice(
-                            window.as_ref(),
-                            &format!(
-                                "added `{}` to [tui.permissions] net — future sessions \
-                                 will not prompt for it",
-                                req.target
-                            ),
-                        );
-                    }
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
@@ -1961,6 +2066,10 @@ mod session_promotion;
 #[cfg(test)]
 #[path = "permissions_tests/ocap_grant_fold.rs"]
 mod ocap_grant_fold;
+
+#[cfg(test)]
+#[path = "permissions_tests/permanent_grant_writer.rs"]
+mod permanent_grant_writer;
 
 /// **A0 byte goldens (#1823, epic #1803): the plain permission-prompt
 /// rendering, frozen verbatim.** These strings ARE the current contract —
