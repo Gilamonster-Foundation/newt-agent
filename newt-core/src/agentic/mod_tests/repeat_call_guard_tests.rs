@@ -1271,6 +1271,37 @@ fn a_routed_build_exec_pass_resets_the_brake_but_a_failure_does_not() {
     ));
 }
 
+/// #2548 round 2 should-fix (red first): a routed `build_exec` pass counts
+/// ONLY when the argv's subcommand/recipe is a gate — mirroring
+/// `Phase::is_gate` exactly, the same "test"/"check" vocabulary the
+/// `lifecycle` side already uses. `cargo build` (an incremental no-op when
+/// already built), `cargo clippy`, `just fmt` and `just clean` all route to
+/// `build_exec` too, but pass trivially or say nothing about behaviour —
+/// a model alternating `edit_file` with a trivially-passing `just fmt` must
+/// not reset the brake, exactly like the `lifecycle` table never counted
+/// `lint`/`format`/`clean`/`setup`.
+#[test]
+fn only_a_routed_build_or_just_gate_recipe_resets_the_brake() {
+    use crate::ExecOutcome::Passed;
+    for (command, expect) in [
+        ("cargo test -p newt-git", true),
+        ("cargo check -p newt-git", true),
+        ("cargo build -p newt-git", false),
+        ("cargo clippy -p newt-git", false),
+        ("just test", true),
+        ("just check", true),
+        ("just fmt", false),
+        ("just clean", false),
+    ] {
+        let args = serde_json::json!({ "command": command });
+        assert_eq!(
+            is_progress_verification("run_command", &args, Some(Passed)),
+            expect,
+            "{command}"
+        );
+    }
+}
+
 /// Review round 3: operator steering is new information; it restarts the count
 /// and re-arms the steer-once latch, exactly like progress.
 #[test]
