@@ -564,6 +564,39 @@ fn approve_entry_for(
     }
 }
 
+/// The target `AllowPermanent`'s danger check and refusal notice should use:
+/// for `FsRead`/`FsWrite`, the target [`newt_core::ocap_store::persist_approve`]
+/// would actually normalize and write (#2524 follow-up item 2) — `/ws/..`
+/// classified and named as `/`, never the raw string that hides how
+/// dangerous the request is. Reuses `ocap_store`'s own normalizer (never a
+/// second copy); falls back to the raw target when normalization itself
+/// fails (a relative or climbing path) — that case is refused downstream by
+/// `persist_approve`'s own check, with its own message. Exec/net targets are
+/// not paths and pass through unchanged.
+fn normalized_danger_target(kind: newt_core::DenialKind, target: &str) -> String {
+    match kind {
+        newt_core::DenialKind::FsRead | newt_core::DenialKind::FsWrite => {
+            newt_core::ocap_store::normalize_fs_path(target).unwrap_or_else(|_| target.to_string())
+        }
+        _ => target.to_string(),
+    }
+}
+
+/// The notice for `AllowPermanent`'s "no root key resolves" fallback (#2524
+/// follow-up item 1): names the ACTUAL configured path — or that none is
+/// configured at all — rather than printing the literal word `key_path`,
+/// which told the operator nothing about what to go check.
+fn no_key_notice(key_path: Option<&std::path::Path>) -> String {
+    let key_path_desc = key_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "no key_path configured".to_string());
+    format!(
+        "permanent allow unavailable (no root key at `{key_path_desc}` in this \
+         session): granted for this session only — run `newt doctor` or restore \
+         ~/.newt/identity.pem"
+    )
+}
+
 /// Operator-facing axis name for the "permanently allowed" notice.
 fn axis_label(kind: newt_core::DenialKind) -> &'static str {
     match kind {
@@ -866,10 +899,29 @@ impl PermissionPromptState {
     /// bad-signature `approve.toml` entry loudly at load (fail-closed); this
     /// only re-shapes whatever survived that check
     /// ([`newt_core::ocap_store::approved_grants`] is a pure re-listing), so
-    /// it can never itself widen past what the signature covers. Call once,
-    /// at session start, after `ocap_policy` is set.
+    /// it can never itself widen past what the signature covers. Called at
+    /// session start, and again after every mid-session `AllowPermanent`
+    /// reload ([`newt_core::ocap_store::persist_approve`]'s caller).
     /// Returns the number of grants folded in, for the session-start
     /// permission-log line (#2532 review, item 3).
+    ///
+    /// **Deliberately monotonic** (#2524 follow-up item 4): this only ever
+    /// `extend`s `durable_grants`, never rebuilds it from the current fold.
+    /// If a later reload drops an entry that an earlier one admitted (the
+    /// operator hand-edited or truncated `approve.toml` mid-session, or a
+    /// previously-valid signature somehow stopped verifying), that entry's
+    /// grant is kept for the rest of THIS session rather than revoked live.
+    /// This is the same posture as a promoted durable grant or a session
+    /// grant: authority admitted once under verification is not silently
+    /// clawed back mid-turn. It is also the only option available here
+    /// without a wider change — `durable_grants` is a flat
+    /// `(DenialKind, String)` set shared with the legacy `/permissions`
+    /// promotion path (`recalled_grants`), so nothing at this call site can
+    /// tell an ocap-sourced entry apart from one promoted another way in
+    /// order to rebuild just its own contribution; a full rebuild here would
+    /// risk dropping grants this function never added. Revocation of a
+    /// dropped `approve.toml` entry takes effect on the NEXT session start,
+    /// where `ocap_policy`/`durable_grants` are rebuilt fresh from `load_store`.
     pub(crate) fn fold_ocap_approvals(&mut self) -> usize {
         let grants = newt_core::ocap_store::approved_grants(&self.ocap_policy);
         let count = grants.len();
@@ -1888,11 +1940,17 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     // The danger refusal must run BEFORE any write attempt for
                     // ALL FOUR durable-store kinds — a real bug fix (#2535):
                     // this used to run only for net.
-                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                    //
+                    // #2524 follow-up item 2: classify (and name, below) the
+                    // NORMALIZED target, not the raw one — `/ws/..` must be
+                    // judged and reported as `/`, the path the writer would
+                    // actually persist, not a raw string that hides it.
+                    let danger_target = normalized_danger_target(req.kind, &req.target);
+                    if self.danger.classify(req.kind, &danger_target) == danger::DangerTier::High {
                         self.record(req, "deny", "permanent-allow-refused-high-danger");
                         self.notice(
                             window.as_ref(),
-                            &format!("permanent allow refused for high-danger `{}`", req.target),
+                            &format!("permanent allow refused for high-danger `{danger_target}`"),
                         );
                         return Deny;
                     }
@@ -1950,7 +2008,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                                     ocap_high_danger_predicate(),
                                     |payload| root.sign(payload).to_bytes(),
                                 ) {
-                                    Ok(()) => {
+                                    Ok(had_comments) => {
                                         // BLOCKER (#2524 round 2 item 1): the
                                         // write just appended ONE freshly-signed
                                         // entry beside whatever else already sat
@@ -1988,6 +2046,19 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                                                 approve_path.display()
                                             ),
                                         );
+                                        // #2524 follow-up item 3: `to_toml`
+                                        // re-serialises the whole file, which
+                                        // drops any hand-written TOML comment
+                                        // — `newt doctor --sign-ocap` already
+                                        // says so; this path did not.
+                                        if had_comments {
+                                            self.notice(
+                                                window.as_ref(),
+                                                "note: re-saving approve.toml dropped any \
+                                                 hand-written comments it had (TOML \
+                                                 comments are not preserved across a write)",
+                                            );
+                                        }
                                         "permanent"
                                     }
                                     Err(e) => {
@@ -2005,10 +2076,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                             _ => {
                                 self.notice(
                                     window.as_ref(),
-                                    "permanent allow unavailable (no root key at \
-                                     `key_path` in this session): granted for this \
-                                     session only — run `newt doctor` or restore \
-                                     ~/.newt/identity.pem",
+                                    &no_key_notice(self.key_path.as_deref()),
                                 );
                                 "session-no-key"
                             }

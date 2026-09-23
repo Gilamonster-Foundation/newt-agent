@@ -284,19 +284,29 @@ pub fn sign_entry(payload: &[u8], sign: &impl Fn(&[u8]) -> [u8; 64]) -> String {
 /// that is not an absolute, `..`-free path (#2524 round 2 item 2: a relative
 /// `read_file path="../../"` must never become a durable `/` grant).
 ///
-/// Returns `()`, not the updated [`PolicyFile`] — the caller must NOT fold
-/// the file this function just wrote straight into a live [`PolicySet`]
-/// (#2524 round 2 item 1, BLOCKER): this function performs no signature
-/// verification of whatever ELSE was already on disk, so folding its return
-/// value would launder a pre-existing unsigned/tampered entry into live
-/// authority the moment any other grant is persisted. The caller must reload
-/// through the verifying path ([`load_store`]) instead.
+/// Returns whether the pre-existing on-disk text (read under the lock, before
+/// this call's own write) contained a `#` comment — NOT the updated
+/// [`PolicyFile`] itself: the caller must NOT fold the file this function
+/// just wrote straight into a live [`PolicySet`] (#2524 round 2 item 1,
+/// BLOCKER): this function performs no signature verification of whatever
+/// ELSE was already on disk, so folding its return value would launder a
+/// pre-existing unsigned/tampered entry into live authority the moment any
+/// other grant is persisted. The caller must reload through the verifying
+/// path ([`load_store`]) instead.
+///
+/// The `bool` (#2524 follow-up item 3) exists because re-serialising through
+/// [`PolicyFile::to_toml`] drops any hand-written TOML comment — `newt doctor
+/// --sign-ocap` already says so; the interactive writer did not. A crude
+/// `contains('#')` scan (not a TOML-comment parser) is deliberately
+/// conservative: a `#` inside a quoted string value is vanishingly rare in
+/// this file's shape (bare paths/commands/hosts) and a false positive here
+/// only costs one extra notice line, never a wrong grant.
 pub fn persist_approve(
     config_path: &Path,
     entry: ApproveEntry,
     is_high_danger: impl Fn(CapabilityClass, &str) -> bool,
     sign: impl Fn(&[u8]) -> [u8; 64],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let entry = normalize_fs_target(entry)?;
     PolicySet::validate_approve(entry.class(), entry.target(), &is_high_danger)
         .map_err(anyhow::Error::msg)?;
@@ -307,6 +317,7 @@ pub fn persist_approve(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
+    let had_comments = text.contains('#');
     let mut file = PolicyFile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
 
     match entry {
@@ -348,7 +359,7 @@ pub fn persist_approve(
 
     let toml = file.to_toml().map_err(|e| anyhow::anyhow!(e))?;
     destination.atomic_write(toml.as_bytes())?;
-    Ok(())
+    Ok(had_comments)
 }
 
 /// Resolve `approve.toml`'s path beside `config_path` and take its write
@@ -383,20 +394,32 @@ fn normalize_fs_target(entry: ApproveEntry) -> anyhow::Result<ApproveEntry> {
     let ApproveEntry::Fs { path, write } = entry else {
         return Ok(entry);
     };
-    if !Path::new(&path).is_absolute() {
+    Ok(ApproveEntry::Fs {
+        path: normalize_fs_path(&path)?,
+        write,
+    })
+}
+
+/// The string-level normalization [`normalize_fs_target`] applies to an
+/// `[[fs]]` target: require an absolute path, run it through the SAME
+/// [`crate::caveats::lexically_normalize`] the read/write fences use, and
+/// refuse any `..` that survives. Exposed `pub` (#2524 follow-up item 2) so
+/// the gate can classify danger and phrase a refusal against the SAME
+/// normalized target the writer would actually persist — never a second
+/// copy of this normalizer, and never a danger decision made against a raw
+/// `/ws/..` that the writer would have turned into `/`.
+pub fn normalize_fs_path(path: &str) -> anyhow::Result<String> {
+    if !Path::new(path).is_absolute() {
         anyhow::bail!("permanent allow refused: fs target `{path}` must be an absolute path");
     }
-    let normalized = crate::caveats::lexically_normalize(&path);
+    let normalized = crate::caveats::lexically_normalize(path);
     if normalized
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         anyhow::bail!("permanent allow refused: fs target `{path}` escapes above its root");
     }
-    Ok(ApproveEntry::Fs {
-        path: normalized.to_string_lossy().into_owned(),
-        write,
-    })
+    Ok(normalized.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
