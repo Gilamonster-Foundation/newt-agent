@@ -199,6 +199,20 @@ impl RouteTable {
         if command.is_empty() {
             return RouteDecision::Exec;
         }
+        // F23 / #2524 "tail-pipe-routes": recognise EXACTLY `<clean build
+        // argv> [2>&1] | tail -N` (or `head -N`) BEFORE the blanket
+        // compound-command refusal below — the model pipes ONLY to cut
+        // output (see `build_piped_to_trim_route`'s doc), and a masked exit
+        // code from `| tail` is the exact hazard `note_verified_pass`'s doc
+        // comment (mod.rs) names as why an un-routed `run_command` pass
+        // can't be trusted. Only short-circuits on an actual match; any
+        // other pipe shape (multiple pipes, `tail -f`, a redirect before the
+        // pipe, a grep, …) falls through unchanged to the refusal below.
+        if command.contains('|') {
+            if let route @ RouteDecision::Route { .. } = build_piped_to_trim_route(command) {
+                return route;
+            }
+        }
         // Compound / redirected / substituted commands never route (see
         // SHELL_META): a single built-in cannot reproduce a pipe/chain/redirect.
         if command.contains(SHELL_META) {
@@ -409,6 +423,108 @@ fn branch_list_route(rest: &[&str]) -> RouteDecision {
         tool: "git",
         args: json!({ "op": "branch-list", "scope": scope }),
     }
+}
+
+/// Recognise EXACTLY `<clean build argv> [2>&1] | tail -N` (or `tail -n N` /
+/// `head -N` / `head -n N`) and nothing wider (F23 / #2524
+/// "tail-pipe-routes"). Measured (2488-r9): the model's own natural call to
+/// verify a build was `cargo … 2>&1 | tail -40` — piping ONLY to cut a long
+/// build's output, not to chain semantics onto it. Because the pipe made it
+/// compound, it refused to route (`SHELL_META`) and ran in the confined
+/// shell instead, where `| tail` masks cargo's real exit code — exactly the
+/// hazard `note_verified_pass`'s doc comment (`mod.rs`) names as why a
+/// piped `run_command` pass can never count as verified. Route the build
+/// argv the model actually wrote (`build_lane_route`, unchanged, still
+/// refuses an unsafe operand or a non-build-tool program) and apply the
+/// trim to the OUTPUT on the harness side instead, so the exit code the
+/// harness sees is cargo's, never `tail`'s.
+///
+/// Returns `RouteDecision::Exec` for anything this exact shape does not
+/// cover: more than one pipe, a pipe to anything but bare `tail`/`head`
+/// with a positive line count, `tail -f` / `head -c`, or a redirect/other
+/// metacharacter surviving in the build half (checked via the existing
+/// [`SHELL_META`] table — reused, not duplicated) — those fall through to
+/// the ordinary compound-command refusal in [`RouteTable::classify`].
+fn build_piped_to_trim_route(command: &str) -> RouteDecision {
+    let Some((build_part, trim_part)) = split_single_pipe(command) else {
+        return RouteDecision::Exec;
+    };
+    let build_part = build_part.trim();
+    let build_part = build_part
+        .strip_suffix("2>&1")
+        .map_or(build_part, str::trim);
+    // Any OTHER shell metacharacter surviving in the build half (a redirect
+    // BEFORE the pipe, a second chain, …) refuses — same table the blanket
+    // compound-command check uses, so a redirect stays refused exactly as
+    // today.
+    if build_part.contains(SHELL_META) {
+        return RouteDecision::Exec;
+    }
+    let Some(trim) = parse_trim_spec(trim_part.trim()) else {
+        return RouteDecision::Exec;
+    };
+    let mut tokens = build_part.split_ascii_whitespace();
+    let Some(program) = tokens.next() else {
+        return RouteDecision::Exec;
+    };
+    if !is_build_tool_program(program) {
+        return RouteDecision::Exec;
+    }
+    let rest: Vec<&str> = tokens.collect();
+    match build_lane_route(program, &rest) {
+        RouteDecision::Route {
+            tool: "build_exec",
+            mut args,
+        } => {
+            args["trim"] = trim;
+            RouteDecision::Route {
+                tool: "build_exec",
+                args,
+            }
+        }
+        // `build_lane_route` itself refused (unsafe operand, unrecognised
+        // subcommand, …) — the same refusal applies with or without the
+        // trailing pipe.
+        other => other,
+    }
+}
+
+/// Split `command` on exactly ONE `|`. `None` for zero pipes or more than
+/// one — the brief's own "multiple pipes … do NOT route" refusal, checked
+/// here rather than downstream so a `| tail -40 | head` never even reaches
+/// [`parse_trim_spec`].
+fn split_single_pipe(command: &str) -> Option<(&str, &str)> {
+    let mut parts = command.split('|');
+    let build_part = parts.next()?;
+    let trim_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((build_part, trim_part))
+}
+
+/// `tail -N` / `tail -n N` / `head -N` / `head -n N` — a bare positive
+/// integer line count and nothing else. `tail -f` (follow), `head -c`
+/// (bytes), extra operands, or a missing/zero/non-numeric count are all
+/// refused — this is the ONE place that decides the trim shape is safe to
+/// apply, so it stays conservative rather than guessing at intent.
+fn parse_trim_spec(spec: &str) -> Option<Value> {
+    let tokens: Vec<&str> = spec.split_ascii_whitespace().collect();
+    let mode = match tokens.first().copied() {
+        Some("tail") => "tail",
+        Some("head") => "head",
+        _ => return None,
+    };
+    let n_str = match &tokens[1..] {
+        [flag] if flag.len() > 1 && flag.starts_with('-') => &flag[1..],
+        ["-n", n] => *n,
+        _ => return None,
+    };
+    let n: u32 = n_str.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(json!({ "mode": mode, "n": n }))
 }
 
 /// A `run_command` reach that maps onto the confined **build lane**
@@ -1163,5 +1279,78 @@ mod tests {
 
         // An Exec decision produces no audit line — nothing was rewritten.
         assert_eq!(audit_line("git add .", &classify("git add .")), None);
+    }
+
+    /// F23 / #2524 "tail-pipe-routes" (red first): the shape measured in
+    /// 2488-r9 — a clean build argv piped only to cut output — routes,
+    /// carrying the build's own argv plus the trim the pipe asked for.
+    /// (`+stable` is dropped from the measured command: a leading
+    /// `+toolchain` selector is a pre-existing, separate gap in
+    /// `cargo_build_route` that never routes — with or without a pipe —
+    /// and is out of scope for this fix.)
+    #[test]
+    fn build_piped_to_tail_or_head_routes_with_the_trim() {
+        assert_eq!(
+            classify(
+                "cargo test -j 4 -p newt-core --test config_publishing_ratchet 2>&1 | tail -40"
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test", "-j", "4", "-p", "newt-core",
+                              "--test", "config_publishing_ratchet"],
+                    "trim": {"mode": "tail", "n": 40},
+                }),
+            }
+        );
+        // Every recognised variant: with/without `2>&1`, `-N` and `-n N`,
+        // `tail` and `head`, and `just`.
+        for (cmd, mode, n) in [
+            ("cargo test -p newt-core | tail -40", "tail", 40),
+            ("cargo test -p newt-core | tail -n 40", "tail", 40),
+            ("cargo build | head -20", "head", 20),
+            ("cargo build | head -n 20", "head", 20),
+            ("just test 2>&1 | tail -5", "tail", 5),
+        ] {
+            let RouteDecision::Route { tool, args } = classify(cmd) else {
+                panic!("{cmd} must route");
+            };
+            assert_eq!(tool, "build_exec", "{cmd}");
+            assert_eq!(args["trim"]["mode"], mode, "{cmd}");
+            assert_eq!(args["trim"]["n"], n, "{cmd}");
+        }
+    }
+
+    /// Anything wider than the exact recognised shape stays refused — the
+    /// SAME `SHELL_META` compound-command refusal every other pipe already
+    /// gets, never a new leniency.
+    #[test]
+    fn build_piped_to_anything_else_never_routes() {
+        for cmd in [
+            // Multiple pipes.
+            "cargo test | tail -40 | head",
+            // Follows, doesn't cut — a live stream, not a bounded trim.
+            "cargo test | tail -f",
+            // Bytes, not lines.
+            "cargo build | head -c 10",
+            // Not tail/head at all.
+            "cargo test | grep FAILED",
+            // A redirect BEFORE the pipe: still compound, still refused.
+            "cargo test > log.txt | tail -40",
+            // Missing, zero, or non-numeric N.
+            "cargo test | tail",
+            "cargo test | tail -0",
+            "cargo test | tail -n 0",
+            "cargo test | tail -abc",
+            // Extra operands after the count.
+            "cargo test | tail -40 extra",
+            // Not a recognised build tool program.
+            "pytest | tail -40",
+            // An operand `build_lane_route` itself would already refuse
+            // (near-miss subcommand) — still refused with the pipe.
+            "cargo run | tail -40",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
     }
 }

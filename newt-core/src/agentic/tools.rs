@@ -1152,6 +1152,7 @@ async fn lifecycle_run_with_escalation(
             "lifecycle action=run hit the confined shell's {}s wall",
             wall.as_secs()
         )),
+        None,
         presentation,
     )
     .await;
@@ -1198,6 +1199,63 @@ fn lifecycle_build_request(
     }
 }
 
+/// Which end of a build's output `build_piped_to_trim_route`'s recognised
+/// `| tail -N` / `| head -N` suffix asked to keep (F23 / #2524
+/// "tail-pipe-routes"). Parsed from the routed call's `"trim"` JSON
+/// (`{"mode": "tail"|"head", "n": N}`, [`routing::parse_trim_spec`]'s
+/// shape) — never trusted beyond that one shape, so a malformed or missing
+/// `trim` object degrades to "no trim" rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputTrim {
+    Tail(u32),
+    Head(u32),
+}
+
+impl OutputTrim {
+    fn from_json(value: Option<&serde_json::Value>) -> Option<Self> {
+        let value = value?;
+        let n = u32::try_from(value.get("n")?.as_u64()?).ok()?;
+        if n == 0 {
+            return None;
+        }
+        match value.get("mode")?.as_str()? {
+            "tail" => Some(Self::Tail(n)),
+            "head" => Some(Self::Head(n)),
+            _ => None,
+        }
+    }
+
+    /// Concatenate `stdout` then `stderr` (the routed call's `2>&1` case is
+    /// the common one — merge into one stream, same as the pipe the model
+    /// wrote would have seen) and keep the last/first `n` LINES of the
+    /// result, matching `| tail -n`/`| head -n`'s own unit.
+    fn apply(self, stdout: &str, stderr: &str) -> String {
+        let mut combined = String::with_capacity(stdout.len() + stderr.len());
+        combined.push_str(stdout);
+        combined.push_str(stderr);
+        let lines: Vec<&str> = combined.lines().collect();
+        let kept = match self {
+            Self::Tail(n) => &lines[lines.len().saturating_sub(n as usize)..],
+            Self::Head(n) => &lines[..(n as usize).min(lines.len())],
+        };
+        kept.join("\n")
+    }
+
+    /// The routed-note clause naming what happened and why, so the model
+    /// sees the trim rather than silently receiving less output than it
+    /// piped for.
+    fn note_clause(self) -> String {
+        match self {
+            Self::Tail(n) => {
+                format!("output trimmed to the last {n} lines, as `| tail -{n}` asked")
+            }
+            Self::Head(n) => {
+                format!("output trimmed to the first {n} lines, as `| head -{n}` asked")
+            }
+        }
+    }
+}
+
 /// Run `program argv` through the confined build lane — `build_tool_request`'s
 /// calibrated fence, the same `leq`/permission-gate re-check `lifecycle
 /// action=build` performs, and [`shell::LIFECYCLE_BUILD_TIMEOUT`] (30 min).
@@ -1227,6 +1285,12 @@ async fn run_confined_build_lane(
     // `action=run` timeout escalation); `None` for a direct `action=build` /
     // `build_exec` call, whose reason speaks for itself.
     escalation_note: Option<&str>,
+    // F23 / #2524 "tail-pipe-routes": `Some` when the routed call carried a
+    // `| tail -N` / `| head -N` suffix (`build_piped_to_trim_route`) — the
+    // build's REAL exit code is still what decides `ExecOutcome`; only the
+    // rendered output is cut, on the harness side, never inside a shell that
+    // could mask the exit code. `None` for every other caller (unchanged).
+    trim: Option<OutputTrim>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
@@ -1277,10 +1341,27 @@ async fn run_confined_build_lane(
     }
     match ConstrainedExecutor::run_async(request).await {
         Ok(out) => {
+            // The build's own exit code (`out.code`) is untouched by `trim` —
+            // only the rendered stdout/stderr text is cut, never inside a
+            // shell pipe that could mask it (the exact hazard this route
+            // exists to avoid).
+            let (stdout, stderr) = match trim {
+                Some(trim) => (
+                    trim.apply(
+                        &String::from_utf8_lossy(&out.stdout),
+                        &String::from_utf8_lossy(&out.stderr),
+                    ),
+                    String::new(),
+                ),
+                None => (
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ),
+            };
             let envelope = serde_json::json!({
                 "exit_code": out.code,
-                "stdout": String::from_utf8_lossy(&out.stdout),
-                "stderr": String::from_utf8_lossy(&out.stderr),
+                "stdout": stdout,
+                "stderr": stderr,
                 "timed_out": out.timed_out,
             });
             (
@@ -3746,6 +3827,7 @@ async fn execute_authorized_tool(
                             tool_offload,
                             spill_store,
                             None,
+                            None,
                             presentation,
                         )
                         .await,
@@ -3829,6 +3911,11 @@ async fn execute_authorized_tool(
                     .await,
                 );
             }
+            // F23 / #2524 "tail-pipe-routes": a `| tail -N` / `| head -N`
+            // suffix the model piped on for readability, not semantics
+            // (`build_piped_to_trim_route`) — the build's own exit code
+            // still decides `outcome`; only the rendered text is cut.
+            let trim = OutputTrim::from_json(args.get("trim"));
             let (text, outcome) = run_confined_build_lane(
                 workspace,
                 std::path::Path::new(workspace),
@@ -3843,18 +3930,21 @@ async fn execute_authorized_tool(
                 tool_offload,
                 spill_store,
                 None,
+                trim,
                 presentation,
             )
             .await;
-            executed((
-                append_routed_note(
-                    text,
-                    format!(
-                        "[routed `{display}` to the confined build lane — 30 min limit, network denied/offline]"
-                    ),
+            let note = match trim {
+                Some(trim) => format!(
+                    "[routed `{display}` to the confined build lane — 30 min limit, network \
+                     denied/offline; {}]",
+                    trim.note_clause()
                 ),
-                outcome,
-            ))
+                None => format!(
+                    "[routed `{display}` to the confined build lane — 30 min limit, network denied/offline]"
+                ),
+            };
+            executed((append_routed_note(text, note), outcome))
         }
 
         "read_file" => {

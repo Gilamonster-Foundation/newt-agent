@@ -1612,3 +1612,126 @@ async fn just_with_justfile_one_level_up_falls_back_to_exec_not_error() {
         "a justfile one level up must be found, not reported missing; got: {out}"
     );
 }
+
+/// F23 / #2524 "tail-pipe-routes" (red first): the EXACT masking bug measured
+/// in 2488-r9 — piping a build ONLY to cut output must never let `tail`'s own
+/// (successful) exit code stand in for the build's. A FAILING build piped to
+/// `tail` must still render as a failure, not `(exit 0)`.
+#[tokio::test]
+#[cfg(not(windows))]
+async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
+    // The recipe below is a POSIX shell one-liner (`just` on Windows has no
+    // portable equivalent without git-bash); the portable, pure-function
+    // coverage lives in `routing.rs`'s `build_piped_to_*` tests.
+
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("justfile"),
+        "check:\n\t@for i in $(seq 1 50); do echo \"line $i\"; done\n\t@exit 1\n",
+    )
+    .unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "just check | tail -10" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("error: command exited 1"),
+        "the build's real failure must survive the pipe, never masked by \
+         tail's own exit code: {out}"
+    );
+    assert!(
+        out.contains("routed") && out.contains("confined build lane"),
+        "the failing build must still have been ROUTED (not run in the \
+         confined shell, where the pipe WOULD mask the exit code): {out}"
+    );
+    assert!(
+        out.contains("output trimmed to the last 10 lines"),
+        "must say the output was trimmed: {out}"
+    );
+    // Only the last 10 lines survive — the recipe's own `just` diagnostic
+    // ("Recipe `check` failed on line 3…") is itself one of those 10, so
+    // count from a line safely inside the cut, not the exact boundary.
+    assert!(out.contains("line 50") && out.contains("line 45"), "{out}");
+    assert!(
+        !out.contains("line 30"),
+        "only the last 10 lines should remain: {out}"
+    );
+}
+
+/// The passing twin: a build that genuinely passes, piped to `head`, keeps
+/// its `Passed` outcome and the first N lines.
+#[tokio::test]
+#[cfg(not(windows))]
+async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("justfile"),
+        "check:\n\t@for i in $(seq 1 50); do echo \"line $i\"; done\n",
+    )
+    .unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "just check | head -5" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !out.contains("error: command exited"),
+        "a genuinely passing build must not be reported as failed: {out}"
+    );
+    assert!(
+        out.contains("output trimmed to the first 5 lines"),
+        "must say the output was trimmed: {out}"
+    );
+    assert!(out.contains("line 1") && out.contains("line 5"), "{out}");
+    assert!(
+        !out.contains("line 6"),
+        "only the first 5 lines should remain: {out}"
+    );
+}
