@@ -29,7 +29,7 @@ use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
 use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
-use output_budget::{max_output_tokens, paginate_read};
+use output_budget::{max_output_tokens, paginate_read, paginate_unspillable};
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
@@ -3975,6 +3975,29 @@ async fn execute_authorized_tool(
                 ),
             };
             executed((append_routed_note(text, note), outcome))
+        }
+
+        // A memory address is not a path. A spill teaser names `memory_fetch`,
+        // but weak models reach for `read_file` with the `spill:<cid>` handle;
+        // treating it as a filename answered "No such file or directory" — a
+        // lie that looped a live session four times (2026-09-23). Serve it
+        // through the one memory resolver instead, with read_file's paging.
+        "read_file" if super::memory_fetch::is_memory_address(args["path"].as_str().unwrap_or("")) => {
+            let address = args["path"].as_str().unwrap_or("").trim();
+            match memory_source {
+                Some(source) => match super::memory_fetch::resolve_memory_address(address, source) {
+                    Ok(body) => paginate_unspillable(
+                        &body,
+                        args["offset"].as_u64().map(|n| n as usize),
+                        args["limit"].as_u64().map(|n| n as usize),
+                    ),
+                    Err(refusal) => refusal,
+                },
+                None => format!(
+                    "`{address}` is a memory address, not a file, and this session has \
+                     no memory store to read it from."
+                ),
+            }
         }
 
         "read_file" => {

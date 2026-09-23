@@ -241,6 +241,27 @@ pub(super) fn paginate_read(
     }
 }
 
+/// [`paginate_read`] held under the model-facing spill cap, for a payload read
+/// back OUT of memory (a `spill:` address given to `read_file`). `read_file`'s
+/// normal cap (~30k chars) exceeds the spill cap (16k), so without this the
+/// answer to "read this spill" would itself be spilled — a fresh handle to the
+/// very text the model asked for.
+pub(super) fn paginate_unspillable(
+    contents: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> String {
+    // paginate_read's continuation footer rides on top of its char cap.
+    const FOOTER_HEADROOM: usize = 512;
+    let unspillable = cap_estimator()
+        .tokens_for_chars(crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP - FOOTER_HEADROOM);
+    let tokens = match max_output_tokens() {
+        0 => unspillable,
+        budget => budget.min(unspillable),
+    };
+    paginate_read(contents, offset, limit, tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

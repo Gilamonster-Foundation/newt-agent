@@ -180,3 +180,131 @@ async fn memory_fetch_with_source_routes_through_execute_tool() {
         vec![MemAddr::Note { id: "1".into() }]
     );
 }
+
+// -- read_file accepts a memory address -------------------------------------
+//
+// A spill teaser tells the model to call `memory_fetch`, but a weak model
+// reaches for `read_file` with the `spill:<cid>` handle instead. Live
+// 2026-09-23: four identical `read_file spill:bafy…` calls, each answered
+// "No such file or directory" — a lie (the payload existed, the tool was
+// wrong), logged `ok:true`, so the repeat guard never fired. `read_file` now
+// resolves any memory address through the same resolver `memory_fetch` uses.
+// Fully mocked: the workspace path is never touched on this branch.
+
+async fn read_file_via(
+    args: serde_json::Value,
+    source: Option<&dyn crate::agentic::MemorySource>,
+) -> String {
+    let caveats = Caveats::top();
+    execute_tool(
+        "read_file",
+        &args,
+        "/nonexistent-workspace-never-touched",
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        source,
+        None,
+        None,
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await
+}
+
+#[tokio::test]
+async fn read_file_of_a_spill_address_serves_the_spilled_payload() {
+    use crate::agentic::memory_fetch::tests::MockSource;
+    use crate::agentic::MemAddr;
+    let source = MockSource {
+        body: Some("EXACT_SPILLED_DETAIL".to_string()),
+        ..Default::default()
+    };
+    let out = read_file_via(
+        serde_json::json!({"path": "spill:bafyexample"}),
+        Some(&source),
+    )
+    .await;
+    assert_eq!(out, "EXACT_SPILLED_DETAIL");
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        vec![MemAddr::Spill {
+            id: "bafyexample".into()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn read_file_of_a_memory_address_honours_offset_and_limit() {
+    use crate::agentic::memory_fetch::tests::MockSource;
+    let body = (1..=10)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = MockSource {
+        body: Some(body),
+        ..Default::default()
+    };
+    let out = read_file_via(
+        serde_json::json!({"path": "spill:bafyexample", "offset": 4, "limit": 2}),
+        Some(&source),
+    )
+    .await;
+    assert!(
+        out.contains("line 4") && out.contains("line 5"),
+        "got: {out}"
+    );
+    assert!(
+        !out.contains("line 3") && !out.contains("line 6"),
+        "got: {out}"
+    );
+}
+
+#[tokio::test]
+async fn read_file_of_a_memory_address_without_a_source_names_memory_fetch_not_enoent() {
+    let out = read_file_via(serde_json::json!({"path": "spill:bafyexample"}), None).await;
+    assert!(
+        !out.contains("os error"),
+        "must not look like a missing file: {out}"
+    );
+    assert!(out.contains("memory address"), "got: {out}");
+}
+
+/// `read_file`'s normal cap (~30k chars) is larger than the spill cap (16k).
+/// A big spilled payload read back through `read_file` must come back paged
+/// UNDER the spill cap, or the answer is itself spilled into a new handle.
+#[tokio::test]
+async fn read_file_of_a_big_spill_pages_under_the_spill_cap() {
+    use crate::agentic::memory_fetch::tests::MockSource;
+    let body = (1..=2_000)
+        .map(|n| format!("line {n} {}", "x".repeat(40)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(body.len() > 60_000);
+    let source = MockSource {
+        body: Some(body),
+        ..Default::default()
+    };
+    let out = read_file_via(
+        serde_json::json!({"path": "spill:bafyexample"}),
+        Some(&source),
+    )
+    .await;
+    let chars = out.chars().count();
+    assert!(
+        chars <= crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP,
+        "{chars} chars would re-spill"
+    );
+    assert!(out.starts_with("line 1 "), "got: {out:.80}");
+    let tail = &out[out.len() - 200..];
+    assert!(out.contains("offset"), "must say how to continue: {tail}");
+}

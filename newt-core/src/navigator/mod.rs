@@ -69,6 +69,14 @@ pub struct NavResult {
     /// Analyzer identity (`regex-floor`, `where_is`, `lexical`, …).
     pub analyzer: String,
     pub kind: EvidenceKind,
+    /// How many hits precede `hits[0]` — nonzero only on a later page (see
+    /// [`NavResult::paged`]), so ordinals continue across pages.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ordinal_offset: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl NavResult {
@@ -83,7 +91,49 @@ impl NavResult {
             warnings: Vec::new(),
             analyzer: analyzer.to_string(),
             kind,
+            ordinal_offset: 0,
         }
+    }
+
+    /// Keep one `page_size` window of `hits` (1-based `page`, default 1) and
+    /// say where it sits — `showing hits 26-50 of 60; pass page: 3 …`.
+    ///
+    /// A result that fits one page is returned untouched. Paging exists so a
+    /// long hit list never overflows into a content spill: a spill hands the
+    /// model a `spill:<cid>` handle and a second tool to learn, where "ask for
+    /// page 2" is an affordance every model already has. `candidates` keeps
+    /// the full count, so the envelope never under-reports what was found.
+    #[must_use]
+    pub fn paged(mut self, page: Option<usize>, page_size: usize) -> Self {
+        let total = self.hits.len();
+        let page = page.filter(|&p| p > 0).unwrap_or(1);
+        if page_size == 0 || (page == 1 && total <= page_size) {
+            return self;
+        }
+        let pages = total.div_ceil(page_size);
+        let start = (page - 1) * page_size;
+        if start >= total {
+            self.hits.clear();
+            self.warnings.push(format!(
+                "page {page} is past the end — {total} hits in {pages} pages of {page_size}"
+            ));
+            return self;
+        }
+        let end = (start + page_size).min(total);
+        self.hits = self.hits.drain(start..end).collect();
+        self.ordinal_offset = start;
+        let mut note = format!("showing hits {}-{end} of {total}", start + 1);
+        if end < total {
+            note.push_str(&format!(
+                "; pass `page: {}` for the next {}",
+                page + 1,
+                (total - end).min(page_size)
+            ));
+        } else {
+            note.push_str(" (last page)");
+        }
+        self.warnings.push(note);
+        self
     }
 
     /// Human/model text view — always includes kind labels + honesty footer.
@@ -102,7 +152,7 @@ impl NavResult {
         for (i, hit) in self.hits.iter().enumerate() {
             out.push_str(&format!(
                 "  {:>2}. {} {}:{}-{}",
-                i + 1,
+                self.ordinal_offset + i + 1,
                 hit.kind.label(),
                 hit.path,
                 hit.start_line,
@@ -206,6 +256,60 @@ impl NavigatorSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lexical_hits(n: usize) -> NavResult {
+        let mut r = NavResult::empty(EvidenceKind::Lexical, "lexical-regex", "gen0");
+        for i in 1..=n {
+            r.hits.push(NavHit {
+                path: "src/lib.rs".into(),
+                start_line: i,
+                end_line: i,
+                kind: EvidenceKind::Lexical,
+                snippet: format!("hit {i}"),
+                symbol: None,
+                detail: None,
+            });
+        }
+        r.candidates = n;
+        r
+    }
+
+    /// A big hit list is paged, not spilled: a spill hands a weak model a
+    /// `spill:<cid>` handle it then misuses (live 2026-09-23), while "page 2"
+    /// is an affordance every model already knows.
+    #[test]
+    fn paging_keeps_one_window_and_names_the_next_page() {
+        let r = lexical_hits(60).paged(Some(2), 25);
+        assert_eq!(r.hits.len(), 25);
+        assert_eq!(r.hits[0].start_line, 26);
+        assert_eq!(r.candidates, 60, "the total stays honest");
+        let text = r.render();
+        assert!(text.contains("26-50 of 60"), "{text}");
+        assert!(text.contains("page: 3"), "{text}");
+        // Ordinals continue across pages, so hit 26 is numbered 26.
+        assert!(text.contains("26. [LEXICAL]"), "{text}");
+    }
+
+    #[test]
+    fn the_last_page_says_it_is_the_last() {
+        let text = lexical_hits(60).paged(Some(3), 25).render();
+        assert!(text.contains("51-60 of 60"), "{text}");
+        assert!(!text.contains("page: 4"), "{text}");
+    }
+
+    #[test]
+    fn a_page_past_the_end_says_how_many_pages_exist() {
+        let r = lexical_hits(60).paged(Some(9), 25);
+        assert!(r.hits.is_empty());
+        assert!(r.render().contains("3 pages"), "{}", r.render());
+    }
+
+    #[test]
+    fn a_result_that_fits_one_page_is_untouched() {
+        let before = lexical_hits(10);
+        let after = before.clone().paged(None, 25);
+        assert_eq!(before.render(), after.render());
+    }
 
     #[test]
     fn nav_result_render_includes_kind_and_incomplete() {
