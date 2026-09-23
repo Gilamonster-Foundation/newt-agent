@@ -123,6 +123,13 @@ impl CaveatsExt for Caveats {
 ///   read-only `fs_write = none` opens ONLY the explicit write paths, never the
 ///   workspace).
 ///
+/// In authority terms the write fence is always a SUBSET of the read fence's
+/// *paths* (it never gains `read_grants`) but a SUPERSET in what it *implies*:
+/// every write root is also a read root (write ⊆ read here, but granting write
+/// on a path always grants read on it too — the same convention
+/// [`crate::ocap_store::approved_grants`] follows when folding a durable
+/// `[[fs]] write = true` entry into both an `FsRead` and an `FsWrite` grant).
+///
 /// Files *under* a granted directory are matched at the enforcement site
 /// (`tui_permits_path`, prefix semantics); this only sets the root set.
 pub fn lock_fs_to_workspace(

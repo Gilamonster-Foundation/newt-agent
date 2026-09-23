@@ -1912,65 +1912,104 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                         }
                         Some(Ok(entry)) => entry,
                     };
-                    // #2535 item 6: a delegated session never establishes its
-                    // own root — reading `key_path` under one anyway would be
-                    // the dangerous shape this repo's OCAP doctrine calls out
-                    // (a key visible on disk, deliberately not rooted in).
-                    let root = if self.delegation.is_some() {
-                        None
+                    // #2524 round 2 item 3: three distinct causes collapsed into
+                    // one message used to leave the operator guessing which one
+                    // applied and what to do about it. Checked in this order so
+                    // each gets its own notice.
+                    let persistent_scope = if self.delegation.is_some() {
+                        // #2535 item 6: a delegated session never establishes
+                        // its own root — reading `key_path` under one anyway
+                        // would be the dangerous shape this repo's OCAP
+                        // doctrine calls out (a key visible on disk,
+                        // deliberately not rooted in).
+                        self.notice(
+                            window.as_ref(),
+                            "permanent allow unavailable (a delegated session never \
+                             establishes its own root key): granted for this session only",
+                        );
+                        "session"
+                    } else if self.config_path.is_none() {
+                        self.notice(
+                            window.as_ref(),
+                            "permanent allow unavailable (no trusted config path for this \
+                             session): granted for this session only",
+                        );
+                        "session-no-config"
                     } else {
-                        self.key_path
+                        let root = self
+                            .key_path
                             .as_deref()
-                            .and_then(|p| newt_identity::load_user_key(p).ok())
-                    };
-                    let persistent_scope = match (root, self.config_path.as_deref()) {
-                        (Some(root), Some(config_path)) => {
-                            match newt_core::ocap_store::persist_approve(
-                                config_path,
-                                entry,
-                                ocap_high_danger_predicate(),
-                                |payload| root.sign(payload).to_bytes(),
-                            ) {
-                                Ok(file) => {
-                                    self.state
-                                        .ocap_policy
-                                        .files
-                                        .insert(newt_core::ocap_store::Verdict::Approve, file);
-                                    self.state.fold_ocap_approvals();
-                                    let approve_path = config_path
-                                        .with_file_name("ocap")
-                                        .join(newt_core::ocap_store::Verdict::Approve.filename());
-                                    self.notice(
-                                        window.as_ref(),
-                                        &format!(
-                                            "permanently allowed: {} `{}` (signed → {})",
-                                            axis_label(req.kind),
-                                            req.target,
-                                            approve_path.display()
-                                        ),
-                                    );
-                                    "permanent"
-                                }
-                                Err(e) => {
-                                    self.notice(
-                                        window.as_ref(),
-                                        &format!(
-                                            "warning: could not persist permanent grant: {e} \
-                                         (granted for this session only)"
-                                        ),
-                                    );
-                                    "permanent-persist-failed"
+                            .and_then(|p| newt_identity::load_user_key(p).ok());
+                        match (root, self.config_path.as_deref()) {
+                            (Some(root), Some(config_path)) => {
+                                match newt_core::ocap_store::persist_approve(
+                                    config_path,
+                                    entry,
+                                    ocap_high_danger_predicate(),
+                                    |payload| root.sign(payload).to_bytes(),
+                                ) {
+                                    Ok(()) => {
+                                        // BLOCKER (#2524 round 2 item 1): the
+                                        // write just appended ONE freshly-signed
+                                        // entry beside whatever else already sat
+                                        // in `approve.toml` — including, in the
+                                        // adversary's case, a pre-existing
+                                        // unsigned or tampered entry nothing on
+                                        // this path has verified. Folding the
+                                        // written `PolicyFile` straight in would
+                                        // launder that entry into live authority
+                                        // the moment ANY grant is persisted.
+                                        // Reload through the SAME verifying path
+                                        // startup uses instead — an unsigned/
+                                        // bad-signature entry drops loudly here,
+                                        // never reaching `fold_ocap_approvals`.
+                                        let root_vk = Some(root.public().as_bytes());
+                                        let (policy, warnings) =
+                                            newt_core::ocap_store::load_store(config_path, root_vk);
+                                        self.state.ocap_policy = policy;
+                                        for w in &warnings {
+                                            self.notice(
+                                                window.as_ref(),
+                                                &format!("warning: OCAP policy: {w}"),
+                                            );
+                                        }
+                                        self.state.fold_ocap_approvals();
+                                        let approve_path = config_path.with_file_name("ocap").join(
+                                            newt_core::ocap_store::Verdict::Approve.filename(),
+                                        );
+                                        self.notice(
+                                            window.as_ref(),
+                                            &format!(
+                                                "permanently allowed: {} `{}` (signed → {})",
+                                                axis_label(req.kind),
+                                                req.target,
+                                                approve_path.display()
+                                            ),
+                                        );
+                                        "permanent"
+                                    }
+                                    Err(e) => {
+                                        self.notice(
+                                            window.as_ref(),
+                                            &format!(
+                                                "warning: could not persist permanent grant: {e} \
+                                             (granted for this session only)"
+                                            ),
+                                        );
+                                        "permanent-persist-failed"
+                                    }
                                 }
                             }
-                        }
-                        _ => {
-                            self.notice(
-                                window.as_ref(),
-                                "permanent allow unavailable (no root key in this session): \
-                                 granted for this session only — run `newt doctor` or restore \
-                                 ~/.newt/identity.pem",
-                            );
-                            "session"
+                            _ => {
+                                self.notice(
+                                    window.as_ref(),
+                                    "permanent allow unavailable (no root key at \
+                                     `key_path` in this session): granted for this \
+                                     session only — run `newt doctor` or restore \
+                                     ~/.newt/identity.pem",
+                                );
+                                "session-no-key"
+                            }
                         }
                     };
                     self.record(req, "allow", persistent_scope);

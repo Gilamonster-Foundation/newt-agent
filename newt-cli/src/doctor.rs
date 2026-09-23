@@ -534,15 +534,20 @@ fn probe_provider(command: &str) -> &'static str {
 /// or more entries were refused (the file was still written — valid entries
 /// are blessed, refused ones stay unsigned and will drop at load,
 /// fail-closed). Errors bubble as `Err` (exit 1).
+///
+/// Re-serialising through [`newt_core::ocap_store::PolicyFile::to_toml`]
+/// drops any TOML comments the operator hand-wrote into `approve.toml`.
 pub fn sign_ocap() -> anyhow::Result<i32> {
     use newt_core::ocap_store::{self, PolicyFile, Verdict};
 
     let Some(config_path) = newt_core::Config::user_config_path() else {
         anyhow::bail!("cannot resolve the user config directory (~/.newt)");
     };
-    let approve_path = config_path
-        .with_file_name("ocap")
-        .join(Verdict::Approve.filename());
+    // #2524 round 2 item 4: the SAME lock `persist_approve` (the interactive
+    // "allow permanently" writer) takes — one route so an in-session grant
+    // and a `--sign-ocap` run can never interleave a read-modify-write.
+    let (destination, _lock) = ocap_store::lock_approve_file(&config_path)?;
+    let approve_path = destination.as_path().to_path_buf();
     let text = match std::fs::read_to_string(&approve_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -561,11 +566,9 @@ pub fn sign_ocap() -> anyhow::Result<i32> {
         newt_tui::ocap_high_danger_predicate(),
         |payload| user.sign(payload).to_bytes(),
     );
-    std::fs::write(
-        &approve_path,
-        file.to_toml().map_err(|e| anyhow::anyhow!(e))?,
-    )
-    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", approve_path.display()))?;
+    destination
+        .atomic_write(file.to_toml().map_err(|e| anyhow::anyhow!(e))?.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", approve_path.display()))?;
 
     println!(
         "blessed {}: {signed} entr{} signed with the root key ({})",

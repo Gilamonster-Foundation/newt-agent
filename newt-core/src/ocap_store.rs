@@ -280,23 +280,28 @@ pub fn sign_entry(payload: &[u8], sign: &impl Fn(&[u8]) -> [u8; 64]) -> String {
 /// Refuses — no lock taken, no write — a high-danger target per
 /// `is_high_danger` (the same [`PolicySet::validate_approve`] invariant
 /// `sign_approves`/`newt doctor --sign-ocap` already enforce, now checked
-/// BEFORE the entry ever reaches disk rather than after). On success returns
-/// the whole updated [`PolicyFile`] so the caller can fold it straight into a
-/// live [`PolicySet`] without a re-read.
+/// BEFORE the entry ever reaches disk rather than after), and an `Fs` target
+/// that is not an absolute, `..`-free path (#2524 round 2 item 2: a relative
+/// `read_file path="../../"` must never become a durable `/` grant).
+///
+/// Returns `()`, not the updated [`PolicyFile`] — the caller must NOT fold
+/// the file this function just wrote straight into a live [`PolicySet`]
+/// (#2524 round 2 item 1, BLOCKER): this function performs no signature
+/// verification of whatever ELSE was already on disk, so folding its return
+/// value would launder a pre-existing unsigned/tampered entry into live
+/// authority the moment any other grant is persisted. The caller must reload
+/// through the verifying path ([`load_store`]) instead.
 pub fn persist_approve(
     config_path: &Path,
     entry: ApproveEntry,
     is_high_danger: impl Fn(CapabilityClass, &str) -> bool,
     sign: impl Fn(&[u8]) -> [u8; 64],
-) -> anyhow::Result<PolicyFile> {
+) -> anyhow::Result<()> {
+    let entry = normalize_fs_target(entry)?;
     PolicySet::validate_approve(entry.class(), entry.target(), &is_high_danger)
         .map_err(anyhow::Error::msg)?;
 
-    let dir = config_path.with_file_name("ocap");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(Verdict::Approve.filename());
-    let destination = crate::atomic_fs::ResolvedPath::resolve(&path)?;
-    let _lock = crate::atomic_fs::acquire_lock(&destination.lock_path())?;
+    let (destination, _lock) = lock_approve_file(config_path)?;
     let text = match std::fs::read_to_string(destination.as_path()) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -343,7 +348,55 @@ pub fn persist_approve(
 
     let toml = file.to_toml().map_err(|e| anyhow::anyhow!(e))?;
     destination.atomic_write(toml.as_bytes())?;
-    Ok(file)
+    Ok(())
+}
+
+/// Resolve `approve.toml`'s path beside `config_path` and take its write
+/// lock — the ONE lock-acquisition route for every approve.toml writer
+/// (#2524 round 2 item 4): [`persist_approve`] (the interactive "allow
+/// permanently" writer) and `newt doctor --sign-ocap` (the bulk re-sign
+/// ceremony, in `newt-cli`) both go through this instead of each taking its
+/// own lock, so the two can never interleave a read-modify-write. Creates the
+/// `ocap/` directory if missing. The caller reads/parses `destination`,
+/// mutates its own [`PolicyFile`], and writes back with
+/// [`crate::atomic_fs::ResolvedPath::atomic_write`] before the returned
+/// [`crate::atomic_fs::LockGuard`] drops.
+pub fn lock_approve_file(
+    config_path: &Path,
+) -> anyhow::Result<(crate::atomic_fs::ResolvedPath, crate::atomic_fs::LockGuard)> {
+    let dir = config_path.with_file_name("ocap");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(Verdict::Approve.filename());
+    let destination = crate::atomic_fs::ResolvedPath::resolve(&path)?;
+    let lock = crate::atomic_fs::acquire_lock(&destination.lock_path())?;
+    Ok((destination, lock))
+}
+
+/// Normalize an [`ApproveEntry::Fs`] target before it ever reaches
+/// `validate_approve` (#2524 round 2 item 2): require an absolute path, run
+/// it through the SAME [`crate::caveats::lexically_normalize`] the read/write
+/// fences already use (one normalizer, not a second one for the durable
+/// store), and refuse any `..` that survives — a relative or climbing target
+/// like `../../` must never durably widen to whatever directory happens to
+/// contain it. `Exec`/`Net` entries pass through untouched.
+fn normalize_fs_target(entry: ApproveEntry) -> anyhow::Result<ApproveEntry> {
+    let ApproveEntry::Fs { path, write } = entry else {
+        return Ok(entry);
+    };
+    if !Path::new(&path).is_absolute() {
+        anyhow::bail!("permanent allow refused: fs target `{path}` must be an absolute path");
+    }
+    let normalized = crate::caveats::lexically_normalize(&path);
+    if normalized
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("permanent allow refused: fs target `{path}` escapes above its root");
+    }
+    Ok(ApproveEntry::Fs {
+        path: normalized.to_string_lossy().into_owned(),
+        write,
+    })
 }
 
 #[cfg(test)]
@@ -700,5 +753,109 @@ mod tests {
         );
         assert_eq!(evaluate_request(&set, DenialKind::Exec, "bash"), None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    fn key() -> agent_mesh_protocol::UserKey {
+        agent_mesh_protocol::UserKey::generate()
+    }
+
+    /// #2524 round 2 item 2, RED FIRST: a relative/climbing `read_file
+    /// path="../../"` must never durably widen — `persist_approve` must
+    /// refuse it (nothing written) rather than let it become a durable grant
+    /// on whatever directory happens to be two levels up from the CWD at
+    /// evaluation time.
+    #[test]
+    fn persist_approve_refuses_a_relative_fs_target_and_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let k = key();
+        let result = persist_approve(
+            &config,
+            ApproveEntry::Fs {
+                path: "../../".to_string(),
+                write: false,
+            },
+            |_, _| false,
+            |payload| k.sign(payload).to_bytes(),
+        );
+        assert!(result.is_err(), "a relative fs target must be refused");
+        assert!(
+            !dir.path().join("ocap").join("approve.toml").exists(),
+            "nothing should be written"
+        );
+    }
+
+    /// Same regression: an ABSOLUTE path that still climbs above its root
+    /// after normalization (`/a/../../b`) must also be refused, not silently
+    /// collapsed to `/b` and durably granted.
+    #[test]
+    fn persist_approve_refuses_an_absolute_path_that_still_climbs_above_its_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let k = key();
+        let result = persist_approve(
+            &config,
+            ApproveEntry::Fs {
+                path: "/a/../../b".to_string(),
+                write: false,
+            },
+            |_, _| false,
+            |payload| k.sign(payload).to_bytes(),
+        );
+        assert!(
+            result.is_err(),
+            "a climbing absolute target must be refused"
+        );
+        assert!(!dir.path().join("ocap").join("approve.toml").exists());
+    }
+
+    /// An absolute path with an internal, fully-contained `..` (`/ws/x/../y`)
+    /// is legitimate — it normalizes to `/ws/y` and must be signed as that
+    /// normalized, unambiguous form, never the raw string.
+    #[test]
+    fn persist_approve_normalizes_a_contained_relative_segment_before_signing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let k = key();
+        persist_approve(
+            &config,
+            ApproveEntry::Fs {
+                path: "/ws/x/../y".to_string(),
+                write: false,
+            },
+            |_, _| false,
+            |payload| k.sign(payload).to_bytes(),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("ocap").join("approve.toml")).unwrap();
+        assert!(text.contains("/ws/y"), "{text}");
+        assert!(!text.contains(".."), "{text}");
+    }
+
+    /// #2524 round 2 item 4: `persist_approve` and `newt doctor --sign-ocap`
+    /// share ONE lock route (`lock_approve_file`) — a lock already held on
+    /// `approve.toml` (simulating a concurrent `--sign-ocap` or another
+    /// session's grant) must make `persist_approve` fail cleanly rather than
+    /// interleave a read-modify-write with the other holder.
+    #[test]
+    fn persist_approve_fails_cleanly_when_the_approve_lock_is_already_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        // Take the SAME lock `persist_approve` would take, via the shared
+        // route, before calling it.
+        let (_destination, _held) = lock_approve_file(&config).unwrap();
+        let k = key();
+        let result = persist_approve(
+            &config,
+            ApproveEntry::Exec {
+                target: "cargo".to_string(),
+            },
+            |_, _| false,
+            |payload| k.sign(payload).to_bytes(),
+        );
+        assert!(
+            result.is_err(),
+            "a held lock must fail the write cleanly, not interleave"
+        );
     }
 }
