@@ -4541,12 +4541,19 @@ impl WorkflowRuntimeState {
         }
     }
 
-    /// A passing `lifecycle` test/check ran this round. THE reset rule, exactly:
-    /// only the harness's structured gate phases count (see
-    /// [`is_progress_verification`]). A `run_command` exit code is not evidence of
-    /// a passing build (`| tail` masks it: 27 of the 29 rounds after run
-    /// 2483-a's edit were `passed`), and classifying commands by keyword would be
-    /// an invented classifier.
+    /// A passing gate check ran this round. THE reset rule, exactly (see
+    /// [`is_progress_verification`]): a `lifecycle` run of a gate phase
+    /// (`test`/`check`), OR a `run_command` #2533/#2543's routing sent to the
+    /// confined build lane (`build_exec` — a direct child spawn, no shell, so
+    /// its exit code is honest) whose `cargo`/`just` subcommand or recipe is
+    /// ALSO literally `test`/`check` — the same `Phase::is_gate` rule, not a
+    /// parallel one. `cargo build`, `cargo clippy`, `just fmt`, `just clean`
+    /// all reach `build_exec` too but do NOT count (#2548 round 2): they pass
+    /// trivially or say nothing about behaviour, exactly like `lifecycle`
+    /// never counted `lint`/`format`/`clean`/`setup`. A raw (unrouted, piped)
+    /// `run_command` exit code is not evidence of a passing build (`| tail`
+    /// masks it: 27 of the 29 rounds after run 2483-a's edit were `passed`),
+    /// and classifying commands by keyword would be an invented classifier.
     fn note_verified_pass(&mut self) {
         self.round_progressed = true;
     }
@@ -5017,8 +5024,16 @@ pub fn is_workspace_write_call(name: &str) -> bool {
 /// U4b: did this completed call PASS a progress-evidencing check — a `lifecycle`
 /// run of a gate phase (`test`/`check`, [`crate::tooling::Phase::is_gate`]), or a
 /// `run_command` ROUTED to the confined build lane (#2533/#2543's
-/// `routing::RouteTable`: a clean, unpiped `cargo build|check|test|clippy` /
-/// `just <recipe>` argv, spawned directly with no shell in between)?
+/// `routing::RouteTable`) whose subcommand IS a gate — `cargo test`/`cargo
+/// check`, or a `just` recipe literally named `test`/`check`? Mirrors
+/// `Phase::is_gate` exactly (`Phase::from_key` happens to share its "test"/
+/// "check" keys with cargo's own subcommand strings and with a recipe name,
+/// so this is the SAME rule, not a parallel one): `cargo build` (an
+/// incremental no-op when already built), `cargo clippy`, and a `just fmt`/
+/// `just clean` all route to `build_exec` too but do NOT count — #2548
+/// round 2's should-fix, because the lifecycle side never counted `lint`/
+/// `format`/`clean`/`setup` either, and a model alternating `edit_file` with
+/// a trivially-passing `just fmt` must not reset the brake.
 ///
 /// A bare `run_command` is still deliberately excluded: a shell exit code is
 /// not evidence of a passing build (`| tail` masks it — see
@@ -5046,14 +5061,27 @@ fn is_progress_verification(
             .and_then(crate::tooling::Phase::from_key)
             .is_some_and(crate::tooling::Phase::is_gate);
     }
-    name == "run_command"
-        && matches!(
-            routing::RouteTable::builtin().classify_call(args),
-            routing::RouteDecision::Route {
-                tool: "build_exec",
-                ..
-            }
-        )
+    if name != "run_command" {
+        return false;
+    }
+    let routing::RouteDecision::Route {
+        tool: "build_exec",
+        args: routed,
+    } = routing::RouteTable::builtin().classify_call(args)
+    else {
+        return false;
+    };
+    // `argv[0]` is the program (`cargo`/`just`); `argv[1]` is cargo's
+    // subcommand or the just recipe name — the SAME slot `Phase::from_key`
+    // reads for `lifecycle`, so one function decides "is this a gate" for
+    // both call shapes.
+    routed
+        .get("argv")
+        .and_then(|v| v.as_array())
+        .and_then(|argv| argv.get(1))
+        .and_then(|v| v.as_str())
+        .and_then(crate::tooling::Phase::from_key)
+        .is_some_and(crate::tooling::Phase::is_gate)
 }
 
 /// #2374: built-in tools that never touch workspace files: harness state,
