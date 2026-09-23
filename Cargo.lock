@@ -4326,6 +4326,7 @@ dependencies = [
  "libc",
  "newt-acp-worker",
  "newt-core",
+ "newt-git",
  "newt-identity",
  "newt-inference",
  "newt-launch",

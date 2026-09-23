@@ -1645,3 +1645,91 @@ async fn the_trace_signal_carries_the_full_cid_and_the_locator() {
     assert_eq!(recovered[0].locator, id);
     assert!(recovered[0].cid.starts_with("bafy"), "{}", recovered[0].cid);
 }
+
+// ---------------------------------------------------------------------------
+// #2482 item 6 / owed from the #2521 review: the missing-gate MCP refusal
+// must ledger `ok = false` on the chat-completions wire too, not only the
+// Anthropic loop (`mod_tests/anthropic_loop.rs`). Adapted from
+// `run_scripted` above.
+// ---------------------------------------------------------------------------
+
+/// MCP stub that records every call it receives; local because
+/// `anthropic_loop_tests::RecordingMcp` is module-private.
+struct RecordingMcpStub {
+    name: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+#[async_trait::async_trait]
+impl McpTools for RecordingMcpStub {
+    fn handles(&self, name: &str) -> bool {
+        name == self.name
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn call(&mut self, leased: &LeasedMcpCall<'_>) -> String {
+        self.seen.lock().unwrap().push(leased.args().clone());
+        "tool-result-text".to_string()
+    }
+}
+
+fn mcp_tool_call() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": null, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "my_server__get_thing", "arguments": "{}"}
+        }]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+#[tokio::test]
+async fn missing_permission_gate_mcp_refusal_records_not_ok_on_the_chat_wire() {
+    let server = MockServer::start().await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedChat {
+            script: vec![mcp_tool_call(), final_answer()],
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    c.tool_events = Some(&mut events);
+    // No permission gate installed at all — the missing-gate refusal path.
+    c.permission_gate = None;
+    let mut mcp = RecordingMcpStub {
+        name: "my_server__get_thing",
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (reply, ..) = chat_complete(c, &mut mcp)
+        .await
+        .expect("the loop must still complete after the refusal");
+
+    assert_eq!(reply, "all done");
+    assert_eq!(
+        mcp.seen.lock().unwrap().len(),
+        0,
+        "the connector must receive zero calls when no gate is available"
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "the refused call is still one ledgered event"
+    );
+    assert!(
+        !events[0].ok,
+        "a refusal the host never dispatched must not ledger ok=true: {:?}",
+        events[0]
+    );
+}

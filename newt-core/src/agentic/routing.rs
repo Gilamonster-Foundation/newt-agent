@@ -94,6 +94,15 @@ const SHELL_ROUTES: &[ShellRoute] = &[
 /// those stay on the exec path.
 const CARGO_BUILD_SUBCOMMANDS: &[&str] = &["build", "check", "test", "clippy"];
 
+/// Is `program` a build tool this repo recognises — the single table both
+/// [`RouteTable::classify`]'s clean-argv route AND (F20) the confined shell's
+/// per-call wall clock read, so a compound build command (`cargo test …; echo
+/// …`) that CANNOT route still gets classified as a build reach by the same
+/// rule, instead of a second hand-maintained list.
+pub(crate) fn is_build_tool_program(program: &str) -> bool {
+    program == "cargo" || program == "just"
+}
+
 /// The git subcommands that are **read-only** and route to the embedded `git`
 /// tool's read path — pure DATA.
 ///
@@ -221,7 +230,7 @@ impl RouteTable {
         // `build_lane_route`'s doc comment): F11's fix for the model that
         // never calls `lifecycle` and instead times out under
         // `run_command`'s 60s wall.
-        if program == "cargo" || program == "just" {
+        if is_build_tool_program(program) {
             let rest: Vec<&str> = tokens.collect();
             return build_lane_route(program, &rest);
         }
