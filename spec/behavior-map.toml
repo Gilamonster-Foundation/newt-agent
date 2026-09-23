@@ -1467,7 +1467,7 @@ path = "newt-cli/src/headless.rs"
 symbol = "fold_ocap_grants"
 
 [BHV-ROUTE-002]
-description = "A recognised build command issued through run_command runs in the build lane: run_command(\"cargo build|check|test|clippy …\") and run_command(\"just <recipe>\") route to the confined build lane (the same leq/permission-gate re-check and 30-minute LIFECYCLE_BUILD_TIMEOUT as lifecycle action=build), running the model's LITERAL argv verbatim — never a re-resolved phase command, so no operand is ever dropped. cargo run/install/publish and any --config/-Z flag stay on the exec path; a call carrying cwd or timeout alongside command is refused rather than silently dropping that field."
+description = "A recognised build command issued through run_command runs in the build lane: run_command(\"cargo build|check|test|clippy …\") and run_command(\"just <recipe>\") route to the confined build lane (the same leq/permission-gate re-check and 30-minute LIFECYCLE_BUILD_TIMEOUT as lifecycle action=build), running the model's LITERAL argv verbatim — never a re-resolved phase command, so no operand is ever dropped. cargo run/install/publish and any --config/-Z flag stay on the exec path; a call carrying cwd or timeout alongside command is refused rather than silently dropping that field. A clean build argv piped ONLY to `tail -N`/`tail -n N`/`head -N`/`head -n N` (optionally with a preceding `2>&1`) also routes (F23 / #2524 'tail-pipe-routes'): the build's real exit code decides the outcome, and the trim is applied to the rendered output on the harness side, never inside a shell that could mask the exit code — the exact hazard an un-routed `| tail` created. Anything wider (multiple pipes, `tail -f`/`head -c`, a redirect before the pipe, a non-tail/head pipe target, or a missing/zero/non-numeric count) stays on the ordinary compound-command refusal."
 [BHV-ROUTE-002.status]
 lean = "none"
 rust = "tested"
@@ -1491,15 +1491,37 @@ path = "newt-core/src/agentic/routing.rs"
 symbol = "tests::build_route_call_requires_bare_call"
 tier = "unit"
 [[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::build_piped_to_tail_or_head_routes_with_the_trim"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::build_piped_to_anything_else_never_routes"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
 symbol = "routed_cargo_test_reaches_the_confined_build_lane"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_failing_build_piped_to_tail_still_reports_the_real_failure"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines"
 tier = "unit"
 [[BHV-ROUTE-002.refs.production]]
 path = "newt-core/src/agentic/routing.rs"
 symbol = "build_lane_route"
 [[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "build_piped_to_trim_route"
+[[BHV-ROUTE-002.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "run_confined_build_lane"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "OutputTrim"
 
 [BHV-TOOLOK-001]
 description = "The ledgered `ok` bit is the dispatch OUTCOME whenever one exists: `ExecOutcome::Passed` is `ok = true`, `Failed`/`Denied`/`TimedOut`/`Unavailable` are `ok = false`, every variant named explicitly (no `_ =>`). The rendered text's prefix classifier (`tool_result_ok`) is used ONLY when no outcome was recorded (`execution = None`) — so a `run_command` that exits 0 with `error:`-shaped stdout is `ok = true`, and a non-zero exit whose render lacks a recognized failure prefix is still `ok = false` (#2482 item 6, follow-up to #2521/#2419)."

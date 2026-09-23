@@ -1227,14 +1227,26 @@ fn only_test_and_check_lifecycle_phases_reset_the_brake() {
     let test = serde_json::json!({ "phase": "test" });
     assert!(!is_progress_verification("lifecycle", &test, Some(Failed)));
     assert!(!is_progress_verification("lifecycle", &test, None));
-    // r9 recon item 4 / #2543: a piped run_command is NEVER routed
-    // (`routing::RouteTable::classify` refuses any compound command), so its
-    // exit code is still the LAST pipeline stage's (`tail`'s, not cargo's) —
-    // excluded exactly as before.
-    let piped = serde_json::json!({ "command": "cargo test -p newt-git | tail -20" });
+    // #2524 follow-up (F23 "tail-pipe-routes"): a build piped ONLY to
+    // `tail`/`head` now DOES route (`build_piped_to_trim_route`) — the
+    // build's own exit code decides the outcome, the trim only touches the
+    // rendered text, so this is no longer excluded. (Was excluded before
+    // that fix landed, on the theory that ANY pipe masks the exit code;
+    // measured in 2488-r9 this was exactly backwards for the tail/head-only
+    // shape the model actually writes.)
+    let tail_piped = serde_json::json!({ "command": "cargo test -p newt-git | tail -20" });
+    assert!(is_progress_verification(
+        "run_command",
+        &tail_piped,
+        Some(Passed)
+    ));
+    // A pipe to anything ELSE still never routes (`classify` refuses any
+    // other compound command), so its exit code is still the LAST pipeline
+    // stage's (`grep`'s, not cargo's) — excluded exactly as before.
+    let grep_piped = serde_json::json!({ "command": "cargo test -p newt-git | grep FAILED" });
     assert!(!is_progress_verification(
         "run_command",
-        &piped,
+        &grep_piped,
         Some(Passed)
     ));
 }
@@ -1300,6 +1312,44 @@ fn only_a_routed_build_or_just_gate_recipe_resets_the_brake() {
             "{command}"
         );
     }
+}
+
+/// #2524 follow-up (red first): `cargo_build_route` keeps a leading
+/// `+toolchain` selector in the routed argv (F23's own evidence was `cargo
+/// +stable test …`), which pushes the gate subcommand from `argv[1]` to
+/// `argv[2]`. Without skipping it here too, a genuine routed pass of
+/// exactly that command would silently never reset the brake — the same
+/// "measured, never counted" gap r9 recon found for the plain (no
+/// toolchain) case.
+#[test]
+fn a_routed_toolchain_selected_gate_pass_still_resets_the_brake() {
+    use crate::ExecOutcome::{Failed, Passed};
+    let routed = serde_json::json!({ "command": "cargo +stable test -p newt-core" });
+    assert!(is_progress_verification(
+        "run_command",
+        &routed,
+        Some(Passed)
+    ));
+    assert!(!is_progress_verification(
+        "run_command",
+        &routed,
+        Some(Failed)
+    ));
+    // The same non-gate exclusion still applies past the toolchain token.
+    let non_gate = serde_json::json!({ "command": "cargo +stable build -p newt-core" });
+    assert!(!is_progress_verification(
+        "run_command",
+        &non_gate,
+        Some(Passed)
+    ));
+    // An invalid `+` token never routes at all (routing.rs's own refusal),
+    // so it never reaches this function with a build_exec route either.
+    let invalid = serde_json::json!({ "command": "cargo +$X test" });
+    assert!(!is_progress_verification(
+        "run_command",
+        &invalid,
+        Some(Passed)
+    ));
 }
 
 /// Review round 3: operator steering is new information; it restarts the count

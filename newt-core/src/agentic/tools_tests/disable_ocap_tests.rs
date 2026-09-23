@@ -1612,3 +1612,231 @@ async fn just_with_justfile_one_level_up_falls_back_to_exec_not_error() {
         "a justfile one level up must be found, not reported missing; got: {out}"
     );
 }
+
+/// A scratch crate whose `cargo check` genuinely FAILS: 20 distinct
+/// undefined-identifier references, each its own compile error, so the
+/// output comfortably exceeds any trim window this test uses. Offline, no
+/// deps — `cargo check` never touches the network for a dependency-free
+/// crate.
+#[cfg(not(windows))]
+fn write_failing_scratch_crate(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let body: String = (1..=20)
+        .map(|i| format!("    let _ = UNDEFINED_VAR_{i};\n"))
+        .collect();
+    std::fs::write(dir.join("src/main.rs"), format!("fn main() {{\n{body}}}\n")).unwrap();
+}
+
+/// A scratch crate whose `cargo check` genuinely PASSES but still emits
+/// substantial output: 10 unused-variable warnings (compiles clean, exit 0
+/// — a warning is not a failure), each its own diagnostic block.
+#[cfg(not(windows))]
+fn write_passing_scratch_crate(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let body: String = (1..=10)
+        .map(|i| format!("    let unused_var_{i} = {i};\n"))
+        .collect();
+    std::fs::write(dir.join("src/main.rs"), format!("fn main() {{\n{body}}}\n")).unwrap();
+}
+
+/// F23 / #2524 "tail-pipe-routes" (red first): the EXACT masking bug measured
+/// in 2488-r9 — piping a build ONLY to cut output must never let `tail`'s own
+/// (successful) exit code stand in for the build's. A FAILING build piped to
+/// `tail` must still render as a failure, not `(exit 0)`.
+///
+/// Uses `cargo check`, not `just` — CI runners are not guaranteed to have
+/// `just` on `PATH` (measured: PR #2549 CI failed both `just`-based
+/// predecessors of these two tests with `exec "just" failed: No such file
+/// or directory` on every runner). `cargo` is what CI always has; the
+/// scratch-crate approach mirrors `routed_cargo_plus_stable_resolves_the_
+/// toolchain_in_the_confined_lane` below. Verified with `just` absent from
+/// `PATH` entirely (not merely unused), so neither test can secretly
+/// depend on it.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_failing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo check 2>&1 | tail -10" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("error: command exited 1"),
+        "the build's real failure must survive the pipe, never masked by \
+         tail's own exit code: {out}"
+    );
+    assert!(
+        out.contains("routed") && out.contains("confined build lane"),
+        "the failing build must still have been ROUTED (not run in the \
+         confined shell, where the pipe WOULD mask the exit code): {out}"
+    );
+    assert!(
+        out.contains("output trimmed to the last 10 lines"),
+        "must say the output was trimmed: {out}"
+    );
+    // Only the last 10 lines survive — rustc reports errors in source
+    // order, so the LAST error (UNDEFINED_VAR_20) must survive the cut and
+    // an early one (UNDEFINED_VAR_1) must not.
+    assert!(out.contains("UNDEFINED_VAR_20"), "{out}");
+    assert!(
+        !out.contains("UNDEFINED_VAR_1`"),
+        "only the last 10 lines should remain: {out}"
+    );
+}
+
+/// The passing twin: a build that genuinely passes, piped to `head`, keeps
+/// its `Passed` outcome and the first N lines. See the failing test's doc
+/// comment for why `cargo`, not `just`.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_passing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo check 2>&1 | head -5" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !out.contains("error: command exited"),
+        "a genuinely passing build (warnings only, exit 0) must not be \
+         reported as failed: {out}"
+    );
+    assert!(
+        out.contains("output trimmed to the first 5 lines"),
+        "must say the output was trimmed: {out}"
+    );
+    // rustc emits warnings in source order — the first (unused_var_1) must
+    // survive the cut, the last (unused_var_10) must not.
+    assert!(out.contains("unused_var_1`"), "{out}");
+    assert!(
+        !out.contains("unused_var_10"),
+        "only the first 5 lines should remain: {out}"
+    );
+}
+
+/// #2524 follow-up (F23 evidence): 2488-r9's own build-verifying command
+/// carried `+stable`. Confirms EMPIRICALLY, not just by code inspection,
+/// that rustup resolves it inside the confined build lane —
+/// `build_tool_request` forwards `RUSTUP_HOME`/`CARGO_HOME` from the
+/// OPERATOR's real environment (never the confined child's redirected
+/// `HOME`), so a routed `cargo +stable check` must behave exactly as it
+/// would from an ordinary shell, never report the toolchain missing.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo +stable check 2>&1 | tail -20" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo +stable check`") && out.contains("confined build lane"),
+        "must have been routed with the toolchain selector kept in the argv: {out}"
+    );
+    assert!(
+        !out.contains("toolchain") || !out.contains("is not installed"),
+        "rustup must resolve +stable inside the confined lane's forwarded \
+         RUSTUP_HOME/CARGO_HOME, not report it missing: {out}"
+    );
+    assert!(
+        !out.contains("error: command exited"),
+        "cargo +stable check on a trivial offline crate must actually \
+         succeed in this environment: {out}"
+    );
+}
