@@ -1749,7 +1749,7 @@ async fn a_strictly_rejected_stream_files_as_model_error() {
         headless_against_stream(streamed_read_file_call(r#""id":7,"#)).await;
     assert_eq!(posts, 1, "exactly one POST: the rejection is not retried");
     assert_eq!(result["tool_calls"], 0, "nothing ran: {result}");
-    assert_eq!(result["end_reason"], "None", "{result}");
+    assert_eq!(result["end_reason"], "Some(Failed)", "{result}");
     assert_eq!(contract["outcome"], "model_error", "{contract}");
 }
 

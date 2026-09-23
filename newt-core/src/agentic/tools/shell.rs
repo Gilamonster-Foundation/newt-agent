@@ -307,12 +307,14 @@ fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
 fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
+    wall: std::time::Duration,
 ) -> agent_bridle::Registry {
     use std::sync::Arc;
     let shell: Arc<dyn agent_bridle::Tool> = match engine {
         crate::ShellEngine::SafeSubset => {
-            let mut tool =
-                agent_bridle::ShellTool::new().with_sandbox_policy(b1_run_command_sandbox_policy());
+            // F20: the wall rides on the limits — see `shell_limits`.
+            let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
+                .with_sandbox_policy(b1_run_command_sandbox_policy());
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
@@ -334,7 +336,7 @@ fn bridle_registry(
             // harness; the real binary path remains Brush unchanged.
             #[cfg(test)]
             let shell = {
-                let mut tool = agent_bridle::ShellTool::new()
+                let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
                     .with_sandbox_policy(b1_run_command_sandbox_policy());
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
@@ -361,6 +363,7 @@ fn bridle_registry(
                     });
                 }
                 let mut tool = agent_bridle::BrushShellTool::new()
+                    .with_timeout(wall)
                     .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
@@ -469,9 +472,26 @@ pub(super) async fn dispatch_bridled_shell(
     // blanket Kernel floor would refuse every exec-restricted command even on
     // Landlock. The correct fix is a PER-AXIS floor at the bridle boundary
     // (fs/net = Kernel, exec = Interceptor-OK); tracked as an ACTIVE deviation.
-    let result = bridle_registry(shell_engine(), live.as_ref().map(LiveOutputSession::relay))
-        .dispatch("shell", args, caveats)
-        .await;
+    // F20: a command whose leading program is a recognised build tool gets the
+    // build lane's wall here too — this IS the lane a compound build command
+    // (`cargo test …; echo …`) runs in, because #2533's routing refuses to
+    // route anything compound. `dispatch_wall` reads only `args["cmd"]`, so
+    // this changes nothing but the wall clock: `caveats` (fs/net/exec
+    // authority) passed to `.dispatch()` below is untouched.
+    let wall = args
+        .get("cmd")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || std::time::Duration::from_secs(run_command_wall_secs()),
+            dispatch_wall,
+        );
+    let result = bridle_registry(
+        shell_engine(),
+        live.as_ref().map(LiveOutputSession::relay),
+        wall,
+    )
+    .dispatch("shell", args, caveats)
+    .await;
     if let Some(live) = live.as_mut() {
         let ordinary_completion = result
             .as_ref()
@@ -835,7 +855,7 @@ pub(super) fn confined_result(
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
     if outcome == ExecOutcome::TimedOut {
-        text.push_str(&timed_out_note());
+        text.push_str(&timed_out_note(dispatch_wall(cmd)));
     }
     (text, outcome)
 }
@@ -855,28 +875,79 @@ fn run_command_wall_secs() -> u64 {
     agent_bridle::LimitsPolicy::default().default_timeout_secs
 }
 
+/// F20: the wall clock for THIS `cmd` — [`LIFECYCLE_BUILD_TIMEOUT`] when its
+/// leading program is a recognised build tool (reusing routing's
+/// `is_build_tool_program` table, not a second list), else the ordinary
+/// [`run_command_wall_secs`]. This is the same 60s-vs-30min split
+/// `lifecycle action=build` already gets — just applied to the shell lane a
+/// COMPOUND build command (`cargo test …; echo …`) actually runs in, since
+/// #2533's routing refuses to route anything compound. Only the wall clock
+/// changes: fs/net/exec authority is unaffected (`dispatch_bridled_shell`
+/// passes `caveats` through unchanged).
+/// `ShellTool` limits for a call whose wall is `wall`. The model's args carry
+/// no `timeout_secs`, so `ShellTool` falls back to `default_timeout_secs`:
+/// that field IS the wall. `max_timeout_secs` is raised with it or the clamp
+/// would cut a build wall back to 300s.
+pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPolicy {
+    let default = agent_bridle::LimitsPolicy::default();
+    agent_bridle::LimitsPolicy {
+        default_timeout_secs: wall.as_secs(),
+        max_timeout_secs: wall.as_secs().max(default.max_timeout_secs),
+        ..default
+    }
+}
+
+pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
+    match leading_program(cmd) {
+        Some(program) if crate::agentic::routing::is_build_tool_program(program) => {
+            LIFECYCLE_BUILD_TIMEOUT
+        }
+        _ => std::time::Duration::from_secs(run_command_wall_secs()),
+    }
+}
+
 /// What the `run_command` description tells the model about its wall, up front.
 /// One owner with [`timed_out_note`], so the two cannot disagree (U6).
 pub(super) fn run_command_limit_sentence() -> String {
     format!(
-        "Each call is killed after {} seconds (wall clock, not configurable per call), so a \
-         cold build or full test run will not finish here: use `lifecycle` action=build, i.e. call \
-         the tool with {LIFECYCLE_BUILD_CALL} ({}-minute limit; `phase` is never `build`) for \
-         those, or narrow the command (one test filter, one crate).",
+        "Each call is killed after {} seconds (wall clock), {} minutes when it starts with \
+         `cargo` or `just`; the result carries the exit code. For an offline build use \
+         `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
+         never `build`), or narrow the command (one test filter, one crate).",
         run_command_wall_secs(),
         LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
     )
 }
 
 /// Appended to a timed-out confined result: the limit, that the command was
-/// killed, and the lane for long builds.
-fn timed_out_note() -> String {
+/// killed, and the lane for long builds. `wall` is the clock that actually
+/// applied to this call (F20: a build-tool command gets the build wall, not
+/// the default) — named explicitly, so a reader can tell why a call ran for
+/// minutes instead of assuming the default 60s.
+fn timed_out_note(wall: std::time::Duration) -> String {
+    let default = std::time::Duration::from_secs(run_command_wall_secs());
+    let wall_note = if wall == default {
+        format!("{}s wall", wall.as_secs())
+    } else {
+        format!(
+            "{}s build-lane wall (not the default {}s)",
+            wall.as_secs(),
+            default.as_secs()
+        )
+    };
+    // A build command already had the build lane's 30 minutes: the only
+    // useful advice left is to narrow it.
+    if wall == LIFECYCLE_BUILD_TIMEOUT {
+        return format!(
+            "\n(the command hit the {wall_note} and was killed; the output above is partial. \
+             Narrow the command: one crate, one test filter.)"
+        );
+    }
     format!(
-        "\n(the command hit the {}s wall and was killed; the output above is partial. For a \
+        "\n(the command hit the {wall_note} and was killed; the output above is partial. For a \
          build or full test run use `lifecycle` action=build, i.e. call the tool with \
          {LIFECYCLE_BUILD_CALL} ({}-minute limit, confined, offline; `phase` is the phase to run, not `build`), or \
          narrow the command.)",
-        run_command_wall_secs(),
         LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
     )
 }

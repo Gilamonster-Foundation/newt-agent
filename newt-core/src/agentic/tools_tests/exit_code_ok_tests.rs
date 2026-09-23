@@ -379,7 +379,7 @@ fn a_host_127_the_shell_did_not_attribute_is_failed() {
 fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
     let limit = agent_bridle::LimitsPolicy::default().default_timeout_secs;
     let (text, class) = confined(
-        "cargo test",
+        "make test",
         envelope(124, "partial", "command timed out after 60s\n", true),
     );
     assert_eq!(class, ExecOutcome::TimedOut);
@@ -419,7 +419,7 @@ fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
 #[test]
 fn timeout_coaching_gives_the_literal_lifecycle_call() {
     const CALL: &str = r#"{"action":"build","phase":"test"}"#;
-    let (text, _) = confined("cargo test", envelope(124, "", "", true));
+    let (text, _) = confined("make test", envelope(124, "", "", true));
     assert!(
         text.contains(CALL),
         "the result must show the call shape: {text}"
@@ -439,4 +439,64 @@ fn timeout_coaching_gives_the_literal_lifecycle_call() {
         description.contains(CALL),
         "the description must too: {description}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #2482 item 6 (follow-up to #2521): `tool_ok` must ground `ok` in the
+// dispatch OUTCOME whenever one exists, not fall through to the text-prefix
+// classifier. Before this fix, only `Denied` was outcome-gated; a `Passed`
+// run_command whose stdout happens to start with `error:` still ledgered
+// `ok = false`, and a `Failed`/`TimedOut` run whose rendered text does NOT
+// start with a recognized prefix still ledgered `ok = true`.
+// ---------------------------------------------------------------------------
+
+/// Red-first: exit 0, stdout starts with `error:` — must be `ok = true`.
+#[test]
+fn passed_with_error_shaped_stdout_is_ok() {
+    let (text, class) = confined(
+        "cat log",
+        envelope(0, "error: quoted from a log\n", "", false),
+    );
+    assert_eq!(class, ExecOutcome::Passed);
+    assert!(
+        tool_ok(&text, Some(class)),
+        "a Passed run must be ok regardless of error-shaped output text: {text}"
+    );
+}
+
+/// Twin: a non-zero exit whose rendered text does NOT start with a
+/// recognized failure prefix must still be `ok = false` — the outcome
+/// decides, not the text. `confined_result` prefixes every `Failed` render
+/// with `error:`, so construct the disagreement directly against `tool_ok`,
+/// the unit under test.
+#[test]
+fn failed_without_error_shaped_text_is_not_ok() {
+    let text = "no recognized prefix here";
+    assert!(
+        !text.trim_start().starts_with("error:"),
+        "test setup: {text}"
+    );
+    assert!(
+        !tool_ok(text, Some(ExecOutcome::Failed)),
+        "a Failed run must not be ok even when its text has no error prefix: {text}"
+    );
+}
+
+/// Every `ExecOutcome` variant must be classified: `Passed` is the only
+/// success, all four failure shapes are `ok = false`.
+#[test]
+fn every_exec_outcome_variant_is_classified() {
+    assert!(tool_ok("anything", Some(ExecOutcome::Passed)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::Failed)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::Denied)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::TimedOut)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::Unavailable)));
+}
+
+/// `None` (no execution outcome recorded — the common case for built-ins)
+/// keeps falling back to the text classifier, unchanged.
+#[test]
+fn none_execution_falls_back_to_text_classifier() {
+    assert!(tool_ok("fine", None));
+    assert!(!tool_ok("error: nope", None));
 }
