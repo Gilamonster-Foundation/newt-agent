@@ -81,3 +81,15 @@ fn a_timed_out_build_command_names_the_build_wall_in_its_result() {
         "missing the default-wall callout in: {text}"
     );
 }
+
+/// F20 regression: the model sends no `timeout_secs`, so `ShellTool` uses
+/// `default_timeout_secs`. Raising only `max_timeout_secs` left a build
+/// command on the SafeSubset engine killed at 60s.
+#[test]
+fn the_wall_is_the_default_timeout_not_just_the_ceiling() {
+    let build = super::shell::shell_limits(build_wall());
+    assert_eq!(build.default_timeout_secs, build_wall().as_secs());
+    assert!(build.max_timeout_secs >= build.default_timeout_secs);
+    let ordinary = super::shell::shell_limits(default_wall());
+    assert_eq!(ordinary.default_timeout_secs, default_wall().as_secs());
+}
