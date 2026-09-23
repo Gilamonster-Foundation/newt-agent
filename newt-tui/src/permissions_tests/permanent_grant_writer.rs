@@ -452,3 +452,156 @@ fn permanent_allow_with_no_root_key_gets_its_own_distinct_fallback() {
     assert_eq!(state.decisions.last().unwrap().scope, "session-no-key");
     assert!(!approve_path(&config).exists(), "nothing should be written");
 }
+
+/// #2524 follow-up item 1 (red first): the no-root-key fallback notice must
+/// name the ACTUAL configured path, or that none is configured, never the
+/// literal word `key_path`.
+#[test]
+fn no_key_notice_names_the_actual_path_not_the_literal_word() {
+    let configured = std::path::Path::new("/opt/newt-fixture/identity.pem");
+    let with_path = no_key_notice(Some(configured));
+    assert!(
+        with_path.contains("/opt/newt-fixture/identity.pem"),
+        "must name the real path: {with_path}"
+    );
+    assert!(
+        !with_path.contains("`key_path`"),
+        "must not print the literal placeholder word: {with_path}"
+    );
+
+    let without_path = no_key_notice(None);
+    assert!(
+        without_path.contains("no key_path configured"),
+        "an unconfigured key_path must say so plainly: {without_path}"
+    );
+    assert!(
+        !without_path.contains("`key_path`"),
+        "must not print the literal placeholder word either: {without_path}"
+    );
+}
+
+/// #2524 follow-up item 2 (red first): the danger check (and its refusal
+/// notice) must classify and name the NORMALIZED fs target persist_approve
+/// would actually write — `/ws/..` must be judged and reported as `/`, not
+/// as the raw string that hides how dangerous the request is.
+#[test]
+fn danger_target_is_normalized_before_classification() {
+    // Platform-absolute paths, not POSIX literals (`/ws/..` has no drive on
+    // Windows — same class of failure as #2545). Compare as `Path`, not
+    // string, since a Windows root renders with backslashes.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let ws = root.join("ws");
+
+    let climbing = ws.join("..");
+    assert_eq!(
+        std::path::Path::new(&normalized_danger_target(
+            DenialKind::FsWrite,
+            &climbing.to_string_lossy()
+        )),
+        root,
+        "a climbing fs target must be classified against its normalized form"
+    );
+    let contained = ws.join("x").join("..").join("y");
+    assert_eq!(
+        std::path::Path::new(&normalized_danger_target(
+            DenialKind::FsRead,
+            &contained.to_string_lossy()
+        )),
+        ws.join("y").as_path(),
+        "an internally-contained relative segment normalizes too"
+    );
+    // A relative/climbing target that fails to normalize falls back to the
+    // raw string — persist_approve's own check refuses it downstream. This
+    // one is relative on every platform, so no tempdir is needed.
+    assert_eq!(
+        normalized_danger_target(DenialKind::FsWrite, "../../"),
+        "../../"
+    );
+    // Exec/net targets are not paths and pass through unchanged.
+    assert_eq!(normalized_danger_target(DenialKind::Exec, "bash"), "bash");
+    assert_eq!(
+        normalized_danger_target(DenialKind::Net, "evil.example"),
+        "evil.example"
+    );
+}
+
+/// The end-to-end wiring: a broad root reached only via a climbing relative
+/// segment (`<root>/ws/..` normalizes cleanly to `<root>`, under a danger
+/// table rooted at `<root>`) must still be refused as high-danger, exactly
+/// as a direct `<root>` request would be — before this fix the raw climbing
+/// string did not classify as High at all, silently reaching the writer
+/// instead of being refused at the gate. Platform-absolute (built from the
+/// fixture's own tempdir, not a POSIX `/` literal — same class as #2545).
+#[test]
+fn allow_permanent_refuses_a_climbing_path_that_normalizes_to_a_broad_root() {
+    let (dir, config, key_path, _root) = fixture();
+    let broad_root = dir.path().to_path_buf();
+    let climbing = broad_root.join("ws").join("..");
+    let mut state = PermissionPromptState::default();
+    let request = req(DenialKind::FsWrite, &climbing.to_string_lossy());
+    match gate_with_danger(
+        &mut state,
+        &config,
+        Some(key_path),
+        None,
+        PromptChoice::AllowPermanent,
+        danger::DangerTable::builtin().with_fs_root(broad_root),
+    )
+    .ask(std::slice::from_ref(&request))
+    {
+        newt_core::PermissionDecision::Deny => {}
+        newt_core::PermissionDecision::Allow(_) => {
+            panic!("a climbing path to a broad root must be refused")
+        }
+    }
+    assert_eq!(
+        state.decisions.last().unwrap().scope,
+        "permanent-allow-refused-high-danger"
+    );
+    assert!(!approve_path(&config).exists(), "nothing should be written");
+}
+
+/// #2524 follow-up item 3 (red first): `persist_approve` reports whether the
+/// pre-existing on-disk text had a comment, so the caller can tell the
+/// operator their comment was NOT preserved across the re-serialise. This is
+/// the actual signal the interactive notice gates on.
+#[test]
+fn persist_approve_reports_when_preexisting_comments_were_dropped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    let ocap_dir = config.with_file_name("ocap");
+    std::fs::create_dir_all(&ocap_dir).unwrap();
+    std::fs::write(
+        ocap_dir.join("approve.toml"),
+        "# hand-written note\n[[exec]]\ntarget = \"curl\"\nsig = \"aa\"\n",
+    )
+    .unwrap();
+    let k = agent_mesh_protocol::UserKey::generate();
+    let had_comments = newt_core::ocap_store::persist_approve(
+        &config,
+        newt_core::ocap_store::ApproveEntry::Exec {
+            target: "cargo".to_string(),
+        },
+        |_, _| false,
+        |payload| k.sign(payload).to_bytes(),
+    )
+    .unwrap();
+    assert!(had_comments, "the pre-existing file had a comment");
+
+    // A second write, now against a file with NO comment (the one just
+    // written by `to_toml`), must report false.
+    let had_comments_again = newt_core::ocap_store::persist_approve(
+        &config,
+        newt_core::ocap_store::ApproveEntry::Exec {
+            target: "just".to_string(),
+        },
+        |_, _| false,
+        |payload| k.sign(payload).to_bytes(),
+    )
+    .unwrap();
+    assert!(
+        !had_comments_again,
+        "a re-serialised file (no hand-written comment left) must report false"
+    );
+}

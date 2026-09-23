@@ -1064,12 +1064,24 @@ fn escalation_result(
         escalated.1,
         crate::ExecOutcome::Denied | crate::ExecOutcome::Unavailable
     ) {
+        // #2541 follow-up: the confined shell already appended
+        // `shell::timed_out_note(wall)` to `first.0` — which recommends
+        // `lifecycle action=build` — before this call ever knew the
+        // escalation would be declined. A result must carry ONE
+        // recommendation, not that suggestion immediately followed by
+        // "declined, do not retry it". Strip it when present; if the exact
+        // suffix isn't there (a different envelope shape), leave the text
+        // alone rather than guess.
+        let first_text = first
+            .0
+            .strip_suffix(&shell::timed_out_note(wall))
+            .unwrap_or(&first.0);
         return (
             format!(
-                "{}\n\nThe action=build escalation did not run:\n{}\n\nBuild authority was \
-                 declined for this call — do not retry it; narrow the command instead (one \
-                 crate, one test filter).",
-                first.0, escalated.0
+                "{first_text}\n\nThe action=build escalation did not run:\n{}\n\nBuild \
+                 authority was declined for this call — do not retry it; narrow the \
+                 command instead (one crate, one test filter).",
+                escalated.0
             ),
             escalated.1,
         );
@@ -1077,8 +1089,9 @@ fn escalation_result(
     escalated_after_timeout(escalated, wall)
 }
 
-/// `lifecycle action=run`, with F19's timeout escalation: on the 60s wall, one
-/// re-run through the SAME build lane `action=build` uses (`run_confined_build_lane`
+/// `lifecycle action=run`, with F19's timeout escalation: on the default wall
+/// (never the build wall — see `escalates`), one re-run through the SAME
+/// build lane `action=build` uses (`run_confined_build_lane`
 /// — same `leq`/permission-gate re-check, never bypassed). A dedicated fn (not
 /// inlined in the `lifecycle` dispatch arm) so `permission_gate`'s two sequential
 /// reborrows each end cleanly at their own `.await`, rather than the borrow

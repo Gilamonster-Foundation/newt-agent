@@ -203,8 +203,16 @@ fn escalates_only_on_a_default_wall_timeout() {
 #[test]
 fn a_refused_escalation_keeps_the_first_runs_evidence() {
     let wall = shell::dispatch_wall("pytest -k slow");
+    // #2541 follow-up (red first): the confined shell already appends its
+    // OWN `shell::timed_out_note(wall)` suffix to a timed-out result — which
+    // itself recommends `lifecycle action=build` — before this call ever
+    // knew the escalation would be declined. A hand-written fixture that
+    // never included that real suffix (the prior shape of this test) could
+    // not catch a result that carries TWO recommendations: the shell's own
+    // "use action=build" immediately followed by "declined, do not retry
+    // it". Use the REAL suffix here so the test can.
     let first = (
-        "partial: test_foo hung\n(the command hit the 60s wall and was killed...)".to_string(),
+        format!("partial: test_foo hung{}", shell::timed_out_note(wall)),
         crate::ExecOutcome::TimedOut,
     );
     for (refusal, outcome) in [
@@ -235,6 +243,13 @@ fn a_refused_escalation_keeps_the_first_runs_evidence() {
             !text.contains("Suggested lifecycle call:"),
             "a refused escalation must not recommend the exact call that was just \
              declined: {text}"
+        );
+        assert!(
+            !text.contains("call the tool with"),
+            "a result must carry ONE recommendation — the shell's own timed-out \
+             suggestion to use action=build (which literally says 'call the tool \
+             with') must not survive alongside the 'declined, do not retry' line: \
+             {text}"
         );
         assert!(
             text.contains("declined") && text.contains("narrow the command"),
