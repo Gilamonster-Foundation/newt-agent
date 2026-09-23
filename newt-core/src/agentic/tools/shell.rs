@@ -700,7 +700,17 @@ pub(super) async fn exec_confined_command(
                 // ONE consult + ONE re-execution per call: a second denial (a
                 // different target reached on the re-run) surfaces as the standard
                 // envelope — the model can retry, which prompts afresh.
-                if let Some(gate) = permission_gate.take() {
+                //
+                // F19/#2541 round 2: REBORROW (`as_deref_mut`), never `take()`. Taking
+                // permanently empties the caller's `&mut Option<&mut dyn PermissionGate>`
+                // — the exact double indirection `lifecycle_run_with_escalation` relies on
+                // to reuse the SAME gate for its second confined call. `take()` here left
+                // that second call (`run_confined_build_lane`) with `permission_gate ==
+                // None` whenever THIS run's denial had just been allowed and the re-dispatch
+                // then timed out: the escalation refused "requires explicit … authority"
+                // without ever asking the operator who just said yes. Nothing below this
+                // block touches `permission_gate` again, so reborrowing costs nothing here.
+                if let Some(gate) = permission_gate.as_deref_mut() {
                     // #905: promptable exec denials OR net-host denials (agent-bridle
                     // #196). On Allow, the re-mint widens the matching axis (net adds
                     // the host to the allow-list), so the proxy admits it on re-run.
