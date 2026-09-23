@@ -153,6 +153,121 @@ fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
     }
 }
 
+/// #2541 round 2 item 3: the escalation's decision, isolated from formatting
+/// and table-tested against all five `ExecOutcome` variants — only a genuine
+/// `TimedOut` justifies spending the build lane's authority on a second run.
+#[test]
+fn escalates_only_on_a_genuine_timeout() {
+    for (outcome, expected) in [
+        (crate::ExecOutcome::TimedOut, true),
+        (crate::ExecOutcome::Passed, false),
+        (crate::ExecOutcome::Failed, false),
+        (crate::ExecOutcome::Denied, false),
+        (crate::ExecOutcome::Unavailable, false),
+    ] {
+        assert_eq!(
+            escalates(outcome),
+            expected,
+            "escalates({outcome:?}) should be {expected}"
+        );
+    }
+}
+
+/// #2541 round 2 item 1 (red first): when the escalation itself does not
+/// execute — `Denied` (including a frame-isolation refusal, which
+/// `run_confined_build_lane` also classes `Denied`) or `Unavailable` — the
+/// FIRST run's result is the ONLY record of which test hung, and it was being
+/// silently dropped in favor of the escalation's bare refusal text. It must
+/// survive, composed through the SAME `lifecycle_run_result(args, first)` the
+/// non-escalating path already uses (see item 4: this is what keeps that
+/// function's `TimedOut` arm alive), with the refusal appended — never lost.
+#[test]
+fn a_refused_escalation_keeps_the_first_runs_evidence() {
+    let args = serde_json::json!({"phase": "test"});
+    let first = (
+        "partial: test_foo hung\n(the command hit the 60s wall and was killed...)".to_string(),
+        crate::ExecOutcome::TimedOut,
+    );
+    for (refusal, outcome) in [
+        (
+            "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".to_string(),
+            crate::ExecOutcome::Denied,
+        ),
+        (
+            "Error: frame isolation: tool authority exceeds the frame's ceiling".to_string(),
+            crate::ExecOutcome::Denied,
+        ),
+        (
+            "error: build workspace: No such file or directory".to_string(),
+            crate::ExecOutcome::Unavailable,
+        ),
+    ] {
+        let (text, out) = escalation_result(&args, first.clone(), (refusal.clone(), outcome));
+        assert_eq!(out, outcome, "the refusal's own class is the final outcome");
+        assert!(
+            text.contains("partial: test_foo hung"),
+            "the first run's evidence (which test hung) must survive: {text}"
+        );
+        assert!(
+            text.contains(&refusal),
+            "the escalation's refusal must still be visible: {text}"
+        );
+    }
+}
+
+/// #2541 round 2 item 1, executing arm: when the escalation DOES run (any
+/// outcome but `Denied`/`Unavailable`), its own result already speaks for the
+/// whole call — `first`'s partial timeout output is superseded, not
+/// duplicated, exactly as before this round's fix.
+#[test]
+fn an_executed_escalation_supersedes_the_first_runs_partial_output() {
+    let args = serde_json::json!({"phase": "test"});
+    let first = (
+        "partial: test_foo hung\n(the command hit the 60s wall and was killed...)".to_string(),
+        crate::ExecOutcome::TimedOut,
+    );
+    let build_result = "  ✓ build check passed".to_string();
+    let (text, out) = escalation_result(
+        &args,
+        first,
+        (build_result.clone(), crate::ExecOutcome::Passed),
+    );
+    assert_eq!(out, crate::ExecOutcome::Passed);
+    assert!(
+        !text.contains("test_foo hung"),
+        "an executed escalation's own result supersedes the first run's partial output: {text}"
+    );
+    assert!(text.ends_with(&build_result), "{text}");
+}
+
+/// #2541 round 2 item 5 (red first): a build-authority prompt that fires
+/// because `action=run` escalated must say so — otherwise the operator sees a
+/// `lifecycle action=build` permission request out of a call they read as
+/// `action=run` and has no idea why.
+#[test]
+fn the_escalation_names_itself_in_the_permission_prompt() {
+    let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));
+    let direct = lifecycle_build_request("/ws", "cargo test --offline", &base, None);
+    assert!(
+        !direct.reason.to_lowercase().contains("escalat"),
+        "a direct action=build call names no escalation: {}",
+        direct.reason
+    );
+    let escalated = lifecycle_build_request(
+        "/ws",
+        "cargo test --offline",
+        &base,
+        Some("lifecycle action=run hit the confined shell's 60s wall"),
+    );
+    assert!(
+        escalated.reason.contains("escalation")
+            && escalated.reason.contains("action=run")
+            && escalated.reason.contains("60s wall"),
+        "the prompt must name why a build-authority request appeared: {}",
+        escalated.reason
+    );
+}
+
 /// #894 regression for the concrete drift that motivated the registry: the
 /// `lifecycle` tool (#891) is advertised + dispatched, so it MUST be a real
 /// name — otherwise every legitimate `lifecycle` call is miscounted as a
@@ -436,11 +551,16 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
 #[test]
 fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));
-    let request = lifecycle_build_request("/ws", "cargo test --offline", &base);
+    let request = lifecycle_build_request("/ws", "cargo test --offline", &base, None);
     assert_eq!(request.kind, DenialKind::Build);
     assert_eq!(request.target, "/ws");
     assert!(request.reason.contains("cargo test --offline"));
     assert!(request.reason.contains("network denied"));
+    assert!(
+        !request.reason.contains("escalation"),
+        "a direct action=build call names no escalation: {}",
+        request.reason
+    );
     assert_eq!(
         crate::agentic::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
         base
