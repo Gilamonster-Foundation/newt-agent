@@ -76,6 +76,11 @@ mod inline_viewport;
 // not a dependency, so "no renderer in the model" is a compile error.
 #[cfg(feature = "rich-tui")]
 mod interaction_view;
+// #2524 item 7: the RichTUI free-text modal for a pending clarification
+// batch — a small purpose-built reader beside `interaction_view`'s
+// choice-list modal, for the reason its own module doc gives.
+#[cfg(feature = "rich-tui")]
+mod clarification_modal;
 /// C2 (#1876) — the PTY acceptance proof that the inline INTERACTION frame
 /// hands the terminal back on every exit path: clean close, panic, and error
 /// return. Same tier and same reasoning as the pager's, and it additionally

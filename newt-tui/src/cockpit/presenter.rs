@@ -899,6 +899,69 @@ impl Presenter {
                 }
                 self.dirty = true;
             }
+            // #2524 item 7: the cockpit's own terminal handoff, mirroring
+            // `Interact` below rather than `ReadLine` above — a pending
+            // clarification takes the modal's reserved rows the same way a
+            // permission prompt does, instead of the persistently-mounted
+            // chat editor `ReadLine` queues into.
+            SurfaceRequest::PresentClarification {
+                batch,
+                hint,
+                prompt: _,
+                color: _,
+                verbose: _,
+                reply,
+            } => {
+                if self.surface.take_end_quit() {
+                    let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
+                    self.dirty = true;
+                    return Ok(());
+                }
+                let prompt_output = self.screen.tty.try_clone()?;
+                if self.dirty {
+                    self.draw()?;
+                }
+                let requested_rows =
+                    crate::clarification_modal::requested_rows(&batch, self.screen.cols);
+                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                self.chat_inactive = true;
+                if reservation.chat_visible {
+                    if let Err(error) = self.draw() {
+                        self.chat_inactive = false;
+                        return Err(error);
+                    }
+                }
+                if let Err(error) = self.screen.place_cursor(reservation.start) {
+                    self.chat_inactive = false;
+                    let _ = self.finish_modal(Some(&reservation));
+                    let _ = self.draw();
+                    return Err(error);
+                }
+                let window = Self::suspend_terminal(prompt_output);
+                let result: io::Result<ReadOutcome> = self
+                    .screen
+                    .tty
+                    .try_clone()
+                    .and_then(|out| {
+                        crate::inline_viewport::cockpit_panel_terminal(
+                            out,
+                            Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
+                        )
+                    })
+                    .and_then(|mut terminal| {
+                        crate::clarification_modal::present_in(&mut terminal, &batch, &hint)
+                    });
+                drop(window);
+                let modal_cleanup = self.finish_modal(Some(&reservation));
+                self.chat_inactive = false;
+                let repaint = (|| -> io::Result<()> {
+                    self.screen.term.clear()?;
+                    self.draw()
+                })();
+                let _ = reply.send(result.map_err(anyhow::Error::from));
+                modal_cleanup?;
+                repaint?;
+            }
             SurfaceRequest::Reload { reply } => {
                 let result = self.surface.reload();
                 let draft = self.editor.draft();
@@ -1829,7 +1892,8 @@ mod terminal_acceptance;
 pub(crate) use terminal_acceptance::cockpit_pager_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
-    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case, panel_resize_case,
+    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
+    cockpit_clarification_input_case, panel_resize_case,
 };
 
 #[cfg(test)]

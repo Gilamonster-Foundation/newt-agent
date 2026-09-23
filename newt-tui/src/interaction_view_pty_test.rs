@@ -169,6 +169,9 @@ fn interaction_view_child() {
         "cockpit_buffered_input" => {
             crate::cockpit::presenter::cockpit_buffered_input_case();
         }
+        "cockpit_clarification_input" => {
+            crate::cockpit::presenter::cockpit_clarification_input_case();
+        }
         #[cfg(feature = "live-spill")]
         "cockpit_pager" => {
             crate::cockpit::presenter::cockpit_pager_case();
@@ -363,6 +366,10 @@ pub(crate) fn drive_cockpit_acceptance() {
 
 pub(crate) fn drive_cockpit_buffered_input() {
     drive_cockpit_case("cockpit_buffered_input");
+}
+
+pub(crate) fn drive_cockpit_clarification_input() {
+    drive_cockpit_case("cockpit_clarification_input");
 }
 
 #[cfg(feature = "live-spill")]

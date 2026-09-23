@@ -185,6 +185,135 @@ fn buffered_input_case() {
     assert!(matches!(closed, Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
 }
 
+/// #2540 round 2 item 2 (red first): the clarification modal's real terminal
+/// input path — the tier that caught NOTHING before this round, because
+/// `clarification_modal`'s own unit tests drive `FreeTextInput` with
+/// synthetic `Event::Key`/`Event::Paste` values, never a real device. Driven
+/// live (Herdr pane, release build) the modal rendered correctly and then
+/// could neither be answered nor left: a paste echoed as literal
+/// `^[[200~…^[[201~`, Enter as literal `^M`, Esc/Ctrl-C/Ctrl-U did nothing.
+/// This types an ordinal answer + Enter, pastes a bracketed `/discuss …` +
+/// Enter, presses Esc, and checks `stty -g` afterward — the four things
+/// measured broken live.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn the_clarification_modal_can_be_answered_pasted_into_and_escaped() {
+    crate::interaction_view_pty_test::drive_cockpit_clarification_input();
+}
+
+pub(crate) fn cockpit_clarification_input_case() {
+    let result = std::panic::catch_unwind(clarification_input_case);
+    if let Err(error) = result {
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-text panic");
+        println!("CLARIFICATION_INPUT_FAILURE:{message}");
+        std::panic::resume_unwind(error);
+    }
+}
+
+fn clarification_input_case() {
+    let tty = TestTty::install();
+    let before = termios_of(0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+
+    // 1: a typed ordinal answer + Enter must reach the clarification path.
+    // A unique batch marker per round, so `type_when_painted`'s whole-buffer
+    // scan (the painted transcript only ever grows across these three
+    // rounds) cannot fire early on a marker an EARLIER round already drew.
+    let (reply, received) = std::sync::mpsc::sync_channel(1);
+    let typer = tty.type_when_painted("CLAR_ROUND_ONE", b"1: keep the index\r");
+    cockpit
+        .handle_request(SurfaceRequest::PresentClarification {
+            batch: "CLAR_ROUND_ONE\n1: keep the index\n2: rebuild it".into(),
+            hint: "ordinal locks it".into(),
+            prompt: String::new(),
+            color: false,
+            verbose: false,
+            reply,
+        })
+        .unwrap();
+    assert!(
+        typer.join().expect("round-one prompt watcher"),
+        "the modal must reach the real terminal before input is sent"
+    );
+    assert!(
+        matches!(received.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line == "1: keep the index"),
+        "a typed ordinal + Enter must reach the clarification path, not \
+         literal bytes: {:?}",
+        received.try_recv()
+    );
+
+    // 2: a bracketed paste of `/discuss …` + Enter must reach the path too —
+    // decoded as ONE `Event::Paste`, not the escape markers themselves typed
+    // character by character.
+    let (reply2, received2) = std::sync::mpsc::sync_channel(1);
+    let typer2 = tty.type_when_painted(
+        "CLAR_ROUND_TWO",
+        b"\x1b[200~/discuss why the plan changed\x1b[201~\r",
+    );
+    cockpit
+        .handle_request(SurfaceRequest::PresentClarification {
+            batch: "CLAR_ROUND_TWO\n1: keep the index".into(),
+            hint: "ordinal locks it".into(),
+            prompt: String::new(),
+            color: false,
+            verbose: false,
+            reply: reply2,
+        })
+        .unwrap();
+    assert!(
+        typer2.join().expect("round-two prompt watcher"),
+        "the modal must reach the real terminal before input is sent"
+    );
+    assert!(
+        matches!(received2.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line == "/discuss why the plan changed"),
+        "a bracketed paste + Enter must reach the clarification path, not \
+         raw escape bytes: {:?}",
+        received2.try_recv()
+    );
+
+    // 3: Esc must dismiss — the caller gets an ordinary answer back, not a
+    // modal the operator cannot leave.
+    let (reply3, received3) = std::sync::mpsc::sync_channel(1);
+    let typer3 = tty.type_when_painted("CLAR_ROUND_THREE", b"\x1b");
+    cockpit
+        .handle_request(SurfaceRequest::PresentClarification {
+            batch: "CLAR_ROUND_THREE\n1: keep the index".into(),
+            hint: "ordinal locks it".into(),
+            prompt: String::new(),
+            color: false,
+            verbose: false,
+            reply: reply3,
+        })
+        .unwrap();
+    assert!(
+        typer3.join().expect("round-three prompt watcher"),
+        "the modal must reach the real terminal before input is sent"
+    );
+    assert!(
+        matches!(received3.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line.is_empty()),
+        "Esc must dismiss to an ordinary (empty) answer, not trap the \
+         operator: {:?}",
+        received3.try_recv()
+    );
+
+    drop(cockpit);
+    // 4: the terminal must come back byte-for-byte itself after all three
+    // rounds — `stty -g` identical to before the first modal opened.
+    assert!(
+        modes_equal(&before, &termios_of(0)),
+        "exact termios restore after the clarification modal"
+    );
+    println!("CLARIFICATION_INPUT_RESTORED");
+}
+
 /// Grounds surface forwarding in a real foreground terminal: the external
 /// command reads operator input, receives its own interrupt/EOF, and gives
 /// the keyboard and exact terminal mode back to the mounted editor.

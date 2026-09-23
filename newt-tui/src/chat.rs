@@ -613,6 +613,17 @@ struct PendingClarification {
     intake: newt_core::agentic::PromptIntake,
 }
 
+/// The answer shape a pending clarification wants, shown beside the batch
+/// rather than folded into it (#2524 item 7). Named once so RichTUI's modal
+/// hint and the lean default's (unused) hint parameter never drift apart.
+///
+/// #2540 round 2 item 3 (measured live): `modal::frame`'s legend is ONE row
+/// with no wrap, and the longer wording clipped mid-word at the box edge
+/// ("…/discuss to talk it thr") on an ordinary terminal width. Shortened
+/// rather than taught to wrap — wrapping is a `modal::frame` change every
+/// other modal's legend would also have to accept.
+const CLARIFICATION_HINT: &str = "ordinal locks it · /discuss to talk it through";
+
 /// The disposition each accepted turn was comprehended with, before any
 /// operating-mode narrowing, keyed by its submitted prompt (#2332).
 type RecordedDispositions =
@@ -1097,6 +1108,13 @@ mod turn_tuning_ratchet_tests;
 #[path = "chat_tests/plan_approval.rs"]
 mod plan_approval_tests;
 
+/// #2524 item 7: the shared trait default `read_line`/`present_clarification`
+/// reproduces today's byte-for-byte, tested against a fake `InputSurface`
+/// that never overrides it.
+#[cfg(test)]
+#[path = "chat_tests/present_clarification.rs"]
+mod present_clarification_tests;
+
 /// #1963: persist a turn that did NOT reach a normal completion — cancelled
 /// by the operator (Esc/Ctrl-C) or ended in a backend/loop error — through
 /// exactly the same durable path [`save_turn_if_persistent`]'s Ok-arm caller
@@ -1309,6 +1327,33 @@ pub(crate) trait InputSurface {
     /// the rich default's timestamp is current). Returns a [`ReadOutcome`];
     /// only an *unexpected* editor error propagates as `Err`.
     fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome>;
+    /// Present a pending clarification `batch` and read the operator's
+    /// answer (#2524 item 7).
+    ///
+    /// `prompt` is the SAME per-turn prompt string `read_line` would have
+    /// received; `hint` names the answer shape (an ordinal, or `/discuss`)
+    /// for a surface that can show it beside the batch rather than folded
+    /// into it. `color`/`verbose` mirror `print_newt`'s own parameters,
+    /// since the default body below is exactly that call.
+    ///
+    /// Defaulted rather than required: every surface except RichTUI wants
+    /// the SAME body — print the batch, then read a line — and a per-surface
+    /// copy of that pair is exactly the sprawl `AGENTS.md`'s reuse
+    /// discipline warns about. RichTUI is the one override, drawing
+    /// `modal::frame` chrome around a free-text reader instead
+    /// (`clarification_modal::present`) so `/discuss` and the ordinal shape
+    /// live in the chrome's hint rather than in scrollback.
+    fn present_clarification(
+        &mut self,
+        batch: &str,
+        _hint: &str,
+        prompt: &str,
+        color: bool,
+        verbose: bool,
+    ) -> anyhow::Result<ReadOutcome> {
+        print_newt(batch, color, verbose);
+        self.read_line(prompt)
+    }
     /// Record a submitted entry in history.
     fn add_history(&mut self, entry: &str);
     /// Persist history to disk (no-op when there is no history path).
@@ -3327,7 +3372,23 @@ fn session_body(
                     });
             // The human has the floor: not "blocked", just waiting.
             newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::Waiting);
-            (surface.read_line(&prompt)?, origin)
+            // #2524 item 7: while a clarification is pending, the very next
+            // read IS the operator's answer to it — route through the
+            // composed surface method so RichTUI can draw it inside modal
+            // chrome instead of scrollback. Every other surface's default
+            // reproduces today's print-then-read exactly (see
+            // `InputSurface::present_clarification`'s doc).
+            let outcome = match pending_clarification.as_ref() {
+                Some(pending) => surface.present_clarification(
+                    &pending.intake.clarification_batch(),
+                    CLARIFICATION_HINT,
+                    &prompt,
+                    color,
+                    verbose,
+                )?,
+                None => surface.read_line(&prompt)?,
+            };
+            (outcome, origin)
         };
         match outcome {
             // #1669 16.3: a keyboard tab motion (`gt`/`gT`/`{count}gt`). The
@@ -4071,12 +4132,16 @@ fn session_body(
                                             &active_conversation_id,
                                             ordinal,
                                         );
-                                        let batch = reopened.clarification_batch();
+                                        // #2524 item 7: the batch is no
+                                        // longer printed here — the very next
+                                        // read (top of loop) is the operator's
+                                        // answer to it, so it goes through
+                                        // `present_clarification` instead,
+                                        // which shows the SAME batch text.
                                         pending_clarification = Some(PendingClarification {
                                             parent: previous.parent,
                                             intake: reopened,
                                         });
-                                        print_newt(&batch, color, verbose);
                                     }
                                     None => {
                                         last_adjudicated = Some(previous);
@@ -7473,7 +7538,11 @@ fn session_body(
                                 parent: Box::new(parent),
                                 intake: prompt_intake,
                             });
-                            print_newt(&batch, color, verbose);
+                            // #2524 item 7: no separate batch print here —
+                            // the very next read (top of loop) goes through
+                            // `present_clarification`, which shows this SAME
+                            // batch text (`clarification_batch()` is
+                            // deterministic over the unchanged intake).
                             println!();
                             continue;
                         }
@@ -7527,7 +7596,6 @@ fn session_body(
                                 }
                             }
                         }
-                        let clarification = prompt_intake.clarification_batch();
                         // #1689 item 1: when a reply was REFUSED, say why
                         // before repeating the batch. The gate never calls the
                         // model, so an identical re-emit is the entire response
@@ -7545,8 +7613,9 @@ fn session_body(
                             print_newt(&reason, color, verbose);
                             println!();
                         }
-                        print_newt(&clarification, color, verbose);
-                        println!();
+                        // #2524 item 7: the batch itself is no longer printed
+                        // here — the very next read (top of loop) goes
+                        // through `present_clarification`, which shows it.
                         continue;
                     }
 
