@@ -4465,20 +4465,28 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
         || r.starts_with("no command configured"))
 }
 
-/// #2419: ground the ledgered `ok` bit in the dispatch OUTCOME before falling
-/// back to `tool_result_ok`'s text prefixes. A pre-dispatch MCP permission
-/// refusal (missing gate, denied/cancelled) sets `execution = Some(Denied)`
-/// without ever reaching the connector; that is authoritative non-success
-/// regardless of how the refusal happens to be worded, so no future refusal
-/// string can silently re-classify as `ok = true` by omitting a recognized
-/// prefix. Every other outcome (including `None`, the common case for
-/// built-ins that never touch the execution slot) keeps the existing
-/// text-based classification unchanged.
+/// #2482 item 6 (follow-up to #2521): ground the ledgered `ok` bit in the
+/// dispatch OUTCOME whenever one exists, full stop — not only for `Denied`.
+/// A `run_command` that exits 0 but whose stdout happens to start with
+/// `error:` is authoritative success (`Passed`) regardless of what its own
+/// output says; a `Failed`/`TimedOut`/`Unavailable` run is authoritative
+/// non-success even when its rendered text has no recognized failure prefix.
+/// `tool_result_ok`'s text prefixes are a best-effort fallback for the
+/// common case where no structured outcome was recorded at all (`None` —
+/// most built-ins never touch the execution slot). Every `ExecOutcome`
+/// variant is named explicitly (no `_ =>`) so a new variant must be
+/// classified on purpose, not silently fall through to text.
 pub(crate) fn tool_ok(result: &str, execution: Option<crate::ExecOutcome>) -> bool {
-    if execution == Some(crate::ExecOutcome::Denied) {
-        return false;
+    match execution {
+        Some(crate::ExecOutcome::Passed) => true,
+        Some(
+            crate::ExecOutcome::Failed
+            | crate::ExecOutcome::Denied
+            | crate::ExecOutcome::TimedOut
+            | crate::ExecOutcome::Unavailable,
+        ) => false,
+        None => tool_result_ok(result),
     }
-    tool_result_ok(result)
 }
 
 // Private-source recovery is a composition invariant, not only a renderer
