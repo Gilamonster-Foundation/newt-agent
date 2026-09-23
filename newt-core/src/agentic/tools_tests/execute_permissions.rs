@@ -689,6 +689,77 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
     assert_eq!(events.last(), Some(&expected_finish), "events: {events:?}");
 }
 
+/// #2541 round 2 item 2 (red first): the double-indirection signature
+/// (`&mut Option<&mut dyn PermissionGate>`, see the doc comment on
+/// `exec_confined_command`'s `permission_gate` param) exists so a caller can
+/// reborrow the SAME gate for a second sequential confined call — F19's
+/// `lifecycle action=run` escalation into `action=build` does exactly that.
+/// `exec_confined_command`'s denial-retry used to `permission_gate.take()`
+/// the Option permanently empty on ANY allowed denial-recovery, so a second
+/// call through the same `Option` saw `None` and silently refused instead of
+/// asking — the operator who had just said yes to the first prompt got a
+/// denial for the second with no prompt at all. Prove the Option survives: a
+/// second `exec_confined_command` call through the SAME
+/// `&mut Option<&mut dyn PermissionGate>` still has a live gate to ask.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let denied = Caveats {
+        exec: Scope::none(),
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut permission_gate: Option<&mut dyn super::PermissionGate> = Some(&mut gate);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+
+    let first = exec_confined_command(
+        "/bin/echo first-call",
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut permission_gate,
+        false,
+        None,
+        None,
+        &mut display,
+    )
+    .await;
+    assert!(first.0.contains("first-call"), "{}", first.0);
+    assert!(
+        permission_gate.is_some(),
+        "the gate must survive a denial-allow so a second confined call can reuse it"
+    );
+
+    let second = exec_confined_command(
+        "/bin/echo second-call",
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut permission_gate,
+        false,
+        None,
+        None,
+        &mut display,
+    )
+    .await;
+    assert!(second.0.contains("second-call"), "{}", second.0);
+    assert_eq!(
+        gate.asks.len(),
+        2,
+        "the same gate must be asked for BOTH confined calls, never silently \
+         refused because it was consumed by the first"
+    );
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.
