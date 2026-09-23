@@ -866,10 +866,14 @@ async fn run_one_turn(
                 usage: None,
                 hallucinations: 0,
                 tool_events,
+                // F14: a loop that errored without typing its end (e.g. an
+                // exhausted context-overflow recovery) ended in a backend/loop
+                // error — `Failed`, never an untyped `None`. A reason the loop
+                // did write (e.g. `Cancelled`) wins.
                 end_reason: if exhausted {
                     Some(crate::TurnEndReason::RunAllowance)
                 } else {
-                    end_reason
+                    end_reason.or(Some(crate::TurnEndReason::Failed))
                 },
                 // W0 (#1511): the class is read from the TYPED chain; an error
                 // with no dispatch classification is OURS — harness_error,
@@ -1959,7 +1963,7 @@ mod tests {
             let err = o.error.expect("the rejection is carried on the outcome");
             assert!(err.contains(message), "{name}: {err}");
             assert_eq!(o.error_class, Some(ErrorClass::Model), "{name}");
-            assert_eq!(o.end_reason, None, "{name}");
+            assert_eq!(o.end_reason, Some(crate::TurnEndReason::Failed), "{name}");
             // Nothing ran; the re-asked rounds leave only not-ok markers (P0 U3).
             assert!(
                 o.tool_events
