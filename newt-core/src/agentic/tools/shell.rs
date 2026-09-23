@@ -924,7 +924,13 @@ pub(super) fn run_command_limit_sentence() -> String {
 /// applied to this call (F20: a build-tool command gets the build wall, not
 /// the default) — named explicitly, so a reader can tell why a call ran for
 /// minutes instead of assuming the default 60s.
-fn timed_out_note(wall: std::time::Duration) -> String {
+///
+/// `pub(super)` (#2541 follow-up): `tools.rs`'s `escalation_result` strips
+/// this exact suffix from a timed-out first run's text when the escalation
+/// it recommends was just DECLINED — a result must carry ONE recommendation,
+/// never this note's "use lifecycle action=build" immediately followed by
+/// "build authority was declined".
+pub(super) fn timed_out_note(wall: std::time::Duration) -> String {
     let default = std::time::Duration::from_secs(run_command_wall_secs());
     let wall_note = if wall == default {
         format!("{}s wall", wall.as_secs())
