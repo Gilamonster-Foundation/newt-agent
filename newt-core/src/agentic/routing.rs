@@ -202,12 +202,22 @@ impl RouteTable {
         }
         // A leading `cd` INSIDE `command` already resolved a `cwd` above —
         // that is the question `cd` itself answers, so a `cwd` FIELD
-        // alongside it is redundant at best and never silently combined
-        // into a second, different directory.
+        // alongside it is never silently combined into a second, different
+        // directory. #2551 round 3: the leading `cd` was folded and
+        // resolved against `workspace`, but a real shell resolves a
+        // RELATIVE leading `cd` against the call's `cwd` field, not the
+        // workspace root — `{command:"cd sub && cargo test", cwd:"other"}`
+        // routes to `<root>/sub` while the shell would run in
+        // `<root>/other/sub`. Refuse rather than silently building/reading
+        // the wrong directory.
         let already_has_cwd =
             matches!(&decision, RouteDecision::Route { args, .. } if args.get("cwd").is_some());
         if already_has_cwd {
-            return decision;
+            return if call.get("cwd").is_some() {
+                RouteDecision::Exec
+            } else {
+                decision
+            };
         }
         // PR1: a model-supplied `cwd` FIELD on an otherwise-bare call is the
         // SAME question a leading `cd` asks — resolved the SAME way
@@ -384,7 +394,16 @@ fn resolve_workspace_relative_dir(
     if !canonical_dir.is_dir() || !canonical_dir.starts_with(&canonical_workspace) {
         return None;
     }
-    if !crate::caveats::permits_path(read_scope, &canonical_dir.to_string_lossy()) {
+    // #2551 round 3 nit: the fence was granted against the (possibly
+    // symlinked) WORKSPACE string, e.g. macOS `/tmp/ws` for a canonical
+    // `/private/tmp/ws`. Checking `canonical_dir` against the un-canonicalized
+    // `read_scope` then fails for every `<dir>`, including `.` — canonicalize
+    // the scope's own roots the same way before checking the canonical side,
+    // so a symlinked workspace root still folds `cd`s.
+    if !crate::caveats::permits_path(
+        &canonicalize_scope(read_scope),
+        &canonical_dir.to_string_lossy(),
+    ) {
         return None;
     }
     let relative = canonical_dir.strip_prefix(&canonical_workspace).ok()?;
@@ -393,6 +412,22 @@ fn resolve_workspace_relative_dir(
     } else {
         relative.to_string_lossy().into_owned()
     })
+}
+
+/// Canonicalize each root in a read-fence scope, for comparing against an
+/// already-canonicalized candidate path. A root that fails to canonicalize
+/// (does not exist, dangling symlink) is kept as-is — it simply will not
+/// match a canonical candidate, which is fail-closed, not a widening.
+fn canonicalize_scope(scope: &crate::caveats::Scope<String>) -> crate::caveats::Scope<String> {
+    match scope {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(set.iter().map(|root| {
+            std::fs::canonicalize(root)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.clone())
+        })),
+    }
 }
 
 /// Insert a resolved `cwd` into a route's args — the one seam both
@@ -2048,5 +2083,61 @@ mod tests {
             classify_at("cd sub/.. && cargo test", &fx.root, &scope),
             RouteDecision::Exec
         );
+    }
+
+    /// #2551 round 3 should-fix: a folded leading `cd` resolves `<dir>`
+    /// against `workspace`, but when the call ALSO carries a `cwd` field, a
+    /// real shell resolves the relative `cd` against THAT directory, not the
+    /// workspace root. `{command:"cd sub && cargo test", cwd:"other"}` used
+    /// to route to `<root>/sub` while the shell would run in
+    /// `<root>/other/sub` (or fail, if that path does not exist) — a
+    /// wrong-directory build that still counted as a pass. Refuse instead of
+    /// resolving the fold against the field: simpler, and the review's
+    /// evidence never combines the two.
+    #[test]
+    fn a_cwd_field_alongside_a_folded_leading_cd_refuses() {
+        let fx = CdFixture::new();
+        let other = fx.root.join("other");
+        std::fs::create_dir(&other).expect("mkdir other");
+        std::fs::create_dir(other.join("sub")).expect("mkdir other/sub");
+        let scope = fx.read_scope();
+        let call = json!({ "command": "cd sub && cargo test", "cwd": "other" });
+        assert_eq!(
+            RouteTable::builtin().classify_call(&call, &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 3 nit: the round-2 dual fence check compares a canonical
+    /// candidate path against the UN-canonicalized `read_scope` roots, so a
+    /// workspace reached through a symlinked path (macOS `/tmp` →
+    /// `/private/tmp`) fails the canonical check for every `<dir>`,
+    /// including `.` — no `cd` ever routes. Canonicalizing the scope's own
+    /// roots before that comparison fixes it. Deliberately does NOT
+    /// canonicalize the tempdir path up front (unlike `CdFixture::new`),
+    /// so the workspace root passed to `classify_call` is itself the
+    /// symlinked string this test is about.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_symlinked_workspace_root_still_folds_a_cd() {
+        let real = tempfile::TempDir::new().expect("tempdir");
+        let real_root = real.path().canonicalize().expect("canonicalize tempdir");
+        std::fs::create_dir(real_root.join("sub")).expect("mkdir sub");
+        let parent = real_root.parent().expect("tempdir has a parent");
+        let link = parent.join(format!(
+            "{}-link",
+            real_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&real_root, &link).expect("symlink workspace root");
+        let scope = crate::caveats::Scope::only([link.to_string_lossy().into_owned()]);
+        let call = json!({ "command": "cd sub && cargo test" });
+        assert_eq!(
+            RouteTable::builtin().classify_call(&call, &link, &scope),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "test"], "cwd": "sub" }),
+            }
+        );
+        std::fs::remove_file(&link).ok();
     }
 }

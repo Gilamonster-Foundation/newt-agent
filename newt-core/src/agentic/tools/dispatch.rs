@@ -76,8 +76,9 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
-    /// #2551 round 2: the ROUTE dispatch actually acted on, recorded here
-    /// (never re-derived from a second `classify_call`) so a caller like
+    /// #2551 round 2: the route the `run_command` routing site acted on,
+    /// recorded here (never re-derived from a second `classify_call`) so a
+    /// caller like
     /// `is_progress_verification` cannot disagree with what really ran.
     /// `classify` reads the filesystem, and the call itself can change it
     /// mid-turn — `cd target; cargo test | tail -5` on a clean checkout
