@@ -809,8 +809,17 @@ fn authorization_prompts_enabled_consults_the_operator() {
 #[test]
 fn allow_permanent_records_session_scope_when_net_persist_fails() {
     let root = tempfile::TempDir::new().unwrap();
-    let config = root.path().join("blocked-config-dir");
-    std::fs::create_dir_all(&config).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    // #2535/#2524 PR1: the durable write moved from `[tui.permissions] net`
+    // to `persist_approve`'s `<config dir>/ocap/approve.toml`. Block THAT
+    // path by pre-occupying `ocap` with a plain file, so `create_dir_all`
+    // fails and the gate falls back to session-only.
+    std::fs::write(root.path().join("ocap"), b"not a directory").unwrap();
+    let key_path = root.path().join("identity.pem");
+    agent_mesh_protocol::UserKey::generate()
+        .save(&key_path)
+        .unwrap();
     let base = base_caveats("/ws");
     let net_req = newt_core::PermissionRequest {
         tool: "web_fetch".to_string(),
@@ -824,7 +833,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
         let mut gate = PromptPermissionGate {
             state: &mut state,
             base,
-            key_path: None,
+            key_path: Some(key_path),
             conversation_id: "conv-config-fail".to_string(),
             log_path: None,
             denials_path: None,
@@ -1036,28 +1045,29 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
             }
             assert_eq!(cancel.load(Ordering::Relaxed), cancelled);
             assert_eq!(exit.load(Ordering::Relaxed), exited);
-            if outcome == HumanQuestionOutcome::Answer("A".into()) {
-                let permissions = crate::migration_notices::read(|report| {
-                    newt_core::Config::load(&config, report)
-                })
-                .unwrap()
-                .tui
-                .unwrap()
-                .permissions;
-                assert_eq!(permissions.net, vec![request.target]);
-            } else {
-                assert!(!config.exists(), "only a permanent answer writes config");
-            }
+            // #2535/#2524 PR1 (P-1): a permanent answer no longer writes
+            // `config.toml` — it signs `~/.newt/ocap/approve.toml` instead,
+            // and this fixture's gate has no `key_path` (no root key), so
+            // even that falls back to session-only. Nothing is ever written
+            // to `config.toml` from this path any more.
+            assert!(
+                !config.exists(),
+                "a permanent answer no longer writes config"
+            );
         }
     }
 }
 
 #[test]
 fn mcp_net_prompt_configured_blank_answer_preserves_grant_lifetime() {
+    // #2535/#2524 PR1 (P-1): `AllowPermanent` no longer writes `config.toml`
+    // at all (durable net grants sign into `approve.toml` now), and this
+    // fixture's gate has no `key_path`, so even that falls back to
+    // session-only — `config.toml` is never created by any of these.
     for (configured, allowed, remembered, persisted) in [
         (None, true, false, false),
         (Some(PromptChoice::AllowSession), true, true, false),
-        (Some(PromptChoice::AllowPermanent), true, true, true),
+        (Some(PromptChoice::AllowPermanent), true, true, false),
         (Some(PromptChoice::Deny), false, false, false),
         (Some(PromptChoice::Back), false, false, false),
     ] {
@@ -1891,8 +1901,12 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
     assert!(fresh.decisions.is_empty());
 }
 
+/// #2535/#2524 PR1: every durable-store kind (exec/fs/net) offers permanent
+/// allow at Low danger now, not just net — `persist_approve` signs whichever
+/// axis the answer names. A high-danger exec target still never offers it
+/// (unchanged; covered by the `a0_freeze_goldens` interpreter golden).
 #[test]
-fn permanent_allow_offered_for_net_only() {
+fn permanent_allow_offered_for_every_durable_store_kind_at_low_danger() {
     let danger = danger::DangerTable::builtin();
     let net = plain::render(&permission_definition(
         &PermissionRequest {
@@ -1909,33 +1923,46 @@ fn permanent_allow_offered_for_net_only() {
         &danger,
         Audience::Terminal,
     ));
-    assert!(
-        net.contains("[A]llow permanently"),
-        "net must offer it: {net}"
-    );
-    assert!(
-        !exec.contains("[A]llow permanently"),
-        "exec must NOT: {exec}"
-    );
+    let fs_write = plain::render(&permission_definition(
+        &PermissionRequest {
+            tool: "run_command".to_string(),
+            kind: DenialKind::FsWrite,
+            target: "/ws/notes.txt".to_string(),
+            reason: String::new(),
+        },
+        &danger,
+        Audience::Terminal,
+    ));
+    for (label, rendered) in [("net", &net), ("exec", &exec), ("fs write", &fs_write)] {
+        assert!(
+            rendered.contains("[A]llow permanently"),
+            "{label} must offer it: {rendered}"
+        );
+    }
     assert!(net.contains("[P]ermanently deny") && exec.contains("[P]ermanently deny"));
 }
 
+/// #2535/#2524 PR1 (P-1): `[A]llow permanently` on a net host now signs and
+/// appends to `~/.newt/ocap/approve.toml` — `[tui.permissions] net` in
+/// `config.toml` is no longer a durable-grant WRITE target (it stays a
+/// legacy READ path, unexercised here since nothing writes it any more).
 #[test]
-fn allow_permanently_grants_now_and_persists_host_to_config() {
-    for (preset, wildcard, force_full_access) in [
-        ("workspace_dev", false, false),
-        ("workspace_dev", true, false),
-        ("workspace_dev", false, true),
-        ("full_access", false, false),
+fn allow_permanently_grants_now_and_persists_host_to_approve_toml() {
+    for (preset, force_full_access) in [
+        ("workspace_dev", false),
+        ("workspace_dev", true),
+        ("full_access", false),
     ] {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
-        let net = if wildcard { r#"["*"]"# } else { "[]" };
         std::fs::write(
             &config,
-            format!("# my config\n[tui.permissions]\npreset = \"{preset}\"\nnet = {net}\n"),
+            format!("# my config\n[tui.permissions]\npreset = \"{preset}\"\nnet = []\n"),
         )
         .unwrap();
+        let key_path = dir.path().join("identity.pem");
+        let root = agent_mesh_protocol::UserKey::generate();
+        root.save(&key_path).unwrap();
         let base = if force_full_access {
             Caveats::top()
         } else {
@@ -1959,7 +1986,7 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
             let mut gate = PromptPermissionGate {
                 state: &mut state,
                 base,
-                key_path: None,
+                key_path: Some(key_path.clone()),
                 conversation_id: "conv-904a".to_string(),
                 log_path: None,
                 denials_path: None,
@@ -1993,31 +2020,28 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
             .session_grants
             .contains(&(DenialKind::Net, "github.com".to_string())));
         assert_eq!(state.decisions[0].scope, "permanent");
+
+        // The config file's `[tui.permissions] net` is untouched — the
+        // durable write moved to the signed store.
         let written = std::fs::read_to_string(&config).unwrap();
         assert!(written.contains("# my config"), "comment lost: {written}");
         assert!(
-            written.contains("github.com"),
-            "host not persisted: {written}"
+            !written.contains("github.com"),
+            "P-1: net is no longer written to config.toml: {written}"
         );
-        let permissions =
-            crate::migration_notices::read(|report| newt_core::Config::load(&config, report))
-                .unwrap()
-                .tui
-                .unwrap()
-                .permissions;
-        assert!(permissions.net.contains(&"github.com".to_string()));
-        let reloaded = if force_full_access {
-            Caveats::top()
-        } else {
-            permissions.to_caveats("/ws")
-        };
-        let policy = newt_mcp_client::HttpNetworkPolicy::with_explicit_hosts(
-            &reloaded.net,
-            &permissions.net,
-        );
-        assert!(
-            policy.explicitly_grants_host("github.com"),
-            "a fresh session honors permanent MCP grants in every mode"
+
+        // The signed store carries the grant, and reloading it through the
+        // real verify-at-load path recognizes it as live.
+        let approve_path = dir.path().join("ocap").join("approve.toml");
+        let approve_text = std::fs::read_to_string(&approve_path).unwrap();
+        assert!(approve_text.contains("github.com"), "{approve_text}");
+        assert!(approve_text.contains("sig ="), "{approve_text}");
+        let (set, warnings) =
+            newt_core::ocap_store::load_store(&config, Some(root.public().as_bytes()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            newt_core::ocap_store::evaluate_request(&set, DenialKind::Net, "github.com"),
+            Some(newt_core::ocap_store::Verdict::Approve)
         );
     }
 }
