@@ -123,6 +123,183 @@ async fn lifecycle_phase_build_points_at_action_build() {
     );
 }
 
+/// F19 (red first): measured in replay 2483-r7 — nine `lifecycle action=run`
+/// calls died at the 60s wall before one `action=build` call passed. The
+/// timeout note already named the exact next call (F11); the model kept
+/// retrying `run` anyway. `escalated_after_timeout` is what labels the
+/// ONE re-run this fix routes into the build lane instead — it must say
+/// plainly that the call escalated and why, and must preserve whatever the
+/// build-lane re-run actually returned (pass, fail, or a fresh refusal),
+/// never silently fall back to the original timeout text.
+#[test]
+fn escalated_after_timeout_labels_the_reroute_and_preserves_the_build_result() {
+    let wall = shell::dispatch_wall("pytest -k slow"); // a non-build-tool program → the default wall
+    for (build_result, outcome) in [
+        ("  ✓ build check passed".to_string(), crate::ExecOutcome::Passed),
+        (
+            "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".to_string(),
+            crate::ExecOutcome::Denied,
+        ),
+    ] {
+        let (text, out) = escalated_after_timeout((build_result.clone(), outcome), wall);
+        assert_eq!(out, outcome, "the build lane's own outcome is preserved");
+        assert!(
+            text.contains("action=run") && text.contains(&format!("{}s wall", wall.as_secs())),
+            "must say plainly it escalated and why, with the wall that applied: {text}"
+        );
+        assert!(
+            text.ends_with(&build_result),
+            "the build lane's real result must survive verbatim: {text}"
+        );
+    }
+}
+
+/// #2541 round 2 item 3, round 3 item 2: the escalation's decision, isolated
+/// from formatting and table-tested — only a genuine `TimedOut` under the
+/// DEFAULT `run_command` wall justifies spending the build lane's authority
+/// on a second run. Since #2543, a cargo/just phase already gets the
+/// 30-minute build wall in the RUN lane; a `TimedOut` there means it ran the
+/// full 30 minutes and died, and re-running it in the build lane (whose only
+/// difference is the offline/calibrated fence) adds nothing.
+#[test]
+fn escalates_only_on_a_default_wall_timeout() {
+    let default_wall = shell::dispatch_wall("pytest -k slow");
+    let build_wall = shell::dispatch_wall("cargo test");
+    assert_eq!(
+        build_wall,
+        shell::LIFECYCLE_BUILD_TIMEOUT,
+        "fixture sanity: cargo must dispatch under the build wall"
+    );
+    assert_ne!(
+        default_wall, build_wall,
+        "fixture sanity: the two walls must differ for this table to mean anything"
+    );
+    for (outcome, wall, expected) in [
+        (crate::ExecOutcome::TimedOut, default_wall, true),
+        (crate::ExecOutcome::TimedOut, build_wall, false),
+        (crate::ExecOutcome::Passed, default_wall, false),
+        (crate::ExecOutcome::Failed, default_wall, false),
+        (crate::ExecOutcome::Denied, default_wall, false),
+        (crate::ExecOutcome::Unavailable, default_wall, false),
+    ] {
+        assert_eq!(
+            escalates(outcome, wall),
+            expected,
+            "escalates({outcome:?}, {wall:?}) should be {expected}"
+        );
+    }
+}
+
+/// #2541 round 2 item 1 (red first), round 3 item 4: when the escalation
+/// itself does not execute — `Denied` (including a frame-isolation refusal,
+/// which `run_confined_build_lane` also classes `Denied`) or `Unavailable`
+/// — the FIRST run's RAW result is the only record of which test hung, and
+/// it was being silently dropped in favor of the escalation's bare refusal
+/// text. It must survive, with the refusal appended — never lost — and
+/// WITHOUT the "Suggested lifecycle call: action=build" prefix
+/// `lifecycle_run_result`'s `TimedOut` arm would otherwise prepend: that is
+/// the exact call this refusal just declined, so opening a refused
+/// escalation by recommending it is wrong (round 3 item 4).
+#[test]
+fn a_refused_escalation_keeps_the_first_runs_evidence() {
+    let wall = shell::dispatch_wall("pytest -k slow");
+    let first = (
+        "partial: test_foo hung\n(the command hit the 60s wall and was killed...)".to_string(),
+        crate::ExecOutcome::TimedOut,
+    );
+    for (refusal, outcome) in [
+        (
+            "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".to_string(),
+            crate::ExecOutcome::Denied,
+        ),
+        (
+            "Error: frame isolation: tool authority exceeds the frame's ceiling".to_string(),
+            crate::ExecOutcome::Denied,
+        ),
+        (
+            "error: build workspace: No such file or directory".to_string(),
+            crate::ExecOutcome::Unavailable,
+        ),
+    ] {
+        let (text, out) = escalation_result(first.clone(), (refusal.clone(), outcome), wall);
+        assert_eq!(out, outcome, "the refusal's own class is the final outcome");
+        assert!(
+            text.contains("partial: test_foo hung"),
+            "the first run's evidence (which test hung) must survive: {text}"
+        );
+        assert!(
+            text.contains(&refusal),
+            "the escalation's refusal must still be visible: {text}"
+        );
+        assert!(
+            !text.contains("Suggested lifecycle call:"),
+            "a refused escalation must not recommend the exact call that was just \
+             declined: {text}"
+        );
+        assert!(
+            text.contains("declined") && text.contains("narrow the command"),
+            "must say plainly that build authority was declined and to narrow the \
+             command instead of retrying it: {text}"
+        );
+    }
+}
+
+/// #2541 round 2 item 1, executing arm: when the escalation DOES run (any
+/// outcome but `Denied`/`Unavailable`), its own result already speaks for the
+/// whole call — `first`'s partial timeout output is superseded, not
+/// duplicated, exactly as before this round's fix.
+#[test]
+fn an_executed_escalation_supersedes_the_first_runs_partial_output() {
+    let wall = shell::dispatch_wall("pytest -k slow");
+    let first = (
+        "partial: test_foo hung\n(the command hit the 60s wall and was killed...)".to_string(),
+        crate::ExecOutcome::TimedOut,
+    );
+    let build_result = "  ✓ build check passed".to_string();
+    let (text, out) = escalation_result(
+        first,
+        (build_result.clone(), crate::ExecOutcome::Passed),
+        wall,
+    );
+    assert_eq!(out, crate::ExecOutcome::Passed);
+    assert!(
+        !text.contains("test_foo hung"),
+        "an executed escalation's own result supersedes the first run's partial output: {text}"
+    );
+    assert!(text.ends_with(&build_result), "{text}");
+}
+
+/// #2541 round 2 item 5, round 3 item 3 (red first): a build-authority prompt
+/// that fires because `action=run` escalated must say so — otherwise the
+/// operator sees a `lifecycle action=build` permission request out of a call
+/// they read as `action=run` and has no idea why. The wall named in the
+/// reason must be DERIVED, never a literal "60s".
+#[test]
+fn the_escalation_names_itself_in_the_permission_prompt() {
+    let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));
+    let direct = lifecycle_build_request("/ws", "cargo test --offline", &base, None);
+    assert!(
+        !direct.reason.to_lowercase().contains("escalat"),
+        "a direct action=build call names no escalation: {}",
+        direct.reason
+    );
+    let wall = shell::dispatch_wall("pytest -k slow");
+    let reason = format!(
+        "lifecycle action=run hit the confined shell's {}s wall",
+        wall.as_secs()
+    );
+    let escalated = lifecycle_build_request("/ws", "cargo test --offline", &base, Some(&reason));
+    assert!(
+        escalated.reason.contains("escalation")
+            && escalated.reason.contains("action=run")
+            && escalated
+                .reason
+                .contains(&format!("{}s wall", wall.as_secs())),
+        "the prompt must name why a build-authority request appeared: {}",
+        escalated.reason
+    );
+}
+
 /// #894 regression for the concrete drift that motivated the registry: the
 /// `lifecycle` tool (#891) is advertised + dispatched, so it MUST be a real
 /// name — otherwise every legitimate `lifecycle` call is miscounted as a
@@ -406,11 +583,16 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
 #[test]
 fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));
-    let request = lifecycle_build_request("/ws", "cargo test --offline", &base);
+    let request = lifecycle_build_request("/ws", "cargo test --offline", &base, None);
     assert_eq!(request.kind, DenialKind::Build);
     assert_eq!(request.target, "/ws");
     assert!(request.reason.contains("cargo test --offline"));
     assert!(request.reason.contains("network denied"));
+    assert!(
+        !request.reason.contains("escalation"),
+        "a direct action=build call names no escalation: {}",
+        request.reason
+    );
     assert_eq!(
         crate::agentic::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
         base
