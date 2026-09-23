@@ -379,7 +379,7 @@ fn a_host_127_the_shell_did_not_attribute_is_failed() {
 fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
     let limit = agent_bridle::LimitsPolicy::default().default_timeout_secs;
     let (text, class) = confined(
-        "cargo test",
+        "make test",
         envelope(124, "partial", "command timed out after 60s\n", true),
     );
     assert_eq!(class, ExecOutcome::TimedOut);
@@ -419,7 +419,7 @@ fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
 #[test]
 fn timeout_coaching_gives_the_literal_lifecycle_call() {
     const CALL: &str = r#"{"action":"build","phase":"test"}"#;
-    let (text, _) = confined("cargo test", envelope(124, "", "", true));
+    let (text, _) = confined("make test", envelope(124, "", "", true));
     assert!(
         text.contains(CALL),
         "the result must show the call shape: {text}"
