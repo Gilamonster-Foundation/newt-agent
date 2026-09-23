@@ -1892,7 +1892,8 @@ mod terminal_acceptance;
 pub(crate) use terminal_acceptance::cockpit_pager_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
-    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case, panel_resize_case,
+    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
+    cockpit_clarification_input_case, panel_resize_case,
 };
 
 #[cfg(test)]
