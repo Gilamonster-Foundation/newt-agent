@@ -674,24 +674,38 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     } else {
         "off"
     };
+    // #2552 round 2 (F26 v3): decide "is `workspace` itself a repo TOPLEVEL"
+    // ONCE, and make every git source below obey the SAME decision — the
+    // round-1 bug was exactly that `status_before.is_none()` (a symptom) and
+    // `GitEngine::open(workspace).is_some()` (a DIFFERENT check, since
+    // `GitEngine` discovers upward same as the shelled `git` did before F26)
+    // could disagree: a subdirectory of a larger repo made `snapshot_workspace`
+    // report `None`/`Some({})` while the engine still opened the ENCLOSING
+    // repo and leaked its whole dirty set into `uncommitted_files`/`commits`.
+    let is_own_repo_root = newt_core::agentic::is_workspace_repo_root(&workspace, &read_scope);
     // U7: the workspace's changed-path set at run start, diffed against the same
     // probe at exit so the hand-back names what THIS run changed, not prior dirt.
-    let status_before = newt_core::agentic::snapshot_workspace(&workspace, &read_scope);
-    // Multi-repo recon PR2: the workspace root itself is not a repo (a bare
-    // folder of checkouts) — probe first-level nested repos instead, so the
-    // hand-back can still say what changed rather than "unavailable". Only
-    // computed when `status_before` is `None`; a repo root's fast path is
-    // untouched.
-    let nested_before = status_before
-        .is_none()
+    // `None` whenever `workspace` is not its own repo root (not a repo at all,
+    // OR a subdirectory of a larger one) — never an unscoped enclosing view.
+    let status_before = is_own_repo_root
+        .then(|| newt_core::agentic::snapshot_workspace(&workspace, &read_scope))
+        .flatten();
+    // Multi-repo recon PR2: the workspace root itself is not its own repo —
+    // probe first-level nested repos instead, so the hand-back can still say
+    // what changed rather than "unavailable". Gated on the SAME
+    // `is_own_repo_root` decision as everything else, not on `status_before`.
+    let nested_before = (!is_own_repo_root)
         .then(|| newt_core::agentic::snapshot_nested_repos(&workspace, &read_scope));
     // #2537: HEAD before the run, via newt-git's OWN embedded engine (never a
     // shelled-out `git`) — the baseline the hand-back diffs against to name
-    // commit(s) this run actually produced. `None` off-repo or when the read
-    // scope can't open the legacy engine (bounded fs_read); the hand-back
-    // then reports "unavailable"/omits `commits`, never a guess.
-    let head_before = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope)
-        .ok()
+    // commit(s) this run actually produced. `None` off-repo, when `workspace`
+    // is not its own repo root (the engine would otherwise discover an
+    // ENCLOSING repo — #2552 round 2 blocker 1), or when the read scope can't
+    // open the legacy engine (bounded fs_read); the hand-back then reports
+    // "unavailable"/omits `commits`, never a guess.
+    let head_before = is_own_repo_root
+        .then(|| newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok())
+        .flatten()
         .and_then(|e| {
             e.head_snapshot(&newt_core::git_caveats::GitCaveats::read_only())
                 .ok()
@@ -805,12 +819,19 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // (the working tree may have changed under an already-open handle) and
     // ask its OWN `status`/`log` — never a shelled-out `git` — for what this
     // run left dirty and what it committed. `None` for both when the
-    // workspace is not a repo (or the engine can't be opened under this
-    // run's fs_read scope); a repo with nothing dirty reports `Some(vec![])`
-    // for `uncommitted_at_exit`, distinguishable from "unavailable".
+    // workspace is not its own repo root (re-checked fresh, in case the run
+    // itself `git init`ed the workspace — #2552 round 2), or when the engine
+    // can't be opened under this run's fs_read scope; a repo with nothing
+    // dirty reports `Some(vec![])` for `uncommitted_at_exit`, distinguishable
+    // from "unavailable". Never opened otherwise: `GitEngine::open` discovers
+    // upward exactly like the shelled `git` did before F26, so opening it
+    // unconditionally would hand a workspace-subdirectory run the ENCLOSING
+    // repo's dirty set (#2552 round 2 blocker 1).
     let git_caveats = newt_core::git_caveats::GitCaveats::read_only();
-    let git_engine = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok();
-    let is_root_repo = git_engine.is_some();
+    let is_root_repo = newt_core::agentic::is_workspace_repo_root(&workspace, &read_scope);
+    let git_engine = is_root_repo
+        .then(|| newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok())
+        .flatten();
     let uncommitted_at_exit = git_engine
         .as_ref()
         .and_then(|e| uncommitted_paths(e, &git_caveats));

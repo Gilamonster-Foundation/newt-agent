@@ -29,8 +29,9 @@ pub mod anthropic_wire;
 mod capability_check;
 mod claim_check;
 pub use claim_check::{
-    files_changed_between, nested_current_paths, nested_files_changed_between,
-    snapshot_nested_repos, snapshot_workspace, NestedRepoSnapshot, StatusSnapshot,
+    files_changed_between, is_workspace_repo_root, nested_current_paths,
+    nested_files_changed_between, snapshot_nested_repos, snapshot_workspace, NestedRepoSnapshot,
+    StatusSnapshot,
 };
 pub(crate) mod compress;
 mod context_recovery;

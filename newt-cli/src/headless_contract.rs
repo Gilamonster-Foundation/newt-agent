@@ -352,10 +352,19 @@ fn repo_file_list_stanza(
     }
 }
 
+/// #2552 round 2 should-fix: the flat union in [`repo_file_list_stanza`] is
+/// capped at `HANDBACK_MAX_FILES`, but `by_repo` carried every repo's FULL
+/// list uncapped — one nested repo with an un-ignored `node_modules/` could
+/// put tens of thousands of paths on a single JSON line. Cap PER REPO, with
+/// a per-repo `truncated` flag, same convention as the flat union.
 fn by_repo_json(by_repo: Vec<(String, Vec<String>)>) -> serde_json::Value {
     serde_json::json!(by_repo
         .into_iter()
-        .map(|(repo, files)| serde_json::json!({"repo": repo, "files": files}))
+        .map(|(repo, mut files)| {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            serde_json::json!({"repo": repo, "files": files, "truncated": truncated})
+        })
         .collect::<Vec<_>>())
 }
 
@@ -904,8 +913,8 @@ mod tests {
         assert_eq!(
             h["files_changed_by_repo"],
             serde_json::json!([
-                {"repo": "repoA", "files": ["a.txt"]},
-                {"repo": "repoB", "files": []},
+                {"repo": "repoA", "files": ["a.txt"], "truncated": false},
+                {"repo": "repoB", "files": [], "truncated": false},
             ])
         );
         assert_eq!(h["files_changed_unprobed"], serde_json::json!(["repoC"]));
@@ -914,11 +923,39 @@ mod tests {
         assert_eq!(h["uncommitted_files_source"], "nested-repos");
         assert_eq!(
             h["uncommitted_files_by_repo"],
-            serde_json::json!([{"repo": "repoA", "files": ["a.txt"]}])
+            serde_json::json!([{"repo": "repoA", "files": ["a.txt"], "truncated": false}])
         );
         // Empty unprobed list is ABSENT, not a fake `[]` — same convention
         // as `commits`.
         assert!(h.get("uncommitted_files_unprobed").is_none(), "{h}");
+    }
+
+    /// #2552 round 2 should-fix (red first): one nested repo with a huge
+    /// dirty set (a stand-in for an un-ignored `node_modules/`) must not put
+    /// its whole uncapped list on the wire via `*_by_repo` — only the flat
+    /// union was capped before this fix.
+    #[test]
+    fn handback_caps_each_repos_by_repo_file_list_independently() {
+        let huge: Vec<String> = (0..HANDBACK_MAX_FILES + 5)
+            .map(|n| format!("f{n}.txt"))
+            .collect();
+        let h = handback(
+            Some(RepoFileList::Nested {
+                files: vec!["big/f0.txt".into()],
+                by_repo: vec![("big".into(), huge.clone())],
+                unprobed: vec![],
+            }),
+            &[],
+            "None",
+            false,
+            None,
+            None,
+        );
+        let by_repo = h["files_changed_by_repo"].as_array().expect("array");
+        assert_eq!(by_repo.len(), 1);
+        let files = by_repo[0]["files"].as_array().expect("files array");
+        assert_eq!(files.len(), HANDBACK_MAX_FILES, "{files:?}");
+        assert_eq!(by_repo[0]["truncated"], true, "{h}");
     }
 
     use newt_core::{BehaviorSignal, ToolCallDialect};

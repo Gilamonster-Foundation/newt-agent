@@ -317,6 +317,19 @@ pub fn snapshot_nested_repos(
 ) -> Vec<NestedRepoSnapshot> {
     crate::tooling::first_level_subdirs(std::path::Path::new(workspace))
         .into_iter()
+        // #2552 round 2 should-fix: `first_level_subdirs`' `is_dir()` and
+        // `is_repo_root`'s `.exists()` both follow symlinks, so a first-level
+        // entry that is a SYMLINK to an outside repo (`workspace/ext ->
+        // /outside/repo`) would otherwise be probed and its paths/status
+        // reported as `ext/…` — a leak of a repo outside the workspace
+        // entirely. Filtered here (not in the shared lister, which has other
+        // callers that may want symlinks) via `symlink_metadata`, which does
+        // NOT follow the link, so a symlink is excluded before `is_repo_root`
+        // ever resolves it.
+        .filter(|dir| {
+            dir.symlink_metadata()
+                .is_ok_and(|meta| !meta.file_type().is_symlink())
+        })
         .filter(|dir| is_repo_root(dir))
         .filter_map(|dir| {
             let repo = dir.file_name()?.to_string_lossy().into_owned();
@@ -334,9 +347,12 @@ pub fn snapshot_nested_repos(
 /// present in `after` with a successful probe, diffed against the SAME repo
 /// in `before` (matched by directory name) — `<repo>/<path>` for every
 /// changed file, sorted. Returns `(files, unprobed)`: `unprobed` names every
-/// repo excluded from `files` — a probe failure at either end, or a repo
+/// repo excluded from `files` — a probe failure at either end, a repo
 /// `after` found that `before` never saw (nothing trustworthy to diff
-/// against) — so it is reported, never silently dropped.
+/// against), or a repo `before` saw that vanished by `after` (deleted or
+/// renamed away mid-run — #2552 round 2 should-fix: previously silently
+/// dropped instead of named) — so it is always reported, never silently
+/// absorbed into an empty diff.
 #[must_use]
 pub fn nested_files_changed_between(
     before: &[NestedRepoSnapshot],
@@ -361,7 +377,14 @@ pub fn nested_files_changed_between(
             files.push(format!("{}/{path}", repo_after.repo));
         }
     }
+    for repo_before in before {
+        if !after.iter().any(|a| a.repo == repo_before.repo) {
+            unprobed.push(repo_before.repo.clone());
+        }
+    }
     files.sort();
+    unprobed.sort();
+    unprobed.dedup();
     (files, unprobed)
 }
 
@@ -388,50 +411,48 @@ pub fn nested_current_paths(snapshots: &[NestedRepoSnapshot]) -> (Vec<String>, V
     (files, unprobed)
 }
 
-/// The workspace's changed-path snapshot, or `None` off-repo / on any git failure.
-///
-/// F26 v2: `workspace` may be a plain SUBDIRECTORY of a larger repo (no
-/// `.git` of its own) rather than a repo root. Git's normal upward discovery
-/// (unceilinged — see `git_hardening::hardened_git`'s doc comment for why a
-/// ceiling was tried and reverted) would otherwise hand this the ENCLOSING
-/// repo's full status: the wrong answer (the workspace itself changed
-/// nothing) and a leak of every path above the workspace. Compare `git
-/// rev-parse --show-toplevel` against `workspace`:
-/// - equal → today's behaviour, unchanged.
-/// - `workspace` strictly below it → scope the status to the workspace
-///   subtree (pathspec `.`, so nothing outside it is even considered) and
-///   strip the `git rev-parse --show-prefix` prefix so every reported path
-///   stays workspace-relative. A nested git repo INSIDE the workspace
-///   collapses to a single opaque `<dir>/` placeholder in that scoped
-///   status (git never descends into an embedded repo) — dropped here
-///   since [`snapshot_nested_repos`] is the real way to see inside one.
+/// F26 v3 (#2552 round 2): the ONE decision every hand-back git source must
+/// obey — is `workspace` itself a repo TOPLEVEL, not merely somewhere inside
+/// one? `git rev-parse --show-toplevel`, CANONICALIZED, compared against a
+/// CANONICALIZED `workspace` (not the lexical comparison v2 used): a
+/// symlinked spelling of the real root — macOS `/tmp` → `/private/tmp`, or a
+/// symlinked checkout — must still read as "own repo", not as "a
+/// subdirectory that happens to share the same toplevel". `false` covers
+/// both "not a repo at all" and "a subdirectory of a larger repo" — the two
+/// cases that must never reach an unscoped engine/status view, so every
+/// caller (the shelled `snapshot_workspace` below, `newt_git::GitEngine`
+/// opened by `headless.rs`, its commits/HEAD baseline, and the nested-repo
+/// probe's gate) makes the SAME call from the SAME check, rather than three
+/// independent (and, in #2552, inconsistent) tests.
+#[must_use]
+pub fn is_workspace_repo_root(workspace: &str, read_scope: &crate::Scope<String>) -> bool {
+    let Some(toplevel) = git_in(workspace, &["rev-parse", "--show-toplevel"], read_scope) else {
+        return false;
+    };
+    let (Ok(toplevel), Ok(root)) = (
+        std::fs::canonicalize(toplevel.trim()),
+        std::fs::canonicalize(workspace),
+    ) else {
+        return false;
+    };
+    toplevel == root
+}
+
+/// The workspace's changed-path snapshot when [`is_workspace_repo_root`] is
+/// `true`; `None` otherwise (off-repo, or `workspace` is a subdirectory of a
+/// larger repo) — the caller's job is then the nested-repo probe instead,
+/// never an unscoped view of an enclosing repo (#2552 round 2 / F26 v3).
 #[must_use]
 pub fn snapshot_workspace(
     workspace: &str,
     read_scope: &crate::Scope<String>,
 ) -> Option<StatusSnapshot> {
-    let toplevel = git_in(workspace, &["rev-parse", "--show-toplevel"], read_scope)?;
-    let toplevel = super::lexical_normalize(std::path::Path::new(toplevel.trim()));
-    let root = super::lexical_normalize(std::path::Path::new(workspace));
-    if toplevel == root {
-        // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
-        let out = git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope)?;
-        return Some(parse_porcelain_z(&out));
+    if !is_workspace_repo_root(workspace, read_scope) {
+        return None;
     }
-    let prefix = git_in(workspace, &["rev-parse", "--show-prefix"], read_scope)?;
-    let prefix = prefix.trim();
-    let mut args: Vec<&str> = SNAPSHOT_STATUS_ARGS.to_vec();
-    args.extend(["--", "."]);
-    let out = git_in(workspace, &args, read_scope)?;
-    Some(
-        parse_porcelain_z(&out)
-            .into_iter()
-            .filter_map(|(path, code)| {
-                let rel = path.strip_prefix(prefix)?;
-                (!rel.ends_with('/')).then(|| (rel.to_string(), code))
-            })
-            .collect(),
-    )
+    // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
+    let out = git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope)?;
+    Some(parse_porcelain_z(&out))
 }
 
 /// `phrase` appears in `text` (already lowercased) with non-alphanumeric
@@ -1143,16 +1164,12 @@ mod tests {
         assert!(snapshot_workspace(&root.path().to_string_lossy(), &crate::Scope::All).is_some());
     }
 
-    /// F26 v2 (red first): a plain folder with no `.git` of its own, sitting
-    /// INSIDE a larger git repo, must never have `git`'s normal upward
-    /// discovery hand it the ENCLOSING repo's status — that both answers
-    /// the wrong question (the outer repo's ~200 paths, not the workspace's)
-    /// and leaks everything above the workspace boundary. `snapshot_workspace`
-    /// on the plain subfolder now scopes to the workspace and reports
-    /// nothing from `outer.txt`; a nested repo it contains (`inner`)
-    /// collapses to an opaque placeholder in that scoped status, which is
-    /// filtered — [`snapshot_nested_repos`] is the real way to see inside
-    /// one, and it still reports `inner` correctly.
+    /// F26 v3 / #2552 round 2 (red first): a plain folder with no `.git` of
+    /// its own, sitting INSIDE a larger git repo, is NOT its own repo root —
+    /// `snapshot_workspace` must return `None` (never the enclosing repo's
+    /// status, scoped or otherwise: `is_workspace_repo_root` is the single
+    /// decision every hand-back source now obeys), and `snapshot_nested_repos`
+    /// is the mechanism that actually reports the nested repo it contains.
     #[test]
     fn snapshot_workspace_never_discovers_an_enclosing_repo_above_the_workspace() {
         let outer = tempfile::tempdir().expect("outer root");
@@ -1173,11 +1190,13 @@ mod tests {
         std::fs::write(inner.join("i.txt"), "one\ntwo\n").unwrap(); // uncommitted
 
         let workspace_str = workspace.to_string_lossy().into_owned();
-        let scoped = snapshot_workspace(&workspace_str, &crate::Scope::All)
-            .expect("workspace is inside a repo, so a (scoped) status must resolve");
         assert!(
-            scoped.is_empty(),
-            "nothing from outer.txt or the opaque inner/ placeholder should surface: {scoped:?}"
+            !is_workspace_repo_root(&workspace_str, &crate::Scope::All),
+            "a subfolder of a larger repo is not its own repo root"
+        );
+        assert!(
+            snapshot_workspace(&workspace_str, &crate::Scope::All).is_none(),
+            "must never resolve to the enclosing repo's status"
         );
         let snapshots = snapshot_nested_repos(&workspace_str, &crate::Scope::All);
         assert_eq!(snapshots.len(), 1, "{snapshots:?}");
@@ -1189,33 +1208,68 @@ mod tests {
         assert_eq!(status.get("i.txt").map(String::as_str), Some(" M"));
     }
 
-    /// F26 v2, new: a workspace that is a plain SUBDIRECTORY of a repo (no
-    /// nested repo involved this time) must report only the edit INSIDE the
-    /// workspace, with a workspace-relative path — never the edit made
-    /// outside it at the outer root.
+    /// #2552 round 2: the symlinked-root nit — `is_workspace_repo_root`
+    /// canonicalizes BOTH sides, so a symlinked spelling of a real repo root
+    /// still reads as "own repo", not as "a subdirectory of the same
+    /// toplevel" (which `git rev-parse --show-toplevel`'s always-resolved
+    /// answer would otherwise make a lexical comparison conclude).
     #[test]
-    fn snapshot_workspace_scoped_to_a_subdirectory_reports_only_its_own_edit() {
-        let outer = tempfile::tempdir().expect("outer root");
-        init_repo(outer.path());
-        std::fs::write(outer.path().join("outside.txt"), "one\n").unwrap();
-        let workspace = outer.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("inside.txt"), "one\n").unwrap();
-        git_in_dir(outer.path(), &["add", "-A"]);
-        git_in_dir(outer.path(), &["commit", "-q", "-m", "init"]);
-
-        // Edit one file outside the workspace, one inside it.
-        std::fs::write(outer.path().join("outside.txt"), "one\ntwo\n").unwrap();
-        std::fs::write(workspace.join("inside.txt"), "one\ntwo\n").unwrap();
-
-        let workspace_str = workspace.to_string_lossy().into_owned();
-        let scoped = snapshot_workspace(&workspace_str, &crate::Scope::All)
-            .expect("workspace is inside a repo");
-        assert_eq!(
-            scoped.get("inside.txt").map(String::as_str),
-            Some(" M"),
-            "{scoped:?}"
+    #[cfg(unix)]
+    fn is_workspace_repo_root_true_through_a_symlinked_spelling_of_the_root() {
+        let real = tempfile::tempdir().expect("real root");
+        init_repo(real.path());
+        let parent = real.path().parent().expect("tempdir has a parent");
+        let link = parent.join(format!(
+            "symlink-{}",
+            real.path().file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+        assert!(
+            is_workspace_repo_root(&link.to_string_lossy(), &crate::Scope::All),
+            "a symlinked spelling of the real root must still count as its own repo"
         );
-        assert_eq!(scoped.len(), 1, "outside.txt must not surface: {scoped:?}");
+        std::fs::remove_file(&link).ok();
+    }
+
+    /// #2552 round 2 should-fix (red first): a first-level entry that is a
+    /// SYMLINK to a repo OUTSIDE the workspace must never be probed —
+    /// `first_level_subdirs`' `is_dir()` and `is_repo_root`'s `.exists()`
+    /// both follow symlinks, so without an explicit skip this would report
+    /// an outside repo's files under `ext/…`.
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_nested_repos_skips_a_symlink_to_an_outside_repo() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside repo");
+        init_repo(outside.path());
+        std::fs::write(outside.path().join("secret.txt"), "leak\n").unwrap();
+        git_in_dir(outside.path(), &["add", "secret.txt"]);
+        git_in_dir(outside.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(outside.path().join("secret.txt"), "leak\nmore\n").unwrap();
+
+        let link = workspace.path().join("ext");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+
+        let snapshots =
+            snapshot_nested_repos(&workspace.path().to_string_lossy(), &crate::Scope::All);
+        assert!(
+            snapshots.is_empty(),
+            "a symlinked first-level entry must never be probed: {snapshots:?}"
+        );
+    }
+
+    /// #2552 round 2 should-fix (red first): a repo present at `before` but
+    /// gone by `after` (deleted or renamed away mid-run) must be NAMED in
+    /// `unprobed`, never silently dropped from the diff.
+    #[test]
+    fn nested_files_changed_between_names_a_repo_deleted_during_the_run() {
+        let before = vec![NestedRepoSnapshot {
+            repo: "gone".to_string(),
+            status: Some(StatusSnapshot::new()),
+        }];
+        let after: Vec<NestedRepoSnapshot> = Vec::new();
+        let (files, unprobed) = nested_files_changed_between(&before, &after);
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(unprobed, vec!["gone".to_string()], "{unprobed:?}");
     }
 }
