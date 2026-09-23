@@ -555,6 +555,22 @@ fn build_lane_route(program: &str, rest: &[&str]) -> RouteDecision {
 /// fence) and never route — same "never widen, never drop" posture as the
 /// git read routes.
 fn cargo_build_route(rest: &[&str]) -> RouteDecision {
+    // #2524 follow-up (F23 evidence): 2488-r9's own command was `cargo
+    // +stable test …` — cargo's leading `+toolchain` selector, ONE token,
+    // before the subcommand. Accept it and KEEP it in the routed argv (the
+    // build lane must run the SAME toolchain the model asked for, never a
+    // silently different default one). A `+` token that isn't a valid
+    // selector (`is_toolchain_selector`) refuses the whole call rather than
+    // stripping it and running something else.
+    let (toolchain, rest) = match rest.split_first() {
+        Some((first, tail)) if first.starts_with('+') => {
+            if !is_toolchain_selector(first) {
+                return RouteDecision::Exec;
+            }
+            (Some(*first), tail)
+        }
+        _ => (None, rest),
+    };
     let Some((sub, rest)) = rest.split_first() else {
         return RouteDecision::Exec;
     };
@@ -567,11 +583,30 @@ fn cargo_build_route(rest: &[&str]) -> RouteDecision {
     {
         return RouteDecision::Exec;
     }
-    let mut argv = vec!["cargo".to_string(), (*sub).to_string()];
+    let mut argv = vec!["cargo".to_string()];
+    argv.extend(toolchain.map(str::to_string));
+    argv.push((*sub).to_string());
     argv.extend(rest.iter().map(|t| (*t).to_string()));
     RouteDecision::Route {
         tool: "build_exec",
         args: json!({ "argv": argv }),
+    }
+}
+
+/// Is `token` a valid cargo/rustup toolchain selector (`+stable`,
+/// `+nightly`, `+1.85.0`, `+nightly-2026-09-01`)? The name after `+` is
+/// restricted to `[A-Za-z0-9._-]+` — rustup toolchain names are a channel,
+/// an optional date, and an optional target triple, dot/dash-separated;
+/// nothing in that alphabet is a shell metacharacter, so this can never
+/// smuggle one past `BUILD_UNSAFE`/`SHELL_META`. A bare `+`, an empty name,
+/// or anything else refuses — see [`cargo_build_route`], which refuses the
+/// WHOLE call on a `false` here rather than silently dropping the token.
+fn is_toolchain_selector(token: &str) -> bool {
+    match token.strip_prefix('+') {
+        Some(name) if !name.is_empty() => name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+        _ => false,
     }
 }
 
@@ -1250,6 +1285,57 @@ mod tests {
         }
     }
 
+    /// #2524 follow-up (F23 evidence): a leading `+toolchain` selector
+    /// routes, kept verbatim in the argv, for every valid rustup toolchain
+    /// name shape.
+    #[test]
+    fn cargo_toolchain_selector_routes_and_is_kept_in_the_argv() {
+        assert_eq!(
+            classify("cargo +stable test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "+stable", "test"] }),
+            }
+        );
+        for (cmd, argv) in [
+            (
+                "cargo +nightly build",
+                json!(["cargo", "+nightly", "build"]),
+            ),
+            ("cargo +1.85.0 check", json!(["cargo", "+1.85.0", "check"])),
+            (
+                "cargo +nightly-2026-09-01 clippy",
+                json!(["cargo", "+nightly-2026-09-01", "clippy"]),
+            ),
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args: json!({ "argv": argv }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    /// An invalid or empty `+` token refuses the WHOLE call — never
+    /// silently dropped, never routed with a different toolchain than the
+    /// model asked for.
+    #[test]
+    fn cargo_invalid_toolchain_selector_never_routes() {
+        for cmd in [
+            "cargo + test",
+            // `$` is a SHELL_META character; also caught by the top-level
+            // compound-command refusal before this ever reaches
+            // `cargo_build_route`, but exercised here for this shape too.
+            "cargo +$X test",
+            "cargo +stable/../etc test",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
     /// A build-lane route drops the rest of the call object (there is
     /// nowhere to put `cwd`/`timeout`), so `classify_call` must refuse to
     /// route a non-bare call — same rule as the scoped git-read route.
@@ -1281,23 +1367,21 @@ mod tests {
         assert_eq!(audit_line("git add .", &classify("git add .")), None);
     }
 
-    /// F23 / #2524 "tail-pipe-routes" (red first): the shape measured in
-    /// 2488-r9 — a clean build argv piped only to cut output — routes,
-    /// carrying the build's own argv plus the trim the pipe asked for.
-    /// (`+stable` is dropped from the measured command: a leading
-    /// `+toolchain` selector is a pre-existing, separate gap in
-    /// `cargo_build_route` that never routes — with or without a pipe —
-    /// and is out of scope for this fix.)
+    /// F23 / #2524 "tail-pipe-routes" (red first): the LITERAL shape
+    /// measured in 2488-r9 — a clean build argv, with its `+stable`
+    /// toolchain selector, piped only to cut output — routes, carrying the
+    /// build's own argv (toolchain included) plus the trim the pipe asked
+    /// for. The `+toolchain` support itself is `is_toolchain_selector`'s.
     #[test]
     fn build_piped_to_tail_or_head_routes_with_the_trim() {
         assert_eq!(
             classify(
-                "cargo test -j 4 -p newt-core --test config_publishing_ratchet 2>&1 | tail -40"
+                "cargo +stable test -j 4 -p newt-core --test config_publishing_ratchet 2>&1 | tail -40"
             ),
             RouteDecision::Route {
                 tool: "build_exec",
                 args: json!({
-                    "argv": ["cargo", "test", "-j", "4", "-p", "newt-core",
+                    "argv": ["cargo", "+stable", "test", "-j", "4", "-p", "newt-core",
                               "--test", "config_publishing_ratchet"],
                     "trim": {"mode": "tail", "n": 40},
                 }),

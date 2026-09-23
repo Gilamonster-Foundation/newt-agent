@@ -1735,3 +1735,64 @@ async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lin
         "only the first 5 lines should remain: {out}"
     );
 }
+
+/// #2524 follow-up (F23 evidence): 2488-r9's own build-verifying command
+/// carried `+stable`. Confirms EMPIRICALLY, not just by code inspection,
+/// that rustup resolves it inside the confined build lane —
+/// `build_tool_request` forwards `RUSTUP_HOME`/`CARGO_HOME` from the
+/// OPERATOR's real environment (never the confined child's redirected
+/// `HOME`), so a routed `cargo +stable check` must behave exactly as it
+/// would from an ordinary shell, never report the toolchain missing.
+#[tokio::test]
+async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo +stable check 2>&1 | tail -20" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo +stable check`") && out.contains("confined build lane"),
+        "must have been routed with the toolchain selector kept in the argv: {out}"
+    );
+    assert!(
+        !out.contains("toolchain") || !out.contains("is not installed"),
+        "rustup must resolve +stable inside the confined lane's forwarded \
+         RUSTUP_HOME/CARGO_HOME, not report it missing: {out}"
+    );
+    assert!(
+        !out.contains("error: command exited"),
+        "cargo +stable check on a trivial offline crate must actually \
+         succeed in this environment: {out}"
+    );
+}
