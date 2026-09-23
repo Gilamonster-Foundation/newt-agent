@@ -891,10 +891,10 @@ pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
 /// One owner with [`timed_out_note`], so the two cannot disagree (U6).
 pub(super) fn run_command_limit_sentence() -> String {
     format!(
-        "Each call is killed after {} seconds (wall clock, not configurable per call), so a \
-         cold build or full test run will not finish here: use `lifecycle` action=build, i.e. call \
-         the tool with {LIFECYCLE_BUILD_CALL} ({}-minute limit; `phase` is never `build`) for \
-         those, or narrow the command (one test filter, one crate).",
+        "Each call is killed after {} seconds (wall clock), {} minutes when it starts with \
+         `cargo` or `just`; the result carries the exit code. For an offline build use \
+         `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
+         never `build`), or narrow the command (one test filter, one crate).",
         run_command_wall_secs(),
         LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
     )
@@ -916,6 +916,14 @@ fn timed_out_note(wall: std::time::Duration) -> String {
             default.as_secs()
         )
     };
+    // A build command already had the build lane's 30 minutes: the only
+    // useful advice left is to narrow it.
+    if wall == LIFECYCLE_BUILD_TIMEOUT {
+        return format!(
+            "\n(the command hit the {wall_note} and was killed; the output above is partial. \
+             Narrow the command: one crate, one test filter.)"
+        );
+    }
     format!(
         "\n(the command hit the {wall_note} and was killed; the output above is partial. For a \
          build or full test run use `lifecycle` action=build, i.e. call the tool with \
