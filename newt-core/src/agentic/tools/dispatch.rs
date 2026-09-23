@@ -76,6 +76,18 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
+    /// #2551 round 2: the ROUTE dispatch actually acted on, recorded here
+    /// (never re-derived from a second `classify_call`) so a caller like
+    /// `is_progress_verification` cannot disagree with what really ran.
+    /// `classify` reads the filesystem, and the call itself can change it
+    /// mid-turn — `cd target; cargo test | tail -5` on a clean checkout
+    /// refuses to route at dispatch (`target/` does not exist yet), runs at
+    /// the root through the confined shell, and CREATES `target/`; a
+    /// second classification after the call would then route successfully
+    /// and count a masked `| tail` pass as verified — exactly what #2548
+    /// exists to exclude. `None` when the call never routed (stayed
+    /// `Exec`) or no funnel is listening.
+    pub(crate) routed_to: Option<&'a std::sync::OnceLock<(&'static str, serde_json::Value)>>,
 }
 
 #[allow(clippy::too_many_arguments)]

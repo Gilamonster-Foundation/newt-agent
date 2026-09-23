@@ -3896,6 +3896,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let routed_to = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read here. Its answer is
             // dynamic per-turn loop state — the num_ctx input ceiling and the
             // conversation's token estimate — which are in scope in the loop, not
@@ -3987,6 +3988,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        routed_to: Some(&routed_to),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -4016,13 +4018,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_modified_workspace = true;
             }
             if ok
-                && is_progress_verification(
-                    name,
-                    &args,
-                    execution.get().copied(),
-                    workspace,
-                    &caveats.fs_read,
-                )
+                && is_progress_verification(name, &args, execution.get().copied(), routed_to.get())
             {
                 workflow_runtime.note_verified_pass();
             }
@@ -5051,20 +5047,22 @@ pub fn is_workspace_write_call(name: &str) -> bool {
 /// A bare `run_command` is still deliberately excluded: a shell exit code is
 /// not evidence of a passing build (`| tail` masks it — see
 /// `note_verified_pass`'s doc), and recognising build commands by keyword
-/// would be an invented classifier. The routed case is different in kind, not
-/// degree: `routing::RouteTable::classify_call` (the SAME check
-/// `dispatch_run_command` already ran to decide the call's real destination)
-/// is re-derived here, so this counts ONLY a call that actually reached
-/// `build_exec`'s direct child spawn — never a compound command (`; echo …`,
-/// `| tail`), which `classify_call` refuses to route (r9 recon item 4: the
-/// exact evidence was `cargo test -p newt-git …` routed and passed three
-/// times through `build_exec`, and none of the three counted before this).
+/// would be an invented classifier. #2551 round 2 (should-fix): this used to
+/// RE-DERIVE the route via a second `classify_call`, which reads the
+/// filesystem — and the call in between can change it. Measured: `cd
+/// target; cargo test | tail -5` on a clean checkout refuses to route at
+/// DISPATCH (`target/` does not exist yet) and runs unrouted at the root,
+/// where `cargo test` CREATES `target/` and `| tail` masks the exit code;
+/// re-classifying AFTER the call then routes successfully and would have
+/// counted exactly the masked pass #2548 exists to exclude. `routed_to` is
+/// dispatch's OWN recorded decision (`tools.rs`'s routing site, the same
+/// place that decided what actually ran) — read here, never recomputed —
+/// so verification cannot see a filesystem state dispatch never acted on.
 fn is_progress_verification(
     name: &str,
     args: &serde_json::Value,
     execution: Option<crate::ExecOutcome>,
-    workspace: &str,
-    read_scope: &crate::caveats::Scope<String>,
+    routed_to: Option<&(&'static str, serde_json::Value)>,
 ) -> bool {
     if execution != Some(crate::ExecOutcome::Passed) {
         return false;
@@ -5079,15 +5077,7 @@ fn is_progress_verification(
     if name != "run_command" {
         return false;
     }
-    let routing::RouteDecision::Route {
-        tool: "build_exec",
-        args: routed,
-    } = routing::RouteTable::builtin().classify_call(
-        args,
-        std::path::Path::new(workspace),
-        read_scope,
-    )
-    else {
+    let Some(("build_exec", routed)) = routed_to.map(|(tool, args)| (*tool, args)) else {
         return false;
     };
     // `argv[0]` is the program (`cargo`/`just`); `argv[1]` is cargo's
@@ -8634,6 +8624,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let routed_to = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // OpenAI-compatible endpoints do not receive `num_ctx`, but a local
             // endpoint's operator-declared window still provides the displayed
@@ -8713,6 +8704,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        routed_to: Some(&routed_to),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -8750,13 +8742,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 round_modified_workspace = true;
             }
             if ok
-                && is_progress_verification(
-                    name,
-                    &args,
-                    execution.get().copied(),
-                    workspace,
-                    &caveats.fs_read,
-                )
+                && is_progress_verification(name, &args, execution.get().copied(), routed_to.get())
             {
                 workflow_runtime.note_verified_pass();
             }
@@ -11034,6 +11020,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let routed_to = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read (mirrors the
             // OpenAI path — `num_ctx` never rides this wire either).
             let result = if tools::is_context_remaining_call(name) {
@@ -11107,6 +11094,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        routed_to: Some(&routed_to),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -11141,13 +11129,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 round_modified_workspace = true;
             }
             if ok
-                && is_progress_verification(
-                    name,
-                    &args,
-                    execution.get().copied(),
-                    workspace,
-                    &caveats.fs_read,
-                )
+                && is_progress_verification(name, &args, execution.get().copied(), routed_to.get())
             {
                 workflow_runtime.note_verified_pass();
             }
@@ -12627,6 +12609,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let execution = std::sync::OnceLock::new();
+            let routed_to = std::sync::OnceLock::new();
             // #727: intercept the read-only budget self-read (see the Ollama path).
             // The Responses loop has no PromptTracker, so `used` is the chars/4
             // estimate of the ACTUAL Responses request; num_ctx is normally unset
@@ -12720,6 +12703,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        routed_to: Some(&routed_to),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -12751,13 +12735,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 round_modified_workspace = true;
             }
             if ok
-                && is_progress_verification(
-                    name,
-                    &args,
-                    execution.get().copied(),
-                    workspace,
-                    &caveats.fs_read,
-                )
+                && is_progress_verification(name, &args, execution.get().copied(), routed_to.get())
             {
                 workflow_runtime.note_verified_pass();
             }

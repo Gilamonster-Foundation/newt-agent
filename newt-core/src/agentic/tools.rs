@@ -3039,6 +3039,7 @@ async fn execute_authorized_tool(
         live_tool_output,
         completed_spill_renderer: _,
         execution,
+        routed_to: routed_to_slot,
     } = collab;
     let smart_harness = invocation.map(|call| call.harness());
     // #2315: hand the shell's execution class to the funnel, return the text.
@@ -3235,6 +3236,11 @@ async fn execute_authorized_tool(
         } else {
             None
         };
+    // #2551 round 2: record the decision dispatch is ABOUT to act on —
+    // never re-derived later (`is_progress_verification`'s should-fix).
+    if let (Some(slot), Some((tool, routed_args))) = (routed_to_slot, &routed) {
+        let _ = slot.set((*tool, routed_args.clone()));
+    }
     let (name, args): (&str, &serde_json::Value) = match &routed {
         Some((tool, routed_args)) => (*tool, routed_args),
         None => (name, args),

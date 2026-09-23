@@ -176,29 +176,27 @@ impl RouteTable {
             workspace,
             read_scope,
         );
-        // A scoped git read and a build-lane route both discard the rest of
-        // the call object once routed — neither has anywhere to put a
-        // `timeout` the model also sent — so both require the call carry
-        // nothing beyond `command` and (PR1) `cwd`. A call carrying
-        // anything else stays Exec rather than silently dropping that field.
-        let requires_bare_call = matches!(
-            &decision,
-            RouteDecision::Route { tool: "git", args }
-                if args.get("op").and_then(Value::as_str)
-                    .is_some_and(super::git_tool::is_scoped_read_op)
-        ) || matches!(
-            &decision,
-            RouteDecision::Route {
-                tool: "build_exec",
-                ..
-            }
-        );
-        if !requires_bare_call {
+        let RouteDecision::Route { tool, .. } = &decision else {
             return decision;
-        }
-        let keys_ok = call
-            .as_object()
-            .is_some_and(|obj| obj.keys().all(|key| key == "command" || key == "cwd"));
+        };
+        // Every route discards the rest of the call object once routed —
+        // none has anywhere to put a `timeout` the model also sent. #2551
+        // round 2 (the BLOCKER's "same rule" for the `cwd`-field path, and
+        // its pre-existing sibling: `{command:"cat f", cwd:"sub"}` used to
+        // route and silently drop `cwd`): a `cwd` field is allowed
+        // alongside `command` ONLY for `build_exec`/`git` — the two routes
+        // that actually read it ([`attach_cwd`]) — every other route
+        // refuses a call carrying anything beyond bare `command`, exactly
+        // as `build_exec`/the scoped git read always required.
+        let extra_keys_allowed: &[&str] = if matches!(*tool, "build_exec" | "git") {
+            &["command", "cwd"]
+        } else {
+            &["command"]
+        };
+        let keys_ok = call.as_object().is_some_and(|obj| {
+            obj.keys()
+                .all(|key| extra_keys_allowed.contains(&key.as_str()))
+        });
         if !keys_ok {
             return RouteDecision::Exec;
         }
@@ -212,8 +210,9 @@ impl RouteTable {
             return decision;
         }
         // PR1: a model-supplied `cwd` FIELD on an otherwise-bare call is the
-        // SAME question a leading `cd` asks — resolved the SAME way. A call
-        // with no `cwd` field at all (the original bare shape) is
+        // SAME question a leading `cd` asks — resolved the SAME way
+        // ([`attach_cwd`]'s own build_exec/git-only rule applies here too).
+        // A call with no `cwd` field at all (the original bare shape) is
         // unaffected: `decision` returned as-is.
         let Some(cwd_field) = call.get("cwd").and_then(Value::as_str) else {
             return decision;
@@ -331,21 +330,33 @@ impl RouteTable {
 /// [`BUILD_UNSAFE`] tables the rest of this module already refuses on, plus
 /// no internal whitespace — `cd /a b` is TWO arguments to a real `cd` and
 /// fails there, #2550 round 2) — `cd -`, `cd ~`, a quoted or globbed dir
-/// never qualifies. Then PR1's real check, replacing #2550's lexical
-/// "does `<dir>` normalize to the workspace root" with the actual question:
-/// does `<dir>` canonicalize (through any symlink) to a real DIRECTORY
-/// inside both the canonical workspace AND this call's fs-read fence
+/// never qualifies. #2551 round 2: a `..` component in `<dir>` ALSO refuses
+/// outright, checked on the un-normalized token (never re-added by
+/// `#2550`'s original reasoning: `std::fs::canonicalize` resolves
+/// PHYSICALLY, following every symlink to its real target, while a real
+/// shell's `cd` defaults to LOGICAL (`-L`) — `cd link/..` lands wherever
+/// `link` pointed in bash, not one physical level up from where it
+/// resolves. Refusing any `..` sidesteps that divergence entirely rather
+/// than trying to emulate it.
+///
+/// Then PR1's real check, replacing #2550's lexical "does `<dir>` normalize
+/// to the workspace root" with the actual question: does `<dir>`
+/// canonicalize (through any symlink) to a real DIRECTORY inside both the
+/// canonical workspace AND this call's fs-read fence
 /// ([`crate::caveats::permits_path`], the SAME containment check the
 /// interactive tool gate and the headless coder apply path both use)? A
 /// missing directory, a file, an out-of-workspace absolute path, and a
 /// symlink that resolves outside all fail identically to how a real `cd`
 /// (or a real out-of-scope read) would refuse — this is the question `cd`
-/// itself answers, not a parallel heuristic. The fence check runs on the
-/// LEXICAL join (`workspace.join(dir)`, matching how `read_file`'s own fs
-/// gate checks a path — see `tools.rs`), not the canonicalized one, so a
-/// symlinked WORKSPACE root cannot itself mismatch a fence granted by its
-/// original string; the canonicalized form is used only to prove `<dir>`
-/// really is a directory really inside the workspace.
+/// itself answers, not a parallel heuristic.
+///
+/// #2551 round 2 should-fix: the fence is checked on BOTH the lexical join
+/// (`workspace.join(dir)`, matching how `read_file`'s own fs gate checks a
+/// path — see `tools.rs`; a symlinked WORKSPACE root cannot itself mismatch
+/// a fence granted by its original string) AND the canonical path (a
+/// symlink INSIDE a granted root that points to a real directory OUTSIDE
+/// the fence — `sub` granted, `sub/link` → `<root>/other` — used to pass
+/// the lexical check alone and route with a `cwd` the fence never granted).
 fn resolve_workspace_relative_dir(
     dir: &str,
     workspace: &Path,
@@ -358,6 +369,9 @@ fn resolve_workspace_relative_dir(
         || dir.contains(GLOB)
         || dir.contains(BUILD_UNSAFE)
         || dir.contains(char::is_whitespace)
+        || Path::new(dir)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return None;
     }
@@ -368,6 +382,9 @@ fn resolve_workspace_relative_dir(
     let canonical_workspace = workspace.canonicalize().ok()?;
     let canonical_dir = lexical.canonicalize().ok()?;
     if !canonical_dir.is_dir() || !canonical_dir.starts_with(&canonical_workspace) {
+        return None;
+    }
+    if !crate::caveats::permits_path(read_scope, &canonical_dir.to_string_lossy()) {
         return None;
     }
     let relative = canonical_dir.strip_prefix(&canonical_workspace).ok()?;
@@ -381,12 +398,29 @@ fn resolve_workspace_relative_dir(
 /// Insert a resolved `cwd` into a route's args — the one seam both
 /// [`RouteTable::classify`]'s leading-`cd` fold and [`RouteTable::
 /// classify_call`]'s `cwd`-field fold use, so a routed call's `cwd` is
-/// attached identically regardless of which shape asked for it. A no-op on
-/// `RouteDecision::Exec`.
+/// attached identically regardless of which shape asked for it.
+///
+/// #2551 round 2 BLOCKER: `cwd` is honoured ONLY by `build_exec`
+/// (`run_confined_build_lane`) and `git` (`newt-git` reads it directly) —
+/// `read_file`/`list_dir`/`find`/`delete_file` all join `workspace + path`
+/// and never look at `args["cwd"]`. Attaching it to any OTHER route would
+/// leave the built-in silently acting on `workspace` while the routed note
+/// (and the model) believed it ran in the folded directory — measured: `cd
+/// sub && rm x` would have deleted `<root>/x`, not `<root>/sub/x`. So a
+/// resolved `cwd != "."` on any other route refuses (`Exec`) instead —
+/// `cwd == "."` (the workspace root itself) is harmless for any tool, since
+/// that IS where they already run.
 fn attach_cwd(decision: RouteDecision, cwd: String) -> RouteDecision {
     let RouteDecision::Route { tool, mut args } = decision else {
         return decision;
     };
+    if !matches!(tool, "build_exec" | "git") {
+        return if cwd == "." {
+            RouteDecision::Route { tool, args }
+        } else {
+            RouteDecision::Exec
+        };
+    }
     if let Some(obj) = args.as_object_mut() {
         obj.insert("cwd".to_string(), Value::String(cwd));
     }
@@ -1019,6 +1053,13 @@ mod tests {
             let sub = root.join("sub");
             std::fs::create_dir(&sub).expect("mkdir sub");
             std::fs::write(root.join("file.txt"), b"not a directory").expect("write file");
+            // #2551 round 2 BLOCKER fixture: `x`/`f` at BOTH the root and
+            // `sub/`, distinct content, so a test that reads/deletes the
+            // WRONG one is provably wrong rather than accidentally right.
+            std::fs::write(root.join("x"), b"root x").expect("write root x");
+            std::fs::write(root.join("f"), b"root f").expect("write root f");
+            std::fs::write(sub.join("x"), b"sub x").expect("write sub x");
+            std::fs::write(sub.join("f"), b"sub f").expect("write sub f");
             Self {
                 _dir: dir,
                 root,
@@ -1287,9 +1328,16 @@ mod tests {
                 );
             }
         }
-        // This repair does not alter the existing routes' argument policy —
-        // none of these are `git`-scoped-read or `build_exec`, so a `cwd`
-        // field is not even consulted for them.
+        // #2551 round 2 BLOCKER (flipped from the pre-round-2 assertion,
+        // per the review — this WAS "routes and silently drops cwd" for
+        // `cat`/`ls`, the exact class of bug the blocker fixes; `git
+        // status` now follows the SAME uniform rule as every other route,
+        // not just the scoped-read ones): a `cwd` field on any of these —
+        // `git status` included, `git` honours `cwd` for every op, not
+        // only `branch-list` — is the SAME question a leading `cd` asks.
+        // Against `no_cd_match()` (a nonexistent workspace) it never
+        // resolves, so all three now refuse rather than silently ignoring
+        // the field and running at the wrong (root) directory.
         for command in ["git status", "cat file", "ls"] {
             assert_eq!(
                 table.classify_call(
@@ -1297,7 +1345,8 @@ mod tests {
                     no_cd_match(),
                     &crate::caveats::Scope::All
                 ),
-                classify(command)
+                RouteDecision::Exec,
+                "{command}"
             );
         }
     }
@@ -1897,6 +1946,106 @@ mod tests {
             .into_owned()]);
         assert_eq!(
             classify_at("cd sub && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 2 BLOCKER (red first, real tempdir with `sub/x`/`sub/f`
+    /// AND `x`/`f` at the root — distinct content, so reading/deleting the
+    /// WRONG one is provably wrong): `cwd` is honoured ONLY by `build_exec`
+    /// and `git` (`newt-git` reads it, `run_confined_build_lane` takes it as
+    /// a real parameter) — `read_file`/`list_dir`/`delete_file` all join
+    /// `workspace + path` and never look at `args["cwd"]`. Attaching `cwd`
+    /// to those routes anyway would leave `cd sub && rm x` deleting
+    /// `<root>/x` instead of `<root>/sub/x` — a wrong-file DELETE gated only
+    /// by `fs_write` on the root, not on `sub`. Every non-build/git route
+    /// with a resolved `cwd != "."` now stays `Exec`; `cwd == "."` (the
+    /// workspace root itself) is harmless and still routes.
+    #[test]
+    fn a_resolved_cwd_never_reaches_a_route_that_does_not_honour_it() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        for cmd in ["cd sub && rm x", "cd sub && cat f", "cd sub && ls"] {
+            assert_eq!(
+                classify_at(cmd, &fx.root, &scope),
+                RouteDecision::Exec,
+                "{cmd}"
+            );
+        }
+        // The pre-existing sibling of the same bug: a `cwd` FIELD (not a
+        // leading `cd`) on a non-build/git route used to route and
+        // silently drop it.
+        assert_eq!(
+            RouteTable::builtin().classify_call(
+                &json!({"command": "cat f", "cwd": "sub"}),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Exec
+        );
+        // `cwd == "."` (the workspace root itself) is harmless — those
+        // tools already run there, so nothing is silently dropped.
+        assert_eq!(
+            classify_at(
+                &format!("cd {} && cat f", fx.root.display()),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Route {
+                tool: "read_file",
+                args: json!({ "path": "f" }),
+            }
+        );
+    }
+
+    /// #2551 round 2 should-fix (red first): the fence must hold on the
+    /// CANONICAL path too, not just the lexical join. A fence granting only
+    /// `sub` and a symlink `sub/link` → a REAL sibling directory `other`
+    /// (never granted): `workspace.join("sub/link")` lexically starts with
+    /// the granted `sub` prefix, but the directory it actually reaches is
+    /// outside the fence. Checking only the lexical join would route with
+    /// `cwd="other"` — a directory the fence never authorized.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_symlink_whose_real_target_is_outside_the_fence_stays_exec() {
+        let fx = CdFixture::new();
+        let other = fx.root.join("other");
+        std::fs::create_dir(&other).expect("mkdir other");
+        std::os::unix::fs::symlink(&other, fx.sub.join("link")).expect("symlink");
+        // Grant ONLY `sub` — `other` is genuinely inside the WORKSPACE, but
+        // never inside THIS call's fence.
+        let scope = crate::caveats::Scope::only([fx.sub.to_string_lossy().into_owned()]);
+        assert_eq!(
+            classify_at("cd sub/link && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 2 should-fix (dropped from #2550 round 2, re-added, red
+    /// first): ANY `..` component in `<dir>` refuses outright, even one
+    /// that would resolve harmlessly. `std::fs::canonicalize` resolves
+    /// PHYSICALLY (follows every symlink to its real target); a real
+    /// shell's `cd` defaults to LOGICAL (`-L`) and never re-resolves a
+    /// symlink component once it has descended through it. With `link →
+    /// <root>/a/b`, `cd link/..` lands at `<root>` in bash (logical: pop
+    /// the textual `link` component) but at `<root>/a` if routed
+    /// (physical: canonicalize resolves `link` first, then climbs one
+    /// REAL level) — two different directories from the same command.
+    /// Refusing any `..` sidesteps the divergence entirely rather than
+    /// trying to emulate bash's logical resolution.
+    #[test]
+    fn a_parent_dir_component_in_the_cd_target_always_refuses() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        // Even a `..` that would resolve harmlessly (back to a sibling
+        // that IS granted) still refuses — the component itself is what's
+        // refused, not its eventual resolution.
+        assert_eq!(
+            classify_at("cd sub/../sub && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+        assert_eq!(
+            classify_at("cd sub/.. && cargo test", &fx.root, &scope),
             RouteDecision::Exec
         );
     }
