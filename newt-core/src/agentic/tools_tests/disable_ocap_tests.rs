@@ -1660,6 +1660,9 @@ fn write_passing_scratch_crate(dir: &std::path::Path) {
 /// toolchain_in_the_confined_lane` below. Verified with `just` absent from
 /// `PATH` entirely (not merely unused), so neither test can secretly
 /// depend on it.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
     let _l = env_lock().await;
@@ -1719,6 +1722,9 @@ async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
 /// The passing twin: a build that genuinely passes, piped to `head`, keeps
 /// its `Passed` outcome and the first N lines. See the failing test's doc
 /// comment for why `cargo`, not `just`.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines() {
     let _l = env_lock().await;
@@ -1776,6 +1782,9 @@ async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lin
 /// OPERATOR's real environment (never the confined child's redirected
 /// `HOME`), so a routed `cargo +stable check` must behave exactly as it
 /// would from an ordinary shell, never report the toolchain missing.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() {
     let _l = env_lock().await;
