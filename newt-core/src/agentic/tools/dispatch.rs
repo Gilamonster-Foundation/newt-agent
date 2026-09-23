@@ -350,8 +350,12 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Option<String>> {
-    let (presentation_name, presentation_detail) =
-        tool_presentation(name, args, std::path::Path::new(workspace));
+    let (presentation_name, presentation_detail) = tool_presentation(
+        name,
+        args,
+        std::path::Path::new(workspace),
+        &caveats.fs_read,
+    );
     display.call(&presentation_name, &presentation_detail);
     let invocation = collab.invocation;
     let execution = collab

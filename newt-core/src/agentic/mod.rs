@@ -1745,7 +1745,12 @@ fn present_synthetic_tool_result<W: std::io::Write>(
     workspace: &std::path::Path,
     result: &str,
 ) {
-    let (name, detail) = tools::tool_presentation(name, args, workspace);
+    // Presentation-only (a completed result being re-rendered, not a live
+    // dispatch decision) — the real authority was already enforced when
+    // this call originally ran, so an unrestricted fence here costs
+    // nothing and avoids threading `Caveats` through a display-only path.
+    let (name, detail) =
+        tools::tool_presentation(name, args, workspace, &crate::caveats::Scope::All);
     display.call(&name, &detail);
     display.result(result);
 }
@@ -4010,7 +4015,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
+            if ok
+                && is_progress_verification(
+                    name,
+                    &args,
+                    execution.get().copied(),
+                    workspace,
+                    &caveats.fs_read,
+                )
+            {
                 workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
@@ -5051,6 +5064,7 @@ fn is_progress_verification(
     args: &serde_json::Value,
     execution: Option<crate::ExecOutcome>,
     workspace: &str,
+    read_scope: &crate::caveats::Scope<String>,
 ) -> bool {
     if execution != Some(crate::ExecOutcome::Passed) {
         return false;
@@ -5068,7 +5082,11 @@ fn is_progress_verification(
     let routing::RouteDecision::Route {
         tool: "build_exec",
         args: routed,
-    } = routing::RouteTable::builtin().classify_call(args, std::path::Path::new(workspace))
+    } = routing::RouteTable::builtin().classify_call(
+        args,
+        std::path::Path::new(workspace),
+        read_scope,
+    )
     else {
         return false;
     };
@@ -8731,7 +8749,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
+            if ok
+                && is_progress_verification(
+                    name,
+                    &args,
+                    execution.get().copied(),
+                    workspace,
+                    &caveats.fs_read,
+                )
+            {
                 workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
@@ -11114,7 +11140,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
+            if ok
+                && is_progress_verification(
+                    name,
+                    &args,
+                    execution.get().copied(),
+                    workspace,
+                    &caveats.fs_read,
+                )
+            {
                 workflow_runtime.note_verified_pass();
             }
             if ok && meaningful_workflow_progress(name, &result) {
@@ -12716,7 +12750,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
-            if ok && is_progress_verification(name, &args, execution.get().copied(), workspace) {
+            if ok
+                && is_progress_verification(
+                    name,
+                    &args,
+                    execution.get().copied(),
+                    workspace,
+                    &caveats.fs_read,
+                )
+            {
                 workflow_runtime.note_verified_pass();
             }
             ledger_note_attribution(attribution, model, name, &args, ok);

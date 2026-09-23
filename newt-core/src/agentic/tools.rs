@@ -2405,6 +2405,7 @@ pub(crate) fn tool_presentation(
     raw_name: &str,
     raw_args: &serde_json::Value,
     workspace: &std::path::Path,
+    read_scope: &crate::caveats::Scope<String>,
 ) -> (String, String) {
     let (name, correction) = match resolve_tool_alias(raw_name) {
         Some(AliasOutcome::Rewrite(canonical)) => (canonical, false),
@@ -2417,7 +2418,7 @@ pub(crate) fn tool_presentation(
 
     if name == "run_command" && !routing_disabled() {
         if let super::routing::RouteDecision::Route { tool, args } =
-            super::routing::RouteTable::builtin().classify_call(raw_args, workspace)
+            super::routing::RouteTable::builtin().classify_call(raw_args, workspace, read_scope)
         {
             let detail = tool_call_detail(tool, &args, workspace);
             return (tool.to_string(), detail);
@@ -3076,9 +3077,11 @@ async fn execute_authorized_tool(
         && name == "run_command"
         && !routing_disabled()
     {
-        match super::routing::RouteTable::builtin()
-            .classify_call(args, std::path::Path::new(workspace))
-        {
+        match super::routing::RouteTable::builtin().classify_call(
+            args,
+            std::path::Path::new(workspace),
+            &caveats.fs_read,
+        ) {
             super::routing::RouteDecision::Route { tool: "git", args }
                 if args
                     .get("op")
@@ -3204,8 +3207,11 @@ async fn execute_authorized_tool(
     let routed: Option<(&'static str, serde_json::Value)> =
         if name == "run_command" && !routing_disabled() {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let decision = super::routing::RouteTable::builtin()
-                .classify_call(args, std::path::Path::new(workspace));
+            let decision = super::routing::RouteTable::builtin().classify_call(
+                args,
+                std::path::Path::new(workspace),
+                &caveats.fs_read,
+            );
             let decision = match decision {
                 super::routing::RouteDecision::Route {
                     tool: "git" | "find",
@@ -3893,26 +3899,39 @@ async fn execute_authorized_tool(
             let Some((program, rest)) = argv.split_first() else {
                 return host_return("error: routed build command had no argv".into());
             };
+            // PR1: `cwd` is the workspace-relative directory a leading `cd`
+            // or a `cwd` field resolved (`routing::resolve_workspace_relative_dir`
+            // already proved it canonicalizes to a real directory inside the
+            // workspace AND this call's fs-read fence — `.` for the
+            // workspace root itself). Absent when the model sent a bare
+            // command with no `cd`/`cwd` at all.
+            let cwd_field = args.get("cwd").and_then(serde_json::Value::as_str);
+            let effective_dir = match cwd_field {
+                Some(cwd) => std::path::Path::new(workspace).join(cwd),
+                None => std::path::Path::new(workspace).to_path_buf(),
+            };
             // `just` only makes sense with a justfile somewhere — the pure
             // router cannot see the filesystem, so the check lives here.
             // `just` itself searches the cwd AND every parent directory
             // (that's how a subcrate's `just check` finds the workspace
-            // root's justfile), so a workspace-only check errors on a repo
-            // whose justfile sits one level up, where the shell path would
-            // have found and run it. #2533 round 2: fall back to the normal
-            // exec path instead — the routed argv is the literal command,
-            // so it runs exactly as the shell would have.
+            // root's justfile), so checking only `effective_dir` errors on a
+            // repo whose justfile sits one level up, where the shell path
+            // would have found and run it. #2533 round 2: fall back to the
+            // normal exec path instead — the routed argv is the literal
+            // command, so it runs exactly as the shell would have, in the
+            // SAME resolved directory the route folded.
             let display = argv.join(" ");
-            if program == "just" && !justfile_findable_from(std::path::Path::new(workspace)) {
+            if program == "just" && !justfile_findable_from(&effective_dir) {
+                let ran_in = effective_dir.to_string_lossy().into_owned();
                 let filesystem_requests =
-                    match declared_filesystem_requests(args, &display, workspace) {
+                    match declared_filesystem_requests(args, &display, &ran_in) {
                         Ok(requests) => requests,
                         Err(error) => return host_return(error),
                     };
                 return executed(
                     exec_confined_command(
                         &display,
-                        workspace,
+                        &ran_in,
                         color,
                         tool_output_lines,
                         caveats,
@@ -3932,17 +3951,9 @@ async fn execute_authorized_tool(
             // (`build_piped_to_trim_route`) — the build's own exit code
             // still decides `outcome`; only the rendered text is cut.
             let trim = OutputTrim::from_json(args.get("trim"));
-            // F24: a leading `cd <workspace root> &&` the classifier
-            // recognised and dropped as a no-op (`strip_noop_cd_prefix`) —
-            // say so, rather than silently running a different-looking
-            // command than the one the model typed.
-            let cd_dropped = args
-                .get("cd_dropped")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
             let (text, outcome) = run_confined_build_lane(
                 workspace,
-                std::path::Path::new(workspace),
+                &effective_dir,
                 program,
                 rest.to_vec(),
                 &display,
@@ -3958,10 +3969,12 @@ async fn execute_authorized_tool(
                 presentation,
             )
             .await;
-            let cd_clause = if cd_dropped {
-                "; the leading `cd` to the workspace root was dropped as a no-op"
-            } else {
-                ""
+            // PR1: say what a `cd`/`cwd` actually folded into, rather than
+            // #2550's root-only "dropped as a no-op" wording — a reader
+            // needs to know WHICH directory the build lane actually ran in.
+            let cd_clause = match cwd_field {
+                Some(".") | None => String::new(),
+                Some(cwd) => format!("; the leading `cd`/`cwd` was folded into cwd={cwd}"),
             };
             let note = match trim {
                 Some(trim) => format!(
