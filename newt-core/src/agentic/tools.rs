@@ -4508,6 +4508,15 @@ mod execute_tool_branch_tests;
 mod exit_code_ok_tests;
 
 // ---------------------------------------------------------------------------
+// F20 — a build command gets the build wall even when it is compound (the
+// shell lane #2533's routing refuses to route it into).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tools_tests/build_wall_tests.rs"]
+mod build_wall_tests;
+
+// ---------------------------------------------------------------------------
 // INTERIM (#297) --disable-ocap / --yolo tests — the exec escape hatch.
 // Removed with the bypass when brush upstreams CommandInterceptor
 // (agent-bridle#20).
