@@ -254,16 +254,44 @@ impl Target {
 
 /// One authority grant: the DATA half of the tree (per-kind target);
 /// enforcement composition is per-kind and lives in [`to_caveat_delta`].
+///
+/// `scope` is private: [`GrantScope::Durable`] is reachable only through
+/// [`Grant::promote`] (#2534 round 3 — the transition, not just the state,
+/// is now the only way in). A caller can construct only a session grant:
+///
+/// ```compile_fail
+/// use newt_core::grant_tree::{Grant, GrantScope, Target};
+/// // `Grant::new` takes a `Provenance`, not a `GrantScope` — `Durable`
+/// // cannot be named here.
+/// let _ = Grant::new(Target::exec("ls"), GrantScope::Durable);
+/// ```
+///
+/// ```compile_fail
+/// use newt_core::grant_tree::{Grant, GrantScope, Provenance, Target};
+/// let mut g = Grant::new(Target::exec("ls"), Provenance::Terminal);
+/// // `scope` is private outside the module — cannot be reassigned.
+/// g.scope = GrantScope::Durable;
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub target: Target,
-    pub scope: GrantScope,
+    scope: GrantScope,
 }
 
 impl Grant {
+    /// Constructs a session grant. `Durable` is not constructible here —
+    /// only [`Grant::promote`] mints one.
     #[must_use]
-    pub fn new(target: Target, scope: GrantScope) -> Self {
-        Self { target, scope }
+    pub fn new(target: Target, provenance: Provenance) -> Self {
+        Self {
+            target,
+            scope: GrantScope::Session(provenance),
+        }
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> GrantScope {
+        self.scope
     }
 
     #[must_use]
@@ -388,7 +416,7 @@ mod tests {
     use crate::caveats::Scope;
 
     fn session_terminal(target: Target) -> Grant {
-        Grant::new(target, GrantScope::Session(Provenance::Terminal))
+        Grant::new(target, Provenance::Terminal)
     }
 
     /// Red test (1): `/a/b` groups under `/a`; `srv`/`get_x` groups under `srv`.
@@ -505,21 +533,18 @@ mod tests {
     /// [`Provenance`] and [`Target`]).
     #[test]
     fn promote_succeeds_only_from_session_terminal() {
-        let web = Grant::new(
-            Target::net("example.com"),
-            GrantScope::Session(Provenance::Web),
-        );
+        let web = Grant::new(Target::net("example.com"), Provenance::Web);
         assert_eq!(web.promote(), Err(NotPromotable));
 
-        let terminal = Grant::new(
-            Target::net("example.com"),
-            GrantScope::Session(Provenance::Terminal),
-        );
+        let terminal = Grant::new(Target::net("example.com"), Provenance::Terminal);
         let promoted = terminal.promote().expect("terminal session promotes");
-        assert_eq!(promoted.scope, GrantScope::Durable);
+        assert_eq!(promoted.scope(), GrantScope::Durable);
 
+        let already_durable = Grant::new(Target::net("example.com"), Provenance::Terminal)
+            .promote()
+            .expect("terminal session promotes");
         assert_eq!(
-            Grant::new(Target::net("example.com"), GrantScope::Durable).promote(),
+            already_durable.promote(),
             Err(NotPromotable),
             "already-durable does not re-promote"
         );
