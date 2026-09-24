@@ -156,3 +156,72 @@ async fn confined_lane_still_runs_forms_that_are_not_a_same_file_redirect() {
     );
     assert_eq!(std::fs::read(ws.path().join("f")).unwrap(), b"x\n");
 }
+
+/// #2560 round 2, fix 1 (red first): `./f` and `f` name the same file —
+/// `resolve_exec_cwd` joins but does not normalize, so this was a miss
+/// before `lexically_normalize` was added to the comparison.
+#[tokio::test]
+async fn confined_lane_refuses_a_dot_slash_spelling_of_the_same_file() {
+    let _l = env_lock().await;
+    let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+
+    let f = seeded_file(ws.path());
+    let out = run_command("cat ./f > f", ws.path(), &caveats).await;
+    assert!(
+        out.starts_with("error: refusing to run this command"),
+        "'./f' and 'f' must compare equal after normalization: {out}"
+    );
+    assert_eq!(std::fs::read(&f).unwrap(), SEED);
+}
+
+/// #2560 round 2, fix 2 (red first): `tee` opens every non-flag operand
+/// with `O_TRUNC` at startup, regardless of any `>` redirect — `sort f |
+/// tee f` is exactly as destructive as `sort f > f`, and `tee f < f` is
+/// the same shape with the read spelled as `<` instead of a plain operand.
+#[tokio::test]
+async fn confined_lane_refuses_tee_writing_over_a_file_it_reads() {
+    let _l = env_lock().await;
+    let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+
+    for command in ["sort f | tee f", "tee f < f", "sort f | tee -a f"] {
+        let f = seeded_file(ws.path());
+        let out = run_command(command, ws.path(), &caveats).await;
+        assert!(
+            out.starts_with("error: refusing to run this command"),
+            "{command:?} must be refused — tee's operand is a write: {out}"
+        );
+        assert_eq!(
+            std::fs::read(&f).unwrap(),
+            SEED,
+            "{command:?} must leave f byte-identical"
+        );
+    }
+}
+
+/// #2560 round 2, fix 3 (red first): the "smallest narrowing" — a
+/// subcommand dispatcher's first operand is a verb, not a path, and a
+/// non-reading command like `echo` never truncates what it "reads". Before
+/// this fix all three refused on a coincidental name match, costing the
+/// model's harmless first instinct (#2558 test 1) for no safety benefit.
+///
+/// Calls [`same_file_redirect_refusal`] directly rather than through real
+/// dispatch: `git diff`/`cargo build` are ROUTED (read-only git → the
+/// embedded git tool; build commands → the confined build lane), a
+/// pre-existing behavior orthogonal to this guard, and driving them through
+/// `execute_tool` in a test was observed to run against the actual process
+/// cwd rather than the tempdir passed as `workspace` — a real but separate
+/// routing quirk, not something to depend on (or risk polluting the repo
+/// with) here. The guard's own decision is what this test is about.
+#[test]
+fn the_guard_no_longer_false_refuses_subcommand_and_non_reading_forms() {
+    for command in ["cargo build > build", "git diff > diff", "echo f > f"] {
+        assert!(
+            same_file_redirect_refusal(command, "/tmp").is_none(),
+            "{command:?} must not be refused by the redirect guard"
+        );
+    }
+}
