@@ -2313,21 +2313,22 @@ mod dispatch_caveats_tests {
     /// `$RUSTUP_HOME`.
     #[test]
     fn a_build_tool_command_gets_its_toolchain_read_root_for_this_dispatch_only() {
-        // SAFETY (test-only): pins the toolchain-home resolution so the
+        // Pins the toolchain-home resolution so the
         // assertion does not depend on the machine running the suite.
+        // Platform-absolute (a POSIX `/fake-home` is not absolute on Windows),
+        // and under the process-env lock like every other env-pinning test.
+        let _env = crate::process_env::lock();
+        let fake = std::env::temp_dir().join("fake-home").join(".rustup");
+        let fake = fake.to_string_lossy().into_owned();
         let saved = std::env::var_os("RUSTUP_HOME");
-        unsafe {
-            std::env::set_var("RUSTUP_HOME", "/fake-home/.rustup");
-        }
+        crate::process_env::set_var("RUSTUP_HOME", &fake);
         let widened = dispatch_caveats_for_command("cargo --version", &base("/ws"));
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("RUSTUP_HOME", v),
-                None => std::env::remove_var("RUSTUP_HOME"),
-            }
+        match saved.and_then(|v| v.into_string().ok()) {
+            Some(v) => crate::process_env::set_var("RUSTUP_HOME", &v),
+            None => crate::process_env::remove_var("RUSTUP_HOME"),
         }
         assert!(
-            widened.permits_fs_read("/fake-home/.rustup"),
+            widened.permits_fs_read(&fake),
             "a build-tool dispatch must be able to read its toolchain home"
         );
     }
