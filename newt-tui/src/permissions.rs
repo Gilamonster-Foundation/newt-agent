@@ -851,6 +851,40 @@ pub(crate) fn session_grant_covers(
                 .any(|(kind, _)| *kind == newt_core::DenialKind::Build))
 }
 
+/// dec1-build-grant round 2 (Reviewer, item 3): which session `Build` grant
+/// covers a request running under `baseline` — the grant whose workspace
+/// CONTAINS the call's cwd, not just the first `Build` grant found. A
+/// multi-root session can hold more than one; clamping to the wrong
+/// workspace's fence would deny (or, worse, over-grant) an otherwise-lawful
+/// call. `baseline.fs_write` is the caller's own write scope for THIS call —
+/// it is anchored to the effective cwd (`workspace_confined_caveats`,
+/// `build_tool_caveats`), so a `Build` grant is a match when its workspace is
+/// an ancestor of (or equal to) one of those write roots. Falls back to the
+/// first `Build` grant found when nothing matches (the prior behavior) —
+/// better an approximate clamp than none.
+fn covering_build_grant_workspace<'a>(
+    grants: &'a std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    baseline: &newt_core::Caveats,
+) -> Option<&'a str> {
+    let cwd_roots: Vec<&str> = match &baseline.fs_write {
+        newt_core::Scope::Only(set) => set.iter().map(String::as_str).collect(),
+        newt_core::Scope::All => Vec::new(),
+    };
+    let build_workspaces = || {
+        grants
+            .iter()
+            .filter(|(kind, _)| *kind == newt_core::DenialKind::Build)
+            .map(|(_, ws)| ws.as_str())
+    };
+    build_workspaces()
+        .find(|ws| {
+            cwd_roots
+                .iter()
+                .any(|root| std::path::Path::new(root).starts_with(ws))
+        })
+        .or_else(|| build_workspaces().next())
+}
+
 /// Consume only the exact pending target; other requests leave it available.
 pub(crate) fn take_pending_once(
     pending: &mut std::collections::BTreeSet<(newt_core::DenialKind, String)>,
@@ -1871,12 +1905,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     once_grants.push((req.kind, req.target.clone()));
                     // This IS the build-tool fallback (an exact match took
                     // the branch above), so pin the clamp to the covering
-                    // Build grant's workspace fence.
-                    if let Some((_, workspace)) = self
-                        .state
-                        .session_grants
-                        .iter()
-                        .find(|(kind, _)| *kind == newt_core::DenialKind::Build)
+                    // Build grant's workspace fence — the grant whose
+                    // workspace contains this call's cwd, when more than one
+                    // is held.
+                    if let Some(workspace) =
+                        covering_build_grant_workspace(&self.state.session_grants, baseline)
                     {
                         let fence = newt_core::confined_exec::build_tool_caveats(
                             std::path::Path::new(workspace),

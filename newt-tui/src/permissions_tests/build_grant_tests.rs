@@ -143,3 +143,72 @@ fn a_build_covered_exec_runs_under_the_build_fence_not_a_wider_shell_baseline() 
         "covered by the session Build grant — no prompt expected"
     );
 }
+
+/// Architect review round 2 (Reviewer FIX-FIRST, PR #2579, BLOCKER, red test
+/// (a)): an exec grant for a build tool must never widen the SESSION's
+/// `fs_read` — that caveats value is what `read_file` and every other tool
+/// call checks for the rest of the session, not just the confined child the
+/// grant was asked for. Would fail before the fix: an earlier version of
+/// `widen_caveats` added the toolchain read roots to `fs_read` directly, so
+/// `recalled_caveats` (and its headless twin, the ocap/durable-grant fold)
+/// would have let `read_file` read `$CARGO_HOME/credentials.toml` after
+/// nothing more than a session `exec:cargo` grant.
+#[test]
+fn an_exec_grant_never_widens_recalled_fs_read_via_either_grant_store() {
+    let ws = "/ws";
+    let base = Caveats {
+        fs_read: Scope::only([ws.to_string()]),
+        fs_write: Scope::only([ws.to_string()]),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    };
+    let credentials = "/home/op/.cargo/credentials.toml";
+
+    // The interactive session-grant store.
+    let mut state = PermissionPromptState::default();
+    state
+        .session_grants
+        .insert((DenialKind::Exec, "cargo".to_string()));
+    let widened = state.recalled_caveats(&base, None);
+    assert!(widened.permits_exec("cargo"));
+    assert!(
+        !widened.permits_fs_read(credentials),
+        "a session exec:cargo grant must never widen fs_read to cargo's \
+         toolchain home — read_file must not gain cargo-credential access \
+         from an exec grant"
+    );
+
+    // The headless durable/ocap-approved fold (`fold_ocap_approvals` extends
+    // this same `durable_grants` set) — same widen, different grant store.
+    let mut durable_state = PermissionPromptState::default();
+    durable_state
+        .durable_grants
+        .insert((DenialKind::Exec, "cargo".to_string()));
+    let widened_durable = durable_state.recalled_caveats(&base, None);
+    assert!(
+        !widened_durable.permits_fs_read(credentials),
+        "a durable/ocap-approved exec:cargo grant must never widen fs_read either"
+    );
+}
+
+/// Shawn's call (round 2, item 3): session `Build` is offered on the web
+/// surface too, same as terminal — pinned deliberately so a later change to
+/// `permission_policy`'s audience handling doesn't silently drop it there.
+#[test]
+fn permission_policy_offers_session_allow_for_build_on_the_web_surface_too() {
+    let danger = DangerTable::builtin().with_fs_root("/ws");
+    let req = build_request("/ws");
+
+    let (terminal_actions, _) = permission_policy(&req, &danger, Audience::Terminal);
+    let (web_actions, _) = permission_policy(&req, &danger, Audience::Web);
+    for (audience, actions) in [("terminal", &terminal_actions), ("web", &web_actions)] {
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.action == PromptChoice::AllowSession),
+            "{audience} must offer session allow for Build"
+        );
+    }
+}

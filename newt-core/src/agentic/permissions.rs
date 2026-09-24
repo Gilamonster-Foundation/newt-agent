@@ -355,17 +355,6 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
         if let Scope::Only(set) = scope {
             set.insert(target.clone());
         }
-        // dec1-build-grant (F35): an exec grant for a build tool carries that
-        // toolchain's read roots too — without this, cargo/just/make could run
-        // but couldn't read `~/.cargo` or `~/.rustup`, so the build failed with
-        // no further prompt to recover from (no FsRead axis names those paths
-        // for the model to ask about). One derivation, shared with the
-        // lifecycle build fence: `confined_exec::toolchain_read_roots`.
-        if *kind == DenialKind::Exec && crate::confined_exec::is_build_tool_exec(target) {
-            if let Scope::Only(reads) = &mut out.fs_read {
-                reads.extend(crate::confined_exec::toolchain_read_roots());
-            }
-        }
     }
     out
 }
@@ -497,38 +486,31 @@ mod tests {
         assert_eq!(widened.max_calls, CountBound::AtMost(7));
     }
 
-    /// dec1-build-grant (F35): granting `exec:cargo` alone left the child
-    /// unable to read `~/.cargo` / `~/.rustup`, and there was no further
-    /// prompt to recover from — a build tool's exec grant must carry its
-    /// toolchain's read roots in the SAME widen, not a second round trip.
-    /// Would fail before the fix: `widened.permits_fs_read` only ever saw the
-    /// literal `"cargo"` target inserted into `exec`, never a read root.
+    /// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579, BLOCKER): an
+    /// earlier version of this widen ALSO added a build tool's toolchain read
+    /// roots to `fs_read` here. That was a real leak: `widen_caveats`'s
+    /// result feeds `recalled_caveats`/`fold_ocap_approvals`, which is the
+    /// caveats checked for EVERY tool the model calls this session —
+    /// including `read_file`. Widening `fs_read` here would have let the
+    /// model's own `read_file` tool read `$CARGO_HOME/credentials.toml` (or
+    /// any other file under the toolchain roots) for the rest of the
+    /// session, armed by nothing more than a session `exec:cargo` grant meant
+    /// only to let the confined build's OWN subprocess resolve its
+    /// toolchain. The toolchain reads now live ONLY on the confined shell
+    /// dispatch's call-scoped caveats
+    /// (`agentic::tools::shell::dispatch_caveats_for_command`), never here.
+    /// This test pins the negative: an exec grant, build tool or not, widens
+    /// `exec` alone.
     #[test]
-    fn widen_of_a_build_tool_exec_grant_carries_toolchain_read_roots() {
-        // SAFETY (test-only): isolates the toolchain-home resolution from the
-        // ambient environment so the assertion does not depend on the
-        // machine running the suite.
-        let saved = std::env::var_os("CARGO_HOME");
-        unsafe {
-            std::env::set_var("CARGO_HOME", "/fake-home/.cargo");
-        }
+    fn widen_of_an_exec_grant_never_touches_fs_read_even_for_a_build_tool() {
         let widened = widen_caveats(&base(), &[(DenialKind::Exec, "cargo".to_string())]);
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("CARGO_HOME", v),
-                None => std::env::remove_var("CARGO_HOME"),
-            }
-        }
         assert!(widened.permits_exec("cargo"));
-        assert!(
-            widened.permits_fs_read("/fake-home/.cargo"),
-            "an exec:cargo grant must also widen fs_read to cargo's toolchain home"
-        );
-        // A non-build-tool exec grant widens exec only, same as before.
-        let widened_npm = widen_caveats(&base(), &[(DenialKind::Exec, "npm".to_string())]);
-        assert!(
-            !widened_npm.permits_fs_read("/fake-home/.cargo"),
-            "an unrelated exec grant must not widen fs_read"
+        assert_eq!(
+            widened.fs_read,
+            base().fs_read,
+            "an exec grant — build tool or not — must never widen fs_read; \
+             that axis feeds every tool the model can call this session, \
+             not just the confined child this grant was asked for"
         );
     }
 
