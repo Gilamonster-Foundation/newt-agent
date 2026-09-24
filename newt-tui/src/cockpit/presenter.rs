@@ -1147,14 +1147,9 @@ impl Presenter {
                 // unwind — so the rows cannot be stranded by a panel that
                 // returns through a path nobody thought about.
                 let (release, released) = std::sync::mpsc::sync_channel(1);
-                let (top, rows) = reservation
-                    .as_ref()
-                    .map_or((0, self.screen.rows), |window| (window.start, window.rows));
                 let window = crate::session_worker::PanelWindow::new(
                     panel_output,
-                    top,
-                    rows,
-                    self.screen.cols,
+                    self.lent_area(reservation.as_ref()),
                     Some(release),
                 );
                 if reply.send(Some(window)).is_err() {
@@ -1169,7 +1164,17 @@ impl Presenter {
                 // Park. A `RecvError` means the window was dropped without a
                 // send — the same "the panel is done" signal, reached by a
                 // path that could not send. Either way: clean up.
-                let _ = released.recv();
+                // #2571: while parked, answer re-measure requests — the panel
+                // hears the resize (it owns the keyboard), this thread owns
+                // the layout. A `RecvError` is the drop: the panel is done.
+                let mut reservation = reservation;
+                while let Ok(crate::session_worker::PanelSignal::Remeasure(reply)) = released.recv()
+                {
+                    // A failed re-plan keeps the old region rather than
+                    // stranding the panel: the reply still goes out.
+                    let _ = self.remeasure_panel(mode, &mut reservation);
+                    let _ = reply.send(self.lent_area(reservation.as_ref()));
+                }
                 let modal_cleanup = self.finish_modal(reservation.as_ref());
                 self.chat_inactive = false;
                 // The panel wrote outside ratatui's diff, so the mounted block
@@ -1328,6 +1333,38 @@ impl Presenter {
                 Ok(())
             }
         }
+    }
+
+    /// The region lent to a panel: its reservation, or the whole screen for an
+    /// alternate-screen loan.
+    fn lent_area(&self, reservation: Option<&ModalReservation>) -> Rect {
+        let (top, rows) = reservation.map_or((0, self.screen.rows), |r| (r.start, r.rows));
+        Rect::new(0, top, self.screen.cols, rows)
+    }
+
+    /// #2571: the terminal resized under a live panel. The same re-layout
+    /// `finish_modal_rows` applies to a resize that lands after a dialog
+    /// closes — clear what a narrower panel may have rewrapped above its old
+    /// top, then the presenter's own resize — and the panel's rows reserved
+    /// again against the new screen.
+    fn remeasure_panel(
+        &mut self,
+        mode: PanelMode,
+        reservation: &mut Option<ModalReservation>,
+    ) -> io::Result<()> {
+        let (cols, rows) = self.screen.terminal_size()?;
+        if (cols, rows) == (self.screen.cols, self.screen.rows) {
+            return Ok(());
+        }
+        if reservation.is_some() {
+            self.screen.tty.write_all(&modal_cleanup_bytes(0)?)?;
+            self.screen.tty.flush()?;
+        }
+        self.on_event(Event::Resize(cols, rows))?;
+        if let PanelMode::Inline(requested) = mode {
+            *reservation = Some(self.screen.reserve_modal_rows(requested)?);
+        }
+        Ok(())
     }
 
     /// A blocking dialog may have consumed every resize event while this
@@ -1893,7 +1930,7 @@ pub(crate) use terminal_acceptance::cockpit_pager_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
-    cockpit_clarification_input_case, panel_resize_case,
+    cockpit_clarification_input_case, panel_live_resize_case, panel_resize_case,
 };
 
 #[cfg(test)]

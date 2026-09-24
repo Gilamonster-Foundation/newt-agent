@@ -141,6 +141,29 @@ pub(crate) fn make_terminal(height: u16) -> io::Result<InlineTerm> {
     crate::inline_viewport::inline_terminal(lease)
 }
 
+/// What the driver does with one terminal event.
+#[derive(Debug, PartialEq, Eq)]
+enum Input {
+    Key(Key),
+    /// The terminal resized: measure the container again and redraw (#2571).
+    Remeasure,
+    Ignore,
+}
+
+/// Pure, so the rule that a resize is never dropped is pinned without a tty.
+fn classify(event: Event) -> Input {
+    match event {
+        // Release and Repeat are not presses. Without this filter a terminal
+        // that reports both delivers every key twice.
+        Event::Key(key) if key.kind == KeyEventKind::Press => Input::Key(key_from_event(
+            key.code,
+            key.modifiers.contains(KeyModifiers::CONTROL),
+        )),
+        Event::Resize(..) => Input::Remeasure,
+        _ => Input::Ignore,
+    }
+}
+
 /// Run `screen` until it closes, and report whether the operator applied.
 ///
 /// The raw-mode guard is scoped so its restore lands where the original bare
@@ -174,18 +197,34 @@ pub(crate) fn drive(
                 if !event::poll(Duration::from_millis(250))? {
                     continue;
                 }
-                let Event::Key(key) = event::read()? else {
-                    continue;
-                };
-                // Release and Repeat are not presses. Without this filter a
-                // terminal that reports both delivers every key twice.
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if let Flow::Close(apply) = screen.key(key_from_event(key.code, ctrl)) {
-                    applied = apply;
-                    break;
+                match classify(event::read()?) {
+                    Input::Key(key) => {
+                        if let Flow::Close(apply) = screen.key(key) {
+                            applied = apply;
+                            break;
+                        }
+                    }
+                    // #2571: a panel never owns its size. The container is
+                    // measured again — by the presenter that lent the rows, or
+                    // by a fresh bottom-rows lease — and the region is cleared,
+                    // so a narrower terminal leaves no stale cells behind.
+                    Input::Remeasure => {
+                        terminal = match window {
+                            Some(window) => {
+                                window.remeasure();
+                                window.terminal()?
+                            }
+                            None => {
+                                // Release the old lease first: under
+                                // `OnCollision::Shift` a new one taken while
+                                // it is held would be minted ABOVE it.
+                                drop(terminal);
+                                make_terminal(height)?
+                            }
+                        };
+                        terminal.clear()?;
+                    }
+                    Input::Ignore => {}
                 }
             }
             terminal.clear()?;
@@ -198,6 +237,30 @@ pub(crate) fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2571: the regression this pins is a panel frozen at its opening size
+    /// because `drive` read keys only and dropped `Event::Resize`.
+    #[test]
+    fn a_resize_is_never_dropped_and_only_presses_are_keys() {
+        use crossterm::event::{KeyEvent, KeyEventState};
+        assert_eq!(classify(Event::Resize(80, 24)), Input::Remeasure);
+        assert_eq!(classify(Event::Resize(1, 1)), Input::Remeasure);
+        let key = |kind| {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                kind,
+                state: KeyEventState::NONE,
+            })
+        };
+        assert_eq!(
+            classify(key(KeyEventKind::Press)),
+            Input::Key(Key::Char('j'))
+        );
+        assert_eq!(classify(key(KeyEventKind::Release)), Input::Ignore);
+        assert_eq!(classify(key(KeyEventKind::Repeat)), Input::Ignore);
+        assert_eq!(classify(Event::FocusGained), Input::Ignore);
+    }
 
     /// **The structural half of #1889.** The PTY test proves `PanelRawGuard`
     /// restores; this proves the panels go through it.

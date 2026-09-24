@@ -429,6 +429,83 @@ pub(crate) fn panel_resize_case() {
     assert!(cockpit.screen.viewport_rect().bottom() <= 12);
 }
 
+/// #2571: a panel follows the terminal while it is OPEN, not only on release.
+/// Shrink then grow a real tty under a live inline panel; each re-measure must
+/// hand back the panel's rows anchored at the new bottom, at the new width.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds `PanelWindow`'s mocked
+/// remeasure tests and `panel::classify`, which cannot observe a real
+/// terminal's size.
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn an_open_panel_follows_the_terminal_through_shrink_and_grow() {
+    crate::interaction_view_pty_test::drive_cockpit_live_resize();
+}
+
+pub(crate) fn panel_live_resize_case() {
+    let _tty = TestTty::install();
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit
+        .editor
+        .on_event(
+            Event::Paste("draft survives a live resize".into()),
+            &mut cockpit.screen,
+        )
+        .unwrap();
+    let draft = cockpit.editor.draft();
+    let (reply, received) =
+        std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+    let panel = std::thread::spawn(move || {
+        let window = received.recv().unwrap().expect("reserved panel");
+        let resize = |rows: u16, cols: u16| {
+            let size = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: TestTty installed this test's owned slave on fd 0; no
+            // live developer terminal is touched.
+            assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
+        };
+        resize(12, 46);
+        window.remeasure();
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 4, 46, 8),
+            "shrink"
+        );
+        resize(30, 100);
+        window.remeasure();
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 22, 100, 8),
+            "grow"
+        );
+        window.remeasure();
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 22, 100, 8),
+            "no change"
+        );
+        drop(window);
+    });
+    cockpit
+        .handle_request(SurfaceRequest::Panel {
+            mode: PanelMode::Inline(8),
+            reply,
+        })
+        .unwrap();
+    panel.join().unwrap();
+    assert_eq!((cockpit.screen.cols, cockpit.screen.rows), (100, 30));
+    assert_eq!(cockpit.editor.draft(), draft);
+    assert!(!cockpit.chat_inactive);
+    assert!(cockpit.screen.viewport_rect().bottom() <= 30);
+}
+
 /// The three properties #1744 turns on, proven on one real terminal with
 /// one cockpit: Ctrl-C's two tiers, a modal occluding the composer, and the
 /// terminal handed back exactly as it was found.

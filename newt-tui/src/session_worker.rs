@@ -185,22 +185,31 @@ pub(crate) enum SurfaceRequest {
 pub(crate) struct PanelWindow {
     /// A clone of the real terminal, NOT fd 1.
     out: std::fs::File,
-    /// First row of the lent region (0-based), and how many rows it spans.
-    /// `rows` is what the presenter could actually spare, which on a short
-    /// terminal is fewer than the panel asked for — [`Self::terminal`] fixes
-    /// the viewport to what was granted, so a panel draws what fits rather
-    /// than painting outside the region it was lent.
-    top: u16,
-    rows: u16,
-    cols: u16,
-    /// Dropped to wake the parked presenter. `None` only in tests that build a
-    /// window with nobody waiting on it.
-    _release: Option<SyncSender<()>>,
+    /// The lent region. `rows` is what the presenter could actually spare,
+    /// which on a short terminal is fewer than the panel asked for —
+    /// [`Self::terminal`] fixes the viewport to what was granted, so a panel
+    /// draws what fits rather than painting outside the region it was lent.
+    /// A `Cell` because the region follows the terminal (#2571): a resize
+    /// re-measures it through [`Self::remeasure`] while panels hold `&self`.
+    area: std::cell::Cell<ratatui::layout::Rect>,
+    /// The parked presenter's channel. Dropping it is the release; a
+    /// [`PanelSignal::Remeasure`] asks for the region again. `None` only in
+    /// tests that build a window with nobody waiting on it.
+    signals: Option<SyncSender<PanelSignal>>,
+}
+
+/// What a live panel can ask of the presenter parked on its window.
+#[cfg(feature = "rich-tui")]
+#[derive(Debug)]
+pub(crate) enum PanelSignal {
+    /// The terminal resized: re-plan the reservation against the new screen,
+    /// clear what the old one left, and reply with the new region.
+    Remeasure(SyncSender<ratatui::layout::Rect>),
 }
 
 #[cfg(feature = "rich-tui")]
 impl PanelWindow {
-    /// Build a window over `out`, releasing `release` when dropped.
+    /// Build a window over `out`, releasing `signals` when dropped.
     ///
     /// **`#[cfg(unix)]` to match its only caller**, exactly as
     /// `inline_viewport::cursor_position_or_anchor` is and for the same
@@ -218,18 +227,34 @@ impl PanelWindow {
     #[cfg(unix)]
     pub(crate) fn new(
         out: std::fs::File,
-        top: u16,
-        rows: u16,
-        cols: u16,
-        release: Option<SyncSender<()>>,
+        area: ratatui::layout::Rect,
+        signals: Option<SyncSender<PanelSignal>>,
     ) -> Self {
         Self {
             out,
-            top,
-            rows,
-            cols,
-            _release: release,
+            area: std::cell::Cell::new(area),
+            signals,
         }
+    }
+
+    /// Ask the presenter for the region again after a terminal resize. The
+    /// presenter owns the layout, so it measures; the window only records the
+    /// answer. With nobody parked (tests) or no answer, the region is kept.
+    pub(crate) fn remeasure(&self) {
+        let Some(signals) = &self.signals else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if signals.send(PanelSignal::Remeasure(tx)).is_ok() {
+            if let Ok(area) = rx.recv() {
+                self.area.set(area);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn area(&self) -> ratatui::layout::Rect {
+        self.area.get()
     }
 
     /// A ratatui terminal fixed to exactly the lent rows.
@@ -238,10 +263,7 @@ impl PanelWindow {
     ///
     /// The tty could not be cloned, or the terminal could not be built.
     pub(crate) fn terminal(&self) -> std::io::Result<crate::inline_viewport::InlineTerm> {
-        crate::inline_viewport::cockpit_panel_terminal(
-            self.out.try_clone()?,
-            ratatui::layout::Rect::new(0, self.top, self.cols, self.rows),
-        )
+        crate::inline_viewport::cockpit_panel_terminal(self.out.try_clone()?, self.area.get())
     }
 
     /// An operator-invoked alternate-screen pager keeps this window alive but
@@ -1587,3 +1609,52 @@ mod tests {
 }
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:29 EDT | Date: 2026-09-15
+
+/// #2571: the window's half of the resize contract, against a fake parked
+/// presenter. The presenter's half runs on a real tty in
+/// `presenter_terminal_acceptance::panel_live_resize_case`.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod panel_window_remeasure_tests {
+    use super::*;
+    use ratatui::layout::Rect;
+    use std::os::fd::FromRawFd;
+
+    /// An in-memory pipe end stands in for the tty clone; nothing is drawn.
+    fn pipe_file() -> std::fs::File {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { libc::close(fds[0]) };
+        unsafe { std::fs::File::from_raw_fd(fds[1]) }
+    }
+
+    #[test]
+    fn a_remeasure_adopts_the_presenters_new_region() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let window = PanelWindow::new(pipe_file(), Rect::new(0, 13, 100, 18), Some(tx));
+        let presenter = std::thread::spawn(move || {
+            let PanelSignal::Remeasure(reply) = rx.recv().unwrap();
+            reply.send(Rect::new(0, 4, 46, 8)).unwrap();
+            // The drop is still the release once the panel is done.
+            assert!(rx.recv().is_err(), "the window's drop must release");
+        });
+        window.remeasure();
+        assert_eq!(window.area(), Rect::new(0, 4, 46, 8));
+        drop(window);
+        presenter.join().unwrap();
+    }
+
+    #[test]
+    fn with_nobody_answering_the_region_is_kept_not_stranded() {
+        let area = Rect::new(0, 13, 100, 18);
+        let unparked = PanelWindow::new(pipe_file(), area, None);
+        unparked.remeasure();
+        assert_eq!(unparked.area(), area);
+        // A presenter that hangs up without replying.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let window = PanelWindow::new(pipe_file(), area, Some(tx));
+        let presenter = std::thread::spawn(move || drop(rx.recv().unwrap()));
+        window.remeasure();
+        assert_eq!(window.area(), area);
+        presenter.join().unwrap();
+    }
+}

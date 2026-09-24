@@ -151,6 +151,9 @@ fn interaction_view_child() {
         "cockpit_resize" => {
             crate::cockpit::presenter::panel_resize_case();
         }
+        "cockpit_live_resize" => {
+            crate::cockpit::presenter::panel_live_resize_case();
+        }
         "cockpit_acceptance" => {
             crate::cockpit::presenter::cockpit_acceptance_case();
         }
@@ -346,6 +349,11 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
 /// event source out of sibling keyboard tests, without dropping assertions.
 pub(crate) fn drive_cockpit_resize() {
     drive_cockpit_case("cockpit_resize");
+}
+
+/// #2571: the same disposable child, resizing while the panel is open.
+pub(crate) fn drive_cockpit_live_resize() {
+    drive_cockpit_case("cockpit_live_resize");
 }
 
 pub(crate) fn drive_startup_migration() {
