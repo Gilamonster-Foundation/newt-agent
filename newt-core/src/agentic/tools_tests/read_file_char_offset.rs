@@ -252,6 +252,70 @@ async fn read_file_on_a_spill_address_pages_a_long_line_without_re_spilling() {
     assert!(pages.len() > 1, "the long line must actually be paginated");
 }
 
+/// Round 2 review off-by-one: when the char cap cuts EXACTLY on the newline
+/// ending the `start` line, `whole_through` must be `start` (the whole line
+/// WAS shown), not `start - 1` — otherwise the footer sends the model back to
+/// re-read the same line from char 0, and a line whose length is an exact
+/// multiple of the effective cap loops forever. Bounded to 500 follow-the-
+/// footer iterations so a regression fails the test instead of hanging.
+async fn exact_multiple_of_cap_line_terminates(k: usize) {
+    let ws = tempfile::TempDir::new().unwrap();
+    // The exact char cap `paginate_unspillable` resolves to on the offload
+    // path (mirrors its own computation).
+    let cap_tokens =
+        output_budget::cap_estimator().tokens_for_chars(content_spill::TOOL_RESULT_SPILL_CAP - 512);
+    let max_chars = output_budget::cap_estimator().chars_for_tokens(cap_tokens);
+    let long_line = "q".repeat(k * max_chars);
+    let original = format!("{long_line}\nshort tail\n");
+    std::fs::write(ws.path().join("f.txt"), &original).unwrap();
+    let caveats = caveats_rw(ws.path());
+    let spill = SessionSpillStore::new([13u8; 16]);
+
+    let mut reconstructed = String::new();
+    let mut offset = None;
+    let mut char_offset = None;
+    let mut iterations = 0;
+    loop {
+        iterations += 1;
+        assert!(
+            iterations <= 500,
+            "k={k}: did not terminate within 500 follow-the-footer iterations \
+             (infinite resume loop — the off-by-one regression)"
+        );
+        let args = page_args("f.txt", offset, char_offset);
+        let page = read_file_offloaded(ws.path(), &caveats, args, None, &spill).await;
+        let (body, next_offset, next_char_offset) = split_page(&page);
+        if char_offset.is_none() && !reconstructed.is_empty() {
+            reconstructed.push('\n');
+        }
+        reconstructed.push_str(body);
+        match next_offset {
+            Some(n) => {
+                offset = Some(n);
+                char_offset = next_char_offset;
+            }
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        reconstructed,
+        original.trim_end_matches('\n'),
+        "k={k}: reassembled bytes must equal the original file exactly, with no \
+         duplicated line from the resume loop"
+    );
+}
+
+#[tokio::test]
+async fn exact_multiple_of_cap_line_terminates_k1() {
+    exact_multiple_of_cap_line_terminates(1).await;
+}
+
+#[tokio::test]
+async fn exact_multiple_of_cap_line_terminates_k2() {
+    exact_multiple_of_cap_line_terminates(2).await;
+}
+
 #[test]
 fn char_offset_is_not_in_the_read_file_tool_schema() {
     // char_offset is learned ONLY from a page's own footer text — it must

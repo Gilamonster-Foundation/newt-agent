@@ -237,6 +237,17 @@ pub(super) fn paginate_read_from(
     let mut lines = contents.lines().skip(start0);
     let first_line_full = lines.next().expect("start0 < total, checked above");
     let first_line_chars = first_line_full.chars().count();
+    // An out-of-range char_offset on the LAST line clamps to "" with no
+    // footer (nothing after it to name), which is ambiguous to the model:
+    // empty content, or a failure? Say so explicitly, mirroring the
+    // "offset past end of file" message above.
+    if char_offset > 0 && char_offset >= first_line_chars && start0 + 1 == total {
+        return format!(
+            "(char_offset {char_offset} is past the end of line {start}, which has \
+             {first_line_chars} chars; call read_file with offset={} to continue)",
+            start + 1
+        );
+    }
     // char_offset resumes mid-way through the `start` line only; every other
     // line in the window is taken in full.
     let first_line_body: String = if char_offset > 0 {
@@ -279,10 +290,16 @@ pub(super) fn paginate_read_from(
                 let next_char_offset = char_offset + emitted_chars;
                 body.truncate(cut);
                 if next_char_offset >= first_line_chars {
-                    // Cut landed exactly at the line's end (possible when
-                    // `rest` is empty and the line is exactly `max_chars`
-                    // long): no partial remainder, resume at the next line.
-                    whole_through = Some(start0);
+                    // Cut landed exactly at the line's end (needs `rest`
+                    // NON-empty — there is more file after this line for the
+                    // footer to point at; when `rest` is empty the file is
+                    // exhausted and there is nothing to resume). The whole
+                    // `start` line WAS shown, so the last whole line shown is
+                    // `start` itself (`start0 + 1`), not `start0` — using
+                    // `start0` pointed the footer one line too early, back at
+                    // this same line, looping forever when its length is an
+                    // exact multiple of the cap.
+                    whole_through = Some(start0 + 1);
                 } else {
                     mid_line = Some((start, next_char_offset));
                 }
