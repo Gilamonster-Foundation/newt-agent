@@ -4983,6 +4983,15 @@ mod build_wall_tests;
 #[path = "tools_tests/disable_ocap_tests.rs"]
 pub(crate) mod disable_ocap_tests;
 
+// ---------------------------------------------------------------------------
+// #2558 HANDOFF item 2 — the same-file redirect guard (`cmd f > f` must not
+// truncate f), through real dispatch in both the confined and host lanes.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tools_tests/redirect_guard.rs"]
+mod redirect_guard_tests;
+
 #[cfg(test)]
 #[path = "tools_tests/smart_frame_isolation.rs"]
 mod smart_frame_isolation_tests;
