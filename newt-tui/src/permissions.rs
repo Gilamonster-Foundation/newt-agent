@@ -132,7 +132,15 @@ fn permission_policy(
         key: "a",
         label: "allow once",
     }];
-    if tier == danger::DangerTier::Low {
+    // dec1-build-grant (F30): `Build` stays High tier — the blast-radius
+    // banner below still fires — but IS session-allowable. It is not an
+    // open-ended interpreter/broad-root grant; it is bounded by the
+    // calibrated `build_tool_caveats` fence (workspace + toolchain reads,
+    // workspace-only writes, network denied), the same confinement an
+    // allow-once already grants. Refusing the session scope bought no extra
+    // safety, only a prompt on every build/test/check in a session (up to 7
+    // times observed in one run — NOTES-2483 F30).
+    if tier == danger::DangerTier::Low || req.kind == DenialKind::Build {
         actions.push(OfferedAction {
             action: PromptChoice::AllowSession,
             key: "s",
@@ -178,6 +186,12 @@ fn permission_policy(
     // where the enum is DEFINED —
     // `newt_interaction::binding::model_fidelity` (#1837).
     let note = match (tier, audience) {
+        (danger::DangerTier::High, Audience::Terminal) if req.kind == DenialKind::Build => Some(
+            format!("confined build authority: session allow covers build/test/check for this workspace this session\n{MODAL_CONTROL_HINT}"),
+        ),
+        (danger::DangerTier::High, Audience::Web) if req.kind == DenialKind::Build => Some(
+            format!("Confined build authority: session authorization is available.\n{MODAL_CONTROL_HINT}"),
+        ),
         (danger::DangerTier::High, Audience::Terminal) => Some(format!(
             "high-danger: session allow refused; key allow / step-up is the future path, P3\n{MODAL_CONTROL_HINT}"
         )),
@@ -737,6 +751,10 @@ fn is_slash_command_at_prompt(answer: &str) -> bool {
 #[path = "permissions_tests/slash_prompt_tests.rs"]
 mod slash_prompt_tests;
 
+#[cfg(test)]
+#[path = "permissions_tests/build_grant_tests.rs"]
+mod build_grant_tests;
+
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
@@ -810,11 +828,27 @@ fn ceiling_permits(
 }
 
 /// Match the exact approved target, without treating a basename as a path grant.
+///
+/// One exception (dec1-build-grant, F30): a session `Build` grant — the
+/// fully-fenced confined-build authority, `build_tool_caveats` — also covers a
+/// later `Exec` request for a build-tool binary (`cargo`/`just`/`make`, see
+/// [`newt_core::confined_exec::is_build_tool_exec`]). This is one-directional
+/// on purpose: `lifecycle_build_request`'s doc comment is explicit that no
+/// `Exec` grant (including `exec:cargo`) may silently acquire `Build`
+/// authority. The reverse is safe — `Build` is the STRONGER, calibrated fence,
+/// so a prior `Build` session grant already covers running that same tool
+/// through the `run_command` / routed-`build_exec` lane. One session grant,
+/// not three.
 pub(crate) fn session_grant_covers(
     grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
 ) -> bool {
     grants.contains(&(req.kind, req.target.clone()))
+        || (req.kind == newt_core::DenialKind::Exec
+            && newt_core::confined_exec::is_build_tool_exec(&req.target)
+            && grants
+                .iter()
+                .any(|(kind, _)| *kind == newt_core::DenialKind::Build))
 }
 
 /// Consume only the exact pending target; other requests leave it available.
@@ -1812,6 +1846,19 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
             if session_grant_covers(&self.state.session_grants, req) {
+                // An exact match needs no further widening — it is already
+                // reachable through `recalled_grants` in `mint`. The
+                // build-tool fallback in `session_grant_covers` is NOT itself
+                // a stored grant, so fold it into this call's `once_grants`
+                // or the returned caveats would never widen `exec`/`fs_read`
+                // for it (dec1-build-grant, F30/F35).
+                if !self
+                    .state
+                    .session_grants
+                    .contains(&(req.kind, req.target.clone()))
+                {
+                    once_grants.push((req.kind, req.target.clone()));
+                }
                 continue;
             }
             if self
@@ -1918,8 +1965,13 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     }
                 }
                 PromptChoice::AllowSession => {
-                    // The form omits this action for high danger; enforce it too.
-                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                    // The form omits this action for high danger; enforce it
+                    // too — except `Build` (dec1-build-grant, F30), which the
+                    // form DOES offer for session scope: it is bounded by the
+                    // calibrated `build_tool_caveats` fence, not open-ended.
+                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High
+                        && req.kind != newt_core::DenialKind::Build
+                    {
                         self.record(req, "deny", "session-allow-refused-high-danger");
                         self.notice(
                             window.as_ref(),

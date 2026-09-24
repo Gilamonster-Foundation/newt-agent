@@ -1101,6 +1101,18 @@ pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[Str
 /// reopen the read-then-disclose path.
 fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     let mut roots = vec![workspace.to_string_lossy().into_owned()];
+    roots.extend(toolchain_read_roots());
+    roots
+}
+
+/// The per-user toolchain / package-cache roots alone (no workspace), derived
+/// from the operator's environment. Shared by [`build_tool_read_roots`] and by
+/// [`crate::agentic::permissions::widen_caveats`]'s build-tool exec arm — an
+/// `exec` grant for `cargo`/`just`/`make` carries the same calibrated reads a
+/// lifecycle build gets, one derivation, not two (dec1-build-grant, F35).
+#[must_use]
+pub fn toolchain_read_roots() -> Vec<String> {
+    let mut roots = Vec::new();
     // (env var that overrides the default, default subdir under HOME)
     for (var, default) in [
         ("CARGO_HOME", ".cargo"),
@@ -1130,9 +1142,41 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     roots
 }
 
+/// Build-tool exec names whose grant carries the toolchain read roots and, in
+/// the TUI danger table, is covered by an existing session build grant —
+/// pure DATA (three-Cs), not a `match` arm, so a new build tool is a data
+/// edit. Compared against the target's file-name component, so a pathful
+/// `/usr/bin/cargo` matches too.
+pub const BUILD_TOOL_EXEC: &[&str] = &["cargo", "just", "make"];
+
+/// Is `target` a build-tool exec name (see [`BUILD_TOOL_EXEC`])? Compares the
+/// file-name component, matching the danger table's `is_interpreter` convention.
+#[must_use]
+pub fn is_build_tool_exec(target: &str) -> bool {
+    let trimmed = target.trim();
+    let name = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(trimmed);
+    BUILD_TOOL_EXEC.contains(&name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dec1-build-grant: the build-tool predicate matches a bare name and a
+    /// pathful target on its file-name component, and rejects an unrelated
+    /// command — the same convention `DangerTable::is_interpreter` uses.
+    #[test]
+    fn is_build_tool_exec_matches_known_names_only() {
+        assert!(is_build_tool_exec("cargo"));
+        assert!(is_build_tool_exec("just"));
+        assert!(is_build_tool_exec("make"));
+        assert!(is_build_tool_exec("/usr/bin/cargo"));
+        assert!(!is_build_tool_exec("rm"));
+        assert!(!is_build_tool_exec("bash"));
+    }
 
     /// RAII guard that restores an env var to its value at construction on
     /// drop, so a failed assertion mid-test does not leak the fake `HOME` (or

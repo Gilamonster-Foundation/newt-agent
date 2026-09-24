@@ -355,6 +355,17 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
         if let Scope::Only(set) = scope {
             set.insert(target.clone());
         }
+        // dec1-build-grant (F35): an exec grant for a build tool carries that
+        // toolchain's read roots too — without this, cargo/just/make could run
+        // but couldn't read `~/.cargo` or `~/.rustup`, so the build failed with
+        // no further prompt to recover from (no FsRead axis names those paths
+        // for the model to ask about). One derivation, shared with the
+        // lifecycle build fence: `confined_exec::toolchain_read_roots`.
+        if *kind == DenialKind::Exec && crate::confined_exec::is_build_tool_exec(target) {
+            if let Scope::Only(reads) = &mut out.fs_read {
+                reads.extend(crate::confined_exec::toolchain_read_roots());
+            }
+        }
     }
     out
 }
@@ -484,6 +495,41 @@ mod tests {
         assert!(!widened.permits_net("evil.example.com"));
         // Non-scope axes are never altered by a grant.
         assert_eq!(widened.max_calls, CountBound::AtMost(7));
+    }
+
+    /// dec1-build-grant (F35): granting `exec:cargo` alone left the child
+    /// unable to read `~/.cargo` / `~/.rustup`, and there was no further
+    /// prompt to recover from — a build tool's exec grant must carry its
+    /// toolchain's read roots in the SAME widen, not a second round trip.
+    /// Would fail before the fix: `widened.permits_fs_read` only ever saw the
+    /// literal `"cargo"` target inserted into `exec`, never a read root.
+    #[test]
+    fn widen_of_a_build_tool_exec_grant_carries_toolchain_read_roots() {
+        // SAFETY (test-only): isolates the toolchain-home resolution from the
+        // ambient environment so the assertion does not depend on the
+        // machine running the suite.
+        let saved = std::env::var_os("CARGO_HOME");
+        unsafe {
+            std::env::set_var("CARGO_HOME", "/fake-home/.cargo");
+        }
+        let widened = widen_caveats(&base(), &[(DenialKind::Exec, "cargo".to_string())]);
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("CARGO_HOME", v),
+                None => std::env::remove_var("CARGO_HOME"),
+            }
+        }
+        assert!(widened.permits_exec("cargo"));
+        assert!(
+            widened.permits_fs_read("/fake-home/.cargo"),
+            "an exec:cargo grant must also widen fs_read to cargo's toolchain home"
+        );
+        // A non-build-tool exec grant widens exec only, same as before.
+        let widened_npm = widen_caveats(&base(), &[(DenialKind::Exec, "npm".to_string())]);
+        assert!(
+            !widened_npm.permits_fs_read("/fake-home/.cargo"),
+            "an unrelated exec grant must not widen fs_read"
+        );
     }
 
     #[test]
