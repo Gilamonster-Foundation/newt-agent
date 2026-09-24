@@ -298,7 +298,7 @@ pub(super) fn read_for_edit(
             if super::is_fs_containment_denied(&error) {
                 return Err(super::denied_fs_result("fs_write", label));
             }
-            Err(format!("error reading {label}: {error}"))
+            Err(format!("error: reading {label}: {error}"))
         }
     }
 }

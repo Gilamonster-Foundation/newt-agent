@@ -243,6 +243,312 @@ fn parse_cd_path(s: &str) -> (String, &str) {
     }
 }
 
+/// #2558 (HANDOFF item 2): `cmd f > f` — the shell truncates `f` before the
+/// command reads it, destroying the input. Run 6 of the refactor test lost a
+/// file this way (`awk … f > f`). Per #2558 ("make the wrong mutation
+/// impossible, don't explain it afterwards"), refuse BEFORE any exec: nothing
+/// runs, nothing changes. Called once, at the top of [`exec_confined_command`]
+/// — the ONE function both the confined lane and the `--yolo` host-bypass
+/// lane route through (the branch between them happens INSIDE it), so a
+/// single call site covers both **for model-typed shell text**: `run_command`,
+/// the routed-build fallback (whose redirect would be `SHELL_META` and never
+/// route in the first place), and the justfile-missing fallback. It does
+/// NOT cover `run_confined_build_lane`'s `sh -c <joined>` lane
+/// (`build_check_argv`, used by `lifecycle action=build` / the #2541
+/// escalation): that runs RESOLVED phase commands from `[lifecycle]`/pack
+/// config, not the model's own typed text, and is reachable only if the
+/// model edits that config — accepted, not "every shell lane".
+///
+/// "Reads" = a plain operand of any command in the pipeline, or `< f` —
+/// narrowed by two rules (#2560 round 2) so a harmless first instinct is not
+/// refused: a [`NON_READING_COMMANDS`] stage (`echo`, `printf`, …) adds no
+/// reads at all, and a [`SUBCOMMAND_DISPATCHERS`] stage's FIRST operand (the
+/// verb — `build`, `diff`, `test`) is skipped, so `cargo build > build` and
+/// `git diff > diff` run. "Writes" = the target of `>`, `>|`, or `>>`
+/// (append is unsafe too, for a command that streams) — PLUS every non-flag
+/// operand of a `tee` stage, which opens each with `O_TRUNC` at startup
+/// regardless of any redirect (`sort f | tee f`). Paths are resolved against
+/// `cwd` via [`resolve_exec_cwd`] — the SAME #2551 resolution
+/// `run_command`/`lifecycle` already use, not a second one — then
+/// lexically normalized (`crate::caveats::lexically_normalize`) so `cat ./f
+/// > f` compares equal to `cat f > f`.
+///
+/// Deliberately NOT a shell parser: a single pipeline of plain tokens, with
+/// minimal single/double-quote handling so `sed 's/a/b/' f > f` still reads
+/// as `sed`, `f`, `>`, `f`. A token touched by an expansion/glob character
+/// (`$` `` ` `` `*` `?` `[` `~`) or an unterminated quote is OPAQUE: it is
+/// never treated as a read OR a write target, so an ambiguous form is left
+/// exactly as today (never refused, never silently trusted as "different
+/// file") rather than risk a false refusal. `&&` / `;` / `||` start a fresh
+/// pipeline scope (each side of `f > f.tmp && mv f.tmp f` is checked on its
+/// own, so that rewrite is never refused); `|` keeps the same scope (a later
+/// stage's write can still collide with an earlier stage's read).
+///
+/// **Stated limits (#2560 round 2 review) — miss, but no worse than today:**
+/// - **Subshells and brace groups**: `(cat f) > f` / `{ cat f; } > f` — `(cat`
+///   becomes an opaque-free but wrong "command word", and the brace form
+///   splits its own scope at `;`. Out of scope for a single-pipeline parser.
+/// - **`dd if=f of=f`**: no redirect operator at all; `of=` truncates unless
+///   `conv=notrunc`. Not special-cased — rare for this model.
+/// - **Symlinks**: `cat link > f` where `link` points at `f` is lexical-only
+///   and invisible here by design (the brief asked for no canonicalization;
+///   canonicalizing would also require the path to already exist).
+/// - **No general flag-skipping**: only `tee`'s operands and a subcommand
+///   dispatcher's first operand are narrowed. A plain `-name`-style flag
+///   elsewhere is still a "read" candidate (harmless unless it coincidentally
+///   equals the write target, which the review judged not worth chasing).
+pub(super) fn same_file_redirect_refusal(cmd: &str, cwd: &str) -> Option<String> {
+    let tokens = tokenize(cmd);
+    let mut start = 0usize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if matches!(tok, RedirectToken::Sep) {
+            if let Some(msg) = check_pipeline_redirects(&tokens[start..idx], cmd, cwd) {
+                return Some(msg);
+            }
+            start = idx + 1;
+        }
+    }
+    check_pipeline_redirects(&tokens[start..], cmd, cwd)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectOp {
+    In,
+    Out,
+    OutAppend,
+    OutClobber,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectToken {
+    /// Dequoted text, and whether it touched an expansion/glob character or
+    /// an unterminated quote (opaque — never a read or write candidate).
+    Word(String, bool),
+    Redirect(RedirectOp),
+    /// `|` — a new stage of the SAME pipeline scope.
+    Pipe,
+    /// `&&` / `;` / `||` — starts a fresh pipeline scope.
+    Sep,
+}
+
+/// Characters that mean "this word may not literally be the path it looks
+/// like" — a glob, a variable, a command substitution, or a bare `~`. Also
+/// applied to a word's DEQUOTED content, so a single-quoted `'*.rs'` (still
+/// meant as a real glob) stays opaque too.
+const AMBIGUOUS_CHARS: [char; 6] = ['$', '`', '*', '?', '[', '~'];
+
+fn tokenize(cmd: &str) -> Vec<RedirectToken> {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '&' && chars.get(i + 1) == Some(&'&') {
+            out.push(RedirectToken::Sep);
+            i += 2;
+            continue;
+        }
+        if c == '|' && chars.get(i + 1) == Some(&'|') {
+            out.push(RedirectToken::Sep);
+            i += 2;
+            continue;
+        }
+        if c == ';' {
+            out.push(RedirectToken::Sep);
+            i += 1;
+            continue;
+        }
+        if c == '|' {
+            out.push(RedirectToken::Pipe);
+            i += 1;
+            continue;
+        }
+        if c == '>' && chars.get(i + 1) == Some(&'>') {
+            out.push(RedirectToken::Redirect(RedirectOp::OutAppend));
+            i += 2;
+            continue;
+        }
+        if c == '>' && chars.get(i + 1) == Some(&'|') {
+            out.push(RedirectToken::Redirect(RedirectOp::OutClobber));
+            i += 2;
+            continue;
+        }
+        if c == '>' {
+            out.push(RedirectToken::Redirect(RedirectOp::Out));
+            i += 1;
+            continue;
+        }
+        if c == '<' {
+            out.push(RedirectToken::Redirect(RedirectOp::In));
+            i += 1;
+            continue;
+        }
+        let (word, opaque, consumed) = read_word(&chars[i..]);
+        out.push(RedirectToken::Word(word, opaque));
+        i += consumed.max(1);
+    }
+    out
+}
+
+/// Read one word starting at `chars[0]` (guaranteed to be a non-whitespace,
+/// non-operator char by [`tokenize`]'s dispatch). Stops at whitespace or an
+/// operator-starting char; single/double-quoted spans are dequoted inline
+/// (their content still checked for [`AMBIGUOUS_CHARS`]). An unterminated
+/// quote consumes the rest of the string and marks the word opaque.
+fn read_word(chars: &[char]) -> (String, bool, usize) {
+    let mut text = String::new();
+    let mut opaque = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() || matches!(c, '>' | '<' | '|' | '&' | ';') {
+            break;
+        }
+        match c {
+            '\'' | '"' => {
+                let quote = c;
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < chars.len() {
+                    if chars[j] == quote {
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !closed {
+                    opaque = true;
+                    text.extend(&chars[i..]);
+                    i = chars.len();
+                    break;
+                }
+                text.extend(&chars[i + 1..j]);
+                i = j + 1;
+            }
+            _ if AMBIGUOUS_CHARS.contains(&c) => {
+                opaque = true;
+                text.push(c);
+                i += 1;
+            }
+            _ => {
+                text.push(c);
+                i += 1;
+            }
+        }
+    }
+    (text, opaque, i)
+}
+
+/// One pipeline scope (already split on `&&`/`;`/`||`): collect every read
+/// (a non-command-name plain operand, or an `< f` target) and every write
+/// (`>`/`>|`/`>>` target), resolve each against `cwd`, and refuse if any
+/// write path matches any read path.
+/// #2560 round 2 "smallest narrowing": commands that never read a file
+/// argument at all — refusing `echo f > f` costs the model's harmless first
+/// instinct (#2558 test 1) for zero safety, since `echo` cannot truncate
+/// anything it "reads". A stage whose command word is one of these adds NONE
+/// of its operands to `reads`.
+const NON_READING_COMMANDS: [&str; 5] = ["echo", "printf", "true", "false", ":"];
+
+/// Subcommand DISPATCHERS: their first operand is a verb (`build`, `diff`,
+/// `test`), never a path, so `cargo build > build` / `git diff > diff` must
+/// not refuse on a coincidental name match. Only the FIRST operand is
+/// skipped — a later plain operand (`git diff HEAD~1 file.rs > file.rs`)
+/// still counts normally.
+const SUBCOMMAND_DISPATCHERS: [&str; 6] = ["cargo", "git", "just", "make", "npm", "go"];
+
+fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> Option<String> {
+    let mut reads: Vec<String> = Vec::new();
+    let mut writes: Vec<String> = Vec::new();
+    let mut at_stage_start = true;
+    // The current stage's command word, and how many operands of THIS stage
+    // have been seen so far — both reset on `Pipe`, never carried across
+    // stages, so the narrowing rules below are per-command, not per-pipeline.
+    let mut stage_command: Option<&str> = None;
+    let mut operand_index = 0usize;
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            RedirectToken::Pipe => {
+                at_stage_start = true;
+                stage_command = None;
+                operand_index = 0;
+                i += 1;
+            }
+            RedirectToken::Sep => unreachable!("pipelines are pre-split on Sep"),
+            RedirectToken::Redirect(op) => {
+                at_stage_start = false;
+                if let Some(RedirectToken::Word(text, false)) = tokens.get(i + 1) {
+                    match op {
+                        RedirectOp::In => reads.push(text.clone()),
+                        RedirectOp::Out | RedirectOp::OutAppend | RedirectOp::OutClobber => {
+                            writes.push(text.clone());
+                        }
+                    }
+                    i += 2;
+                } else {
+                    // Missing or opaque target: never attributed either way.
+                    i += 1;
+                }
+            }
+            RedirectToken::Word(text, opaque) => {
+                if at_stage_start {
+                    stage_command = Some(text.as_str());
+                    at_stage_start = false;
+                } else if stage_command == Some("tee") {
+                    // #2560 round 2: `tee` opens EVERY non-flag operand with
+                    // O_TRUNC at startup — `sort f | tee f` is exactly as
+                    // destructive as `sort f > f`, so its operands are
+                    // WRITES, not reads. `-a` (append) is a flag, not a
+                    // path — skipped like any flag — and still refused,
+                    // same as `>>`: append is unsafe for a tool that streams.
+                    if !opaque && !text.starts_with('-') {
+                        writes.push(text.clone());
+                    }
+                    operand_index += 1;
+                } else {
+                    let non_reading =
+                        stage_command.is_some_and(|c| NON_READING_COMMANDS.contains(&c));
+                    let subcommand_slot = operand_index == 0
+                        && stage_command.is_some_and(|c| SUBCOMMAND_DISPATCHERS.contains(&c));
+                    if !opaque && !non_reading && !subcommand_slot {
+                        reads.push(text.clone());
+                    }
+                    operand_index += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+    // #2560 round 2: `resolve_exec_cwd` joins but does not normalize, so a
+    // lexical spelling difference (`cat ./f > f`) missed the guard entirely
+    // — `ws/./f` != `ws/f` by string equality. `lexically_normalize` (the
+    // same normalizer `caveats::permits_path` already uses for containment)
+    // collapses `.`/`..` components on BOTH sides before comparing.
+    let normalized =
+        |token: &str| crate::caveats::lexically_normalize(&resolve_exec_cwd(cwd, Some(token)));
+    writes.iter().find_map(|write| {
+        let write_path = normalized(write);
+        reads
+            .iter()
+            .any(|read| normalized(read) == write_path)
+            .then(|| {
+                format!(
+                    "error: refusing to run this command — it reads '{write}' and \
+                     also redirects output to '{write}' in the same pipeline. The \
+                     shell truncates '{write}' before the command finishes reading \
+                     it, destroying the input. Write to a new name and move it into \
+                     place instead (e.g. `awk … f > f.tmp && mv f.tmp f`).\n\
+                     Refused command: {cmd}"
+                )
+            })
+    })
+}
+
 pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
     serde_json::json!({
         "cmd": cmd,
@@ -587,6 +893,13 @@ pub(super) async fn exec_confined_command(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, ExecOutcome) {
+    // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
+    // BEFORE either lane below runs anything — this is the single choke
+    // point both the confined dispatch and the `--yolo` host-bypass share.
+    if let Some(refusal) = same_file_redirect_refusal(cmd, cwd) {
+        return (refusal, ExecOutcome::Denied);
+    }
+
     // Venv injection (#783): the confined shell carries the venv via
     // agent-bridle's structured `env` seam (see `confined_dispatch_args` /
     // `venv_env_map`), NOT by prepending `export …;` to the command — an

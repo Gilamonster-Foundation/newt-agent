@@ -828,6 +828,35 @@ fn workflow_blocker_classification_refreshes_for_the_same_fingerprint() {
     }
 }
 
+/// #2561 review (b): an fs-producer failure (`error: reading ...`) is a real
+/// ledger failure (finding 1's fix keeps `ok=false`), but must NOT become
+/// workflow error evidence. Otherwise it (1) nudges an edit against a
+/// missing-path fingerprint, (2) counts a probe of a wrong path as round
+/// progress — defeating the no-progress brake, and (3) displaces a real
+/// compile-error fingerprint mid-repair.
+#[test]
+fn an_fs_producer_failure_does_not_displace_or_count_as_progress() {
+    let compile_error = "error[E0425]: cannot find value `X` in this scope\n --> src/main.rs:1:1\n";
+    let enoent_read = "error: reading src/missing.rs: No such file or directory (os error 2)";
+
+    let mut state = WorkflowRuntimeState::default();
+    assert!(
+        state.record_tool_result(compile_error, false),
+        "the first real error must register as evidence"
+    );
+    let before = state.error_evidence.clone();
+    assert!(before.is_some(), "compile error must set active evidence");
+
+    assert!(
+        !state.record_tool_result(enoent_read, false),
+        "an fs-producer failure must not count as round progress (no-progress brake regression)"
+    );
+    assert_eq!(
+        state.error_evidence, before,
+        "the ENOENT read must not displace the compile-error fingerprint"
+    );
+}
+
 #[test]
 fn workflow_blocker_records_filesystem_capability_denial() {
     // The prefix emitted by tools::denied_fs_result is not a compiler error.
