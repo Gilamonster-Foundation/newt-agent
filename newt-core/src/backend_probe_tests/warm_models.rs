@@ -169,3 +169,43 @@ fn router_states_keep_loaded_and_unloaded_distinct_from_unknown() {
     );
     assert!(parse_llamacpp_model_states(&serde_json::json!({"data": [{"id":"hosted"}]})).is_none());
 }
+
+/// #2567: a router `/models` entry carries the argv it spawned the model with
+/// and its preset block. The shape is the live router's (verified 2026-09-24);
+/// the paths here are placeholders.
+#[test]
+fn launch_declaration_reads_args_and_preset_for_the_named_model() {
+    let body = serde_json::json!({"data": [
+        {"id": "other", "status": {"value": "unloaded", "args": ["llama-server", "--ctx-size", "8192"]}},
+        {"id": "m-35b", "status": {
+            "value": "loaded",
+            "args": ["/opt/llama/llama-server", "--chat-template-kwargs", "{\"enable_thinking\": false}",
+                     "--jinja", "--ctx-size", "131072", "--model", "/models/m.gguf"],
+            "preset": "[m-35b]\nctx-size = 131072\n"
+        }}
+    ]});
+    let launch = parse_llamacpp_launch(&body, "m-35b").expect("declared");
+    assert_eq!(
+        launch.args.first().map(String::as_str),
+        Some("--chat-template-kwargs"),
+        "binary dropped"
+    );
+    assert_eq!(launch.flag("--ctx-size"), Some("131072"));
+    assert_eq!(
+        launch.flag("--chat-template-kwargs"),
+        Some("{\"enable_thinking\": false}")
+    );
+    assert_eq!(
+        launch.flag("--jinja"),
+        Some("--ctx-size"),
+        "flag() is positional; callers ask for valued flags"
+    );
+    assert_eq!(
+        launch.preset.as_deref(),
+        Some("[m-35b]\nctx-size = 131072\n")
+    );
+    assert!(parse_llamacpp_launch(&body, "absent").is_none());
+    assert!(
+        parse_llamacpp_launch(&serde_json::json!({"data": [{"id": "bare"}]}), "bare").is_none()
+    );
+}

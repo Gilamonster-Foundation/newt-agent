@@ -12,8 +12,11 @@ mod brand;
 mod chat;
 mod codex_env;
 mod color;
+mod context_window;
 mod crew_form;
 mod help;
+#[cfg(feature = "rich-tui")]
+mod inference_panel;
 mod migration_notices;
 mod navigator_cmds;
 mod session_capability;
@@ -111,6 +114,8 @@ mod prompt_visibility_test;
 // assertion is structural ("on screen while still running"), not a stopwatch.
 #[cfg(all(test, unix))]
 mod interrupt_ack_pty_test;
+#[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+mod scrollbar;
 /// #1981: the ONE list of top-level slash commands. Three lists knew this
 /// before and none agreed; see the module doc.
 /// #1981: `/settings` — the typed form the knob verbs are absorbed into.

@@ -245,7 +245,8 @@ impl TurnMetrics {
     }
 }
 
-fn fmt_count(n: u64) -> String {
+/// `n` with thousands separators, e.g. `104,857`.
+pub fn fmt_count(n: u64) -> String {
     // Insert thousands separators for readability.
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);

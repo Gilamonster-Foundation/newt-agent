@@ -40,7 +40,9 @@ mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
-pub use generation_policy::{projected_cognition, validate_output_allowance};
+pub use generation_policy::{
+    preview_chat_generation, projected_cognition, validate_output_allowance, ChatGenerationPreview,
+};
 mod git_tool;
 pub mod openai_sse;
 pub(crate) mod self_verify;

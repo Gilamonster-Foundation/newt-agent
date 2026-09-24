@@ -81,14 +81,11 @@ impl LinesPanel {
 
 impl Screen for LinesPanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let top = self.cursor.top();
         let rows: Vec<crate::config_panel::RowView> = self
             .lines
             .iter()
-            .skip(top)
-            .take(VISIBLE)
             .enumerate()
-            .map(|(offset, line)| crate::config_panel::RowView {
+            .map(|(index, line)| crate::config_panel::RowView {
                 // The label column carries the whole line: these are sentences
                 // and audit records, not `name: value` pairs, and splitting
                 // them into columns would wrap them at a place they do not
@@ -96,7 +93,7 @@ impl Screen for LinesPanel {
                 label: "",
                 value: line.clone(),
                 provenance: String::new(),
-                selected: top + offset == self.cursor.at(),
+                selected: index == self.cursor.at(),
                 editable: false,
             })
             .collect();

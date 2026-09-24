@@ -71,6 +71,13 @@ const SECTIONS: &[(&str, char, &str)] = &[
     ("Backends", 'b', "choose · edit · add · remove"),
     ("Themes", 't', "presets · styles · live preview · save"),
     ("MCP", 'm', "servers · connection · login · tools"),
+    // #2567: read-only, so it is hosted (PR10a's rule), appended so the LINK
+    // indices above keep their meaning.
+    (
+        "Inference",
+        'i',
+        "window · ceiling · thinking · sampling · server launch",
+    ),
 ];
 
 /// Index of the Session section in the shell — the one whose outcome
@@ -529,6 +536,7 @@ fn settings_shell<'a>(
     panel: &'a mut dyn Screen,
     audit: &'a mut dyn Screen,
     theme: &'a mut dyn Screen,
+    inference: &'a mut dyn Screen,
     initial_section: Option<char>,
 ) -> crate::shell::Shell<'a> {
     let mut shell = crate::shell::Shell::new(vec![
@@ -538,6 +546,7 @@ fn settings_shell<'a>(
         section(3, crate::shell::Body::Link),
         section(4, crate::shell::Body::Screen(theme)),
         section(5, crate::shell::Body::Link),
+        section(6, crate::shell::Body::Screen(inference)),
     ]);
     if let Some(index) = initial_section.and_then(|initial| {
         SECTIONS
@@ -559,6 +568,9 @@ pub(crate) fn run(
     // because the fs read is the caller's, rendered by `receipt_audit_lines`
     // because the verification belongs with the rendering.
     audit: Vec<String>,
+    // The Inference section's rows, resolved by the caller before the panel
+    // opens (`inference_panel::gather`): its launch fetch is network I/O.
+    inference: Vec<String>,
     initial_section: Option<char>,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
@@ -581,11 +593,13 @@ pub(crate) fn run(
     // confirmation and persistence path, so this shell reports only intent.
     let mut audit_panel = crate::lines_panel::LinesPanel::new("audit", audit);
     let mut theme_panel = crate::theme_panel::ThemePanel::new();
+    let mut inference_panel = crate::lines_panel::LinesPanel::new("inference", inference);
     let (applied, linked) = {
         let mut shell = settings_shell(
             &mut panel,
             &mut audit_panel,
             &mut theme_panel,
+            &mut inference_panel,
             initial_section,
         );
         crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
@@ -1120,7 +1134,9 @@ mod tests {
             let mut panel = panel();
             let mut audit = crate::lines_panel::LinesPanel::new("audit", Vec::new());
             let mut theme = crate::theme_panel::ThemePanel::new();
-            let mut shell = settings_shell(&mut panel, &mut audit, &mut theme, None);
+            let mut inference = crate::lines_panel::LinesPanel::new("inference", Vec::new());
+            let mut shell =
+                settings_shell(&mut panel, &mut audit, &mut theme, &mut inference, None);
             let mut flow = Flow::Stay;
             for key in keys {
                 flow = shell.key(key);
@@ -1138,7 +1154,14 @@ mod tests {
             let mut panel = panel();
             let mut audit = crate::lines_panel::LinesPanel::new("audit", Vec::new());
             let mut theme = crate::theme_panel::ThemePanel::new();
-            let mut shell = settings_shell(&mut panel, &mut audit, &mut theme, Some(shortcut));
+            let mut inference = crate::lines_panel::LinesPanel::new("inference", Vec::new());
+            let mut shell = settings_shell(
+                &mut panel,
+                &mut audit,
+                &mut theme,
+                &mut inference,
+                Some(shortcut),
+            );
             assert_eq!(shell.key(Key::Enter), Flow::Close(false));
             assert_eq!(shell.linked(), Some(index));
         }

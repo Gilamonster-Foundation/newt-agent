@@ -1142,6 +1142,62 @@ pub fn parse_llamacpp_model_states(json: &serde_json::Value) -> Option<Vec<(Stri
     )
 }
 
+/// One model's launch declaration on a llama.cpp router (#2567): the argv the
+/// router spawned it with (binary path dropped) and its preset block, both
+/// verbatim from the router's `/models` entry (`status.args`, `status.preset`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlamaCppLaunch {
+    pub args: Vec<String>,
+    pub preset: Option<String>,
+}
+
+impl LlamaCppLaunch {
+    /// The value following `--flag`, e.g. `flag("--ctx-size")`.
+    #[must_use]
+    pub fn flag(&self, name: &str) -> Option<&str> {
+        let at = self.args.iter().position(|arg| arg == name)?;
+        self.args.get(at + 1).map(String::as_str)
+    }
+}
+
+/// Pure: `model`'s launch declaration from a router `/models` body. `None` when
+/// the entry is absent or declares neither args nor a preset.
+pub fn parse_llamacpp_launch(json: &serde_json::Value, model: &str) -> Option<LlamaCppLaunch> {
+    let entries = json["data"].as_array().or_else(|| json.as_array())?;
+    let status = &entries
+        .iter()
+        .find(|entry| entry["id"].as_str().or_else(|| entry["model"].as_str()) == Some(model))?
+        ["status"];
+    let args: Vec<String> = status["args"]
+        .as_array()
+        .map(|argv| {
+            argv.iter()
+                .skip(1)
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let preset = status["preset"].as_str().map(str::to_string);
+    (!args.is_empty() || preset.is_some()).then_some(LlamaCppLaunch { args, preset })
+}
+
+/// GET the router's `/models` and read `model`'s launch declaration. Thin IO
+/// shell over [`parse_llamacpp_launch`], same endpoint as
+/// [`fetch_llamacpp_model_states`].
+pub async fn fetch_llamacpp_launch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    model: &str,
+) -> anyhow::Result<Option<LlamaCppLaunch>> {
+    let url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let response = maybe_bearer(client.get(url), api_key).send().await?;
+    if !response.status().is_success() {
+        return Err(ProbeHttpStatus(response.status()).into());
+    }
+    Ok(parse_llamacpp_launch(&response.json().await?, model))
+}
+
 /// Extract the warm subset using the same state parser as the model manager.
 pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String>> {
     Some(

@@ -64,6 +64,45 @@ pub fn validate_output_allowance(
     }
 }
 
+/// What a Chat Completions request will carry for generation — the public,
+/// read-only view of [`GenerationPolicy::resolve`] for display (#2567). It is
+/// computed by the same resolver the dispatch loop uses, so a panel cannot
+/// show a value the request would not send.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ChatGenerationPreview {
+    /// The `enable_thinking` value sent in `chat_template_kwargs`; `None` when
+    /// the request sends no thinking selection at all (server default applies).
+    pub enable_thinking: Option<bool>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    /// `max_tokens` as sent; `None` when the field is omitted.
+    pub max_output_tokens: Option<u32>,
+    /// The output allowance reserved locally, sent or not.
+    pub output_allowance: Option<u32>,
+}
+
+#[must_use]
+pub fn preview_chat_generation(
+    cognition: Option<Cognition>,
+    output_allowance: Option<u32>,
+    capability: ChatCompletionsCapability,
+    reasoning_replay_scope: ReasoningReplayScope,
+) -> ChatGenerationPreview {
+    let policy = GenerationPolicy::resolve(
+        cognition,
+        output_allowance,
+        capability,
+        reasoning_replay_scope,
+    );
+    ChatGenerationPreview {
+        enable_thinking: policy.thinking.filter(|_| policy.chat_template_kwargs),
+        temperature: policy.temperature,
+        top_p: policy.top_p,
+        max_output_tokens: policy.max_output_tokens,
+        output_allowance: policy.output_allowance,
+    }
+}
+
 /// Backend-neutral generation choices resolved once per Chat Completions turn.
 /// Request serialization projects these values only onto fields the endpoint
 /// explicitly declared it accepts.
@@ -210,6 +249,41 @@ mod tests {
             parallel_tool_calls: Some(false),
             bounded_reasoning_continuation: Some(true),
         }
+    }
+
+    /// #2566/#2567: the preview reports exactly what is sent, including the
+    /// two silent-off cases — no `cognition` projection, no cognition level.
+    #[test]
+    fn the_preview_reports_the_thinking_selection_the_request_sends() {
+        let scope = ReasoningReplayScope::default();
+        let on =
+            preview_chat_generation(Some(Cognition::Thoughtful), None, local_capability(), scope);
+        assert_eq!(on.enable_thinking, Some(true));
+        assert_eq!((on.temperature, on.top_p), (Some(0.6), Some(0.95)));
+        let zen = preview_chat_generation(Some(Cognition::Zen), None, local_capability(), scope);
+        assert_eq!(zen.enable_thinking, Some(false));
+        let no_level = preview_chat_generation(None, None, local_capability(), scope);
+        assert_eq!(
+            no_level.enable_thinking, None,
+            "no cognition level: nothing sent"
+        );
+        let no_projection = ChatCompletionsCapability {
+            cognition: None,
+            ..local_capability()
+        };
+        let silent =
+            preview_chat_generation(Some(Cognition::Thoughtful), None, no_projection, scope);
+        assert_eq!(
+            silent.enable_thinking, None,
+            "kwargs flag alone sends nothing"
+        );
+        let no_kwargs = ChatCompletionsCapability {
+            chat_template_kwargs: None,
+            ..local_capability()
+        };
+        let sampled = preview_chat_generation(Some(Cognition::Thoughtful), None, no_kwargs, scope);
+        assert_eq!(sampled.enable_thinking, None);
+        assert_eq!(sampled.temperature, Some(0.6), "sampling still projects");
     }
 
     #[test]

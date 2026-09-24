@@ -1101,7 +1101,11 @@ pub(crate) fn render_panel_with_styles(
         }
         lines.push(Line::from(spans));
     }
+    // The hint sits on the box's last line, not under the last row: a hint
+    // floating mid-box reads as "that is everything" when the list scrolls.
+    lines.resize(visible, Line::default());
     lines.push(bottom);
+    render_scroll_gutter(f, inner, rows.len(), top, visible);
 
     let para = Paragraph::new(lines);
     f.render_widget(
@@ -1111,6 +1115,50 @@ pub(crate) fn render_panel_with_styles(
             y: inner.y,
             width: inner.width.saturating_sub(1),
             height: inner.height,
+        },
+    );
+}
+
+/// A left-edge scrollbar in the column `render_panel` leaves free, drawn only
+/// when the rows outrun the window. Left, because newt's layouts are
+/// left-heavy: the right edge is where a narrow terminal trims. The glyphs are
+/// `scrollbar`'s shared set (`▲` more above, `▼` more below, `▓` thumb,
+/// `▒` track), the same the spill viewport draws.
+fn render_scroll_gutter(
+    f: &mut ratatui::Frame,
+    inner: Rect,
+    len: usize,
+    top: usize,
+    visible: usize,
+) {
+    use crate::scrollbar::{SCROLL_ABOVE, SCROLL_BELOW, SCROLL_THUMB, SCROLL_TRACK};
+    if len <= visible || visible == 0 {
+        return;
+    }
+    let thumb = crate::scrollbar::thumb_row(top, len - visible, visible);
+    let glyphs: Vec<Line> = (0..visible)
+        .map(|row| {
+            let glyph = if row == 0 && top > 0 {
+                SCROLL_ABOVE
+            } else if row + 1 == visible && top + visible < len {
+                SCROLL_BELOW
+            } else if Some(row) == thumb {
+                SCROLL_THUMB
+            } else {
+                SCROLL_TRACK
+            };
+            Line::from(Span::styled(
+                glyph.to_string(),
+                crate::theme::style(crate::theme::Role::Dim),
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(glyphs),
+        Rect {
+            height: u16::try_from(visible).unwrap_or(inner.height),
+            width: 1,
+            ..inner
         },
     );
 }
