@@ -454,6 +454,10 @@ mod reasoning_replay;
 #[path = "http_reasoning_overflow.rs"]
 mod reasoning_overflow;
 
+#[cfg(test)]
+#[path = "http_overflow_cognition_retry.rs"]
+mod overflow_cognition_retry;
+
 #[path = "http_context_exceeded.rs"]
 mod context_exceeded;
 

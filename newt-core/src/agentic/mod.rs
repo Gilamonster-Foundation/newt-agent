@@ -1858,6 +1858,19 @@ macro_rules! no_progress_gate {
     };
 }
 
+/// F34: the concise nudge appended for the one lower-cognition re-dispatch.
+const REASONING_OVERFLOW_NUDGE: &str = "Your reasoning used the whole output budget before you \
+answered. Be concise and act now: give the answer or make the tool call.";
+
+/// F34: the one visible line when a reasoning overflow ends a turn empty.
+fn reasoning_overflow_reason(retried: bool) -> String {
+    let times = if retried { "twice" } else { "once" };
+    format!(
+        "(model returned an empty response — reasoning exhausted the output budget {times}; \
+lower `/settings cognition`, raise the output allowance, or rephrase)"
+    )
+}
+
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -6838,12 +6851,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
     let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
-    let generation_policy = generation_policy::GenerationPolicy::resolve(
+    let mut generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
         output_allowance,
         chat_completions_capability,
         reasoning_replay_scope,
     );
+    // F34: the one-shot cognition drop after a reasoning overflow; loop-local,
+    // so the next turn resolves the operator's level afresh.
+    let mut cognition_drop_used = false;
     // Every body this loop sends applies `generation_policy`, so the cap is
     // server-enforced exactly when the policy projects `max_tokens`.
     observability::observe_output_allowance(
@@ -7936,8 +7952,36 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         if reasoning_overflow {
             let has_round_budget = round + 1 < current_tool_round_limit;
+            // F34: re-dispatch once, one cognition level lower, with a nudge to
+            // be concise. Only where cognition projects onto the wire (else the
+            // lower level changes nothing) and never for a second overflow.
+            let lower = cognition
+                .filter(|_| chat_completions_capability.cognition == Some(true))
+                .and_then(|level| Some((level, level.lower()?)))
+                .filter(|_| !cognition_drop_used && has_round_budget);
+            if let Some((from, to)) = lower {
+                cognition_drop_used = true;
+                generation_policy = generation_policy::GenerationPolicy::resolve(
+                    Some(to),
+                    output_allowance,
+                    chat_completions_capability,
+                    reasoning_replay_scope,
+                );
+                if let Some(obs) = solve_obs.as_deref_mut() {
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::CognitionDropRetry {
+                            round,
+                            from: from.label().into(),
+                            to: to.label().into(),
+                        });
+                }
+                messages
+                    .push(serde_json::json!({"role":"user","content":REASONING_OVERFLOW_NUDGE}));
+                continue 'round_loop;
+            }
             let can_continue = generation_policy
-                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
+                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget)
+                && !cognition_drop_used;
 
             let resolving_existing_continuation =
                 reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
@@ -8409,7 +8453,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 **slot = Some(accepted_reason);
             }
             if content.is_empty() {
-                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                let out = if reasoning_overflow {
+                    reasoning_overflow_reason(cognition_drop_used)
+                } else {
+                    "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
+                };
                 observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }

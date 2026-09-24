@@ -346,6 +346,18 @@ impl Cognition {
         }
     }
 
+    /// The next level down the ladder, `None` at [`Self::Zen`] (F34: the
+    /// one-shot retry after a reasoning overflow).
+    #[must_use]
+    pub fn lower(self) -> Option<Self> {
+        match self {
+            Self::Zen => None,
+            Self::Rational => Some(Self::Zen),
+            Self::Thoughtful => Some(Self::Rational),
+            Self::Meticulous => Some(Self::Thoughtful),
+        }
+    }
+
     /// All levels, light → deep (for `/cognition list` and menus).
     #[must_use]
     pub fn all() -> [Self; 4] {
