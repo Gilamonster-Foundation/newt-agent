@@ -1446,6 +1446,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // (env) or a --loadout axis (set just above) always wins, and a
             // provider naming a since-removed [[backends]] entry is ignored.
             {
+                // Key on the session workspace, not the launch directory.
+                if let Some(dir) = &path {
+                    newt_core::settings::set_workspace(dir);
+                }
                 let session = newt_core::settings::load();
                 if !session.is_empty() {
                     let cfg =
