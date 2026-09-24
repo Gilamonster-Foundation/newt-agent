@@ -41,6 +41,139 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Filesystem grants for the session workspace's **own** git metadata (F32,
+/// #2537): the extra read/write roots that let the model commit and move the
+/// ref of the branch it has checked out, without needing to reach outside the
+/// workspace fence for anything else.
+///
+/// Empty on any failure to resolve, on detached HEAD, and on the default
+/// branch (`main`/`master`/the remote's `HEAD`) — those get read-only access
+/// to the metadata, no write roots, so a caller that MEETs these into the
+/// session `fs_write` scope grants nothing extra.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OwnGitGrant {
+    pub read: Vec<String>,
+    pub write: Vec<String>,
+}
+
+/// Compute [`OwnGitGrant`] for `workspace`'s checked-out repository.
+///
+/// Resolves the worktree gitdir and the common (administrative) dir with
+/// `git rev-parse`, never by hand-parsing the `.git` gitlink file. Write
+/// roots are exactly what `git add` + `git commit` touch on the own branch
+/// (verified with `strace -f -e trace=file`, see module docs above and
+/// `RESULT-dec2-own-gitdir.md`): the worktree gitdir's `index`, `HEAD`,
+/// `logs/HEAD`, `COMMIT_EDITMSG` and their `.lock` files, plus the common
+/// dir's `objects/` subtree and `refs/heads/<branch>` with its log and lock.
+/// `config`, `hooks/`, other branches' refs, and the default branch are never
+/// granted write.
+pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
+    let Some((common_dir, absolute_git_dir)) = git_dirs(workspace) else {
+        return OwnGitGrant::default();
+    };
+    let read = vec![
+        path_to_string(&absolute_git_dir),
+        path_to_string(&common_dir),
+    ];
+    let read_only = OwnGitGrant {
+        read: read.clone(),
+        write: Vec::new(),
+    };
+
+    let Some(branch) = own_branch(workspace) else {
+        return read_only; // detached HEAD
+    };
+    if is_default_branch(workspace, &branch) {
+        return read_only;
+    }
+
+    let write = [
+        absolute_git_dir.join("index"),
+        absolute_git_dir.join("index.lock"),
+        absolute_git_dir.join("HEAD"),
+        absolute_git_dir.join("HEAD.lock"),
+        absolute_git_dir.join("logs/HEAD"),
+        absolute_git_dir.join("COMMIT_EDITMSG"),
+        common_dir.join("objects"),
+        common_dir.join(format!("refs/heads/{branch}")),
+        common_dir.join(format!("refs/heads/{branch}.lock")),
+        common_dir.join(format!("logs/refs/heads/{branch}")),
+    ]
+    .iter()
+    .map(|p| path_to_string(p))
+    .collect();
+    OwnGitGrant { read, write }
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// `(git-common-dir, absolute-git-dir)`, both made absolute against
+/// `workspace` (`--git-common-dir` prints relative for a normal checkout).
+fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = hardened_git(
+        workspace,
+        &["rev-parse", "--git-common-dir", "--absolute-git-dir"],
+    )
+    .ok()?
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let common_dir = lines.next()?;
+    let absolute_git_dir = PathBuf::from(lines.next()?);
+    let common_dir = if Path::new(common_dir).is_absolute() {
+        PathBuf::from(common_dir)
+    } else {
+        workspace.join(common_dir)
+    };
+    Some((common_dir, absolute_git_dir))
+}
+
+/// The checked-out branch name (`refs/heads/<name>` stripped), or `None` for
+/// detached HEAD / an unresolvable symbolic ref.
+fn own_branch(workspace: &Path) -> Option<String> {
+    let output = hardened_git(workspace, &["symbolic-ref", "-q", "HEAD"])
+        .ok()?
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/heads/")
+        .map(str::to_owned)
+}
+
+/// Is `branch` the repo's default branch — `main`, `master`, or whatever the
+/// remote's `HEAD` points at? The remote lookup is best-effort: an offline or
+/// remote-less repo just falls back to the hardcoded names.
+fn is_default_branch(workspace: &Path, branch: &str) -> bool {
+    if branch == "main" || branch == "master" {
+        return true;
+    }
+    let Some(output) = hardened_git(
+        workspace,
+        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|mut c| c.output().ok()) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .is_some_and(|default| default == branch)
+}
+
 /// Git config keys/values forced via `-c` so a hostile repo `.git/config` cannot
 /// turn a harness `git` call into code execution. `-c` outranks repo-local
 /// config, so these win even when the attacker set the opposite in `.git/config`.
@@ -276,5 +409,138 @@ mod subdir_discovery_tests {
             "rev-parse HEAD from a repo subdirectory must still succeed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+/// Real `git`, real tempdirs: grounds [`own_gitdir_grants`] against actual
+/// worktree layouts rather than a belief about what `git rev-parse` prints.
+/// Per the workspace testing tiers this is an expensive/real-resource test,
+/// not the mocked unit tier; it is small and self-contained enough to run
+/// inline rather than being split into the weekly suite.
+#[cfg(all(test, unix))]
+mod own_gitdir_grant_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git invocation");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        std::fs::write(dir.join("seed"), "x").unwrap();
+        git(dir, &["add", "seed"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Would have failed before this fix: no grants existed at all, so
+    /// `permits_path` denied every file `git add`/`git commit` touches on a
+    /// linked worktree's own branch (F32, #2537).
+    #[test]
+    fn linked_worktree_on_own_branch_grants_add_and_commit_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root.path().join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+
+        let grant = own_gitdir_grants(&wt);
+        assert!(!grant.write.is_empty(), "own branch must get write roots");
+
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        let scope = crate::caveats::Scope::only(grant.write.clone());
+        let path = |rel: &str| main.join(".git").join(rel).to_string_lossy().into_owned();
+        for touched in [
+            path("worktrees/wt/index"),
+            path("worktrees/wt/HEAD"),
+            path("worktrees/wt/logs/HEAD"),
+            path("worktrees/wt/COMMIT_EDITMSG"),
+            path("objects/pack/multi-pack-index"),
+            path("refs/heads/task"),
+            path("logs/refs/heads/task"),
+        ] {
+            assert!(
+                crate::caveats::permits_path(&scope, &touched),
+                "{touched} must be permitted"
+            );
+        }
+        for denied in [
+            path("refs/heads/main"),
+            path("config"),
+            path("hooks/pre-commit"),
+        ] {
+            assert!(
+                !crate::caveats::permits_path(&scope, &denied),
+                "{denied} must stay denied"
+            );
+        }
+
+        // The grants are real enough to actually run `git add` + `git commit`
+        // under them.
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+    }
+
+    #[test]
+    fn normal_checkout_on_own_branch_grants_add_and_commit_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["checkout", "-q", "-b", "task"]);
+
+        let grant = own_gitdir_grants(repo.path());
+        assert!(!grant.write.is_empty());
+
+        std::fs::write(repo.path().join("f.txt"), "hi").unwrap();
+        git(repo.path(), &["add", "f.txt"]);
+        git(repo.path(), &["commit", "-q", "-m", "task work"]);
+    }
+
+    /// Writing `refs/heads/main`, `config`, or `hooks/pre-commit` must never be
+    /// in the grant, on either layout.
+    #[test]
+    fn default_branch_checkout_grants_no_write_roots() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["branch", "-m", "main"]);
+
+        let grant = own_gitdir_grants(repo.path());
+        assert!(
+            grant.write.is_empty(),
+            "checkout on the default branch must not get commit authority: {:?}",
+            grant.write
+        );
+    }
+
+    #[test]
+    fn detached_head_grants_read_only() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        git(repo.path(), &["checkout", "-q", &head]);
+
+        let grant = own_gitdir_grants(repo.path());
+        assert!(
+            grant.write.is_empty(),
+            "detached HEAD must not get write roots"
+        );
+        assert!(!grant.read.is_empty(), "detached HEAD still gets read");
     }
 }

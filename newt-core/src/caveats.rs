@@ -165,12 +165,18 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
             })
             .unwrap_or_default()
     };
-    lock_fs_to_workspace(
-        caveats,
-        workspace,
-        &parse("NEWT_READ_PATHS"),
-        &parse("NEWT_WRITE_PATHS"),
-    );
+    // The workspace's own git metadata (HEAD, index, objects, the checked-out
+    // branch's ref) lives outside `workspace` for a linked worktree — grant it
+    // narrowly so the model can commit its own branch without a fence prompt
+    // (F32, #2537). Empty on the default branch / detached HEAD / resolve
+    // failure, so this never widens authority beyond the own-branch case.
+    let own_git = crate::git_hardening::own_gitdir_grants(std::path::Path::new(workspace));
+    let mut read = parse("NEWT_READ_PATHS");
+    read.extend(own_git.read);
+    let mut write = parse("NEWT_WRITE_PATHS");
+    write.extend(own_git.write);
+
+    lock_fs_to_workspace(caveats, workspace, &read, &write);
 }
 
 // ---------------------------------------------------------------------------
