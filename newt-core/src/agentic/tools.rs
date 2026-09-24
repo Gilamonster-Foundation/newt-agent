@@ -4111,6 +4111,7 @@ async fn execute_authorized_tool(
                         &body,
                         args["offset"].as_u64().map(|n| n as usize),
                         args["limit"].as_u64().map(|n| n as usize),
+                        0,
                     ),
                     Err(refusal) => refusal,
                 },
@@ -4134,7 +4135,7 @@ async fn execute_authorized_tool(
                     // budget so read_file and run_command share one cap —
                     // held under the spill cap when offload is on, so a big
                     // file pages with `offset=` instead of becoming a handle.
-                    read_file_page(&contents, offset, limit, tool_offload)
+                    read_file_page(path, &contents, offset, limit, tool_offload)
                 }
                 Err(tool_output) => tool_output,
             }

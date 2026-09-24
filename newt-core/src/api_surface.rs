@@ -79,25 +79,44 @@ fn python_outline() -> Vec<SymbolRule> {
     ]
 }
 
-/// One line outlining `content` — a read of `path` whose first line is file
-/// line `first_line` — as `N kind name` entries joined by ` | `, capped near
-/// `max_chars` with a `… +K more` tail. `None` when `path`'s language has no
-/// outline rules or nothing matched (#2557).
-///
-/// The built-in packs only: this runs inside context compression, which has
-/// no workspace configuration in hand. A read-page footer (`[payload
-/// truncated …]`, `[showing lines …]`) is never an entry.
-pub fn outline_line(
-    path: &str,
-    content: &str,
-    first_line: usize,
-    max_chars: usize,
-) -> Option<String> {
+/// One outline item's ABSOLUTE line span (#2557 round 2 — the prototype only
+/// carried a single line number). `start == end` for a one-line declaration
+/// (`mod x;`, a `const`, a unit `struct`); a block item's `end` is the
+/// engine's best estimate — see [`outline_items`]'s doc for how the regex
+/// floor computes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineEntry {
+    pub start: usize,
+    pub end: usize,
+    pub kind: String,
+    pub name: String,
+}
+
+/// The outline of one read range: its top-level items plus the
+/// content-addressed identity of the EXACT bytes it describes (#2557 round 2,
+/// per the provenance-audit skill: identity minted through
+/// `content-addressable`, never a hand-rolled hash).
+pub struct FileOutline {
+    pub entries: Vec<OutlineEntry>,
+    /// `RawContentId::from_content(content.as_bytes())` — the raw-bytes
+    /// profile, since this identifies an opaque byte RANGE, not a canonical
+    /// structured value (`ContentId`'s profile). A later read of the same
+    /// range can compare this id instead of re-diffing the text.
+    pub content_id: content_addressable::RawContentId,
+}
+
+/// Budget for a rendered outline (#2557): about a tenth of a 15k-char page,
+/// so the map survives while the bulk goes — shared by the aged-read summary
+/// (`prune.rs`) and the first-read lead (`output_budget.rs`), one constant.
+pub const OUTLINE_MAX_CHARS: usize = 1_500;
+
+/// A pack's extensions and its compiled outline rules `(regex, kind)`.
+type CompiledOutlinePack = (Vec<String>, Vec<(Regex, String)>);
+
+fn compiled_outline_packs() -> &'static [CompiledOutlinePack] {
     use std::sync::OnceLock;
-    /// A pack's extensions and its compiled outline rules `(regex, kind)`.
-    type CompiledPack = (Vec<String>, Vec<(Regex, String)>);
-    static COMPILED: OnceLock<Vec<CompiledPack>> = OnceLock::new();
-    let packs = COMPILED.get_or_init(|| {
+    static COMPILED: OnceLock<Vec<CompiledOutlinePack>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
         builtin_packs()
             .into_iter()
             .filter(|pack| !pack.outline.is_empty())
@@ -110,12 +129,36 @@ pub fn outline_line(
                 (pack.extensions, rules)
             })
             .collect()
-    });
-    let ext = std::path::Path::new(path).extension()?.to_str()?;
-    let (_, rules) = packs
+    })
+}
+
+/// The top-level items in `content` (a read of `path` whose first line is
+/// file line `first_line`), with ABSOLUTE line spans, plus the
+/// content-addressed id of `content` itself. `None` when `path`'s language
+/// has no outline rules, or none matched.
+///
+/// **Engine (#2557): the existing `SymbolRule` regexes are the floor — this
+/// is a per-line pattern match, not a parser, so it cannot see where a block
+/// item's body actually ends.** A tree-sitter `tags.scm` engine (needs MSRV
+/// 1.90, #2556, held) gives real node spans and can replace this function's
+/// body behind the same signature — everything downstream (rendering,
+/// content-addressing, the read-page wiring) is engine-agnostic.
+///
+/// Span rule, applied per matched item: if the matched line, trimmed, ends
+/// with `;` (a one-line declaration — `mod x;`, `const Y: T = …;`, a unit
+/// `struct Z;`) its span is that one line. Otherwise (a block item: `fn`,
+/// `impl`, `trait`, `enum` with a body) the regex has no way to see the
+/// closing brace, so the floor uses **the next item's start line − 1**; the
+/// LAST item in the read range has no "next", so its span ends at the last
+/// line actually read (the range this outline describes, not a guess at the
+/// true end of a block that may continue past what was read).
+pub fn outline_items(path: &str, content: &str, first_line: usize) -> Option<FileOutline> {
+    let ext = Path::new(path).extension()?.to_str()?;
+    let (_, rules) = compiled_outline_packs()
         .iter()
         .find(|(exts, _)| exts.iter().any(|e| e == ext))?;
-    let mut entries: Vec<String> = Vec::new();
+    let last_line = first_line + content.lines().count().saturating_sub(1);
+    let mut hits: Vec<(usize, &str, String, bool)> = Vec::new();
     for (i, line) in content.lines().enumerate() {
         if line.starts_with("[payload truncated") || line.starts_with("[showing lines") {
             continue;
@@ -123,32 +166,96 @@ pub fn outline_line(
         if let Some((name, kind)) = rules.iter().find_map(|(re, kind)| {
             re.captures(line)
                 .and_then(|c| c.get(1))
-                .map(|m| (m.as_str().trim(), kind))
+                .map(|m| (m.as_str().trim(), kind.as_str()))
         }) {
             let name: String = name.chars().take(60).collect();
-            entries.push(format!("{} {kind} {name}", first_line + i));
+            let is_statement = line.trim_end().ends_with(';');
+            hits.push((first_line + i, kind, name, is_statement));
         }
     }
-    if entries.is_empty() {
+    if hits.is_empty() {
         return None;
     }
-    let total = entries.len();
+    let entries = hits
+        .iter()
+        .enumerate()
+        .map(|(idx, (start, kind, name, is_statement))| {
+            let end = if *is_statement {
+                *start
+            } else {
+                match hits.get(idx + 1) {
+                    Some((next_start, ..)) => next_start.saturating_sub(1).max(*start),
+                    None => last_line.max(*start),
+                }
+            };
+            OutlineEntry {
+                start: *start,
+                end,
+                kind: (*kind).to_string(),
+                name: name.clone(),
+            }
+        })
+        .collect();
+    Some(FileOutline {
+        entries,
+        content_id: content_addressable::RawContentId::from_content(content.as_bytes()),
+    })
+}
+
+/// Render `outline`'s entries as `start[-end] kind name` items joined by
+/// ` | `, capped near `max_chars` with a `… +K more` tail, followed by the
+/// content id (its first 12 hex digest chars — a fingerprint for a later
+/// read to compare, not the full CID; the FULL id is what [`outline_items`]
+/// actually mints and carries on [`FileOutline`]).
+#[must_use]
+pub fn render_outline(outline: &FileOutline, max_chars: usize) -> String {
+    let total = outline.entries.len();
+    let fingerprint = &outline.content_id.digest_hex()[..12];
+    let id_tag = format!(" | id:{fingerprint}");
+    let budget = max_chars.saturating_sub(id_tag.len());
     let mut out = String::new();
     let mut shown = 0;
-    for entry in &entries {
-        if !out.is_empty() && out.len() + entry.len() + 3 > max_chars {
+    for entry in &outline.entries {
+        let piece = if entry.start == entry.end {
+            format!("{} {} {}", entry.start, entry.kind, entry.name)
+        } else {
+            format!(
+                "{}-{} {} {}",
+                entry.start, entry.end, entry.kind, entry.name
+            )
+        };
+        if !out.is_empty() && out.len() + piece.len() + 3 > budget {
             break;
         }
         if !out.is_empty() {
             out.push_str(" | ");
         }
-        out.push_str(entry);
+        out.push_str(&piece);
         shown += 1;
     }
-    if shown < total {
-        out.push_str(&format!(" | … +{} more", total - shown));
+    let left_out = total - shown;
+    if left_out > 0 {
+        out.push_str(&format!(" | … +{left_out} more"));
     }
-    Some(out)
+    out.push_str(&id_tag);
+    out
+}
+
+/// [`outline_items`] + [`render_outline`] in one call — the shape
+/// `prune.rs`'s aged-read summary and `read_file`'s first-page lead both
+/// want. `None` when `path`'s language has no outline rules, or nothing
+/// matched — the caller keeps its plain fallback either way.
+///
+/// The built-in packs only: an aged-read call runs inside context
+/// compression, which has no workspace configuration in hand.
+pub fn outline_line(
+    path: &str,
+    content: &str,
+    first_line: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let outline = outline_items(path, content, first_line)?;
+    Some(render_outline(&outline, max_chars))
 }
 
 pub fn builtin_packs() -> Vec<LanguagePack> {
@@ -1083,5 +1190,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── #2557: outline spans, content-addressing, and the first-read lead ──
+
+    /// A ~340-line Rust fixture with real, distinguishable top-level items —
+    /// not a synthetic `fn item_N(){}` wall — so a span assertion is checking
+    /// against actual source shape (mod/use, a multi-line fn, a struct, an
+    /// enum, an impl block, a trait, and a one-line const).
+    fn big_rust_fixture() -> String {
+        let mut out = String::new();
+        out.push_str("//! doc comment\n\nmod attempt_capture;\nuse std::fmt;\n\n");
+        for i in 0..20 {
+            out.push_str(&format!(
+                "pub(crate) fn compact_responses_input_{i}(x: u32) -> u32 {{\n    \
+                 let inner = x + 1;\n    inner * 2\n}}\n\n"
+            ));
+            out.push_str(&format!(
+                "struct ResponsesCompaction{i} {{\n    field: u32,\n}}\n\n"
+            ));
+            out.push_str(&format!("enum Outcome{i} {{\n    A,\n    B,\n}}\n\n"));
+            out.push_str(&format!(
+                "impl fmt::Display for Outcome{i} {{\n    \
+                 fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {{\n        \
+                 Ok(())\n    }}\n}}\n\n"
+            ));
+            out.push_str(&format!("const LIMIT_{i}: u32 = {i};\n\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn a_big_rust_fixtures_outline_spans_match_the_real_items() {
+        let content = big_rust_fixture();
+        let outline = outline_items("mod.rs", &content, 1).expect("rust has outline rules");
+        assert!(outline.entries.len() > 50, "{}", outline.entries.len());
+        let lines: Vec<&str> = content.lines().collect();
+        for entry in &outline.entries {
+            // The span's START line, 1-based, must actually contain the
+            // item's name — the span points at real content, not a guess.
+            let start_line = lines[entry.start - 1];
+            assert!(
+                start_line.contains(&entry.name),
+                "entry {entry:?} start line is {start_line:?}"
+            );
+            // A one-line item (const) has start == end; a block item's span
+            // must reach at least as far as its own opening line and not run
+            // past the fixture.
+            assert!(entry.end >= entry.start, "{entry:?}");
+            assert!(entry.end <= lines.len(), "{entry:?}");
+        }
+        // A one-line declaration: start == end.
+        let mod_entry = outline
+            .entries
+            .iter()
+            .find(|e| e.name == "attempt_capture")
+            .expect("mod attempt_capture must be an entry");
+        assert_eq!(mod_entry.start, mod_entry.end, "{mod_entry:?}");
+        // A block item spans more than its own opening line.
+        let fn_entry = outline
+            .entries
+            .iter()
+            .find(|e| e.name == "compact_responses_input_0")
+            .expect("the fn must be an entry");
+        assert!(fn_entry.end > fn_entry.start, "{fn_entry:?}");
+    }
+
+    #[test]
+    fn paging_by_a_span_returns_that_item() {
+        let content = big_rust_fixture();
+        let outline = outline_items("mod.rs", &content, 1).unwrap();
+        let entry = outline
+            .entries
+            .iter()
+            .find(|e| e.name == "compact_responses_input_5")
+            .unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let span: Vec<&str> = lines[entry.start - 1..entry.end].to_vec();
+        let page = span.join("\n");
+        // The exact span read back is the item's own declaration line, and
+        // nothing from a neighboring item.
+        assert!(page.contains(&entry.name), "{page}");
+        assert!(
+            !page.contains("compact_responses_input_4")
+                && !page.contains("compact_responses_input_6"),
+            "the span must not spill into a neighboring item: {page}"
+        );
+    }
+
+    #[test]
+    fn the_outline_carries_a_content_addressed_id_not_a_hand_rolled_one() {
+        let content = big_rust_fixture();
+        let outline = outline_items("mod.rs", &content, 1).unwrap();
+        let expected = content_addressable::RawContentId::from_content(content.as_bytes());
+        assert_eq!(outline.content_id, expected);
+        // A single byte's difference must mint a DIFFERENT id — this is
+        // content addressing, not a length check or a version counter.
+        let changed = content.replacen('0', "9", 1);
+        let other = outline_items("mod.rs", &changed, 1).unwrap();
+        assert_ne!(outline.content_id, other.content_id);
+        let rendered = render_outline(&outline, OUTLINE_MAX_CHARS);
+        assert!(rendered.contains("id:"), "{rendered}");
+    }
+
+    #[test]
+    fn a_file_with_no_outline_rules_for_its_language_returns_none() {
+        assert!(outline_items("notes.txt", &big_rust_fixture(), 1).is_none());
     }
 }

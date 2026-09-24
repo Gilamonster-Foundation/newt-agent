@@ -327,10 +327,6 @@ fn already_pruned(content: &str, paired_name: &str) -> bool {
         || content.starts_with(&format!("[{paired_name}] "))
 }
 
-/// Budget for an aged read's outline (#2557): about a tenth of a 15k-char page,
-/// so the map survives while the bulk goes.
-const OUTLINE_MAX_CHARS: usize = 1_500;
-
 /// Per-tool one-line summary of a tool result (the pass-2 rewrite).
 fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
     let lines = content.lines().count();
@@ -367,7 +363,12 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             let path = args.and_then(|a| a.get("path")).and_then(Value::as_str);
             let outline = path
                 .and_then(|p| {
-                    crate::api_surface::outline_line(p, content, first_line, OUTLINE_MAX_CHARS)
+                    crate::api_surface::outline_line(
+                        p,
+                        content,
+                        first_line,
+                        crate::api_surface::OUTLINE_MAX_CHARS,
+                    )
                 })
                 .map_or_else(String::new, |o| format!("; outline: {o}"));
             format!(
@@ -1458,13 +1459,21 @@ mod outline_tests {
     fn an_aged_rust_read_keeps_an_outline_with_absolute_lines() {
         let args = serde_json::json!({"path": "src/agentic/mod.rs", "offset": 400});
         let line = one_line_summary("read_file", Some(&args), RUST_PAGE);
-        // offset 400 → the page's line 2 is file line 401.
+        // offset 400 → the page's line 2 is file line 401. A one-line item
+        // (`mod x;`, ends with `;`) has start == end, no dash; a block item
+        // (`fn`, `impl`) spans to the next item's start - 1 (#2557 round 2).
         assert!(line.contains("401 mod attempt_capture"), "{line}");
-        assert!(line.contains("404 fn compact_responses_input"), "{line}");
+        assert!(
+            line.contains("404-408 fn compact_responses_input"),
+            "{line}"
+        );
         assert!(line.contains("409 enum ResponsesCompaction"), "{line}");
-        assert!(line.contains("410 impl"), "{line}");
+        assert!(line.contains("410-412 impl"), "{line}");
         // Top-level only: a method inside an impl is not an outline entry.
         assert!(!line.contains("fn fmt"), "{line}");
+        // The content-addressed tag (#2557 round 2): a RawContentId
+        // fingerprint, never a hand-rolled hash.
+        assert!(line.contains("| id:"), "{line}");
         // Still ONE line in the shared grammar, so the digest fold can fold it.
         assert!(is_one_line_summary(&line), "{line}");
     }

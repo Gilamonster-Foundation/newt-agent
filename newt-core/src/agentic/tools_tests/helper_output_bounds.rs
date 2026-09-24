@@ -345,7 +345,10 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
         .collect::<Vec<_>>()
         .join("\n");
     let cap = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
-    let on = read_file_page(&body, None, None, true);
+    // "test.txt": no outline rules for this extension, so this test stays
+    // about the spill cap alone; the outline+spill-cap interaction has its
+    // own test on a real `.rs` fixture (`api_surface`'s outline tests).
+    let on = read_file_page("test.txt", &body, None, None, true);
     assert!(
         on.chars().count() <= cap,
         "{} chars would spill",
@@ -353,7 +356,7 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
     );
     assert!(on.contains("offset="), "says how to continue");
     // Offload off: nothing would spill, so the ordinary (larger) cap applies.
-    let off = read_file_page(&body, None, None, false);
+    let off = read_file_page("test.txt", &body, None, None, false);
     assert!(
         off.chars().count() > cap,
         "offload off keeps the full budget"

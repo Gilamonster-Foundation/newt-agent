@@ -262,28 +262,88 @@ pub(super) fn paginate_read(
 /// spill cap is replaced by a teaser + `spill:` handle — the model asked for
 /// text and got a handle to redeem — so the page is held under that cap and
 /// ends with the `offset=` to continue from instead.
+///
+/// #2557: a large file's FIRST read (no `offset`, or `offset` 1) leads with
+/// its OUTLINE — the map run 7's model was reaching for when it re-read page
+/// 1 of a 13,399-line file seven times, all before compaction ever fired, so
+/// an aged-read outline alone would not have helped. The outline is built
+/// from the WHOLE file (`contents`, before windowing), so it names items
+/// page 1 alone would never show. Its chars come out of the SAME budget the
+/// page itself is capped to — never a bonus on top — so the combined result
+/// still respects the caller's model/spill budget. A later page (an explicit
+/// `offset`) is already inside a chosen span, so no outline: repeating the
+/// map right next to a piece of the territory is noise, not help. A read
+/// that returns the whole file verbatim (no paging needed at all) also skips
+/// it — there is no "page 1" to orient inside.
 pub(super) fn read_file_page(
+    path: &str,
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
     tool_offload: bool,
 ) -> String {
-    if tool_offload {
-        paginate_unspillable(contents, offset, limit)
+    let base_tokens = max_output_tokens();
+    // Compute the ordinary page FIRST, at the full (unreserved) budget. A
+    // small file that returns verbatim here has no "page 1" to orient inside
+    // — reserving room for an outline before this check would risk FORCING
+    // an otherwise-whole read to paginate, just to make space for a map it
+    // never needed (the brief's "a small file is unchanged" case).
+    let page = if tool_offload {
+        paginate_unspillable(contents, offset, limit, 0)
     } else {
-        paginate_read(contents, offset, limit, max_output_tokens())
+        paginate_read(contents, offset, limit, base_tokens)
+    };
+    if offset.unwrap_or(1) > 1 || page == contents {
+        return page;
     }
+    let Some(outline) = crate::api_surface::outline_items(path, contents, 1)
+        .map(|o| crate::api_surface::render_outline(&o, crate::api_surface::OUTLINE_MAX_CHARS))
+    else {
+        return page;
+    };
+    // A self-labeled header, so the model reads this block as the file's
+    // map and names the mechanism to use it — re-read any item's span with
+    // `offset=` — rather than a bare, unexplained line of entries.
+    let lead = format!("[outline of {path} — re-read any span with offset=<start>]\n{outline}");
+    // Only NOW, knowing an outline will actually be attached, recompute the
+    // page with room reserved for it (+2 for the blank-line separator below)
+    // — so the combined result still respects the caller's model/spill
+    // budget rather than adding the outline as a bonus on top of it.
+    let reserved_chars = lead.len() + 2;
+    let page = if tool_offload {
+        paginate_unspillable(contents, offset, limit, reserved_chars)
+    } else {
+        let tokens = reserve_tokens_for_chars(base_tokens, reserved_chars);
+        paginate_read(contents, offset, limit, tokens)
+    };
+    format!("{lead}\n\n{page}")
+}
+
+/// Converts a char reservation into a token reservation, using the SAME
+/// conservative chars/token ratio the output cap itself is sized with
+/// (#2557) — so a caller that must reserve room for something else (here,
+/// the outline lead) subtracts from the same budget the page is measured
+/// against, rather than a second, inconsistent one.
+fn reserve_tokens_for_chars(max_output_tokens: usize, reserved_chars: usize) -> usize {
+    if reserved_chars == 0 || max_output_tokens == 0 {
+        return max_output_tokens;
+    }
+    let reserved_tokens = cap_estimator().tokens_for_chars(reserved_chars) + 1;
+    max_output_tokens.saturating_sub(reserved_tokens)
 }
 
 /// [`paginate_read`] held under the model-facing spill cap, for a payload read
 /// back OUT of memory (a `spill:` address given to `read_file`). `read_file`'s
 /// normal cap (~30k chars) exceeds the spill cap (16k), so without this the
 /// answer to "read this spill" would itself be spilled — a fresh handle to the
-/// very text the model asked for.
+/// very text the model asked for. `reserved_chars` is [`read_file_page`]'s
+/// outline-lead reservation (0 from any other caller, e.g. a `spill:<cid>`
+/// redemption, which never gets an outline of its own).
 pub(super) fn paginate_unspillable(
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    reserved_chars: usize,
 ) -> String {
     // paginate_read's continuation footer rides on top of its char cap.
     const FOOTER_HEADROOM: usize = 512;
@@ -293,6 +353,7 @@ pub(super) fn paginate_unspillable(
         0 => unspillable,
         budget => budget.min(unspillable),
     };
+    let tokens = reserve_tokens_for_chars(tokens, reserved_chars);
     paginate_read(contents, offset, limit, tokens)
 }
 
@@ -336,5 +397,87 @@ mod tests {
         // TOOL_RESULT_SPILL_CAP spills even with a generous budget.
         let big = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP + 1;
         assert!(should_spill_full_output(big, big, usize::MAX, true));
+    }
+
+    // ── #2557: outline-on-first-read, wired through read_file_page ──
+
+    fn big_rust_file(lines: usize) -> String {
+        (0..lines / 3)
+            .map(|i| format!("fn item_{i}() {{\n    let x = {i};\n}}\n"))
+            .collect()
+    }
+
+    /// #2557 (red first): a file that needs paging at all leads its FIRST
+    /// page with the outline — the map run 7's model was reaching for when
+    /// it re-read page 1 seven times, all before compaction ever fired (so
+    /// an aged-read-only outline would not have helped that run).
+    #[test]
+    fn a_large_first_read_leads_with_the_outline() {
+        let content = big_rust_file(3_000);
+        let page = read_file_page("newt-core/src/agentic/mod.rs", &content, None, None, false);
+        assert!(
+            page.starts_with("[outline of newt-core/src/agentic/mod.rs"),
+            "{}",
+            &page[..page.len().min(200)]
+        );
+        assert!(page.contains("fn item_0"), "{}", &page[..300]);
+        assert!(
+            page.contains("id:"),
+            "the content-addressed tag: {}",
+            &page[..300]
+        );
+        // Still says how to continue — the outline is a LEAD, not a
+        // replacement for the page.
+        assert!(page.contains("offset="), "{page}");
+    }
+
+    /// A LATER page (an explicit `offset`) never repeats the outline — the
+    /// model is already inside a chosen span.
+    #[test]
+    fn a_later_page_does_not_repeat_the_outline() {
+        let content = big_rust_file(3_000);
+        let page = read_file_page(
+            "newt-core/src/agentic/mod.rs",
+            &content,
+            Some(500),
+            None,
+            false,
+        );
+        assert!(
+            !page.starts_with("[outline of"),
+            "{}",
+            &page[..200.min(page.len())]
+        );
+    }
+
+    /// #2557 (red first, the brief's spill-cap requirement): on a 12k-line
+    /// file, WITH content offload on, the outline-plus-page result must
+    /// still stay under the spill cap — the outline is reserved OUT of the
+    /// same budget, never a bonus that pushes the combined result over it.
+    #[test]
+    fn the_outline_stays_under_the_spill_cap_on_a_12k_line_file() {
+        let content = big_rust_file(12_000);
+        let cap = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
+        let page = read_file_page("newt-core/src/agentic/mod.rs", &content, None, None, true);
+        assert!(
+            page.chars().count() <= cap,
+            "{} chars would spill: {}",
+            page.chars().count(),
+            &page[..300]
+        );
+        assert!(page.starts_with("[outline of"), "{}", &page[..200]);
+    }
+
+    /// #2557 (red first, the brief's "a small file is unchanged" requirement):
+    /// a file that fits whole (no paging needed) must NEVER be forced to
+    /// paginate just to make room for an outline it doesn't need.
+    #[test]
+    fn a_small_file_is_unchanged() {
+        let content = "fn main() {\n    println!(\"hi\");\n}\n";
+        let page = read_file_page("newt-core/src/main.rs", content, None, None, false);
+        assert_eq!(
+            page, content,
+            "a whole verbatim read must carry no outline lead"
+        );
     }
 }
