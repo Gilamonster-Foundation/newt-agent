@@ -30,7 +30,7 @@
 //!
 //! An entry exists only while it differs from the global `[session]` choice
 //! (or the default backend), is dropped when switched back, is capped at
-//! [`MAX_PROJECTS`] with least-recently-used eviction, and is pruned when its
+//! [`MAX_PROJECTS`] with least-recently-switched eviction (a start never writes), and is pruned when its
 //! path no longer exists. `[session]` is now hand-set: the app no longer
 //! writes it.
 //!
@@ -175,7 +175,7 @@ pub fn should_persist(ephemeral: bool) -> bool {
     !ephemeral
 }
 
-/// Most per-project entries kept; the least recently used is evicted first.
+/// Most per-project entries kept; the least recently switched is evicted first.
 pub const MAX_PROJECTS: usize = 32;
 
 /// One `[projects.<root>]` entry: the axes that differ from the global choice.
@@ -208,7 +208,7 @@ pub enum Choice<'a> {
 /// Record `choice` for `project` in `doc`: keep only what differs from the
 /// global `[session]` choice (`default_provider` is the config default backend,
 /// the baseline when `[session]` names none), drop the entry when nothing does,
-/// then prune paths that no longer `exist` and evict least-recently-used beyond
+/// then prune paths that no longer `exist` and evict least-recently-switched beyond
 /// [`MAX_PROJECTS`]. Pure over `doc` so it unit-tests without a filesystem.
 pub fn apply_project_choice(
     doc: &mut toml::Table,
@@ -279,7 +279,7 @@ const HEADER: &str = "\
 # (/model <name>) in the TUI: the choice is remembered PER PROJECT, under
 # [projects.\"<repo root>\"], and restored the next time newt starts there.
 # Only choices that differ from [session] (your own default, hand-set) are
-# kept; at most 32 projects, least recently used dropped, missing paths pruned.
+# kept; at most 32 projects, least recently SWITCHED dropped (reads never touch it), missing paths pruned.
 # Restore is the LOWEST precedence: an explicit NEWT_PROVIDER / NEWT_DGX_MODEL
 # in the environment, a --backend-* flag or a --loadout, or a resumed
 # conversation's pin, always wins. Delete this file to forget every choice.
@@ -349,19 +349,18 @@ fn write_doc(path: &Path, doc: &toml::Table) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
-/// The canonical repo root of the current directory (`git rev-parse
-/// --show-toplevel`), else the canonical current directory. `None` if neither
-/// resolves.
+/// The repo root for `cwd`: the parent of the nearest ancestor `.git` (a dir,
+/// or a linked worktree's file), else `cwd`. Pure over the injected `exists`.
+fn root_for(cwd: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    crate::config::find_ancestor_dir(cwd, Path::new(".git"), exists)
+        .and_then(|git| git.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// The canonical project root of the current directory (no subprocess).
 fn project_key() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let top = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    let root = top.unwrap_or(cwd);
+    let root = root_for(&cwd, |p| p.exists());
     Some(
         root.canonicalize()
             .unwrap_or(root)
@@ -630,7 +629,7 @@ mod tests {
         );
     }
 
-    /// (d): 33 projects leave 32, and the least recently used one is gone.
+    /// (d): 33 projects leave 32, and the least recently switched one is gone.
     #[test]
     fn the_table_is_capped_and_evicts_the_lru() {
         let mut d = doc("");
@@ -691,5 +690,16 @@ mod tests {
         switch(&mut d, "/a", Choice::Provider("y"));
         assert!(d.contains_key("custom"));
         assert!(to_toml_string(&d).expect("ser").contains("PER PROJECT"));
+    }
+
+    /// The root is the nearest ancestor holding `.git` (dir or worktree file),
+    /// else the cwd itself.
+    #[test]
+    fn root_is_the_git_ancestor_else_cwd() {
+        let repo = Path::new("/r");
+        let has_git = |p: &Path| p == repo.join(".git");
+        assert_eq!(root_for(Path::new("/r/a/b"), has_git), repo);
+        assert_eq!(root_for(Path::new("/r"), has_git), repo);
+        assert_eq!(root_for(Path::new("/x/y"), |_| false), Path::new("/x/y"));
     }
 }
