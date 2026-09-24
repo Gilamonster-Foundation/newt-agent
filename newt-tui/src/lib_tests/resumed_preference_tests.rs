@@ -817,3 +817,40 @@ fn a_corrupt_pin_falls_open_to_the_invocation_baseline() {
     assert_eq!(cli_cognition(), CognitionOverride::Unset);
     assert_eq!(cli_tenacity(), None);
 }
+
+/// dec4 / PR #2578: the per-project sticky restore seeds `NEWT_PROVIDER` at
+/// startup exactly like an env value; a resumed conversation's pin is applied
+/// afterwards and must beat it.
+#[test]
+fn a_resumed_pin_beats_the_per_project_sticky_restore() {
+    let _g = GlobalSettingsGuard::acquire();
+    reset_globals();
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let store = store_in(root.path(), ws.path());
+    let cfg = cfg_with(&["sol", "other"]);
+    let id = durable_conversation(&store, "pinned");
+    store
+        .update_preference_pin(
+            &id,
+            &OperatorPreferencePin {
+                backend: Some("other".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // What `Session::restore` does for this project's entry.
+    // SAFETY: guarded single-threaded test (env restored on drop).
+    unsafe { std::env::set_var("NEWT_PROVIDER", "sol") };
+    let baseline = PreferenceBaseline::snapshot(Some("sol".into()), None);
+    let mut session = Session::new(&cfg);
+
+    session.switch_at_startup(
+        StartupConversation::ResumedHeld,
+        Some(&store),
+        &id,
+        &baseline,
+        &cfg,
+    );
+    assert_eq!(std::env::var("NEWT_PROVIDER").as_deref(), Ok("other"));
+}

@@ -666,6 +666,9 @@ pub fn run_code(
         io::stdout().is_terminal(),
     );
 
+    if let Some(p) = path {
+        newt_core::settings::set_workspace(p);
+    }
     let workspace = resolve_workspace(path);
 
     // `no_splash` is already resolved by the caller (CLI flags + config).

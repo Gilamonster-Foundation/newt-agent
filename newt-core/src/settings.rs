@@ -279,7 +279,7 @@ const HEADER: &str = "\
 # (/model <name>) in the TUI: the choice is remembered PER PROJECT, under
 # [projects.\"<repo root>\"], and restored the next time newt starts there.
 # Only choices that differ from [session] (your own default, hand-set) are
-# kept; at most 32 projects, least recently SWITCHED dropped (reads never touch it), missing paths pruned.
+# kept; at most 32 projects, least recently SWITCHED dropped (reads never touch it), missing (or unmounted) paths pruned.
 # Restore is the LOWEST precedence: an explicit NEWT_PROVIDER / NEWT_DGX_MODEL
 # in the environment, a --backend-* flag or a --loadout, or a resumed
 # conversation's pin, always wins. Delete this file to forget every choice.
@@ -357,10 +357,29 @@ fn root_for(cwd: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
-/// The canonical project root of the current directory (no subprocess).
+/// The session's workspace, when it is not the process cwd (`newt headless
+/// --cwd DIR`). ponytail: process-wide instead of threading a parameter through
+/// every `/backends`/`/model` call site; one session per process.
+static WORKSPACE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Declare the session workspace so the per-project key follows it, not the
+/// directory the process happened to be launched from.
+pub fn set_workspace(dir: &Path) {
+    if let Ok(mut w) = WORKSPACE.lock() {
+        *w = Some(dir.to_path_buf());
+    }
+}
+
+/// The project root for `workspace` (else `cwd`). Pure over `exists`.
+fn key_for(workspace: Option<&Path>, cwd: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    root_for(workspace.unwrap_or(cwd), exists)
+}
+
+/// The canonical project root of the session workspace (no subprocess).
 fn project_key() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let root = root_for(&cwd, |p| p.exists());
+    let ws = WORKSPACE.lock().ok().and_then(|w| w.clone());
+    let root = key_for(ws.as_deref(), &cwd, |p| p.exists());
     Some(
         root.canonicalize()
             .unwrap_or(root)
@@ -701,5 +720,20 @@ mod tests {
         assert_eq!(root_for(Path::new("/r/a/b"), has_git), repo);
         assert_eq!(root_for(Path::new("/r"), has_git), repo);
         assert_eq!(root_for(Path::new("/x/y"), |_| false), Path::new("/x/y"));
+    }
+
+    /// PR #2578 review: `newt headless --cwd A` launched from inside B keys on
+    /// A, never on the process cwd B.
+    #[test]
+    fn the_workspace_beats_the_process_cwd() {
+        let has_git = |p: &Path| p == Path::new("/a/.git") || p == Path::new("/b/.git");
+        assert_eq!(
+            key_for(Some(Path::new("/a/sub")), Path::new("/b"), has_git),
+            Path::new("/a")
+        );
+        assert_eq!(key_for(None, Path::new("/b"), has_git), Path::new("/b"));
+        let mut d = doc("");
+        switch(&mut d, "/b", Choice::Provider("y"));
+        assert_eq!(Session::for_project(&d, "/a").provider, None);
     }
 }
