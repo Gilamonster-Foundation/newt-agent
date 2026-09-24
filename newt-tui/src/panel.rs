@@ -141,6 +141,47 @@ pub(crate) fn make_terminal(height: u16) -> io::Result<InlineTerm> {
     crate::inline_viewport::inline_terminal(lease)
 }
 
+/// Lease `wanted` rows, or — when another surface holds what that needs —
+/// the `granted` rows the panel already had. The arbiter's refusal is the
+/// ownership rule: a panel never takes rows it was not lent, and an
+/// ungrantable size change keeps the panel open rather than closing it.
+/// Returns the terminal and the height it got. The lease-taker is injected so
+/// the rule is tested against a fake arbiter.
+fn relet<T>(
+    granted: u16,
+    wanted: u16,
+    mut lease: impl FnMut(u16) -> io::Result<T>,
+) -> io::Result<(T, u16)> {
+    match lease(wanted) {
+        Ok(terminal) => Ok((terminal, wanted)),
+        Err(_) if wanted != granted => lease(granted).map(|terminal| (terminal, granted)),
+        Err(error) => Err(error),
+    }
+}
+
+/// What the driver does with one terminal event.
+#[derive(Debug, PartialEq, Eq)]
+enum Input {
+    Key(Key),
+    /// The terminal resized: measure the container again and redraw (#2571).
+    Remeasure,
+    Ignore,
+}
+
+/// Pure, so the rule that a resize is never dropped is pinned without a tty.
+fn classify(event: Event) -> Input {
+    match event {
+        // Release and Repeat are not presses. Without this filter a terminal
+        // that reports both delivers every key twice.
+        Event::Key(key) if key.kind == KeyEventKind::Press => Input::Key(key_from_event(
+            key.code,
+            key.modifiers.contains(KeyModifiers::CONTROL),
+        )),
+        Event::Resize(..) => Input::Remeasure,
+        _ => Input::Ignore,
+    }
+}
+
 /// Run `screen` until it closes, and report whether the operator applied.
 ///
 /// The raw-mode guard is scoped so its restore lands where the original bare
@@ -174,18 +215,35 @@ pub(crate) fn drive(
                 if !event::poll(Duration::from_millis(250))? {
                     continue;
                 }
-                let Event::Key(key) = event::read()? else {
-                    continue;
-                };
-                // Release and Repeat are not presses. Without this filter a
-                // terminal that reports both delivers every key twice.
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if let Flow::Close(apply) = screen.key(key_from_event(key.code, ctrl)) {
-                    applied = apply;
-                    break;
+                match classify(event::read()?) {
+                    Input::Key(key) => {
+                        if let Flow::Close(apply) = screen.key(key) {
+                            applied = apply;
+                            break;
+                        }
+                    }
+                    // #2571: a panel never owns its size. The container is
+                    // measured again — by the presenter that lent the rows, or
+                    // by a fresh bottom-rows lease — and the region is cleared,
+                    // so a narrower terminal leaves no stale cells behind.
+                    Input::Remeasure => {
+                        terminal = match window {
+                            Some(window) => {
+                                window.remeasure();
+                                window.terminal()?
+                            }
+                            None => {
+                                let granted = terminal.get_frame().area().height;
+                                // Release the old lease first: under
+                                // `OnCollision::Shift` a new one taken while
+                                // it is held would be minted ABOVE it.
+                                drop(terminal);
+                                relet(granted, height, make_terminal)?.0
+                            }
+                        };
+                        terminal.clear()?;
+                    }
+                    Input::Ignore => {}
                 }
             }
             terminal.clear()?;
@@ -198,6 +256,90 @@ pub(crate) fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2573 review: with a row holder in the way, an ungrantable size keeps
+    /// the panel at the rows it had — it neither closes nor takes more.
+    #[test]
+    fn an_ungrantable_lease_keeps_the_panel_at_its_granted_rows() {
+        // A fake arbiter: 12 free rows above a holder of the bottom rows.
+        let free = 12;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut arbiter = |rows: u16| {
+            asked.borrow_mut().push(rows);
+            if rows <= free {
+                Ok(rows)
+            } else {
+                Err(io::Error::other("another surface already owns these rows"))
+            }
+        };
+        assert_eq!(relet(8, 10, &mut arbiter).unwrap(), (10, 10), "grantable");
+        assert_eq!(
+            relet(8, 20, &mut arbiter).unwrap(),
+            (8, 8),
+            "kept, not closed"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![10, 20, 8],
+            "the fallback asks the arbiter too"
+        );
+        assert!(
+            relet(20, 20, &mut arbiter).is_err(),
+            "nothing to fall back to"
+        );
+    }
+
+    /// Grounds the fake arbiter above in the real one: a holder of the bottom
+    /// rows (a prompt viewport, say) makes a full-screen lease ungrantable, and
+    /// `relet` keeps the smaller lease `Shift` can mint above the holder.
+    #[test]
+    #[serial_test::serial(tty_arbiter)]
+    fn with_a_real_row_holder_relet_keeps_what_the_arbiter_grants() {
+        use newt_core::tty::{OnCollision, Region, Terminal};
+        let screen =
+            ratatui::backend::Backend::size(&ratatui::backend::CrosstermBackend::new(io::stdout()))
+                .map_or(24, |size| size.height);
+        let holder = Terminal::lease_region(
+            Region::Rows {
+                top: screen - 3,
+                height: 3,
+            },
+            OnCollision::Refuse,
+        )
+        .expect("the holder takes the bottom rows");
+        let lease = |rows| crate::inline_viewport::lease_bottom_rows(rows, OnCollision::Shift);
+        assert!(
+            lease(screen).is_err(),
+            "the whole screen overlaps the holder"
+        );
+        let (_kept, rows) = relet(6, screen, lease).expect("falls back, stays open");
+        assert_eq!(rows, 6);
+        drop(holder);
+    }
+
+    /// #2571: the regression this pins is a panel frozen at its opening size
+    /// because `drive` read keys only and dropped `Event::Resize`.
+    #[test]
+    fn a_resize_is_never_dropped_and_only_presses_are_keys() {
+        use crossterm::event::{KeyEvent, KeyEventState};
+        assert_eq!(classify(Event::Resize(80, 24)), Input::Remeasure);
+        assert_eq!(classify(Event::Resize(1, 1)), Input::Remeasure);
+        let key = |kind| {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                kind,
+                state: KeyEventState::NONE,
+            })
+        };
+        assert_eq!(
+            classify(key(KeyEventKind::Press)),
+            Input::Key(Key::Char('j'))
+        );
+        assert_eq!(classify(key(KeyEventKind::Release)), Input::Ignore);
+        assert_eq!(classify(key(KeyEventKind::Repeat)), Input::Ignore);
+        assert_eq!(classify(Event::FocusGained), Input::Ignore);
+    }
 
     /// **The structural half of #1889.** The PTY test proves `PanelRawGuard`
     /// restores; this proves the panels go through it.

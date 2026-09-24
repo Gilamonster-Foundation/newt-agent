@@ -268,6 +268,30 @@ impl Screen {
     /// Give the blocking window the composer's rows. Erase the editor first,
     /// then preserve any covered transcript in scrollback. The draft stays in
     /// memory and is painted again only after this window releases input.
+    /// Re-reserve a live panel's rows after a resize (#2573). Unlike
+    /// [`Self::reserve_modal_rows`] this erases only from `erase_from` — what
+    /// the OLD panel could still occupy — and scrolls nothing: the transcript
+    /// above the panel is left where the terminal put it.
+    fn remeasure_modal_rows(
+        &mut self,
+        requested: u16,
+        erase_from: u16,
+    ) -> io::Result<ModalReservation> {
+        let plan = plan_modal_reservation(self.top, self.rows, requested);
+        self.tty.hold()?;
+        let mut buf = Vec::new();
+        queue!(
+            buf,
+            crossterm::cursor::Hide,
+            MoveTo(0, erase_from.min(plan.start)),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        self.tty.write_all(&buf)?;
+        self.tty.flush()?;
+        self.term.clear()?;
+        Ok(plan)
+    }
+
     fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
@@ -583,6 +607,27 @@ fn restore_terminal_modes() {
 /// smaller) new screen.
 fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
     old_top.min(new_top).min(rows.saturating_sub(1))
+}
+
+/// The row a live panel's resize erases from (#2573): the higher of its old
+/// and new tops — both bottom-anchored, the same rule the block uses — raised
+/// by the rows a narrower terminal reflowed its old full-width rows onto.
+/// Nothing above that is the panel's, so the transcript survives.
+fn panel_erase_from(
+    old_start: u16,
+    old_rows: u16,
+    old_cols: u16,
+    cols: u16,
+    rows: u16,
+    requested: u16,
+) -> u16 {
+    let new_start = plan_modal_reservation(0, rows, requested).start;
+    let lifted = if cols < old_cols {
+        reflow_growth(&vec![usize::from(old_cols); usize::from(old_rows)], cols)
+    } else {
+        0
+    };
+    resize_erase_from(old_start, new_start, rows).saturating_sub(lifted)
 }
 
 /// How many rows the old block grows by when a terminal reflows it at `cols`:
@@ -1147,14 +1192,9 @@ impl Presenter {
                 // unwind — so the rows cannot be stranded by a panel that
                 // returns through a path nobody thought about.
                 let (release, released) = std::sync::mpsc::sync_channel(1);
-                let (top, rows) = reservation
-                    .as_ref()
-                    .map_or((0, self.screen.rows), |window| (window.start, window.rows));
                 let window = crate::session_worker::PanelWindow::new(
                     panel_output,
-                    top,
-                    rows,
-                    self.screen.cols,
+                    self.lent_area(reservation.as_ref()),
                     Some(release),
                 );
                 if reply.send(Some(window)).is_err() {
@@ -1169,7 +1209,17 @@ impl Presenter {
                 // Park. A `RecvError` means the window was dropped without a
                 // send — the same "the panel is done" signal, reached by a
                 // path that could not send. Either way: clean up.
-                let _ = released.recv();
+                // #2571: while parked, answer re-measure requests — the panel
+                // hears the resize (it owns the keyboard), this thread owns
+                // the layout. A `RecvError` is the drop: the panel is done.
+                let mut reservation = reservation;
+                while let Ok(crate::session_worker::PanelSignal::Remeasure(reply)) = released.recv()
+                {
+                    // A failed re-plan keeps the old region rather than
+                    // stranding the panel: the reply still goes out.
+                    let _ = self.remeasure_panel(mode, &mut reservation);
+                    let _ = reply.send(self.lent_area(reservation.as_ref()));
+                }
                 let modal_cleanup = self.finish_modal(reservation.as_ref());
                 self.chat_inactive = false;
                 // The panel wrote outside ratatui's diff, so the mounted block
@@ -1328,6 +1378,40 @@ impl Presenter {
                 Ok(())
             }
         }
+    }
+
+    /// The region lent to a panel: its reservation, or the whole screen for an
+    /// alternate-screen loan.
+    fn lent_area(&self, reservation: Option<&ModalReservation>) -> Rect {
+        let (top, rows) = reservation.map_or((0, self.screen.rows), |r| (r.start, r.rows));
+        Rect::new(0, top, self.screen.cols, rows)
+    }
+
+    /// #2571: the terminal resized under a live panel. The same re-layout
+    /// `finish_modal_rows` applies to a resize that lands after a dialog
+    /// closes — clear what a narrower panel may have rewrapped above its old
+    /// top, then the presenter's own resize — and the panel's rows reserved
+    /// again against the new screen.
+    fn remeasure_panel(
+        &mut self,
+        mode: PanelMode,
+        reservation: &mut Option<ModalReservation>,
+    ) -> io::Result<()> {
+        let (cols, rows) = self.screen.terminal_size()?;
+        if (cols, rows) == (self.screen.cols, self.screen.rows) {
+            return Ok(());
+        }
+        // Measured before the presenter's own resize moves its geometry.
+        let old = reservation.as_ref().map(|r| (r.start, r.rows));
+        let old_cols = self.screen.cols;
+        self.on_event(Event::Resize(cols, rows))?;
+        // An alternate-screen loan owns the whole screen and redraws it: the
+        // presenter's geometry above is its whole resize contract (#2573).
+        if let (PanelMode::Inline(requested), Some((old_start, old_rows))) = (mode, old) {
+            let erase_from = panel_erase_from(old_start, old_rows, old_cols, cols, rows, requested);
+            *reservation = Some(self.screen.remeasure_modal_rows(requested, erase_from)?);
+        }
+        Ok(())
     }
 
     /// A blocking dialog may have consumed every resize event while this
@@ -1834,6 +1918,24 @@ mod tests {
         assert_eq!(reflow_growth(&[47], 47), 0, "an exact fit does not wrap");
     }
 
+    /// #2573 review: a live panel's resize erases only rows the panel could
+    /// still occupy. The regression: clearing from row 0 wiped the transcript.
+    #[test]
+    fn a_panel_resize_erases_only_what_the_old_panel_could_occupy() {
+        // Same height, wider: only the panel's own rows (13..).
+        assert_eq!(panel_erase_from(13, 18, 100, 118, 31, 18), 13);
+        // Taller terminal: the old panel at 13.. is stale; nothing above it.
+        assert_eq!(panel_erase_from(13, 18, 100, 100, 45, 18), 13);
+        // Shorter: the new panel starts higher, so erase from its top.
+        assert_eq!(panel_erase_from(13, 18, 100, 100, 25, 18), 7);
+        // Narrower: each full-width old row reflows onto two, lifting the
+        // stale panel by its height — never past the top of the screen.
+        assert_eq!(panel_erase_from(20, 8, 100, 60, 31, 8), 12);
+        assert_eq!(panel_erase_from(13, 18, 100, 60, 31, 18), 0);
+        // Never row 0 unless the reflow truly reaches it.
+        assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
+    }
+
     #[test]
     fn resize_erases_from_the_higher_of_the_old_and_new_block_tops() {
         // Terminal grew 24->30, block 4: old top 20, new top 26 — clear from 20.
@@ -1893,7 +1995,8 @@ pub(crate) use terminal_acceptance::cockpit_pager_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
-    cockpit_clarification_input_case, panel_resize_case,
+    cockpit_clarification_input_case, cockpit_panel_loop_case, panel_live_resize_case,
+    panel_resize_case,
 };
 
 #[cfg(test)]

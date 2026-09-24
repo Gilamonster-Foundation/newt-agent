@@ -413,4 +413,45 @@ mod tests {
         assert!(rows[0].contains("all verify"), "{:?}", rows[0]);
         assert!(rows[1].starts_with('✓'));
     }
+
+    /// #2567/#2571: the box is the container. Rows fill it, the hint sits on
+    /// the last line above the border, and overflow shows the left scrollbar.
+    #[test]
+    fn overflowing_rows_fill_the_box_pin_the_hint_and_show_a_scrollbar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let panel = LinesPanel::new("inference", (0..30).map(|n| format!("row {n}")).collect());
+        let (w, h) = (40u16, 10u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| panel.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let line =
+            |y: u16| -> String { (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect() };
+        // Border on rows 0 and h-1; the hint directly above the bottom border.
+        assert!(
+            line(h - 2).contains("Esc leave"),
+            "hint not on the last line:\n{}",
+            (0..h).map(line).collect::<Vec<_>>().join("\n")
+        );
+        // Every body row between the border and the hint is a content row.
+        for y in 1..h - 2 {
+            assert!(
+                line(y).contains("row "),
+                "row {y} is not content: {:?}",
+                line(y)
+            );
+        }
+        let gutter: String = (1..h - 2)
+            .map(|y| buf.cell((1, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            gutter.contains(crate::scrollbar::SCROLL_BELOW),
+            "no ▼ in {gutter:?}"
+        );
+        assert!(
+            gutter.contains(crate::scrollbar::SCROLL_THUMB),
+            "no thumb in {gutter:?}"
+        );
+    }
 }

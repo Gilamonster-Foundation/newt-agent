@@ -151,6 +151,12 @@ fn interaction_view_child() {
         "cockpit_resize" => {
             crate::cockpit::presenter::panel_resize_case();
         }
+        "cockpit_live_resize" => {
+            crate::cockpit::presenter::panel_live_resize_case();
+        }
+        "cockpit_panel_loop" => {
+            crate::cockpit::presenter::cockpit_panel_loop_case();
+        }
         "cockpit_acceptance" => {
             crate::cockpit::presenter::cockpit_acceptance_case();
         }
@@ -334,7 +340,7 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
         .stderr(std::process::Stdio::null());
     if matches!(
         mode,
-        "cockpit_bang" | "cockpit_buffered_input" | "cockpit_pager"
+        "cockpit_bang" | "cockpit_buffered_input" | "cockpit_pager" | "cockpit_panel_loop"
     ) {
         child.env("NEWT_EDIT_MODE", "emacs");
     }
@@ -346,6 +352,11 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
 /// event source out of sibling keyboard tests, without dropping assertions.
 pub(crate) fn drive_cockpit_resize() {
     drive_cockpit_case("cockpit_resize");
+}
+
+/// #2571: the same disposable child, resizing while the panel is open.
+pub(crate) fn drive_cockpit_live_resize() {
+    drive_cockpit_case("cockpit_live_resize");
 }
 
 pub(crate) fn drive_startup_migration() {
@@ -471,6 +482,77 @@ fn drive_cockpit_pager_sizes(sizes: &[(u16, u16)]) {
         }
         if pty.termios_snapshot() != baseline {
             return Err("pager/cockpit did not restore the exact terminal mode".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    transcript.push_str(&pty.screen_to_eof());
+    assert!(result.is_ok(), "{result:?}: {transcript:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {transcript:?}"
+    );
+}
+
+/// #2573 review: drive a real panel through resizes and keys, then close it.
+/// The selection must survive, no resize may erase from row 0 (the transcript
+/// above the panel stays), the border must sit at each new width, and the
+/// draft and terminal modes must come back.
+pub(crate) fn drive_cockpit_panel_loop() {
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(24, 80);
+    let baseline = pty.termios_snapshot();
+    let mut child = spawn_child(&pty, "cockpit_panel_loop");
+    let mut transcript = String::new();
+    let result = (|| -> Result<(), String> {
+        if !pty.wait_for_screen_after("panel-row-00", "╯", REACH_TIMEOUT) {
+            return Err("the panel never painted".into());
+        }
+        transcript.push_str(&pty.screen());
+        pty.type_in("jjj");
+        if !pty.wait_for_screen("panel-row-03", REACH_TIMEOUT) {
+            return Err("the selection did not move".into());
+        }
+        transcript.push_str(&pty.screen());
+        for &(height, width) in &[(24u16, 50u16), (24, 100), (40, 100), (16, 100)] {
+            pty.resize(height, width);
+            signal_winch(child.id());
+            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
+                return Err(format!("no repaint after resize to {width}x{height}"));
+            }
+            let repaint = pty.screen();
+            transcript.push_str(&repaint);
+            if repaint.contains("\x1b[1;1H\x1b[J") || repaint.contains("\x1b[2J") {
+                return Err(format!("resize to {width}x{height} erased from row 0"));
+            }
+            let rows = screen_grid(&repaint);
+            if !rows
+                .iter()
+                .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
+            {
+                return Err(format!("border not at the new width {width}: {rows:?}"));
+            }
+            if !rows.iter().any(|row| row.contains("❯ panel-row-03")) {
+                return Err(format!(
+                    "selection lost after resize to {width}x{height}: {rows:?}"
+                ));
+            }
+        }
+        pty.type_in("\x1b");
+        if !pty.wait_for_screen("PANEL_CLOSED", REACH_TIMEOUT) {
+            return Err("Esc did not close the panel".into());
+        }
+        transcript.push_str(&pty.screen());
+        pty.type_in("\r");
+        if !pty.wait_for_screen("PANEL_LOOP_RESTORED", REACH_TIMEOUT) {
+            return Err("the draft was not handed back intact".into());
+        }
+        if pty.termios_snapshot() != baseline {
+            return Err("panel/cockpit did not restore the exact terminal mode".into());
         }
         pty.type_in("\n");
         Ok(())
