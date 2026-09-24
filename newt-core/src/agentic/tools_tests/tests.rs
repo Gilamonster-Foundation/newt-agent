@@ -71,6 +71,10 @@ mod shell_routing;
 #[path = "helper_shell_authority.rs"]
 mod shell_authority;
 
+#[cfg(test)]
+#[path = "helper_git_shell_grant.rs"]
+mod git_shell_grant;
+
 // #2274 part 1 — a binary the carried userland does not carry must produce a
 // NAMED refusal, distinguishable from a grant denial and from a binary that is
 // not installed at all.

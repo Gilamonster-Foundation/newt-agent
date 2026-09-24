@@ -179,3 +179,51 @@ fn own_branch_linked_worktree_commit_succeeds_under_a_production_shaped_session(
         .unwrap();
     assert!(String::from_utf8_lossy(&message.stdout).contains("task work"));
 }
+
+/// F32/#2537, PR #2577 round 3 item 1: round 2's "cwd always resolves inside
+/// `self.root`, so it must be the session's own repo" reasoning was false —
+/// a NESTED linked worktree's `git_dir`/`common_dir` can point ANYWHERE on
+/// disk via its `commondir` file, entirely independent of where the worktree
+/// directory itself sits. Here the session workspace `root` is a plain
+/// (non-repo) directory containing a linked worktree of a DIFFERENT repo that
+/// lives OUTSIDE the workspace entirely — `cwd` resolves inside `root` (so
+/// `checked_dispatch_root` admits it), but the repo it opens is neither
+/// write-granted nor the session's own repo. Must be refused. Would have
+/// failed before this fix: round 2's code granted this unconditionally.
+#[test]
+fn nested_worktree_of_a_foreign_repo_is_refused_even_though_cwd_is_inside_root() {
+    let root = tempfile::tempdir().unwrap();
+    let foreign = tempfile::tempdir().unwrap(); // OUTSIDE root entirely
+    git(foreign.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(foreign.path().join("seed"), "x").unwrap();
+    git(foreign.path(), &["add", "seed"]);
+    git(foreign.path(), &["commit", "-q", "-m", "init"]);
+    let nested = root.path().join("nested");
+    git(
+        foreign.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            nested.to_str().unwrap(),
+            "-b",
+            "task",
+        ],
+    );
+
+    // `root` itself is not a repo at all — the session workspace need not be
+    // one — so it can never be "the same repo" as `nested`.
+    let t = tool(root.path());
+    let mut session = Caveats::top();
+    session.fs_write = Scope::only([root.path().to_string_lossy().into_owned()]);
+    std::fs::write(nested.join("f.txt"), "x\n").unwrap();
+    let err = t
+        .dispatch(
+            "add",
+            &serde_json::json!({"cwd": "nested", "paths": ["f.txt"]}),
+            &GitCaveats::top(),
+            &session,
+        )
+        .unwrap_err();
+    assert!(err.contains("capability denied"), "got: {err}");
+}

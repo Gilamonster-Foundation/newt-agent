@@ -67,7 +67,8 @@ use shell::{
     shell_envelope_output, venv_env_map,
 };
 use shell::{
-    declared_filesystem_requests, exec_confined_command, resolve_exec_cwd, split_leading_cd,
+    declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,
+    resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
 use shell::{
@@ -3829,13 +3830,18 @@ async fn execute_authorized_tool(
                 Ok(requests) => requests,
                 Err(error) => return host_return(error),
             };
+            // F32/#2537 round 3: a bare `git …` in this session's own repo, on
+            // a non-default branch, gets kernel WRITE on its own gitdir +
+            // `objects/` for THIS dispatch only — see
+            // `dispatch_caveats_for_git_shell`'s doc comment.
+            let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             executed(
                 exec_confined_command(
                     cmd,
                     &run_cwd,
                     color,
                     tool_output_lines,
-                    caveats,
+                    &git_shell_caveats,
                     &filesystem_requests,
                     exec_floor,
                     &mut permission_gate,

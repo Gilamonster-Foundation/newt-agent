@@ -1509,18 +1509,38 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         }
         let (git_dir, common_dir, worktree) =
             scoped_repository_paths(&root, &read_scope).map_err(|e| e.to_string())?;
-        // A whole-directory `permits_path(write_scope, git_dir/common_dir)` check
-        // used to gate mutation here. It always failed for a linked worktree's
-        // own repo (F32, #2537): `checked_dispatch_root` already proved `cwd`
-        // resolves *inside* `self.root` (the session workspace), so this is
-        // always the session's own repository — there is no other repo `cwd`
-        // could reach. The actual invariant that matters (never move the
-        // default branch) is enforced at the engine layer, in
-        // `refuse_if_default_branch`, below every `commit`/`amend`/`rebase`;
-        // this in-process tool writes refs/objects directly and was never
-        // gated by the session `fs_write` scope in the first place (see the
-        // no-`cwd` arm above, which never consulted it either). PR #2577
-        // review.
+        // PR #2577 round 2 removed a whole-directory `permits_path(write_scope,
+        // git_dir/common_dir)` check here on the theory that `cwd` resolving
+        // *inside* `self.root` (proved by `checked_dispatch_root`) means `cwd`
+        // is always the session's own repository. Round 3 correction: that is
+        // FALSE — a NESTED repository (#2552 `InsideRepo`) is supported, and a
+        // nested LINKED worktree's `git_dir`/`common_dir` can point anywhere on
+        // disk via its `commondir` file, regardless of where the worktree
+        // directory itself sits. So the gate is restored, widened by exactly
+        // one case: mutation through `cwd` is permitted when the resolved
+        // `git_dir`/`common_dir` are EITHER an explicit `fs_write` grant, OR
+        // are the session workspace's OWN repository — the same
+        // `git_dir`/`common_dir` `self.root` itself resolves to (the case
+        // `refuse_if_default_branch` protects at the engine layer). Anything
+        // else — a foreign nested repo `cwd` merely happens to point at — falls
+        // back to needing the ordinary explicit `fs_write` grant.
+        if explicit_cwd
+            && mutates
+            && ![&git_dir, &common_dir]
+                .iter()
+                .all(|path| newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy()))
+        {
+            let is_own_repo = scoped_repository_paths(&self.root, &read_scope)
+                .ok()
+                .is_some_and(|(own_git_dir, own_common_dir, _)| {
+                    git_dir == own_git_dir && common_dir == own_common_dir
+                });
+            if !is_own_repo {
+                return Err(
+                    "capability denied: fs_write for selected worktree Git metadata".into(),
+                );
+            }
+        }
         if op == "branch-list" {
             validate_branch_ref_inputs(&git_dir, &common_dir, &read_scope)
                 .map_err(|e| e.to_string())?;
