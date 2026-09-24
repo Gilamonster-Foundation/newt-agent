@@ -8633,6 +8633,9 @@ fn session_body(
                                         openai_api: turn_api,
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
+                                        overflow_retry: model_tune
+                                            .and_then(|t| t.overflow_retry)
+                                            .unwrap_or_default(),
                                         attempt_ledger: Some(&turn_attempts),
                                         reasoning_replay_scope: turn_capabilities.reasoning_replay_scope(),
                                         emits_leading_reasoning: turn_capabilities.emits_leading_reasoning(),

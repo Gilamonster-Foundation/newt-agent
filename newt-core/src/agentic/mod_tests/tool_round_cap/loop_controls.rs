@@ -85,6 +85,7 @@ async fn a_set_cancel_flag_abandons_the_turn_before_any_network_call() {
     let flag = std::sync::atomic::AtomicBool::new(true);
     let (reply, streamed, usage, hallu) = chat_complete(
         ChatCtx {
+            overflow_retry: Default::default(),
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -423,6 +424,7 @@ async fn read_only_nudge_injected_after_three_rounds() {
     let caveats = Caveats::top();
     let (reply, _streamed, _usage, _hallu) = chat_complete(
         ChatCtx {
+            overflow_retry: Default::default(),
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,

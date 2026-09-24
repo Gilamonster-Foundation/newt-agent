@@ -8,6 +8,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,

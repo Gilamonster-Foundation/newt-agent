@@ -39,7 +39,7 @@ pub(crate) use layering::{
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
 pub use memory::{MemoryConfig, MemoryDisclosure, MemoryProviderKind};
-pub use newt_tuner::ModelTuning;
+pub use newt_tuner::{ModelTuning, OverflowRetry};
 pub use permissions::{ModeConfig, PermissionPreset, ToolPermissions};
 pub use presentation::{
     markdown_is_session_pinned, session_markdown_mode, session_spill_lines,

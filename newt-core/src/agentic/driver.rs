@@ -180,6 +180,8 @@ pub struct TurnDriverConfig {
     /// #2312: explicit output-token allowance for driven turns. `None` keeps
     /// the cognition table and wire defaults.
     pub output_allowance: Option<u32>,
+    /// `[[model_tuning]] overflow_retry` for driven turns.
+    pub overflow_retry: crate::config::OverflowRetry,
     /// #2313: explicit run-level call-count allowance for driven turns.
     /// `None` keeps dispatch unbudgeted (today's default behavior).
     pub run_allowance: Option<u32>,
@@ -233,6 +235,7 @@ impl TurnDriverConfig {
             context_manager: crate::ContextManager::default(),
             code_search: None,
             output_allowance: None,
+            overflow_retry: Default::default(),
             run_allowance: None,
         }
     }
@@ -743,6 +746,7 @@ async fn run_one_turn(
         responses_capability: config.responses_capability.clone(),
         openai_api: config.openai_api,
         output_allowance: config.output_allowance,
+        overflow_retry: config.overflow_retry,
         attempt_ledger: Some(&attempt_ledger),
         reasoning_replay_scope: config.reasoning_replay_scope,
         emits_leading_reasoning: config.emits_leading_reasoning,
