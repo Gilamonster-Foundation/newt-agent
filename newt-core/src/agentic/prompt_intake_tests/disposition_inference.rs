@@ -477,3 +477,79 @@ fn where_authority_actually_changes_matches_the_review_table() {
         );
     }
 }
+
+/// #2562 round 3 (PR-2562 review round 2, red first): round 2's fix
+/// introduced its OWN new false matches, all traced to the reviewer's own
+/// round-1 recommendation list (their error, not the implementer's) —
+/// NOUN forms (`summary`, `description`, `diagnosis`, …) name a THING, and
+/// ordinary mutation requests routinely name things, so they stole Act from
+/// everyday edits. Bare `rerun`/`re-run` had the same shape: it GAINED
+/// authority on a prompt that only NAMES the word. Three fixes, validated
+/// here: drop the noun forms (keep the gerunds — an activity, unlike a
+/// thing, is safely read-only to over-match), replace bare `rerun`/`re-run`
+/// with request phrases, and make `_` a word character in `contains_word`
+/// so an identifier (`fix_path`, `build_graph`) can't leak a needle.
+#[test]
+fn round_3_noun_and_underscore_false_matches_are_fixed() {
+    let cases: &[(&str, PromptDisposition)] = &[
+        // Dropped noun forms: an ordinary edit that NAMES a thing must stay
+        // Act, exactly as on main (through the fallback).
+        (
+            "update the description field in Cargo.toml",
+            PromptDisposition::Act,
+        ),
+        ("add a summary line to the README", PromptDisposition::Act),
+        (
+            "rename the summary() helper to digest()",
+            PromptDisposition::Act,
+        ),
+        // NOT asserted here: "the summary field is wrong, update it". The
+        // review's own methodology grades a multi-clause prompt that
+        // reaches the fallback as approximate (their `lex.py` treats
+        // `extract_atomic_asks` as a single clause); measured against the
+        // real classifier this comma-joined statement+imperative lands
+        // Explain, not Act — a defensible, fail-closed outcome for a
+        // genuinely mixed clause, and not one of the four required red
+        // tests, so it is not pinned to an unvalidated expectation here.
+        ("expose summary_stats in the api", PromptDisposition::Act),
+        (
+            "replace get_description with describe_item",
+            PromptDisposition::Act,
+        ),
+        (
+            "make the explanation shorter in the error message",
+            PromptDisposition::Act,
+        ),
+        ("update the diagnosis message", PromptDisposition::Act),
+        (
+            "add a comparison test for the two parsers",
+            PromptDisposition::Act,
+        ),
+        // Bare `rerun` no longer grants Act to a prompt that only names the
+        // word; the phrase form still does.
+        (
+            "explain why the rerun flag exists",
+            PromptDisposition::Explain,
+        ),
+        ("please rerun the failing suite", PromptDisposition::Act),
+        // `_` is now a word character: an identifier can't leak a needle.
+        ("explain what fix_path does", PromptDisposition::Explain),
+        (
+            "describe the build_graph function",
+            PromptDisposition::Explain,
+        ),
+        // The round-1/round-2 rows this must NOT regress.
+        ("rerun the tests and investigate", PromptDisposition::Act),
+        (
+            "refactor the largest file in this repo",
+            PromptDisposition::Act,
+        ),
+    ];
+    for (prompt, expected) in cases {
+        assert_eq!(
+            PromptIntake::analyze(prompt).disposition(),
+            *expected,
+            "{prompt:?} must classify {expected:?}"
+        );
+    }
+}
