@@ -506,6 +506,64 @@ pub(crate) fn panel_live_resize_case() {
     assert!(cockpit.screen.viewport_rect().bottom() <= 30);
 }
 
+/// #2573 review: the whole panel path on a real terminal — the cockpit lends
+/// rows, `panel::drive` runs a real panel through its own event loop, and the
+/// parent resizes and types. Grounds `panel::classify`, `PanelWindow`'s
+/// remeasure tests and `panel_erase_from`, none of which can observe a real
+/// terminal's resize, rendered cells or restored modes.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_driven_panel_survives_resizes_keeps_its_selection_and_hands_back_the_draft() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_loop();
+}
+
+pub(crate) fn cockpit_panel_loop_case() {
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let before = termios_of(0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit
+        .screen
+        .insert_rows(vec![b"HISTORY_ABOVE_PANEL".to_vec()])
+        .unwrap();
+    cockpit
+        .editor
+        .on_event(
+            Event::Paste("draft-survives-the-panel".into()),
+            &mut cockpit.screen,
+        )
+        .unwrap();
+    cockpit.draw().unwrap();
+    let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
+    let worker = std::thread::spawn(move || {
+        let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
+        let window = crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(8));
+        let rows = (0..30).map(|n| format!("panel-row-{n:02}")).collect();
+        let mut panel = crate::lines_panel::LinesPanel::new("loop", rows);
+        crate::panel::drive(&mut panel, 8, window.as_ref()).unwrap();
+        drop(window);
+        println!("PANEL_CLOSED");
+        match remote.read_line("after panel").unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "draft-survives-the-panel"),
+            other => panic!("the panel lost the draft: {other:?}"),
+        }
+    });
+    cockpit.run(&requests).unwrap();
+    worker.join().unwrap();
+    assert!(
+        modes_equal(&before, &termios_of(0)),
+        "exact termios restore"
+    );
+    println!("PANEL_LOOP_RESTORED");
+    // Let the parent sample modes before session-leader exit hangs up the tty.
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
 /// The three properties #1744 turns on, proven on one real terminal with
 /// one cockpit: Ctrl-C's two tiers, a modal occluding the composer, and the
 /// terminal handed back exactly as it was found.
