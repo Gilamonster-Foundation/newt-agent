@@ -357,11 +357,18 @@ jobs:
         run: cargo audit
 
   msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV (declared rust-version)
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
+      # The floor lives in ONE place — `rust-version` in Cargo.toml's
+      # [workspace.package]; `just msrv` reads it the same way.
+      - name: Read the declared MSRV
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       # PIPELINE PARITY: mirrored by `just msrv` + .githooks/pre-push. Verifies the
       # declared `rust-version` ([workspace.package] in Cargo.toml) actually
@@ -380,7 +387,7 @@ jobs:
       # The feature flags match every other workspace gate in this file. A
       # kernel- or schema-gated dependency is a third way for the floor to
       # drift unseen: without them it is never resolved here at all.
-      - name: cargo check (MSRV 1.88, all targets)
+      - name: cargo check (declared MSRV, all targets)
         run: cargo check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
 
   musl:

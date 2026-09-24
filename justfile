@@ -372,24 +372,26 @@ audit:
 # --- MSRV (A2) ---
 
 # MSRV gate: the workspace — lib, bin AND test targets — must compile on the
-# declared rust-version (1.88, [workspace.package] in Cargo.toml). PIPELINE
-# PARITY: mirrors the "MSRV (Rust 1.88)" job in .github/workflows/ci.yml and
+# declared rust-version ([workspace.package] in Cargo.toml — the ONE place the
+# number lives; this recipe and CI read it). PIPELINE
+# PARITY: mirrors the MSRV job in .github/workflows/ci.yml and
 # the .githooks/pre-push hook. `--all-targets` is what makes dev-dependencies
 # count (#2161): without it they resolve but never build, so their
 # rust-version is never enforced and the floor can drift under the tests.
 # The feature flags match `just test` and the CI test/lint jobs: a kernel- or
 # schema-gated dependency is otherwise never resolved here at all.
-# Local best-effort: needs rustup + the 1.88 toolchain; skips (with a note)
+# Local best-effort: needs rustup + the declared toolchain; skips (with a note)
 # otherwise — CI is the hard gate.
 msrv:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! rustup toolchain list 2>/dev/null | grep -q '^1\.88'; then
-        echo "[msrv] rust 1.88 toolchain not installed — skipping locally (CI enforces it)."
-        echo "        install: rustup toolchain install 1.88"
+    msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    if ! rustup toolchain list 2>/dev/null | grep -q "^${msrv}"; then
+        echo "[msrv] rust ${msrv} toolchain not installed — skipping locally (CI enforces it)."
+        echo "        install: rustup toolchain install ${msrv}"
         exit 0
     fi
-    cargo +1.88 check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
+    cargo +"${msrv}" check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
 
 # --- Coverage ---
 #
