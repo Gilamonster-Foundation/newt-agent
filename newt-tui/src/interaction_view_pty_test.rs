@@ -542,6 +542,36 @@ pub(crate) fn drive_cockpit_panel_loop() {
                 ));
             }
         }
+        // #2574: the sizing keys, through the same loop. Height is counted
+        // from the drawn borders; the selection must survive every step.
+        let panel_height = |rows: &[String]| {
+            let top = rows.iter().position(|row| row.contains('╭'));
+            let bottom = rows.iter().rposition(|row| row.contains('╰'));
+            top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
+        };
+        for (keys, want, what) in [
+            ("\x1b[1;2A", Some(9), "Shift-Up grows one row"),
+            ("\x1b[1;2B", Some(8), "Shift-Down shrinks one row"),
+            ("\x1a", Some(16), "Ctrl-Z fills the 16-row screen"),
+            ("\x1a", Some(8), "Ctrl-Z again restores the prior height"),
+        ] {
+            pty.type_in(keys);
+            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
+                return Err(format!("no repaint after: {what}"));
+            }
+            let repaint = pty.screen();
+            transcript.push_str(&repaint);
+            let rows = screen_grid(&repaint);
+            if panel_height(&rows) != want {
+                return Err(format!(
+                    "{what}: height {:?}: {rows:?}",
+                    panel_height(&rows)
+                ));
+            }
+            if !rows.iter().any(|row| row.contains("❯ panel-row-03")) {
+                return Err(format!("selection lost after: {what}: {rows:?}"));
+            }
+        }
         pty.type_in("\x1b");
         if !pty.wait_for_screen("PANEL_CLOSED", REACH_TIMEOUT) {
             return Err("Esc did not close the panel".into());
