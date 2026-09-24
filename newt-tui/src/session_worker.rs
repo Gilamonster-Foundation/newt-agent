@@ -261,7 +261,9 @@ impl PanelWindow {
         }
     }
 
-    #[cfg(test)]
+    /// Test-only here, and unix-only with its callers (the remeasure tests and
+    /// the cockpit acceptance cases); #2574's driver makes it production.
+    #[cfg(all(test, unix))]
     pub(crate) fn area(&self) -> ratatui::layout::Rect {
         self.area.get()
     }
