@@ -411,37 +411,71 @@ pub fn nested_current_paths(snapshots: &[NestedRepoSnapshot]) -> (Vec<String>, V
     (files, unprobed)
 }
 
-/// F26 v3 (#2552 round 2): the ONE decision every hand-back git source must
-/// obey — is `workspace` itself a repo TOPLEVEL, not merely somewhere inside
-/// one? `git rev-parse --show-toplevel`, CANONICALIZED, compared against a
-/// CANONICALIZED `workspace` (not the lexical comparison v2 used): a
-/// symlinked spelling of the real root — macOS `/tmp` → `/private/tmp`, or a
-/// symlinked checkout — must still read as "own repo", not as "a
-/// subdirectory that happens to share the same toplevel". `false` covers
-/// both "not a repo at all" and "a subdirectory of a larger repo" — the two
-/// cases that must never reach an unscoped engine/status view, so every
-/// caller (the shelled `snapshot_workspace` below, `newt_git::GitEngine`
-/// opened by `headless.rs`, its commits/HEAD baseline, and the nested-repo
-/// probe's gate) makes the SAME call from the SAME check, rather than three
-/// independent (and, in #2552, inconsistent) tests.
+/// F26 v4 (#2552 round 3): the ONE decision every hand-back git source must
+/// obey — where does `workspace` sit relative to a repo? `git rev-parse
+/// --show-toplevel`, CANONICALIZED, compared against a CANONICALIZED
+/// `workspace` (a symlinked spelling of the real root — macOS `/tmp` →
+/// `/private/tmp`, or a symlinked checkout — must still read as
+/// [`OwnRoot`](WorkspaceRepoLocation::OwnRoot)). Three-way, not the round-2
+/// bool: round 2's `false` collapsed "not a repo at all" and "a subdirectory
+/// of a larger repo" into one case and dropped subtree-scoped status
+/// entirely for the second — round 3's review: that re-creates the exact
+/// "nothing changed" bug this PR fixes for the everyday `--cwd repo/crate`
+/// invocation, where `crate` has no nested repos of its own to fall back on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceRepoLocation {
+    /// `workspace` IS the repo toplevel — today's behaviour, unchanged.
+    OwnRoot,
+    /// `workspace` is a SUBDIRECTORY of a larger repo. `prefix` is `git
+    /// rev-parse --show-prefix` (e.g. `"crate/"`) — the string every path
+    /// reported for this case is stripped of, so it stays workspace-relative.
+    InsideRepo { prefix: String },
+    /// No repo found at all (or the read scope refused the probe).
+    NotARepo,
+}
+
+/// See [`WorkspaceRepoLocation`]. Every caller (the shelled `snapshot_workspace`
+/// / `snapshot_workspace_subtree` below, `newt_git::GitEngine` opened by
+/// `headless.rs`, its commits/HEAD baseline, and the nested-repo probe's
+/// gate) makes this SAME call, rather than independent (and, in #2552,
+/// inconsistent) tests.
 #[must_use]
-pub fn is_workspace_repo_root(workspace: &str, read_scope: &crate::Scope<String>) -> bool {
+pub fn locate_workspace_repo(
+    workspace: &str,
+    read_scope: &crate::Scope<String>,
+) -> WorkspaceRepoLocation {
     let Some(toplevel) = git_in(workspace, &["rev-parse", "--show-toplevel"], read_scope) else {
-        return false;
+        return WorkspaceRepoLocation::NotARepo;
     };
     let (Ok(toplevel), Ok(root)) = (
         std::fs::canonicalize(toplevel.trim()),
         std::fs::canonicalize(workspace),
     ) else {
-        return false;
+        return WorkspaceRepoLocation::NotARepo;
     };
-    toplevel == root
+    if toplevel == root {
+        return WorkspaceRepoLocation::OwnRoot;
+    }
+    let Some(prefix) = git_in(workspace, &["rev-parse", "--show-prefix"], read_scope) else {
+        return WorkspaceRepoLocation::NotARepo;
+    };
+    WorkspaceRepoLocation::InsideRepo {
+        prefix: prefix.trim().to_string(),
+    }
 }
 
-/// The workspace's changed-path snapshot when [`is_workspace_repo_root`] is
-/// `true`; `None` otherwise (off-repo, or `workspace` is a subdirectory of a
-/// larger repo) — the caller's job is then the nested-repo probe instead,
-/// never an unscoped view of an enclosing repo (#2552 round 2 / F26 v3).
+/// Convenience for a caller that only needs the `OwnRoot` yes/no (e.g.
+/// deciding whether the embedded `GitEngine`'s STATUS methods, never its
+/// commits, are safe to use — see [`WorkspaceRepoLocation`]'s doc).
+#[must_use]
+pub fn is_workspace_repo_root(workspace: &str, read_scope: &crate::Scope<String>) -> bool {
+    locate_workspace_repo(workspace, read_scope) == WorkspaceRepoLocation::OwnRoot
+}
+
+/// The workspace's changed-path snapshot when it IS a repo toplevel
+/// ([`WorkspaceRepoLocation::OwnRoot`]); `None` otherwise (off-repo, or a
+/// subdirectory of a larger repo — see [`snapshot_workspace_subtree`] for
+/// that case instead, never an unscoped view of the enclosing repo).
 #[must_use]
 pub fn snapshot_workspace(
     workspace: &str,
@@ -453,6 +487,36 @@ pub fn snapshot_workspace(
     // Status alone: a repo with no commit yet has no HEAD, and must still be probed.
     let out = git_in(workspace, &SNAPSHOT_STATUS_ARGS, read_scope)?;
     Some(parse_porcelain_z(&out))
+}
+
+/// The workspace's changed-path snapshot when `workspace` is a SUBDIRECTORY
+/// of a larger repo ([`WorkspaceRepoLocation::InsideRepo`]) — F26 v2's
+/// scoping, restored in round 3 as a real (not dropped) third case: status
+/// scoped with pathspec `.` (nothing outside the workspace subtree is even
+/// considered) and every path stripped of `prefix` (`git rev-parse
+/// --show-prefix`, from [`locate_workspace_repo`]) so it stays
+/// workspace-relative. A nested git repo INSIDE the workspace collapses to a
+/// single opaque `<dir>/` placeholder in that scoped status (git never
+/// descends into an embedded repo) — dropped here, since
+/// [`snapshot_nested_repos`] is the real way to see inside one.
+#[must_use]
+pub fn snapshot_workspace_subtree(
+    workspace: &str,
+    prefix: &str,
+    read_scope: &crate::Scope<String>,
+) -> Option<StatusSnapshot> {
+    let mut args: Vec<&str> = SNAPSHOT_STATUS_ARGS.to_vec();
+    args.extend(["--", "."]);
+    let out = git_in(workspace, &args, read_scope)?;
+    Some(
+        parse_porcelain_z(&out)
+            .into_iter()
+            .filter_map(|(path, code)| {
+                let rel = path.strip_prefix(prefix)?;
+                (!rel.ends_with('/')).then(|| (rel.to_string(), code))
+            })
+            .collect(),
+    )
 }
 
 /// `phrase` appears in `text` (already lowercased) with non-alphanumeric

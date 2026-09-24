@@ -297,6 +297,25 @@ pub enum RepoFileList {
         by_repo: Vec<(String, Vec<String>)>,
         unprobed: Vec<String>,
     },
+    /// #2552 round 3: `workspace` is a SUBDIRECTORY of a larger repo
+    /// (`WorkspaceRepoLocation::InsideRepo`) — `claim_check::
+    /// snapshot_workspace_subtree`'s scoped-and-prefix-stripped status,
+    /// workspace-relative, UNION'd with any first-level nested repos the
+    /// subdirectory itself contains (`<repo>/`-prefixed, same as
+    /// [`RepoFileList::Nested`]). `files` is the flat union of both;
+    /// `by_repo`/`unprobed` cover ONLY the nested repos (the subtree's own
+    /// loose files have no "repo" to attribute them to). A DISTINCT source,
+    /// `"git_status_subtree"`, so a consumer can tell the list is scoped to
+    /// a subdirectory rather than a genuine repo root — round 2 dropped this
+    /// case entirely, which round 2's review named a regression: at the
+    /// everyday `--cwd repo/crate` invocation (no nested repos to fall back
+    /// on), everything rendered `"unavailable"` — the exact "nothing
+    /// changed" answer this PR exists to stop.
+    Subtree {
+        files: Vec<String>,
+        by_repo: Vec<(String, Vec<String>)>,
+        unprobed: Vec<String>,
+    },
 }
 
 /// One conversion, shared by `handback`'s `files_changed` and
@@ -337,6 +356,21 @@ fn repo_file_list_stanza(
             RepoFileListStanza {
                 value: serde_json::json!(files),
                 source: "nested-repos",
+                truncated,
+                by_repo: Some(by_repo),
+                unprobed,
+            }
+        }
+        Some(RepoFileList::Subtree {
+            mut files,
+            by_repo,
+            unprobed,
+        }) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            RepoFileListStanza {
+                value: serde_json::json!(files),
+                source: "git_status_subtree",
                 truncated,
                 by_repo: Some(by_repo),
                 unprobed,

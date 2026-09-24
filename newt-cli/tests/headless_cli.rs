@@ -2330,11 +2330,21 @@ async fn handback_at_a_real_repo_root_is_unaffected_by_nested_repo_support() {
 /// holding nested repo `inner/` with its own edit. The hand-back must name
 /// `inner`'s edit in BOTH `files_changed` and `uncommitted_files`, and
 /// `outer.txt` must appear in NEITHER field, NOR any `*_by_repo` breakdown —
-/// before this fix, `uncommitted_files` (sourced from `GitEngine::open`,
+/// before round 2's fix, `uncommitted_files` (sourced from `GitEngine::open`,
 /// which discovers upward same as the shelled `git`) reported the outer
 /// repo's whole dirty set, and `files_changed`'s nested probe never ran at
 /// all (gated on `snapshot_workspace`'s `None`, which the F26 v2 scoped
 /// branch no longer returned for this case).
+///
+/// Round 3 update: `workspace` genuinely IS a subdirectory of the outer
+/// repo (`WorkspaceRepoLocation::InsideRepo`, not `NotARepo` — it only
+/// LOOKED like the bare-multi-repo-root case because it has no `.git` of
+/// its own; `outer/` does), so the source is now the more accurate
+/// `"git_status_subtree"`, not `"nested-repos"` (reserved for a workspace
+/// that is not inside ANY repo at all). `inner`'s edit still surfaces via
+/// the SAME `by_repo` mechanism the round-2 fix added, now folded into the
+/// `InsideRepo` case per round 3's review table ("if first-level nested
+/// repos also exist, report both").
 #[tokio::test(flavor = "multi_thread")]
 async fn handback_at_a_repo_subdirectory_reports_only_its_nested_repo_never_the_enclosing_one() {
     let server = MockServer::start().await;
@@ -2376,7 +2386,7 @@ async fn handback_at_a_repo_subdirectory_reports_only_its_nested_repo_never_the_
         "outer.txt must appear in no field: {handback}"
     );
     assert_eq!(
-        handback["uncommitted_files_source"], "nested-repos",
+        handback["uncommitted_files_source"], "git_status_subtree",
         "{handback}"
     );
     assert_eq!(
@@ -2385,15 +2395,16 @@ async fn handback_at_a_repo_subdirectory_reports_only_its_nested_repo_never_the_
         "{handback}"
     );
     assert_eq!(
-        handback["files_changed_source"], "nested-repos",
+        handback["files_changed_source"], "git_status_subtree",
         "{handback}"
     );
     // The delta needs a matching before/after probe of the SAME repo; a
     // no-op run's `files_changed` delta legitimately stays empty since
     // `inner`'s edit predates the run start — `uncommitted_files` (the
     // CURRENT set, needing no "before") is the field that must carry it,
-    // asserted above. `files_changed_source` alone pins that the nested
-    // path was reached at all, not the enclosing repo's `"git_status_delta"`.
+    // asserted above. `files_changed_source` alone pins that the subtree
+    // path was reached at all, not the enclosing repo's unscoped
+    // `"git_status_delta"`.
 }
 
 /// #2552 round 2 should-fix (red first, end to end): a first-level entry
@@ -2484,6 +2495,57 @@ async fn handback_at_a_symlinked_repo_root_takes_the_root_branch() {
     assert!(
         handback.get("uncommitted_files_by_repo").is_none(),
         "{handback}"
+    );
+}
+
+/// #2552 round 3 (red first, end to end): the review's ruling scenario —
+/// `--cwd repo/crate` with an edit inside `crate/` and one outside it at the
+/// repo root. Round 2 made this render `"unavailable"` for every field
+/// (dropping F26 v2's subtree scoping entirely); round 3 restores it as a
+/// real third case with a DISTINCT source, `"git_status_subtree"`, so a
+/// consumer can tell the list is scoped to a subdirectory. Only the inside
+/// edit must appear, workspace-relative (no `crate/` prefix).
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_repo_subdirectory_reports_only_the_subtree_edit_with_a_distinct_source() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let repo = tempfile::tempdir().expect("repo root");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    let crate_dir = repo.path().join("crate");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+    std::fs::write(repo.path().join("root.txt"), "one\n").unwrap();
+    std::fs::write(crate_dir.join("lib.rs"), "one\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "init"]);
+    // Edit one file outside the workspace (repo root), one inside it (crate/).
+    std::fs::write(repo.path().join("root.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(crate_dir.join("lib.rs"), "one\ntwo\n").unwrap();
+
+    let handback = handback_from_a_no_op_run(&server, &crate_dir, control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status_subtree",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["lib.rs"]),
+        "workspace-relative, no crate/ prefix, and never root.txt: {handback}"
+    );
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("root.txt"),
+        "the outside-the-workspace edit must appear in no field: {handback}"
     );
 }
 
