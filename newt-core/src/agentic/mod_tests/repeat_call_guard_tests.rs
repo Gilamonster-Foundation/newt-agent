@@ -1451,6 +1451,31 @@ fn a_routed_cd_prefixed_gate_pass_still_resets_the_brake() {
     ));
 }
 
+/// F28 (#2483 evidence): a routed pass through a stripped leading `timeout`
+/// wrapper counts as verification exactly like the bare command would —
+/// `is_progress_verification` reads the recorded `routed_to` argv, which
+/// never carries the dropped `timeout` (only `timeout_secs`, a
+/// field this function never looks at), so the gate check is identical
+/// whether or not the model wrapped its call in `timeout`.
+#[test]
+fn a_routed_timeout_wrapped_gate_pass_still_resets_the_brake() {
+    use crate::ExecOutcome::Passed;
+    let wrapped = serde_json::json!({ "command": "timeout 300 cargo test -p newt-core" });
+    let routed = (
+        "build_exec",
+        serde_json::json!({
+            "argv": ["cargo", "test", "-p", "newt-core"],
+            "timeout_secs": 300,
+        }),
+    );
+    assert!(is_progress_verification(
+        "run_command",
+        &wrapped,
+        Some(Passed),
+        Some(&routed)
+    ));
+}
+
 /// #2551 round 2 should-fix (red first): `is_progress_verification` must
 /// NEVER disagree with what dispatch actually decided, even when the
 /// filesystem changed between dispatch and this call. Measured shape: `cd

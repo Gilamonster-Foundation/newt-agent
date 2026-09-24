@@ -1029,6 +1029,19 @@ fn escalated_after_timeout(
     result
 }
 
+/// Render a wall clock for the routed-note wording (F28 round 2): whole
+/// minutes when the wall is minute-granular (`30 min`, matching round 1's
+/// wording), seconds otherwise (`2s`) — a `timeout 2 …` test wall must not
+/// be misreported as "0 min"/"1 min" by naive `div_ceil(60)` rounding.
+fn format_wall(wall: std::time::Duration) -> String {
+    let secs = wall.as_secs();
+    if secs > 0 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// F19/#2541 round 2 item 3, round 3 item 2: the ONE decision the escalation
 /// makes, isolated from formatting so it is table-testable on its own — only
 /// a genuine timeout justifies spending the build lane's authority on a
@@ -1170,6 +1183,7 @@ async fn lifecycle_run_with_escalation(
             wall.as_secs()
         )),
         None,
+        shell::LIFECYCLE_BUILD_TIMEOUT,
         presentation,
     )
     .await;
@@ -1308,6 +1322,12 @@ async fn run_confined_build_lane(
     // rendered output is cut, on the harness side, never inside a shell that
     // could mask the exit code. `None` for every other caller (unchanged).
     trim: Option<OutputTrim>,
+    // F28 round 2 (PR-F28 review, Blocker 2): the wall clock THIS call
+    // should die at. `shell::LIFECYCLE_BUILD_TIMEOUT` for every caller
+    // except a routed `timeout N …` wrapper, which passes
+    // `min(N, LIFECYCLE_BUILD_TIMEOUT)` so a model's own shorter hang guard
+    // is honoured instead of silently widened to the lane's full 30 min.
+    wall: std::time::Duration,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
@@ -1332,8 +1352,7 @@ async fn run_confined_build_lane(
             )
         }
     };
-    let request =
-        build_tool_request(&root, &cwd, program, argv).timeout(shell::LIFECYCLE_BUILD_TIMEOUT);
+    let request = build_tool_request(&root, &cwd, program, argv).timeout(wall);
     let build = request.caveats();
     if let Some(harness) = smart_harness {
         if let Err(error) = harness.validate_tool_authority(build, &root) {
@@ -3943,6 +3962,7 @@ async fn execute_authorized_tool(
                             spill_store,
                             None,
                             None,
+                            shell::LIFECYCLE_BUILD_TIMEOUT,
                             presentation,
                         )
                         .await,
@@ -4044,6 +4064,19 @@ async fn execute_authorized_tool(
             // (`build_piped_to_trim_route`) — the build's own exit code
             // still decides `outcome`; only the rendered text is cut.
             let trim = OutputTrim::from_json(args.get("trim"));
+            // F28 round 2 (PR-F28 review, Blocker 2): a routed `timeout N …`
+            // wrapper carries its parsed `N` here (`routing::strip_leading_timeout`),
+            // in place of the round-1 `timeout_dropped` flag that just threw
+            // it away. `0` is GNU `timeout`'s own "no timeout" — treated as
+            // "use the lane's own wall", never as an instant timeout.
+            let timeout_secs = args.get("timeout_secs").and_then(serde_json::Value::as_u64);
+            let wall = match timeout_secs {
+                Some(0) | None => shell::LIFECYCLE_BUILD_TIMEOUT,
+                Some(secs) => std::cmp::min(
+                    std::time::Duration::from_secs(secs),
+                    shell::LIFECYCLE_BUILD_TIMEOUT,
+                ),
+            };
             let (text, outcome) = run_confined_build_lane(
                 workspace,
                 &effective_dir,
@@ -4059,6 +4092,7 @@ async fn execute_authorized_tool(
                 spill_store,
                 None,
                 trim,
+                wall,
                 presentation,
             )
             .await;
@@ -4084,15 +4118,38 @@ async fn execute_authorized_tool(
             } else {
                 ""
             };
+            // F28 round 2 (PR-F28 review, Blocker 2): say WHICH wall a
+            // leading `timeout` wrapper actually left in effect — round 1's
+            // "the lane's own 30 min limit already applies" was false
+            // whenever the model's own N was shorter than the lane wall
+            // (`timeout 60 cargo test`, a hang guard, used to silently wait
+            // up to 30 min). `wall` above is already `min(N, lane wall)`.
+            let timeout_clause = match timeout_secs {
+                None | Some(0) => String::new(),
+                Some(secs) => {
+                    if wall.as_secs() == secs {
+                        format!(
+                            "; `timeout {secs}` honoured as this lane's wall ({})",
+                            format_wall(wall)
+                        )
+                    } else {
+                        format!(
+                            "; `timeout {secs}` was capped at the lane's {} limit",
+                            format_wall(wall)
+                        )
+                    }
+                }
+            };
+            let wall_desc = format_wall(wall);
             let note = match trim {
                 Some(trim) => format!(
-                    "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline; {}{cd_clause}{echo_clause}]",
+                    "[routed `{display}` to the confined build lane — {wall_desc} limit, \
+                     network denied/offline; {}{cd_clause}{echo_clause}{timeout_clause}]",
                     trim.note_clause()
                 ),
                 None => format!(
-                    "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline{cd_clause}{echo_clause}]"
+                    "[routed `{display}` to the confined build lane — {wall_desc} limit, \
+                     network denied/offline{cd_clause}{echo_clause}{timeout_clause}]"
                 ),
             };
             executed((append_routed_note(text, note), outcome))
