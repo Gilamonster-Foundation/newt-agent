@@ -294,15 +294,18 @@ impl RouteTable {
     /// lane (`build_exec`) — a non-routable remainder (`timeout 5 rm -rf
     /// x`) stays `Exec`, same as the bare `rm` case always was.
     fn classify_stripped(&self, command: &str) -> RouteDecision {
-        if let Some(remainder) = strip_leading_timeout(command) {
+        if let Some((timeout_secs, remainder)) = strip_leading_timeout(command) {
             return match self.classify_build_shapes(remainder) {
                 RouteDecision::Route {
                     tool: "build_exec",
                     args,
-                } => mark_timeout_dropped(RouteDecision::Route {
-                    tool: "build_exec",
-                    args,
-                }),
+                } => mark_timeout_secs(
+                    RouteDecision::Route {
+                        tool: "build_exec",
+                        args,
+                    },
+                    timeout_secs,
+                ),
                 _ => RouteDecision::Exec,
             };
         }
@@ -706,7 +709,7 @@ fn mark_echo_dropped(decision: RouteDecision) -> RouteDecision {
 /// REMAINDER is itself routable (and so whether the strip actually applies)
 /// is [`RouteTable::classify_stripped`]'s call, not this function's — this
 /// is pure lexical stripping only.
-fn strip_leading_timeout(command: &str) -> Option<&str> {
+fn strip_leading_timeout(command: &str) -> Option<(u64, &str)> {
     let after = command.strip_prefix("timeout")?;
     let mut rest = after.strip_prefix(char::is_whitespace)?.trim_start();
     loop {
@@ -724,7 +727,24 @@ fn strip_leading_timeout(command: &str) -> Option<&str> {
     if remainder.is_empty() {
         return None;
     }
-    Some(remainder)
+    Some((duration_secs(duration), remainder))
+}
+
+/// Parse a value [`is_plain_duration`] already validated (digits, optional
+/// trailing `s`/`m`/`h`/`d`) into whole seconds — GNU `timeout`'s own units.
+/// No suffix means seconds, `timeout`'s own default.
+fn duration_secs(token: &str) -> u64 {
+    let (digits, multiplier) = match token.chars().last() {
+        Some('s') => (&token[..token.len() - 1], 1),
+        Some('m') => (&token[..token.len() - 1], 60),
+        Some('h') => (&token[..token.len() - 1], 3600),
+        Some('d') => (&token[..token.len() - 1], 86400),
+        _ => (token, 1),
+    };
+    digits
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_mul(multiplier)
 }
 
 /// Split `s` (already left-trimmed by the caller where it matters) into its
@@ -750,10 +770,30 @@ fn split_first_token(s: &str) -> Option<(&str, &str)> {
 fn consume_timeout_option<'a>(token: &str, tail: &'a str) -> Option<&'a str> {
     match token {
         "--preserve-status" | "--foreground" => Some(tail),
-        "-s" | "-k" => split_first_token(tail).map(|(_, rest)| rest),
-        _ if token.starts_with("--signal=") || token.starts_with("--kill-after=") => Some(tail),
+        "-s" => {
+            split_first_token(tail).and_then(|(value, rest)| is_plain_signal(value).then_some(rest))
+        }
+        "-k" => split_first_token(tail)
+            .and_then(|(value, rest)| is_plain_duration(value).then_some(rest)),
+        _ if token.starts_with("--signal=") => {
+            is_plain_signal(&token["--signal=".len()..]).then_some(tail)
+        }
+        _ if token.starts_with("--kill-after=") => {
+            is_plain_duration(&token["--kill-after=".len()..]).then_some(tail)
+        }
         _ => None,
     }
+}
+
+/// Is `token` a plain `timeout` `-s`/`--signal` SIGNAL — letters and digits
+/// only (`TERM`, `SIGKILL`, `9`)? No metacharacter can hide in a value this
+/// narrow, so no separate refusal is needed downstream (Blocker 1, PR-F28
+/// review): a metacharacter here — `$(...)`, `` ` ``, `;`, `|`, `>`, `&`, a
+/// quote — used to be accepted verbatim and silently vanish once the
+/// `timeout` prefix was stripped, discarding a command substitution the real
+/// shell would have run.
+fn is_plain_signal(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Is `token` a plain `timeout` DURATION — digits only, with an optional
@@ -768,19 +808,23 @@ fn is_plain_duration(token: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Flag a routed `build_exec` call as having had a leading `timeout` wrapper
-/// dropped — read by `tools.rs`'s note so the model is told why no
-/// `timeout`-imposed wall applies: the build lane's OWN wall
-/// (`LIFECYCLE_BUILD_TIMEOUT` in `tools/shell.rs`) already
-/// covers it. Mirrors [`mark_echo_dropped`]'s shape exactly.
-fn mark_timeout_dropped(decision: RouteDecision) -> RouteDecision {
+/// Carry a routed `build_exec` call's leading `timeout N …` duration as
+/// `timeout_secs` — read by `tools.rs`'s `build_exec` arm, which applies
+/// `min(timeout_secs, LIFECYCLE_BUILD_TIMEOUT)` as the lane's ACTUAL wall,
+/// rather than round 1's `timeout_dropped: true` flag, which discarded the
+/// model's own (possibly shorter) bound entirely (PR-F28 review, Blocker 2).
+/// Mirrors [`mark_echo_dropped`]'s shape.
+fn mark_timeout_secs(decision: RouteDecision, timeout_secs: u64) -> RouteDecision {
     match decision {
         RouteDecision::Route {
             tool: "build_exec",
             mut args,
         } => {
             if let Some(obj) = args.as_object_mut() {
-                obj.insert("timeout_dropped".to_string(), Value::Bool(true));
+                obj.insert(
+                    "timeout_secs".to_string(),
+                    Value::Number(timeout_secs.into()),
+                );
             }
             RouteDecision::Route {
                 tool: "build_exec",
@@ -2556,7 +2600,7 @@ mod tests {
                 tool: "build_exec",
                 args: json!({
                     "argv": ["cargo", "build", "-p", "newt-core"],
-                    "timeout_dropped": true,
+                    "timeout_secs": 300,
                 }),
             }
         );
@@ -2579,7 +2623,7 @@ mod tests {
                 args: json!({
                     "argv": ["cargo", "build", "-p", "newt-core"],
                     "cwd": "sub",
-                    "timeout_dropped": true,
+                    "timeout_secs": 300,
                 }),
             }
         );
@@ -2596,7 +2640,7 @@ mod tests {
                 args: json!({
                     "argv": ["cargo", "build"],
                     "trim": { "mode": "tail", "n": 20 },
-                    "timeout_dropped": true,
+                    "timeout_secs": 300,
                 }),
             }
         );
@@ -2613,7 +2657,7 @@ mod tests {
                 args: json!({
                     "argv": ["cargo", "build", "-p", "newt-core"],
                     "echo_dropped": true,
-                    "timeout_dropped": true,
+                    "timeout_secs": 300,
                 }),
             }
         );
@@ -2642,6 +2686,63 @@ mod tests {
         assert_eq!(
             classify("timeout 1 timeout 2 cargo test"),
             RouteDecision::Exec
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 (red first): `-s`'s value used to be
+    /// accepted as ANY next token, so a command substitution hiding in it
+    /// silently vanished once the `timeout` prefix was stripped — the shell
+    /// WOULD have run `touch pwned`. The whole strip must refuse instead of
+    /// discarding text the model asked the shell to execute.
+    #[test]
+    fn a_metacharacter_in_the_signal_value_refuses_the_whole_strip() {
+        assert_eq!(
+            classify("timeout -s $(touch${IFS}pwned) 5 cargo test"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 (red first): same hole via `--kill-after=`'s
+    /// value — a `;`-chained command hiding after the `=` used to be
+    /// accepted and dropped along with the rest of the wrapper.
+    #[test]
+    fn a_metacharacter_in_the_kill_after_value_refuses_the_whole_strip() {
+        assert_eq!(
+            classify("timeout --kill-after=1;touch${IFS}x 5 cargo test"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 non-regression: value validation must not
+    /// over-refuse a plain signal name — `-s KILL` still strips and routes.
+    #[test]
+    fn a_plain_signal_value_still_strips_and_routes() {
+        assert_eq!(
+            classify("timeout -s KILL 5 cargo test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test"],
+                    "timeout_secs": 5,
+                }),
+            }
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 non-regression: a plain `--signal=`/`-k`
+    /// combination (long-form signal, short-form kill-after) still strips
+    /// and routes.
+    #[test]
+    fn a_plain_signal_and_kill_after_value_still_strips_and_routes() {
+        assert_eq!(
+            classify("timeout --signal=TERM -k 5 60 cargo test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test"],
+                    "timeout_secs": 60,
+                }),
+            }
         );
     }
 }

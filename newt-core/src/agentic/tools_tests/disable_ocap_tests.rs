@@ -1614,6 +1614,71 @@ async fn just_with_justfile_one_level_up_falls_back_to_exec_not_error() {
     );
 }
 
+/// PR-F28 review, Blocker 2 (red first, real dispatch, offload on): a routed
+/// `timeout 2 …` wrapper must leave the build lane at THAT 2-second wall, not
+/// the lane's own 30-minute one — round 1 threw the model's own bound away.
+/// A scratch justfile recipe that sleeps 10s proves it: the call must die at
+/// ~2s (`ExecOutcome::TimedOut`), and the note must name the 2-second wall
+/// actually applied, never "30 min".
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_routed_short_timeout_wrapper_honours_its_own_wall_not_the_lane_wall() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("justfile"), "slow:\n\tsleep 10\n").unwrap();
+    let caveats = Caveats::top();
+
+    let started = std::time::Instant::now();
+    let out = execute_tool_with_offload(
+        "build_exec",
+        &serde_json::json!({
+            "argv": ["just", "slow"],
+            "timeout_secs": 2,
+        }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        None, // permission_gate
+        None, // exec_floor
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+        true, // tool_offload
+        None, // spill_store
+        None, // persona_tools
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    if crate::confined_exec::kernel_fs_fence_available() {
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "a `timeout 2` routed call must die at ~2s, not the 30 min lane wall; \
+             elapsed {elapsed:?}, out: {out}"
+        );
+        assert!(
+            !super::tool_result_ok(&out),
+            "a call killed by its own 2-second wall must not read ok:true; got: {out}"
+        );
+        assert!(
+            out.contains("`timeout 2` honoured as this lane's wall (2s)"),
+            "the note must name the 2-second wall actually applied, not the 30 min \
+             lane wall; got: {out}"
+        );
+    }
+}
+
 /// A scratch crate whose `cargo check` genuinely FAILS: 20 distinct
 /// undefined-identifier references, each its own compile error, so the
 /// output comfortably exceeds any trim window this test uses. Offline, no
