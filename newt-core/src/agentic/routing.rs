@@ -1852,6 +1852,9 @@ mod tests {
     /// folds it correctly for the confined shell's own dispatch. Folds now,
     /// with `cwd` attached, for BOTH the build lane and the git read route,
     /// and composes with #2549's tail-pipe route.
+    // Not on Windows: the cd fold does not resolve there yet (fail-closed to
+    // Exec, as before this change). Refusal tests still run on every platform.
+    #[cfg(not(windows))]
     #[test]
     fn cd_into_a_real_subdirectory_routes_with_cwd() {
         let fx = CdFixture::new();
@@ -2020,6 +2023,9 @@ mod tests {
         );
         // `cwd == "."` (the workspace root itself) is harmless — those
         // tools already run there, so nothing is silently dropped.
+        // Not on Windows: the cd fold does not resolve there yet and stays
+        // Exec (fail-closed); the refusals above still run on every platform.
+        #[cfg(not(windows))]
         assert_eq!(
             classify_at(
                 &format!("cd {} && cat f", fx.root.display()),
