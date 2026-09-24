@@ -472,20 +472,20 @@ pub(crate) fn panel_live_resize_case() {
             assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
         };
         resize(12, 46);
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(
             window.area(),
             ratatui::layout::Rect::new(0, 4, 46, 8),
             "shrink"
         );
         resize(30, 100);
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(
             window.area(),
             ratatui::layout::Rect::new(0, 22, 100, 8),
             "grow"
         );
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(
             window.area(),
             ratatui::layout::Rect::new(0, 22, 100, 8),
@@ -504,6 +504,41 @@ pub(crate) fn panel_live_resize_case() {
     assert_eq!(cockpit.editor.draft(), draft);
     assert!(!cockpit.chat_inactive);
     assert!(cockpit.screen.viewport_rect().bottom() <= 30);
+
+    // #2574 review: an alternate-screen loan owns the whole screen. Its
+    // resize contract is the presenter's own resize — re-measuring hands back
+    // the whole NEW screen, and no inline rows are reserved for it.
+    let (reply, received) =
+        std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+    let alternate = std::thread::spawn(move || {
+        let window = received.recv().unwrap().expect("alternate-screen loan");
+        let size = libc::winsize {
+            ws_row: 20,
+            ws_col: 70,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: as above — this test's own slave on fd 0.
+        assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
+        window.remeasure(None);
+        assert_eq!(window.area(), ratatui::layout::Rect::new(0, 0, 70, 20));
+        window.remeasure(Some(5));
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 0, 70, 20),
+            "a height request does not shrink a full-screen loan"
+        );
+        drop(window);
+    });
+    cockpit
+        .handle_request(SurfaceRequest::Panel {
+            mode: PanelMode::AlternateScreen,
+            reply,
+        })
+        .unwrap();
+    alternate.join().unwrap();
+    assert_eq!((cockpit.screen.cols, cockpit.screen.rows), (70, 20));
+    assert_eq!(cockpit.editor.draft(), draft);
 }
 
 /// #2573 review: the whole panel path on a real terminal — the cockpit lends

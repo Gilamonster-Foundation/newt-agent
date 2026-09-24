@@ -293,16 +293,28 @@ impl Screen {
     }
 
     fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
+        self.reserve_modal_rows_from(self.top, requested)
+    }
+
+    /// Reserve `requested` rows for a modal whose rows today start at
+    /// `occupied_top` — the block's top when a modal opens, the panel's own top
+    /// when the operator sizes it (#2574). Only transcript rows the new plan
+    /// covers above `occupied_top` scroll into scrollback.
+    fn reserve_modal_rows_from(
+        &mut self,
+        occupied_top: u16,
+        requested: u16,
+    ) -> io::Result<ModalReservation> {
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
         let mut buf = Vec::new();
         queue!(
             buf,
             crossterm::cursor::Hide,
-            MoveTo(0, self.top),
+            MoveTo(0, occupied_top),
             Clear(ClearType::FromCursorDown)
         )?;
-        let covered_transcript = self.top.saturating_sub(plan.start);
+        let covered_transcript = occupied_top.saturating_sub(plan.start);
         if covered_transcript > 0 {
             queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
             buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
@@ -1213,8 +1225,15 @@ impl Presenter {
                 // hears the resize (it owns the keyboard), this thread owns
                 // the layout. A `RecvError` is the drop: the panel is done.
                 let mut reservation = reservation;
-                while let Ok(crate::session_worker::PanelSignal::Remeasure(reply)) = released.recv()
+                let mut mode = mode;
+                while let Ok(crate::session_worker::PanelSignal::Remeasure { rows, reply }) =
+                    released.recv()
                 {
+                    // The operator sized the panel (Shift-↑/↓, zoom): an inline
+                    // loan takes the new request; the screen clamps it.
+                    if let (Some(rows), PanelMode::Inline(_)) = (rows, mode) {
+                        mode = PanelMode::Inline(rows);
+                    }
                     // A failed re-plan keeps the old region rather than
                     // stranding the panel: the reply still goes out.
                     let _ = self.remeasure_panel(mode, &mut reservation);
@@ -1387,7 +1406,8 @@ impl Presenter {
         Rect::new(0, top, self.screen.cols, rows)
     }
 
-    /// #2571: the terminal resized under a live panel. The same re-layout
+    /// #2571: the terminal resized under a live panel, or the operator asked
+    /// for a different height (Shift-↑/↓, zoom). The same re-layout
     /// `finish_modal_rows` applies to a resize that lands after a dialog
     /// closes — clear what a narrower panel may have rewrapped above its old
     /// top, then the presenter's own resize — and the panel's rows reserved
@@ -1398,18 +1418,26 @@ impl Presenter {
         reservation: &mut Option<ModalReservation>,
     ) -> io::Result<()> {
         let (cols, rows) = self.screen.terminal_size()?;
-        if (cols, rows) == (self.screen.cols, self.screen.rows) {
-            return Ok(());
-        }
+        let resized = (cols, rows) != (self.screen.cols, self.screen.rows);
         // Measured before the presenter's own resize moves its geometry.
         let old = reservation.as_ref().map(|r| (r.start, r.rows));
         let old_cols = self.screen.cols;
-        self.on_event(Event::Resize(cols, rows))?;
+        if resized {
+            self.on_event(Event::Resize(cols, rows))?;
+        }
         // An alternate-screen loan owns the whole screen and redraws it: the
-        // presenter's geometry above is its whole resize contract (#2573).
-        if let (PanelMode::Inline(requested), Some((old_start, old_rows))) = (mode, old) {
+        // presenter's own resize above is its whole resize contract (#2573).
+        let (PanelMode::Inline(requested), Some((old_start, old_rows))) = (mode, old) else {
+            return Ok(());
+        };
+        if resized {
             let erase_from = panel_erase_from(old_start, old_rows, old_cols, cols, rows, requested);
             *reservation = Some(self.screen.remeasure_modal_rows(requested, erase_from)?);
+        } else if old_rows != requested.min(self.screen.rows) {
+            // The operator sized the panel (#2574): reserved from the panel's
+            // own top, so a grow scrolls only the rows it newly covers into
+            // scrollback and a shrink erases only the rows it gives back.
+            *reservation = Some(self.screen.reserve_modal_rows_from(old_start, requested)?);
         }
         Ok(())
     }
