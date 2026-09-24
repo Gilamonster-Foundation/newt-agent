@@ -223,13 +223,21 @@ pub(super) fn paginate_read(
         }
         // Cut on the last whole line when there is one, so the footer can name
         // the exact line to resume from. A single line longer than the cap
-        // (minified, base64) has no boundary and is cut mid-line as before.
+        // (minified, base64, one huge log line) has no earlier boundary — cutting
+        // it mid-line would give the footer no EXACT resume point (line-granular
+        // offset over a char-granular cut), silently losing the remainder of the
+        // line forever. Emit that one line WHOLE instead (bypassing the cap for
+        // this one oversized line only) and resume at the NEXT line, so every
+        // byte is still reachable by following the footer's offset exactly.
         match body[..cut].rfind('\n') {
             Some(newline) => {
                 body.truncate(newline);
                 whole_through = Some(start0 + body.lines().count());
             }
-            None => body.truncate(cut),
+            None => {
+                body = window[0].to_string();
+                whole_through = Some(start0 + 1);
+            }
         }
     }
     let footer = if let Some(last) = whole_through {
@@ -336,5 +344,52 @@ mod tests {
         // TOOL_RESULT_SPILL_CAP spills even with a generous budget.
         let big = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP + 1;
         assert!(should_spill_full_output(big, big, usize::MAX, true));
+    }
+
+    #[test]
+    fn a_line_longer_than_the_page_budget_is_never_lost_across_pagination() {
+        // Regression (#2553 review finding 2, VERIFY-2553.md): a single line
+        // longer than the char budget used to be cut mid-line with no earlier
+        // newline to land on. The footer then had no EXACT resume point — only
+        // "a higher offset" — and the only higher line offset available SKIPS
+        // the rest of that line forever. Fix: emit the oversized line WHOLE and
+        // resume at the next line, so following the footer's offset exactly
+        // reconstructs every byte with no gap and no duplicate.
+        let long_line = "x".repeat(40_000);
+        let original = format!("short one\n{long_line}\nshort two\nshort three\n");
+
+        let budget_tokens = 5_000; // small budget forces the long line to be capped
+        let mut reconstructed = String::new();
+        let mut offset = None;
+        for _ in 0..20 {
+            let page = paginate_read(&original, offset, None, budget_tokens);
+            let (body, next_offset) = match page.rfind("\n\n[") {
+                Some(marker_start) => {
+                    let body = &page[..marker_start];
+                    let footer = &page[marker_start..];
+                    let next = footer
+                        .rsplit("offset=")
+                        .next()
+                        .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|n| n.parse::<usize>().ok());
+                    (body, next)
+                }
+                None => (page.as_str(), None),
+            };
+            if !reconstructed.is_empty() {
+                reconstructed.push('\n');
+            }
+            reconstructed.push_str(body);
+            match next_offset {
+                Some(n) => offset = Some(n),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            reconstructed,
+            original.trim_end_matches('\n'),
+            "every byte of the original file must appear exactly once, in order"
+        );
     }
 }
