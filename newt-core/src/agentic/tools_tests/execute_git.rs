@@ -99,7 +99,8 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
             ),
         ] {
             if name == "run_command" {
-                let (presented_name, _) = tool_presentation(name, &args, ws.path());
+                let (presented_name, _) =
+                    tool_presentation(name, &args, ws.path(), &crate::caveats::Scope::All);
                 assert_eq!(
                     presented_name,
                     if accepted { "git" } else { "run_command" },

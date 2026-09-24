@@ -1467,7 +1467,7 @@ path = "newt-cli/src/headless.rs"
 symbol = "fold_ocap_grants"
 
 [BHV-ROUTE-002]
-description = "A recognised build command issued through run_command runs in the build lane: run_command(\"cargo build|check|test|clippy …\") and run_command(\"just <recipe>\") route to the confined build lane (the same leq/permission-gate re-check and 30-minute LIFECYCLE_BUILD_TIMEOUT as lifecycle action=build), running the model's LITERAL argv verbatim — never a re-resolved phase command, so no operand is ever dropped. cargo run/install/publish and any --config/-Z flag stay on the exec path; a call carrying cwd or timeout alongside command is refused rather than silently dropping that field. A clean build argv piped ONLY to `tail -N`/`tail -n N`/`head -N`/`head -n N` (optionally with a preceding `2>&1`) also routes (F23 / #2524 'tail-pipe-routes'): the build's real exit code decides the outcome, and the trim is applied to the rendered output on the harness side, never inside a shell that could mask the exit code — the exact hazard an un-routed `| tail` created. Anything wider (multiple pipes, `tail -f`/`head -c`, a redirect before the pipe, a non-tail/head pipe target, or a missing/zero/non-numeric count) stays on the ordinary compound-command refusal. A leading `cd <workspace root> && ` is a no-op and is stripped before classification (F24 / #2524 'cd-root-noop'), composing with the tail/head trim and counting as #2548 progress verification exactly like the bare command; only an EXACT match on the session's own cwd qualifies — a subdirectory, an unrelated path, the wrong separator (`;`/`||`), a second `cd`, `cd -`/`cd ~`, or a quoted/glob/metacharacter-carrying dir token all stay compound. The routed note says the `cd` was dropped as a no-op."
+description = "A recognised build command issued through run_command runs in the build lane: run_command(\"cargo build|check|test|clippy …\") and run_command(\"just <recipe>\") route to the confined build lane (the same leq/permission-gate re-check and 30-minute LIFECYCLE_BUILD_TIMEOUT as lifecycle action=build), running the model's LITERAL argv verbatim — never a re-resolved phase command, so no operand is ever dropped. cargo run/install/publish and any --config/-Z flag stay on the exec path; a call carrying timeout alongside command is refused rather than silently dropping that field. A clean build argv piped ONLY to `tail -N`/`tail -n N`/`head -N`/`head -n N` (optionally with a preceding `2>&1`) also routes (F23 / #2524 'tail-pipe-routes'): the build's real exit code decides the outcome, and the trim is applied to the rendered output on the harness side, never inside a shell that could mask the exit code — the exact hazard an un-routed `| tail` created. Anything wider (multiple pipes, `tail -f`/`head -c`, a redirect before the pipe, a non-tail/head pipe target, or a missing/zero/non-numeric count) stays on the ordinary compound-command refusal. PR1 (multi-repo-recon, r10-r12 evidence): a leading `cd <dir> && `/`cd <dir>; ` — the workspace root (F24's original case) OR a real subdirectory — folds into a routed `cwd` when `<dir>` canonicalizes to a real directory inside both the canonical workspace AND the call's fs-read fence (the SAME question a real `cd` answers, via std::fs::canonicalize, replacing F24's lexical exact-match-only check); a `cwd` FIELD on an otherwise-bare call resolves the SAME way. A target that does not exist, is a file not a directory, resolves (through any symlink) outside the workspace or fence, `cd -`/`cd ~`, a quoted/glob/metacharacter-carrying dir, unquoted internal whitespace, or a second `cd` all stay compound/Exec. The routed note names the folded directory (empty for the workspace root itself, `cwd=\".\"`)."
 [BHV-ROUTE-002.status]
 lean = "none"
 rust = "tested"
@@ -1512,23 +1512,35 @@ symbol = "a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_li
 tier = "unit"
 [[BHV-ROUTE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "tests::a_noop_cd_to_the_workspace_root_is_dropped_before_classification"
+symbol = "tests::cd_into_a_real_subdirectory_routes_with_cwd"
 tier = "unit"
 [[BHV-ROUTE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "tests::cd_prefix_stays_compound_unless_it_exactly_matches_the_workspace_root"
+symbol = "tests::cd_stays_exec_when_the_target_does_not_resolve_or_is_out_of_authority"
 tier = "unit"
 [[BHV-ROUTE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "tests::cd_dropped_flag_is_only_set_when_a_noop_cd_was_actually_stripped"
+symbol = "tests::cd_through_a_symlink_that_escapes_the_workspace_stays_exec"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cd_into_a_real_subdirectory_outside_the_fence_stays_exec"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_cwd_field_on_a_bare_call_routes_the_same_way"
 tier = "unit"
 [[BHV-ROUTE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
 symbol = "a_noop_cd_to_the_workspace_root_still_routes_and_says_so"
 tier = "unit"
 [[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_cd_prefixed_subdirectory_routes_and_says_so"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/repeat_call_guard_tests.rs"
-symbol = "a_routed_noop_cd_prefixed_gate_pass_still_resets_the_brake"
+symbol = "a_routed_cd_prefixed_gate_pass_still_resets_the_brake"
 tier = "unit"
 [[BHV-ROUTE-002.refs.production]]
 path = "newt-core/src/agentic/routing.rs"
@@ -1538,7 +1550,7 @@ path = "newt-core/src/agentic/routing.rs"
 symbol = "build_piped_to_trim_route"
 [[BHV-ROUTE-002.refs.production]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "strip_noop_cd_prefix"
+symbol = "resolve_workspace_relative_dir"
 [[BHV-ROUTE-002.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "run_confined_build_lane"

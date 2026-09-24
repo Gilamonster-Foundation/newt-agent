@@ -76,6 +76,19 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// #2315: where a shell call records its execution class for the loop's
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
+    /// #2551 round 2: the route the `run_command` routing site acted on,
+    /// recorded here (never re-derived from a second `classify_call`) so a
+    /// caller like
+    /// `is_progress_verification` cannot disagree with what really ran.
+    /// `classify` reads the filesystem, and the call itself can change it
+    /// mid-turn — `cd target; cargo test | tail -5` on a clean checkout
+    /// refuses to route at dispatch (`target/` does not exist yet), runs at
+    /// the root through the confined shell, and CREATES `target/`; a
+    /// second classification after the call would then route successfully
+    /// and count a masked `| tail` pass as verified — exactly what #2548
+    /// exists to exclude. `None` when the call never routed (stayed
+    /// `Exec`) or no funnel is listening.
+    pub(crate) routed_to: Option<&'a std::sync::OnceLock<(&'static str, serde_json::Value)>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -350,8 +363,12 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Option<String>> {
-    let (presentation_name, presentation_detail) =
-        tool_presentation(name, args, std::path::Path::new(workspace));
+    let (presentation_name, presentation_detail) = tool_presentation(
+        name,
+        args,
+        std::path::Path::new(workspace),
+        &caveats.fs_read,
+    );
     display.call(&presentation_name, &presentation_detail);
     let invocation = collab.invocation;
     let execution = collab
