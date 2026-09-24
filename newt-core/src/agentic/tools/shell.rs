@@ -784,19 +784,24 @@ pub(super) async fn dispatch_bridled_shell(
     // route anything compound. `dispatch_wall` reads only `args["cmd"]`, so
     // this changes nothing but the wall clock: `caveats` (fs/net/exec
     // authority) passed to `.dispatch()` below is untouched.
-    let wall = args
-        .get("cmd")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || std::time::Duration::from_secs(run_command_wall_secs()),
-            dispatch_wall,
-        );
+    let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
+    let wall = cmd.map_or_else(
+        || std::time::Duration::from_secs(run_command_wall_secs()),
+        dispatch_wall,
+    );
+    // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
+    // read roots for a build-tool command are added ONLY to the caveats used
+    // for THIS dispatch, never folded back into the session's standing
+    // authority (`widen_caveats` deliberately does not touch `fs_read` for an
+    // exec grant — see its doc comment). Call-scoped, exactly like
+    // `build_tool_caveats` for the lifecycle build lane.
+    let dispatch_caveats = dispatch_caveats_for_command(cmd.unwrap_or(""), caveats);
     let result = bridle_registry(
         shell_engine(),
         live.as_ref().map(LiveOutputSession::relay),
         wall,
     )
-    .dispatch("shell", args, caveats)
+    .dispatch("shell", args, &dispatch_caveats)
     .await;
     if let Some(live) = live.as_mut() {
         let ordinary_completion = result
@@ -1973,6 +1978,35 @@ fn leading_program(cmd: &str) -> Option<&str> {
     cmd.split_ascii_whitespace().find(|tok| !tok.contains('='))
 }
 
+/// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the caveats for
+/// ONE confined-shell dispatch — `caveats` as-is, unless `cmd`'s leading
+/// program is a build tool (`confined_exec::is_build_tool_exec`), in which
+/// case its toolchain read roots (`confined_exec::toolchain_read_roots`) are
+/// added to `fs_read`. Call-scoped and NEVER returned to the permission
+/// gate: `widen_caveats` deliberately leaves an exec grant's `fs_read`
+/// untouched, because its result feeds `recalled_caveats` — the caveats
+/// checked for every tool the model calls this session, including
+/// `read_file`. Widening the SESSION's `fs_read` from an `exec:cargo` grant
+/// would let `read_file` read `$CARGO_HOME/credentials.toml` for the rest of
+/// the session; widening only this one dispatch's caveats lets the SPAWNED
+/// cargo process resolve its own toolchain and nothing else gains the read.
+fn dispatch_caveats_for_command(
+    cmd: &str,
+    caveats: &crate::caveats::Caveats,
+) -> crate::caveats::Caveats {
+    let Some(program) = leading_program(cmd) else {
+        return caveats.clone();
+    };
+    if !crate::confined_exec::is_build_tool_exec(program) {
+        return caveats.clone();
+    }
+    let mut widened = caveats.clone();
+    if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
+        reads.extend(crate::confined_exec::toolchain_read_roots());
+    }
+    widened
+}
+
 /// The exec grants in force, for the refusal's second line. Naming what IS
 /// granted turns "no" into a question the operator can answer in one line.
 fn granted_host_binaries(exec: &crate::caveats::Scope<String>) -> String {
@@ -2252,4 +2286,59 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
         });
     }
     Some(requests)
+}
+
+#[cfg(test)]
+mod dispatch_caveats_tests {
+    use super::*;
+    use crate::caveats::{Caveats, CaveatsExt as _, CountBound, Scope};
+
+    fn base(ws: &str) -> Caveats {
+        Caveats {
+            fs_read: Scope::only([ws.to_string()]),
+            fs_write: Scope::only([ws.to_string()]),
+            exec: Scope::only(["cargo".to_string()]),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    /// dec1-build-grant round 2, red test (b): the shell-lane dispatch
+    /// caveats for a build-tool command include its toolchain read root —
+    /// call-scoped, so `read_file` (which checks the SESSION's caveats, not
+    /// this dispatch's) never sees it. Would fail before the fix:
+    /// `dispatch_caveats_for_command` did not exist; `dispatch_bridled_shell`
+    /// passed the raw session `caveats` straight through, unable to read
+    /// `$RUSTUP_HOME`.
+    #[test]
+    fn a_build_tool_command_gets_its_toolchain_read_root_for_this_dispatch_only() {
+        // Pins the toolchain-home resolution so the
+        // assertion does not depend on the machine running the suite.
+        // Platform-absolute (a POSIX `/fake-home` is not absolute on Windows),
+        // and under the process-env lock like every other env-pinning test.
+        let _env = crate::process_env::lock();
+        let fake = std::env::temp_dir().join("fake-home").join(".rustup");
+        let fake = fake.to_string_lossy().into_owned();
+        let saved = std::env::var_os("RUSTUP_HOME");
+        crate::process_env::set_var("RUSTUP_HOME", &fake);
+        let widened = dispatch_caveats_for_command("cargo --version", &base("/ws"));
+        match saved.and_then(|v| v.into_string().ok()) {
+            Some(v) => crate::process_env::set_var("RUSTUP_HOME", &v),
+            None => crate::process_env::remove_var("RUSTUP_HOME"),
+        }
+        assert!(
+            widened.permits_fs_read(&fake),
+            "a build-tool dispatch must be able to read its toolchain home"
+        );
+    }
+
+    /// A non-build-tool command is passed through unchanged — no toolchain
+    /// roots leak into an ordinary `run_command` dispatch.
+    #[test]
+    fn a_non_build_tool_command_is_unchanged() {
+        let base = base("/ws");
+        let widened = dispatch_caveats_for_command("ls -la", &base);
+        assert_eq!(widened.fs_read, base.fs_read);
+    }
 }
