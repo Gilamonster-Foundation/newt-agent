@@ -183,12 +183,35 @@ fn take_tail_chars(text: &str, max_chars: usize) -> String {
 /// next window so the model paginates instead of drowning. A whole-file read
 /// that fits both caps is returned verbatim (exact bytes). `max_output_tokens ==
 /// 0` disables the char backstop (only the line window applies). Pure (no fs) —
-/// unit-tested directly.
+/// unit-tested directly. Test-only: every production call site now threads an
+/// explicit `char_offset` through [`paginate_read_from`] directly.
+#[cfg(test)]
 pub(super) fn paginate_read(
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
     max_output_tokens: usize,
+) -> String {
+    paginate_read_from(contents, offset, limit, max_output_tokens, None)
+}
+
+/// [`paginate_read`] with an optional `char_offset`: the character position
+/// WITHIN the `offset` line to resume from. `offset` still picks the LINE;
+/// `char_offset` narrows to a character position inside that one line. This
+/// is how a single line longer than the char budget stays paginated under
+/// the cap instead of either being cut with no exact resume point (the
+/// pre-#2553 bug) or emitted whole, unbounded (round 1's bug, #2563: unbounded
+/// with offload off, and an infinite re-spill loop with offload on, since the
+/// whole-line page re-exceeds the spill cap every time). `char_offset` is
+/// deliberately NOT part of `read_file`'s public schema (see
+/// `tools/catalog.rs`) — the model learns it only from a page's own footer,
+/// which is the one place it is ever correct to use.
+pub(super) fn paginate_read_from(
+    contents: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_output_tokens: usize,
+    char_offset: Option<usize>,
 ) -> String {
     let max_chars = if max_output_tokens == 0 {
         usize::MAX
@@ -202,20 +225,49 @@ pub(super) fn paginate_read(
     let total = contents.lines().count();
     let start = offset.filter(|&o| o > 0).unwrap_or(1); // 1-based
     let limit = limit.filter(|&l| l > 0).unwrap_or(DEFAULT_READ_LIMIT);
+    let char_offset = char_offset.unwrap_or(0);
     // Common case: a whole-file read that fits both caps → return verbatim.
-    if start == 1 && limit >= total && contents.len() <= max_chars {
+    if char_offset == 0 && start == 1 && limit >= total && contents.len() <= max_chars {
         return contents.to_string();
     }
     let start0 = start - 1;
     if start0 >= total {
         return format!("(offset {start} is past end of file — {total} lines total)");
     }
-    let window: Vec<&str> = contents.lines().skip(start0).take(limit).collect();
-    let end = start0 + window.len(); // 1-based last line shown == end
-    let mut body = window.join("\n");
+    let mut lines = contents.lines().skip(start0);
+    let first_line_full = lines.next().expect("start0 < total, checked above");
+    let first_line_chars = first_line_full.chars().count();
+    // An out-of-range char_offset on the LAST line clamps to "" with no
+    // footer (nothing after it to name), which is ambiguous to the model:
+    // empty content, or a failure? Say so explicitly, mirroring the
+    // "offset past end of file" message above.
+    if char_offset > 0 && char_offset >= first_line_chars && start0 + 1 == total {
+        return format!(
+            "(char_offset {char_offset} is past the end of line {start}, which has \
+             {first_line_chars} chars; call read_file with offset={} to continue)",
+            start + 1
+        );
+    }
+    // char_offset resumes mid-way through the `start` line only; every other
+    // line in the window is taken in full.
+    let first_line_body: String = if char_offset > 0 {
+        first_line_full.chars().skip(char_offset).collect()
+    } else {
+        first_line_full.to_string()
+    };
+    let rest: Vec<&str> = lines.take(limit.saturating_sub(1)).collect();
+    let end = start0 + 1 + rest.len(); // 1-based last line shown == end
+    let mut body = first_line_body;
+    for line in &rest {
+        body.push('\n');
+        body.push_str(line);
+    }
     let char_capped = body.len() > max_chars;
     // The last line shown WHOLE, when the char cap cut on a line boundary.
     let mut whole_through = None;
+    // Set when the cut lands mid-way through the `start` line itself, with no
+    // earlier newline to land on: (line number, char position to resume from).
+    let mut mid_line = None;
     if char_capped {
         let mut cut = max_chars;
         while cut > 0 && !body.is_char_boundary(cut) {
@@ -223,25 +275,48 @@ pub(super) fn paginate_read(
         }
         // Cut on the last whole line when there is one, so the footer can name
         // the exact line to resume from. A single line longer than the cap
-        // (minified, base64) has no boundary and is cut mid-line as before.
+        // (minified, base64, one huge log line) has no earlier boundary in
+        // `body` — the cut lands inside the `start` line's own content, which
+        // can only happen before any `rest` line's newline. Resume with
+        // `char_offset` at the exact cut point instead of either losing the
+        // remainder (pre-#2553) or emitting the whole line unbounded (#2563).
         match body[..cut].rfind('\n') {
             Some(newline) => {
                 body.truncate(newline);
                 whole_through = Some(start0 + body.lines().count());
             }
-            None => body.truncate(cut),
+            None => {
+                let emitted_chars = body[..cut].chars().count();
+                let next_char_offset = char_offset + emitted_chars;
+                body.truncate(cut);
+                if next_char_offset >= first_line_chars {
+                    // Cut landed exactly at the line's end (needs `rest`
+                    // NON-empty — there is more file after this line for the
+                    // footer to point at; when `rest` is empty the file is
+                    // exhausted and there is nothing to resume). The whole
+                    // `start` line WAS shown, so the last whole line shown is
+                    // `start` itself (`start0 + 1`), not `start0` — using
+                    // `start0` pointed the footer one line too early, back at
+                    // this same line, looping forever when its length is an
+                    // exact multiple of the cap.
+                    whole_through = Some(start0 + 1);
+                } else {
+                    mid_line = Some((start, next_char_offset));
+                }
+            }
         }
     }
-    let footer = if let Some(last) = whole_through {
+    let footer = if let Some((line, next_char_offset)) = mid_line {
+        Some(format!(
+            "payload truncated to {max_chars} chars (~{max_output_tokens} tokens); line {line} \
+             continues: call read_file with offset={line} char_offset={next_char_offset} to \
+             continue"
+        ))
+    } else if let Some(last) = whole_through {
         Some(format!(
             "payload truncated to {max_chars} chars (~{max_output_tokens} tokens) at line \
              {last} of {total}; call read_file with offset={} to continue",
             last + 1
-        ))
-    } else if char_capped {
-        Some(format!(
-            "payload truncated to {max_chars} chars (~{max_output_tokens} tokens) from line \
-             {start}; call read_file with a higher offset (and/or smaller limit) to continue"
         ))
     } else if end < total {
         Some(format!(
@@ -266,12 +341,13 @@ pub(super) fn read_file_page(
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    char_offset: Option<usize>,
     tool_offload: bool,
 ) -> String {
     if tool_offload {
-        paginate_unspillable(contents, offset, limit)
+        paginate_unspillable(contents, offset, limit, char_offset)
     } else {
-        paginate_read(contents, offset, limit, max_output_tokens())
+        paginate_read_from(contents, offset, limit, max_output_tokens(), char_offset)
     }
 }
 
@@ -284,6 +360,7 @@ pub(super) fn paginate_unspillable(
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    char_offset: Option<usize>,
 ) -> String {
     // paginate_read's continuation footer rides on top of its char cap.
     const FOOTER_HEADROOM: usize = 512;
@@ -293,7 +370,7 @@ pub(super) fn paginate_unspillable(
         0 => unspillable,
         budget => budget.min(unspillable),
     };
-    paginate_read(contents, offset, limit, tokens)
+    paginate_read_from(contents, offset, limit, tokens, char_offset)
 }
 
 #[cfg(test)]
@@ -336,5 +413,75 @@ mod tests {
         // TOOL_RESULT_SPILL_CAP spills even with a generous budget.
         let big = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP + 1;
         assert!(should_spill_full_output(big, big, usize::MAX, true));
+    }
+
+    #[test]
+    fn a_line_longer_than_the_page_budget_is_never_lost_across_pagination() {
+        // Regression (#2553 review finding 2 AND #2563 round 2): a single line
+        // longer than the char budget must stay reachable AND every page must
+        // stay under the char cap. Round 1 fixed the reachability by emitting
+        // the whole oversized line unbounded (a NEW bug, #2563: unbounded with
+        // offload off, an infinite re-spill loop with offload on). The real
+        // fix pages the oversized line too, via `char_offset` — the character
+        // position within the named line to resume from — so following each
+        // footer exactly (offset, and char_offset when present) reconstructs
+        // every byte with no gap, no duplicate, and no page over budget.
+        let long_line = "x".repeat(40_000);
+        let original = format!("short one\n{long_line}\nshort two\nshort three\n");
+
+        let budget_tokens = 5_000; // small budget forces the long line to be capped
+        let max_chars = cap_estimator().chars_for_tokens(budget_tokens);
+        let mut reconstructed = String::new();
+        let mut offset = None;
+        let mut char_offset = None;
+        for _ in 0..20 {
+            let page = paginate_read_from(&original, offset, None, budget_tokens, char_offset);
+            let (body, footer) = match page.rfind("\n\n[") {
+                Some(marker_start) => (&page[..marker_start], Some(&page[marker_start..])),
+                None => (page.as_str(), None),
+            };
+            assert!(
+                page.len() <= max_chars + 300,
+                "every page must stay under the char budget (~{max_chars} chars): {} bytes",
+                page.len()
+            );
+            let mut next_offset = None;
+            let mut next_char_offset = None;
+            if let Some(footer) = footer {
+                for tok in footer.split_whitespace() {
+                    if let Some(v) = tok.strip_prefix("offset=") {
+                        next_offset = v
+                            .trim_end_matches(|c: char| !c.is_ascii_digit())
+                            .parse()
+                            .ok();
+                    } else if let Some(v) = tok.strip_prefix("char_offset=") {
+                        next_char_offset = v
+                            .trim_end_matches(|c: char| !c.is_ascii_digit())
+                            .parse()
+                            .ok();
+                    }
+                }
+            }
+            // A page continuing MID-LINE (char_offset set) is glued directly
+            // onto the previous page's body — it is the SAME line, not a new
+            // one — everything else gets a newline separator.
+            if char_offset.is_none() && !reconstructed.is_empty() {
+                reconstructed.push('\n');
+            }
+            reconstructed.push_str(body);
+            match next_offset {
+                Some(n) => {
+                    offset = Some(n);
+                    char_offset = next_char_offset;
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            reconstructed,
+            original.trim_end_matches('\n'),
+            "every byte of the original file must appear exactly once, in order"
+        );
     }
 }

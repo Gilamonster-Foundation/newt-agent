@@ -49,16 +49,22 @@ fn paginate_read_small_file_is_returned_verbatim_without_a_footer() {
 #[test]
 fn paginate_read_char_backstop_tracks_the_token_budget() {
     // #726: the char backstop is now token-derived (budget × chars/token),
-    // NOT a hardcoded 100k. One enormous line: the line window can't help;
-    // the token-derived char backstop must. With a 1000-token budget the
-    // backstop is ~4000 chars, so a 50k-char line is truncated near there.
+    // NOT a hardcoded 100k. Two lines, the first enormous: the line window
+    // can't help; the token-derived char backstop must. With a 1000-token
+    // budget the backstop is ~4000 chars.
+    //
+    // #2563 (round 2): round 1 emitted an over-budget single line WHOLE,
+    // which is unbounded with offload off and re-spills forever with offload
+    // on. Every page — including the single-oversized-line case — MUST stay
+    // under the char cap; the model resumes mid-line via the footer's
+    // `char_offset` (checked below), never by an unbounded whole-line page.
     let budget = 1_000;
     let max_chars = crate::tokens::TokenEstimation::default().chars_for_tokens(budget);
-    let body = "x".repeat(50_000);
+    let body = format!("{}\nshort second line", "x".repeat(50_000));
     let out = paginate_read(&body, None, None, budget);
     assert!(
         out.len() < max_chars + 300,
-        "char-capped to the token budget (~{max_chars} chars): {} bytes",
+        "the oversized first line stays under the cap, not emitted whole: {} bytes",
         out.len()
     );
     assert!(out.contains("truncated"), "marks the truncation");
@@ -66,15 +72,21 @@ fn paginate_read_char_backstop_tracks_the_token_budget() {
         out.contains("~1000 tokens"),
         "footer names the token budget: {out:?}"
     );
-
-    // A LARGER budget keeps more of the same line — the backstop tracks the
-    // budget rather than a fixed constant.
-    let wide = paginate_read(&body, None, None, 4_000);
     assert!(
-        wide.len() > out.len(),
-        "a wider token budget keeps more chars: {} vs {}",
-        wide.len(),
-        out.len()
+        out.contains("offset=1 char_offset="),
+        "footer resumes MID-LINE via char_offset, not at the next line: {out:?}"
+    );
+
+    // A multi-line body that fits within one WHOLE line per page still tracks
+    // the budget for the boundary it cuts on (the ordinary, non-oversized case).
+    let many_lines = "y".repeat(30) + "\n";
+    let wide_body = many_lines.repeat(500);
+    let max_chars = crate::tokens::TokenEstimation::default().chars_for_tokens(budget);
+    let wide_out = paginate_read(&wide_body, None, None, budget);
+    assert!(
+        wide_out.len() < max_chars + 300,
+        "char-capped to the token budget (~{max_chars} chars): {} bytes",
+        wide_out.len()
     );
 }
 
@@ -345,7 +357,7 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
         .collect::<Vec<_>>()
         .join("\n");
     let cap = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
-    let on = read_file_page(&body, None, None, true);
+    let on = read_file_page(&body, None, None, None, true);
     assert!(
         on.chars().count() <= cap,
         "{} chars would spill",
@@ -353,7 +365,7 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
     );
     assert!(on.contains("offset="), "says how to continue");
     // Offload off: nothing would spill, so the ordinary (larger) cap applies.
-    let off = read_file_page(&body, None, None, false);
+    let off = read_file_page(&body, None, None, None, false);
     assert!(
         off.chars().count() > cap,
         "offload off keeps the full budget"
