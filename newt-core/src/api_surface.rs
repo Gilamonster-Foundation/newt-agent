@@ -48,9 +48,113 @@ fn rule(pattern: &str, kind: &str) -> SymbolRule {
 /// language-pack template <lang>` emits one to a drop-in file. Best-effort regexes
 /// (a surface, not a parser); override any of them by name with your own pack.
 #[must_use]
+/// Rust top-level definitions for an outline (#2557). Column 0 only: an item
+/// indented inside an `impl` or `mod` block is detail, not the file's map.
+fn rust_outline() -> Vec<SymbolRule> {
+    const VIS: &str = r"^(?:pub(?:\([^)]*\))?\s+)?";
+    vec![
+        rule(
+            &format!(r#"{VIS}(?:(?:async|const|unsafe|extern\s+"[^"]*")\s+)*fn\s+(\w+)"#),
+            "fn",
+        ),
+        rule(&format!(r"{VIS}struct\s+(\w+)"), "struct"),
+        rule(&format!(r"{VIS}enum\s+(\w+)"), "enum"),
+        rule(&format!(r"{VIS}(?:unsafe\s+)?trait\s+(\w+)"), "trait"),
+        rule(&format!(r"{VIS}mod\s+(\w+)"), "mod"),
+        rule(&format!(r"{VIS}type\s+(\w+)"), "type"),
+        rule(&format!(r"{VIS}(?:const|static)\s+(\w+)"), "const"),
+        rule(
+            r"^(?:unsafe\s+)?impl(?:<[^{]*?>)?\s+([^{]+?)\s*(?:\{.*)?$",
+            "impl",
+        ),
+        rule(r"^macro_rules!\s*(\w+)", "macro"),
+    ]
+}
+
+/// Python module-level definitions for an outline (#2557), any visibility.
+fn python_outline() -> Vec<SymbolRule> {
+    vec![
+        rule(r"^(?:async\s+)?def\s+(\w+)", "fn"),
+        rule(r"^class\s+(\w+)", "class"),
+    ]
+}
+
+/// One line outlining `content` — a read of `path` whose first line is file
+/// line `first_line` — as `N kind name` entries joined by ` | `, capped near
+/// `max_chars` with a `… +K more` tail. `None` when `path`'s language has no
+/// outline rules or nothing matched (#2557).
+///
+/// The built-in packs only: this runs inside context compression, which has
+/// no workspace configuration in hand. A read-page footer (`[payload
+/// truncated …]`, `[showing lines …]`) is never an entry.
+pub fn outline_line(
+    path: &str,
+    content: &str,
+    first_line: usize,
+    max_chars: usize,
+) -> Option<String> {
+    use std::sync::OnceLock;
+    /// A pack's extensions and its compiled outline rules `(regex, kind)`.
+    type CompiledPack = (Vec<String>, Vec<(Regex, String)>);
+    static COMPILED: OnceLock<Vec<CompiledPack>> = OnceLock::new();
+    let packs = COMPILED.get_or_init(|| {
+        builtin_packs()
+            .into_iter()
+            .filter(|pack| !pack.outline.is_empty())
+            .map(|pack| {
+                let rules = pack
+                    .outline
+                    .iter()
+                    .filter_map(|r| Regex::new(&r.pattern).ok().map(|re| (re, r.kind.clone())))
+                    .collect();
+                (pack.extensions, rules)
+            })
+            .collect()
+    });
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    let (_, rules) = packs
+        .iter()
+        .find(|(exts, _)| exts.iter().any(|e| e == ext))?;
+    let mut entries: Vec<String> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if line.starts_with("[payload truncated") || line.starts_with("[showing lines") {
+            continue;
+        }
+        if let Some((name, kind)) = rules.iter().find_map(|(re, kind)| {
+            re.captures(line)
+                .and_then(|c| c.get(1))
+                .map(|m| (m.as_str().trim(), kind))
+        }) {
+            let name: String = name.chars().take(60).collect();
+            entries.push(format!("{} {kind} {name}", first_line + i));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let total = entries.len();
+    let mut out = String::new();
+    let mut shown = 0;
+    for entry in &entries {
+        if !out.is_empty() && out.len() + entry.len() + 3 > max_chars {
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        out.push_str(entry);
+        shown += 1;
+    }
+    if shown < total {
+        out.push_str(&format!(" | … +{} more", total - shown));
+    }
+    Some(out)
+}
+
 pub fn builtin_packs() -> Vec<LanguagePack> {
     vec![
         LanguagePack {
+            outline: rust_outline(),
             name: "rust".into(),
             aliases: vec!["rust".into(), "rs".into()],
             extensions: vec!["rs".into()],
@@ -67,6 +171,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: python_outline(),
             name: "python".into(),
             aliases: vec!["python".into(), "python3".into(), "py".into()],
             extensions: vec!["py".into()],
@@ -78,6 +183,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "bash".into(),
             aliases: vec![
                 "bash".into(),
@@ -93,6 +199,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "c_cpp".into(),
             aliases: vec!["c".into(), "c++".into(), "c/c++".into(), "cpp".into()],
             extensions: vec![
@@ -116,6 +223,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "csharp".into(),
             aliases: vec![
                 "c#".into(),
@@ -140,6 +248,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "go".into(),
             aliases: vec!["go".into(), "golang".into()],
             extensions: vec!["go".into()],
@@ -153,6 +262,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "java".into(),
             aliases: vec!["java".into()],
             extensions: vec!["java".into()],
@@ -174,6 +284,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "ruby".into(),
             aliases: vec!["ruby".into(), "rb".into()],
             extensions: vec!["rb".into()],
@@ -187,6 +298,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
         // Dart + TypeScript: the symbol side of the project packs the "IDE for
         // LLMs" ships out of the box (#1288). Regex is the bootstrap (AST later).
         LanguagePack {
+            outline: Vec::new(),
             name: "dart".into(),
             aliases: vec!["dart".into()],
             extensions: vec!["dart".into()],
@@ -200,6 +312,7 @@ pub fn builtin_packs() -> Vec<LanguagePack> {
             ],
         },
         LanguagePack {
+            outline: Vec::new(),
             name: "typescript".into(),
             aliases: vec!["typescript".into(), "type script".into(), "ts".into()],
             extensions: vec!["ts".into(), "tsx".into()],
@@ -795,6 +908,7 @@ mod tests {
     fn a_custom_pack_adds_a_language_with_no_code_change() {
         // Simulate ingesting an external Ruby pack (what a drop-in file would do).
         let ruby = LanguagePack {
+            outline: Vec::new(),
             name: "ruby".into(),
             aliases: vec!["ruby".into(), "rb".into()],
             extensions: vec!["rb".into()],
@@ -814,6 +928,7 @@ mod tests {
     fn a_custom_pack_overrides_a_builtin_by_name() {
         // A pack named "rust" replaces the built-in (here: also surface `fn` privates).
         let custom_rust = LanguagePack {
+            outline: Vec::new(),
             name: "rust".into(),
             aliases: vec!["rust".into()],
             extensions: vec!["rs".into()],
@@ -931,6 +1046,7 @@ mod tests {
     #[test]
     fn invalid_regex_in_a_rule_is_skipped_not_fatal() {
         let bad = LanguagePack {
+            outline: Vec::new(),
             name: "bad".into(),
             aliases: vec![],
             extensions: vec!["zz".into()],

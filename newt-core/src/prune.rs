@@ -327,6 +327,10 @@ fn already_pruned(content: &str, paired_name: &str) -> bool {
         || content.starts_with(&format!("[{paired_name}] "))
 }
 
+/// Budget for an aged read's outline (#2557): about a tenth of a 15k-char page,
+/// so the map survives while the bulk goes.
+const OUTLINE_MAX_CHARS: usize = 1_500;
+
 /// Per-tool one-line summary of a tool result (the pass-2 rewrite).
 fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
     let lines = content.lines().count();
@@ -352,8 +356,22 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             )
         }
         "read_file" => {
+            // #2557: keep the MAP of what was read. The outline rides the same
+            // single line (the digest fold's grammar), with absolute line
+            // numbers from the call's `offset`, so the model can re-read the
+            // exact span it needs instead of page 1 again.
+            let first_line = args
+                .and_then(|a| a.get("offset"))
+                .and_then(Value::as_u64)
+                .map_or(1, |n| n.max(1) as usize);
+            let path = args.and_then(|a| a.get("path")).and_then(Value::as_str);
+            let outline = path
+                .and_then(|p| {
+                    crate::api_surface::outline_line(p, content, first_line, OUTLINE_MAX_CHARS)
+                })
+                .map_or_else(String::new, |o| format!("; outline: {o}"));
             format!(
-                "[read_file] read '{}' -> {status}, {lines} lines ({chars} chars)",
+                "[read_file] read '{}' -> {status}, {lines} lines ({chars} chars){outline}",
                 arg("path")
             )
         }
@@ -1410,5 +1428,81 @@ mod tests {
                 "raw tool output was mistaken for a one-liner: {raw:?}"
             );
         }
+    }
+}
+
+/// #2557: an aged `read_file` keeps the MAP of what it read — an outline with
+/// absolute line numbers — instead of shrinking to a bare count. Live
+/// 2026-09-23: after its reads aged out, a weak model re-read page 1 of a
+/// 13,399-line file seven times; the one-liner left it no other way back to
+/// "where things are".
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    const RUST_PAGE: &str = "//! doc\n\
+        mod attempt_capture;\n\
+        use std::fmt;\n\
+        \n\
+        pub(crate) fn compact_responses_input(x: u32) -> u32 {\n\
+        \x20   let inner = 1;\n\
+        \x20   x + inner\n\
+        }\n\
+        \n\
+        enum ResponsesCompaction { A }\n\
+        impl fmt::Display for ResponsesCompaction {\n\
+        \x20   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { Ok(()) }\n\
+        }\n";
+
+    #[test]
+    fn an_aged_rust_read_keeps_an_outline_with_absolute_lines() {
+        let args = serde_json::json!({"path": "src/agentic/mod.rs", "offset": 400});
+        let line = one_line_summary("read_file", Some(&args), RUST_PAGE);
+        // offset 400 → the page's line 2 is file line 401.
+        assert!(line.contains("401 mod attempt_capture"), "{line}");
+        assert!(line.contains("404 fn compact_responses_input"), "{line}");
+        assert!(line.contains("409 enum ResponsesCompaction"), "{line}");
+        assert!(line.contains("410 impl"), "{line}");
+        // Top-level only: a method inside an impl is not an outline entry.
+        assert!(!line.contains("fn fmt"), "{line}");
+        // Still ONE line in the shared grammar, so the digest fold can fold it.
+        assert!(is_one_line_summary(&line), "{line}");
+    }
+
+    #[test]
+    fn a_read_without_offset_starts_at_line_one() {
+        let args = serde_json::json!({"path": "lib.rs"});
+        let line = one_line_summary("read_file", Some(&args), RUST_PAGE);
+        assert!(line.contains("2 mod attempt_capture"), "{line}");
+    }
+
+    #[test]
+    fn a_language_without_outline_rules_keeps_the_plain_one_liner() {
+        let args = serde_json::json!({"path": "notes.txt"});
+        let line = one_line_summary("read_file", Some(&args), RUST_PAGE);
+        assert!(!line.contains("outline"), "{line}");
+        assert!(is_one_line_summary(&line), "{line}");
+    }
+
+    #[test]
+    fn a_long_outline_is_capped_and_says_how_many_it_left_out() {
+        let page: String = (0..500).map(|i| format!("fn item_{i}() {{}}\n")).collect();
+        let args = serde_json::json!({"path": "big.rs"});
+        let line = one_line_summary("read_file", Some(&args), &page);
+        assert!(
+            line.chars().count() < 2_000,
+            "{} chars",
+            line.chars().count()
+        );
+        assert!(line.contains("more"), "{line:.200}");
+        assert!(is_one_line_summary(&line));
+    }
+
+    #[test]
+    fn the_read_page_footer_is_not_an_outline_entry() {
+        let page = format!("{RUST_PAGE}\n\n[payload truncated to 15489 chars (~5163 tokens) at line 13 of 13399; call read_file with offset=14 to continue]");
+        let args = serde_json::json!({"path": "mod.rs"});
+        let line = one_line_summary("read_file", Some(&args), &page);
+        assert!(!line.contains("payload truncated"), "{line}");
     }
 }

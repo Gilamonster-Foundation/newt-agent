@@ -43,6 +43,14 @@ pub struct LanguagePack {
     pub entry_points: Vec<String>,
     /// Public-symbol extraction rules, applied per source line.
     pub symbols: Vec<SymbolRule>,
+    /// Top-level definition rules for a FILE OUTLINE (#2557): every item at
+    /// the top level, any visibility — not just the public API `symbols`
+    /// extracts. Applied per line; capture group 1 = the name. Empty means the
+    /// language has no outline, and an aged read of its files compresses to
+    /// the plain one-liner. The regex floor, until a tree-sitter `tags.scm`
+    /// engine can replace it behind the same pack model.
+    #[serde(default)]
+    pub outline: Vec<SymbolRule>,
 }
 
 /// `[context.api_surface]` — the workspace-API-surface knowledge_base technique.
