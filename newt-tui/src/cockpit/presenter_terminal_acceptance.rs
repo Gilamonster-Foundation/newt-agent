@@ -626,6 +626,36 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
 // capture can otherwise keep dup2 from restoring fd 1 during teardown.
 pub(crate) fn cockpit_acceptance_case() {
     let tty = TestTty::install();
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    //
+    // `Presenter::open` asks `crossterm::terminal::size()` FIRST, and crossterm
+    // 0.28 resolves that to `open("/dev/tty")` directly (not stdin) in
+    // `window_size()`. `/dev/tty` is the process's *controlling* terminal; the
+    // parent hands this child fd 0/1 as a pty slave but does NOT make it the
+    // controlling terminal (that needs `setsid` + `TIOCSCTTY`). Without one the
+    // open returns ENXIO, `size()?` errors, `Presenter::open` fails, and the
+    // child panics with "cockpit failed to open" — which is exactly the macOS
+    // real-PTY failure (the self-hosted Linux ARC runner happens to have a
+    // controlling terminal, so it passed; the macos-latest runner does not).
+    //
+    // The `setsid`/`TIOCSCTTY` MUST follow `TestTty::install()`, which puts the
+    // fresh pty on fd 0: setting the controlling terminal on the inherited
+    // slave instead would make crossterm report the inherited slave's 50x200
+    // size rather than the 24x80 the app actually paints into. Every other PTY
+    // child sets this up before opening the terminal; this one had to, and was
+    // missing it. `setsid()` returns the new session id (its own pid) on
+    // success, not 0, so `>= 0` is the same guard the other PTY cases use.
+    assert!(unsafe { libc::setsid() } >= 0, "setsid for the controlling tty");
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    // The child now owns the controlling terminal, so on exit the tty driver
+    // sends SIGHUP to the session (the "session-leader exit hangs up its tty"
+    // hazard the other cases dodge by blocking on a `read_line` tail so the
+    // parent samples first). This case is driven by `drive_cockpit_case`, which
+    // asserts the child exited *successfully* and only then drains the screen,
+    // so the child must NOT die from that SIGHUP: ignore it so the child exits
+    // with status 0 and the parent samples restoration from the already-written
+    // pty buffer after the child is gone.
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
     newt_core::tty::set_interrupt_pending(false);
 
     // A shell's terminal: canonical, echoing.
