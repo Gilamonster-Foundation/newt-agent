@@ -27,6 +27,10 @@
 //! sticky grant of a broad fs root is a whole-tree permit. The operator may
 //! `[a]llow once` per op or `[d]eny`; `[k]ey allow` (step-up, **P3, unbuilt**)
 //! is the intended standing path for these.
+//!
+//! One exception: `DenialKind::Build` IS session-allowable despite staying
+//! High tier (dec1-build-grant, #2483 F30) — it is bounded by the calibrated
+//! `build_tool_caveats` fence, not an open-ended interpreter/broad-root grant.
 
 use newt_core::DenialKind;
 use std::collections::BTreeSet;

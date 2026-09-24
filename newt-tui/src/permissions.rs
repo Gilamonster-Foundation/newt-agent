@@ -1823,6 +1823,17 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             return Deny;
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
+        // dec1-build-grant round 2: a request covered by the Build-grant
+        // fallback in `session_grant_covers` (an Exec of a build tool, e.g.
+        // `cargo`, covered by a session Build grant rather than an exact
+        // stored Exec grant) must run under a fence no wider than
+        // `build_tool_caveats` — never whatever the shell lane's CURRENT
+        // baseline happens to allow (e.g. a net host granted separately
+        // earlier in the session). `widen_caveats` only ADDS to `baseline`;
+        // it cannot narrow a wider net/exec/write axis back down, so the
+        // clamp has to be applied here, after minting, not folded into the
+        // widen itself.
+        let mut build_covered_clamp: Option<newt_core::Caveats> = None;
         let web = self.state.web_store.clone();
         for req in requests {
             // Build grants are non-axis but still bounded by an explicit
@@ -1858,6 +1869,23 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     .contains(&(req.kind, req.target.clone()))
                 {
                     once_grants.push((req.kind, req.target.clone()));
+                    // This IS the build-tool fallback (an exact match took
+                    // the branch above), so pin the clamp to the covering
+                    // Build grant's workspace fence.
+                    if let Some((_, workspace)) = self
+                        .state
+                        .session_grants
+                        .iter()
+                        .find(|(kind, _)| *kind == newt_core::DenialKind::Build)
+                    {
+                        let fence = newt_core::confined_exec::build_tool_caveats(
+                            std::path::Path::new(workspace),
+                        );
+                        build_covered_clamp = Some(match build_covered_clamp.take() {
+                            Some(existing) => existing.meet(&fence),
+                            None => fence,
+                        });
+                    }
                 }
                 continue;
             }
@@ -2172,7 +2200,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
         }
-        Allow(self.mint(baseline, &once_grants))
+        let minted = self.mint(baseline, &once_grants);
+        Allow(match build_covered_clamp {
+            Some(fence) => minted.meet(&fence),
+            None => minted,
+        })
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {

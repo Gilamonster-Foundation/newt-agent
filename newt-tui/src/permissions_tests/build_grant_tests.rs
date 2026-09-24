@@ -5,8 +5,14 @@
 //! `run_command` lanes alike.
 
 use super::danger::{DangerTable, DangerTier};
-use super::{permission_policy, session_grant_covers, Audience, PromptChoice};
-use newt_core::{DenialKind, PermissionRequest};
+use super::permission_prompt_tests::scripted_gate;
+use super::{
+    permission_policy, session_grant_covers, Audience, PermissionPromptState, PromptChoice,
+};
+use newt_core::caveats::{CountBound, Scope};
+use newt_core::{Caveats, CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
+use std::cell::Cell;
+use std::rc::Rc;
 
 fn build_request(workspace: &str) -> PermissionRequest {
     PermissionRequest {
@@ -75,4 +81,65 @@ fn a_session_build_grant_covers_exec_of_the_same_build_tool() {
         reason: "cleanup".into(),
     };
     assert!(!session_grant_covers(&grants, &rm));
+}
+
+/// Architect review round 1, #1: `session_grant_covers` decides WHETHER a
+/// Build-covered exec is allowed, but not what fence it runs under. Would
+/// fail before the fix: the covered exec ran under whatever the shell lane's
+/// CURRENT `baseline` allowed (here, a net host a prior, unrelated grant
+/// added), not the calibrated `build_tool_caveats` fence — `widen_caveats`
+/// only adds to `baseline`, it never narrows a wider net/exec/write axis
+/// back down. A session Build grant must clamp the covered exec to the build
+/// fence regardless of what else the shell lane has been granted.
+#[test]
+fn a_build_covered_exec_runs_under_the_build_fence_not_a_wider_shell_baseline() {
+    let ws = "/ws";
+    let mut state = PermissionPromptState::default();
+    // The operator already granted Build authority for this workspace.
+    state
+        .session_grants
+        .insert((DenialKind::Build, ws.to_string()));
+
+    // The shell lane's CURRENT baseline is wider than the build fence: it
+    // carries a net grant some earlier, unrelated permission decision added.
+    let wide_baseline = Caveats {
+        fs_read: Scope::only([ws.to_string()]),
+        fs_write: Scope::only([ws.to_string()]),
+        exec: Scope::only(["cargo".to_string()]),
+        net: Scope::only(["crates.io".to_string()]),
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    };
+
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        wide_baseline.clone(),
+        None,
+        None,
+        vec![],
+        prompts.clone(),
+    );
+    let cargo_test = PermissionRequest {
+        tool: "run_command".into(),
+        kind: DenialKind::Exec,
+        target: "cargo".into(),
+        reason: "cargo test".into(),
+    };
+    let decision = gate.ask_with_caveats(&wide_baseline, std::slice::from_ref(&cargo_test));
+    let newt_core::PermissionDecision::Allow(caveats) = decision else {
+        panic!(
+            "a session Build grant must cover exec of the workspace's build tool without prompting"
+        );
+    };
+    assert!(
+        !caveats.permits_net("crates.io"),
+        "a Build-covered exec must run under the calibrated build fence \
+         (net denied), never the shell lane's wider current baseline"
+    );
+    assert_eq!(
+        prompts.get(),
+        0,
+        "covered by the session Build grant — no prompt expected"
+    );
 }
