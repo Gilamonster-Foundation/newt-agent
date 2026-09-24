@@ -295,6 +295,10 @@ mod display;
 mod filesystem;
 
 #[cfg(test)]
+#[path = "read_file_char_offset.rs"]
+mod read_file_char_offset;
+
+#[cfg(test)]
 #[path = "execute_file_artifacts.rs"]
 mod file_artifacts;
 
