@@ -116,6 +116,9 @@ async fn host_lane_refuses_every_same_file_redirect_form_and_never_touches_the_f
 /// The twin: forms that must keep working, unchanged — a different target,
 /// the model's own safe rewrite (write-then-`mv`), and a command with no
 /// read of its own target at all. Confined lane.
+// Unix only: these forms really execute (awk via /bin/sh). The refusal tests
+// run everywhere, because the guard fires before any exec.
+#[cfg(unix)]
 #[tokio::test]
 async fn confined_lane_still_runs_forms_that_are_not_a_same_file_redirect() {
     let _l = env_lock().await;
