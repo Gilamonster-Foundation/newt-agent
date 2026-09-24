@@ -283,6 +283,36 @@ RAII, and required parameters so the broken call does not compile.
 If a second implementation is truly warranted, say so in the PR and explain
 what the existing abstraction could not be widened to cover.
 
+## Harness design — dependable over elaborate
+
+> The strongest version of Newt is not one that teaches a small model to
+> operate an increasingly elaborate harness. It is one that makes the harness
+> dependable enough that the model has fewer things to remember, fewer
+> protocols to negotiate, and fewer opportunities to turn an incomplete
+> intention into the wrong mutation. — the operator, 2026-09-24
+
+This is the test for any change to what the model sees or calls:
+
+1. **Make the model's first instinct work.** A weak model reaches for the
+   familiar tool. Widen that tool instead of teaching a new one. For example,
+   `read_file` accepts the `spill:` handle the model was already passing it
+   (#2553).
+2. **Make the wrong mutation impossible or harmless.** Prevent it rather than
+   explaining it afterwards. For example, `awk … f > f` truncates `f` before
+   `awk` reads it; it destroyed a 9,254-line file in a live run (#2555).
+3. **Make a redundant action cheap and silent rather than refusing it.** A
+   refusal is a protocol the model has to negotiate.
+4. **New model-facing surface has to earn its place with evidence from a live
+   run.** That covers a tool, a parameter, and any refusal the model must
+   interpret. Measured in weak-model refactor runs: the new `copy_from`
+   parameter went unused in three consecutive runs, because the model used
+   the shell instead. A refusal naming the exact missing keys did not stop the
+   model from resending the identical call (#2553, #2555).
+
+This is the reuse discipline turned on the model's side of the harness. There,
+the burden is on code that adds lines. Here, the burden is on anything that
+adds something the model must remember.
+
 ## Content-addressable data structures — the base rule
 
 **Every data structure that is persisted, transmitted, chained, or identified
