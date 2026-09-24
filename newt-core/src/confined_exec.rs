@@ -1110,18 +1110,25 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
 /// [`crate::agentic::permissions::widen_caveats`]'s build-tool exec arm — an
 /// `exec` grant for `cargo`/`just`/`make` carries the same calibrated reads a
 /// lifecycle build gets, one derivation, not two (dec1-build-grant, F35).
+///
+/// dec1-build-grant round 3 (architect review, PR #2579): every root here is
+/// non-secret by construction — narrow this list rather than the callers, and
+/// every caller inherits the fix. `$CARGO_HOME` is narrowed to
+/// [`cargo_home_read_roots`] (never the whole directory — that grant let
+/// `cargo --version; cat $CARGO_HOME/credentials.toml` read the secret
+/// straight through it), and `$XDG_CACHE_HOME` is dropped entirely: nothing
+/// in this repo has shown a build needs it, and it can hold arbitrary
+/// per-tool state (an ML CLI's auth token cache, for one). If a real build
+/// ever needs a specific cache subdirectory, grant that subdirectory with a
+/// comment naming why — never the whole cache root.
 #[must_use]
 pub fn toolchain_read_roots() -> Vec<String> {
     let mut roots = Vec::new();
-    // (env var that overrides the default, default subdir under HOME)
-    for (var, default) in [
-        ("CARGO_HOME", ".cargo"),
-        ("RUSTUP_HOME", ".rustup"),
-        ("XDG_CACHE_HOME", ".cache"),
-    ] {
-        if let Some(path) = operator_tool_home(var, default) {
-            roots.push(path);
-        }
+    if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
+        roots.extend(cargo_home_read_roots(&home));
+    }
+    if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
+        roots.push(path);
     }
     // System C toolchain headers: world-readable OS files with zero
     // disclosure value (P0 U6e) — this is a read-then-disclose fence, and
@@ -1139,6 +1146,27 @@ pub fn toolchain_read_roots() -> Vec<String> {
     if let Some(path) = operator_tool_home("XDG_BIN_HOME", ".local/bin") {
         roots.push(path);
     }
+    roots
+}
+
+/// `$CARGO_HOME`'s narrow, non-secret read set (dec1-build-grant round 3):
+/// `bin/` (cached toolchain binaries), `registry/` (downloaded crate
+/// sources), `git/` (vendored git dependencies) — what `cargo build`/`cargo
+/// test` reads to resolve dependencies with the network denied — plus the
+/// config file, if the operator has one. NEVER `credentials.toml` /
+/// `credentials`: those hold registry auth tokens, and the whole-directory
+/// grant this replaces handed them to ANY confined command whose leading
+/// token merely looked like a build tool. A subdir that doesn't exist yet is
+/// a harmless no-op grant, so this never probes the filesystem — same style
+/// as the rest of this module's root derivation.
+fn cargo_home_read_roots(cargo_home: &str) -> Vec<String> {
+    let base = Path::new(cargo_home);
+    let mut roots: Vec<String> = ["bin", "registry", "git"]
+        .into_iter()
+        .map(|subdir| base.join(subdir).to_string_lossy().into_owned())
+        .collect();
+    roots.push(base.join("config.toml").to_string_lossy().into_owned());
+    roots.push(base.join("config").to_string_lossy().into_owned());
     roots
 }
 
@@ -1275,6 +1303,67 @@ mod tests {
         assert!(!roots_relative.contains(&local_bin));
     }
 
+    /// dec1-build-grant round 3 (architect review, PR #2579), red test (a):
+    /// the whole `$CARGO_HOME` directory is no longer a root — a hostile
+    /// `cargo --version; cat $CARGO_HOME/credentials.toml` read the secret
+    /// straight through that grant. `toolchain_read_roots` now narrows
+    /// `$CARGO_HOME` to `bin/`/`registry/`/`git/` + a config file, and drops
+    /// `$XDG_CACHE_HOME` entirely. Would fail before the fix: `roots`
+    /// contained the bare `$CARGO_HOME` and `$XDG_CACHE_HOME` strings, which
+    /// `permits_path` (ancestor-or-equal, the same check the fence itself
+    /// uses) would have found to cover `credentials.toml` and
+    /// `huggingface/token`.
+    #[test]
+    fn toolchain_read_roots_narrows_cargo_home_and_drops_the_cache_dir() {
+        let _env = crate::process_env::lock();
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_cargo = EnvRestore::capture("CARGO_HOME");
+        let _restore_xdg_cache = EnvRestore::capture("XDG_CACHE_HOME");
+        let fake_home = std::env::temp_dir().join("fake-home-for-toolchain-read-roots-test");
+        crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
+        crate::process_env::remove_var("CARGO_HOME");
+        crate::process_env::remove_var("XDG_CACHE_HOME");
+
+        let roots = toolchain_read_roots();
+        let cargo_home = fake_home.join(".cargo");
+
+        // The narrow subdirs a real build needs ARE granted.
+        for subdir in ["bin", "registry", "git"] {
+            let expected = cargo_home.join(subdir).to_string_lossy().into_owned();
+            assert!(roots.contains(&expected), "missing {expected} in {roots:?}");
+        }
+        for config in ["config.toml", "config"] {
+            let expected = cargo_home.join(config).to_string_lossy().into_owned();
+            assert!(roots.contains(&expected), "missing {expected} in {roots:?}");
+        }
+        // The whole CARGO_HOME directory itself is never a root — a
+        // directory grant would also cover credentials.toml.
+        assert!(!roots
+            .iter()
+            .any(|r| r == cargo_home.to_string_lossy().as_ref()));
+
+        // The credential files are never covered — ancestor-or-equal check,
+        // the same containment logic the fence itself enforces.
+        let read_scope = Scope::only(roots.clone());
+        for secret in ["credentials.toml", "credentials"] {
+            let forbidden = cargo_home.join(secret).to_string_lossy().into_owned();
+            assert!(
+                !crate::caveats::permits_path(&read_scope, &forbidden),
+                "toolchain_read_roots must never grant read over {forbidden}"
+            );
+        }
+
+        // $XDG_CACHE_HOME is dropped entirely — not a root, and no path
+        // beneath the default cache dir is covered either.
+        let default_cache = fake_home.join(".cache").to_string_lossy().into_owned();
+        assert!(!roots.iter().any(|r| r == &default_cache));
+        let hf_token = fake_home
+            .join(".cache/huggingface/token")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!crate::caveats::permits_path(&read_scope, &hf_token));
+    }
+
     #[test]
     fn already_cancelled_request_never_attempts_spawn() {
         let request = ExecRequest::new(
@@ -1299,25 +1388,39 @@ mod tests {
             env.get("CARGO_TARGET_DIR").map(std::path::Path::new),
             Some(Path::new("/ws").join("target").as_path())
         );
-        for name in ["CARGO_HOME", "RUSTUP_HOME"] {
-            if let Some(path) = operator_tool_home(
-                name,
-                if name == "CARGO_HOME" {
-                    ".cargo"
-                } else {
-                    ".rustup"
-                },
-            ) {
-                assert_eq!(env.get(name), Some(&path));
+        // `RUSTUP_HOME` env matches an operator override and is fully
+        // readable (never a secret; toolchains only).
+        if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
+            assert_eq!(env.get("RUSTUP_HOME"), Some(&path));
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &path
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &path
+            ));
+        }
+        // `CARGO_HOME` env still resolves to the whole home (cargo itself
+        // needs that to find its own layout) — but the READ grant is the
+        // narrowed `cargo_home_read_roots` set (round 3, PR #2579): the
+        // subdirs a build needs are readable, `credentials.toml` is not.
+        if let Some(path) = operator_tool_home("CARGO_HOME", ".cargo") {
+            assert_eq!(env.get("CARGO_HOME"), Some(&path));
+            for subdir in ["bin", "registry", "git"] {
                 assert!(crate::caveats::permits_path(
                     &request.caveats.fs_read,
-                    &path
-                ));
-                assert!(!crate::caveats::permits_path(
-                    &request.caveats.fs_write,
-                    &path
+                    &Path::new(&path).join(subdir).to_string_lossy()
                 ));
             }
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &Path::new(&path).join("credentials.toml").to_string_lossy()
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &path
+            ));
         }
         assert!(env.keys().all(|name| [
             "HOME",

@@ -274,3 +274,96 @@ fn build_fence_denies_write_escape_and_secret_read() {
         Err(e) => panic!("unexpected refusal: {e}"),
     }
 }
+
+/// dec1-build-grant round 3 (architect review, PR #2579): `build_tool_caveats`
+/// must read `$CARGO_HOME/bin`/`registry`/`git` (real dependency/toolchain
+/// resolution) but must NEVER read `$CARGO_HOME/credentials.toml` — the
+/// whole-directory grant this replaces would have let `cargo --version; cat
+/// $CARGO_HOME/credentials.toml` read the secret straight through it. Real
+/// Landlock proof (not just `toolchain_read_roots_narrows_cargo_home_and_
+/// drops_the_cache_dir`'s pure-unit check): the kernel fence must actually
+/// deny the credentials read while still permitting the narrowed subdir a
+/// real build needs — proving (b) from the review, that the narrowed set
+/// still works, and (a) at the strongest tier this repo has.
+#[test]
+#[serial]
+fn build_fence_reads_cargo_home_subdirs_but_never_credentials() {
+    let ws = tempdir().unwrap();
+    let cargo_home = tempdir().unwrap();
+    std::fs::create_dir_all(cargo_home.path().join("bin")).unwrap();
+    std::fs::write(cargo_home.path().join("bin/marker.txt"), "cached-binary").unwrap();
+    std::fs::write(
+        cargo_home.path().join("credentials.toml"),
+        "token = \"SECRET-abc123\"",
+    )
+    .unwrap();
+
+    // SAFETY (test-only, `#[serial]`): this integration test file is its own
+    // process; CARGO_HOME is read once, synchronously, right here to build
+    // the caveats, then restored before any other test in this binary runs.
+    let saved = std::env::var_os("CARGO_HOME");
+    unsafe {
+        std::env::set_var("CARGO_HOME", cargo_home.path());
+    }
+    let caveats = build_tool_caveats(ws.path());
+    unsafe {
+        match saved {
+            Some(v) => std::env::set_var("CARGO_HOME", v),
+            None => std::env::remove_var("CARGO_HOME"),
+        }
+    }
+
+    // (b): the narrowed subdir is still readable — a confined build can
+    // still resolve its cached toolchain/dependencies.
+    let read_marker = format!(
+        "cat '{}'",
+        cargo_home.path().join("bin/marker.txt").display()
+    );
+    let req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        "sh",
+        ["-c", read_marker.as_str()],
+        ws.path(),
+        caveats.clone(),
+    )
+    .env("PATH", "/usr/bin:/bin");
+    if landlock_available() {
+        let out = ConstrainedExecutor::run(&req)
+            .expect("a granted CARGO_HOME/bin read must run under Landlock");
+        assert!(
+            out.success,
+            "cat of a granted read root should succeed: {out:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("cached-binary"),
+            "the narrowed CARGO_HOME/bin root must still be readable: {out:?}"
+        );
+    } else {
+        assert!(matches!(
+            ConstrainedExecutor::run(&req),
+            Err(ExecRefused::ConfinementUnenforceable(_))
+        ));
+    }
+
+    // (a): credentials.toml stays unreadable — never in the grant.
+    let read_creds = format!(
+        "cat '{}'",
+        cargo_home.path().join("credentials.toml").display()
+    );
+    let req = ExecRequest::new(
+        ExecOrigin::AgentInfluenced,
+        "sh",
+        ["-c", read_creds.as_str()],
+        ws.path(),
+        caveats,
+    )
+    .env("PATH", "/usr/bin:/bin");
+    match ConstrainedExecutor::run(&req) {
+        Ok(out) => assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("SECRET-abc123"),
+            "a build tool must never read (and thus disclose) $CARGO_HOME/credentials.toml: {out:?}"
+        ),
+        Err(ExecRefused::ConfinementUnenforceable(_)) => {}
+        Err(e) => panic!("unexpected refusal: {e}"),
+    }
+}
