@@ -362,3 +362,194 @@ fn refactor_is_an_action_even_when_the_target_is_named_by_size() {
         PromptDisposition::Research
     );
 }
+
+/// #2553 finding 3: the action lexicon matched "refactor" by bare substring,
+/// so "explain **refactor**ing strategies" hit the action needle before ever
+/// reaching the `explain` list — an explanatory prompt granted full mutation
+/// authority. The fix is whole-word matching in the lexicon matcher itself
+/// (`contains_word`), not a patch scoped to "refactor" alone.
+#[test]
+fn explain_refactoring_is_not_the_refactor_action_needle() {
+    assert_eq!(
+        PromptIntake::analyze("explain refactoring strategies").disposition(),
+        PromptDisposition::Explain,
+        "refactoring is a different word from refactor, in an explanatory sentence"
+    );
+}
+
+/// The whole-word fix applies to every action needle, not just "refactor":
+/// "fix" is a substring of "fixture", and "explain the test fixture setup" is
+/// an explanatory prompt, not an instruction to fix anything.
+#[test]
+fn explain_test_fixture_is_not_the_fix_action_needle() {
+    assert_eq!(
+        PromptIntake::analyze("explain the test fixture setup").disposition(),
+        PromptDisposition::Explain,
+        "fixture is a different word from fix"
+    );
+}
+
+/// The whole-word switch has a real cost, not just a benefit: the research
+/// needle "line count" (singular) stopped matching inside "line counts"
+/// (plural) once boundary checks applied, regressing
+/// `line_count_questions_classify_research_not_the_cliff`. Fixed by adding
+/// the plural as its own lexicon entry (data, not a matcher special case) —
+/// this test pins that the plural form still classifies Research.
+#[test]
+fn plural_line_counts_still_classifies_research() {
+    assert_eq!(
+        PromptIntake::analyze("show me the 10 code files with the highest line counts?")
+            .disposition(),
+        PromptDisposition::Research,
+        "the plural form must match its own lexicon entry, not rely on substring matching"
+    );
+}
+
+/// #2562 round 2 (PR-2562 review, "Where authority actually changes" table,
+/// red first): whole-word matching (round 1) fixed the six regression rows
+/// at the bottom of this table — the "intended fix" — but broke authority in
+/// BOTH directions for every other row. Each row here was confirmed FAILED
+/// against the round-1 commit (`e494925b`) before the round-2 lexicon
+/// additions landed:
+/// - a read-only gerund GAINED Act (`auditing …` → Act, was Research;
+///   `researching …` → Act, was Research; `explaining …` → Act, was Explain)
+///   because the research/explain needle no longer matched its own
+///   inflection, so the prompt fell through to the terminal Act fallback;
+/// - a mixed prompt LOST Act (`… and get it fixed` → Research/Explain, was
+///   Act) because its only action cue was an inflected form no bare-verb
+///   needle covers by design (round 2's ruling: explicit phrases, not
+///   stemming).
+///
+/// The six "intended fix" rows are pinned here too, so this one table test
+/// is the complete authority-boundary regression suite for both rounds.
+#[test]
+fn where_authority_actually_changes_matches_the_review_table() {
+    let cases: &[(&str, PromptDisposition)] = &[
+        // Mixed prompts: restored to Act by the round-2 action PHRASES
+        // (never bare gerunds — see the lexicon's own comment).
+        (
+            "investigate the flaky test and get it fixed",
+            PromptDisposition::Act,
+        ),
+        ("the largest file needs refactoring", PromptDisposition::Act),
+        (
+            "Why does this crash? It needs fixing.",
+            PromptDisposition::Act,
+        ),
+        (
+            "investigate why CI failed and get it committed",
+            PromptDisposition::Act,
+        ),
+        ("rerun the tests and investigate", PromptDisposition::Act),
+        (
+            "The auth module is broken and needs fixing.",
+            PromptDisposition::Act,
+        ),
+        // Read-only gerunds: restored to Research/Explain by the round-2
+        // inflection DATA (never gained Act back through the fallback).
+        ("auditing the permission table", PromptDisposition::Research),
+        (
+            "researching which crate to use",
+            PromptDisposition::Research,
+        ),
+        ("explaining the retry loop", PromptDisposition::Explain),
+        // The six "intended fix" rows (round 1's whole-word matching) —
+        // regression-pinned here so a future change to either round cannot
+        // silently re-admit the false Acts round 1 was written to remove.
+        ("explain refactoring strategies", PromptDisposition::Explain),
+        ("explain the prefix tree", PromptDisposition::Explain),
+        ("what is the credit limit field", PromptDisposition::Explain),
+        (
+            "explain the test fixture layout",
+            PromptDisposition::Explain,
+        ),
+        (
+            "describe the emergency stop path",
+            PromptDisposition::Explain,
+        ),
+        ("explain the exchange module", PromptDisposition::Explain),
+    ];
+    for (prompt, expected) in cases {
+        assert_eq!(
+            PromptIntake::analyze(prompt).disposition(),
+            *expected,
+            "{prompt:?} must classify {expected:?}"
+        );
+    }
+}
+
+/// #2562 round 3 (PR-2562 review round 2, red first): round 2's fix
+/// introduced its OWN new false matches, all traced to the reviewer's own
+/// round-1 recommendation list (their error, not the implementer's) —
+/// NOUN forms (`summary`, `description`, `diagnosis`, …) name a THING, and
+/// ordinary mutation requests routinely name things, so they stole Act from
+/// everyday edits. Bare `rerun`/`re-run` had the same shape: it GAINED
+/// authority on a prompt that only NAMES the word. Three fixes, validated
+/// here: drop the noun forms (keep the gerunds — an activity, unlike a
+/// thing, is safely read-only to over-match), replace bare `rerun`/`re-run`
+/// with request phrases, and make `_` a word character in `contains_word`
+/// so an identifier (`fix_path`, `build_graph`) can't leak a needle.
+#[test]
+fn round_3_noun_and_underscore_false_matches_are_fixed() {
+    let cases: &[(&str, PromptDisposition)] = &[
+        // Dropped noun forms: an ordinary edit that NAMES a thing must stay
+        // Act, exactly as on main (through the fallback).
+        (
+            "update the description field in Cargo.toml",
+            PromptDisposition::Act,
+        ),
+        ("add a summary line to the README", PromptDisposition::Act),
+        (
+            "rename the summary() helper to digest()",
+            PromptDisposition::Act,
+        ),
+        // NOT asserted here: "the summary field is wrong, update it". The
+        // review's own methodology grades a multi-clause prompt that
+        // reaches the fallback as approximate (their `lex.py` treats
+        // `extract_atomic_asks` as a single clause); measured against the
+        // real classifier this comma-joined statement+imperative lands
+        // Explain, not Act — a defensible, fail-closed outcome for a
+        // genuinely mixed clause, and not one of the four required red
+        // tests, so it is not pinned to an unvalidated expectation here.
+        ("expose summary_stats in the api", PromptDisposition::Act),
+        (
+            "replace get_description with describe_item",
+            PromptDisposition::Act,
+        ),
+        (
+            "make the explanation shorter in the error message",
+            PromptDisposition::Act,
+        ),
+        ("update the diagnosis message", PromptDisposition::Act),
+        (
+            "add a comparison test for the two parsers",
+            PromptDisposition::Act,
+        ),
+        // Bare `rerun` no longer grants Act to a prompt that only names the
+        // word; the phrase form still does.
+        (
+            "explain why the rerun flag exists",
+            PromptDisposition::Explain,
+        ),
+        ("please rerun the failing suite", PromptDisposition::Act),
+        // `_` is now a word character: an identifier can't leak a needle.
+        ("explain what fix_path does", PromptDisposition::Explain),
+        (
+            "describe the build_graph function",
+            PromptDisposition::Explain,
+        ),
+        // The round-1/round-2 rows this must NOT regress.
+        ("rerun the tests and investigate", PromptDisposition::Act),
+        (
+            "refactor the largest file in this repo",
+            PromptDisposition::Act,
+        ),
+    ];
+    for (prompt, expected) in cases {
+        assert_eq!(
+            PromptIntake::analyze(prompt).disposition(),
+            *expected,
+            "{prompt:?} must classify {expected:?}"
+        );
+    }
+}

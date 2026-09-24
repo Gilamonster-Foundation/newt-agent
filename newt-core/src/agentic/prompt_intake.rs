@@ -1422,6 +1422,38 @@ impl Default for DispositionLexicon {
                 "open a pr",
                 "open pr",
                 "merge",
+                // #2562 round 2 (PR-2562 review, "data not stemming" ruling,
+                // part 2): whole-word matching (#2553 finding 3) means a bare
+                // gerund/participle ("fixing", "refactoring", "implemented")
+                // is NOT added here — those are description words as often
+                // as commands ("explain refactoring", "how is caching
+                // implemented?"), and alone they already reach Act through
+                // the terminal fallback (measured: 22/22 ordinary
+                // imperatives). What whole-word matching broke instead is
+                // the MIXED prompt whose only action cue is one of these
+                // unambiguous REQUEST PHRASES, which used to win only by
+                // accidentally substring-matching a bare verb needle
+                // elsewhere in the same clause — restore those explicitly:
+                "needs fixing",
+                "need fixing",
+                "needs refactoring",
+                "need refactoring",
+                "get it fixed",
+                "get them fixed",
+                "get it committed",
+                // #2562 round 3 (PR-2562 review round 2): bare "rerun" /
+                // "re-run" GAINED authority on an explanatory prompt that
+                // merely NAMES the word ("explain why the rerun flag
+                // exists"). "run " no longer matches inside "rerun the
+                // tests" either way ("re" is alphanumeric-adjacent, so the
+                // left edge fails the whole-word check — correctly: "rerun"
+                // is one word, not "run" plus a prefix) — but the fix is
+                // request PHRASES, not the bare word, same asymmetry as
+                // "needs fixing" above.
+                "rerun the",
+                "re-run the",
+                "please rerun",
+                "please re-run",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1447,10 +1479,36 @@ impl Default for DispositionLexicon {
                 // Research and giving Research the capability is the fix for
                 // "Research is too strict".
                 "line count",
+                // Whole-word matching (#2553 finding 3) no longer lets
+                // "line count" match inside "line counts" — add the plural
+                // as its own entry rather than reopen substring matching.
+                "line counts",
                 "most lines",
                 "fewest lines",
                 "longest file",
                 "shortest file",
+                // #2562 round 2 (PR-2562 review, "data not stemming" ruling,
+                // part 1, BLOCKING): whole-word matching stopped these
+                // needles from matching their own inflections, which
+                // silently fell through to the Act fallback — a read-only
+                // gerund GAINING mutation authority ("auditing the
+                // permission table" → Act). GERUNDS ONLY (round 3, PR-2562
+                // review round 2): a gerund names an ACTIVITY, and a request
+                // built on one is read-only — safe to over-match, since at
+                // worst an ambiguous prompt loses authority rather than
+                // gaining it. The matching NOUN forms (`investigation`,
+                // `analysis`, `diagnosis`, `comparison`, `audits`) were
+                // tried and reverted: a noun names a THING, and ordinary
+                // mutation requests routinely name things ("update the
+                // diagnosis message", "add a comparison test") — those nouns
+                // cost Act on everyday edits, exactly #2558 test 1.
+                "researching",
+                "auditing",
+                "investigating",
+                "analyzing",
+                "diagnosing",
+                "exploring",
+                "comparing",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1469,6 +1527,14 @@ impl Default for DispositionLexicon {
                 // #2332: keeps "Could you tell me what X does?" an answer once
                 // `could you ` makes a question a request.
                 "tell me",
+                // #2562 round 2/round 3: same "data not stemming" ruling —
+                // see the research list's matching comment above. GERUNDS
+                // ONLY: `summary`/`description`/`explanation` are nouns and
+                // were reverted (round 3) after they cost Act on
+                // "update the description field", "add a summary line".
+                "explaining",
+                "summarizing",
+                "describing",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1539,6 +1605,43 @@ impl Default for DispositionLexicon {
     }
 }
 
+/// Whole-word substring match (#2553 finding 3): `needle` matches `haystack`
+/// only where its outer edges land on a word boundary. Checked only on edges
+/// that are themselves word characters — a needle already padded with a space
+/// or quote (`" test \""`, `"run "`) supplies its own boundary on that side
+/// and needs no further check. This is what keeps `"refactor"` off
+/// `"refactoring"` (suffix, no trailing boundary) while still matching
+/// `"refactor the largest file"` (#2553's original case), and applies to
+/// every lexicon entry, not a special case for one word.
+///
+/// `_` counts as a word character (#2562 round 3, PR-2562 review round 2):
+/// `char::is_alphanumeric` alone treats `_` as a boundary, so an identifier
+/// leaked a needle into authority — `explain what fix_path does` hit `fix`,
+/// `describe the build_graph function` hit `build`, `summary_stats` hit
+/// `summary` — granting or stealing Act on a purely explanatory question
+/// about code. The old substring matcher had the same flaw, so this closes
+/// a pre-existing gap in finding 3's own class, not a fresh regression.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let end = abs + needle.len();
+        let left_ok = !needle.chars().next().is_some_and(is_word)
+            || !haystack[..abs].chars().next_back().is_some_and(is_word);
+        let right_ok = !needle.chars().next_back().is_some_and(is_word)
+            || !haystack[end..].chars().next().is_some_and(is_word);
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 fn infer_disposition(prompt: &str, asks: &[AtomicAsk]) -> PromptDisposition {
     infer_disposition_with(prompt, asks, &DispositionLexicon::default())
 }
@@ -1582,7 +1685,11 @@ fn infer_disposition_with(
     // Padding makes a lexicon entry with a leading-space word boundary match at
     // the beginning of a prompt without losing that boundary inside prose.
     let padded = format!(" {lower}");
-    let hit = |needles: &[String]| needles.iter().any(|n| !n.is_empty() && padded.contains(n));
+    let hit = |needles: &[String]| {
+        needles
+            .iter()
+            .any(|n| !n.is_empty() && contains_word(&padded, n))
+    };
     if hit(&lexicon.action) {
         return PromptDisposition::Act;
     }
