@@ -64,13 +64,13 @@ pub fn tool_definitions() -> serde_json::Value {
                 "name": "write_file",
                 "description": "Create a file, or replace one entirely. To change an \
                                 existing file use edit_file (a large shrink is refused). To \
-                                move existing code into a new file, copy its lines with \
-                                run_command (sed -n 'A,Bp' src > dst) — never retype them.",
+                                move existing code, use copy_from — never retype it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "content": { "type": "string", "description": "The complete new file contents" }
+                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty)" },
+                        "copy_from": { "type": "object", "description": "Append lines start_line..end_line of another file, copied exactly", "properties": { "path": { "type": "string" }, "start_line": { "type": "integer" }, "end_line": { "type": "integer" } } }
                     },
                     "required": ["path", "content"]
                 }
@@ -80,18 +80,19 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace one exact string in an existing file. Fails if \
-                                old_string is missing or matches more than once (add context). \
-                                To remove a large block, delete its line range with run_command \
-                                instead of quoting it in old_string.",
+                "description": "Replace one exact string in an existing file, or a line \
+                                range (start_line..end_line; empty new_string deletes it). \
+                                Use the range for large blocks instead of quoting them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "old_string": { "type": "string", "description": "Exact string to find and replace (must match exactly once)" },
-                        "new_string": { "type": "string", "description": "Replacement string" }
+                        "old_string": { "type": "string", "description": "Exact string to replace (must match once); omit when using a line range" },
+                        "new_string": { "type": "string", "description": "Replacement" },
+                        "start_line": { "type": "integer" },
+                        "end_line": { "type": "integer" }
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path", "new_string"]
                 }
             }
         },

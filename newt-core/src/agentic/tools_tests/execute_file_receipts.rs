@@ -524,3 +524,84 @@ async fn deleting_a_final_symlink_does_not_report_its_target_contents_as_deleted
         "target remains\n"
     );
 }
+
+// -- moving code by line range: no retyping, no shell dialect -------------
+//
+// Live 2026-09-23: a retyped 1,263-line move fabricated symbols; a shell sed
+// range copy then failed on BSD-vs-GNU syntax and left `mod.rs-e` behind.
+
+#[tokio::test]
+async fn copy_from_moves_a_line_range_byte_exact_after_a_typed_header() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("src.rs"),
+        "l1\nfn moved() {\n    body();\n}\nl5\n",
+    )
+    .unwrap();
+    let (model, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "dst.rs", "content": "use x;\n",
+            "copy_from": {"path": "src.rs", "start_line": 2, "end_line": 4}}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(model.contains("Added (+4 -0)"), "{model}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("dst.rs")).unwrap(),
+        "use x;\nfn moved() {\n    body();\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_deletes_a_line_range_without_quoting_it() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("src.rs"),
+        "l1\nfn moved() {\n    body();\n}\nl5\n",
+    )
+    .unwrap();
+    let (model, _) = model_and_display(
+        "edit_file",
+        serde_json::json!({"path": "src.rs", "start_line": 2, "end_line": 4, "new_string": "mod dst;\n"}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(model.contains("Modified (+1 -3)"), "{model}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("src.rs")).unwrap(),
+        "l1\nmod dst;\nl5\n"
+    );
+}
+
+/// `copy_from` reads through read_file's own fence: a source outside the
+/// fs_read scope is refused, and nothing is written.
+#[tokio::test]
+async fn copy_from_a_source_outside_the_read_scope_is_denied_and_writes_nothing() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "private\n").unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+        ..caveats_rw(ws.path())
+    };
+    let (model, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "dst.txt", "content": "",
+            "copy_from": {"path": secret.to_string_lossy(), "start_line": 1, "end_line": 1}}),
+        ws.path(),
+        &caveats,
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(
+        model.contains("fs_read"),
+        "refusal names the denied axis: {model}"
+    );
+    assert!(!model.contains("private"), "{model}");
+    assert!(!ws.path().join("dst.txt").exists(), "nothing written");
+}

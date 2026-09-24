@@ -1487,6 +1487,58 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
 /// Consult the #263 gate for one denied fs path. Returns `true` only when
 /// the human allowed it AND the re-minted caveats actually permit the path —
 /// the widened authority is re-checked, never assumed.
+/// Authorise and read one file exactly as `read_file` does, for every tool
+/// that reads a file's contents: `read_file` itself and `write_file`'s
+/// `copy_from`, so a copied range crosses the same fence a read would.
+///
+/// Did the fs_read SCOPE authorise this (the automatic, object-bound fence),
+/// or only a #263 permission-gate grant (the human approving this exact
+/// out-of-scope path)? That distinction decides whether the read is
+/// object-bound. `Err` carries the model-facing refusal or read error.
+fn authorized_read(
+    tool: &str,
+    path: &str,
+    workspace: &str,
+    caveats: &crate::caveats::Caveats,
+    permission_gate: Option<&mut (dyn PermissionGate + '_)>,
+) -> Result<String, String> {
+    let full = std::path::Path::new(workspace).join(path);
+    let full_str = full.to_string_lossy();
+    let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
+    if !scope_permits {
+        // #263: the gate may grant the read; deny (or no gate) keeps the
+        // standard denial text bit-for-bit.
+        let allowed = permission_gate.is_some_and(|gate| {
+            fs_gate_allows(gate, tool, DenialKind::FsRead, &full_str, |c| &c.fs_read)
+        });
+        if !allowed {
+            return Err(denied_fs_result("fs_read", path));
+        }
+    }
+    // #1176: shadow-OCAP — under --full-access the fs fence is top(), so this
+    // read runs unconfined; record the path a leash would have gated on (no-op
+    // unless recording is armed). `newt ocap propose` folds it into reviewable
+    // fs candidates.
+    if full_access_requested() {
+        crate::flight_recorder::log_observed(
+            crate::flight_recorder::ShadowAxis::FsRead,
+            &full_str,
+            tool,
+        );
+    }
+    // step-52.2: object-bound read when the SCOPE authorised it — resolve
+    // `path` beneath the granted root (openat2 RESOLVE_BENEATH), so a symlink /
+    // `..` / absolute escape the lexical gate admits is refused by the kernel.
+    // A gate-approved out-of-scope path was explicitly vouched for by the human
+    // (#263), so it reads as-is; `Scope::All` (--full-access) is unconfined
+    // inside `object_bound_read`.
+    if scope_permits {
+        object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
+    } else {
+        std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
+    }
+}
+
 fn fs_gate_allows(
     gate: &mut dyn PermissionGate,
     tool: &str,
@@ -2326,7 +2378,17 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "write_file" => {
             let path = string("path", "");
             let bytes = args["content"].as_str().unwrap_or("").len();
-            format!("{} ({bytes} bytes)", file_capture::display_text(&path))
+            let copy = &args["copy_from"];
+            match copy["path"].as_str() {
+                Some(source) => format!(
+                    "{} ({bytes} bytes + {}:{}-{})",
+                    file_capture::display_text(&path),
+                    file_capture::display_text(source),
+                    copy["start_line"],
+                    copy["end_line"],
+                ),
+                None => format!("{} ({bytes} bytes)", file_capture::display_text(&path)),
+            }
         }
         "edit_file" | "delete_file" => file_capture::display_text(&string("path", "")).into_owned(),
         "read_file" => string("path", ""),
@@ -4004,48 +4066,7 @@ async fn execute_authorized_tool(
 
         "read_file" => {
             let path = args["path"].as_str().unwrap_or("");
-            let full = std::path::Path::new(workspace).join(path);
-            let full_str = full.to_string_lossy();
-            // Did the fs_read SCOPE authorise this (the automatic, object-bound
-            // fence), or only a #263 permission-gate grant (the human approving
-            // this exact out-of-scope path)? That distinction decides whether the
-            // read is object-bound below.
-            let scope_permits = tui_permits_path(&caveats.fs_read, &full_str);
-            if !scope_permits {
-                // #263: the gate may grant the read; deny (or no gate) keeps
-                // the standard denial text bit-for-bit.
-                let allowed = permission_gate.is_some_and(|gate| {
-                    fs_gate_allows(gate, "read_file", DenialKind::FsRead, &full_str, |c| {
-                        &c.fs_read
-                    })
-                });
-                if !allowed {
-                    return denied_fs_result("fs_read", path);
-                }
-            }
-            // #1176: shadow-OCAP — under --full-access the fs fence is top(), so
-            // this read runs unconfined; record the path a leash would have
-            // gated on (no-op unless recording is armed). `newt ocap propose`
-            // folds it into reviewable fs candidates.
-            if full_access_requested() {
-                crate::flight_recorder::log_observed(
-                    crate::flight_recorder::ShadowAxis::FsRead,
-                    &full_str,
-                    "read_file",
-                );
-            }
-            // step-52.2: object-bound read when the SCOPE authorised it — resolve
-            // `path` beneath the granted root (openat2 RESOLVE_BENEATH), so a
-            // symlink / `..` / absolute escape the lexical gate admits is refused
-            // by the kernel. A gate-approved out-of-scope path was explicitly
-            // vouched for by the human (#263), so it reads as-is; `Scope::All`
-            // (--full-access) is unconfined inside `object_bound_read`.
-            let read = if scope_permits {
-                object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
-            } else {
-                std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
-            };
-            match read {
+            match authorized_read("read_file", path, workspace, caveats, permission_gate) {
                 Ok(contents) => {
                     // #719: window + cap the MODEL-facing payload (the on-screen
                     // display is capped separately) so one read of a large file
@@ -4065,6 +4086,44 @@ async fn execute_authorized_tool(
         "write_file" => {
             let path = args["path"].as_str().unwrap_or("");
             let content = args["content"].as_str().unwrap_or("");
+            // Move code without retyping it: `copy_from` appends an exact line
+            // range of another file after `content` (a typed header). The
+            // source is read through read_file's own fence. Live 2026-09-23 a
+            // retyped 1,263-line move fabricated symbols; a shell `sed` copy
+            // failed on BSD-vs-GNU syntax and left `mod.rs-e` behind.
+            let copied;
+            let content = match args.get("copy_from") {
+                Some(spec) => {
+                    let (Some(source), Some(start), Some(end)) = (
+                        spec["path"].as_str(),
+                        spec["start_line"].as_u64(),
+                        spec["end_line"].as_u64(),
+                    ) else {
+                        return "error: copy_from needs path, start_line and end_line".to_string();
+                    };
+                    let text = match authorized_read(
+                        "write_file",
+                        source,
+                        workspace,
+                        caveats,
+                        permission_gate.as_deref_mut(),
+                    ) {
+                        Ok(text) => text,
+                        Err(refusal) => return refusal,
+                    };
+                    copied = match file_capture::copy_line_range(
+                        content,
+                        &text,
+                        start as usize,
+                        end as usize,
+                    ) {
+                        Ok(text) => text,
+                        Err(refusal) => return refusal,
+                    };
+                    copied.as_str()
+                }
+                None => content,
+            };
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             // Scope- vs #263-gate-authorised, same split as read_file (step-52.2):
@@ -4366,6 +4425,12 @@ async fn execute_authorized_tool(
             let path = args["path"].as_str().unwrap_or("");
             let old_string = args["old_string"].as_str().unwrap_or("");
             let new_string = args["new_string"].as_str().unwrap_or("");
+            // A line range replaces those lines with `new_string` (empty deletes
+            // them), so removing a large block never means quoting it back.
+            let range = match (args["start_line"].as_u64(), args["end_line"].as_u64()) {
+                (Some(start), Some(end)) => Some((start as usize, end as usize)),
+                _ => None,
+            };
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             // step-52.5: same scope-vs-#263-gate split as write_file — decides
@@ -4391,8 +4456,8 @@ async fn execute_authorized_tool(
                     "edit_file",
                 );
             }
-            if old_string.is_empty() {
-                return "error: old_string must not be empty — use write_file to create new files"
+            if old_string.is_empty() && range.is_none() {
+                return "error: old_string must not be empty (or give start_line and end_line) — use write_file to create new files"
                     .to_string();
             }
             if !file_capture::regular_target(&full) {
@@ -4410,7 +4475,11 @@ async fn execute_authorized_tool(
                 Ok(s) => s,
                 Err(tool_output) => return tool_output,
             };
-            let count = existing.matches(old_string).count();
+            let count = if range.is_some() {
+                1
+            } else {
+                existing.matches(old_string).count()
+            };
             if count == 0 {
                 // Show the file's actual head so the model can copy the exact
                 // text and self-correct on the next call — instead of guessing
@@ -4464,7 +4533,15 @@ async fn execute_authorized_tool(
                     super::artifact_hooks::ArtifactFileState::from_bytes(existing.as_bytes())
                 }
             });
-            let updated = existing.replacen(old_string, new_string, 1);
+            let updated = match range {
+                Some((start, end)) => {
+                    match file_capture::replace_line_range(&existing, start, end, new_string) {
+                        Ok(updated) => updated,
+                        Err(refusal) => return refusal,
+                    }
+                }
+                None => existing.replacen(old_string, new_string, 1),
+            };
             let old_lines = existing.lines().count();
             let new_lines = updated.lines().count();
             let delta = new_lines as i64 - old_lines as i64;

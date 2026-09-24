@@ -327,6 +327,59 @@ pub(super) fn regular_target(path: &Path) -> bool {
     }
 }
 
+/// Lines `start..=end` (1-based) of `text`, byte-exact, or a refusal naming
+/// the file's length.
+fn line_range<'a>(text: &'a str, start: usize, end: usize) -> Result<(usize, usize), String> {
+    let lines: Vec<&'a str> = text.split_inclusive('\n').collect();
+    if start == 0 || start > end || end > lines.len() {
+        return Err(format!(
+            "error: lines {start}-{end} are not a range of this file ({} lines)",
+            lines.len()
+        ));
+    }
+    let from: usize = lines[..start - 1].iter().map(|l| l.len()).sum();
+    let to: usize = from + lines[start - 1..end].iter().map(|l| l.len()).sum::<usize>();
+    Ok((from, to))
+}
+
+/// `header` followed by lines `start..=end` of `source`, copied byte for byte.
+/// Moving code this way means the model never retypes it: live 2026-09-23 a
+/// retyped 1,263-line move fabricated symbols and was deleted twice.
+pub(super) fn copy_line_range(
+    header: &str,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Result<String, String> {
+    let (from, to) = line_range(source, start, end)?;
+    let mut out = header.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&source[from..to]);
+    Ok(out)
+}
+
+/// `text` with lines `start..=end` replaced by `replacement` (empty deletes
+/// them), every other byte untouched — so removing a large block does not
+/// require quoting it back verbatim as an `old_string`.
+pub(super) fn replace_line_range(
+    text: &str,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) -> Result<String, String> {
+    let (from, to) = line_range(text, start, end)?;
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..from]);
+    out.push_str(replacement);
+    if !replacement.is_empty() && !replacement.ends_with('\n') && to < text.len() {
+        out.push('\n');
+    }
+    out.push_str(&text[to..]);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +493,55 @@ mod tests {
             matches(&scoped, &root.path().join("link"), b"inside\n"),
             !cfg!(target_os = "macos")
         );
+    }
+}
+
+/// Pure tests for moving code by line range — no filesystem.
+#[cfg(test)]
+mod line_range_tests {
+    use super::{copy_line_range, replace_line_range};
+
+    const SRC: &str = "l1\nl2\nl3\nl4\nl5\n";
+
+    #[test]
+    fn a_copied_range_is_byte_exact_and_follows_the_typed_header() {
+        assert_eq!(
+            copy_line_range("use x;\n", SRC, 2, 4).unwrap(),
+            "use x;\nl2\nl3\nl4\n"
+        );
+        assert_eq!(copy_line_range("", SRC, 5, 5).unwrap(), "l5\n");
+    }
+
+    #[test]
+    fn a_header_without_a_trailing_newline_still_starts_the_copy_on_its_own_line() {
+        assert_eq!(
+            copy_line_range("use x;", SRC, 1, 1).unwrap(),
+            "use x;\nl1\n"
+        );
+    }
+
+    #[test]
+    fn a_replaced_range_keeps_every_other_line_byte_exact() {
+        assert_eq!(
+            replace_line_range(SRC, 2, 4, "mod m;\n").unwrap(),
+            "l1\nmod m;\nl5\n"
+        );
+        // Deletion: an empty replacement removes the lines cleanly.
+        assert_eq!(replace_line_range(SRC, 2, 4, "").unwrap(), "l1\nl5\n");
+        // A replacement missing its newline does not glue onto the next line.
+        assert_eq!(
+            replace_line_range(SRC, 2, 4, "mod m;").unwrap(),
+            "l1\nmod m;\nl5\n"
+        );
+    }
+
+    #[test]
+    fn a_bad_range_is_refused_with_the_file_length() {
+        for (start, end) in [(0, 2), (3, 2), (4, 9)] {
+            let err = replace_line_range(SRC, start, end, "").unwrap_err();
+            assert!(err.contains("5 lines"), "{err}");
+            let err = copy_line_range("", SRC, start, end).unwrap_err();
+            assert!(err.contains("5 lines"), "{err}");
+        }
     }
 }
