@@ -62,12 +62,10 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write or overwrite a file within granted file access. \
-                                WARNING: use edit_file instead when modifying an existing file — \
-                                write_file replaces the entire contents and will fail if the new \
-                                content is significantly shorter than the original (shrink guard). \
-                                Only use write_file for new files or full rewrites you have \
-                                explicitly generated in their entirety.",
+                "description": "Create a file, or replace one entirely. To change an \
+                                existing file use edit_file (a large shrink is refused). To \
+                                move existing code into a new file, copy its lines with \
+                                run_command (sed -n 'A,Bp' src > dst) — never retype them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -82,11 +80,10 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Make a targeted edit to an existing file by replacing one exact \
-                                string with another. Safer than write_file for modifying existing \
-                                files — you only generate the change, not the whole file. \
-                                Fails with a clear error if old_string is not found or matches \
-                                multiple times (add more surrounding context to make it unique).",
+                "description": "Replace one exact string in an existing file. Fails if \
+                                old_string is missing or matches more than once (add context). \
+                                To remove a large block, delete its line range with run_command \
+                                instead of quoting it in old_string.",
                 "parameters": {
                     "type": "object",
                     "properties": {
