@@ -4790,6 +4790,20 @@ impl WorkflowRuntimeState {
 }
 
 fn workflow_error_fingerprint(result: &str) -> Option<String> {
+    // #2561 review (b): an fs-producer failure (missing/unwritable/undeletable
+    // path) is a real failure for the ledger (`ok=false` via #2553's fix), but
+    // it is NOT workflow error evidence. Letting it fingerprint here nudges the
+    // model to EDIT against a missing-path fingerprint (wrong mutation), counts
+    // a probed-wrong-path round as progress (defeating the no-progress brake),
+    // and displaces a real compile-error fingerprint mid-repair. Denials
+    // already route through `unreachable_by_edit` without this path.
+    if result.lines().next().is_some_and(|first| {
+        first.starts_with("error: reading ")
+            || first.starts_with("error: writing ")
+            || first.starts_with("error: deleting ")
+    }) {
+        return None;
+    }
     build_error_fingerprint(result).or_else(|| edit_miss_fingerprint(result))
 }
 

@@ -3017,8 +3017,14 @@ async fn execute_tool_inner(
         .await;
     };
     let harness = invocation.harness();
+    // Captured before `collab` is moved into the inner `execute_authorized_tool`
+    // call below (`Option<&OnceLock<_>>` is `Copy`, so this doesn't disturb it).
+    let execution = collab.execution;
     if let Err(error) = harness.validate_tool_authority(caveats, std::path::Path::new(workspace)) {
         invocation.host();
+        if let Some(slot) = execution {
+            let _ = slot.set(crate::ExecOutcome::Denied);
+        }
         return format!("Error: frame isolation: {error}");
     }
     let mut gate =
@@ -3051,6 +3057,9 @@ async fn execute_tool_inner(
     match gate.and_then(|gate| gate.refusal) {
         Some(error) => {
             invocation.host();
+            if let Some(slot) = execution {
+                let _ = slot.set(crate::ExecOutcome::Denied);
+            }
             format!("Error: frame isolation: permission denied: {error}")
         }
         None => result,
@@ -3365,9 +3374,15 @@ async fn execute_authorized_tool(
         "re_read" => match smart_harness {
             Some(harness) => match harness.read(args) {
                 Ok(text) => { invocation.expect("smart dispatch has a witness").retrieval(); text }
-                Err(error) => { invocation.expect("smart dispatch has a witness").host(); format!("Error: re_read refused: {error}") }
+                Err(error) => {
+                    invocation.expect("smart dispatch has a witness").host();
+                    executed((format!("Error: re_read refused: {error}"), crate::ExecOutcome::Denied))
+                }
             },
-            None => "Error: re_read is unavailable outside a smart harness session".to_string(),
+            None => executed((
+                "Error: re_read is unavailable outside a smart harness session".to_string(),
+                crate::ExecOutcome::Unavailable,
+            )),
         },
         "memory_fetch" => match memory_source {
             Some(source) => execute_memory_fetch(args, source, color, tool_output_lines),
@@ -3691,7 +3706,13 @@ async fn execute_authorized_tool(
         // `meet`-attenuated caveats. Same presence-gating as `git` (the `/team`
         // toggle) — without an injected impl the tools were never advertised.
         "crew" if smart_harness.is_some() =>
-            { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into() },
+            {
+                invocation.expect("smart dispatch has a witness").host();
+                executed((
+                    "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into(),
+                    crate::ExecOutcome::Unavailable,
+                ))
+            },
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
                 let out = match runner.dispatch(name, args, caveats).await {
@@ -4729,7 +4750,13 @@ async fn execute_authorized_tool(
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
         "find" if smart_harness.is_some() =>
-            { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string() },
+            {
+                invocation.expect("smart dispatch has a witness").host();
+                executed((
+                    "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
+                    crate::ExecOutcome::Unavailable,
+                ))
+            },
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
             let full = std::path::Path::new(workspace).join(path);
