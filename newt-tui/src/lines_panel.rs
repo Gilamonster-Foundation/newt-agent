@@ -40,9 +40,20 @@ use crate::panel::{Flow, Key, Screen};
 /// Rows visible at once. The panel leases this many plus chrome.
 const VISIBLE: usize = 12;
 
+/// One row: a label, a value, and where the value came from. Columns are laid
+/// out by `render_panel` — the panels' one column owner — so no caller pads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LineRow {
+    pub(crate) label: &'static str,
+    pub(crate) value: String,
+    pub(crate) from: String,
+}
+
 pub(crate) struct LinesPanel {
     title: &'static str,
-    lines: Vec<String>,
+    rows: Vec<LineRow>,
+    /// Label and value column widths; `(0, 72)` for plain sentence lines.
+    widths: (usize, usize),
     cursor: ListCursor,
 }
 
@@ -55,10 +66,28 @@ impl LinesPanel {
     /// rendering of the same state is how a panel and its command come to
     /// disagree about what is true.
     pub(crate) fn new(title: &'static str, lines: Vec<String>) -> Self {
-        let len = lines.len();
+        let rows = lines
+            .into_iter()
+            .map(|value| LineRow {
+                label: "",
+                value,
+                from: String::new(),
+            })
+            .collect();
+        Self::with_columns(title, rows, (0, 72))
+    }
+
+    /// Build from label/value/provenance rows, laid out in `widths` columns.
+    pub(crate) fn with_columns(
+        title: &'static str,
+        rows: Vec<LineRow>,
+        widths: (usize, usize),
+    ) -> Self {
+        let len = rows.len();
         Self {
             title,
-            lines,
+            rows,
+            widths,
             cursor: ListCursor::new(len, VISIBLE, 0),
         }
     }
@@ -70,11 +99,11 @@ impl LinesPanel {
 
     #[cfg(test)]
     fn visible_rows(&self) -> Vec<&str> {
-        self.lines
+        self.rows
             .iter()
             .skip(self.cursor.top())
             .take(VISIBLE)
-            .map(String::as_str)
+            .map(|row| row.value.as_str())
             .collect()
     }
 }
@@ -82,17 +111,16 @@ impl LinesPanel {
 impl Screen for LinesPanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
         let rows: Vec<crate::config_panel::RowView> = self
-            .lines
+            .rows
             .iter()
             .enumerate()
-            .map(|(index, line)| crate::config_panel::RowView {
-                // The label column carries the whole line: these are sentences
-                // and audit records, not `name: value` pairs, and splitting
-                // them into columns would wrap them at a place they do not
-                // mean anything.
-                label: "",
-                value: line.clone(),
-                provenance: String::new(),
+            .map(|(index, row)| crate::config_panel::RowView {
+                // Sentence lines (audit records, permission prose) keep an
+                // empty label: splitting them into columns would wrap them at
+                // a place they do not mean anything.
+                label: row.label,
+                value: row.value.clone(),
+                provenance: row.from.clone(),
                 selected: index == self.cursor.at(),
                 editable: false,
             })
@@ -102,8 +130,8 @@ impl Screen for LinesPanel {
             self.title,
             &rows,
             crate::config_panel::hint_line("↑↓ scroll · ^u/^d page · Esc leave"),
-            0,
-            72,
+            self.widths.0,
+            self.widths.1,
         );
     }
 

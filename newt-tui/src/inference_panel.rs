@@ -13,6 +13,7 @@ use newt_core::model_card::ChatCompletionsCapability;
 use newt_core::role_profile::Cognition;
 
 use crate::context_window::{ContextWindow, LimitSource, WindowSource};
+use crate::lines_panel::LineRow;
 
 pub(crate) struct Inference<'a> {
     pub(crate) model: &'a str,
@@ -60,7 +61,7 @@ pub(crate) fn gather(
     recovered_window: Option<u32>,
     context_size_override: Option<u32>,
     last_turn: Option<(u32, Option<u32>)>,
-) -> Vec<String> {
+) -> Vec<LineRow> {
     use newt_core::cognition::{
         cli_cognition, effective_cognition, persona_cognition, CognitionOverride,
     };
@@ -125,18 +126,25 @@ fn limit_source(source: LimitSource) -> &'static str {
     }
 }
 
-fn row(label: &str, value: &str, from: &str) -> String {
-    format!("{label:<18} {value:<22} {from}")
+/// Column widths for `LinesPanel::with_columns`: label, then value.
+pub(crate) const WIDTHS: (usize, usize) = (18, 22);
+
+fn row(label: &'static str, value: &str, from: &str) -> LineRow {
+    LineRow {
+        label,
+        value: value.to_string(),
+        from: from.to_string(),
+    }
 }
 
 fn count(n: Option<u32>) -> String {
     n.map_or_else(|| "unknown".to_string(), |n| fmt_count(u64::from(n)))
 }
 
-pub(crate) fn lines(i: &Inference<'_>) -> Vec<String> {
+pub(crate) fn lines(i: &Inference<'_>) -> Vec<LineRow> {
     let mut out = vec![
-        format!("{} · backend {}", i.model, i.backend),
-        String::new(),
+        row("", &format!("{} · backend {}", i.model, i.backend), ""),
+        row("", "", ""),
     ];
     let w = &i.window;
     out.push(row(
@@ -179,14 +187,14 @@ pub(crate) fn lines(i: &Inference<'_>) -> Vec<String> {
         let value = format!("{} / {}", fmt_count(u64::from(used)), count(budget));
         out.push(row("last turn", &value, "tokens sent / send budget"));
     }
-    out.push(String::new());
+    out.push(row("", "", ""));
     out.extend(thinking_rows(i));
-    out.push(String::new());
+    out.push(row("", "", ""));
     out.extend(launch_rows(i));
     out
 }
 
-fn thinking_rows(i: &Inference<'_>) -> Vec<String> {
+fn thinking_rows(i: &Inference<'_>) -> Vec<LineRow> {
     let level = i.cognition.map(Cognition::label);
     let (value, why) = match i.preview.enable_thinking {
         Some(true) => (
@@ -267,7 +275,7 @@ fn key_values(json: &str) -> String {
     }
 }
 
-fn launch_rows(i: &Inference<'_>) -> Vec<String> {
+fn launch_rows(i: &Inference<'_>) -> Vec<LineRow> {
     let note = match i.launch {
         LaunchProbe::Declared(launch) => return declared_rows(launch),
         LaunchProbe::Absent => "the router declares no launch arguments for this model".to_string(),
@@ -283,7 +291,7 @@ fn launch_rows(i: &Inference<'_>) -> Vec<String> {
     vec![row("server launch", "—", &note)]
 }
 
-fn declared_rows(launch: &LlamaCppLaunch) -> Vec<String> {
+fn declared_rows(launch: &LlamaCppLaunch) -> Vec<LineRow> {
     let mut rows = vec![row("server launch", "", "router /models status.args")];
     let mut args = launch.args.iter().peekable();
     while let Some(arg) = args.next() {
@@ -291,11 +299,8 @@ fn declared_rows(launch: &LlamaCppLaunch) -> Vec<String> {
             Some(next) if arg.starts_with("--") && !next.starts_with("--") => args.next(),
             _ => None,
         };
-        rows.push(
-            format!("  {arg} {}", value.map_or("", String::as_str))
-                .trim_end()
-                .to_string(),
-        );
+        let flag = format!("{arg} {}", value.map_or("", String::as_str));
+        rows.push(row("", flag.trim_end(), ""));
     }
     rows
 }

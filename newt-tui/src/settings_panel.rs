@@ -570,7 +570,7 @@ pub(crate) fn run(
     audit: Vec<String>,
     // The Inference section's rows, resolved by the caller before the panel
     // opens (`inference_panel::gather`): its launch fetch is network I/O.
-    inference: Vec<String>,
+    inference: Vec<crate::lines_panel::LineRow>,
     initial_section: Option<char>,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
@@ -593,7 +593,11 @@ pub(crate) fn run(
     // confirmation and persistence path, so this shell reports only intent.
     let mut audit_panel = crate::lines_panel::LinesPanel::new("audit", audit);
     let mut theme_panel = crate::theme_panel::ThemePanel::new();
-    let mut inference_panel = crate::lines_panel::LinesPanel::new("inference", inference);
+    let mut inference_panel = crate::lines_panel::LinesPanel::with_columns(
+        "inference",
+        inference,
+        crate::inference_panel::WIDTHS,
+    );
     let (applied, linked) = {
         let mut shell = settings_shell(
             &mut panel,

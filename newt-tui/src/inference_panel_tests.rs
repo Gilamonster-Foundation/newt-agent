@@ -1,5 +1,6 @@
 use super::*;
 use crate::context_window::{ContextWindow, WindowSource};
+use crate::lines_panel::LineRow;
 
 fn window() -> ContextWindow {
     ContextWindow {
@@ -46,12 +47,17 @@ fn inference(launch: &LaunchProbe) -> Inference<'_> {
     }
 }
 
-fn the_row(lines: &[String], label: &str) -> String {
+/// One row as the operator reads it, columns joined.
+fn text(row: &LineRow) -> String {
+    format!("{} {} {}", row.label, row.value, row.from)
+}
+
+fn the_row(lines: &[LineRow], label: &str) -> String {
     lines
         .iter()
-        .find(|l| l.starts_with(label))
+        .find(|row| row.label.starts_with(label))
+        .map(text)
         .unwrap_or_else(|| panic!("no `{label}` row in {lines:#?}"))
-        .clone()
 }
 
 /// The motivating confusion: `/105k` on the status bar was the input ceiling,
@@ -124,15 +130,15 @@ fn the_server_launch_declaration_is_listed_flag_by_flag() {
     let default = the_row(&lines, "  server default");
     assert!(default.contains("enable_thinking=false"), "{default}");
     assert!(
-        lines.contains(&"  --jinja".to_string()),
+        lines.iter().any(|row| row.value == "--jinja"),
         "a bare flag stands alone: {lines:#?}"
     );
-    assert!(lines.contains(&"  --ctx-size 131072".to_string()));
+    assert!(lines.iter().any(|row| row.value == "--ctx-size 131072"));
     let none = lines_without_launch();
     assert!(the_row(&none, "server launch").contains("not a llama.cpp router"));
 }
 
-fn lines_without_launch() -> Vec<String> {
+fn lines_without_launch() -> Vec<LineRow> {
     lines(&inference(&LaunchProbe::Unsupported))
 }
 
@@ -171,7 +177,7 @@ fn a_session_override_is_shown_as_the_override_it_is() {
     let cap = the_row(&lines, "input cap");
     assert!(cap.contains("50,000") && cap.contains("override"), "{cap}");
     assert!(
-        !lines.iter().any(|l| l.starts_with("largest accepted")),
+        !lines.iter().any(|row| row.label == "largest accepted"),
         "an override is not a learned measurement: {lines:#?}"
     );
 }
