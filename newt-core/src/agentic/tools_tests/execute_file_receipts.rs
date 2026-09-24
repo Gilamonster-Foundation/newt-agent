@@ -554,29 +554,6 @@ async fn copy_from_moves_a_line_range_byte_exact_after_a_typed_header() {
     );
 }
 
-#[tokio::test]
-async fn edit_file_deletes_a_line_range_without_quoting_it() {
-    let ws = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        ws.path().join("src.rs"),
-        "l1\nfn moved() {\n    body();\n}\nl5\n",
-    )
-    .unwrap();
-    let (model, _) = model_and_display(
-        "edit_file",
-        serde_json::json!({"path": "src.rs", "start_line": 2, "end_line": 4, "new_string": "mod dst;\n"}),
-        ws.path(),
-        &caveats_rw(ws.path()),
-        ToolCollaborators::default(),
-    )
-    .await;
-    assert!(model.contains("Modified (+1 -3)"), "{model}");
-    assert_eq!(
-        std::fs::read_to_string(ws.path().join("src.rs")).unwrap(),
-        "l1\nmod dst;\nl5\n"
-    );
-}
-
 /// `copy_from` reads through read_file's own fence: a source outside the
 /// fs_read scope is refused, and nothing is written.
 #[tokio::test]
@@ -606,39 +583,196 @@ async fn copy_from_a_source_outside_the_read_scope_is_denied_and_writes_nothing(
     assert!(!ws.path().join("dst.txt").exists(), "nothing written");
 }
 
-/// Live 2026-09-23 (run 4, 89k/105k context): the model meant a range delete
-/// and sent only `{path, new_string}` — three identical calls, because the
-/// refusal restated the rule instead of what arrived. The refusal now echoes
-/// the received keys and names a missing half of the range.
-#[tokio::test]
-async fn an_edit_without_old_string_or_range_says_which_keys_arrived() {
+// -- an incomplete edit must never become a deletion ------------------------
+//
+// `new_string` was read with `unwrap_or("")` since Step 9.7 (#253): an edit
+// that arrived WITHOUT it silently deleted its target. Under context pressure
+// a weak model does drop keys (live, 2026-09-23: nine `edit_file` calls
+// carrying only {path, new_string} in one run), and the line-range mode added
+// in #2553 made the failure easy to hit — `{path, start_line, end_line}` alone
+// deleted those lines. The harness now validates the call before touching the
+// file: `new_string` must be present and a string; an explicit "" still
+// deletes on purpose. The range mode is removed (it was also unbound to the
+// version the model observed, so a stale range hit the wrong lines).
+
+const EDIT_FIXTURE: &str = "line a\nline b\nline c\nline d\nline e\n";
+
+async fn edit_outcome(args: serde_json::Value) -> (String, String) {
     let ws = tempfile::TempDir::new().unwrap();
-    std::fs::write(ws.path().join("f.txt"), "a\nb\nc\n").unwrap();
-    for (args, missing) in [
-        (
-            serde_json::json!({"path": "f.txt", "new_string": ""}),
-            "start_line",
-        ),
-        (
-            serde_json::json!({"path": "f.txt", "new_string": "", "start_line": 2}),
-            "end_line",
-        ),
+    std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+    let (model, _) = model_and_display(
+        "edit_file",
+        args,
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+    (model, after)
+}
+
+#[tokio::test]
+async fn an_edit_without_a_string_new_string_fails_and_changes_nothing() {
+    for args in [
+        // The review's exact reproduction: a valid range, no new_string.
+        serde_json::json!({"path": "fixture.rs", "start_line": 2, "end_line": 4}),
+        // The older path: a matching old_string, no new_string.
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b"}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": null}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": 7}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": false}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": ["x"]}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": {"x": 1}}),
     ] {
+        let (model, after) = edit_outcome(args.clone()).await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("new_string"),
+            "names the missing field: {model}"
+        );
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+    }
+}
+
+#[tokio::test]
+async fn a_line_range_selector_is_refused_and_changes_nothing() {
+    for args in [
+        serde_json::json!({"path": "fixture.rs", "start_line": 2, "end_line": 4, "new_string": "x"}),
+        serde_json::json!({"path": "fixture.rs", "start_line": 2, "new_string": ""}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "end_line": 4, "new_string": "x"}),
+    ] {
+        let (model, after) = edit_outcome(args.clone()).await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("line range"),
+            "says ranges are not supported: {model}"
+        );
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_empty_new_string_still_deletes_on_purpose() {
+    let (model, after) = edit_outcome(
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b\n", "new_string": ""}),
+    )
+    .await;
+    assert!(tool_result_ok(&model), "{model}");
+    assert_eq!(after, "line a\nline c\nline d\nline e\n");
+}
+
+// -- write_file: the same dropped-key bug ----------------------------------
+//
+// `content` was read with `unwrap_or("")`, so a write that dropped it emptied
+// the file and reported success. The shrink guard only fires past 30 lines
+// and 30%, so a small file was wiped silently and a new path created empty.
+
+#[tokio::test]
+async fn a_write_without_a_string_content_fails_and_changes_nothing() {
+    for args in [
+        serde_json::json!({"path": "fixture.rs"}),
+        serde_json::json!({"path": "fixture.rs", "content": null}),
+        serde_json::json!({"path": "fixture.rs", "content": 7}),
+        serde_json::json!({"path": "new.rs"}),
+    ] {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
         let (model, _) = model_and_display(
-            "edit_file",
-            args,
+            "write_file",
+            args.clone(),
             ws.path(),
             &caveats_rw(ws.path()),
             ToolCollaborators::default(),
         )
         .await;
-        assert!(model.contains("old_string must not be empty"), "{model}");
-        assert!(model.contains("received: "), "echoes what arrived: {model}");
-        assert!(model.contains("new_string, path"), "{model}");
-        assert!(model.contains(&format!("missing {missing}")), "{model}");
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("content"),
+            "names the missing field: {model}"
+        );
+        let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+        assert!(
+            !ws.path().join("new.rs").exists(),
+            "no empty file created for {args}"
+        );
     }
-    assert_eq!(
-        std::fs::read_to_string(ws.path().join("f.txt")).unwrap(),
-        "a\nb\nc\n"
-    );
+}
+
+/// A malformed call is refused before the operator is asked to approve it:
+/// approving an edit that is then refused anyway wastes the human's consent.
+struct NeverAsked;
+
+impl PermissionGate for NeverAsked {
+    fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        panic!("a malformed call reached the permission gate: {requests:?}")
+    }
+
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
+        panic!("a malformed call reached the confirm prompt: {question}")
+    }
+}
+
+#[tokio::test]
+async fn malformed_mutations_are_refused_before_the_permission_gate() {
+    for (tool, args, names) in [
+        (
+            "edit_file",
+            serde_json::json!({"path": "fixture.rs", "old_string": "", "new_string": "x"}),
+            "old_string",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"path": "fixture.rs", "new_string": "x"}),
+            "old_string",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"old_string": "line b", "new_string": "x"}),
+            "path",
+        ),
+        ("write_file", serde_json::json!({"content": "x"}), "path"),
+        (
+            "write_file",
+            serde_json::json!({"path": "fixture.rs"}),
+            "content",
+        ),
+    ] {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+        // Writes are outside scope, so a well-formed call WOULD ask the gate.
+        let caveats = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = NeverAsked;
+        let (model, _) = model_and_display(
+            tool,
+            args.clone(),
+            ws.path(),
+            &caveats,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate),
+                ..ToolCollaborators::default()
+            },
+        )
+        .await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {tool} {args} -> {model}"
+        );
+        assert!(model.contains(names), "names `{names}`: {model}");
+        let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {tool} {args}");
+    }
 }

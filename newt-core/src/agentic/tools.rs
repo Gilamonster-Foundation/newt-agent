@@ -4144,7 +4144,16 @@ async fn execute_authorized_tool(
 
         "write_file" => {
             let path = args["path"].as_str().unwrap_or("");
-            let content = args["content"].as_str().unwrap_or("");
+            // Validate before the gate or the file, as edit_file does: a write
+            // that dropped `content` used to empty its target and report
+            // success (the shrink guard misses files under 30 lines).
+            let Some(content) = args.get("content").and_then(serde_json::Value::as_str) else {
+                return "error: write_file needs `content` as a string — nothing was written"
+                    .to_string();
+            };
+            if path.is_empty() {
+                return "error: write_file needs `path` — nothing was written".to_string();
+            }
             // Move code without retyping it: `copy_from` appends an exact line
             // range of another file after `content` (a typed header). The
             // source is read through read_file's own fence. Live 2026-09-23 a
@@ -4483,13 +4492,33 @@ async fn execute_authorized_tool(
         "edit_file" => {
             let path = args["path"].as_str().unwrap_or("");
             let old_string = args["old_string"].as_str().unwrap_or("");
-            let new_string = args["new_string"].as_str().unwrap_or("");
-            // A line range replaces those lines with `new_string` (empty deletes
-            // them), so removing a large block never means quoting it back.
-            let range = match (args["start_line"].as_u64(), args["end_line"].as_u64()) {
-                (Some(start), Some(end)) => Some((start as usize, end as usize)),
-                _ => None,
+            // Validate the call BEFORE the permission gate or the file: an
+            // incomplete edit must never become a mutation. `new_string` was
+            // read with `unwrap_or("")` since #253, so an edit that arrived
+            // without it silently DELETED its target; a weak model under
+            // context pressure does drop keys. An explicit "" still deletes on
+            // purpose.
+            let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str)
+            else {
+                return "error: edit_file needs `new_string` as a string (use \"\" to delete \
+                        the matched text) — nothing was changed"
+                    .to_string();
             };
+            // The line-range mode (#2553) is removed: it was not bound to the
+            // version the model observed, so a stale range edited the wrong
+            // lines. A caller still sending one is refused, never reinterpreted.
+            if args.get("start_line").is_some() || args.get("end_line").is_some() {
+                return "error: edit_file does not take a line range (start_line/end_line) — \
+                        give old_string, the exact text to replace; nothing was changed"
+                    .to_string();
+            }
+            if path.is_empty() {
+                return "error: edit_file needs `path` — nothing was changed".to_string();
+            }
+            if old_string.is_empty() {
+                return "error: old_string must not be empty — use write_file to create new files"
+                    .to_string();
+            }
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             // step-52.5: same scope-vs-#263-gate split as write_file — decides
@@ -4515,26 +4544,6 @@ async fn execute_authorized_tool(
                     "edit_file",
                 );
             }
-            if old_string.is_empty() && range.is_none() {
-                // Echo what ARRIVED: under context pressure a model can intend a
-                // range and emit only {path, new_string}, then resend it verbatim
-                // while the refusal restates a rule it believes it followed.
-                let mut received: Vec<&str> = args
-                    .as_object()
-                    .map(|object| object.keys().map(String::as_str).collect())
-                    .unwrap_or_default();
-                received.sort_unstable();
-                let missing = match (args["start_line"].as_u64(), args["end_line"].as_u64()) {
-                    (Some(_), None) => "end_line",
-                    (None, Some(_)) => "start_line",
-                    _ => "start_line and end_line",
-                };
-                return format!(
-                    "error: old_string must not be empty (or give start_line and end_line) — \
-                     this call received: {}; missing {missing}. Use write_file to create new files",
-                    received.join(", ")
-                );
-            }
             if !file_capture::regular_target(&full) {
                 return file_capture::present(
                     format!("error: edit_file refuses a nonregular target: {path}"),
@@ -4550,11 +4559,7 @@ async fn execute_authorized_tool(
                 Ok(s) => s,
                 Err(tool_output) => return tool_output,
             };
-            let count = if range.is_some() {
-                1
-            } else {
-                existing.matches(old_string).count()
-            };
+            let count = existing.matches(old_string).count();
             if count == 0 {
                 // Show the file's actual head so the model can copy the exact
                 // text and self-correct on the next call — instead of guessing
@@ -4608,15 +4613,7 @@ async fn execute_authorized_tool(
                     super::artifact_hooks::ArtifactFileState::from_bytes(existing.as_bytes())
                 }
             });
-            let updated = match range {
-                Some((start, end)) => {
-                    match file_capture::replace_line_range(&existing, start, end, new_string) {
-                        Ok(updated) => updated,
-                        Err(refusal) => return refusal,
-                    }
-                }
-                None => existing.replacen(old_string, new_string, 1),
-            };
+            let updated = existing.replacen(old_string, new_string, 1);
             let old_lines = existing.lines().count();
             let new_lines = updated.lines().count();
             let delta = new_lines as i64 - old_lines as i64;

@@ -80,19 +80,17 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace one exact string in an existing file, or a line \
-                                range (start_line..end_line; empty new_string deletes it). \
-                                Use the range for large blocks instead of quoting them.",
+                "description": "Replace one exact string in an existing file. Fails if \
+                                old_string is missing or matches more than once (add context). \
+                                An empty new_string deletes the match.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "old_string": { "type": "string", "description": "Exact string to replace (must match once); omit when using a line range" },
-                        "new_string": { "type": "string", "description": "Replacement" },
-                        "start_line": { "type": "integer" },
-                        "end_line": { "type": "integer" }
+                        "old_string": { "type": "string", "description": "Exact string to replace (must match exactly once)" },
+                        "new_string": { "type": "string", "description": "Replacement (\"\" deletes the match)" }
                     },
-                    "required": ["path", "new_string"]
+                    "required": ["path", "old_string", "new_string"]
                 }
             }
         },
