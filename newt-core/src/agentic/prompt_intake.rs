@@ -1422,6 +1422,31 @@ impl Default for DispositionLexicon {
                 "open a pr",
                 "open pr",
                 "merge",
+                // #2562 round 2 (PR-2562 review, "data not stemming" ruling,
+                // part 2): whole-word matching (#2553 finding 3) means a bare
+                // gerund/participle ("fixing", "refactoring", "implemented")
+                // is NOT added here — those are description words as often
+                // as commands ("explain refactoring", "how is caching
+                // implemented?"), and alone they already reach Act through
+                // the terminal fallback (measured: 22/22 ordinary
+                // imperatives). What whole-word matching broke instead is
+                // the MIXED prompt whose only action cue is one of these
+                // unambiguous REQUEST PHRASES, which used to win only by
+                // accidentally substring-matching a bare verb needle
+                // elsewhere in the same clause — restore those explicitly:
+                "needs fixing",
+                "need fixing",
+                "needs refactoring",
+                "need refactoring",
+                "get it fixed",
+                "get them fixed",
+                "get it committed",
+                // "run " no longer matches inside "rerun the tests" — `re`
+                // is alphanumeric-adjacent, so the left edge fails the
+                // whole-word check (correctly: "rerun" is one word, not
+                // "run" plus a prefix). Add the compound as its own entry.
+                "rerun",
+                "re-run",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1455,6 +1480,27 @@ impl Default for DispositionLexicon {
                 "fewest lines",
                 "longest file",
                 "shortest file",
+                // #2562 round 2 (PR-2562 review, "data not stemming" ruling,
+                // part 1, BLOCKING): whole-word matching stopped these
+                // needles from matching their own inflections, which
+                // silently fell through to the Act fallback — a read-only
+                // gerund GAINING mutation authority ("auditing the
+                // permission table" → Act). Unlike the action list, these
+                // are safe to over-match: at worst an ambiguous prompt loses
+                // authority rather than gaining it, so the inflections are
+                // added outright rather than as narrow phrases.
+                "researching",
+                "auditing",
+                "audits",
+                "investigating",
+                "investigation",
+                "analyzing",
+                "analysis",
+                "diagnosing",
+                "diagnosis",
+                "exploring",
+                "comparing",
+                "comparison",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1473,6 +1519,14 @@ impl Default for DispositionLexicon {
                 // #2332: keeps "Could you tell me what X does?" an answer once
                 // `could you ` makes a question a request.
                 "tell me",
+                // #2562 round 2: same "data not stemming" ruling, part 1 —
+                // see the research list's matching comment above.
+                "explaining",
+                "explanation",
+                "summarizing",
+                "summary",
+                "describing",
+                "description",
             ]
             .map(str::to_string)
             .to_vec(),

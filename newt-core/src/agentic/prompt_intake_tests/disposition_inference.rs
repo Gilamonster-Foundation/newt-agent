@@ -404,3 +404,76 @@ fn plural_line_counts_still_classifies_research() {
         "the plural form must match its own lexicon entry, not rely on substring matching"
     );
 }
+
+/// #2562 round 2 (PR-2562 review, "Where authority actually changes" table,
+/// red first): whole-word matching (round 1) fixed the six regression rows
+/// at the bottom of this table — the "intended fix" — but broke authority in
+/// BOTH directions for every other row. Each row here was confirmed FAILED
+/// against the round-1 commit (`e494925b`) before the round-2 lexicon
+/// additions landed:
+/// - a read-only gerund GAINED Act (`auditing …` → Act, was Research;
+///   `researching …` → Act, was Research; `explaining …` → Act, was Explain)
+///   because the research/explain needle no longer matched its own
+///   inflection, so the prompt fell through to the terminal Act fallback;
+/// - a mixed prompt LOST Act (`… and get it fixed` → Research/Explain, was
+///   Act) because its only action cue was an inflected form no bare-verb
+///   needle covers by design (round 2's ruling: explicit phrases, not
+///   stemming).
+///
+/// The six "intended fix" rows are pinned here too, so this one table test
+/// is the complete authority-boundary regression suite for both rounds.
+#[test]
+fn where_authority_actually_changes_matches_the_review_table() {
+    let cases: &[(&str, PromptDisposition)] = &[
+        // Mixed prompts: restored to Act by the round-2 action PHRASES
+        // (never bare gerunds — see the lexicon's own comment).
+        (
+            "investigate the flaky test and get it fixed",
+            PromptDisposition::Act,
+        ),
+        ("the largest file needs refactoring", PromptDisposition::Act),
+        (
+            "Why does this crash? It needs fixing.",
+            PromptDisposition::Act,
+        ),
+        (
+            "investigate why CI failed and get it committed",
+            PromptDisposition::Act,
+        ),
+        ("rerun the tests and investigate", PromptDisposition::Act),
+        (
+            "The auth module is broken and needs fixing.",
+            PromptDisposition::Act,
+        ),
+        // Read-only gerunds: restored to Research/Explain by the round-2
+        // inflection DATA (never gained Act back through the fallback).
+        ("auditing the permission table", PromptDisposition::Research),
+        (
+            "researching which crate to use",
+            PromptDisposition::Research,
+        ),
+        ("explaining the retry loop", PromptDisposition::Explain),
+        // The six "intended fix" rows (round 1's whole-word matching) —
+        // regression-pinned here so a future change to either round cannot
+        // silently re-admit the false Acts round 1 was written to remove.
+        ("explain refactoring strategies", PromptDisposition::Explain),
+        ("explain the prefix tree", PromptDisposition::Explain),
+        ("what is the credit limit field", PromptDisposition::Explain),
+        (
+            "explain the test fixture layout",
+            PromptDisposition::Explain,
+        ),
+        (
+            "describe the emergency stop path",
+            PromptDisposition::Explain,
+        ),
+        ("explain the exchange module", PromptDisposition::Explain),
+    ];
+    for (prompt, expected) in cases {
+        assert_eq!(
+            PromptIntake::analyze(prompt).disposition(),
+            *expected,
+            "{prompt:?} must classify {expected:?}"
+        );
+    }
+}
