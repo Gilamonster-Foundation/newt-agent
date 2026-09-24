@@ -506,6 +506,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.output_allowance = output_allowance;
+    dc.overflow_retry = cfg
+        .find_model_tuning(&model)
+        .and_then(|t| t.overflow_retry)
+        .unwrap_or_default();
     dc.run_allowance = run_allowance;
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;

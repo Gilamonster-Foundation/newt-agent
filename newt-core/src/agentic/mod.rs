@@ -1022,6 +1022,9 @@ pub struct ChatCtx<'a> {
     /// cognition, thinking or sampling; every loop reserves it locally, and it is
     /// sent only where the wire declares a cap. `None` keeps today's defaults.
     pub output_allowance: Option<u32>,
+    /// `[[model_tuning]] overflow_retry`: the one-shot retry after a
+    /// reasoning overflow (Chat Completions loop only).
+    pub overflow_retry: crate::config::OverflowRetry,
     /// The run's attempt ledger (#2313). Every primary inference request is
     /// recorded as one attempt at the send, from its exact wire bytes. `None`
     /// records nothing.
@@ -1858,6 +1861,23 @@ macro_rules! no_progress_gate {
     };
 }
 
+/// F34: the concise nudge appended for the one thinking-off re-dispatch.
+const REASONING_OVERFLOW_NUDGE: &str = "Your reasoning used the whole output budget before you \
+answered. Be concise and act now: give the answer or make the tool call.";
+
+/// F34: the one visible line when a reasoning overflow ends a turn empty.
+fn reasoning_overflow_reason(retried: bool) -> String {
+    let tail = if retried {
+        "; a retry without thinking was also empty"
+    } else {
+        " once"
+    };
+    format!(
+        "(model returned an empty response — reasoning exhausted the output budget{tail}; \
+lower `/settings cognition`, raise the output allowance, or rephrase)"
+    )
+}
+
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -1977,6 +1997,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         responses_capability: _,
         openai_api: _,
         output_allowance,
+        overflow_retry: _,
         attempt_ledger,
         reasoning_replay_scope: _,
         max_tool_rounds,
@@ -6760,6 +6781,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // into a local generation policy.
         cognition,
         output_allowance,
+        overflow_retry,
         attempt_ledger,
         chat_completions_capability,
         responses_capability: _,
@@ -6844,6 +6866,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         chat_completions_capability,
         reasoning_replay_scope,
     );
+    // F34: the one-shot cognition drop after a reasoning overflow; loop-local,
+    // so the next turn resolves the operator's level afresh.
+    let mut cognition_drop_used = false;
+    // The lower-level policy for the single round that follows the drop.
+    let mut retry_policy: Option<(usize, generation_policy::GenerationPolicy)> = None;
     // Every body this loop sends applies `generation_policy`, so the cap is
     // server-enforced exactly when the policy projects `max_tokens`.
     observability::observe_output_allowance(
@@ -7094,6 +7121,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut turn_heartbeat = TurnHeartbeat::default();
     let mut uncorrelatable_batches: u32 = 0;
     'round_loop: for round in 0..hard_tool_rounds {
+        // F34: the drop lasts one request; every other round runs the
+        // operator's original policy.
+        let round_policy = match retry_policy {
+            Some((at, lowered)) if at == round => lowered,
+            _ => generation_policy,
+        };
         // #2331: a call to an authorized tool whose schema was off the wire
         // promoted it; its schema rides every request from here on.
         if hidden_tools.append_promoted(&mut tools) {
@@ -7415,7 +7448,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 "stream": true,
                 "stream_options": {"include_usage": true},
             });
-            generation_policy.apply_to_chat_completions_body(&mut body);
+            round_policy.apply_to_chat_completions_body(&mut body);
             // Drop tools (and the now-meaningless tool_choice) for a model that
             // rejected them on a prior "does not support tools" 400.
             if !tools_supported {
@@ -7593,7 +7626,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 recovered_input_budget(
                                     context_window,
                                     input_ceiling_pct,
-                                    generation_policy.output_allowance,
+                                    round_policy.output_allowance,
                                     effective_input_ceiling,
                                 )
                             })
@@ -7936,8 +7969,47 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         if reasoning_overflow {
             let has_round_budget = round + 1 < current_tool_round_limit;
+            // F34: re-dispatch once with thinking off (same budget) and a nudge to
+            // be concise. Only where cognition projects onto the wire (else the
+            // lower level changes nothing) and never for a second overflow.
+            let lower = cognition
+                .filter(|_| chat_completions_capability.cognition == Some(true))
+                .filter(|level| *level != crate::role_profile::Cognition::Zen)
+                .filter(|_| overflow_retry == crate::config::OverflowRetry::ThinkingOff)
+                .filter(|_| !cognition_drop_used && has_round_budget);
+            if let Some(from) = lower {
+                cognition_drop_used = true;
+                // Thinking off (Zen's projection) at the ORIGINAL budget.
+                retry_policy = Some((
+                    round + 1,
+                    generation_policy::GenerationPolicy {
+                        thinking: Some(false),
+                        ..generation_policy
+                    },
+                ));
+                tracing::info!(
+                    round,
+                    from = from.label(),
+                    to = "thinking-off",
+                    "reasoning overflow: re-dispatching once with thinking off"
+                );
+                if let Some(obs) = solve_obs.as_deref_mut() {
+                    obs.behavior_signals
+                        .push(observability::BehaviorSignal::CognitionDropRetry {
+                            round,
+                            from: from.label().into(),
+                            to: "thinking-off".into(),
+                        });
+                }
+                // Keep user/assistant alternation; the partial reasoning is not replayed.
+                messages.push(serde_json::json!({"role":"assistant","content":""}));
+                messages
+                    .push(serde_json::json!({"role":"user","content":REASONING_OVERFLOW_NUDGE}));
+                continue 'round_loop;
+            }
             let can_continue = generation_policy
-                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget);
+                .allows_reasoning_continuation(reasoning_continuation_attempted, has_round_budget)
+                && !cognition_drop_used;
 
             let resolving_existing_continuation =
                 reasoning_continuation_attempted && reasoning_overflow_signal_index.is_some();
@@ -8409,7 +8481,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 **slot = Some(accepted_reason);
             }
             if content.is_empty() {
-                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                let out = if reasoning_overflow {
+                    reasoning_overflow_reason(cognition_drop_used)
+                } else {
+                    "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
+                };
                 observability::observe_harness_reply(&mut solve_obs);
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
@@ -9330,6 +9406,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // the output cap projects onto this wire today (see below).
         cognition,
         output_allowance,
+        overflow_retry: _,
         attempt_ledger,
         chat_completions_capability,
         responses_capability: _,
@@ -11612,6 +11689,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         responses_capability,
         openai_api: _,
         output_allowance,
+        overflow_retry: _,
         attempt_ledger,
         reasoning_replay_scope: _,
         max_tool_rounds,

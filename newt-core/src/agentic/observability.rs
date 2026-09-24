@@ -157,6 +157,13 @@ pub enum BehaviorSignal {
         finish_reason: String,
         reasoning_tokens_estimate: usize,
     },
+    /// F34: a reasoning overflow was re-dispatched once at the next-lower
+    /// cognition level (labels, e.g. `thoughtful` → `rational`).
+    CognitionDropRetry {
+        round: usize,
+        from: String,
+        to: String,
+    },
 }
 
 impl BehaviorSignal {

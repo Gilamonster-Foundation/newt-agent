@@ -31,6 +31,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -453,6 +454,10 @@ mod reasoning_replay;
 #[cfg(test)]
 #[path = "http_reasoning_overflow.rs"]
 mod reasoning_overflow;
+
+#[cfg(test)]
+#[path = "http_overflow_cognition_retry.rs"]
+mod overflow_cognition_retry;
 
 #[path = "http_context_exceeded.rs"]
 mod context_exceeded;

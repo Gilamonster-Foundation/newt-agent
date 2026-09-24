@@ -22,6 +22,7 @@ fn ctx<'a>(
     workspace: &'a str,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,

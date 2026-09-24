@@ -42,6 +42,19 @@ impl std::fmt::Display for TunerError {
 
 impl std::error::Error for TunerError {}
 
+/// What to do when reasoning exhausts the output budget before any answer
+/// (`finish_reason=length`, no content, no tool call). Per-model, under
+/// `[[model_tuning]] overflow_retry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverflowRetry {
+    /// Re-dispatch once with thinking off at the same output budget.
+    #[default]
+    ThinkingOff,
+    /// No retry: the pre-existing continuation path, then the reason line.
+    Off,
+}
+
 /// Inference-parameter overrides for a specific model name.
 ///
 /// Matched against the active model by exact string equality.  Add entries
@@ -92,6 +105,10 @@ pub struct ModelTuning {
     /// output budget while cognition, thinking and sampling stay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_allowance: Option<u32>,
+
+    /// Per-model reasoning-overflow retry. Unset means `thinking-off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow_retry: Option<OverflowRetry>,
 
     /// Per-model run-level call-count allowance (#2313): the number of
     /// primary inference dispatches this model may make before further
@@ -158,6 +175,22 @@ fn load_toml(path: &Path) -> Result<toml::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_retry_round_trips_in_kebab_case_and_defaults_to_thinking_off() {
+        let parse = |body: &str| -> ModelTuning {
+            toml::from_str(&format!("model = \"m\"\n{body}")).expect("parses")
+        };
+        assert_eq!(parse("").overflow_retry, None);
+        assert_eq!(OverflowRetry::default(), OverflowRetry::ThinkingOff);
+        let off = parse("overflow_retry = \"off\"");
+        assert_eq!(off.overflow_retry, Some(OverflowRetry::Off));
+        let on = parse("overflow_retry = \"thinking-off\"");
+        assert_eq!(on.overflow_retry, Some(OverflowRetry::ThinkingOff));
+        let text = toml::to_string(&off).expect("serializes");
+        assert!(text.contains("overflow_retry = \"off\""), "{text}");
+        assert_eq!(parse(&text.replace("model = \"m\"\n", "")), off);
+    }
 
     #[test]
     fn test_model_tuning_dir() {
