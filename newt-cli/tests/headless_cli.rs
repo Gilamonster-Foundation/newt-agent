@@ -2211,6 +2211,344 @@ async fn handback_reports_a_clean_repo_when_the_run_touched_nothing() {
     assert!(handback.get("commits").is_none(), "{handback}");
 }
 
+/// Multi-repo recon PR2 (red first, end to end): a bare folder holding two
+/// git repos, one with a real uncommitted edit — the hand-back must name
+/// that repo and file, never a bare "unavailable" (RECON.md row 5's
+/// measured gap).
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_nested_repos_at_a_bare_multi_repo_root() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("bare multi-repo root");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    let repo_a = workspace.path().join("repoA");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    git(&repo_a, &["init", "-q"]);
+    git(&repo_a, &["config", "user.email", "t@example.com"]);
+    git(&repo_a, &["config", "user.name", "t"]);
+    std::fs::write(repo_a.join("a.txt"), "one\n").unwrap();
+    git(&repo_a, &["add", "a.txt"]);
+    git(&repo_a, &["commit", "-q", "-m", "init"]);
+    std::fs::write(repo_a.join("a.txt"), "one\ntwo\n").unwrap(); // uncommitted edit
+    let repo_b = workspace.path().join("repoB");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    git(&repo_b, &["init", "-q"]);
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files_source"], "nested-repos",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["repoA/a.txt"]),
+        "{handback}"
+    );
+    let by_repo = handback["uncommitted_files_by_repo"]
+        .as_array()
+        .expect("per-repo breakdown present");
+    assert!(
+        by_repo
+            .iter()
+            .any(|r| r["repo"] == "repoA" && r["files"] == serde_json::json!(["a.txt"])),
+        "{handback}"
+    );
+    assert!(
+        by_repo
+            .iter()
+            .any(|r| r["repo"] == "repoB" && r["files"] == serde_json::json!([])),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_unprobed").is_none(),
+        "both repos probed cleanly: {handback}"
+    );
+}
+
+/// A root that IS itself a git repo is byte-identical to today: the nested
+/// path is never reached, `files_changed_source`/`uncommitted_files_source`
+/// stay `"git_status_delta"`/`"git_status"`, and no per-repo/unprobed field
+/// appears at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_real_repo_root_is_unaffected_by_nested_repo_support() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["files_changed_source"], "git_status_delta",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status",
+        "{handback}"
+    );
+    assert!(
+        handback.get("files_changed_by_repo").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("files_changed_unprobed").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_by_repo").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_unprobed").is_none(),
+        "{handback}"
+    );
+}
+
+/// #2552 round 2 (red first, end to end): the exact blocker scenario. An
+/// outer repo with an edit, and a `workspace/` subfolder (itself no `.git`)
+/// holding nested repo `inner/` with its own edit. The hand-back must name
+/// `inner`'s edit in BOTH `files_changed` and `uncommitted_files`, and
+/// `outer.txt` must appear in NEITHER field, NOR any `*_by_repo` breakdown —
+/// before round 2's fix, `uncommitted_files` (sourced from `GitEngine::open`,
+/// which discovers upward same as the shelled `git`) reported the outer
+/// repo's whole dirty set, and `files_changed`'s nested probe never ran at
+/// all (gated on `snapshot_workspace`'s `None`, which the F26 v2 scoped
+/// branch no longer returned for this case).
+///
+/// Round 3 update: `workspace` genuinely IS a subdirectory of the outer
+/// repo (`WorkspaceRepoLocation::InsideRepo`, not `NotARepo` — it only
+/// LOOKED like the bare-multi-repo-root case because it has no `.git` of
+/// its own; `outer/` does), so the source is now the more accurate
+/// `"git_status_subtree"`, not `"nested-repos"` (reserved for a workspace
+/// that is not inside ANY repo at all). `inner`'s edit still surfaces via
+/// the SAME `by_repo` mechanism the round-2 fix added, now folded into the
+/// `InsideRepo` case per round 3's review table ("if first-level nested
+/// repos also exist, report both").
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_repo_subdirectory_reports_only_its_nested_repo_never_the_enclosing_one() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let outer = tempfile::tempdir().expect("outer repo");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(outer.path(), &["init", "-q"]);
+    git(outer.path(), &["config", "user.email", "t@example.com"]);
+    git(outer.path(), &["config", "user.name", "t"]);
+    std::fs::write(outer.path().join("outer.txt"), "one\n").unwrap();
+    git(outer.path(), &["add", "outer.txt"]);
+    git(outer.path(), &["commit", "-q", "-m", "outer init"]);
+    std::fs::write(outer.path().join("outer.txt"), "one\ntwo\n").unwrap(); // outer edit
+
+    let workspace = outer.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let inner = workspace.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    git(&inner, &["init", "-q"]);
+    git(&inner, &["config", "user.email", "t@example.com"]);
+    git(&inner, &["config", "user.name", "t"]);
+    std::fs::write(inner.join("i.txt"), "one\n").unwrap();
+    git(&inner, &["add", "i.txt"]);
+    git(&inner, &["commit", "-q", "-m", "inner init"]);
+    std::fs::write(inner.join("i.txt"), "one\ntwo\n").unwrap(); // inner edit
+
+    let handback = handback_from_a_no_op_run(&server, &workspace, control.path()).await;
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("outer.txt"),
+        "outer.txt must appear in no field: {handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status_subtree",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["inner/i.txt"]),
+        "{handback}"
+    );
+    assert_eq!(
+        handback["files_changed_source"], "git_status_subtree",
+        "{handback}"
+    );
+    // The delta needs a matching before/after probe of the SAME repo; a
+    // no-op run's `files_changed` delta legitimately stays empty since
+    // `inner`'s edit predates the run start — `uncommitted_files` (the
+    // CURRENT set, needing no "before") is the field that must carry it,
+    // asserted above. `files_changed_source` alone pins that the subtree
+    // path was reached at all, not the enclosing repo's unscoped
+    // `"git_status_delta"`.
+}
+
+/// #2552 round 2 should-fix (red first, end to end): a first-level entry
+/// that is a SYMLINK to a repo OUTSIDE the workspace must never be probed —
+/// its files must not reach the hand-back at all.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn handback_never_probes_a_symlinked_first_level_dir_pointing_outside() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("bare workspace root");
+    let outside = tempfile::tempdir().expect("outside repo");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(outside.path(), &["init", "-q"]);
+    git(outside.path(), &["config", "user.email", "t@example.com"]);
+    git(outside.path(), &["config", "user.name", "t"]);
+    std::fs::write(outside.path().join("secret.txt"), "leak\n").unwrap();
+    git(outside.path(), &["add", "secret.txt"]);
+    git(outside.path(), &["commit", "-q", "-m", "init"]);
+    std::fs::write(outside.path().join("secret.txt"), "leak\nmore\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join("ext")).expect("symlink");
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("secret.txt"),
+        "a symlinked first-level dir must never be probed: {handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "unavailable",
+        "no real nested repo exists (the symlink is skipped), so this stays \
+         unavailable exactly like an empty bare folder: {handback}"
+    );
+}
+
+/// #2552 round 2 (red first, end to end): a symlinked SPELLING of the
+/// workspace root that IS itself a real repo root must take the root
+/// branch, not be mistaken for "a subdirectory of the real path" by a
+/// lexical (rather than canonicalized) toplevel comparison.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn handback_at_a_symlinked_repo_root_takes_the_root_branch() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let real = tempfile::tempdir().expect("real repo root");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(real.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(real.path().join("a.txt"), "one\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(real.path().join("a.txt"), "one\ntwo\n").unwrap();
+
+    let link = real
+        .path()
+        .parent()
+        .expect("tempdir has a parent")
+        .join(format!(
+            "symlink-{}",
+            real.path().file_name().unwrap().to_string_lossy()
+        ));
+    std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+
+    let handback = handback_from_a_no_op_run(&server, &link, control.path()).await;
+    std::fs::remove_file(&link).ok();
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status",
+        "a symlinked spelling of a real repo root must still take the root \
+         branch, not the nested-repos path: {handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_by_repo").is_none(),
+        "{handback}"
+    );
+}
+
+/// #2552 round 3 (red first, end to end): the review's ruling scenario —
+/// `--cwd repo/crate` with an edit inside `crate/` and one outside it at the
+/// repo root. Round 2 made this render `"unavailable"` for every field
+/// (dropping F26 v2's subtree scoping entirely); round 3 restores it as a
+/// real third case with a DISTINCT source, `"git_status_subtree"`, so a
+/// consumer can tell the list is scoped to a subdirectory. Only the inside
+/// edit must appear, workspace-relative (no `crate/` prefix).
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_repo_subdirectory_reports_only_the_subtree_edit_with_a_distinct_source() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let repo = tempfile::tempdir().expect("repo root");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    let crate_dir = repo.path().join("crate");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+    std::fs::write(repo.path().join("root.txt"), "one\n").unwrap();
+    std::fs::write(crate_dir.join("lib.rs"), "one\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "init"]);
+    // Edit one file outside the workspace (repo root), one inside it (crate/).
+    std::fs::write(repo.path().join("root.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(crate_dir.join("lib.rs"), "one\ntwo\n").unwrap();
+
+    let handback = handback_from_a_no_op_run(&server, &crate_dir, control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status_subtree",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["lib.rs"]),
+        "workspace-relative, no crate/ prefix, and never root.txt: {handback}"
+    );
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("root.txt"),
+        "the outside-the-workspace edit must appear in no field: {handback}"
+    );
+}
+
 /// #2537 item 4, edge case 3: a detached HEAD must not crash or misreport —
 /// the same clean/no-commits result as a normal branch checkout.
 #[tokio::test(flavor = "multi_thread")]

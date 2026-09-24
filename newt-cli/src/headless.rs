@@ -674,20 +674,70 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     } else {
         "off"
     };
+    // #2552 round 3 (F26 v4): decide WHERE `workspace` sits relative to a
+    // repo — its own toplevel, a SUBDIRECTORY of a larger one, or no repo at
+    // all — ONCE, and make every git source below obey the SAME three-way
+    // decision. Round 1's bug was `status_before.is_none()` (a symptom) and
+    // `GitEngine::open(workspace).is_some()` (a DIFFERENT, upward-discovering
+    // check) disagreeing. Round 2 collapsed "subdirectory" and "not a repo"
+    // into one case and dropped subtree-scoped status entirely for it — round
+    // 2's review: that re-creates the exact "nothing changed" bug this PR
+    // fixes for the everyday `--cwd repo/crate` invocation, which has no
+    // nested repos of its own to fall back on.
+    let repo_location = newt_core::agentic::locate_workspace_repo(&workspace, &read_scope);
     // U7: the workspace's changed-path set at run start, diffed against the same
     // probe at exit so the hand-back names what THIS run changed, not prior dirt.
-    let status_before = newt_core::agentic::snapshot_workspace(&workspace, &read_scope);
+    // `Root`-shaped only at the repo's own toplevel; `None` off-repo. A
+    // subdirectory's own (subtree-scoped) delta is computed later, in
+    // `files_changed_delta`, since it needs the prefix AND an `after` probe.
+    let status_before = matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot
+    )
+    .then(|| newt_core::agentic::snapshot_workspace(&workspace, &read_scope))
+    .flatten();
+    // #2552 round 3: the subtree-scoped equivalent of `status_before`, for a
+    // workspace that is a SUBDIRECTORY of a larger repo — restores F26 v2's
+    // scoping as a real third case rather than dropping it (round 2's
+    // review: dropping it re-creates the "nothing changed" bug this PR fixes
+    // for the everyday `--cwd repo/crate` invocation).
+    let subtree_before = match &repo_location {
+        newt_core::agentic::WorkspaceRepoLocation::InsideRepo { prefix } => {
+            newt_core::agentic::snapshot_workspace_subtree(&workspace, prefix, &read_scope)
+        }
+        _ => None,
+    };
+    // Multi-repo recon PR2: nested first-level repos can exist whether
+    // `workspace` is a subdirectory of a larger repo OR not a repo at all —
+    // gated on NOT being the repo's own toplevel, same as `status_before`'s
+    // complement, never on whether a status snapshot came back.
+    let nested_before = (!matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot
+    ))
+    .then(|| newt_core::agentic::snapshot_nested_repos(&workspace, &read_scope));
     // #2537: HEAD before the run, via newt-git's OWN embedded engine (never a
     // shelled-out `git`) — the baseline the hand-back diffs against to name
-    // commit(s) this run actually produced. `None` off-repo or when the read
-    // scope can't open the legacy engine (bounded fs_read); the hand-back
-    // then reports "unavailable"/omits `commits`, never a guess.
-    let head_before = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope)
-        .ok()
-        .and_then(|e| {
-            e.head_snapshot(&newt_core::git_caveats::GitCaveats::read_only())
-                .ok()
-        });
+    // commit(s) this run actually produced. The engine is opened whenever
+    // `workspace` is inside SOME repo (own root OR a subdirectory of one) —
+    // `commits`/HEAD use ONLY the engine's `head_snapshot`/`commits_since`
+    // (run-window commit IDs, no path content), never its STATUS methods, so
+    // opening it for a subdirectory of a larger repo cannot leak a path
+    // (#2552 round 3: an unannounced commit to the enclosing repo is exactly
+    // what an operator running from `repo/crate` most needs to see). `None`
+    // off-repo, or when the read scope can't open the legacy engine (bounded
+    // fs_read); the hand-back then reports "unavailable"/omits `commits`,
+    // never a guess.
+    let head_before = (!matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::NotARepo
+    ))
+    .then(|| newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok())
+    .flatten()
+    .and_then(|e| {
+        e.head_snapshot(&newt_core::git_caveats::GitCaveats::read_only())
+            .ok()
+    });
     let started = Instant::now();
     driver
         .submit(instruction.trim())
@@ -796,15 +846,46 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // #2537: hand-back commit truth. Re-open the embedded engine at exit
     // (the working tree may have changed under an already-open handle) and
     // ask its OWN `status`/`log` — never a shelled-out `git` — for what this
-    // run left dirty and what it committed. `None` for both when the
-    // workspace is not a repo (or the engine can't be opened under this
-    // run's fs_read scope); a repo with nothing dirty reports `Some(vec![])`
-    // for `uncommitted_at_exit`, distinguishable from "unavailable".
+    // run left dirty and what it committed. The repo location is re-checked
+    // fresh (in case the run itself `git init`ed the workspace — #2552 round
+    // 2). The engine is opened whenever `workspace` is inside SOME repo (own
+    // root OR a subdirectory of one — #2552 round 3), but its STATUS methods
+    // (`uncommitted_paths`) are used ONLY at the repo's own toplevel:
+    // `GitEngine::open` discovers upward exactly like the shelled `git` did
+    // before F26, so its unscoped status would hand a workspace-subdirectory
+    // run the ENCLOSING repo's dirty set (#2552 round 2 blocker 1) — a
+    // subdirectory's current dirty set instead comes from
+    // `snapshot_workspace_subtree` inside `uncommitted_repo_file_list`,
+    // below. The engine's `commits_since` carries only run-window commit
+    // IDs, never path content, so it IS safe to use for a subdirectory too
+    // (round 3: an unannounced commit to the enclosing repo is what an
+    // operator running from `repo/crate` most needs to see).
     let git_caveats = newt_core::git_caveats::GitCaveats::read_only();
-    let git_engine = newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok();
-    let uncommitted_at_exit = git_engine
-        .as_ref()
-        .and_then(|e| uncommitted_paths(e, &git_caveats));
+    let repo_location = newt_core::agentic::locate_workspace_repo(&workspace, &read_scope);
+    let is_root_repo = matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot
+    );
+    let git_engine = (!matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::NotARepo
+    ))
+    .then(|| newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok())
+    .flatten();
+    let uncommitted_at_exit = is_root_repo
+        .then(|| {
+            git_engine
+                .as_ref()
+                .and_then(|e| uncommitted_paths(e, &git_caveats))
+        })
+        .flatten();
+    let uncommitted_delta = uncommitted_repo_file_list(
+        uncommitted_at_exit,
+        &repo_location,
+        &nested_before,
+        &workspace,
+        &read_scope,
+    );
     let commits_this_run = git_engine.as_ref().and_then(|engine| {
         commits_since(
             engine,
@@ -861,14 +942,18 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         // Harness-written, never the model's claim; solve_result only (the
         // contract record is field-pinned). Carries no hash or id.
         "handback": headless_contract::handback(
-            status_before.as_ref().and_then(|before| {
-                newt_core::agentic::snapshot_workspace(&workspace, &read_scope)
-                    .map(|after| newt_core::agentic::files_changed_between(before, &after))
-            }),
+            files_changed_delta(
+                &status_before,
+                &subtree_before,
+                &repo_location,
+                &nested_before,
+                &workspace,
+                &read_scope,
+            ),
             o_opt.map_or(&[][..], |o| &o.tool_events[..]),
             &end_reason,
             reply_chars > 0,
-            uncommitted_at_exit.clone(),
+            uncommitted_delta,
             commits_this_run.clone(),
         ),
     });
@@ -1283,6 +1368,177 @@ fn confined_bench_caveats_with_grants(
     }
 }
 
+/// The union/per-repo/unprobed shape shared by [`nested_delta_by_repo`] and
+/// [`nested_current_by_repo`] — one named struct instead of a 3-element
+/// tuple (`clippy::type_complexity`).
+struct NestedByRepo {
+    files: Vec<String>,
+    by_repo: Vec<(String, Vec<String>)>,
+    unprobed: Vec<String>,
+}
+
+/// `(files, by_repo)` for a nested-repo DELTA, shared by [`files_changed_delta`]'s
+/// `NotARepo` and `InsideRepo` branches — the ONE place that turns
+/// `nested_files_changed_between` plus a per-repo diff into the `by_repo`
+/// breakdown, so the two branches cannot drift in how they compute it.
+fn nested_delta_by_repo(
+    before: &[newt_core::agentic::NestedRepoSnapshot],
+    after: &[newt_core::agentic::NestedRepoSnapshot],
+) -> NestedByRepo {
+    let (files, unprobed) = newt_core::agentic::nested_files_changed_between(before, after);
+    let by_repo = after
+        .iter()
+        .map(|repo| {
+            let before_status = before
+                .iter()
+                .find(|b| b.repo == repo.repo)
+                .and_then(|b| b.status.as_ref());
+            let files = match (before_status, repo.status.as_ref()) {
+                (Some(b), Some(a)) => newt_core::agentic::files_changed_between(b, a),
+                _ => Vec::new(),
+            };
+            (repo.repo.clone(), files)
+        })
+        .collect();
+    NestedByRepo {
+        files,
+        by_repo,
+        unprobed,
+    }
+}
+
+/// `(files, by_repo)` for a nested-repo CURRENT set (not a delta), shared by
+/// [`uncommitted_repo_file_list`]'s `NotARepo` and `InsideRepo` branches.
+fn nested_current_by_repo(snapshots: &[newt_core::agentic::NestedRepoSnapshot]) -> NestedByRepo {
+    let (files, unprobed) = newt_core::agentic::nested_current_paths(snapshots);
+    let by_repo = snapshots
+        .iter()
+        .map(|repo| {
+            let files = repo
+                .status
+                .as_ref()
+                .map(|s| s.keys().cloned().collect())
+                .unwrap_or_default();
+            (repo.repo.clone(), files)
+        })
+        .collect();
+    NestedByRepo {
+        files,
+        by_repo,
+        unprobed,
+    }
+}
+
+/// Multi-repo recon PR2 / #2552 round 3: the hand-back's `files_changed`
+/// input — the workspace root's own status DELTA when it IS a repo toplevel
+/// (unchanged), the SUBTREE-scoped delta (workspace-relative, UNION'd with
+/// any nested repos the subdirectory itself contains) when it is a
+/// subdirectory of a larger repo, or the union of nested-repo deltas alone
+/// when it is not a repo at all. `nested_before` empty/`None` at either
+/// non-root case, with no subtree edit either, stays `"unavailable"`,
+/// matching the `None`-means-nothing-to-report convention rather than
+/// fabricating an empty list.
+fn files_changed_delta(
+    status_before: &Option<newt_core::agentic::StatusSnapshot>,
+    subtree_before: &Option<newt_core::agentic::StatusSnapshot>,
+    repo_location: &newt_core::agentic::WorkspaceRepoLocation,
+    nested_before: &Option<Vec<newt_core::agentic::NestedRepoSnapshot>>,
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> Option<headless_contract::RepoFileList> {
+    if let Some(before) = status_before {
+        let after = newt_core::agentic::snapshot_workspace(workspace, read_scope)?;
+        return Some(headless_contract::RepoFileList::Root(
+            newt_core::agentic::files_changed_between(before, &after),
+        ));
+    }
+    if let newt_core::agentic::WorkspaceRepoLocation::InsideRepo { prefix } = repo_location {
+        let before = subtree_before.as_ref()?;
+        let after = newt_core::agentic::snapshot_workspace_subtree(workspace, prefix, read_scope)?;
+        let mut files = newt_core::agentic::files_changed_between(before, &after);
+        let (by_repo, unprobed) = match nested_before.as_ref() {
+            Some(nb) if !nb.is_empty() => {
+                let after_nested = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+                let nested = nested_delta_by_repo(nb, &after_nested);
+                files.extend(nested.files);
+                (nested.by_repo, nested.unprobed)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        files.sort();
+        return Some(headless_contract::RepoFileList::Subtree {
+            files,
+            by_repo,
+            unprobed,
+        });
+    }
+    let before = nested_before.as_ref()?;
+    if before.is_empty() {
+        return None;
+    }
+    let after = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+    let nested = nested_delta_by_repo(before, &after);
+    Some(headless_contract::RepoFileList::Nested {
+        files: nested.files,
+        by_repo: nested.by_repo,
+        unprobed: nested.unprobed,
+    })
+}
+
+/// Multi-repo recon PR2 / #2552 round 3: the hand-back's `uncommitted_files`
+/// input — the workspace root's CURRENT dirty set (via the embedded git
+/// engine, unchanged) at a repo toplevel, the SUBTREE-scoped current set
+/// (UNION'd with any nested repos the subdirectory itself contains) at a
+/// subdirectory of a larger repo, or the union of each nested repo's own
+/// current dirty set alone when there is no repo at all.
+fn uncommitted_repo_file_list(
+    uncommitted_at_exit: Option<Vec<String>>,
+    repo_location: &newt_core::agentic::WorkspaceRepoLocation,
+    nested_before: &Option<Vec<newt_core::agentic::NestedRepoSnapshot>>,
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> Option<headless_contract::RepoFileList> {
+    match repo_location {
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot => {
+            uncommitted_at_exit.map(headless_contract::RepoFileList::Root)
+        }
+        newt_core::agentic::WorkspaceRepoLocation::InsideRepo { prefix } => {
+            let subtree =
+                newt_core::agentic::snapshot_workspace_subtree(workspace, prefix, read_scope)?;
+            let mut files: Vec<String> = subtree.into_keys().collect();
+            let (by_repo, unprobed) = match nested_before.as_ref() {
+                Some(nb) if !nb.is_empty() => {
+                    let snapshots =
+                        newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+                    let nested = nested_current_by_repo(&snapshots);
+                    files.extend(nested.files);
+                    (nested.by_repo, nested.unprobed)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            files.sort();
+            Some(headless_contract::RepoFileList::Subtree {
+                files,
+                by_repo,
+                unprobed,
+            })
+        }
+        newt_core::agentic::WorkspaceRepoLocation::NotARepo => {
+            let before = nested_before.as_ref()?;
+            if before.is_empty() {
+                return None;
+            }
+            let snapshots = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+            let nested = nested_current_by_repo(&snapshots);
+            Some(headless_contract::RepoFileList::Nested {
+                files: nested.files,
+                by_repo: nested.by_repo,
+                unprobed: nested.unprobed,
+            })
+        }
+    }
+}
+
 /// #2537: the workspace's CURRENT staged+unstaged+untracked paths, sorted
 /// and deduplicated — the hand-back's "uncommitted at exit" list. `None`
 /// only when `engine.status` itself fails (the caller already turns "no
@@ -1335,6 +1591,89 @@ fn commits_since(
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+
+    /// #2552 round 3: `commits_since` — the exact function `handback`'s
+    /// `commits` field is built from — is reached whenever `workspace` is
+    /// inside SOME repo (`WorkspaceRepoLocation::InsideRepo`, not just
+    /// `OwnRoot`), and correctly names a commit made from the subdirectory.
+    ///
+    /// Grounds a real limitation found while writing this test: an
+    /// end-to-end test through the FULL `newt headless` binary, with the
+    /// MODEL making the commit via a tool call, is not currently
+    /// constructible — `newt_core::agentic::driver::TurnDriver` hardcodes
+    /// `git_tool: None` (no builder wires a `GitTool` impl for any
+    /// `TurnDriver`-based run, headless included), and a shell `git commit`
+    /// via `run_command` is deliberately refused (`tools.rs`: "refusing to
+    /// create a git commit via the shell — that bypasses harness-managed
+    /// commit attribution"). So no headless run — subdirectory or repo
+    /// root alike — can populate `commits` from a MODEL action today; this
+    /// is orthogonal to and predates #2552. This test instead grounds
+    /// `commits_since` itself against a REAL git repo and the REAL embedded
+    /// `newt_git::GitEngine` (never mocked), the same call
+    /// `uncommitted_delta`'s exit-time block makes — proving the mechanism
+    /// this PR widened to the `InsideRepo` case is correct, at the level
+    /// that is actually testable.
+    #[test]
+    fn commits_since_names_a_commit_made_from_a_repo_subdirectory() {
+        let repo = tempfile::tempdir().expect("repo root");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git")
+                .status
+                .success());
+        };
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "t@example.com"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        let crate_dir = repo.path().join("crate");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(crate_dir.join("lib.rs"), "one\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "init"]);
+
+        let read_scope = newt_core::Scope::All;
+        let crate_str = crate_dir.to_string_lossy().into_owned();
+        assert!(
+            matches!(
+                newt_core::agentic::locate_workspace_repo(&crate_str, &read_scope),
+                newt_core::agentic::WorkspaceRepoLocation::InsideRepo { .. }
+            ),
+            "crate/ must resolve as a SUBDIRECTORY of the enclosing repo"
+        );
+
+        let engine = newt_git::GitEngine::open(&crate_dir, &read_scope)
+            .expect("the engine must open for a repo subdirectory too (#2552 blocker 1)");
+        let caveats = newt_core::git_caveats::GitCaveats::read_only();
+        let before = engine
+            .head_snapshot(&caveats)
+            .expect("head_snapshot must succeed");
+
+        std::fs::write(crate_dir.join("lib.rs"), "one\ntwo\n").unwrap();
+        git(&crate_dir, &["add", "-A"]);
+        git(&crate_dir, &["commit", "-q", "-m", "during the run"]);
+        let after_head = git_rev_parse_head(repo.path());
+
+        let commits = commits_since(&engine, &caveats, before.head.as_deref())
+            .expect("commits_since must resolve, not unavailable");
+        assert_eq!(
+            commits,
+            vec![after_head],
+            "the commit made from crate/ must be named"
+        );
+    }
+
+    #[cfg(test)]
+    fn git_rev_parse_head(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
 
     /// #2314: the seed id is of the entries, not the file's spelling, and a
     /// seed the store could not faithfully hold is refused before any run.

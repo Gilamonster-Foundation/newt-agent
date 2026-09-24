@@ -116,6 +116,14 @@ pub fn hardened_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat");
+    // F26 v1 tried `GIT_CEILING_DIRECTORIES=cwd's parent` here, but this
+    // builder is shared by `metadata_git`, which also backs the TUI's
+    // HEAD/dirty line, the ACP worker's diff, and crew — a ceiling here
+    // would blind every one of them to `cd newt-core && newt` (a workspace
+    // that IS a repo subdirectory, the common case, not the leak case).
+    // The enclosing-repo leak this was guarding against is fixed instead
+    // where it is actually observed: `claim_check::snapshot_workspace`
+    // scopes and prefix-strips its own status, below.
     Ok(c)
 }
 
@@ -223,5 +231,50 @@ mod tests {
                 io::ErrorKind::NotFound
             );
         }
+    }
+}
+
+/// F26 v2 regression (portable — not macOS-gated, unlike the module above):
+/// `hardened_git`/`metadata_git` must still discover a repo when run from a
+/// SUBDIRECTORY of it. A v1 fix set `GIT_CEILING_DIRECTORIES` to stop upward
+/// discovery, which also blinded `metadata_git` — shared by the TUI's
+/// HEAD/dirty line, the ACP worker's diff, and crew — to the ordinary case of
+/// `cd newt-core && newt`. That approach was reverted; this test pins that a
+/// subdirectory launch still finds its repo.
+#[cfg(test)]
+mod subdir_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn hardened_git_from_a_repo_subdirectory_still_finds_the_repo() {
+        let root = tempfile::tempdir().expect("repo root");
+        let init = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("git")
+                .status
+                .success());
+        };
+        init(&["init", "-q"]);
+        init(&["config", "user.email", "t@example.com"]);
+        init(&["config", "user.name", "t"]);
+        std::fs::write(root.path().join("f.txt"), "one\n").unwrap();
+        init(&["add", "f.txt"]);
+        init(&["commit", "-q", "-m", "init"]);
+
+        let subdir = root.path().join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let out = hardened_git(&subdir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "rev-parse HEAD from a repo subdirectory must still succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

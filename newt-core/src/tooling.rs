@@ -382,7 +382,11 @@ fn nested_phase_dirs(
 /// best-effort discovery aid, not a required read. Skips dot-dirs and the
 /// obvious build-noise directories so `target/`/`node_modules/` never masquerade
 /// as a nested project.
-fn first_level_subdirs(repo_dir: &Path) -> Vec<std::path::PathBuf> {
+///
+/// `pub` (multi-repo recon PR2): the ONE first-level directory lister, also
+/// reused by `claim_check::snapshot_nested_repos` to find first-level git
+/// repos under a non-repo workspace root — never a second lister.
+pub fn first_level_subdirs(repo_dir: &Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(repo_dir) else {
         return Vec::new();
     };

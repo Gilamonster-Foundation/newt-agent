@@ -28,7 +28,11 @@ pub mod anthropic_wire;
 /// turn's `ToolEvent` ledger. Same append-never-rewrite shape.
 mod capability_check;
 mod claim_check;
-pub use claim_check::{files_changed_between, snapshot_workspace, StatusSnapshot};
+pub use claim_check::{
+    files_changed_between, is_workspace_repo_root, locate_workspace_repo, nested_current_paths,
+    nested_files_changed_between, snapshot_nested_repos, snapshot_workspace,
+    snapshot_workspace_subtree, NestedRepoSnapshot, StatusSnapshot, WorkspaceRepoLocation,
+};
 pub(crate) mod compress;
 mod context_recovery;
 mod crew_attest;
