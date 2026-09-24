@@ -26,8 +26,8 @@
 use std::path::Path;
 
 use newt_core::confined_exec::{
-    build_tool_caveats, workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor,
-    ExecOrigin, ExecRefused, ExecRequest,
+    build_tool_caveats, build_tool_request, workspace_confined_caveats, ConfinedOutput,
+    ConstrainedExecutor, ExecOrigin, ExecRefused, ExecRequest,
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -366,4 +366,66 @@ fn build_fence_reads_cargo_home_subdirs_but_never_credentials() {
         Err(ExecRefused::ConfinementUnenforceable(_)) => {}
         Err(e) => panic!("unexpected refusal: {e}"),
     }
+}
+
+/// The absolute path of `bin` on `$PATH`, or `None` if it isn't there.
+fn which_on_path(bin: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(bin))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// dec1-build-grant round 4 (architect review, PR #2579): round 3's Landlock
+/// test proved a narrow READ works; it never ran cargo. This runs a REAL
+/// `cargo check --offline` end to end through the EXACT build-fence path the
+/// lifecycle build lane uses — `build_tool_request` -> `build_tool_caveats`
+/// -> `ConstrainedExecutor` — against this operator's REAL `$CARGO_HOME` /
+/// `$RUSTUP_HOME` (no fake homes: the whole point is proving the narrowed
+/// `cargo_home_read_roots` set is sufficient for a real toolchain, not a
+/// synthetic one). `--offline` matches the lane's own `CARGO_NET_OFFLINE`
+/// env grant, so a fresh dependency fetch is never in scope — this crate has
+/// none, deliberately, so a passing run only proves the READ SET, not a
+/// network grant this fence must never have.
+///
+/// Skipped (not failed) without Landlock or a `cargo` on `$PATH`: this is a
+/// positive-integration proof of an operator toolchain that may not exist on
+/// every CI runner, unlike the rest of this file's deny/refuse proofs, which
+/// hold either way.
+#[test]
+#[serial]
+fn a_real_confined_cargo_check_succeeds_under_the_narrowed_read_set() {
+    if !landlock_available() {
+        eprintln!("skip: no Landlock on this host");
+        return;
+    }
+    let Some(_cargo_on_path) = which_on_path("cargo") else {
+        eprintln!("skip: no cargo on $PATH");
+        return;
+    };
+
+    let ws = tempdir().unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"tiny\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(ws.path().join("src")).unwrap();
+    std::fs::write(ws.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    let req = build_tool_request(ws.path(), ws.path(), "cargo", ["check", "--offline"]);
+    let out = ConstrainedExecutor::run(&req)
+        .expect("a confined cargo check must run under Landlock on this host");
+    assert_eq!(
+        out.sandbox_kind,
+        agent_bridle::SandboxKind::Landlock,
+        "the build must actually be Landlock-confined, not advisory"
+    );
+    assert!(
+        out.success,
+        "confined `cargo check --offline` failed under the narrowed read set:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
