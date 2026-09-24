@@ -1447,6 +1447,10 @@ impl Default for DispositionLexicon {
                 // Research and giving Research the capability is the fix for
                 // "Research is too strict".
                 "line count",
+                // Whole-word matching (#2553 finding 3) no longer lets
+                // "line count" match inside "line counts" — add the plural
+                // as its own entry rather than reopen substring matching.
+                "line counts",
                 "most lines",
                 "fewest lines",
                 "longest file",
@@ -1539,6 +1543,35 @@ impl Default for DispositionLexicon {
     }
 }
 
+/// Whole-word substring match (#2553 finding 3): `needle` matches `haystack`
+/// only where its outer edges land on a word boundary. Checked only on edges
+/// that are themselves alphanumeric — a needle already padded with a space or
+/// quote (`" test \""`, `"run "`) supplies its own boundary on that side and
+/// needs no further check. This is what keeps `"refactor"` off
+/// `"refactoring"` (suffix, no trailing boundary) while still matching
+/// `"refactor the largest file"` (#2553's original case), and applies to
+/// every lexicon entry, not a special case for one word.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric();
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let end = abs + needle.len();
+        let left_ok = !needle.chars().next().is_some_and(is_word)
+            || !haystack[..abs].chars().next_back().is_some_and(is_word);
+        let right_ok = !needle.chars().next_back().is_some_and(is_word)
+            || !haystack[end..].chars().next().is_some_and(is_word);
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 fn infer_disposition(prompt: &str, asks: &[AtomicAsk]) -> PromptDisposition {
     infer_disposition_with(prompt, asks, &DispositionLexicon::default())
 }
@@ -1582,7 +1615,11 @@ fn infer_disposition_with(
     // Padding makes a lexicon entry with a leading-space word boundary match at
     // the beginning of a prompt without losing that boundary inside prose.
     let padded = format!(" {lower}");
-    let hit = |needles: &[String]| needles.iter().any(|n| !n.is_empty() && padded.contains(n));
+    let hit = |needles: &[String]| {
+        needles
+            .iter()
+            .any(|n| !n.is_empty() && contains_word(&padded, n))
+    };
     if hit(&lexicon.action) {
         return PromptDisposition::Act;
     }

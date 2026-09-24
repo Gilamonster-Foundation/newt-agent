@@ -362,3 +362,45 @@ fn refactor_is_an_action_even_when_the_target_is_named_by_size() {
         PromptDisposition::Research
     );
 }
+
+/// #2553 finding 3: the action lexicon matched "refactor" by bare substring,
+/// so "explain **refactor**ing strategies" hit the action needle before ever
+/// reaching the `explain` list — an explanatory prompt granted full mutation
+/// authority. The fix is whole-word matching in the lexicon matcher itself
+/// (`contains_word`), not a patch scoped to "refactor" alone.
+#[test]
+fn explain_refactoring_is_not_the_refactor_action_needle() {
+    assert_eq!(
+        PromptIntake::analyze("explain refactoring strategies").disposition(),
+        PromptDisposition::Explain,
+        "refactoring is a different word from refactor, in an explanatory sentence"
+    );
+}
+
+/// The whole-word fix applies to every action needle, not just "refactor":
+/// "fix" is a substring of "fixture", and "explain the test fixture setup" is
+/// an explanatory prompt, not an instruction to fix anything.
+#[test]
+fn explain_test_fixture_is_not_the_fix_action_needle() {
+    assert_eq!(
+        PromptIntake::analyze("explain the test fixture setup").disposition(),
+        PromptDisposition::Explain,
+        "fixture is a different word from fix"
+    );
+}
+
+/// The whole-word switch has a real cost, not just a benefit: the research
+/// needle "line count" (singular) stopped matching inside "line counts"
+/// (plural) once boundary checks applied, regressing
+/// `line_count_questions_classify_research_not_the_cliff`. Fixed by adding
+/// the plural as its own lexicon entry (data, not a matcher special case) —
+/// this test pins that the plural form still classifies Research.
+#[test]
+fn plural_line_counts_still_classifies_research() {
+    assert_eq!(
+        PromptIntake::analyze("show me the 10 code files with the highest line counts?")
+            .disposition(),
+        PromptDisposition::Research,
+        "the plural form must match its own lexicon entry, not rely on substring matching"
+    );
+}
