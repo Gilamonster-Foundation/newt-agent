@@ -94,6 +94,16 @@ pub(super) fn receipt(
 }
 
 pub(super) fn receipt_from_model(model: &ChangeSet, unchanged: bool) -> String {
+    format!(
+        "{}\n\n{}",
+        receipt_headline(model, unchanged),
+        model.to_markdown()
+    )
+}
+
+/// The receipt's first line — `Modified (+1 -1)` — which is all a SUCCESSFUL
+/// mutation tells the model; the patch below it is the operator's.
+pub(super) fn receipt_headline(model: &ChangeSet, unchanged: bool) -> String {
     let file = &model.files()[0];
     let kind = if unchanged {
         "No content change"
@@ -104,12 +114,7 @@ pub(super) fn receipt_from_model(model: &ChangeSet, unchanged: bool) -> String {
             _ => "Modified",
         }
     };
-    format!(
-        "{kind} (+{} -{})\n\n{}",
-        file.additions(),
-        file.removals(),
-        model.to_markdown()
-    )
+    format!("{kind} (+{} -{})", file.additions(), file.removals())
 }
 
 // Quote the path as Git patch syntax, keeping each header on one physical line.

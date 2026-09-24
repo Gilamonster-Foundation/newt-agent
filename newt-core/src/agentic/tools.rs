@@ -24,13 +24,13 @@ use super::report::{execute_render_report, render_report_tool_definition};
 use crate::caveats::CaveatsExt as _;
 use crate::PermissionAction;
 #[cfg(test)]
+use output_budget::paginate_read;
+#[cfg(test)]
 use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
 #[cfg(test)]
 use output_budget::DEFAULT_OUTPUT_CAP_CHARS_PER_TOKEN;
 #[cfg(test)]
 use output_budget::{cap_model_output, cap_model_output_with_handle};
-#[cfg(test)]
-use output_budget::paginate_read;
 use output_budget::{paginate_unspillable, read_file_page};
 pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
@@ -4231,7 +4231,7 @@ async fn execute_authorized_tool(
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, workspace))
                             .unwrap_or_default();
-                        receipt.present(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
+                        receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
                     Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
                 }
@@ -4356,7 +4356,7 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    receipt.present(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
+                    receipt.present_success(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
                 Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }
@@ -4547,7 +4547,7 @@ async fn execute_authorized_tool(
                     let escape_warning = literal_newline_escape_warning(old_string, new_string)
                         .map(|w| format!("\n{w}"))
                         .unwrap_or_default();
-                    receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}"), presentation)
+                    receipt.present_success(format!("edited {path} ({delta_str} lines, now {new_lines} total){escape_warning}"), &format!("{artifact}{check}"), presentation)
                 }
                 Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }

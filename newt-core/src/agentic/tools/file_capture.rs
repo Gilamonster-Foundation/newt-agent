@@ -124,13 +124,21 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
                 "\n\n{}",
                 super::file_change::receipt_from_model(&model, unchanged)
             );
+            let headline = format!(
+                "\n\n{}",
+                super::file_change::receipt_headline(&model, unchanged)
+            );
             let captured = (!unchanged).then(|| CapturedChange {
                 model,
                 path: path.into(),
                 before: old.map(str::to_owned),
                 after: new.map(str::to_owned),
             });
-            Receipt { text, captured }
+            Receipt {
+                text,
+                headline,
+                captured,
+            }
         }
         Err(error) => Receipt::plain(format!("\n\nfile-change receipt unavailable: {error}")),
     }
@@ -145,15 +153,37 @@ struct CapturedChange {
 
 pub(super) struct Receipt {
     text: String,
+    /// The model-facing first line of `text` (`\n\nModified (+1 -1)`).
+    headline: String,
     captured: Option<CapturedChange>,
 }
 
 impl Receipt {
     fn plain(text: String) -> Self {
         Self {
+            headline: text.clone(),
             text,
             captured: None,
         }
+    }
+
+    /// A SUCCESSFUL mutation: the model gets `prefix + headline + suffix`
+    /// ("wrote x (3 lines)\n\nModified (+1 -1)"); the operator's display
+    /// keeps the full receipt and its styled diff. The model wrote the change,
+    /// so echoing it back only costs context — a 1,497-line new file's echo
+    /// spilled and cost a round to read back (live 2026-09-23). Failures keep
+    /// [`Self::present`]: the observed state after a failed or partial
+    /// operation is information the model does not already have.
+    pub(super) fn present_success(
+        self,
+        prefix: String,
+        suffix: &str,
+        presentation: &mut dyn super::ToolPresentation,
+    ) -> String {
+        let model = format!("{prefix}{}{suffix}", self.headline);
+        let full = self.present(prefix, suffix, presentation);
+        presentation.display_source(full);
+        model
     }
 
     /// Record the receipt's exact byte range while assembling this result.

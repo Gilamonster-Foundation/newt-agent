@@ -1,17 +1,30 @@
 use super::*;
 
 /// Grounds `memory_fetch_with_source_routes_through_execute_tool` against a
-/// real file and session store: the advertised JSON instruction must recover
-/// the omitted middle on the next provider request, including minimal exposure.
+/// real directory and session store: the advertised JSON instruction must
+/// recover the omitted middle on the next provider request, in a read-only
+/// (Explain) turn with minimal exposure.
+///
+/// The spill comes from an oversized `list_dir`. It used to come from
+/// `read_file`, which now pages under the spill cap (`offset=` to continue)
+/// and never spills — a large file's middle is reached by paging, not by a
+/// handle.
 #[tokio::test]
-async fn spill_retrieval_round_trip_recovers_file_middle_on_the_wire() {
+async fn spill_retrieval_round_trip_recovers_the_listing_middle_on_the_wire() {
     let workspace = tempfile::tempdir().unwrap();
-    let exact = format!(
-        "{}\nEXACT_MIDDLE_DETAIL\n{}",
-        "a".repeat(9_000),
-        "z".repeat(9_000)
-    );
-    std::fs::write(workspace.path().join("refs.txt"), &exact).unwrap();
+    let dir = workspace.path().join("many");
+    std::fs::create_dir(&dir).unwrap();
+    // ~24k chars of names, over the 16k spill cap; the marker sorts into the
+    // middle, far from the 800-char head and tail the teaser keeps.
+    let mut names: Vec<String> = (0..400)
+        .map(|i| format!("entry_{i:04}_{}", "p".repeat(50)))
+        .collect();
+    names.push("entry_0200_EXACT_MIDDLE_DETAIL".to_string());
+    for name in &names {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+    names.sort();
+    let exact = names.join("\n");
     let spill = SessionSpillStore::new([7; 16]);
     let source = StoreMemorySource::from_stores(None, None).with_spill_store(&spill);
     let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
@@ -29,7 +42,7 @@ async fn spill_retrieval_round_trip_recovers_file_middle_on_the_wire() {
             let round = requests.len();
             requests.push(body.clone());
             let call = match round {
-                0 => Some(("read_file", serde_json::json!({"path": "refs.txt"}))),
+                0 => Some(("list_dir", serde_json::json!({"path": "many"}))),
                 1 => {
                     let teaser = body["messages"].as_array().unwrap().last().unwrap()["content"]
                         .as_str()
