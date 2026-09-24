@@ -63,8 +63,8 @@ pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
     envelope_denial_reason, envelope_denied, exec_denial_requests, exec_floor_permits,
-    net_denial_requests, pr_creation_url, shadow_records, shell_engine, shell_envelope_output,
-    venv_env_map,
+    net_denial_requests, pr_creation_url, same_file_redirect_refusal, shadow_records, shell_engine,
+    shell_envelope_output, venv_env_map,
 };
 use shell::{
     declared_filesystem_requests, exec_confined_command, resolve_exec_cwd, split_leading_cd,
@@ -5011,6 +5011,15 @@ mod build_wall_tests;
 #[cfg(test)]
 #[path = "tools_tests/disable_ocap_tests.rs"]
 pub(crate) mod disable_ocap_tests;
+
+// ---------------------------------------------------------------------------
+// #2558 HANDOFF item 2 — the same-file redirect guard (`cmd f > f` must not
+// truncate f), through real dispatch in both the confined and host lanes.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tools_tests/redirect_guard.rs"]
+mod redirect_guard_tests;
 
 #[cfg(test)]
 #[path = "tools_tests/smart_frame_isolation.rs"]
