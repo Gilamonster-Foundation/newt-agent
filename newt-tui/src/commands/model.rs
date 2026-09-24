@@ -523,7 +523,12 @@ pub(crate) fn apply_backend_choice(name: &str, color: bool, verbose: bool) -> bo
         // unknown name therefore cannot capture ambient persona routing.
         newt_core::runtime::mark_backend_pick(name);
         if newt_core::settings::should_persist(is_ephemeral_session()) {
-            newt_core::settings::record_provider(name);
+            newt_core::settings::record_provider(
+                name,
+                crate::resolve_runtime_or_default()
+                    .default_backend
+                    .as_deref(),
+            );
         }
         match crate::resolve_backend_choice(&crate::resolve_runtime_or_default()) {
             Ok(choice) => print_newt(
@@ -622,7 +627,12 @@ pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
     // (possibly a persona's route) is never adopted here.
     newt_core::runtime::mark_model_pick(name);
     if newt_core::settings::should_persist(is_ephemeral_session()) {
-        newt_core::settings::record_model(name);
+        newt_core::settings::record_model(
+            name,
+            crate::resolve_runtime_or_default()
+                .default_backend
+                .as_deref(),
+        );
     }
     let cfg = crate::resolve_runtime_or_default();
     let Some(choice) = choice_or_print(&cfg, color, verbose) else {
