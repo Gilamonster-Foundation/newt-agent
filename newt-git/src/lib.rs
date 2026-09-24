@@ -216,6 +216,53 @@ pub struct GitEngine {
     repo: Repository,
 }
 
+/// Refuse a ref-move onto the repository's default branch (F32/#2537: newt may
+/// never move `main`/`master`/the remote's default, whatever a caller's
+/// filesystem grants are). The ONE checkpoint every mutating op that advances a
+/// branch ref (`commit`, `amend`, `rebase`) routes through, so the guard cannot
+/// be bypassed by reaching one of them through a different path.
+///
+/// `branch_ref` is the target ref a caller is about to rewrite (`refs/heads/…`,
+/// as returned by [`read_head`]). Anything other than `refs/heads/main` or
+/// `refs/heads/master` also checks the shared repo's `refs/remotes/origin/HEAD`
+/// symbolic target (best-effort — an offline or remote-less repo just falls
+/// back to the hardcoded names, same as `newt_core::git_hardening::own_gitdir_grants`).
+///
+/// `ref_already_exists` is `false` only for the very first commit on an unborn
+/// branch (the `git` tool's own `init` op always names the new branch `main`,
+/// #461's advertised "commit in a fresh, not-yet-a-repo workspace" flow) — F32
+/// protects an EXISTING default branch's history from being retargeted, not
+/// the act of creating one. Every subsequent commit/amend/rebase on that same
+/// branch passes `true` and is refused.
+fn refuse_if_default_branch(
+    git_dir: &Path,
+    branch_ref: &str,
+    ref_already_exists: bool,
+) -> Result<(), GitError> {
+    if !ref_already_exists {
+        return Ok(());
+    }
+    let Some(name) = branch_ref.strip_prefix("refs/heads/") else {
+        return Ok(());
+    };
+    if name == "main" || name == "master" {
+        return Err(GitError::Refused(format!(
+            "refusing to move the default branch '{name}' (F32/#2537) — commit on a feature branch instead"
+        )));
+    }
+    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    if let Ok(raw) = std::fs::read_to_string(common.join("refs/remotes/origin/HEAD")) {
+        if let Some(default) = raw.trim().strip_prefix("ref: refs/remotes/origin/") {
+            if default == name {
+                return Err(GitError::Refused(format!(
+                    "refusing to move the default branch '{name}' (F32/#2537) — commit on a feature branch instead"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl GitEngine {
     /// Discover and open the repository containing `root` (walks up for `.git`).
     /// Legacy discovery/config/ODB reads require unrestricted read authority;
@@ -563,9 +610,14 @@ impl GitEngine {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
         }
+        let branch_ref = read_head(&self.repo.git_dir)?;
+        let head_oid = self.head_oid()?;
+        if let Some(branch_ref) = &branch_ref {
+            refuse_if_default_branch(&self.repo.git_dir, branch_ref, head_oid.is_some())?;
+        }
         let index = self.repo.load_index()?;
         let tree = write_tree_from_index(&self.repo.odb, &index, "")?;
-        let parents: Vec<ObjectId> = self.head_oid()?.into_iter().collect();
+        let parents: Vec<ObjectId> = head_oid.into_iter().collect();
         let ident = author.ident_now();
         let commit = CommitData {
             tree,
@@ -582,7 +634,7 @@ impl GitEngine {
             .repo
             .odb
             .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-        match read_head(&self.repo.git_dir)? {
+        match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot commit on a detached HEAD")),
         }
@@ -601,6 +653,12 @@ impl GitEngine {
     ) -> Result<CommitInfo, GitError> {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
+        }
+        let branch_ref = read_head(&self.repo.git_dir)?;
+        // Amend always rewrites an existing commit (the `head_oid` lookup
+        // below fails otherwise), so the ref unconditionally already exists.
+        if let Some(branch_ref) = &branch_ref {
+            refuse_if_default_branch(&self.repo.git_dir, branch_ref, true)?;
         }
         let head = self
             .head_oid()?
@@ -626,7 +684,7 @@ impl GitEngine {
             .repo
             .odb
             .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-        match read_head(&self.repo.git_dir)? {
+        match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
         }
@@ -742,6 +800,9 @@ impl GitEngine {
         }
         let head_ref = read_head(&self.repo.git_dir)?
             .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
+        // Rebase always replays onto existing history, so the branch ref
+        // unconditionally already exists.
+        refuse_if_default_branch(&self.repo.git_dir, &head_ref, true)?;
         let old_head_tree = self.head_tree()?;
         let onto_oid = self.resolve_one(onto)?;
 
@@ -1448,14 +1509,18 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         }
         let (git_dir, common_dir, worktree) =
             scoped_repository_paths(&root, &read_scope).map_err(|e| e.to_string())?;
-        if explicit_cwd
-            && mutates
-            && [&git_dir, &common_dir].iter().any(|path| {
-                !newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy())
-            })
-        {
-            return Err("capability denied: fs_write for selected worktree Git metadata".into());
-        }
+        // A whole-directory `permits_path(write_scope, git_dir/common_dir)` check
+        // used to gate mutation here. It always failed for a linked worktree's
+        // own repo (F32, #2537): `checked_dispatch_root` already proved `cwd`
+        // resolves *inside* `self.root` (the session workspace), so this is
+        // always the session's own repository — there is no other repo `cwd`
+        // could reach. The actual invariant that matters (never move the
+        // default branch) is enforced at the engine layer, in
+        // `refuse_if_default_branch`, below every `commit`/`amend`/`rebase`;
+        // this in-process tool writes refs/objects directly and was never
+        // gated by the session `fs_write` scope in the first place (see the
+        // no-`cwd` arm above, which never consulted it either). PR #2577
+        // review.
         if op == "branch-list" {
             validate_branch_ref_inputs(&git_dir, &common_dir, &read_scope)
                 .map_err(|e| e.to_string())?;

@@ -16,7 +16,7 @@ fn local_git_tool_log_lists_commits() {
 }
 #[test]
 fn local_git_tool_add_then_commit_succeeds_when_permitted() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
     let t = tool(dir.path());
     let staged = t
@@ -41,7 +41,7 @@ fn local_git_tool_add_then_commit_succeeds_when_permitted() {
 }
 #[test]
 fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     std::fs::write(dir.path().join("d.txt"), "d\n").unwrap();
     let t = tool(dir.path());
     t.dispatch(
@@ -82,7 +82,7 @@ fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
 }
 #[test]
 fn local_git_tool_amend_keeps_message_when_omitted() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     let t = tool(dir.path());
     // Amend with no message → keep "first commit".
     t.dispatch(
@@ -137,4 +137,65 @@ fn local_git_tool_commit_denied_on_read_only_caveats() {
             &newt_core::caveats::Caveats::top()
         )
         .is_ok());
+}
+
+/// F32/#2537, PR #2577 round 2: the `git` tool is the REAL commit path (a
+/// shell `git commit` is refused and redirected to it, and this in-process
+/// tool reads/writes refs directly — no session `fs_write` grant gates it).
+/// So the invariant "newt never moves the default branch" has to be enforced
+/// here, in `GitEngine`/`refuse_if_default_branch`, not by withholding a
+/// filesystem grant. Would have failed before that guard existed: a commit
+/// on `main` landed with no refusal at all.
+#[test]
+fn commit_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
+    let dir = repo_with_commit(); // committed on `main` by the fixture
+    let before = std::fs::read(dir.path().join(".git/refs/heads/main")).unwrap();
+    std::fs::write(dir.path().join("b.txt"), "x\n").unwrap();
+    let t = tool(dir.path());
+    t.dispatch(
+        "add",
+        &serde_json::json!({"paths": ["b.txt"]}),
+        &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
+    )
+    .unwrap();
+    let err = t
+        .dispatch(
+            "commit",
+            &serde_json::json!({"message": "should not land"}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
+        .unwrap_err();
+    assert!(err.contains("default branch"), "got: {err}");
+    assert_eq!(
+        std::fs::read(dir.path().join(".git/refs/heads/main")).unwrap(),
+        before,
+        "refs/heads/main must be unchanged by the refused commit"
+    );
+}
+
+/// The same invariant for `amend`, with the attempted retarget explicit: a
+/// model that somehow moved `HEAD` to `refs/heads/main` (the fence no longer
+/// grants writing `HEAD` at all — see `caveats::apply_cli_fs_grants` — but
+/// the engine-level guard is the backstop if it ever did) still cannot amend
+/// there.
+#[test]
+fn amend_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
+    let dir = repo_with_commit();
+    let before = std::fs::read(dir.path().join(".git/refs/heads/main")).unwrap();
+    let t = tool(dir.path());
+    let err = t
+        .dispatch(
+            "amend",
+            &serde_json::json!({"message": "should not land"}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
+        .unwrap_err();
+    assert!(err.contains("default branch"), "got: {err}");
+    assert_eq!(
+        std::fs::read(dir.path().join(".git/refs/heads/main")).unwrap(),
+        before
+    );
 }

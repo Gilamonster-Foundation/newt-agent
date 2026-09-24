@@ -166,15 +166,22 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
             .unwrap_or_default()
     };
     // The workspace's own git metadata (HEAD, index, objects, the checked-out
-    // branch's ref) lives outside `workspace` for a linked worktree — grant it
-    // narrowly so the model can commit its own branch without a fence prompt
-    // (F32, #2537). Empty on the default branch / detached HEAD / resolve
-    // failure, so this never widens authority beyond the own-branch case.
+    // branch's ref) lives outside `workspace` for a linked worktree — grant
+    // READ so `git status`/`diff`/`log` work there (F32, #2537). Deliberately
+    // READ-ONLY: the real commit path is the in-process `git` tool
+    // (`newt-git`'s `GitEngine::commit`/`amend`/`rebase`, guarded there by
+    // `refuse_if_default_branch`), not a write grant on these paths — a write
+    // grant here would let `write_file`/`edit_file` retarget `HEAD` to `main`
+    // or corrupt the shared `objects/` store with no prompt (PR #2577 review).
+    // `own_gitdir_grants` still computes a `write` set (kept for callers that
+    // reason about it directly, e.g. `newt-git`'s explicit-`cwd` dispatch
+    // check); folding it into the SHELL lane's kernel fence is deliberately
+    // out of scope here — that is an operator decision, not this function's
+    // to make.
     let own_git = crate::git_hardening::own_gitdir_grants(std::path::Path::new(workspace));
     let mut read = parse("NEWT_READ_PATHS");
     read.extend(own_git.read);
-    let mut write = parse("NEWT_WRITE_PATHS");
-    write.extend(own_git.write);
+    let write = parse("NEWT_WRITE_PATHS");
 
     lock_fs_to_workspace(caveats, workspace, &read, &write);
 }
@@ -389,6 +396,69 @@ mod tests {
         assert!(
             !c.permits_exec("cargo-x"),
             "a different program sharing a prefix must not match"
+        );
+    }
+
+    /// PR #2577 round 2, item 2: `apply_cli_fs_grants` must extend `fs_read`
+    /// with the workspace's own git metadata (F32/#2537) but NEVER `fs_write`
+    /// — a write grant there let `write_file` retarget `HEAD` to `main` or
+    /// corrupt the shared `objects/` store with no prompt. Real `git`, real
+    /// tempdirs, `#[cfg(unix)]` per the real-resource testing tier.
+    #[cfg(unix)]
+    #[test]
+    fn own_gitdir_grants_are_read_only_in_session_caveats() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        git(&main, &["add", "seed"]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        let wt = root.path().join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+
+        std::env::remove_var("NEWT_READ_PATHS");
+        std::env::remove_var("NEWT_WRITE_PATHS");
+        let mut caveats = Caveats::top();
+        apply_cli_fs_grants(&mut caveats, &wt.to_string_lossy());
+
+        let common_dir = main.join(".git");
+        assert!(
+            permits_path(
+                &caveats.fs_read,
+                &common_dir.join("objects").to_string_lossy()
+            ),
+            "the common git dir must be READ-granted"
+        );
+        assert!(
+            !permits_path(
+                &caveats.fs_write,
+                &common_dir.join("objects").to_string_lossy()
+            ),
+            "the common git dir's objects/ must NOT be write-granted"
+        );
+        assert!(
+            !permits_path(
+                &caveats.fs_write,
+                &common_dir.join("worktrees/wt/HEAD").to_string_lossy()
+            ),
+            "the worktree's HEAD must NOT be write-granted — that would let a \
+             model retarget it to main with no prompt"
         );
     }
 }

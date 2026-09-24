@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn add_then_commit_advances_history() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     std::fs::write(dir.path().join("new.txt"), "data\n").unwrap();
     let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let caps = GitCaveats::top();
