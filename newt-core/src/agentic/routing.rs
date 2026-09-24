@@ -258,7 +258,20 @@ impl RouteTable {
         // tail-pipe attempt, the SHELL_META refusal), so `<rest>` is
         // classified exactly as if it had been sent alone from `<dir>`.
         let (effective, cwd) = fold_leading_cd(trimmed, workspace, read_scope);
+        // F27 (r14a evidence): a trailing `; echo "EXIT: $?"` (or the same
+        // idea with `&&`, `EXIT=`, `exit `, `${PIPESTATUS[0]}`, …) is a
+        // no-op once the command routes — the routed result already
+        // reports the REAL exit code, never masked by the shell's own `$?`
+        // the way `| tail`'s exit code masks a piped build's. Strip it
+        // BEFORE the ordinary classification below, same pass as the `cd`
+        // fold above, so the two compose.
+        let (effective, echo_dropped) = strip_trailing_exit_echo(effective);
         let decision = self.classify_stripped(effective);
+        let decision = if echo_dropped {
+            mark_echo_dropped(decision)
+        } else {
+            decision
+        };
         match cwd {
             Some(cwd) => attach_cwd(decision, cwd),
             None => decision,
@@ -499,6 +512,146 @@ fn fold_leading_cd<'a>(
     match resolve_workspace_relative_dir(dir, workspace, read_scope) {
         Some(cwd) => (rest, Some(cwd)),
         None => (command, None),
+    }
+}
+
+/// F27 (r14a evidence, `newt-eval/NOTES-2483.md`): strip a single trailing
+/// `; echo <arg>` / `&& echo <arg>` whose argument merely reports `$?` (or
+/// `${PIPESTATUS[0]}`) — a routed call already reports its REAL exit code,
+/// so the echo adds nothing and its only effect was to keep the whole
+/// command compound (`;`/`&&` is [`SHELL_META`]), forcing it to run
+/// un-routed in the confined shell where `$?` after `cmd; echo …$?…` is
+/// always 0 (the shell's own exit code), silently masking a real failure.
+/// Also strips a trailing `2>&1` off what remains, mirroring
+/// [`build_piped_to_trim_route`]'s own local strip — the r14a shape pairs
+/// the two (`cargo test 2>&1; echo "EXIT: $?"`).
+///
+/// Returns `(command, false)` unchanged unless the echo's argument is
+/// PROVABLY inert once dropped ([`is_inert_exit_status_arg`]) — an argument
+/// with a command substitution or a redirect could have a real side effect
+/// that must not silently vanish, and a bare `||` (not `&&`/`;`) or a second
+/// `;`/`&&` surviving in what would become the build half both fall through
+/// unchanged, refused downstream by the ordinary [`SHELL_META`] check
+/// exactly as before this function existed. `(effective, true)` on a strip —
+/// the `bool` lets [`RouteTable::classify`] flag the routed call
+/// ([`mark_echo_dropped`]) so the rendered note can say so (#2554 round 2,
+/// mirroring #2549's trim note and #2551's `cd`/`cwd` clause).
+///
+/// #2554 round 2 should-fix: also refuses when the KEPT half contains a
+/// quote character. `split_trailing_echo`'s rightmost-separator search has
+/// no notion of quoting, so a `;`/`&&` INSIDE a quoted argument can become
+/// the "separator" (`rm "x; echo "$?""` — one `rm` of a file literally named
+/// `x; echo "$?"` in the shell) and the kept half is then not provably the
+/// command a real shell would run. The r14a evidence never quotes the build
+/// half, so refusing any quote there costs nothing real.
+fn strip_trailing_exit_echo(command: &str) -> (&str, bool) {
+    let Some((build_part, echo_arg)) = split_trailing_echo(command) else {
+        return (command, false);
+    };
+    if build_part.contains(['\'', '"']) {
+        return (command, false);
+    }
+    if !is_inert_exit_status_arg(echo_arg) {
+        return (command, false);
+    }
+    let build_part = build_part.trim();
+    let build_part = build_part
+        .strip_suffix("2>&1")
+        .map_or(build_part, str::trim);
+    (build_part, true)
+}
+
+/// Split `command` on its RIGHTMOST `&&` or `;`, only when the tail (after
+/// trimming) is `echo <arg>` with a non-empty `<arg>`. `None` when there is
+/// no trailing `echo` at all (including when the only separator is `||`,
+/// which this never matches).
+fn split_trailing_echo(command: &str) -> Option<(&str, &str)> {
+    let amp = command.rfind("&&").map(|i| (i, i + 2));
+    let semi = command.rfind(';').map(|i| (i, i + 1));
+    let (sep_start, tail_start) = match (amp, semi) {
+        (Some(a), Some(s)) => {
+            if a.0 > s.0 {
+                a
+            } else {
+                s
+            }
+        }
+        (Some(a), None) => a,
+        (None, Some(s)) => s,
+        (None, None) => return None,
+    };
+    let build_part = &command[..sep_start];
+    let echo_arg = command[tail_start..].trim_start().strip_prefix("echo ")?;
+    let echo_arg = echo_arg.trim();
+    if echo_arg.is_empty() {
+        return None;
+    }
+    Some((build_part, echo_arg))
+}
+
+/// Is `arg` (the raw text after `echo `, still possibly quoted) safe to
+/// drop entirely? `echo` itself has no side effect beyond stdout, so any
+/// number of inert words is fine — the actual hazard is an argument that
+/// hides a REAL side effect: a command substitution (`` ` `` / `$(`), a
+/// redirect, a further `;`/`&&`/`|` smuggled inside, or — #2554 round 2
+/// should-fix, the sharpest hole — a NEWLINE, which a real shell always
+/// treats as starting a brand-new command, never more `echo` argument text.
+/// Requires at least one reference to `$?` or `${PIPESTATUS[0]}` (otherwise
+/// this isn't an exit-status echo at all — `echo "$HOME"` must stay
+/// compound) and, once every such reference is removed, nothing from
+/// [`SHELL_META`] (which already lists `\n`) or a bare `\r` may remain.
+fn is_inert_exit_status_arg(arg: &str) -> bool {
+    // Checked on the RAW argument, before any quote-unwrapping or `$?`
+    // scrubbing: `echo EXIT=$?<LF>git add -A` scrubs to `<LF>git add -A`,
+    // and a check that ran only on the scrubbed text could still miss a
+    // newline hiding a real command — reject it outright here instead.
+    if arg.contains(['\n', '\r']) {
+        return false;
+    }
+    let inner = if let Some(unquoted) = arg.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        // #2554 round 2 should-fix: a stray inner `"` (`"$?""` unwraps to
+        // `$?"`) is not this shape either — refuse rather than guess which
+        // half of a broken quote pairing the shell would have honoured.
+        if unquoted.contains('"') {
+            return false;
+        }
+        unquoted
+    } else if arg.contains(['"', '\'']) {
+        // An unmatched or single quote isn't this shape — refuse rather
+        // than guess at shell quoting rules.
+        return false;
+    } else {
+        arg
+    };
+    if !inner.contains("$?") && !inner.contains("${PIPESTATUS[0]}") {
+        return false;
+    }
+    let scrubbed = inner.replace("${PIPESTATUS[0]}", "").replace("$?", "");
+    !scrubbed
+        .chars()
+        .any(|c| SHELL_META.contains(&c) || c == '\r')
+}
+
+/// Flag a routed `build_exec` call as having had a trailing exit-code `echo`
+/// dropped — read by `tools.rs`'s note so the model is told the `EXIT: N`
+/// line it asked for was replaced by the lane's own (real) exit code,
+/// rather than simply vanishing. A no-op for any other route: the flag only
+/// has a rendered meaning on the build lane.
+fn mark_echo_dropped(decision: RouteDecision) -> RouteDecision {
+    match decision {
+        RouteDecision::Route {
+            tool: "build_exec",
+            mut args,
+        } => {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("echo_dropped".to_string(), Value::Bool(true));
+            }
+            RouteDecision::Route {
+                tool: "build_exec",
+                args,
+            }
+        }
+        other => other,
     }
 }
 
@@ -2145,5 +2298,113 @@ mod tests {
             }
         );
         std::fs::remove_file(&link).ok();
+    }
+
+    /// F27 (r14a evidence): the exact measured shape — a folded leading
+    /// `cd`, a build piped through `2>&1`, and a trailing exit-status echo
+    /// — routes with `cwd` attached, same as if the echo were never there.
+    #[test]
+    fn a_folded_cd_with_2_and_1_and_a_trailing_exit_echo_routes_with_cwd() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        assert_eq!(
+            classify_at(
+                "cd sub && cargo test 2>&1; echo \"EXIT: $?\"",
+                &fx.root,
+                &scope,
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "test"], "cwd": "sub", "echo_dropped": true }),
+            }
+        );
+    }
+
+    /// F27: every echo-suffix variant from the evidence routes, whether the
+    /// separator is `;` or `&&`, quoted or bare, `EXIT:`/`EXIT=`/`exit `-
+    /// prefixed, or referencing `${PIPESTATUS[0]}` instead of `$?`.
+    #[test]
+    fn every_trailing_exit_echo_variant_is_stripped_and_routes() {
+        for cmd in [
+            "cargo test; echo \"EXIT: $?\"",
+            "cargo test && echo \"EXIT: $?\"",
+            "cargo test; echo \"EXIT=$?\"",
+            "cargo test; echo \"exit $?\"",
+            "cargo test; echo $?",
+            "cargo test; echo \"TEST_EXIT=${PIPESTATUS[0]}\"",
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args: json!({ "argv": ["cargo", "test"], "echo_dropped": true }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    /// F27 negative cases: anything that is NOT provably an inert
+    /// exit-status echo stays compound (`Exec`), exactly as before this
+    /// change — an echo of unrelated text or a variable, a command
+    /// substitution, a redirect, `||` (not `&&`/`;`), and two trailing
+    /// echoes (the first one is not the one that gets dropped, and it
+    /// keeps its own `;` in what remains).
+    #[test]
+    fn a_trailing_echo_that_is_not_provably_inert_stays_compound() {
+        for cmd in [
+            "cargo test; echo \"$HOME\"",
+            "cargo test; echo $(date)",
+            "cargo test; echo x > f",
+            "cargo test || echo \"$?\"",
+            "cargo test; echo a; echo \"$?\"",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// F27: routing decides nothing about the build's own outcome — a
+    /// failing build still routes with the echo stripped, and it is the
+    /// confined build lane (never the shell's own masked `$?`) that reports
+    /// the real failure. See `disable_ocap_tests.rs` for the end-to-end
+    /// dispatch confirmation that the reported exit code is the REAL one.
+    #[test]
+    fn a_trailing_exit_echo_on_a_command_that_would_fail_still_routes() {
+        assert_eq!(
+            classify("cargo test --this-flag-does-not-exist; echo \"EXIT: $?\""),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test", "--this-flag-does-not-exist"],
+                    "echo_dropped": true,
+                }),
+            }
+        );
+    }
+
+    /// #2554 round 2 should-fix (red first): a newline inside the echo tail
+    /// must never be treated as more argument text — `cargo test; echo
+    /// EXIT=$?<LF>touch marker` used to scrub to `<LF>touch marker`, see no
+    /// forbidden character in a hand-rolled table that omitted `\n`, and
+    /// silently DROP `touch marker` while routing the build. `\n` is
+    /// checked directly now, before any scrubbing.
+    #[test]
+    fn a_newline_in_the_echo_tail_refuses_the_whole_strip() {
+        assert_eq!(
+            classify("cargo test; echo EXIT=$?\ntouch marker"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2554 round 2 should-fix (red first): the rightmost-`;`/`&&` search
+    /// has no notion of quoting, so a separator INSIDE a quoted argument
+    /// could become the split point. `rm "x; echo "$?""` is ONE `rm` of a
+    /// file literally named `x; echo "$?"` in a real shell; splitting it
+    /// used to route `rm "x` as `delete_file { path: "\"x" }` — a different
+    /// file than the shell would ever touch. A quote anywhere in the kept
+    /// half now refuses the whole strip.
+    #[test]
+    fn a_quote_inside_the_kept_half_refuses_the_whole_strip() {
+        assert_eq!(classify("rm \"x; echo \"$?\"\""), RouteDecision::Exec);
     }
 }
