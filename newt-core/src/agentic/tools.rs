@@ -4457,8 +4457,24 @@ async fn execute_authorized_tool(
                 );
             }
             if old_string.is_empty() && range.is_none() {
-                return "error: old_string must not be empty (or give start_line and end_line) — use write_file to create new files"
-                    .to_string();
+                // Echo what ARRIVED: under context pressure a model can intend a
+                // range and emit only {path, new_string}, then resend it verbatim
+                // while the refusal restates a rule it believes it followed.
+                let mut received: Vec<&str> = args
+                    .as_object()
+                    .map(|object| object.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                received.sort_unstable();
+                let missing = match (args["start_line"].as_u64(), args["end_line"].as_u64()) {
+                    (Some(_), None) => "end_line",
+                    (None, Some(_)) => "start_line",
+                    _ => "start_line and end_line",
+                };
+                return format!(
+                    "error: old_string must not be empty (or give start_line and end_line) — \
+                     this call received: {}; missing {missing}. Use write_file to create new files",
+                    received.join(", ")
+                );
             }
             if !file_capture::regular_target(&full) {
                 return file_capture::present(

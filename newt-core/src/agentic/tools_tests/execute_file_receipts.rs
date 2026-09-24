@@ -605,3 +605,40 @@ async fn copy_from_a_source_outside_the_read_scope_is_denied_and_writes_nothing(
     assert!(!model.contains("private"), "{model}");
     assert!(!ws.path().join("dst.txt").exists(), "nothing written");
 }
+
+/// Live 2026-09-23 (run 4, 89k/105k context): the model meant a range delete
+/// and sent only `{path, new_string}` — three identical calls, because the
+/// refusal restated the rule instead of what arrived. The refusal now echoes
+/// the received keys and names a missing half of the range.
+#[tokio::test]
+async fn an_edit_without_old_string_or_range_says_which_keys_arrived() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("f.txt"), "a\nb\nc\n").unwrap();
+    for (args, missing) in [
+        (
+            serde_json::json!({"path": "f.txt", "new_string": ""}),
+            "start_line",
+        ),
+        (
+            serde_json::json!({"path": "f.txt", "new_string": "", "start_line": 2}),
+            "end_line",
+        ),
+    ] {
+        let (model, _) = model_and_display(
+            "edit_file",
+            args,
+            ws.path(),
+            &caveats_rw(ws.path()),
+            ToolCollaborators::default(),
+        )
+        .await;
+        assert!(model.contains("old_string must not be empty"), "{model}");
+        assert!(model.contains("received: "), "echoes what arrived: {model}");
+        assert!(model.contains("new_string, path"), "{model}");
+        assert!(model.contains(&format!("missing {missing}")), "{model}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("f.txt")).unwrap(),
+        "a\nb\nc\n"
+    );
+}
