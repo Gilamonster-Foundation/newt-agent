@@ -355,6 +355,9 @@ mod tests {
         );
         let (_kept, rows) = relet(6, screen, lease).expect("falls back, stays open");
         assert_eq!(rows, 6);
+        // #2574: a zoom asks for all of it; the holder still wins.
+        let (_kept, rows) = relet(6, crate::modal_size::FILL, lease).expect("zoom falls back");
+        assert_eq!(rows, 6);
         drop(holder);
     }
 
