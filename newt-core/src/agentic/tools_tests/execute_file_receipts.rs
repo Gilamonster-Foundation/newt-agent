@@ -667,3 +667,112 @@ async fn an_explicit_empty_new_string_still_deletes_on_purpose() {
     assert!(tool_result_ok(&model), "{model}");
     assert_eq!(after, "line a\nline c\nline d\nline e\n");
 }
+
+// -- write_file: the same dropped-key bug ----------------------------------
+//
+// `content` was read with `unwrap_or("")`, so a write that dropped it emptied
+// the file and reported success. The shrink guard only fires past 30 lines
+// and 30%, so a small file was wiped silently and a new path created empty.
+
+#[tokio::test]
+async fn a_write_without_a_string_content_fails_and_changes_nothing() {
+    for args in [
+        serde_json::json!({"path": "fixture.rs"}),
+        serde_json::json!({"path": "fixture.rs", "content": null}),
+        serde_json::json!({"path": "fixture.rs", "content": 7}),
+        serde_json::json!({"path": "new.rs"}),
+    ] {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+        let (model, _) = model_and_display(
+            "write_file",
+            args.clone(),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            ToolCollaborators::default(),
+        )
+        .await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("content"),
+            "names the missing field: {model}"
+        );
+        let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+        assert!(
+            !ws.path().join("new.rs").exists(),
+            "no empty file created for {args}"
+        );
+    }
+}
+
+/// A malformed call is refused before the operator is asked to approve it:
+/// approving an edit that is then refused anyway wastes the human's consent.
+struct NeverAsked;
+
+impl PermissionGate for NeverAsked {
+    fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        panic!("a malformed call reached the permission gate: {requests:?}")
+    }
+
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
+        panic!("a malformed call reached the confirm prompt: {question}")
+    }
+}
+
+#[tokio::test]
+async fn malformed_mutations_are_refused_before_the_permission_gate() {
+    for (tool, args, names) in [
+        (
+            "edit_file",
+            serde_json::json!({"path": "fixture.rs", "old_string": "", "new_string": "x"}),
+            "old_string",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"path": "fixture.rs", "new_string": "x"}),
+            "old_string",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"old_string": "line b", "new_string": "x"}),
+            "path",
+        ),
+        ("write_file", serde_json::json!({"content": "x"}), "path"),
+        (
+            "write_file",
+            serde_json::json!({"path": "fixture.rs"}),
+            "content",
+        ),
+    ] {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+        // Writes are outside scope, so a well-formed call WOULD ask the gate.
+        let caveats = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = NeverAsked;
+        let (model, _) = model_and_display(
+            tool,
+            args.clone(),
+            ws.path(),
+            &caveats,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate),
+                ..ToolCollaborators::default()
+            },
+        )
+        .await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {tool} {args} -> {model}"
+        );
+        assert!(model.contains(names), "names `{names}`: {model}");
+        let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {tool} {args}");
+    }
+}

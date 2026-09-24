@@ -4119,7 +4119,16 @@ async fn execute_authorized_tool(
 
         "write_file" => {
             let path = args["path"].as_str().unwrap_or("");
-            let content = args["content"].as_str().unwrap_or("");
+            // Validate before the gate or the file, as edit_file does: a write
+            // that dropped `content` used to empty its target and report
+            // success (the shrink guard misses files under 30 lines).
+            let Some(content) = args.get("content").and_then(serde_json::Value::as_str) else {
+                return "error: write_file needs `content` as a string — nothing was written"
+                    .to_string();
+            };
+            if path.is_empty() {
+                return "error: write_file needs `path` — nothing was written".to_string();
+            }
             // Move code without retyping it: `copy_from` appends an exact line
             // range of another file after `content` (a typed header). The
             // source is read through read_file's own fence. Live 2026-09-23 a
@@ -4478,6 +4487,13 @@ async fn execute_authorized_tool(
                         give old_string, the exact text to replace; nothing was changed"
                     .to_string();
             }
+            if path.is_empty() {
+                return "error: edit_file needs `path` — nothing was changed".to_string();
+            }
+            if old_string.is_empty() {
+                return "error: old_string must not be empty — use write_file to create new files"
+                    .to_string();
+            }
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             // step-52.5: same scope-vs-#263-gate split as write_file — decides
@@ -4502,10 +4518,6 @@ async fn execute_authorized_tool(
                     &full_str,
                     "edit_file",
                 );
-            }
-            if old_string.is_empty() {
-                return "error: old_string must not be empty — use write_file to create new files"
-                    .to_string();
             }
             if !file_capture::regular_target(&full) {
                 return file_capture::present(
