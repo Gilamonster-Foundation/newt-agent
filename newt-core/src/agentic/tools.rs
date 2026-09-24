@@ -3982,15 +3982,30 @@ async fn execute_authorized_tool(
                 Some(".") | None => String::new(),
                 Some(cwd) => format!("; the leading `cd`/`cwd` was folded into cwd={cwd}"),
             };
+            // F27 / #2554 round 2: say when a trailing exit-code `echo` was
+            // dropped (`routing::mark_echo_dropped`) — the model asked for
+            // an `EXIT: N` line and will not find one; without this clause
+            // it looks like the request was silently ignored rather than
+            // answered a different way, which is exactly the kind of gap
+            // that drives a re-run (the no-progress spiral this line of
+            // work exists to end).
+            let echo_clause = if args.get("echo_dropped").and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                "; a trailing exit-code `echo` was dropped — this lane's own exit code, above, \
+                 is the real one"
+            } else {
+                ""
+            };
             let note = match trim {
                 Some(trim) => format!(
                     "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline; {}{cd_clause}]",
+                     denied/offline; {}{cd_clause}{echo_clause}]",
                     trim.note_clause()
                 ),
                 None => format!(
                     "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline{cd_clause}]"
+                     denied/offline{cd_clause}{echo_clause}]"
                 ),
             };
             executed((append_routed_note(text, note), outcome))

@@ -1774,6 +1774,15 @@ async fn a_failing_build_with_a_trailing_exit_echo_still_reports_the_real_failur
          trailing echo WOULD have kept it compound and masked the exit \
          code): {out}"
     );
+    // #2554 round 2: the model asked for an `EXIT: N` line and will not
+    // find one — the note must say the echo was dropped and that the
+    // lane's own exit code (above) is the real one, so a model grepping
+    // its own output for `EXIT` does not re-run the call believing it
+    // never answered.
+    assert!(
+        out.contains("a trailing exit-code `echo` was dropped"),
+        "the routed note must say the echo was dropped: {out}"
+    );
 }
 
 /// The passing twin: a build that genuinely passes, piped to `head`, keeps
