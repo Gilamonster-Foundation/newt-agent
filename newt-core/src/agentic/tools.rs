@@ -4906,9 +4906,18 @@ async fn execute_authorized_tool(
 /// successful `run_command` whose *output* happens to start with one of
 /// these is misclassified; the recorded event is an outcome claim, not a
 /// gate.
+///
+/// #2553 review finding 1: `authorized_read`/`object_bound_write`/
+/// `object_bound_delete`'s fs-error text is `"error reading {path}: {e}"`
+/// (space, not colon, after `error`) — a near-miss of the `"error:"` prefix
+/// below, so a real ENOENT `read_file` ledgered `ok = true`. Matching the
+/// bare `"error "` word (not just `"error:"`) closes that family in this one
+/// place rather than editing every `format!` call site that spells a
+/// failure this way.
 pub(crate) fn tool_result_ok(result: &str) -> bool {
     let r = result.trim_start();
     !(r.starts_with("error:")
+        || r.starts_with("error ")
         || r.starts_with("capability denied:")
         || r.starts_with("unknown tool")
         || r.starts_with("no command configured"))
