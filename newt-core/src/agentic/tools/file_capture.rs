@@ -360,26 +360,6 @@ pub(super) fn copy_line_range(
     Ok(out)
 }
 
-/// `text` with lines `start..=end` replaced by `replacement` (empty deletes
-/// them), every other byte untouched — so removing a large block does not
-/// require quoting it back verbatim as an `old_string`.
-pub(super) fn replace_line_range(
-    text: &str,
-    start: usize,
-    end: usize,
-    replacement: &str,
-) -> Result<String, String> {
-    let (from, to) = line_range(text, start, end)?;
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..from]);
-    out.push_str(replacement);
-    if !replacement.is_empty() && !replacement.ends_with('\n') && to < text.len() {
-        out.push('\n');
-    }
-    out.push_str(&text[to..]);
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +479,7 @@ mod tests {
 /// Pure tests for moving code by line range — no filesystem.
 #[cfg(test)]
 mod line_range_tests {
-    use super::{copy_line_range, replace_line_range};
+    use super::copy_line_range;
 
     const SRC: &str = "l1\nl2\nl3\nl4\nl5\n";
 
@@ -521,25 +501,8 @@ mod line_range_tests {
     }
 
     #[test]
-    fn a_replaced_range_keeps_every_other_line_byte_exact() {
-        assert_eq!(
-            replace_line_range(SRC, 2, 4, "mod m;\n").unwrap(),
-            "l1\nmod m;\nl5\n"
-        );
-        // Deletion: an empty replacement removes the lines cleanly.
-        assert_eq!(replace_line_range(SRC, 2, 4, "").unwrap(), "l1\nl5\n");
-        // A replacement missing its newline does not glue onto the next line.
-        assert_eq!(
-            replace_line_range(SRC, 2, 4, "mod m;").unwrap(),
-            "l1\nmod m;\nl5\n"
-        );
-    }
-
-    #[test]
     fn a_bad_range_is_refused_with_the_file_length() {
         for (start, end) in [(0, 2), (3, 2), (4, 9)] {
-            let err = replace_line_range(SRC, start, end, "").unwrap_err();
-            assert!(err.contains("5 lines"), "{err}");
             let err = copy_line_range("", SRC, start, end).unwrap_err();
             assert!(err.contains("5 lines"), "{err}");
         }
