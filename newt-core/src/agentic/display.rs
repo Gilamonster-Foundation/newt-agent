@@ -1259,6 +1259,9 @@ pub(crate) struct ToolDisplay<W: Write> {
     /// global here — so a call site cannot silently get the wrong mode.
     summary: bool,
     result_override: Option<String>,
+    /// What the OPERATOR should see when it differs from what the model got
+    /// (see [`ToolPresentation::display_source`]). Consumed by `result`.
+    display_source: Option<String>,
     file_change: Option<std::sync::Arc<crate::agentic::FileChangePresentation>>,
     /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
     /// When present, completed tool output ADDITIONALLY renders as an interactive
@@ -1282,6 +1285,7 @@ impl<W: Write> ToolDisplay<W> {
             spill_lines,
             summary,
             result_override: None,
+            display_source: None,
             file_change: None,
             completed_spill_renderer: None,
         }
@@ -1381,9 +1385,14 @@ impl<W: Write> ToolDisplay<W> {
     }
 
     pub(crate) fn result(&mut self, output: &str) {
-        let raw_output = output;
+        // The operator's view starts from the display source when a tool gave
+        // one (the full receipt behind a model-facing headline), else from
+        // what the model got. Escaping overrides and file-change byte ranges
+        // are both bound to this display text, never to the model's.
+        let source = self.display_source.take();
+        let raw_output = source.as_deref().unwrap_or(output);
         let overridden = self.result_override.take();
-        let output = overridden.as_deref().unwrap_or(output);
+        let output = overridden.as_deref().unwrap_or(raw_output);
         let change = self
             .file_change
             .take()
@@ -1540,6 +1549,10 @@ pub(crate) trait ToolPresentation: Send {
     fn document(&mut self, output: &str);
     fn override_result(&mut self, output: String);
     fn file_change(&mut self, _change: std::sync::Arc<crate::agentic::FileChangePresentation>) {}
+    /// The operator's full view of a result whose model-facing text is
+    /// shorter: a mutation tells the model "Modified (+1 -1)" while the
+    /// operator keeps the diff. Hosts without a display ignore it.
+    fn display_source(&mut self, _full: String) {}
 }
 
 impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
@@ -1591,6 +1604,10 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
 
     fn file_change(&mut self, change: std::sync::Arc<crate::agentic::FileChangePresentation>) {
         self.file_change = Some(change);
+    }
+
+    fn display_source(&mut self, full: String) {
+        self.display_source = Some(full);
     }
 }
 

@@ -4,8 +4,43 @@
 
 use super::*;
 
+/// What the MODEL got and what the OPERATOR saw, separately. Color off prints
+/// the display text verbatim (the plain-terminal fallback), so each side is
+/// asserted on its own: on success the model gets a one-line headline
+/// ("Modified (+1 -1)"), the operator keeps the full diff (pi's content vs
+/// details split; Codex's "Updated the following files"). Live 2026-09-23:
+/// echoing a 1,497-line new file back to the model spilled it, and the model
+/// spent a round reading its own write back.
+async fn model_and_display(
+    name: &str,
+    args: serde_json::Value,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+    collab: ToolCollaborators<'_, '_>,
+) -> (String, String) {
+    let mut display = ToolDisplay::new(Vec::new(), false, 4096, 0, false);
+    let model = execute_tool_with_display_cancellable(
+        &mut display,
+        name,
+        &args,
+        &ws.to_string_lossy(),
+        false,
+        20,
+        caveats,
+        &mut NoMcp,
+        collab,
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (model, String::from_utf8(display.into_inner()).unwrap())
+}
+
 #[tokio::test]
-async fn actual_file_operations_supply_rich_cells_without_changing_the_raw_receipt() {
+async fn a_successful_mutation_gives_the_model_a_headline_and_the_operator_the_diff() {
     let ws = tempfile::TempDir::new().unwrap();
     let path = "state.rs";
     for (name, args, kind) in [
@@ -40,7 +75,11 @@ async fn actual_file_operations_supply_rich_cells_without_changing_the_raw_recei
         .await
         .unwrap()
         .unwrap();
-        assert!(raw.contains("```diff"), "canonical returned patch: {raw}");
+        assert!(
+            !raw.contains("```diff"),
+            "the model gets a headline, not the patch: {raw}"
+        );
+        assert!(raw.contains(&format!("{kind} (+")), "{raw}");
         let visible = String::from_utf8(display.into_inner()).unwrap();
         assert!(
             visible.contains(&format!("{kind} \"state.rs\"")),
@@ -204,8 +243,12 @@ async fn file_receipts_keep_raw_source_but_neutralize_terminal_controls() {
             after.as_deref(),
         )
         .unwrap();
-        assert!(raw.contains(&expected_receipt), "raw {name} result changed");
-        assert!(raw.contains("\u{1b}]52;"), "raw source was lost");
+        let headline = expected_receipt.lines().next().unwrap();
+        assert!(raw.contains(headline), "{name} headline missing: {raw:?}");
+        assert!(
+            !raw.contains("\u{1b}]52;"),
+            "the model gets no file bytes on success: {raw:?}"
+        );
         let visible = String::from_utf8(display.into_inner()).unwrap();
         assert!(
             visible.chars().all(|ch| !ch.is_control() || ch == '\n'),
@@ -321,77 +364,68 @@ async fn a_write_captures_its_preimage_after_confirmation() {
         fs_write: Scope::All,
         ..caveats_rw(ws.path())
     };
-    let output = execute_tool(
+    let (model, seen) = model_and_display(
         "write_file",
-        &serde_json::json!({"path": "state.txt", "content": "written\n"}),
-        &ws.path().to_string_lossy(),
-        false,
-        20,
+        serde_json::json!({"path": "state.txt", "content": "written\n"}),
+        ws.path(),
         &caveats,
-        &mut NoMcp,
-        None,
-        None,
-        None,
-        None,
-        Some(&mut gate),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate),
+            ..ToolCollaborators::default()
+        },
     )
     .await;
-    assert!(
-        output.contains("-changed while confirming\n+written\n"),
-        "{output}"
-    );
-    assert!(!output.contains("-before confirmation"), "{output}");
+    assert!(model.contains("Modified (+1 -1)"), "{model}");
+    assert!(seen.contains("-changed while confirming"), "{seen}");
+    assert!(seen.contains("+written"), "{seen}");
+    assert!(!seen.contains("-before confirmation"), "{seen}");
 }
 
 #[tokio::test]
 async fn sequential_file_tools_show_the_immediate_change_without_an_artifact_sink() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_rw(ws.path());
-    let added = run_tool(
+    let (added, seen) = model_and_display(
         "write_file",
         serde_json::json!({"path": "state.txt", "content": "one\n"}),
         ws.path(),
         &caveats,
-        None,
+        ToolCollaborators::default(),
     )
     .await;
     assert!(added.starts_with("wrote state.txt"), "{added}");
     assert!(added.contains("Added (+1 -0)"), "{added}");
-    assert!(added.contains("--- /dev/null\n"), "{added}");
-    assert!(added.contains("+one\n"), "{added}");
+    assert!(
+        !added.contains("--- /dev/null"),
+        "no patch to the model: {added}"
+    );
+    assert!(seen.contains("--- /dev/null"), "{seen}");
+    assert!(seen.contains("+one"), "{seen}");
 
-    let edited = run_tool(
+    let (edited, seen) = model_and_display(
         "edit_file",
         serde_json::json!({"path": "state.txt", "old_string": "one", "new_string": "two"}),
         ws.path(),
         &caveats,
-        None,
+        ToolCollaborators::default(),
     )
     .await;
     assert!(edited.starts_with("edited state.txt"), "{edited}");
     assert!(edited.contains("Modified (+1 -1)"), "{edited}");
-    assert!(edited.contains("-one\n+two\n"), "{edited}");
-    assert!(!edited.contains("--- /dev/null\n"), "{edited}");
+    assert!(seen.contains("-one") && seen.contains("+two"), "{seen}");
+    assert!(!seen.contains("--- /dev/null"), "{seen}");
 
-    let deleted = run_tool(
+    let (deleted, seen) = model_and_display(
         "delete_file",
         serde_json::json!({"path": "state.txt"}),
         ws.path(),
         &caveats,
-        None,
+        ToolCollaborators::default(),
     )
     .await;
     assert!(deleted.starts_with("deleted state.txt"), "{deleted}");
     assert!(deleted.contains("Deleted (+0 -1)"), "{deleted}");
-    assert!(deleted.contains("-two\n"), "{deleted}");
+    assert!(seen.contains("-two"), "{seen}");
     assert!(!ws.path().join("state.txt").exists());
 }
 
@@ -400,18 +434,24 @@ async fn sequential_file_tools_show_the_immediate_change_without_an_artifact_sin
 async fn a_failed_build_check_keeps_the_verified_tool_change() {
     let ws = tempfile::TempDir::new().unwrap();
     std::fs::write(ws.path().join("state.txt"), "old\n").unwrap();
-    let output = run_tool(
+    let (output, seen) = model_and_display(
         "write_file",
         serde_json::json!({"path": "state.txt", "content": "tool bytes\n"}),
         ws.path(),
         &caveats_rw(ws.path()),
-        Some("printf 'build bytes\\n' > state.txt; exit 1"),
+        ToolCollaborators {
+            build_check_cmd: Some("printf 'build bytes\\n' > state.txt; exit 1"),
+            ..ToolCollaborators::default()
+        },
     )
     .await;
     assert!(output.contains("Modified (+1 -1)"), "{output}");
-    assert!(output.contains("-old\n+tool bytes\n"), "{output}");
-    assert!(!output.contains("+build bytes\n"), "{output}");
     assert!(output.contains("build check failed"), "{output}");
+    assert!(
+        seen.contains("-old") && seen.contains("+tool bytes"),
+        "{seen}"
+    );
+    assert!(!seen.contains("+build bytes"), "{seen}");
     assert_eq!(
         std::fs::read_to_string(ws.path().join("state.txt")).unwrap(),
         "build bytes\n"
@@ -482,5 +522,123 @@ async fn deleting_a_final_symlink_does_not_report_its_target_contents_as_deleted
     assert_eq!(
         std::fs::read_to_string(ws.path().join("target.txt")).unwrap(),
         "target remains\n"
+    );
+}
+
+// -- moving code by line range: no retyping, no shell dialect -------------
+//
+// Live 2026-09-23: a retyped 1,263-line move fabricated symbols; a shell sed
+// range copy then failed on BSD-vs-GNU syntax and left `mod.rs-e` behind.
+
+#[tokio::test]
+async fn copy_from_moves_a_line_range_byte_exact_after_a_typed_header() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("src.rs"),
+        "l1\nfn moved() {\n    body();\n}\nl5\n",
+    )
+    .unwrap();
+    let (model, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "dst.rs", "content": "use x;\n",
+            "copy_from": {"path": "src.rs", "start_line": 2, "end_line": 4}}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(model.contains("Added (+4 -0)"), "{model}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("dst.rs")).unwrap(),
+        "use x;\nfn moved() {\n    body();\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_deletes_a_line_range_without_quoting_it() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("src.rs"),
+        "l1\nfn moved() {\n    body();\n}\nl5\n",
+    )
+    .unwrap();
+    let (model, _) = model_and_display(
+        "edit_file",
+        serde_json::json!({"path": "src.rs", "start_line": 2, "end_line": 4, "new_string": "mod dst;\n"}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(model.contains("Modified (+1 -3)"), "{model}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("src.rs")).unwrap(),
+        "l1\nmod dst;\nl5\n"
+    );
+}
+
+/// `copy_from` reads through read_file's own fence: a source outside the
+/// fs_read scope is refused, and nothing is written.
+#[tokio::test]
+async fn copy_from_a_source_outside_the_read_scope_is_denied_and_writes_nothing() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "private\n").unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+        ..caveats_rw(ws.path())
+    };
+    let (model, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "dst.txt", "content": "",
+            "copy_from": {"path": secret.to_string_lossy(), "start_line": 1, "end_line": 1}}),
+        ws.path(),
+        &caveats,
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(
+        model.contains("fs_read"),
+        "refusal names the denied axis: {model}"
+    );
+    assert!(!model.contains("private"), "{model}");
+    assert!(!ws.path().join("dst.txt").exists(), "nothing written");
+}
+
+/// Live 2026-09-23 (run 4, 89k/105k context): the model meant a range delete
+/// and sent only `{path, new_string}` — three identical calls, because the
+/// refusal restated the rule instead of what arrived. The refusal now echoes
+/// the received keys and names a missing half of the range.
+#[tokio::test]
+async fn an_edit_without_old_string_or_range_says_which_keys_arrived() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("f.txt"), "a\nb\nc\n").unwrap();
+    for (args, missing) in [
+        (
+            serde_json::json!({"path": "f.txt", "new_string": ""}),
+            "start_line",
+        ),
+        (
+            serde_json::json!({"path": "f.txt", "new_string": "", "start_line": 2}),
+            "end_line",
+        ),
+    ] {
+        let (model, _) = model_and_display(
+            "edit_file",
+            args,
+            ws.path(),
+            &caveats_rw(ws.path()),
+            ToolCollaborators::default(),
+        )
+        .await;
+        assert!(model.contains("old_string must not be empty"), "{model}");
+        assert!(model.contains("received: "), "echoes what arrived: {model}");
+        assert!(model.contains("new_string, path"), "{model}");
+        assert!(model.contains(&format!("missing {missing}")), "{model}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("f.txt")).unwrap(),
+        "a\nb\nc\n"
     );
 }

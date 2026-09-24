@@ -476,38 +476,50 @@ pub(crate) fn execute_memory_fetch(
             .to_string();
     }
 
+    match resolve_memory_address(address, source) {
+        Ok(body) => match grep {
+            Some(pattern) => grep_payload(&body, pattern),
+            None => body,
+        },
+        Err(refusal) => refusal,
+    }
+}
+
+/// Is `raw` a memory address (`spill:`, `note:`, `turn:`, `compaction:`,
+/// `prompt:`) rather than a filesystem path?
+pub(crate) fn is_memory_address(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.starts_with("prompt:") || MemAddr::parse(raw).is_some()
+}
+
+/// Resolve one memory address to its verbatim body — the ONE resolver behind
+/// both `memory_fetch` and `read_file`'s memory-address branch. `Err` carries
+/// the model-facing text for a malformed address, a failed fetch, or absence.
+pub(crate) fn resolve_memory_address(
+    address: &str,
+    source: &dyn MemorySource,
+) -> Result<String, String> {
     let payload = if address.starts_with("prompt:") {
         let Ok(id) = address.parse::<PromptId>() else {
-            let out = format!(
+            return Err(format!(
                 "{address:?} is not a valid prompt address — copy a `prompt:<uuid>` handle exactly as Newt showed it."
-            );
-            return out;
+            ));
         };
         source.fetch_prompt(id)
     } else if let Some(addr) = MemAddr::parse(address) {
         source.fetch(&addr)
     } else {
-        let out = format!(
+        return Err(format!(
             "{address:?} is not a memory address — they look like `note:3` \
              (a numbered note) or `turn:174856320012#7` (a conversation id \
              and `seq` from a recall hit). Copy one exactly as it was shown."
-        );
-        return out;
+        ));
     };
-
-    let payload = match payload {
-        Ok(p) => p,
-        Err(e) => return format!("error: {e}"),
-    };
-
-    let out = match payload {
-        MemPayload::Found(body) => match grep {
-            Some(pattern) => grep_payload(&body, pattern),
-            None => body,
-        },
-        MemPayload::NotFound { reason } => format!("no such memory item: {reason}"),
-    };
-    out
+    match payload {
+        Ok(MemPayload::Found(body)) => Ok(body),
+        Ok(MemPayload::NotFound { reason }) => Err(format!("no such memory item: {reason}")),
+        Err(e) => Err(format!("error: {e}")),
+    }
 }
 
 fn grep_payload(body: &str, pattern: &str) -> String {

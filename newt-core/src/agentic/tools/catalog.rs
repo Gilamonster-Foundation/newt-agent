@@ -62,17 +62,15 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write or overwrite a file within granted file access. \
-                                WARNING: use edit_file instead when modifying an existing file — \
-                                write_file replaces the entire contents and will fail if the new \
-                                content is significantly shorter than the original (shrink guard). \
-                                Only use write_file for new files or full rewrites you have \
-                                explicitly generated in their entirety.",
+                "description": "Create a file, or replace one entirely. To change an \
+                                existing file use edit_file (a large shrink is refused). To \
+                                move existing code, use copy_from — never retype it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "content": { "type": "string", "description": "The complete new file contents" }
+                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty)" },
+                        "copy_from": { "type": "object", "description": "Append lines start_line..end_line of another file, copied exactly", "properties": { "path": { "type": "string" }, "start_line": { "type": "integer" }, "end_line": { "type": "integer" } } }
                     },
                     "required": ["path", "content"]
                 }
@@ -82,19 +80,19 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Make a targeted edit to an existing file by replacing one exact \
-                                string with another. Safer than write_file for modifying existing \
-                                files — you only generate the change, not the whole file. \
-                                Fails with a clear error if old_string is not found or matches \
-                                multiple times (add more surrounding context to make it unique).",
+                "description": "Replace one exact string in an existing file, or a line \
+                                range (start_line..end_line; empty new_string deletes it). \
+                                Use the range for large blocks instead of quoting them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "old_string": { "type": "string", "description": "Exact string to find and replace (must match exactly once)" },
-                        "new_string": { "type": "string", "description": "Replacement string" }
+                        "old_string": { "type": "string", "description": "Exact string to replace (must match once); omit when using a line range" },
+                        "new_string": { "type": "string", "description": "Replacement" },
+                        "start_line": { "type": "integer" },
+                        "end_line": { "type": "integer" }
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path", "new_string"]
                 }
             }
         },

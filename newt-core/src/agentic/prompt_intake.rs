@@ -1402,6 +1402,9 @@ impl Default for DispositionLexicon {
                 "edit",
                 "delete",
                 "fix",
+                // Checked before research, so "refactor the largest file"
+                // acts instead of falling to the research needle "largest".
+                "refactor",
                 "build",
                 "run ",
                 "execute",

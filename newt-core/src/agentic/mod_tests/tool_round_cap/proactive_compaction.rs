@@ -369,8 +369,13 @@ async fn responses_proactive_no_progress_invokes_the_compactor_exactly_once() {
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
     ctx.workspace = workspace.path().to_str().unwrap();
     ctx.summarizer = Some(&*summ);
-    ctx.safe_context = Some(8_000);
-    ctx.num_ctx = Some(8_000);
+    // Round 0 carries the whole tool catalog, so its budget needs headroom
+    // over the catalog's size: at 8_000 one new optional tool parameter
+    // (`text_search.page`) tipped round 0 over and the test failed for a
+    // reason unrelated to what it checks. 9_000 keeps that headroom while the
+    // 64k-char fixture (~16k+ tokens) still cannot fit on round 1.
+    ctx.safe_context = Some(9_000);
+    ctx.num_ctx = Some(9_000);
     ctx.max_ok_input = None;
     ctx.recover_cw_400 = None;
     ctx.max_tool_rounds = 2;

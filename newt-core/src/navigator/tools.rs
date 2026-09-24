@@ -55,6 +55,11 @@ pub fn goto_definition_tool_definition() -> serde_json::Value {
     )
 }
 
+/// Hits per `text_search` page. Sized so a typical page stays well under the
+/// model-facing spill cap (`TOOL_RESULT_SPILL_CAP`, 16k chars): a page the
+/// model asks for beats a spill handle it has to learn to redeem.
+const TEXT_SEARCH_PAGE_SIZE: usize = 25;
+
 #[must_use]
 pub fn text_search_tool_definition() -> serde_json::Value {
     json!({
@@ -66,7 +71,8 @@ pub fn text_search_tool_definition() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Regex pattern to search for" },
-                    "path": { "type": "string", "description": "Optional workspace-relative file or directory to scope the search (e.g. 'newt-core/src' or 'src/lib.rs'). Omit for the whole workspace." }
+                    "path": { "type": "string", "description": "Optional workspace-relative file or directory to scope the search (e.g. 'newt-core/src' or 'src/lib.rs'). Omit for the whole workspace." },
+                    "page": { "type": "integer", "description": "25 hits per page; default 1." }
                 },
                 "required": ["query"]
             }
@@ -217,6 +223,10 @@ pub fn execute_nav_tool(
                 args["path"].as_str(),
                 &id,
             )
+            .paged(
+                args["page"].as_u64().map(|n| n as usize),
+                TEXT_SEARCH_PAGE_SIZE,
+            )
         }
         "find_references" => {
             let symbol = args["symbol"].as_str().unwrap_or("").trim();
@@ -286,6 +296,13 @@ pub fn execute_nav_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_search_advertises_a_page_parameter() {
+        let def = text_search_tool_definition();
+        let page = &def["function"]["parameters"]["properties"]["page"];
+        assert_eq!(page["type"], "integer", "{def}");
+    }
 
     #[test]
     fn nav_tool_definitions_named() {
