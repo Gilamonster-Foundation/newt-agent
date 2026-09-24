@@ -4084,15 +4084,29 @@ async fn execute_authorized_tool(
             } else {
                 ""
             };
+            // F28 (#2483 evidence): say when a leading `timeout` wrapper was
+            // dropped (`routing::mark_timeout_dropped`) — the model asked
+            // for a wrapper wall and will not find one; without this clause
+            // it looks like the flag was silently ignored rather than
+            // superseded by the lane's own wall, named explicitly below.
+            let timeout_clause =
+                if args.get("timeout_dropped").and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    "; a leading `timeout` wrapper was dropped — this lane's own 30 min limit, \
+                     above, already applies"
+                } else {
+                    ""
+                };
             let note = match trim {
                 Some(trim) => format!(
                     "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline; {}{cd_clause}{echo_clause}]",
+                     denied/offline; {}{cd_clause}{echo_clause}{timeout_clause}]",
                     trim.note_clause()
                 ),
                 None => format!(
                     "[routed `{display}` to the confined build lane — 30 min limit, network \
-                     denied/offline{cd_clause}{echo_clause}]"
+                     denied/offline{cd_clause}{echo_clause}{timeout_clause}]"
                 ),
             };
             executed((append_routed_note(text, note), outcome))
