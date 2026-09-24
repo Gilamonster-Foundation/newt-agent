@@ -41,6 +41,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use newt_core::tty::raw_mode::RawModeGuard;
 
 use crate::inline_viewport::InlineTerm;
+use crate::modal_size::{ModalSize, SizeKey};
 use crate::session_worker::PanelWindow;
 
 /// The component vocabulary is shared directly with NewtUI. Newt retains
@@ -165,6 +166,8 @@ enum Input {
     Key(Key),
     /// The terminal resized: measure the container again and redraw (#2571).
     Remeasure,
+    /// The operator sized the modal: Shift-↑/↓, or Ctrl-Z to zoom.
+    Size(SizeKey),
     Ignore,
 }
 
@@ -173,7 +176,27 @@ fn classify(event: Event) -> Input {
     match event {
         // Release and Repeat are not presses. Without this filter a terminal
         // that reports both delivers every key twice.
-        Event::Key(key) if key.kind == KeyEventKind::Press => Input::Key(key_from_event(
+        Event::Key(key) if key.kind != KeyEventKind::Press => Input::Ignore,
+        // The sizing keys belong to the driver, not the panel: every modal
+        // sizes the same way. None of them was a panel key — Shift-↑/↓ reached
+        // panels as plain ↑/↓, and no panel binds Ctrl-Z. (Ctrl-↑/↓ would
+        // have collided with macOS Mission Control.)
+        Event::Key(key)
+            if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Up =>
+        {
+            Input::Size(SizeKey::Grow)
+        }
+        Event::Key(key)
+            if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Down =>
+        {
+            Input::Size(SizeKey::Shrink)
+        }
+        Event::Key(key)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') =>
+        {
+            Input::Size(SizeKey::Zoom)
+        }
+        Event::Key(key) => Input::Key(key_from_event(
             key.code,
             key.modifiers.contains(KeyModifiers::CONTROL),
         )),
@@ -202,9 +225,10 @@ pub(crate) fn drive(
     let loop_result = {
         let _raw = PanelRawGuard::enter()?;
         (|| -> io::Result<()> {
+            let mut size = ModalSize::new(height);
             let mut terminal = match window {
                 Some(window) => window.terminal()?,
-                None => make_terminal(height)?,
+                None => make_terminal(size.requested())?,
             };
             terminal.clear()?;
             loop {
@@ -215,35 +239,52 @@ pub(crate) fn drive(
                 if !event::poll(Duration::from_millis(250))? {
                     continue;
                 }
-                match classify(event::read()?) {
+                // `Some(rows)`: lay out again at a new requested height;
+                // `Some(None)`: again at the same request (a terminal resize).
+                let relayout = match classify(event::read()?) {
                     Input::Key(key) => {
                         if let Flow::Close(apply) = screen.key(key) {
                             applied = apply;
                             break;
                         }
+                        None
                     }
                     // #2571: a panel never owns its size. The container is
                     // measured again — by the presenter that lent the rows, or
                     // by a fresh bottom-rows lease — and the region is cleared,
                     // so a narrower terminal leaves no stale cells behind.
-                    Input::Remeasure => {
-                        terminal = match window {
-                            Some(window) => {
-                                window.remeasure();
-                                window.terminal()?
-                            }
-                            None => {
-                                let granted = terminal.get_frame().area().height;
-                                // Release the old lease first: under
-                                // `OnCollision::Shift` a new one taken while
-                                // it is held would be minted ABOVE it.
-                                drop(terminal);
-                                relet(granted, height, make_terminal)?.0
-                            }
-                        };
-                        terminal.clear()?;
+                    Input::Remeasure => Some(None),
+                    Input::Size(key) => {
+                        let granted = window.map_or_else(
+                            || terminal.get_frame().area().height,
+                            |window| window.area().height,
+                        );
+                        size.apply(key, granted).map(Some)
                     }
-                    Input::Ignore => {}
+                    Input::Ignore => None,
+                };
+                if let Some(rows) = relayout {
+                    terminal = match window {
+                        Some(window) => {
+                            window.remeasure(rows);
+                            window.terminal()?
+                        }
+                        None => {
+                            let granted = terminal.get_frame().area().height;
+                            // Release the old lease first: under
+                            // `OnCollision::Shift` a new one taken while it is
+                            // held would be minted ABOVE it.
+                            drop(terminal);
+                            let (terminal, got) = relet(granted, size.requested(), make_terminal)?;
+                            // An ungrantable grow/zoom kept the old rows: the
+                            // size state follows what was actually granted.
+                            if got != size.requested() {
+                                size = ModalSize::new(got);
+                            }
+                            terminal
+                        }
+                    };
+                    terminal.clear()?;
                 }
             }
             terminal.clear()?;
@@ -339,6 +380,41 @@ mod tests {
         assert_eq!(classify(key(KeyEventKind::Release)), Input::Ignore);
         assert_eq!(classify(key(KeyEventKind::Repeat)), Input::Ignore);
         assert_eq!(classify(Event::FocusGained), Input::Ignore);
+    }
+
+    /// The modal sizing keys are the driver's, and plain arrows stay the
+    /// panel's (they scroll and select).
+    #[test]
+    fn shift_arrows_size_the_modal_and_ctrl_z_zooms() {
+        use crossterm::event::{KeyEvent, KeyEventState};
+        let press = |code, modifiers| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        assert_eq!(
+            classify(press(KeyCode::Up, KeyModifiers::SHIFT)),
+            Input::Size(SizeKey::Grow)
+        );
+        assert_eq!(
+            classify(press(KeyCode::Down, KeyModifiers::SHIFT)),
+            Input::Size(SizeKey::Shrink)
+        );
+        assert_eq!(
+            classify(press(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Input::Size(SizeKey::Zoom)
+        );
+        assert_eq!(
+            classify(press(KeyCode::Up, KeyModifiers::NONE)),
+            Input::Key(Key::Up)
+        );
+        assert_eq!(
+            classify(press(KeyCode::Char('z'), KeyModifiers::NONE)),
+            Input::Key(Key::Char('z'))
+        );
     }
 
     /// **The structural half of #1889.** The PTY test proves `PanelRawGuard`

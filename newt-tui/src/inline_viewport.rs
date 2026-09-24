@@ -343,6 +343,9 @@ pub(crate) fn lease_bottom_rows(
             width: 80,
             height: 24,
         });
+    // A zoomed modal asks for "all of it" (`modal_size::FILL`); the lease is
+    // what the screen actually has.
+    let height = height.min(screen.height);
     let top = screen.height.saturating_sub(height);
     newt_core::tty::Terminal::lease_region(newt_core::tty::Region::Rows { top, height }, policy)
         .ok_or_else(|| io::Error::other("another surface already owns these rows"))
