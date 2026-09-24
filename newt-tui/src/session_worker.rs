@@ -204,9 +204,14 @@ pub(crate) struct PanelWindow {
 #[cfg(all(feature = "rich-tui", unix))]
 #[derive(Debug)]
 pub(crate) enum PanelSignal {
-    /// The terminal resized: re-plan the reservation against the new screen,
-    /// clear what the old one left, and reply with the new region.
-    Remeasure(SyncSender<ratatui::layout::Rect>),
+    /// Re-plan the reservation and reply with the new region: after a terminal
+    /// resize (`rows: None`, keep the requested height), or because the
+    /// operator sized the panel (`rows: Some(n)`, Shift-↑/↓ or zoom; the
+    /// presenter clamps to the screen).
+    Remeasure {
+        rows: Option<u16>,
+        reply: SyncSender<ratatui::layout::Rect>,
+    },
 }
 
 #[cfg(feature = "rich-tui")]
@@ -243,27 +248,29 @@ impl PanelWindow {
     /// be parked on one and this is a no-op; it gains a body with the ConPTY
     /// cockpit, exactly as [`Self::new`] does.
     #[cfg(not(unix))]
-    pub(crate) fn remeasure(&self) {}
+    pub(crate) fn remeasure(&self, _rows: Option<u16>) {}
 
-    /// Ask the presenter for the region again after a terminal resize. The
-    /// presenter owns the layout, so it measures; the window only records the
-    /// answer. With nobody parked (tests) or no answer, the region is kept.
+    /// Ask the presenter for the region again — after a terminal resize, or
+    /// with the operator's requested height. The presenter owns the layout, so
+    /// it measures; the window only records the answer. With nobody parked
+    /// (tests) or no answer, the region is kept.
     #[cfg(unix)]
-    pub(crate) fn remeasure(&self) {
+    pub(crate) fn remeasure(&self, rows: Option<u16>) {
         let Some(signals) = &self.signals else {
             return;
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        if signals.send(PanelSignal::Remeasure(tx)).is_ok() {
+        if signals
+            .send(PanelSignal::Remeasure { rows, reply: tx })
+            .is_ok()
+        {
             if let Ok(area) = rx.recv() {
                 self.area.set(area);
             }
         }
     }
 
-    /// Test-only here, and unix-only with its callers (the remeasure tests and
-    /// the cockpit acceptance cases); #2574's driver makes it production.
-    #[cfg(all(test, unix))]
+    /// The region currently lent (the driver reads its granted height).
     pub(crate) fn area(&self) -> ratatui::layout::Rect {
         self.area.get()
     }
@@ -1643,12 +1650,13 @@ mod panel_window_remeasure_tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let window = PanelWindow::new(pipe_file(), Rect::new(0, 13, 100, 18), Some(tx));
         let presenter = std::thread::spawn(move || {
-            let PanelSignal::Remeasure(reply) = rx.recv().unwrap();
+            let PanelSignal::Remeasure { rows, reply } = rx.recv().unwrap();
+            assert_eq!(rows, Some(8), "the requested height reaches the presenter");
             reply.send(Rect::new(0, 4, 46, 8)).unwrap();
             // The drop is still the release once the panel is done.
             assert!(rx.recv().is_err(), "the window's drop must release");
         });
-        window.remeasure();
+        window.remeasure(Some(8));
         assert_eq!(window.area(), Rect::new(0, 4, 46, 8));
         drop(window);
         presenter.join().unwrap();
@@ -1658,13 +1666,13 @@ mod panel_window_remeasure_tests {
     fn with_nobody_answering_the_region_is_kept_not_stranded() {
         let area = Rect::new(0, 13, 100, 18);
         let unparked = PanelWindow::new(pipe_file(), area, None);
-        unparked.remeasure();
+        unparked.remeasure(None);
         assert_eq!(unparked.area(), area);
         // A presenter that hangs up without replying.
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let window = PanelWindow::new(pipe_file(), area, Some(tx));
         let presenter = std::thread::spawn(move || drop(rx.recv().unwrap()));
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(window.area(), area);
         presenter.join().unwrap();
     }

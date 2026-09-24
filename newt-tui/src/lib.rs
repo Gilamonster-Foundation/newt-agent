@@ -208,6 +208,8 @@ mod theme;
 // every panel, so a third panel cannot inherit a third copy of the event loop
 // `/psyche` and `/backends` were each carrying.
 #[cfg(feature = "rich-tui")]
+mod modal_size;
+#[cfg(feature = "rich-tui")]
 mod panel;
 // `/settings` as a chooser (slash_registry's `Disposition::Panel`), over the
 // same driver and the same chrome as /psyche and /backends. The typed form

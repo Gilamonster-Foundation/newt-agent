@@ -472,20 +472,20 @@ pub(crate) fn panel_live_resize_case() {
             assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
         };
         resize(12, 46);
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(
             window.area(),
             ratatui::layout::Rect::new(0, 4, 46, 8),
             "shrink"
         );
         resize(30, 100);
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(
             window.area(),
             ratatui::layout::Rect::new(0, 22, 100, 8),
             "grow"
         );
-        window.remeasure();
+        window.remeasure(None);
         assert_eq!(
             window.area(),
             ratatui::layout::Rect::new(0, 22, 100, 8),
