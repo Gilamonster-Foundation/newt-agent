@@ -509,11 +509,12 @@ fn none_execution_falls_back_to_text_classifier() {
 /// simulated string.** `read_file` never touches an `ExecOutcome` slot (only
 /// `run_command`/build paths do), so `tool_ok` falls back to
 /// `tool_result_ok`'s text classifier for every read. `authorized_read`'s
-/// ENOENT text is `"error reading {path}: {e}"` — note the missing colon
-/// after `error` — which does not match `tool_result_ok`'s `"error:"`
-/// prefix, so a real missing-file read ledgers `ok = true`. On the refactor
-/// run this blinded the repeat-call guard across four repeated reads of the
-/// same nonexistent path.
+/// ENOENT text now reads `"error: reading {path}: {e}"`, fixed to use the
+/// one `"error:"` convention `tool_result_ok` checks for (previously
+/// `"error reading {path}: {e}"` — a space, not a colon, after `error` —
+/// which did not match and let a real missing-file read ledger `ok = true`,
+/// blinding the repeat-call guard across four repeated reads of the same
+/// nonexistent path on a live refactor run).
 #[tokio::test]
 async fn a_real_read_file_enoent_dispatch_ledgers_as_ok() {
     use crate::agentic::NoMcp;
@@ -556,5 +557,65 @@ async fn a_real_read_file_enoent_dispatch_ledgers_as_ok() {
     assert!(
         !tool_ok(&out, None),
         "a real ENOENT read must not ledger ok=true: {out}"
+    );
+}
+
+/// **Mirror-bug regression: a successful read is not a failure just because
+/// its file content starts with the word "error".** Architect review of the
+/// finding-1 fix flagged that widening `tool_result_ok` to match a bare
+/// `"error "` prefix (tried first, then reverted) would misclassify a
+/// successful `read_file` whose *content* happens to start with `"error "`
+/// text. The fix instead corrected the producer sites to spell failures with
+/// the one `"error:"` convention, leaving the classifier strict — so a real
+/// successful read of file content starting with `"error handling..."` must
+/// still ledger `ok = true`.
+#[tokio::test]
+async fn a_real_read_file_success_with_error_prefixed_content_ledgers_as_ok() {
+    use crate::agentic::NoMcp;
+    use crate::caveats::{Caveats, CountBound, Scope};
+
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("notes.txt"),
+        "error handling is centralized in this module",
+    )
+    .unwrap();
+
+    let caveats = Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    };
+
+    let out = crate::agentic::tools::dispatch::execute_tool(
+        "read_file",
+        &serde_json::json!({"path": "notes.txt"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        tool_ok(&out, None),
+        "a successful read whose content starts with 'error ' must ledger ok=true: {out}"
     );
 }

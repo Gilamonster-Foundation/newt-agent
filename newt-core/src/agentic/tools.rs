@@ -591,7 +591,7 @@ fn object_bound_read(
         // error (the two matchers disagreeing); fail closed rather than read.
         None => Err(denied_fs_result(axis, path)),
         Some(None) => {
-            std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+            std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
         }
         Some(Some((root, rel))) => {
             let read = crate::fs_cap::WorkspaceDir::open_granted_file(
@@ -607,7 +607,7 @@ fn object_bound_read(
             match read {
                 Ok(s) => Ok(s),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
-                Err(e) => Err(format!("error reading {path}: {e}")),
+                Err(e) => Err(format!("error: reading {path}: {e}")),
             }
         }
     }
@@ -653,7 +653,7 @@ fn object_bound_read(
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<String, String> {
-    std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+    std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -672,7 +672,7 @@ fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), St
     if let Some(parent) = full.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(full, content).map_err(|e| format!("error writing {path}: {e}"))
+    std::fs::write(full, content).map_err(|e| format!("error: writing {path}: {e}"))
 }
 
 /// Object-bound write of `content` to `full` (the workspace-joined model path)
@@ -706,7 +706,7 @@ fn object_bound_write(
             match write {
                 Ok(()) => Ok(()),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
-                Err(e) => Err(format!("error writing {path}: {e}")),
+                Err(e) => Err(format!("error: writing {path}: {e}")),
             }
         }
     }
@@ -738,14 +738,16 @@ fn object_bound_delete(
 ) -> Result<(), String> {
     match object_bound_target(scope, full_str) {
         None => Err(denied_fs_result("fs_write", path)),
-        Some(None) => std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}")),
+        Some(None) => {
+            std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
+        }
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
                 .and_then(|dir| dir.unlink(&rel))
             {
                 Ok(()) => Ok(()),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
-                Err(e) => Err(format!("error deleting {path}: {e}")),
+                Err(e) => Err(format!("error: deleting {path}: {e}")),
             }
         }
     }
@@ -758,7 +760,7 @@ fn object_bound_delete(
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<(), String> {
-    std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}"))
+    std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
 }
 
 /// Whether `find`'s recursive-read root is contained to the WORKSPACE. Unlike
@@ -1535,7 +1537,7 @@ fn authorized_read(
     if scope_permits {
         object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
     } else {
-        std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
+        std::fs::read_to_string(&full).map_err(|e| format!("error: reading {path}: {e}"))
     }
 }
 
@@ -4361,12 +4363,12 @@ async fn execute_authorized_tool(
             let meta = match std::fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return format!("error deleting {path}: file does not exist");
+                    return format!("error: deleting {path}: file does not exist");
                 }
-                Err(e) => return format!("error deleting {path}: {e}"),
+                Err(e) => return format!("error: deleting {path}: {e}"),
             };
             if meta.file_type().is_dir() {
-                return format!("error deleting {path}: delete_file refuses directories");
+                return format!("error: deleting {path}: delete_file refuses directories");
             }
             let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
             let artifact_path_within = artifact_tracking
@@ -4397,7 +4399,7 @@ async fn execute_authorized_tool(
             let delete_result = if scope_permits {
                 object_bound_delete(&caveats.fs_write, path, &full, &full_str)
             } else {
-                std::fs::remove_file(&full).map_err(|e| format!("error deleting {path}: {e}"))
+                std::fs::remove_file(&full).map_err(|e| format!("error: deleting {path}: {e}"))
             };
             let receipt_after = file_capture::capture(&caveats.fs_read, &full);
             let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
@@ -4906,18 +4908,9 @@ async fn execute_authorized_tool(
 /// successful `run_command` whose *output* happens to start with one of
 /// these is misclassified; the recorded event is an outcome claim, not a
 /// gate.
-///
-/// #2553 review finding 1: `authorized_read`/`object_bound_write`/
-/// `object_bound_delete`'s fs-error text is `"error reading {path}: {e}"`
-/// (space, not colon, after `error`) — a near-miss of the `"error:"` prefix
-/// below, so a real ENOENT `read_file` ledgered `ok = true`. Matching the
-/// bare `"error "` word (not just `"error:"`) closes that family in this one
-/// place rather than editing every `format!` call site that spells a
-/// failure this way.
 pub(crate) fn tool_result_ok(result: &str) -> bool {
     let r = result.trim_start();
     !(r.starts_with("error:")
-        || r.starts_with("error ")
         || r.starts_with("capability denied:")
         || r.starts_with("unknown tool")
         || r.starts_with("no command configured"))

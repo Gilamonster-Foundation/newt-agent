@@ -1587,8 +1587,16 @@ async fn a_recovered_call_completes_with_a_derived_id_and_a_reshaped_turn() {
         assistant["content"], BARE,
         "the original text stays as evidence"
     );
-    let tool = messages.last().unwrap();
-    assert_eq!(tool["role"], "tool");
+    // A real ENOENT read now renders `"error: reading ..."` (the one
+    // `"error:"` convention, #2553 finding-1 follow-up), so it also matches
+    // the workflow-progress error fingerprint and a repair nudge follows the
+    // tool turn — find the tool message by role rather than assuming it is
+    // last; that nudge is not what this test is about.
+    let tool = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .expect("the recovered call's tool result");
     assert_eq!(
         tool["tool_call_id"], id,
         "the result answers the derived id"
