@@ -7,12 +7,12 @@
 //! cannot show a value the next request would not carry.
 
 use newt_core::agentic::ChatGenerationPreview;
-use newt_core::backend_probe::LlamaCppLaunch;
+use newt_core::backend_probe::{LaunchProbe, LlamaCppLaunch};
 use newt_core::metrics::fmt_count;
 use newt_core::model_card::ChatCompletionsCapability;
 use newt_core::role_profile::Cognition;
 
-use crate::context_window::{ContextWindow, WindowSource};
+use crate::context_window::{ContextWindow, LimitSource, WindowSource};
 
 pub(crate) struct Inference<'a> {
     pub(crate) model: &'a str,
@@ -30,9 +30,9 @@ pub(crate) struct Inference<'a> {
     /// Why a configured card is switched off, when it is.
     pub(crate) card_inactive: Option<String>,
     pub(crate) preview: ChatGenerationPreview,
-    pub(crate) launch: Option<&'a LlamaCppLaunch>,
-    /// Why there is no launch declaration, when there is none.
-    pub(crate) launch_note: &'a str,
+    /// What the launch-declaration probe found — a timeout or a refused key
+    /// is reported as such, never as "not a router".
+    pub(crate) launch: &'a LaunchProbe,
 }
 
 fn describe(source: WindowSource) -> &'static str {
@@ -90,25 +90,14 @@ pub(crate) fn gather(
         capability,
         decision.reasoning_replay_scope(),
     );
-    let launch = tokio::task::block_in_place(|| {
+    let launch = LaunchProbe::from_result(tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(3))
                 .build()?;
             newt_core::backend_probe::fetch_llamacpp_launch(&client, url, api_key, model).await
         })
-    });
-    let (launch, launch_note) = match launch {
-        Ok(Some(launch)) => (Some(launch), ""),
-        Ok(None) => (
-            None,
-            "the router declares no launch arguments for this model",
-        ),
-        Err(_) => (
-            None,
-            "not a llama.cpp router (no /models launch declaration)",
-        ),
-    };
+    }));
     lines(&Inference {
         model,
         backend: &choice.name,
@@ -123,9 +112,17 @@ pub(crate) fn gather(
         card: choice.capabilities.card(),
         card_inactive: crate::applicability_prose(decision.applicability()),
         preview,
-        launch: launch.as_ref(),
-        launch_note,
+        launch: &launch,
     })
+}
+
+fn limit_source(source: LimitSource) -> &'static str {
+    match source {
+        LimitSource::PercentOfWindow => "a percentage of the window",
+        LimitSource::Cached => "learned: capability cache",
+        LimitSource::ConfiguredWindow => "[[model_tuning]] context_window, used as-is",
+        LimitSource::SessionOverride => "/context size — this session's override",
+    }
 }
 
 fn row(label: &str, value: &str, from: &str) -> String {
@@ -157,22 +154,26 @@ pub(crate) fn lines(i: &Inference<'_>) -> Vec<String> {
             "a server rejection proved it",
         ));
     }
-    let ceiling_from = format!(
-        "{}% of the window · [context] input_ceiling_pct{}",
-        i.input_ceiling_pct,
-        if i.input_ceiling_pct_is_default {
-            " (default, #2565)"
-        } else {
-            ""
-        }
-    );
+    let ceiling_from = match w.safe_context_source {
+        Some(LimitSource::PercentOfWindow) => format!(
+            "{}% of the window · [context] input_ceiling_pct{}",
+            i.input_ceiling_pct,
+            if i.input_ceiling_pct_is_default {
+                " (default, #2565)"
+            } else {
+                ""
+            }
+        ),
+        Some(source) => limit_source(source).to_string(),
+        None => "no window to derive it from".to_string(),
+    };
     out.push(row("input ceiling", &count(w.safe_context), &ceiling_from));
-    if let Some(max_ok) = w.max_ok_input {
-        out.push(row(
-            "largest accepted",
-            &count(Some(max_ok)),
-            "learned: capability cache",
-        ));
+    if let (Some(max_ok), Some(source)) = (w.max_ok_input, w.max_ok_input_source) {
+        let label = match source {
+            LimitSource::SessionOverride => "input cap",
+            _ => "largest accepted",
+        };
+        out.push(row(label, &count(Some(max_ok)), limit_source(source)));
     }
     if let Some((used, budget)) = i.last_turn {
         let value = format!("{} / {}", fmt_count(u64::from(used)), count(budget));
@@ -221,7 +222,11 @@ fn thinking_rows(i: &Inference<'_>) -> Vec<String> {
         ),
     };
     let mut rows = vec![row("model thinking", &value, &why)];
-    if let Some(kwargs) = i.launch.and_then(|l| l.flag("--chat-template-kwargs")) {
+    let declared = match i.launch {
+        LaunchProbe::Declared(launch) => Some(launch),
+        _ => None,
+    };
+    if let Some(kwargs) = declared.and_then(|l| l.flag("--chat-template-kwargs")) {
         rows.push(row(
             "  server default",
             &key_values(kwargs),
@@ -263,9 +268,22 @@ fn key_values(json: &str) -> String {
 }
 
 fn launch_rows(i: &Inference<'_>) -> Vec<String> {
-    let Some(launch) = i.launch else {
-        return vec![row("server launch", "—", i.launch_note)];
+    let note = match i.launch {
+        LaunchProbe::Declared(launch) => return declared_rows(launch),
+        LaunchProbe::Absent => "the router declares no launch arguments for this model".to_string(),
+        LaunchProbe::Unsupported => {
+            "not a llama.cpp router (no /models launch declaration)".to_string()
+        }
+        LaunchProbe::Refused(status) => {
+            format!("probe refused: HTTP {status} — check the backend's credential")
+        }
+        LaunchProbe::TimedOut => "probe timed out (3 s) — the server may be busy".to_string(),
+        LaunchProbe::Failed(detail) => format!("probe failed: {detail}"),
     };
+    vec![row("server launch", "—", &note)]
+}
+
+fn declared_rows(launch: &LlamaCppLaunch) -> Vec<String> {
     let mut rows = vec![row("server launch", "", "router /models status.args")];
     let mut args = launch.args.iter().peekable();
     while let Some(arg) = args.next() {

@@ -129,3 +129,46 @@ fn the_ceiling_percentage_default_comes_from_config_not_a_literal() {
         newt_core::config::ContextConfig::default().input_ceiling_pct
     );
 }
+
+/// #2572 review: an override is not a percentage and not a measurement. The
+/// sources come from the one resolution, so the view cannot re-derive them.
+#[test]
+fn each_limit_carries_the_source_that_set_it() {
+    let served = WindowFacts {
+        served: Some(131_072),
+        cached_max_ok_input: Some(100_703),
+        ..facts(BackendKind::Openai)
+    };
+    let got = resolve(served);
+    assert_eq!(got.safe_context_source, Some(LimitSource::PercentOfWindow));
+    assert_eq!(got.max_ok_input_source, Some(LimitSource::Cached));
+    let overridden = resolve(WindowFacts {
+        context_size_override: Some(50_000),
+        ..served
+    });
+    assert_eq!(
+        (overridden.safe_context, overridden.safe_context_source),
+        (Some(50_000), Some(LimitSource::SessionOverride))
+    );
+    assert_eq!(
+        (overridden.max_ok_input, overridden.max_ok_input_source),
+        (Some(50_000), Some(LimitSource::SessionOverride))
+    );
+    let cached_only = resolve(WindowFacts {
+        cached_safe_context: Some(30_000),
+        ..facts(BackendKind::Openai)
+    });
+    assert_eq!(cached_only.safe_context_source, Some(LimitSource::Cached));
+    let configured = resolve(WindowFacts {
+        configured_window: Some(32_768),
+        ..facts(BackendKind::Ollama)
+    });
+    assert_eq!(
+        (configured.safe_context, configured.safe_context_source),
+        (Some(32_768), Some(LimitSource::ConfiguredWindow))
+    );
+    assert_eq!(
+        resolve(facts(BackendKind::Openai)).safe_context_source,
+        None
+    );
+}

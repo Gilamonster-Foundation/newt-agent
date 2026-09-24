@@ -209,3 +209,57 @@ fn launch_declaration_reads_args_and_preset_for_the_named_model() {
         parse_llamacpp_launch(&serde_json::json!({"data": [{"id": "bare"}]}), "bare").is_none()
     );
 }
+
+/// #2572 review: a launch probe's failure modes stay distinct, each against a
+/// real HTTP exchange (wiremock), so the Inference view never calls a timeout
+/// or a refused key "not a router".
+#[tokio::test]
+async fn launch_probe_distinguishes_absent_unsupported_refused_and_timed_out() {
+    use std::time::Duration;
+    let probe = |server: &MockServer, timeout: Duration| {
+        let url = server.uri();
+        async move {
+            let client = reqwest::Client::builder().timeout(timeout).build().unwrap();
+            LaunchProbe::from_result(fetch_llamacpp_launch(&client, &url, None, "m").await)
+        }
+    };
+    let long = Duration::from_secs(5);
+    let respond = |template: ResponseTemplate| async move {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    };
+    let declared = respond(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [
+        {"id": "m", "status": {"value": "loaded", "args": ["llama-server", "--ctx-size", "8192"]}}
+    ]})))
+    .await;
+    assert!(matches!(
+        probe(&declared, long).await,
+        LaunchProbe::Declared(_)
+    ));
+    let absent = respond(
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [{"id": "m"}]})),
+    )
+    .await;
+    assert_eq!(probe(&absent, long).await, LaunchProbe::Absent);
+    let missing = respond(ResponseTemplate::new(404)).await;
+    assert_eq!(probe(&missing, long).await, LaunchProbe::Unsupported);
+    let not_json = respond(ResponseTemplate::new(200).set_body_string("<html>")).await;
+    assert_eq!(probe(&not_json, long).await, LaunchProbe::Unsupported);
+    let refused = respond(ResponseTemplate::new(401)).await;
+    assert_eq!(probe(&refused, long).await, LaunchProbe::Refused(401));
+    let broken = respond(ResponseTemplate::new(500)).await;
+    assert_eq!(
+        probe(&broken, long).await,
+        LaunchProbe::Failed("HTTP 500".into())
+    );
+    let slow = respond(ResponseTemplate::new(200).set_delay(Duration::from_millis(500))).await;
+    assert_eq!(
+        probe(&slow, Duration::from_millis(50)).await,
+        LaunchProbe::TimedOut
+    );
+}

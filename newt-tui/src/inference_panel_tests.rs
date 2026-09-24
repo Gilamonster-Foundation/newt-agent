@@ -7,7 +7,9 @@ fn window() -> ContextWindow {
         window_source: Some(WindowSource::Served),
         recovered_hard_window: None,
         safe_context: Some(104_857),
+        safe_context_source: Some(crate::context_window::LimitSource::PercentOfWindow),
         max_ok_input: Some(100_703),
+        max_ok_input_source: Some(crate::context_window::LimitSource::Cached),
         num_ctx: Some(131_072),
     }
 }
@@ -20,7 +22,7 @@ fn thinking_capability() -> ChatCompletionsCapability {
     }
 }
 
-fn inference<'a>(launch: Option<&'a LlamaCppLaunch>) -> Inference<'a> {
+fn inference(launch: &LaunchProbe) -> Inference<'_> {
     Inference {
         model: "m-35b",
         backend: "lab-router",
@@ -41,7 +43,6 @@ fn inference<'a>(launch: Option<&'a LlamaCppLaunch>) -> Inference<'a> {
             output_allowance: None,
         },
         launch,
-        launch_note: "not a llama.cpp router",
     }
 }
 
@@ -57,7 +58,7 @@ fn the_row(lines: &[String], label: &str) -> String {
 /// not the window. The section shows both, and what each comes from.
 #[test]
 fn the_window_and_the_ceiling_are_separate_rows_with_their_sources() {
-    let lines = lines(&inference(None));
+    let lines = lines(&inference(&LaunchProbe::Unsupported));
     let window = the_row(&lines, "context window");
     assert!(
         window.contains("131,072") && window.contains("reported by the server"),
@@ -74,7 +75,10 @@ fn the_window_and_the_ceiling_are_separate_rows_with_their_sources() {
 
 #[test]
 fn thinking_on_says_what_is_sent_and_where_the_level_came_from() {
-    let row = the_row(&lines(&inference(None)), "model thinking");
+    let row = the_row(
+        &lines(&inference(&LaunchProbe::Unsupported)),
+        "model thinking",
+    );
     assert!(row.contains("ON"), "{row}");
     assert!(
         row.contains("enable_thinking=true") && row.contains("thoughtful (session override)"),
@@ -86,7 +90,7 @@ fn thinking_on_says_what_is_sent_and_where_the_level_came_from() {
 #[test]
 fn thinking_off_names_the_first_missing_link() {
     let off = |edit: &dyn Fn(&mut Inference<'_>)| {
-        let mut i = inference(None);
+        let mut i = inference(&LaunchProbe::Unsupported);
         i.preview.enable_thinking = None;
         edit(&mut i);
         the_row(&lines(&i), "model thinking")
@@ -116,7 +120,7 @@ fn the_server_launch_declaration_is_listed_flag_by_flag() {
         .to_vec(),
         preset: None,
     };
-    let lines = lines(&inference(Some(&launch)));
+    let lines = lines(&inference(&LaunchProbe::Declared(launch)));
     let default = the_row(&lines, "  server default");
     assert!(default.contains("enable_thinking=false"), "{default}");
     assert!(
@@ -129,5 +133,71 @@ fn the_server_launch_declaration_is_listed_flag_by_flag() {
 }
 
 fn lines_without_launch() -> Vec<String> {
-    lines(&inference(None))
+    lines(&inference(&LaunchProbe::Unsupported))
+}
+
+/// #2572 review: a `/context size` override is neither a percentage-derived
+/// ceiling nor a learned measurement. The rows read the source the resolver
+/// recorded (driven through `resolve`, not re-derived here).
+#[test]
+fn a_session_override_is_shown_as_the_override_it_is() {
+    use crate::context_window::{resolve, WindowFacts};
+    let facts = WindowFacts {
+        kind: newt_core::BackendKind::Openai,
+        served: Some(131_072),
+        cached_window: None,
+        cached_hard_window: None,
+        cached_safe_context: None,
+        cached_max_ok_input: Some(100_703),
+        configured_window: None,
+        community_window: None,
+        recovered_window: None,
+        input_ceiling_pct: 80,
+        configured_num_ctx: None,
+        context_size_override: Some(50_000),
+    };
+    let mut i = inference(&LaunchProbe::Unsupported);
+    i.window = resolve(facts);
+    let lines = lines(&i);
+    let ceiling = the_row(&lines, "input ceiling");
+    assert!(
+        ceiling.contains("50,000") && ceiling.contains("/context size"),
+        "{ceiling}"
+    );
+    assert!(
+        !ceiling.contains("% of the window"),
+        "an override is not a percentage: {ceiling}"
+    );
+    let cap = the_row(&lines, "input cap");
+    assert!(cap.contains("50,000") && cap.contains("override"), "{cap}");
+    assert!(
+        !lines.iter().any(|l| l.starts_with("largest accepted")),
+        "an override is not a learned measurement: {lines:#?}"
+    );
+}
+
+/// #2572 review: every probe outcome reads differently, and only
+/// `Unsupported` says "not a llama.cpp router".
+#[test]
+fn launch_probe_failures_are_not_reported_as_not_a_router() {
+    let note = |probe: LaunchProbe| the_row(&lines(&inference(&probe)), "server launch");
+    let cases = [
+        (LaunchProbe::Absent, "declares no launch arguments"),
+        (LaunchProbe::Unsupported, "not a llama.cpp router"),
+        (LaunchProbe::Refused(401), "HTTP 401"),
+        (LaunchProbe::TimedOut, "timed out"),
+        (
+            LaunchProbe::Failed("could not connect".into()),
+            "could not connect",
+        ),
+    ];
+    for (probe, says) in cases {
+        let row = note(probe.clone());
+        assert!(row.contains(says), "{probe:?}: {row}");
+        assert_eq!(
+            row.contains("not a llama.cpp router"),
+            probe == LaunchProbe::Unsupported,
+            "{probe:?}: {row}"
+        );
+    }
 }

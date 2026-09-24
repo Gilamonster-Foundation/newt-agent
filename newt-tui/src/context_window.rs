@@ -46,9 +46,25 @@ pub(crate) struct ContextWindow {
     /// The tightest window a server rejection has proven, if any.
     pub(crate) recovered_hard_window: Option<u32>,
     pub(crate) safe_context: Option<u32>,
+    /// Why `safe_context` has its value — the view says this, never guesses.
+    pub(crate) safe_context_source: Option<LimitSource>,
     pub(crate) max_ok_input: Option<u32>,
+    pub(crate) max_ok_input_source: Option<LimitSource>,
     /// What the loop hands core as the window.
     pub(crate) num_ctx: Option<u32>,
+}
+
+/// Where an input limit came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitSource {
+    /// `input_ceiling_pct` of a window.
+    PercentOfWindow,
+    /// The capability cache (learned from earlier requests).
+    Cached,
+    /// `[[model_tuning]] context_window`, used as-is.
+    ConfiguredWindow,
+    /// `/context size <N>` for this session.
+    SessionOverride,
 }
 
 /// The effective input ceiling percentage: `[context] input_ceiling_pct`, else
@@ -108,22 +124,38 @@ pub(crate) fn resolve(f: WindowFacts) -> ContextWindow {
     let recovered_hard_window =
         cap_context_window_by_recovery(f.recovered_window, f.cached_hard_window);
     let full_window = cap_context_window_by_recovery(requested_full_window, recovered_hard_window);
-    let ceiling = |w| newt_core::config::input_percentage_ceiling(w, f.input_ceiling_pct);
+    let ceiling = |w| {
+        (
+            newt_core::config::input_percentage_ceiling(w, f.input_ceiling_pct),
+            LimitSource::PercentOfWindow,
+        )
+    };
+    let cached = f.cached_safe_context.map(|n| (n, LimitSource::Cached));
     let safe_context = if f.kind == newt_core::BackendKind::Openai {
-        full_window.map(ceiling).or(f.cached_safe_context)
+        full_window.map(ceiling).or(cached)
     } else {
         recovered_hard_window
             .or(f.served)
             .map(ceiling)
-            .or(f.cached_safe_context)
-            .or(f.configured_window)
+            .or(cached)
+            .or(f
+                .configured_window
+                .map(|n| (n, LimitSource::ConfiguredWindow)))
     };
     // `/context size <N>` caps both the safe context and the max-ok guard; a
     // raise past the probed value is honored (the operator opted in).
     let (safe_context, max_ok_input) = match f.context_size_override {
-        Some(n) => (Some(n), Some(n)),
-        None => (safe_context, f.cached_max_ok_input),
+        Some(n) => (
+            Some((n, LimitSource::SessionOverride)),
+            Some((n, LimitSource::SessionOverride)),
+        ),
+        None => (
+            safe_context,
+            f.cached_max_ok_input.map(|n| (n, LimitSource::Cached)),
+        ),
     };
+    let (safe_context, safe_context_source) = safe_context.unzip();
+    let (max_ok_input, max_ok_input_source) = max_ok_input.unzip();
     let requested_num_ctx = f
         .configured_num_ctx
         .or_else(|| context_window_for_core(f.kind, full_window, safe_context));
@@ -132,7 +164,9 @@ pub(crate) fn resolve(f: WindowFacts) -> ContextWindow {
         window_source,
         recovered_hard_window,
         safe_context,
+        safe_context_source,
         max_ok_input,
+        max_ok_input_source,
         num_ctx: cap_context_window_by_recovery(requested_num_ctx, recovered_hard_window),
     }
 }

@@ -1198,6 +1198,51 @@ pub async fn fetch_llamacpp_launch(
     Ok(parse_llamacpp_launch(&response.json().await?, model))
 }
 
+/// What asking a server for a model's launch declaration found. A timeout or
+/// a refused credential is not "this is not a router" — the operator acts on
+/// the difference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchProbe {
+    /// The router declared how it launched the model.
+    Declared(LlamaCppLaunch),
+    /// The server answered `/models` but declares no launch arguments for it.
+    Absent,
+    /// The server has no router `/models` (404/405/501, or a body that is not
+    /// a model list): not a llama.cpp router.
+    Unsupported,
+    /// The server refused the credential (401/403).
+    Refused(u16),
+    /// No answer within the deadline.
+    TimedOut,
+    /// Could not connect, or another HTTP failure; the detail says which.
+    Failed(String),
+}
+
+impl LaunchProbe {
+    /// Classify [`fetch_llamacpp_launch`]'s outcome. Pure.
+    #[must_use]
+    pub fn from_result(result: anyhow::Result<Option<LlamaCppLaunch>>) -> Self {
+        let error = match result {
+            Ok(Some(launch)) => return Self::Declared(launch),
+            Ok(None) => return Self::Absent,
+            Err(error) => error,
+        };
+        if let Some(ProbeHttpStatus(status)) = error.downcast_ref::<ProbeHttpStatus>() {
+            return match status.as_u16() {
+                401 | 403 => Self::Refused(status.as_u16()),
+                404 | 405 | 501 => Self::Unsupported,
+                other => Self::Failed(format!("HTTP {other}")),
+            };
+        }
+        match error.downcast_ref::<reqwest::Error>() {
+            Some(e) if e.is_timeout() => Self::TimedOut,
+            Some(e) if e.is_decode() => Self::Unsupported,
+            Some(e) if e.is_connect() => Self::Failed("could not connect".to_string()),
+            _ => Self::Failed(error.to_string()),
+        }
+    }
+}
+
 /// Extract the warm subset using the same state parser as the model manager.
 pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String>> {
     Some(
