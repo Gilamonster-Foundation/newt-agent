@@ -108,6 +108,11 @@ fn session_fs_write_still_excludes_the_common_objects_directory() {
         &main,
         &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
     );
+    // Round 4: the per-dispatch write grant is bound to the identity cached
+    // at session start (`apply_cli_fs_grants` → `own_gitdir_grants`) — prime
+    // it the same way production does, or the widening below finds no cached
+    // identity and correctly grants nothing.
+    crate::git_hardening::own_gitdir_grants(&wt);
 
     let session = crate::caveats::Caveats {
         fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
@@ -146,6 +151,7 @@ fn default_branch_gets_no_shell_write_widening() {
     std::fs::write(root.path().join("seed"), "x").unwrap();
     real_git(root.path(), &["add", "seed"]);
     real_git(root.path(), &["commit", "-q", "-m", "init"]);
+    crate::git_hardening::own_gitdir_grants(root.path());
 
     let session = crate::caveats::Caveats {
         fs_write: crate::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
@@ -159,5 +165,132 @@ fn default_branch_gets_no_shell_write_widening() {
     assert_eq!(
         widened.fs_write, session.fs_write,
         "the default branch must get no shell-lane write widening"
+    );
+}
+
+/// PR #2577 round 4, Blocker 1(a): rewriting the workspace's `.git` gitlink
+/// after session start must NOT redirect the next `git` dispatch's write
+/// grant onto a different repository — that repo's `hooks/`/`config` become
+/// kernel-writable otherwise (hooks mean code execution the next time
+/// anyone runs git there). Confirmed red by temporarily reverting
+/// `own_gitdir_shell_write_grant` to call `own_gitdir_grants(workspace).write`
+/// directly (round 3's behavior): it followed the rewritten gitlink and
+/// returned the foreign repo's directories.
+#[test]
+fn rewriting_the_gitlink_after_session_start_grants_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    real_git(&main, &["init", "-q"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    let wt = root.path().join("wt");
+    real_git(
+        &main,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+    );
+    // Session start: prime the cache to the REAL identity.
+    crate::git_hardening::own_gitdir_grants(&wt);
+    assert!(
+        !crate::git_hardening::own_gitdir_shell_write_grant(&wt).is_empty(),
+        "sanity: the real identity must grant write before any tampering"
+    );
+
+    // A completely separate repository, also on a non-default branch.
+    let other = tempfile::tempdir().unwrap();
+    real_git(other.path(), &["init", "-q", "-b", "task"]);
+    std::fs::write(other.path().join("seed"), "y").unwrap();
+    real_git(other.path(), &["add", "seed"]);
+    real_git(other.path(), &["commit", "-q", "-m", "init"]);
+
+    // The model rewrites the gitlink (an ordinary file `write_file` can
+    // reach) to point at the OTHER repo's `.git`.
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", other.path().join(".git").display()),
+    )
+    .unwrap();
+
+    assert!(
+        crate::git_hardening::own_gitdir_shell_write_grant(&wt).is_empty(),
+        "a rewritten gitlink must grant nothing, not the foreign repo's directories"
+    );
+}
+
+/// PR #2577 round 4, Blocker 1(b): rewriting the worktree gitdir's
+/// `commondir` file after session start must NOT redirect the next `git`
+/// dispatch's write grant onto a different repository's `objects/`.
+#[test]
+fn rewriting_commondir_after_session_start_grants_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    real_git(&main, &["init", "-q"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    let wt = root.path().join("wt");
+    real_git(
+        &main,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+    );
+    crate::git_hardening::own_gitdir_grants(&wt);
+    assert!(!crate::git_hardening::own_gitdir_shell_write_grant(&wt).is_empty());
+
+    let other = tempfile::tempdir().unwrap();
+    real_git(other.path(), &["init", "-q", "-b", "task"]);
+    std::fs::write(other.path().join("seed"), "y").unwrap();
+    real_git(other.path(), &["add", "seed"]);
+    real_git(other.path(), &["commit", "-q", "-m", "init"]);
+
+    // `<worktree admin dir>/commondir` is INSIDE the granted write directory
+    // itself — a compound `git status; echo … > …/commondir` (leading
+    // program `git`) can reach it under the widened fence.
+    let admin_dir = main.join(".git/worktrees/wt");
+    std::fs::write(
+        admin_dir.join("commondir"),
+        format!("{}\n", other.path().join(".git").display()),
+    )
+    .unwrap();
+
+    let write = crate::git_hardening::own_gitdir_shell_write_grant(&wt);
+    assert!(
+        write.is_empty(),
+        "a rewritten commondir must grant nothing, not the other repo's objects/: {write:?}"
+    );
+}
+
+/// Discovered from the actual CI run of this PR: a Landlock-confined `git
+/// add` on a runner that ships `/etc/gitconfig` (this dev sandbox does not,
+/// which is why the kernel-confined test above passed here but failed in
+/// CI) fails with "unknown error occurred while reading the configuration
+/// files", exit 128 — real git always tries to read system config,
+/// regardless of repo/branch, and Landlock's base read allowlist does not
+/// include it. Deterministic (no dependency on whether `/etc/gitconfig`
+/// exists on the machine running this test): the widened `fs_read` must
+/// include it.
+#[test]
+fn git_shell_widening_grants_read_on_etc_gitconfig() {
+    let root = tempfile::tempdir().unwrap();
+    real_git(root.path(), &["init", "-q", "-b", "task"]);
+    std::fs::write(root.path().join("seed"), "x").unwrap();
+    real_git(root.path(), &["add", "seed"]);
+    real_git(root.path(), &["commit", "-q", "-m", "init"]);
+    crate::git_hardening::own_gitdir_grants(root.path());
+
+    let session = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
+        fs_write: crate::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
+        ..crate::caveats::Caveats::top()
+    };
+    let widened = super::shell::dispatch_caveats_for_git_shell(
+        "git add f.txt",
+        &root.path().to_string_lossy(),
+        &session,
+    );
+    assert!(
+        crate::caveats::permits_path(&widened.fs_read, "/etc/gitconfig"),
+        "the widened dispatch must grant read on /etc/gitconfig"
     );
 }

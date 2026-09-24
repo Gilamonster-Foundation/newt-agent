@@ -36,10 +36,12 @@
 //! `--no-textconv --no-ext-diff` in `args` (belt-and-suspenders on top of the
 //! `diff.external=` override).
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 /// Filesystem grants for the session workspace's **own** git metadata (F32,
 /// #2537): the extra read/write roots that let the model commit and move the
@@ -80,7 +82,15 @@ pub struct OwnGitGrant {
 /// possible from a directory-write grant on non-default branches — Shawn
 /// accepted that trade-off (see `RESULT-dec2-own-gitdir.md`).
 pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
-    let Some((common_dir, absolute_git_dir)) = git_dirs(workspace) else {
+    // PR #2577 round 4, Blocker 1: this is the SESSION-START call
+    // (`caveats::apply_cli_fs_grants`'s sole production caller runs before any
+    // model action). Prime the identity cache HERE, from this resolve, so a
+    // later per-dispatch re-check (`own_gitdir_shell_write_grant`) has a
+    // trustworthy answer to compare against instead of re-trusting whatever a
+    // (by-then possibly model-rewritten) `.git` gitlink / `commondir` says.
+    let resolved = git_dirs(workspace);
+    prime_identity_cache(workspace, resolved.clone());
+    let Some((common_dir, absolute_git_dir)) = resolved else {
         return OwnGitGrant::default();
     };
     let read = vec![
@@ -104,6 +114,72 @@ pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
         path_to_string(&common_dir.join("objects")),
     ];
     OwnGitGrant { read, write }
+}
+
+/// `(common_dir, absolute_git_dir)`.
+type GitDirPair = (PathBuf, PathBuf);
+
+/// The identity pair `own_gitdir_grants` resolved the ONE time it ran at
+/// session bootstrap, keyed by workspace. `None` for a workspace bootstrap
+/// never resolved (or resolved to "not a repo") is a distinct cache state
+/// from "not yet looked up" — both read back as `None` from
+/// [`cached_identity`], and both correctly deny the per-dispatch grant.
+fn identity_cache() -> &'static Mutex<HashMap<PathBuf, Option<GitDirPair>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<GitDirPair>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prime_identity_cache(workspace: &Path, resolved: Option<GitDirPair>) {
+    identity_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(workspace.to_path_buf(), resolved);
+}
+
+fn cached_identity(workspace: &Path) -> Option<GitDirPair> {
+    identity_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(workspace)
+        .cloned()
+        .flatten()
+}
+
+/// Per-dispatch write grant for the confined-shell `git` lane
+/// (`dispatch_caveats_for_git_shell`, PR #2577 round 3/4). Re-runs `rev-parse`
+/// on EVERY `git` dispatch, but the write grant is bound to the identity
+/// [`own_gitdir_grants`] cached at session start, not to whatever the fresh
+/// resolve says: the workspace's `.git` gitlink and the worktree gitdir's
+/// `commondir` file are both ordinary, model-writable files, so trusting a
+/// live re-resolve would let a rewritten pointer grant kernel write on an
+/// ENTIRELY DIFFERENT repository's `hooks/`/`config`/`objects` (Blocker 1) —
+/// hooks mean code execution the next time anyone runs git there. The fresh
+/// resolve is still run, but ONLY to CONFIRM it still equals the cached
+/// identity; any mismatch — or no cached identity at all (session bootstrap
+/// never ran, or resolved to "not a repo") — grants nothing. The branch check
+/// is re-read fresh every dispatch, same as before: that can only NARROW the
+/// grant (a default branch → nothing), never widen it, so re-reading it is
+/// safe in a way re-trusting the path resolve is not.
+pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
+    let Some((cached_common, cached_git_dir)) = cached_identity(workspace) else {
+        return Vec::new();
+    };
+    let Some((fresh_common, fresh_git_dir)) = git_dirs(workspace) else {
+        return Vec::new();
+    };
+    if fresh_common != cached_common || fresh_git_dir != cached_git_dir {
+        return Vec::new(); // re-pointed since session start — grant nothing
+    }
+    let Some(branch) = own_branch(workspace) else {
+        return Vec::new();
+    };
+    if is_default_branch(workspace, &branch) {
+        return Vec::new();
+    }
+    vec![
+        path_to_string(&cached_git_dir),
+        path_to_string(&cached_common.join("objects")),
+    ]
 }
 
 fn path_to_string(path: &Path) -> String {

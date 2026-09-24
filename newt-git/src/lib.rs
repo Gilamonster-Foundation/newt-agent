@@ -228,12 +228,24 @@ pub struct GitEngine {
 /// symbolic target (best-effort — an offline or remote-less repo just falls
 /// back to the hardcoded names, same as `newt_core::git_hardening::own_gitdir_grants`).
 ///
-/// `ref_already_exists` is `false` only for the very first commit on an unborn
-/// branch (the `git` tool's own `init` op always names the new branch `main`,
-/// #461's advertised "commit in a fresh, not-yet-a-repo workspace" flow) — F32
-/// protects an EXISTING default branch's history from being retargeted, not
-/// the act of creating one. Every subsequent commit/amend/rebase on that same
-/// branch passes `true` and is refused.
+/// `ref_already_exists` is `false` only for the ONE case the exemption exists
+/// for: a truly fresh repository with NO refs anywhere at all (see
+/// [`repository_has_no_refs`]) — the `git` tool's own `init` op always names
+/// the new branch `main`, #461's advertised "commit in a fresh,
+/// not-yet-a-repo workspace" flow. F32 protects an EXISTING default branch's
+/// history from being retargeted, not the act of creating one in a repo that
+/// has nothing yet.
+///
+/// PR #2577 round 4, Blocker 2: this used to be sourced from `HEAD`'s own
+/// `head_oid().is_some()` — "is THIS branch unborn" — which an (until this
+/// round unguarded) `branch-delete main` could flip back to `false` by
+/// deleting `main`'s only ref, reopening the exemption for a commit that
+/// creates a brand-new `main` as a root commit, discarding the deleted
+/// branch's history with the guard never firing. Every call site now derives
+/// `ref_already_exists` from `repository_has_no_refs`, which asks "does
+/// ANYTHING in this repo have a ref" rather than "does this ONE ref" — a
+/// `branch-delete main` next to a surviving `task` branch cannot reopen the
+/// exemption, because `task` still has a ref.
 fn refuse_if_default_branch(
     git_dir: &Path,
     branch_ref: &str,
@@ -261,6 +273,41 @@ fn refuse_if_default_branch(
         }
     }
     Ok(())
+}
+
+/// Does this repository have NO refs anywhere — no loose ref under
+/// `refs/heads` (recursively, since a branch name may contain `/`) and no
+/// `refs/heads/…` line in `packed-refs`? The narrow "creating the default
+/// branch is fine" exemption in [`refuse_if_default_branch`] is meant for
+/// exactly this state (a fresh `git init`), not for "this ONE branch happens
+/// to be unborn" — the latter is reachable by deleting an existing default
+/// branch's ref while sibling branches survive (Blocker 2).
+fn repository_has_no_refs(git_dir: &Path) -> bool {
+    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    if directory_has_any_file(&common.join("refs/heads")) {
+        return false;
+    }
+    match std::fs::read_to_string(common.join("packed-refs")) {
+        Ok(contents) => !contents.lines().any(|line| line.contains("refs/heads/")),
+        Err(_) => true, // no packed-refs file at all
+    }
+}
+
+fn directory_has_any_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if directory_has_any_file(&path) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
 }
 
 impl GitEngine {
@@ -613,7 +660,11 @@ impl GitEngine {
         let branch_ref = read_head(&self.repo.git_dir)?;
         let head_oid = self.head_oid()?;
         if let Some(branch_ref) = &branch_ref {
-            refuse_if_default_branch(&self.repo.git_dir, branch_ref, head_oid.is_some())?;
+            refuse_if_default_branch(
+                &self.repo.git_dir,
+                branch_ref,
+                !repository_has_no_refs(&self.repo.git_dir),
+            )?;
         }
         let index = self.repo.load_index()?;
         let tree = write_tree_from_index(&self.repo.odb, &index, "")?;
@@ -655,10 +706,15 @@ impl GitEngine {
             return Err(GitError::Denied("commit"));
         }
         let branch_ref = read_head(&self.repo.git_dir)?;
-        // Amend always rewrites an existing commit (the `head_oid` lookup
-        // below fails otherwise), so the ref unconditionally already exists.
+        // Amend always rewrites an existing commit, so `repository_has_no_refs`
+        // is unconditionally false here — computed via the shared helper
+        // anyway, for one source of truth (round 4).
         if let Some(branch_ref) = &branch_ref {
-            refuse_if_default_branch(&self.repo.git_dir, branch_ref, true)?;
+            refuse_if_default_branch(
+                &self.repo.git_dir,
+                branch_ref,
+                !repository_has_no_refs(&self.repo.git_dir),
+            )?;
         }
         let head = self
             .head_oid()?
@@ -800,9 +856,13 @@ impl GitEngine {
         }
         let head_ref = read_head(&self.repo.git_dir)?
             .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
-        // Rebase always replays onto existing history, so the branch ref
-        // unconditionally already exists.
-        refuse_if_default_branch(&self.repo.git_dir, &head_ref, true)?;
+        // Rebase always replays onto existing history — same shared helper
+        // as `commit`/`amend` (round 4), one source of truth.
+        refuse_if_default_branch(
+            &self.repo.git_dir,
+            &head_ref,
+            !repository_has_no_refs(&self.repo.git_dir),
+        )?;
         let old_head_tree = self.head_tree()?;
         let onto_oid = self.resolve_one(onto)?;
 
@@ -968,6 +1028,14 @@ impl GitEngine {
         if !caps.permits_ref(&refname) {
             return Err(GitError::Denied("refs"));
         }
+        // `write_ref` below has no existence check — this is an implicit
+        // force-move if `refname` already points elsewhere. Round 4, Blocker
+        // 2's audit: gate it the same way `commit`/`amend`/`rebase` are.
+        refuse_if_default_branch(
+            &self.repo.git_dir,
+            &refname,
+            !repository_has_no_refs(&self.repo.git_dir),
+        )?;
         let oid = self
             .head_oid()?
             .ok_or(GitError::Unsupported("cannot branch from an unborn HEAD"))?;
@@ -1000,6 +1068,15 @@ impl GitEngine {
         let (target, created) = match (existing, create) {
             (Some(oid), _) => (Some(oid), false),
             (None, true) => {
+                // Round 4, Blocker 2's audit: `checkout -b main` creating a
+                // FRESH `refs/heads/main` while the repository already has
+                // other refs is the same "retarget the default branch"
+                // shape the exemption exists to NOT cover.
+                refuse_if_default_branch(
+                    &self.repo.git_dir,
+                    &refname,
+                    !repository_has_no_refs(&self.repo.git_dir),
+                )?;
                 let oid = head.ok_or(GitError::Unsupported(
                     "cannot create a branch from an unborn HEAD",
                 ))?;
@@ -1063,6 +1140,13 @@ impl GitEngine {
         if resolve_ref(&self.repo.git_dir, &refname).is_err() {
             return Err(GitError::Refused(format!("branch '{name}' does not exist")));
         }
+        // Round 4, Blocker 2: deleting `refname` here means it just resolved
+        // above, so it unconditionally exists — `true`, always. This closes
+        // the bypass where `branch-delete main` (previously unguarded) made
+        // `main` unborn, reopening the OLD (per-ref) exemption for a commit
+        // that created a brand-new `main` as a root commit with the guard
+        // never firing.
+        refuse_if_default_branch(&self.repo.git_dir, &refname, true)?;
         delete_ref(&self.repo.git_dir, &refname)?;
         Ok(format!("deleted branch '{name}'"))
     }

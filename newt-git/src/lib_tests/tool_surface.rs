@@ -199,3 +199,70 @@ fn amend_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
         before
     );
 }
+
+/// PR #2577 round 4, Blocker 2 red test 1: `branch-delete main` from a
+/// session on `task` must be refused — `branch_delete` was unguarded before
+/// this round (it refused only the CURRENT branch), so this alone was a
+/// default-branch ref move the decision forbids.
+#[test]
+fn branch_delete_of_the_default_branch_is_refused() {
+    let dir = repo_with_commit(); // one commit on `main`
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
+    let t = tool(dir.path());
+    let err = t
+        .dispatch(
+            "branch-delete",
+            &serde_json::json!({"name": "main"}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
+        .unwrap_err();
+    assert!(err.contains("default branch"), "got: {err}");
+    assert!(
+        git_cmd(dir.path())
+            .args(["rev-parse", "--verify", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "refs/heads/main must survive the refused delete"
+    );
+}
+
+/// PR #2577 round 4, Blocker 2 red test 2: the bypass the fix closes. Delete
+/// `main` OUT OF BAND (real git, standing in for whatever else could remove
+/// it), point `HEAD` at the now-unborn `refs/heads/main`, and confirm a
+/// `git`-tool commit still refuses — the OLD per-ref "is THIS branch unborn"
+/// carve-out would have let this land as a brand-new root commit on `main`,
+/// discarding `task`'s history with the guard never firing. `task`'s ref
+/// surviving is exactly what `repository_has_no_refs` now checks for.
+#[test]
+fn commit_onto_a_deleted_and_recreated_default_branch_is_still_refused() {
+    let dir = repo_with_commit(); // one commit on `main`
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
+    git(dir.path(), &["branch", "-D", "main"]); // out of band — task survives
+                                                // Point HEAD at the now-unborn `main`, matching what `write_file HEAD`
+                                                // could do if the fence still granted it (it does not — see
+                                                // `caveats::apply_cli_fs_grants` — this is the engine-level backstop).
+    std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    let t = tool(dir.path());
+    let err = t
+        .dispatch(
+            "commit",
+            &serde_json::json!({"message": "should not land"}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
+        .unwrap_err();
+    assert!(err.contains("default branch"), "got: {err}");
+    assert!(
+        !git_cmd(dir.path())
+            .args(["rev-parse", "--verify", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "sanity: main really is gone before the refused commit"
+    );
+}
