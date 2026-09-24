@@ -43,9 +43,9 @@
 #   - `just audit` matches the "Security audit" job (cargo audit against the
 #     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit
 #     is absent — CI is the hard gate)
-#   - `just msrv` matches the "MSRV (Rust 1.88)" job (cargo +1.88 check
+#   - `just msrv` matches the MSRV job (cargo +<declared rust-version> check
 #     --all-targets, so dev-deps count too — #2161; local best-effort, needs
-#     rustup + the 1.88 toolchain — CI is the hard gate)
+#     rustup + the declared toolchain — CI is the hard gate)
 # PARITY EXCEPTION (#1098), deliberate and one-directional: on a push whose
 # every path is documentation, this hook runs `just docs-check` ALONE and skips
 # the cargo gates. CI still runs everything on every push, so the authoritative

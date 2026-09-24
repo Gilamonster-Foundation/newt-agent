@@ -84,6 +84,12 @@ exclude = ["newt-mesh", "newt-web"]
 # until 0.8.0 actually ships.
 version = "0.8.0"
 edition = "2021"
+# MSRV 1.88 -> 1.90 (2026-09-24, operator decision). tree-sitter 0.27 and
+# tree-sitter-tags 0.27 need 1.90 (the language-pack AST engine: outlines with
+# real spans instead of regexes). This workspace owes no compatibility promise
+# that would hold the floor down, so it moves when a dependency we want needs
+# it. Verified by `cargo +1.90 check --workspace --all-targets`.
+#
 # MSRV 1.75 -> 1.88. The old "1.75" was already STALE: the current lock needs
 # 1.88 (darling 0.23 + instability 0.3.12, pulled in by the ratatui/rich-tui
 # work) — CI hid it by building on stable, so the declared floor drifted from
@@ -92,7 +98,7 @@ edition = "2021"
 # time 0.3.x deps top out at 1.88) with no dep pins. The diffy 0.4 / rusqlite
 # 0.31 pins below were forced by the old 1.75 floor and MAY now be relaxed in a
 # separate follow-up; left as-is here to keep this change minimal.
-rust-version = "1.88"
+rust-version = "1.90"
 license = "Apache-2.0"
 repository = "https://github.com/hartsock/newt-agent"
 homepage = "https://github.com/hartsock/newt-agent"
@@ -196,13 +202,13 @@ ignore = "0.4"
 # `applier-diffy` feature (default applier stays the in-house fuzzy
 # parser). Pure-Rust, no C deps → preserves the PyO3 wheel story.
 # Pinned to 0.4 historically (diffy 0.5 raised MSRV to 1.85, above the old
-# 1.75 floor). Now that the floor is 1.88, 0.5 is allowed — relax in a
+# 1.75 floor). Now that the floor is 1.90, 0.5 is allowed — relax in a
 # follow-up if desired; kept at 0.4 here to avoid churning the lock.
 diffy = "0.4"
 
 # Embedded git engine (newt-git): grit-lib is a pure-Rust from-scratch git
 # reimplementation (MIT). It pulls icu_normalizer 2.2 (rustc 1.86) + time 0.3.x
-# (1.88) — the reason the workspace MSRV is 1.88. MIT only — never depend on the
+# (1.88) — the reason the floor was 1.88 before tree-sitter 0.27 raised it to 1.90. MIT only — never depend on the
 # sibling `grit-legacy` crate (GPL-2.0).
 grit-lib = "0.4"
 
@@ -219,7 +225,7 @@ grit-lib = "0.4"
 # stops shipping it.
 # Pinned to 0.31 historically: the newest rusqlite that compiled at the old
 # 1.75 floor (0.32+ used post-1.75 features; 0.40 pulls edition-2024 hashlink,
-# Cargo 1.85+). With the floor now 1.88 those are all allowed — relax in a
+# Cargo 1.85+). With the floor now 1.90 those are all allowed — relax in a
 # follow-up if desired; kept at 0.31 here to avoid churning the lock + the
 # bundled-SQLite/FTS5 story. Same minimal-change stance as diffy 0.4 above.
 rusqlite = { version = "0.31", features = ["bundled"] }
