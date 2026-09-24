@@ -102,7 +102,7 @@ async fn edit_file_denied_outside_fs_write_scope_and_missing_file() {
         None,
     )
     .await;
-    assert!(out.contains("error reading missing.txt"), "got: {out}");
+    assert!(out.contains("error: reading missing.txt"), "got: {out}");
 }
 
 #[tokio::test]
@@ -395,7 +395,7 @@ async fn read_file_denial_and_missing_file_errors() {
         None,
     )
     .await;
-    assert!(out.contains("error reading nope.txt"), "got: {out}");
+    assert!(out.contains("error: reading nope.txt"), "got: {out}");
 }
 
 #[tokio::test]

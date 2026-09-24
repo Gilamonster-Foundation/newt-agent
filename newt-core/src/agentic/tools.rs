@@ -591,7 +591,7 @@ fn object_bound_read(
         // error (the two matchers disagreeing); fail closed rather than read.
         None => Err(denied_fs_result(axis, path)),
         Some(None) => {
-            std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+            std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
         }
         Some(Some((root, rel))) => {
             let read = crate::fs_cap::WorkspaceDir::open_granted_file(
@@ -607,7 +607,7 @@ fn object_bound_read(
             match read {
                 Ok(s) => Ok(s),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
-                Err(e) => Err(format!("error reading {path}: {e}")),
+                Err(e) => Err(format!("error: reading {path}: {e}")),
             }
         }
     }
@@ -653,7 +653,7 @@ fn object_bound_read(
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<String, String> {
-    std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
+    std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -672,7 +672,7 @@ fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), St
     if let Some(parent) = full.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(full, content).map_err(|e| format!("error writing {path}: {e}"))
+    std::fs::write(full, content).map_err(|e| format!("error: writing {path}: {e}"))
 }
 
 /// Object-bound write of `content` to `full` (the workspace-joined model path)
@@ -706,7 +706,7 @@ fn object_bound_write(
             match write {
                 Ok(()) => Ok(()),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
-                Err(e) => Err(format!("error writing {path}: {e}")),
+                Err(e) => Err(format!("error: writing {path}: {e}")),
             }
         }
     }
@@ -738,14 +738,16 @@ fn object_bound_delete(
 ) -> Result<(), String> {
     match object_bound_target(scope, full_str) {
         None => Err(denied_fs_result("fs_write", path)),
-        Some(None) => std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}")),
+        Some(None) => {
+            std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
+        }
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
                 .and_then(|dir| dir.unlink(&rel))
             {
                 Ok(()) => Ok(()),
                 Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
-                Err(e) => Err(format!("error deleting {path}: {e}")),
+                Err(e) => Err(format!("error: deleting {path}: {e}")),
             }
         }
     }
@@ -758,7 +760,7 @@ fn object_bound_delete(
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<(), String> {
-    std::fs::remove_file(full).map_err(|e| format!("error deleting {path}: {e}"))
+    std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
 }
 
 /// Whether `find`'s recursive-read root is contained to the WORKSPACE. Unlike
@@ -1535,7 +1537,7 @@ fn authorized_read(
     if scope_permits {
         object_bound_read(&caveats.fs_read, "fs_read", path, &full, &full_str)
     } else {
-        std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
+        std::fs::read_to_string(&full).map_err(|e| format!("error: reading {path}: {e}"))
     }
 }
 
@@ -3015,8 +3017,14 @@ async fn execute_tool_inner(
         .await;
     };
     let harness = invocation.harness();
+    // Captured before `collab` is moved into the inner `execute_authorized_tool`
+    // call below (`Option<&OnceLock<_>>` is `Copy`, so this doesn't disturb it).
+    let execution = collab.execution;
     if let Err(error) = harness.validate_tool_authority(caveats, std::path::Path::new(workspace)) {
         invocation.host();
+        if let Some(slot) = execution {
+            let _ = slot.set(crate::ExecOutcome::Denied);
+        }
         return format!("Error: frame isolation: {error}");
     }
     let mut gate =
@@ -3049,6 +3057,9 @@ async fn execute_tool_inner(
     match gate.and_then(|gate| gate.refusal) {
         Some(error) => {
             invocation.host();
+            if let Some(slot) = execution {
+                let _ = slot.set(crate::ExecOutcome::Denied);
+            }
             format!("Error: frame isolation: permission denied: {error}")
         }
         None => result,
@@ -3363,9 +3374,15 @@ async fn execute_authorized_tool(
         "re_read" => match smart_harness {
             Some(harness) => match harness.read(args) {
                 Ok(text) => { invocation.expect("smart dispatch has a witness").retrieval(); text }
-                Err(error) => { invocation.expect("smart dispatch has a witness").host(); format!("Error: re_read refused: {error}") }
+                Err(error) => {
+                    invocation.expect("smart dispatch has a witness").host();
+                    executed((format!("Error: re_read refused: {error}"), crate::ExecOutcome::Denied))
+                }
             },
-            None => "Error: re_read is unavailable outside a smart harness session".to_string(),
+            None => executed((
+                "Error: re_read is unavailable outside a smart harness session".to_string(),
+                crate::ExecOutcome::Unavailable,
+            )),
         },
         "memory_fetch" => match memory_source {
             Some(source) => execute_memory_fetch(args, source, color, tool_output_lines),
@@ -3689,7 +3706,13 @@ async fn execute_authorized_tool(
         // `meet`-attenuated caveats. Same presence-gating as `git` (the `/team`
         // toggle) — without an injected impl the tools were never advertised.
         "crew" if smart_harness.is_some() =>
-            { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into() },
+            {
+                invocation.expect("smart dispatch has a witness").host();
+                executed((
+                    "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into(),
+                    crate::ExecOutcome::Unavailable,
+                ))
+            },
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
                 let out = match runner.dispatch(name, args, caveats).await {
@@ -4361,12 +4384,12 @@ async fn execute_authorized_tool(
             let meta = match std::fs::symlink_metadata(&full) {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return format!("error deleting {path}: file does not exist");
+                    return format!("error: deleting {path}: file does not exist");
                 }
-                Err(e) => return format!("error deleting {path}: {e}"),
+                Err(e) => return format!("error: deleting {path}: {e}"),
             };
             if meta.file_type().is_dir() {
-                return format!("error deleting {path}: delete_file refuses directories");
+                return format!("error: deleting {path}: delete_file refuses directories");
             }
             let artifact_tracking = artifact_sink.is_some() && artifact_context.is_some();
             let artifact_path_within = artifact_tracking
@@ -4397,7 +4420,7 @@ async fn execute_authorized_tool(
             let delete_result = if scope_permits {
                 object_bound_delete(&caveats.fs_write, path, &full, &full_str)
             } else {
-                std::fs::remove_file(&full).map_err(|e| format!("error deleting {path}: {e}"))
+                std::fs::remove_file(&full).map_err(|e| format!("error: deleting {path}: {e}"))
             };
             let receipt_after = file_capture::capture(&caveats.fs_read, &full);
             let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
@@ -4727,7 +4750,13 @@ async fn execute_authorized_tool(
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
         "find" if smart_harness.is_some() =>
-            { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string() },
+            {
+                invocation.expect("smart dispatch has a witness").host();
+                executed((
+                    "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
+                    crate::ExecOutcome::Unavailable,
+                ))
+            },
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
             let full = std::path::Path::new(workspace).join(path);

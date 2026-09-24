@@ -451,6 +451,104 @@ async fn real_shell_cannot_read_or_mutate_private_frame() {
     }
 }
 
+async fn dispatch_with_execution(
+    harness: &SmartHarness,
+    workspace: &Path,
+    caveats: &Caveats,
+    name: &str,
+    args: serde_json::Value,
+) -> (String, Option<crate::ExecOutcome>) {
+    let batch = harness.fixture_tool_batch(name, args.clone());
+    let invocation = batch.start(0, None).unwrap();
+    let mut display = super::super::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
+    let execution = std::sync::OnceLock::new();
+    let output = execute_tool_with_display_cancellable(
+        &mut display,
+        name,
+        &args,
+        workspace.to_str().unwrap(),
+        false,
+        20,
+        caveats,
+        &mut NoMcp,
+        ToolCollaborators {
+            invocation: Some(&invocation),
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (output, execution.get().copied())
+}
+
+/// #2561 review (a): a smart-harness refusal is a real failure, and must
+/// ledger `ok=false` via a RECORDED `ExecOutcome`, not by the text
+/// classifier matching `Error:` (capital E, which it never does —
+/// `http_smart_completion.rs:489` pins that the smart harness tells host
+/// from tool output by its witness, not by text).
+#[tokio::test]
+#[serial_test::serial]
+async fn smart_harness_refusals_ledger_as_failures() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = workspace.path().join(".newt/frame");
+    let (harness, _) = harness(&directory);
+    let marker = directory.join("marker");
+    std::fs::write(&marker, "frame contents").unwrap();
+    let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+
+    // frame isolation refusal (validate_tool_authority rejects the call)
+    let (output, execution) = dispatch_with_execution(
+        &harness,
+        workspace.path(),
+        &caveats,
+        "read_file",
+        serde_json::json!({"path":marker}),
+    )
+    .await;
+    assert!(output.contains("frame isolation"), "{output}");
+    assert!(
+        !tool_ok(&output, execution),
+        "frame isolation refusal must ledger ok=false: {output}"
+    );
+
+    // re_read refusal outside a smart harness session — re-run with no invocation.
+    let mut display = super::super::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
+    let execution2 = std::sync::OnceLock::new();
+    let output2 = execute_tool_with_display_cancellable(
+        &mut display,
+        "re_read",
+        &serde_json::json!({}),
+        workspace.path().to_str().unwrap(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        ToolCollaborators {
+            execution: Some(&execution2),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(output2.contains("re_read is unavailable"), "{output2}");
+    assert!(
+        !tool_ok(&output2, execution2.get().copied()),
+        "re_read-outside-smart-harness must ledger ok=false: {output2}"
+    );
+}
+
 struct UnconfinedDelegate(std::path::PathBuf);
 
 /// Grounds the find-adapter refusal in its real descriptor-discard boundary:
