@@ -1,4 +1,7 @@
 use super::*;
+use crate::context_window::{
+    cap_context_window_by_recovery, context_window_for_core, selected_model_context_window,
+};
 
 /// #2466: a `/model`/`/backend` switch must not leave the PREVIOUS model's
 /// gauge on screen — `gauge_for_cap_switch` is the pure rule the loop applies

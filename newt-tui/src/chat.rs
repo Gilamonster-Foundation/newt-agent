@@ -231,34 +231,6 @@ fn decorate_round_cap_reply(
 #[path = "chat_tests/origin_upgrade.rs"]
 mod origin_upgrade_tests;
 
-/// Preserve the unit boundary between a backend's full context window and an
-/// already-derived input cap. OpenAI-compatible loops need the former so core
-/// can reserve the active generation policy; Ollama keeps using the latter as
-/// its conservative `num_ctx` KV-allocation fallback.
-fn context_window_for_core(
-    kind: newt_core::BackendKind,
-    full_context_window: Option<u32>,
-    safe_context: Option<u32>,
-) -> Option<u32> {
-    match kind {
-        // Hosted APIs (OpenAI-compatible and Anthropic) get the full declared
-        // window: core reserves the active generation policy itself.
-        newt_core::BackendKind::Openai | newt_core::BackendKind::Anthropic => full_context_window,
-        newt_core::BackendKind::Ollama | newt_core::BackendKind::Embedded => safe_context,
-    }
-}
-
-/// Resolve the selected model's full window from strongest to weakest
-/// declaration. The caller performs the exact model lookup for configured and
-/// community profiles, so switching models naturally produces a new value.
-fn selected_model_context_window(
-    live: Option<u32>,
-    configured: Option<u32>,
-    community: Option<u32>,
-) -> Option<u32> {
-    live.or(configured).or(community)
-}
-
 /// The canonical [`probe::CapKey`] for the active serving principal — the ONE
 /// place the serving-default rule lives (three-Cs: the broken "key by bare
 /// model" call is unrepresentable once every site takes this key).
@@ -281,20 +253,6 @@ fn session_cap_id(
         backend_name,
         model,
     )
-}
-
-/// A numbered server rejection is an authoritative upper bound on later
-/// turns. It may tighten an explicit/session window but never raise a tighter
-/// operator choice. An ordinary discovered window is deliberately not passed
-/// here, so experimental raises remain possible until the server rejects one.
-fn cap_context_window_by_recovery(
-    requested: Option<u32>,
-    recovered_hard_window: Option<u32>,
-) -> Option<u32> {
-    match (requested, recovered_hard_window) {
-        (Some(requested), Some(recovered)) => Some(requested.min(recovered)),
-        (requested, recovered) => requested.or(recovered),
-    }
 }
 
 /// #2466: the gauge is per-model (window or ratchet), so it must not survive
@@ -2465,17 +2423,22 @@ fn session_body(
                 inf_kind,
                 inf_key.as_deref(),
             );
+        // The turn loop's own derivation (#2567), so the startup budget and
+        // the first turn cannot disagree about the window.
+        let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+            &cfg,
+            inf_kind,
+            &inf_model,
+            inf_context_window,
+            entry,
+            &community_tunings,
+            None,
+            None,
+        ))
+        .full_window;
         if updated {
             probe::save_cache(&cap_cache);
         }
-        let declared_window = selected_model_context_window(
-            inf_context_window,
-            cfg.find_model_tuning(&inf_model)
-                .and_then(|tuning| tuning.context_window),
-            community_tunings
-                .find(&inf_model)
-                .and_then(|profile| profile.context_window),
-        );
         probe::resolve_memory_budget(
             mem_cfg.context_tokens,
             declared_window,
@@ -6461,6 +6424,21 @@ fn session_body(
                             .ok()
                             .map(|c| c.display_model().to_string())
                             .unwrap_or_default();
+                        // #2567: the Inference section, resolved once with
+                        // the turn loop's own resolvers before the panel opens.
+                        let inference_rows = crate::inference_panel::gather(
+                            &cfg,
+                            &choice,
+                            &inf_model,
+                            &inf_url,
+                            inf_key.as_deref(),
+                            inf_context_window,
+                            &cap_cache.get(&cap_id).cloned().unwrap_or_default(),
+                            &community_tunings,
+                            recovered_context_windows.get(&cap_id).copied(),
+                            context_size_override,
+                            token_gauge,
+                        );
                         let mut initial_section = None;
                         loop {
                             let mut walked_to_permissions = false;
@@ -6482,6 +6460,7 @@ fn session_body(
                                 models.clone(),
                                 current_model.clone(),
                                 audit_rows,
+                                inference_rows.clone(),
                                 initial_section,
                                 window,
                             ) {
@@ -7716,29 +7695,17 @@ fn session_body(
                         cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens),
                     );
                     let eff_compaction_trigger_policy = compaction_trigger_policy(&cfg);
-                    let eff_input_ceiling_pct = newt_core::config::normalize_input_ceiling_pct(
-                        cfg.context
-                            .as_ref()
-                            .map(|c| c.input_ceiling_pct)
-                            .unwrap_or(80),
-                    );
+                    let eff_input_ceiling_pct = crate::context_window::input_ceiling_pct(&cfg);
 
                     // Lazy context-window discovery: /api/show is attempted at
                     // most ONCE per model per session — even when the fetch
                     // fails or the endpoint reports no context length, the
                     // `ctx_window_probed` negative cache prevents the
                     // every-turn refetch (Phase 20; `ensure_context_window`
-                    // alone only early-outs on success). Also reads the
-                    // empirically-confirmed max input (max_ok_input) used as
-                    // the pre-send budget gate (issue #223) and the learned
-                    // estimate-calibration ratio (Phase 20 §2.3).
-                    let (
-                        eff_context_window,
-                        eff_safe_context,
-                        eff_max_ok_input,
-                        eff_estimate_ratio,
-                        eff_recovered_hard_window,
-                    ) = {
+                    // alone only early-outs on success). The derivation itself
+                    // is `context_window::resolve`, shared with the startup
+                    // memory budget and the `/settings` Model section (#2567).
+                    let (context_window, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(cap_id.clone()).or_default();
                         // #1199: the server-declared window from session-start
                         // adopt (`inf_context_window`) is authoritative and
@@ -7758,66 +7725,25 @@ fn session_body(
                                 inf_kind,
                                 inf_key.as_deref(),
                             );
-                        let cached_sc = entry.safe_context;
-                        let cached_window = entry.context_window;
-                        let cached_hard_window = entry.hard_context_window;
-                        let moi = entry.max_ok_input;
+                        let facts = crate::context_window::facts_for(
+                            &cfg,
+                            inf_kind,
+                            &inf_model,
+                            inf_context_window,
+                            entry,
+                            &community_tunings,
+                            recovered_context_windows.get(&cap_id).copied(),
+                            context_size_override,
+                        );
                         let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        // Keep the full window separate from the derived input
-                        // cap. Chat Completions needs the former to reserve its
-                        // active maximum output; Ollama still uses the latter
-                        // as its conservative KV-allocation fallback.
-                        let requested_full_window = selected_model_context_window(
-                            inf_context_window.or(cached_window),
-                            model_tune.and_then(|t| t.context_window),
-                            community_tunings
-                                .find(&inf_model)
-                                .and_then(|profile| profile.context_window),
-                        );
-                        let recovered_hard_window = cap_context_window_by_recovery(
-                            recovered_context_windows.get(&cap_id).copied(),
-                            cached_hard_window,
-                        );
-                        let full_window = cap_context_window_by_recovery(
-                            requested_full_window,
-                            recovered_hard_window,
-                        );
-                        let sc = if inf_kind == newt_core::BackendKind::Openai {
-                            full_window
-                                .map(|window| {
-                                    newt_core::config::input_percentage_ceiling(
-                                        window,
-                                        eff_input_ceiling_pct,
-                                    )
-                                })
-                                .or(cached_sc)
-                        } else {
-                            recovered_hard_window
-                                .map(|window| {
-                                    newt_core::config::input_percentage_ceiling(
-                                        window,
-                                        eff_input_ceiling_pct,
-                                    )
-                                })
-                                .or_else(|| inf_context_window.map(|w| w * 80 / 100))
-                                .or(cached_sc)
-                                .or_else(|| model_tune.and_then(|t| t.context_window))
-                        };
-                        (full_window, sc, moi, ratio, recovered_hard_window)
+                        (crate::context_window::resolve(facts), ratio)
                     };
-
-                    // Apply the `/context size <N>` session override: it caps
-                    // both the safe-context budget and the max-ok-input guard to
-                    // the user's chosen ceiling. A raise past the probed value is
-                    // honored too — the user is explicitly opting into a larger
-                    // send window for experimentation.
-                    let (eff_safe_context, eff_max_ok_input) = match context_size_override {
-                        Some(n) => (Some(n), Some(n)),
-                        None => (eff_safe_context, eff_max_ok_input),
-                    };
+                    let eff_context_window = context_window.full_window;
+                    let eff_safe_context = context_window.safe_context;
+                    let eff_max_ok_input = context_window.max_ok_input;
 
                     // Memory providers keep their history but follow the
                     // currently selected model's budget. Rebinding every turn
@@ -7856,20 +7782,7 @@ fn session_body(
                         }
                     }
 
-                    // Context-window resolution: explicit num_ctx first. For
-                    // OpenAI, hand core the full window so its input percentage
-                    // and output reserve apply exactly once. For Ollama, retain
-                    // the safe-context fallback that caps KV allocation.
-                    let requested_num_ctx = model_tune
-                        .and_then(|t| t.num_ctx)
-                        .or_else(|| num_ctx(&cfg))
-                        .or_else(|| {
-                            context_window_for_core(inf_kind, eff_context_window, eff_safe_context)
-                        });
-                    let eff_num_ctx = cap_context_window_by_recovery(
-                        requested_num_ctx,
-                        eff_recovered_hard_window,
-                    );
+                    let eff_num_ctx = context_window.num_ctx;
 
                     // Build message list from memory manager. A fresh runtime
                     // block is prepended to the (frozen) system prompt EACH turn
