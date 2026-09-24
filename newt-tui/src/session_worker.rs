@@ -194,12 +194,14 @@ pub(crate) struct PanelWindow {
     area: std::cell::Cell<ratatui::layout::Rect>,
     /// The parked presenter's channel. Dropping it is the release; a
     /// [`PanelSignal::Remeasure`] asks for the region again. `None` only in
-    /// tests that build a window with nobody waiting on it.
+    /// tests that build a window with nobody waiting on it. Unix-only with its
+    /// one reader, the cockpit presenter — see [`Self::new`].
+    #[cfg(unix)]
     signals: Option<SyncSender<PanelSignal>>,
 }
 
 /// What a live panel can ask of the presenter parked on its window.
-#[cfg(feature = "rich-tui")]
+#[cfg(all(feature = "rich-tui", unix))]
 #[derive(Debug)]
 pub(crate) enum PanelSignal {
     /// The terminal resized: re-plan the reservation against the new screen,
@@ -237,9 +239,16 @@ impl PanelWindow {
         }
     }
 
+    /// Off unix there is no cockpit to lend a window (#1746), so nothing can
+    /// be parked on one and this is a no-op; it gains a body with the ConPTY
+    /// cockpit, exactly as [`Self::new`] does.
+    #[cfg(not(unix))]
+    pub(crate) fn remeasure(&self) {}
+
     /// Ask the presenter for the region again after a terminal resize. The
     /// presenter owns the layout, so it measures; the window only records the
     /// answer. With nobody parked (tests) or no answer, the region is kept.
+    #[cfg(unix)]
     pub(crate) fn remeasure(&self) {
         let Some(signals) = &self.signals else {
             return;
