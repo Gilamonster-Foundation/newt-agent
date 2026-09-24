@@ -1722,6 +1722,60 @@ async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
     );
 }
 
+/// F27 (r14a evidence): the twin hazard to the `| tail` case above — a
+/// trailing `; echo "EXIT: $?"` used to keep the whole command compound
+/// (SHELL_META), so it ran un-routed in the confined shell, where `$?`
+/// after `cargo check; echo "EXIT: $?"` is ALWAYS the shell's own exit
+/// code (0), never cargo's. Stripping the echo (routing.rs) lets the
+/// command route to the build lane instead, which reports cargo's REAL
+/// exit code — a failure must still render as a failure, never masked by
+/// the echo's synthetic success.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_failing_build_with_a_trailing_exit_echo_still_reports_the_real_failure() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_failing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo check 2>&1; echo \"EXIT: $?\"" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("error: command exited 1"),
+        "the build's real failure must survive, never masked by the shell's \
+         own $? (always 0 after `cmd; echo …$?…`): {out}"
+    );
+    assert!(
+        out.contains("routed") && out.contains("confined build lane"),
+        "must have been ROUTED (not run in the confined shell, where the \
+         trailing echo WOULD have kept it compound and masked the exit \
+         code): {out}"
+    );
+}
+
 /// The passing twin: a build that genuinely passes, piped to `head`, keeps
 /// its `Passed` outcome and the first N lines. See the failing test's doc
 /// comment for why `cargo`, not `just`.
