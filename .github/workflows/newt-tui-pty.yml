@@ -41,6 +41,13 @@ on:
       - "newt-tui/src/transcript_pager.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
+      - "newt-tui/src/panel.rs"
+      - "newt-tui/src/panel_raw_mode_pty_test.rs"
+      - "newt-tui/src/modal_size.rs"
+      - "newt-tui/src/inline_viewport.rs"
+      - "newt-tui/src/lines_panel.rs"
+      - "newt-tui/src/session_worker.rs"
+      - "newt-tui/src/interaction_view_pty_test.rs"
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
       - "tests/pty/**"
@@ -91,6 +98,14 @@ jobs:
       - name: Run transcript pager real-PTY tests
         run: |
           cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
+            -- --ignored --test-threads=1
+
+      # The panel driver on a real terminal with no cockpit (`panel::drive(..,
+      # None)`): raw-mode lifecycle on every exit path, and a panel beside a
+      # holder of the bottom rows. `#[ignore]`d, and nothing else ran them.
+      - name: Run panel raw-mode and row-holder real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui panel_raw_mode_pty_test \
             -- --ignored --test-threads=1
 
       # The cockpit owns fd 0/1 and the terminal's modes for a whole session,
