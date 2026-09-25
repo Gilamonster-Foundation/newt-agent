@@ -572,9 +572,10 @@ fn a_panel_body_survives_a_competing_bottom_anchored_viewport() {
 /// Drive `panel::drive(.., None)` beside a holder of the bottom 3 rows. The
 /// panel starts at 6 rows on a 24-row terminal. Ctrl-Z asks for the whole
 /// screen and Shift-Up for one more row; then, if `shrink_to` is set, the
-/// terminal shrinks to that many rows (`holder_follows`: the holder moves to
+/// terminal shrinks to that many rows (and the panel must then be the given
+/// height) (`holder_follows`: the holder moves to
 /// the new bottom first, as the rich prompt does) and Esc closes.
-fn drive_held(shrink_to: Option<u16>, holder_follows: bool) -> Held {
+fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool) -> Held {
     let pty = Pty::open();
     pty.resize(24, 80);
     let baseline = pty.termios_snapshot();
@@ -627,7 +628,7 @@ fn drive_held(shrink_to: Option<u16>, holder_follows: bool) -> Held {
             6,
         )?;
         step("Shift-Up grows one row", &|| pty.type_in("\x1b[1;2A"), 7)?;
-        if let Some(rows) = shrink_to {
+        if let Some((rows, panel_rows)) = shrink_to {
             step(
                 "the terminal shrinks",
                 &|| {
@@ -638,7 +639,7 @@ fn drive_held(shrink_to: Option<u16>, holder_follows: bool) -> Held {
                     }
                     signal_winch(child.id());
                 },
-                7,
+                panel_rows,
             )?;
         }
         transcript.push_str(&pty.screen());
@@ -711,13 +712,36 @@ fn a_panel_beside_a_row_holder_stays_open_at_its_granted_height() {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_panel_beside_a_row_holder_survives_a_terminal_shrink_that_still_fits() {
-    let held = drive_held(Some(10), true);
+    let held = drive_held(Some((10, 7)), true);
     assert!(held.result.is_ok(), "{:?}: {:?}", held.result, held.stream);
     assert!(
         held.stream.contains("HOLDER_MOVED:true"),
         "{:?}",
         held.stream
     );
+    assert!(
+        held.stream.contains("DRIVE_RESULT:Ok(false)"),
+        "drive did not return Ok: {:?}",
+        held.stream
+    );
+    assert!(
+        held.termios_restored,
+        "termios not restored: {:?}",
+        held.stream
+    );
+    assert!(held.exit_ok, "{:?}", held.stream);
+}
+
+/// A shrink that leaves fewer free rows above the holder than the panel had
+/// (24 → 8, holder on rows 5..7, so 5 free) degrades the panel to what fits.
+/// Before, `relet` found neither 7 rows nor the granted 7 and `drive` returned
+/// `Err("another surface already owns these rows")`, closing the panel.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_shrink_that_leaves_no_room_degrades_the_panel_instead_of_closing_it() {
+    let held = drive_held(Some((8, 5)), true);
+    assert!(held.result.is_ok(), "{:?}: {:?}", held.result, held.stream);
     assert!(
         held.stream.contains("DRIVE_RESULT:Ok(false)"),
         "drive did not return Ok: {:?}",

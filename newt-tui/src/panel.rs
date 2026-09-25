@@ -41,7 +41,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use newt_core::tty::raw_mode::RawModeGuard;
 
 use crate::inline_viewport::InlineTerm;
-use crate::modal_size::{ModalSize, SizeKey};
+use crate::modal_size::{ModalSize, SizeKey, MIN_ROWS};
 use crate::session_worker::PanelWindow;
 
 /// The component vocabulary is shared directly with NewtUI. Newt retains
@@ -143,21 +143,28 @@ pub(crate) fn make_terminal(height: u16) -> io::Result<InlineTerm> {
 }
 
 /// Lease `wanted` rows, or — when another surface holds what that needs —
-/// the `granted` rows the panel already had. The arbiter's refusal is the
-/// ownership rule: a panel never takes rows it was not lent, and an
-/// ungrantable size change keeps the panel open rather than closing it.
-/// Returns the terminal and the height it got. The lease-taker is injected so
-/// the rule is tested against a fake arbiter.
+/// the `granted` rows the panel already had, or, when a terminal shrink left
+/// fewer free rows than that, the most that fit, down to [`MIN_ROWS`]. The
+/// arbiter's refusal is the ownership rule: a panel never takes rows it was
+/// not lent, and an ungrantable size change degrades the panel rather than
+/// closing it. Only when not even `MIN_ROWS` is granted is the refusal an
+/// error. Returns the terminal and the height it got. The lease-taker is
+/// injected so the rule is tested against a fake arbiter.
 fn relet<T>(
     granted: u16,
     wanted: u16,
     mut lease: impl FnMut(u16) -> io::Result<T>,
 ) -> io::Result<(T, u16)> {
-    match lease(wanted) {
-        Ok(terminal) => Ok((terminal, wanted)),
-        Err(_) if wanted != granted => lease(granted).map(|terminal| (terminal, granted)),
-        Err(error) => Err(error),
+    let refused = match lease(wanted) {
+        Ok(terminal) => return Ok((terminal, wanted)),
+        Err(error) => error,
+    };
+    for rows in (MIN_ROWS..=granted).rev().filter(|rows| *rows != wanted) {
+        if let Ok(terminal) = lease(rows) {
+            return Ok((terminal, rows));
+        }
     }
+    Err(refused)
 }
 
 /// What the driver does with one terminal event.
@@ -324,9 +331,28 @@ mod tests {
             vec![10, 20, 8],
             "the fallback asks the arbiter too"
         );
+        // #2573 hardening: a shrink that leaves fewer free rows than the panel
+        // had degrades to what fits; it does not close the panel.
+        assert_eq!(
+            relet(20, 20, &mut arbiter).unwrap(),
+            (12, 12),
+            "degrades to the free rows"
+        );
+        let mut five_free = |rows: u16| {
+            if rows <= 5 {
+                Ok(rows)
+            } else {
+                Err(io::Error::other("another surface already owns these rows"))
+            }
+        };
+        assert_eq!(relet(7, 7, &mut five_free).unwrap(), (5, 5));
+        let mut none_free = |rows: u16| -> io::Result<u16> {
+            let _ = rows;
+            Err(io::Error::other("another surface already owns these rows"))
+        };
         assert!(
-            relet(20, 20, &mut arbiter).is_err(),
-            "nothing to fall back to"
+            relet(7, 7, &mut none_free).is_err(),
+            "not even MIN_ROWS fits: the only error"
         );
     }
 
