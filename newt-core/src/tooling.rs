@@ -182,18 +182,27 @@ pub fn builtin_tooling_packs() -> Vec<ToolingPack> {
         // Rust + PyO3 (maturin) — a compound toolchain: BOTH Cargo.toml AND
         // pyproject.toml. `require_all` supersedes the plain `rust` + `python`
         // packs so a PyO3 repo gets one coherent lifecycle, not three stacked.
+        //
+        // Rust-only on purpose. `maturin`, `ruff` and `pytest` need a venv
+        // the confined sandbox does not carry, so every phase that named them
+        // failed there, and `test` (`maturin develop && pytest -x`) never ran
+        // `cargo test` at all: a live ornith-35b refactor of newt-agent could
+        // not verify a single Rust change. A repo's own `[lifecycle]` would
+        // override this, but it is control-plane config and is stripped from
+        // an untrusted checkout, so this pack is what sessions actually get.
+        // The Python side stays an operator step (`maturin develop && pytest`).
         ToolingPack {
             name: "pyo3".into(),
             detect: vec!["Cargo.toml".into(), "pyproject.toml".into()],
             require_all: true,
             phases: PhaseCommands {
-                setup: some("maturin develop"),
-                format: some("cargo fmt && ruff format ."),
-                lint: some("cargo clippy --all-targets -- -D warnings && ruff check ."),
-                test: some("maturin develop && pytest -x"),
+                setup: some("cargo fetch"),
+                format: some("cargo fmt"),
+                lint: some("cargo clippy --all-targets -- -D warnings"),
+                test: some("cargo test"),
                 check: some(
                     "cargo fmt -- --check && cargo clippy --all-targets -- -D warnings \
-                     && maturin develop && cargo test && pytest -x",
+                     && cargo test",
                 ),
                 clean: some("cargo clean"),
             },
@@ -516,17 +525,30 @@ mod tests {
     #[test]
     fn pyo3_require_all_supersedes_rust_and_python() {
         // Rust + PyO3 (BOTH markers) → the `pyo3` pack ONLY, not rust + python
-        // stacked. One coherent format + one check (with `maturin develop`).
+        // stacked: one format, one check, and no python-pack `pytest`.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
         std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
         assert_eq!(
             phase_commands_from_packs(dir.path(), Phase::Format, &builtin_tooling_packs()),
-            vec!["cargo fmt && ruff format .".to_string()]
+            vec!["cargo fmt".to_string()]
         );
         let check = phase_commands_from_packs(dir.path(), Phase::Check, &builtin_tooling_packs());
         assert_eq!(check.len(), 1, "one coherent check, not three: {check:?}");
-        assert!(check[0].contains("maturin develop"), "{check:?}");
+        assert!(check[0].contains("cargo test"), "{check:?}");
+        // Every phase runs inside the sandbox, so none may need the venv tools
+        // it does not carry; and `test` must actually run the Rust tests.
+        for phase in Phase::ALL {
+            for cmd in phase_commands_from_packs(dir.path(), phase, &builtin_tooling_packs()) {
+                for tool in ["maturin", "ruff", "pytest"] {
+                    assert!(!cmd.contains(tool), "{phase:?} names {tool}: {cmd}");
+                }
+            }
+        }
+        assert_eq!(
+            phase_commands_from_packs(dir.path(), Phase::Test, &builtin_tooling_packs()),
+            vec!["cargo test".to_string()]
+        );
         // A pure-Rust repo still resolves just `rust`.
         let d2 = tempfile::tempdir().unwrap();
         std::fs::write(d2.path().join("Cargo.toml"), "").unwrap();
