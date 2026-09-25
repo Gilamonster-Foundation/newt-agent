@@ -15,6 +15,10 @@
 # check` (fmt + clippy + test + coverage floor). Pin it here so every future
 # `newt lifecycle <phase>` / crew normalize-before-commit run in this repo
 # uses that gate instead of the misdetected pyo3 pack.
+#
+# `[lifecycle]` is control-plane config, so it is stripped when this checkout
+# is untrusted (`config/layering.rs` CONTROL_PLANE_KEYS). Those sessions get
+# the built-in `pyo3` pack, which is now Rust-only (`cargo test`, no maturin).
 [lifecycle]
 setup = "just install-hooks"
 format = "just fmt"
