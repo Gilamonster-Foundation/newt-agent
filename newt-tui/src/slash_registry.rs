@@ -849,6 +849,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Journal,
     ),
+    cmd_on(
+        // The meta prefix (ctrl+space by default): a `/settings` field that
+        // was never a verb, like `compaction`. Journal, because the write
+        // goes through `apply_and_record`; it also persists to config.
+        "prefix",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
     cmd(
         // Absorbed as the form's first `Text` field in #2009 PR5, and
         // still a typed verb until the window closes.

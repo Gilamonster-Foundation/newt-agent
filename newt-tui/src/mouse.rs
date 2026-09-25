@@ -46,6 +46,13 @@ const ENABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
 /// Release, in reverse: disable SGR ext (`?1006l`) then button reporting
 /// (`?1000l`).
 const DISABLE_MOUSE_CAPTURE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+/// Drag-capable capture for a panel's border (herdr-style resize): adds
+/// `?1002h`, which reports motion ONLY while a button is held — no flood while
+/// the pointer idles, unlike `?1003h`. Scoped to an open panel.
+#[cfg(feature = "rich-tui")]
+const ENABLE_DRAG_CAPTURE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+#[cfg(feature = "rich-tui")]
+const DISABLE_DRAG_CAPTURE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// Tracks whether a `MouseCaptureGuard` is currently alive (capture physically
 /// on). Set ONLY by [`MouseCaptureGuard::enable`] and cleared ONLY by its
@@ -60,6 +67,10 @@ static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// asserts release via this handle, not the renderer's writer).
 pub(crate) enum MouseSink {
     Stdout,
+    /// The real terminal, when stdout is the cockpit's capture pty (a panel's
+    /// lent window). Panels are Rich-TUI only.
+    #[cfg(feature = "rich-tui")]
+    Tty(std::fs::File),
     #[cfg(test)]
     Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>),
 }
@@ -69,6 +80,12 @@ impl MouseSink {
         match self {
             Self::Stdout => {
                 let mut out = std::io::stdout();
+                let _ = out.write_all(bytes);
+                let _ = out.flush();
+            }
+            #[cfg(feature = "rich-tui")]
+            Self::Tty(file) => {
+                let mut out = file;
                 let _ = out.write_all(bytes);
                 let _ = out.flush();
             }
@@ -85,13 +102,29 @@ impl MouseSink {
 /// on normal return, `?`, and panic-unwind alike.
 pub(crate) struct MouseCaptureGuard {
     sink: MouseSink,
+    release: &'static [u8],
 }
 
 impl MouseCaptureGuard {
     pub(crate) fn enable(sink: MouseSink) -> Self {
         sink.emit(ENABLE_MOUSE_CAPTURE);
         CAPTURE_ACTIVE.store(true, Ordering::SeqCst);
-        Self { sink }
+        Self {
+            sink,
+            release: DISABLE_MOUSE_CAPTURE,
+        }
+    }
+
+    /// Drag-capable capture for as long as a panel is open, so its top border
+    /// can be dragged. Released by the same `Drop`, with the matching bytes.
+    #[cfg(feature = "rich-tui")]
+    pub(crate) fn enable_drag(sink: MouseSink) -> Self {
+        sink.emit(ENABLE_DRAG_CAPTURE);
+        CAPTURE_ACTIVE.store(true, Ordering::SeqCst);
+        Self {
+            sink,
+            release: DISABLE_DRAG_CAPTURE,
+        }
     }
 
     /// Turn-scoped stdout guard when `on` is true; `None` leaves the terminal
@@ -107,7 +140,7 @@ impl Drop for MouseCaptureGuard {
         // The single release point: fires on normal return, `?`, and while the
         // stack unwinds on a propagating panic. A caught/recovered panic does
         // NOT run this, so mid-turn recovery leaves capture (and the flag) on.
-        self.sink.emit(DISABLE_MOUSE_CAPTURE);
+        self.sink.emit(self.release);
         CAPTURE_ACTIVE.store(false, Ordering::SeqCst);
     }
 }

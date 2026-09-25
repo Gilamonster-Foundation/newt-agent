@@ -728,6 +728,9 @@ pub(crate) struct Presenter {
     chat_inactive: bool,
     dirty: bool,
     last_draw: Instant,
+    /// The meta prefix at the prompt (`ctrl+space` then a key), fed before the
+    /// editor sees a key — the same sequencer and table panels use.
+    meta: crate::prefix::Sequencer,
     /// Restores the terminal modes `open` took — raw mode, line wrap, bracketed
     /// paste, cursor visibility — on EVERY exit of the session: a clean return,
     /// an `io::Error` propagating out of `run`, or a panic (via Drop during
@@ -898,6 +901,7 @@ impl Presenter {
             was_suspended: false,
             chat_inactive: false,
             dirty: true,
+            meta: crate::prefix::Sequencer::new(crate::prefix::current()),
             last_draw: Instant::now(),
             _restore: restore,
             _raw: raw,
@@ -1389,6 +1393,7 @@ impl Presenter {
                 self.escape_during_turn();
                 Ok(())
             }
+            Event::Key(key) if key.kind == KeyEventKind::Press && self.meta_key(&key)? => Ok(()),
             other => {
                 let outcome = self.editor.on_event(other, &mut self.screen)?;
                 if let Some(outcome) = outcome {
@@ -1397,6 +1402,44 @@ impl Presenter {
                 Ok(())
             }
         }
+    }
+
+    /// The meta prefix at the prompt. `Ok(true)` when the key was the
+    /// prefix's (consumed); `Ok(false)` hands it to the editor — including a
+    /// doubled prefix, which is how the chord itself still reaches the editor.
+    fn meta_key(&mut self, key: &crossterm::event::KeyEvent) -> io::Result<bool> {
+        use crate::prefix::{MetaAction, Sequencer, Step, BINDINGS};
+        let prefix = crate::prefix::current();
+        if self.meta != Sequencer::new(prefix) && !self.meta.armed() {
+            self.meta = Sequencer::new(prefix);
+        }
+        let ctrl = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+        let note = match self
+            .meta
+            .feed(crate::panel::key_from_event(key.code, ctrl), &BINDINGS)
+        {
+            Step::Pass(_) => return Ok(false),
+            Step::Armed | Step::Cancelled => return Ok(true),
+            Step::Act(MetaAction::Redraw) => {
+                self.screen.term.clear()?;
+                self.draw()?;
+                return Ok(true);
+            }
+            Step::Act(MetaAction::Help) => format!(
+                "{}: {}  (zoom and resize act on an open panel)",
+                crate::prefix::chord_label(prefix),
+                BINDINGS.describe()
+            ),
+            Step::Act(action @ (MetaAction::Zoom | MetaAction::Resize)) => format!(
+                "{} acts on an open panel (e.g. /settings) — at the prompt: {} then ? for keys",
+                action.name(),
+                crate::prefix::chord_label(prefix)
+            ),
+        };
+        self.screen.insert_rows(vec![note.into_bytes()])?;
+        Ok(true)
     }
 
     /// The region lent to a panel: its reservation, or the whole screen for an

@@ -1181,10 +1181,14 @@ pub(crate) fn status_line(status: &str) -> Line<'static> {
 
 /// The dim key-hint bottom line — shared panel chrome (#1667).
 pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
-    // Every panel is run by `panel::drive`, which owns the modal sizing keys
-    // (`modal_size`), so every hint advertises them — one place, not eight.
+    // Every panel is run by `panel::drive`, which owns the sizing keys and the
+    // meta prefix (`panel_controls`), so every hint advertises them — one
+    // place, not eight.
     Line::from(Span::styled(
-        format!("{hint} · ⇧↑↓ size · ^z zoom"),
+        format!(
+            "{hint} · ⇧↑↓ size · {} ? keys",
+            crate::prefix::active_label()
+        ),
         crate::theme::style(crate::theme::Role::Dim),
     ))
 }
