@@ -312,6 +312,9 @@ pub struct GitProfile {
     pub author: SandboxAuthor,
     /// Where [`GitProfile::config`] came from, so `/settings` can show it.
     pub config_source: GitConfigSource,
+    /// How the harness signs the commits its own git tool writes
+    /// (`crate::commit_signing`).
+    pub signing: SigningMode,
     /// Plain git settings for sandbox git (`init.defaultBranch = "main"`). Only
     /// keys on `git_hardening`'s copyable list ever reach git.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -345,6 +348,33 @@ impl SandboxAuthor {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+/// Which key signs the commits the harness's own git tool writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SigningMode {
+    /// Unsigned.
+    #[default]
+    Off,
+    /// The harness key (`signing_key`), signed in-process.
+    Harness,
+    /// The operator's own git signing setup (`user.signingkey`, `gpg.format`).
+    Operator,
+}
+
+impl SigningMode {
+    /// Every value, for the `/settings` menu and setup.
+    pub const ALL: [Self; 3] = [Self::Off, Self::Harness, Self::Operator];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Harness => "harness",
             Self::Operator => "operator",
         }
     }
