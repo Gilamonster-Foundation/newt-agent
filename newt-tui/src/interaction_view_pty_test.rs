@@ -502,7 +502,7 @@ fn drive_cockpit_pager_sizes(sizes: &[(u16, u16)]) {
 /// (`ED`/`EL`) and scrolling at the bottom row. Approximation: cursor motion
 /// is absolute and there is no reflow, so a resize is not modelled: `rows` is
 /// the height to scroll at, and rows are not lost when the terminal shrinks.
-fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
+pub(crate) fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
     let mut grid: Vec<Vec<char>> = vec![Vec::new(); rows];
     let (mut row, mut col) = (0usize, 0usize);
     let mut chars = stream.chars().peekable();
