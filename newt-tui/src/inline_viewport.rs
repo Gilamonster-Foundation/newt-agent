@@ -285,8 +285,8 @@ impl<W: Write> Write for AnchoredBackend<W> {
 /// The terminal owns the lease, so the rows are returned on drop with no
 /// caller left to forget.
 pub(crate) fn inline_terminal(lease: newt_core::tty::RegionLease) -> io::Result<InlineTerm> {
-    let height = match lease.region() {
-        newt_core::tty::Region::Rows { height, .. } => height,
+    let (top, height) = match lease.region() {
+        newt_core::tty::Region::Rows { top, height } => (top, height),
         // A whole-screen holder is the alternate screen, not an inline strip.
         newt_core::tty::Region::WholeScreen => {
             return Err(io::Error::other(
@@ -294,8 +294,16 @@ pub(crate) fn inline_terminal(lease: newt_core::tty::RegionLease) -> io::Result<
             ))
         }
     };
+    let mut backend = AnchoredBackend::with_lease(PanelOut::Stdout(io::stdout()), Some(lease));
+    // Park the cursor on the lease's top row before ratatui looks at it. An
+    // inline viewport opens at the CURSOR (a terminal that answers the query
+    // reports it) and emits its opening newlines from there, so a cursor left
+    // anywhere else — the old panel's bottom row, or its old top when the
+    // panel grew — puts the viewport outside the rows this surface leased,
+    // scrolling a holder below it or erasing its first row on the next clear.
+    backend.set_cursor_position(Position { x: 0, y: top })?;
     Terminal::with_options(
-        AnchoredBackend::with_lease(PanelOut::Stdout(io::stdout()), Some(lease)),
+        backend,
         TerminalOptions {
             viewport: Viewport::Inline(height),
         },

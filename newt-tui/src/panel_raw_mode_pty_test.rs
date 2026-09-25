@@ -295,18 +295,25 @@ fn panel_raw_mode_child() {
                 newt_core::tty::OnCollision::Refuse,
             )
             .expect("the holder takes the bottom rows first");
-            let paint = |top: u16| {
+            let paint = |top: u16, park: u16| {
                 let mut out = std::io::stdout();
                 for r in 0..HOLDER_ROWS {
                     let _ = write!(out, "\x1b[{};1H{HOLDER_SENTINEL}-{r}", top + r + 1);
                 }
-                // Park the cursor at the top: a `println!` from row 24 would
-                // scroll the holder's rows up a line and blur what is measured.
-                let _ = write!(out, "\x1b[1;1H");
+                // Park the cursor (1-based `park`): a `println!` from row 24
+                // would scroll the holder's rows up a line and blur what is
+                // measured.
+                let _ = write!(out, "\x1b[{park};1H");
                 let _ = out.flush();
             };
             let (_, rows) = crossterm::terminal::size().expect("size");
-            paint(rows - HOLDER_ROWS);
+            // Where a real prompt leaves the cursor: the row a panel opens on,
+            // just above the holder. A terminal that answers the cursor query
+            // (`drive_held(.., true)`) places the panel here.
+            paint(
+                rows - HOLDER_ROWS,
+                rows - HOLDER_ROWS - PANEL_TEST_HEIGHT + 1,
+            );
             let holder = Arc::new(Mutex::new(holder));
             if std::env::var_os("NEWT_PANEL_HELD_MOVE").is_some() {
                 let holder = holder.clone();
@@ -324,12 +331,14 @@ fn panel_raw_mode_child() {
                         },
                         newt_core::tty::OnCollision::Refuse,
                     );
-                    paint(top);
+                    paint(top, 1);
                     println!("HOLDER_MOVED:{moved}");
                     return;
                 });
             }
-            println!("HOLDER_READY");
+            // No newline: it would move the cursor off the panel's row.
+            print!("HOLDER_READY");
+            std::io::stdout().flush().ok();
             let result = crate::panel::drive(&mut HeldPanel, PANEL_TEST_HEIGHT, None);
             // Say how `drive` ended, whichever way it did.
             println!(
@@ -578,7 +587,7 @@ fn a_panel_body_survives_a_competing_bottom_anchored_viewport() {
 /// terminal shrinks to that many rows (and the panel must then be the given
 /// height) (`holder_follows`: the holder moves to
 /// the new bottom first, as the rich prompt does) and Esc closes.
-fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool) -> Held {
+fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool, answer_dsr: bool) -> Held {
     let pty = Pty::open();
     pty.resize(24, 80);
     let baseline = pty.termios_snapshot();
@@ -598,22 +607,26 @@ fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool) -> Held {
     let mut child = command.spawn().expect("spawn the pty child");
     // The command still owns dups of the slave: drop them, or EOF never comes.
     drop(command);
-    let mut transcript = String::new();
     let panel_height = |repaint: &str| {
         let rows = screen_grid(repaint);
         let top = rows.iter().position(|row| row.contains('╭'));
         let bottom = rows.iter().rposition(|row| row.contains('╰'));
         top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
     };
+    let mut pump = Pump {
+        pty: &pty,
+        transcript: String::new(),
+        mark: 0,
+        answer_dsr,
+        rows: 24,
+    };
     let result = (|| -> Result<(), String> {
-        let mut step = |what: &str, act: &dyn Fn(), want: usize| -> Result<(), String> {
-            transcript.push_str(&pty.screen());
-            act();
-            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
+        let step = |pump: &mut Pump, what: &str, act: &dyn Fn(&mut Pump), want: usize| {
+            pump.mark();
+            act(pump);
+            let Some(repaint) = pump.until("╯") else {
                 return Err(format!("no repaint after: {what}"));
-            }
-            let repaint = pty.screen();
-            transcript.push_str(&repaint);
+            };
             match panel_height(&repaint) {
                 Some(height) if height == want => Ok(()),
                 other => Err(format!(
@@ -621,52 +634,114 @@ fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool) -> Held {
                 )),
             }
         };
-        if !pty.wait_for_screen_after("HOLDER_READY", "╯", REACH_TIMEOUT) {
+        if pump.until("HOLDER_READY").is_none() || pump.until("╯").is_none() {
             return Err("the panel never painted".into());
         }
-        // The DSR is unanswered on purpose: the panel anchors on its lease.
+        // With `answer_dsr` off the DSR is unanswered on purpose and the panel
+        // anchors on its lease; on, the parent answers it from where its own
+        // replay says the cursor is, as a real terminal does.
         step(
+            &mut pump,
             "Ctrl-Z is refused, the panel keeps its rows",
-            &|| pty.type_in("\x1a"),
+            &|_| pty.type_in("\x1a"),
             6,
         )?;
-        step("Shift-Up grows one row", &|| pty.type_in("\x1b[1;2A"), 7)?;
+        step(
+            &mut pump,
+            "Shift-Up grows one row",
+            &|_| pty.type_in("\x1b[1;2A"),
+            7,
+        )?;
         if let Some((rows, panel_rows)) = shrink_to {
+            pump.rows = usize::from(rows);
             step(
+                &mut pump,
                 "the terminal shrinks",
-                &|| {
+                &|pump| {
                     pty.resize(rows, 80);
                     if holder_follows {
                         // The holder moves first; only then does the panel hear.
-                        assert!(pty.wait_for_screen("HOLDER_MOVED:true", REACH_TIMEOUT));
+                        assert!(pump.until("HOLDER_MOVED:true").is_some());
                     }
                     signal_winch(child.id());
                 },
                 panel_rows,
             )?;
         }
-        transcript.push_str(&pty.screen());
+        pump.mark();
         pty.type_in("\x1b");
-        if !pty.wait_for_screen("HOLDER_STILL_HOLDS", REACH_TIMEOUT) {
+        if pump.until("HOLDER_STILL_HOLDS").is_none() {
             return Err("Esc did not close the panel".into());
         }
         Ok(())
     })();
     // `drive` has returned by now, one way or another; the child says how.
-    let returned = pty.wait_for_screen("HOLDER_STILL_HOLDS", Duration::from_secs(10));
+    let returned = result.is_ok() || pump.until("HOLDER_STILL_HOLDS").is_some();
     let termios_restored = returned && pty.termios_snapshot() == baseline;
-    transcript.push_str(&pty.screen());
+    pump.pump();
     pty.type_in("\n");
     if result.is_err() {
         let _ = child.kill();
     }
     let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    let mut transcript = pump.transcript;
     transcript.push_str(&pty.screen_when_finished(status.is_some()));
     Held {
         result,
         stream: transcript,
         termios_restored,
         exit_ok: status.is_some_and(|status| status.success()),
+    }
+}
+
+/// Drains the child's output into one transcript, and (when `answer_dsr`)
+/// answers each cursor-position query from a replay of that transcript.
+struct Pump<'a> {
+    pty: &'a Pty,
+    transcript: String,
+    /// Where the current step's bytes start in `transcript`.
+    mark: usize,
+    answer_dsr: bool,
+    /// The screen height the replay scrolls at.
+    rows: usize,
+}
+
+impl Pump<'_> {
+    fn pump(&mut self) {
+        let chunk = self.pty.screen();
+        for (at, _) in chunk.match_indices("\x1b[6n") {
+            if self.answer_dsr {
+                let seen = format!("{}{}", self.transcript, &chunk[..at]);
+                let (_, (row, col)) =
+                    crate::interaction_view_pty_test::erasing_screen(&seen, self.rows);
+                self.pty.type_in(&format!("\x1b[{};{}R", row + 1, col + 1));
+            }
+        }
+        self.transcript.push_str(&chunk);
+    }
+
+    fn mark(&mut self) {
+        self.pump();
+        self.mark = self.transcript.len();
+    }
+
+    /// Pump until `needle` appears in what arrived since the last `mark`, and
+    /// return that text. The mark then moves past it.
+    fn until(&mut self, needle: &str) -> Option<String> {
+        let deadline = Instant::now() + REACH_TIMEOUT;
+        loop {
+            self.pump();
+            if let Some(at) = self.transcript[self.mark..].find(needle) {
+                let end = self.mark + at + needle.len();
+                let text = self.transcript[self.mark..end].to_string();
+                self.mark = end;
+                return Some(text);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -706,7 +781,7 @@ fn assert_holder_untouched(held: &Held, rows: usize, top: usize) {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_panel_beside_a_row_holder_stays_open_at_its_granted_height() {
-    let held = drive_held(None, false);
+    let held = drive_held(None, false, false);
     assert!(held.result.is_ok(), "{:?}: {:?}", held.result, held.stream);
     assert!(
         held.stream.contains("DRIVE_RESULT:Ok(false)"),
@@ -729,7 +804,7 @@ fn a_panel_beside_a_row_holder_stays_open_at_its_granted_height() {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_panel_beside_a_row_holder_survives_a_terminal_shrink_that_still_fits() {
-    let held = drive_held(Some((10, 7)), true);
+    let held = drive_held(Some((10, 7)), true, false);
     assert!(held.result.is_ok(), "{:?}: {:?}", held.result, held.stream);
     assert!(
         held.stream.contains("HOLDER_MOVED:true"),
@@ -757,7 +832,7 @@ fn a_panel_beside_a_row_holder_survives_a_terminal_shrink_that_still_fits() {
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_shrink_that_leaves_no_room_degrades_the_panel_instead_of_closing_it() {
-    let held = drive_held(Some((8, 5)), true);
+    let held = drive_held(Some((8, 5)), true, false);
     assert!(held.result.is_ok(), "{:?}: {:?}", held.result, held.stream);
     assert!(
         held.stream.contains("DRIVE_RESULT:Ok(false)"),
@@ -770,4 +845,24 @@ fn a_shrink_that_leaves_no_room_degrades_the_panel_instead_of_closing_it() {
         held.stream
     );
     assert!(held.exit_ok, "{:?}", held.stream);
+}
+
+/// #2591 review: a terminal that ANSWERS the cursor query (production shape)
+/// places a fresh inline viewport at the cursor. Growing the panel one row
+/// (Shift-Up) rebuilds it; with the cursor parked at the OLD top the 7-row
+/// viewport landed one row low and its clear erased the holder's first row.
+/// The park is on the new lease's top, so the holder's rows survive.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_grow_beside_a_holder_leaves_its_rows_when_the_terminal_answers_the_cursor_query() {
+    let held = drive_held(None, false, true);
+    assert!(held.result.is_ok(), "{:?}: {:?}", held.result, held.stream);
+    assert!(
+        held.stream.contains("DRIVE_RESULT:Ok(false)"),
+        "drive did not return Ok: {:?}",
+        held.stream
+    );
+    assert!(held.stream.contains("\x1b[6n"), "control: the panel asked");
+    assert_holder_untouched(&held, 24, 21);
 }

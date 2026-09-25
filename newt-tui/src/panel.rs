@@ -341,14 +341,7 @@ pub(crate) fn drive(
                             window.terminal()?
                         }
                         None => {
-                            let area = terminal.get_frame().area();
-                            let granted = area.height;
-                            // A fresh inline viewport opens by emitting
-                            // newlines from the CURSOR. Left at the panel's
-                            // bottom row, those scroll the screen and drag a
-                            // holder's rows up under the next clear. Park it
-                            // on the panel's top row first.
-                            terminal.set_cursor_position((0, area.y))?;
+                            let granted = terminal.get_frame().area().height;
                             // Release the old lease first: under
                             // `OnCollision::Shift` a new one taken while it is
                             // held would be minted ABOVE it.

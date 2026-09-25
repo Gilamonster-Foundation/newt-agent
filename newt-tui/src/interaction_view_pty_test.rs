@@ -503,6 +503,12 @@ fn drive_cockpit_pager_sizes(sizes: &[(u16, u16)]) {
 /// is absolute and there is no reflow, so a resize is not modelled: `rows` is
 /// the height to scroll at, and rows are not lost when the terminal shrinks.
 pub(crate) fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
+    erasing_screen(stream, rows).0
+}
+
+/// [`erasing_grid`] plus where the cursor is (0-based row, column): what a
+/// terminal would answer to a cursor-position query at the end of `stream`.
+pub(crate) fn erasing_screen(stream: &str, rows: usize) -> (Vec<String>, (usize, usize)) {
     let mut grid: Vec<Vec<char>> = vec![Vec::new(); rows];
     let (mut row, mut col) = (0usize, 0usize);
     let mut chars = stream.chars().peekable();
@@ -579,9 +585,11 @@ pub(crate) fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
             _ => {}
         }
     }
-    grid.into_iter()
+    let lines = grid
+        .into_iter()
         .map(|l| l.into_iter().collect::<String>().trim_end().to_string())
-        .collect()
+        .collect();
+    (lines, (row, col))
 }
 
 /// #2573 review: drive a real panel through resizes and keys, then close it.
