@@ -10,13 +10,21 @@ const MAX_ENTRIES: usize = 64;
 const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 1024 * 1024;
 
+/// Its reader half (`id`, `dropped_lines`, the accessors, and the archive's
+/// `get`/`latest`) serves the Rich-TUI transcript pager and `/spill`. A
+/// `live-spill` build without `rich-tui` still archives spills but compiles no
+/// reader, so that half is unread there — the same shape, and the same
+/// attribute, as `mod transcript_pager` in lib.rs.
 #[derive(Clone, Debug)]
 pub(crate) struct CompletedSpill {
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
     id: u64,
     lines: Arc<[String]>,
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
     dropped_lines: usize,
 }
 
+#[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
 impl CompletedSpill {
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -119,6 +127,7 @@ impl CompletedSpillArchive {
         id
     }
 
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
     pub(crate) fn get(&self, id: u64) -> Option<CompletedSpill> {
         self.state
             .lock()
@@ -151,6 +160,7 @@ impl CompletedSpillArchive {
             .collect()
     }
 
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
     pub(crate) fn latest(&self) -> Option<CompletedSpill> {
         self.state
             .lock()
