@@ -69,6 +69,10 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
     // No commit yet → drain is zero (a bare `HEAD` move from init does NOT
     // count as a contributor-consuming commit).
     assert_eq!(t.drain_commit_success(), 0);
+    // Off `main` before the second mutation (`amend`): the first commit on
+    // an unborn branch is exempt from `refuse_if_default_branch` (F32/#2537),
+    // but a subsequent amend on that now-existing ref is not.
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
     std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
     t.dispatch(
         "add",
@@ -152,6 +156,9 @@ fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
         &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
+    // Off `main` before C2/C3: only the very first commit on an unborn
+    // branch is exempt from `refuse_if_default_branch` (F32/#2537).
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
 
     // C1: credits model-a (contributor) + qwen3:30b (active).
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();

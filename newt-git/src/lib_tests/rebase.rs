@@ -6,7 +6,7 @@ use super::*;
 fn repo_with_three() -> (tempfile::TempDir, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    git(p, &["init", "-q", "-b", "main"]);
+    git(p, &["init", "-q", "-b", "agent-work"]);
     let mk = |name: &str, content: &str, msg: &str| {
         std::fs::write(p.join(name), content).unwrap();
         git(p, &["add", name]);
@@ -245,7 +245,7 @@ fn rebase_refuses_on_a_dirty_tree() {
 fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    git(p, &["init", "-q", "-b", "main"]);
+    git(p, &["init", "-q", "-b", "agent-work"]);
     std::fs::write(p.join(".gitignore"), "x.env\n").unwrap();
     std::fs::write(p.join("a.txt"), "v1\n").unwrap();
     git(p, &["add", ".gitignore", "a.txt"]);
@@ -412,7 +412,7 @@ fn rebase_aborts_on_conflict_leaving_the_branch_unchanged() {
     // (both c1 and c3 changed a.txt from c2's base).
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    git(p, &["init", "-q", "-b", "main"]);
+    git(p, &["init", "-q", "-b", "agent-work"]);
     let mk = |content: &str, msg: &str| {
         std::fs::write(p.join("a.txt"), content).unwrap();
         git(p, &["add", "a.txt"]);

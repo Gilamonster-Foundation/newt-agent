@@ -216,6 +216,100 @@ pub struct GitEngine {
     repo: Repository,
 }
 
+/// Refuse a ref-move onto the repository's default branch (F32/#2537: newt may
+/// never move `main`/`master`/the remote's default, whatever a caller's
+/// filesystem grants are). The ONE checkpoint every mutating op that advances a
+/// branch ref (`commit`, `amend`, `rebase`) routes through, so the guard cannot
+/// be bypassed by reaching one of them through a different path.
+///
+/// `branch_ref` is the target ref a caller is about to rewrite (`refs/heads/…`,
+/// as returned by [`read_head`]). Anything other than `refs/heads/main` or
+/// `refs/heads/master` also checks the shared repo's `refs/remotes/origin/HEAD`
+/// symbolic target (best-effort — an offline or remote-less repo just falls
+/// back to the hardcoded names, same as `newt_core::git_hardening::own_gitdir_grants`).
+///
+/// `ref_already_exists` is `false` only for the ONE case the exemption exists
+/// for: a truly fresh repository with NO refs anywhere at all (see
+/// [`repository_has_no_refs`]) — the `git` tool's own `init` op always names
+/// the new branch `main`, #461's advertised "commit in a fresh,
+/// not-yet-a-repo workspace" flow. F32 protects an EXISTING default branch's
+/// history from being retargeted, not the act of creating one in a repo that
+/// has nothing yet.
+///
+/// PR #2577 round 4, Blocker 2: this used to be sourced from `HEAD`'s own
+/// `head_oid().is_some()` — "is THIS branch unborn" — which an (until this
+/// round unguarded) `branch-delete main` could flip back to `false` by
+/// deleting `main`'s only ref, reopening the exemption for a commit that
+/// creates a brand-new `main` as a root commit, discarding the deleted
+/// branch's history with the guard never firing. Every call site now derives
+/// `ref_already_exists` from `repository_has_no_refs`, which asks "does
+/// ANYTHING in this repo have a ref" rather than "does this ONE ref" — a
+/// `branch-delete main` next to a surviving `task` branch cannot reopen the
+/// exemption, because `task` still has a ref.
+fn refuse_if_default_branch(
+    git_dir: &Path,
+    branch_ref: &str,
+    ref_already_exists: bool,
+) -> Result<(), GitError> {
+    if !ref_already_exists {
+        return Ok(());
+    }
+    let Some(name) = branch_ref.strip_prefix("refs/heads/") else {
+        return Ok(());
+    };
+    if name == "main" || name == "master" {
+        return Err(GitError::Refused(format!(
+            "refusing to move the default branch '{name}' (F32/#2537) — commit on a feature branch instead"
+        )));
+    }
+    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    if let Ok(raw) = std::fs::read_to_string(common.join("refs/remotes/origin/HEAD")) {
+        if let Some(default) = raw.trim().strip_prefix("ref: refs/remotes/origin/") {
+            if default == name {
+                return Err(GitError::Refused(format!(
+                    "refusing to move the default branch '{name}' (F32/#2537) — commit on a feature branch instead"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does this repository have NO refs anywhere — no loose ref under
+/// `refs/heads` (recursively, since a branch name may contain `/`) and no
+/// `refs/heads/…` line in `packed-refs`? The narrow "creating the default
+/// branch is fine" exemption in [`refuse_if_default_branch`] is meant for
+/// exactly this state (a fresh `git init`), not for "this ONE branch happens
+/// to be unborn" — the latter is reachable by deleting an existing default
+/// branch's ref while sibling branches survive (Blocker 2).
+fn repository_has_no_refs(git_dir: &Path) -> bool {
+    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    if directory_has_any_file(&common.join("refs/heads")) {
+        return false;
+    }
+    match std::fs::read_to_string(common.join("packed-refs")) {
+        Ok(contents) => !contents.lines().any(|line| line.contains("refs/heads/")),
+        Err(_) => true, // no packed-refs file at all
+    }
+}
+
+fn directory_has_any_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if directory_has_any_file(&path) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
 impl GitEngine {
     /// Discover and open the repository containing `root` (walks up for `.git`).
     /// Legacy discovery/config/ODB reads require unrestricted read authority;
@@ -563,9 +657,18 @@ impl GitEngine {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
         }
+        let branch_ref = read_head(&self.repo.git_dir)?;
+        let head_oid = self.head_oid()?;
+        if let Some(branch_ref) = &branch_ref {
+            refuse_if_default_branch(
+                &self.repo.git_dir,
+                branch_ref,
+                !repository_has_no_refs(&self.repo.git_dir),
+            )?;
+        }
         let index = self.repo.load_index()?;
         let tree = write_tree_from_index(&self.repo.odb, &index, "")?;
-        let parents: Vec<ObjectId> = self.head_oid()?.into_iter().collect();
+        let parents: Vec<ObjectId> = head_oid.into_iter().collect();
         let ident = author.ident_now();
         let commit = CommitData {
             tree,
@@ -582,7 +685,7 @@ impl GitEngine {
             .repo
             .odb
             .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-        match read_head(&self.repo.git_dir)? {
+        match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot commit on a detached HEAD")),
         }
@@ -601,6 +704,17 @@ impl GitEngine {
     ) -> Result<CommitInfo, GitError> {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
+        }
+        let branch_ref = read_head(&self.repo.git_dir)?;
+        // Amend always rewrites an existing commit, so `repository_has_no_refs`
+        // is unconditionally false here — computed via the shared helper
+        // anyway, for one source of truth (round 4).
+        if let Some(branch_ref) = &branch_ref {
+            refuse_if_default_branch(
+                &self.repo.git_dir,
+                branch_ref,
+                !repository_has_no_refs(&self.repo.git_dir),
+            )?;
         }
         let head = self
             .head_oid()?
@@ -626,7 +740,7 @@ impl GitEngine {
             .repo
             .odb
             .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-        match read_head(&self.repo.git_dir)? {
+        match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
         }
@@ -742,6 +856,13 @@ impl GitEngine {
         }
         let head_ref = read_head(&self.repo.git_dir)?
             .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
+        // Rebase always replays onto existing history — same shared helper
+        // as `commit`/`amend` (round 4), one source of truth.
+        refuse_if_default_branch(
+            &self.repo.git_dir,
+            &head_ref,
+            !repository_has_no_refs(&self.repo.git_dir),
+        )?;
         let old_head_tree = self.head_tree()?;
         let onto_oid = self.resolve_one(onto)?;
 
@@ -907,6 +1028,14 @@ impl GitEngine {
         if !caps.permits_ref(&refname) {
             return Err(GitError::Denied("refs"));
         }
+        // `write_ref` below has no existence check — this is an implicit
+        // force-move if `refname` already points elsewhere. Round 4, Blocker
+        // 2's audit: gate it the same way `commit`/`amend`/`rebase` are.
+        refuse_if_default_branch(
+            &self.repo.git_dir,
+            &refname,
+            !repository_has_no_refs(&self.repo.git_dir),
+        )?;
         let oid = self
             .head_oid()?
             .ok_or(GitError::Unsupported("cannot branch from an unborn HEAD"))?;
@@ -939,6 +1068,15 @@ impl GitEngine {
         let (target, created) = match (existing, create) {
             (Some(oid), _) => (Some(oid), false),
             (None, true) => {
+                // Round 4, Blocker 2's audit: `checkout -b main` creating a
+                // FRESH `refs/heads/main` while the repository already has
+                // other refs is the same "retarget the default branch"
+                // shape the exemption exists to NOT cover.
+                refuse_if_default_branch(
+                    &self.repo.git_dir,
+                    &refname,
+                    !repository_has_no_refs(&self.repo.git_dir),
+                )?;
                 let oid = head.ok_or(GitError::Unsupported(
                     "cannot create a branch from an unborn HEAD",
                 ))?;
@@ -1002,6 +1140,13 @@ impl GitEngine {
         if resolve_ref(&self.repo.git_dir, &refname).is_err() {
             return Err(GitError::Refused(format!("branch '{name}' does not exist")));
         }
+        // Round 4, Blocker 2: deleting `refname` here means it just resolved
+        // above, so it unconditionally exists — `true`, always. This closes
+        // the bypass where `branch-delete main` (previously unguarded) made
+        // `main` unborn, reopening the OLD (per-ref) exemption for a commit
+        // that created a brand-new `main` as a root commit with the guard
+        // never firing.
+        refuse_if_default_branch(&self.repo.git_dir, &refname, true)?;
         delete_ref(&self.repo.git_dir, &refname)?;
         Ok(format!("deleted branch '{name}'"))
     }
@@ -1448,13 +1593,37 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         }
         let (git_dir, common_dir, worktree) =
             scoped_repository_paths(&root, &read_scope).map_err(|e| e.to_string())?;
+        // PR #2577 round 2 removed a whole-directory `permits_path(write_scope,
+        // git_dir/common_dir)` check here on the theory that `cwd` resolving
+        // *inside* `self.root` (proved by `checked_dispatch_root`) means `cwd`
+        // is always the session's own repository. Round 3 correction: that is
+        // FALSE — a NESTED repository (#2552 `InsideRepo`) is supported, and a
+        // nested LINKED worktree's `git_dir`/`common_dir` can point anywhere on
+        // disk via its `commondir` file, regardless of where the worktree
+        // directory itself sits. So the gate is restored, widened by exactly
+        // one case: mutation through `cwd` is permitted when the resolved
+        // `git_dir`/`common_dir` are EITHER an explicit `fs_write` grant, OR
+        // are the session workspace's OWN repository — the same
+        // `git_dir`/`common_dir` `self.root` itself resolves to (the case
+        // `refuse_if_default_branch` protects at the engine layer). Anything
+        // else — a foreign nested repo `cwd` merely happens to point at — falls
+        // back to needing the ordinary explicit `fs_write` grant.
         if explicit_cwd
             && mutates
-            && [&git_dir, &common_dir].iter().any(|path| {
-                !newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy())
-            })
+            && ![&git_dir, &common_dir]
+                .iter()
+                .all(|path| newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy()))
         {
-            return Err("capability denied: fs_write for selected worktree Git metadata".into());
+            let is_own_repo = scoped_repository_paths(&self.root, &read_scope)
+                .ok()
+                .is_some_and(|(own_git_dir, own_common_dir, _)| {
+                    git_dir == own_git_dir && common_dir == own_common_dir
+                });
+            if !is_own_repo {
+                return Err(
+                    "capability denied: fs_write for selected worktree Git metadata".into(),
+                );
+            }
         }
         if op == "branch-list" {
             validate_branch_ref_inputs(&git_dir, &common_dir, &read_scope)

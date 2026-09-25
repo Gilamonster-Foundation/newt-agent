@@ -1972,6 +1972,79 @@ fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'
         .filter(|name| !name.is_empty())
 }
 
+/// F32/#2537, PR #2577 round 3 (Shawn): when the confined shell is about to
+/// run a bare `git …` command in the session's OWN repository on a
+/// non-default branch, widen the caveats passed to THIS ONE dispatch with
+/// kernel WRITE on the worktree's own gitdir and the common `objects/`
+/// directory (`own_gitdir_shell_write_grant` — round 3 narrowed the grant to
+/// exactly those two directories; round 4 bound it to the identity resolved
+/// at session start rather than a live re-resolve, see that function's doc
+/// comment). This unblocks a confined-shell `git add` under the real kernel
+/// fence (a file-level Landlock rule cannot carry the
+/// `MAKE_REG`/`REFER`/`REMOVE_FILE` rights `index.lock` create+rename and
+/// object insertion need — a directory rule can).
+///
+/// Deliberately scoped to a SIMPLE `git` invocation, not folded into the
+/// session `fs_write` scope: `write_file`/`edit_file` on git metadata stay
+/// refused (`caveats::apply_cli_fs_grants` never grants this), and a shell
+/// `git commit` is refused outright before reaching here
+/// (`run_command_creates_shell_git_commit`), so this widening never needs to
+/// cover a ref move — `refuse_if_default_branch` in `newt-git` is what
+/// prevents that, at the one place a commit can actually land. A compound
+/// command (`git add && rm -rf /`) is not "leading program `git`" in the
+/// sense that matters here either way — it still runs through the confined
+/// engine, which gates each spawn on these SAME (possibly widened) caveats,
+/// so a second program in the pipeline gets the same widened `fs_write` too;
+/// that is the accepted trade-off Shawn signed off on (a confined-shell
+/// `rm -rf <common>/objects` becomes possible on a non-default branch — see
+/// `RESULT-dec2-own-gitdir.md`), not an oversight.
+///
+/// Mirrors the shape a sibling PR's `dispatch_caveats_for_command` (build
+/// tools) uses — a separate function, called at the same call site, so the
+/// two compose without conflict.
+pub(super) fn dispatch_caveats_for_git_shell(
+    cmd: &str,
+    workspace: &str,
+    caveats: &crate::caveats::Caveats,
+) -> crate::caveats::Caveats {
+    if leading_program(cmd) != Some("git") {
+        return caveats.clone();
+    }
+    // Round 4, Blocker 1: NOT `own_gitdir_grants` — that re-resolves via a
+    // live `rev-parse`, which follows model-writable pointers (the workspace
+    // `.git` gitlink, `<gitdir>/commondir`). This bounds the write grant to
+    // the identity cached at session start.
+    let write = crate::git_hardening::own_gitdir_shell_write_grant(std::path::Path::new(workspace));
+    if write.is_empty() {
+        return caveats.clone();
+    }
+    let mut widened = caveats.clone();
+    widened.fs_write = match &widened.fs_write {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => {
+            crate::caveats::Scope::only(set.iter().cloned().chain(write))
+        }
+    };
+    // Real git ALWAYS tries to read the system config (`/etc/gitconfig`),
+    // regardless of repo/branch — not just on a host that happens to have
+    // one. Landlock's base read allowlist does not include it (CI caught
+    // this: a Landlock-confined `git add` on a runner that ships
+    // `/etc/gitconfig` failed with "unknown error occurred while reading
+    // the configuration files", exit 128 — this environment's sandbox
+    // silently worked only because it has no such file). One extra,
+    // non-secret, well-known system path, granted only on this ONE widened
+    // dispatch, same as the write grant above.
+    widened.fs_read = match &widened.fs_read {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(
+            set.iter()
+                .cloned()
+                .chain(std::iter::once("/etc/gitconfig".to_string())),
+        ),
+    };
+    widened
+}
+
 /// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
 /// the program.
 fn leading_program(cmd: &str) -> Option<&str> {

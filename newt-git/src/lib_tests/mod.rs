@@ -72,6 +72,17 @@ fn repo_with_commit() -> tempfile::TempDir {
     dir
 }
 
+/// [`repo_with_commit`], checked out onto a non-default branch. For tests
+/// that go on to commit/amend/rebase THROUGH the `git` tool or `GitEngine`
+/// (not raw `git`) — those are refused on `main` by
+/// `refuse_if_default_branch` (F32/#2537), and a test exercising ordinary
+/// mutation isn't exercising that guard.
+fn repo_with_commit_on_task_branch() -> tempfile::TempDir {
+    let dir = repo_with_commit();
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
+    dir
+}
+
 /// A temp repo with three commits: `c1` adds `a.txt`, `c2` adds `b.txt`, `c3`
 /// modifies `a.txt`. Returns the dir plus each commit's real `git rev-parse`
 /// oid, oldest first, so revision/range/pathspec tests can assert against
