@@ -300,6 +300,9 @@ fn panel_raw_mode_child() {
                 for r in 0..HOLDER_ROWS {
                     let _ = write!(out, "\x1b[{};1H{HOLDER_SENTINEL}-{r}", top + r + 1);
                 }
+                // Park the cursor at the top: a `println!` from row 24 would
+                // scroll the holder's rows up a line and blur what is measured.
+                let _ = write!(out, "\x1b[1;1H");
                 let _ = out.flush();
             };
             let (_, rows) = crossterm::terminal::size().expect("size");
@@ -676,15 +679,28 @@ struct Held {
     exit_ok: bool,
 }
 
+/// The holder's rows are still there after everything: replayed with erases.
+fn assert_holder_untouched(held: &Held, rows: usize, top: usize) {
+    // Up to where `drive` returned: the child's later `println!`s and the test
+    // harness's own lines scroll the screen and are not part of the property.
+    let stream = held.stream.split("DRIVE_RESULT").next().unwrap_or_default();
+    let screen = crate::interaction_view_pty_test::erasing_grid(stream, rows);
+    for r in 0..usize::from(HOLDER_ROWS) {
+        assert!(
+            screen[top + r].contains(&format!("{HOLDER_SENTINEL}-{r}")),
+            "holder row {r} was overwritten or erased: {screen:#?}\nstream={:?}",
+            held.stream
+        );
+    }
+}
+
 /// #2573 hardening, the no-cockpit path: with the bottom 3 rows held (a
 /// `Refuse` lease), Ctrl-Z cannot take the screen and Shift-Up grows only
 /// into free rows. The panel stays open at what it was granted, and Esc closes
 /// with `drive` returning `Ok` and termios restored.
 ///
-/// NOT asserted: that the holder's rows are untouched. They are not — the
-/// panel's `clear` erases from its own top row to the bottom of the screen,
-/// holder included (see RESULT.md); pinning that as a passing test would
-/// bless it.
+/// The holder's rows must also be untouched (#2573 hardening): the panel
+/// erases only its own rows.
 #[serial_test::serial(interaction_pty)]
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
@@ -702,6 +718,7 @@ fn a_panel_beside_a_row_holder_stays_open_at_its_granted_height() {
         held.stream
     );
     assert!(held.exit_ok, "{:?}", held.stream);
+    assert_holder_untouched(&held, 24, 21);
 }
 
 /// The same beside a holder that follows a terminal shrink 24 → 10 rows, as
