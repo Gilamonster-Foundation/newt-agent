@@ -2228,3 +2228,32 @@ async fn lifecycle_run_of_non_build_tool_does_not_request_build_authority() {
         gate.seen
     );
 }
+
+/// Grounds `confined_exec::developer_exec_twins` against a REAL confined
+/// `python3` under a restricted exec grant. A live ornith-1.5-35b refactor run
+/// had `python3` granted by name, yet the shell resolved the `/usr/bin` xcrun
+/// shim (Seatbelt denied the Xcode binary its PATH put first), and the shim
+/// failed with `You can set the path to the Xcode folder using
+/// /usr/bin/xcode-select -switch`. Library tests run the safe-subset engine
+/// (see `bridle_registry`), so this covers the exec fence, not brush's lookup.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial_test::serial]
+async fn confined_python3_runs_on_macos() {
+    let _l = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats {
+        exec: Scope::only(["python3".to_string()]),
+        ..caveats_no_exec(ws.path())
+    };
+    let out = run_tool(
+        "run_command",
+        serde_json::json!({"command": "python3 -c 'print(40 + 2)'"}),
+        ws.path(),
+        &caveats,
+    )
+    .await;
+    assert!(out.contains("42"), "{out}");
+}

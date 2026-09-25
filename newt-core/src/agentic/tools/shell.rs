@@ -2067,15 +2067,15 @@ fn dispatch_caveats_for_command(
     cmd: &str,
     caveats: &crate::caveats::Caveats,
 ) -> crate::caveats::Caveats {
-    let Some(program) = leading_program(cmd) else {
-        return caveats.clone();
-    };
-    if !crate::confined_exec::is_build_tool_exec(program) {
-        return caveats.clone();
-    }
     let mut widened = caveats.clone();
-    if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
-        reads.extend(crate::confined_exec::toolchain_read_roots());
+    if let crate::caveats::Scope::Only(exec) = &mut widened.exec {
+        let twins = crate::confined_exec::developer_exec_twins(exec.iter());
+        exec.extend(twins);
+    }
+    if leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec) {
+        if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
+            reads.extend(crate::confined_exec::toolchain_read_roots());
+        }
     }
     widened
 }
