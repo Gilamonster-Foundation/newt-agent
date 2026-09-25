@@ -15,6 +15,9 @@ pub(crate) enum SizeKey {
     Shrink,
     /// Fill the screen; again, back to the height before zooming.
     Zoom,
+    /// Exactly this many rows (a mouse drag of the top border), floored at
+    /// [`MIN_ROWS`]. Leaves zoom, like Grow and Shrink.
+    To(u16),
 }
 
 /// Border, one content row, the hint line, border: the least a modal can be
@@ -65,6 +68,10 @@ impl ModalSize {
             SizeKey::Shrink => {
                 self.before_zoom = None;
                 self.requested = granted.saturating_sub(1).max(MIN_ROWS);
+            }
+            SizeKey::To(rows) => {
+                self.before_zoom = None;
+                self.requested = rows.max(MIN_ROWS);
             }
             SizeKey::Zoom => match self.before_zoom.take() {
                 Some(previous) => self.requested = previous,

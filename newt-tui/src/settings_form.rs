@@ -108,6 +108,7 @@ pub(crate) enum Field {
     Detail,
     Posture,
     Rounds,
+    Prefix,
 }
 
 impl Field {
@@ -126,6 +127,7 @@ impl Field {
         Self::Detail,
         Self::Posture,
         Self::Rounds,
+        Self::Prefix,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -146,6 +148,7 @@ impl Field {
             Self::Detail => "detail",
             Self::Posture => "posture",
             Self::Rounds => "rounds",
+            Self::Prefix => "prefix",
         }
     }
 
@@ -164,6 +167,7 @@ impl Field {
             Self::Detail => "tool-output detail rows",
             Self::Posture => "permission posture",
             Self::Rounds => "tool-call round limit",
+            Self::Prefix => "meta prefix key",
         }
     }
 
@@ -235,6 +239,20 @@ impl Field {
             // `auto` is a real choosable value, not the absence of one: it
             // means "follow colour", which is a different state from `on`
             // on a pipe. The absorbed verb offered all three and so does this.
+            // Each choice says what it would shadow, because that is the
+            // whole trade: tmux/herdr semantics on a chord of your choosing.
+            Self::Prefix => owned(&[
+                ("ctrl+space", "collides with nothing in newt (default)"),
+                (
+                    "ctrl+a",
+                    "GNU Screen's; shadows line-start in emacs/nano editing",
+                ),
+                (
+                    "ctrl+b",
+                    "tmux's and herdr's own; inside them it reaches them first",
+                ),
+                ("ctrl+n", "shadows next-line in emacs editing"),
+            ]),
             Self::Markdown => owned(&[
                 ("auto", "render when colour is active (default)"),
                 ("on", "always render (still needs colour)"),
@@ -328,6 +346,7 @@ impl Field {
     pub(crate) fn current(self) -> String {
         use newt_core::cognition::cli_cognition;
         match self {
+            Self::Prefix => prefix_setting(),
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
                 newt_core::EditMode::Emacs => "emacs",
@@ -572,6 +591,73 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
     newt_core::interaction_form::menu(field.label(), "Esc cancels", &refs)
 }
 
+/// The meta prefix as the operator names it: `NEWT_PREFIX_KEY` (this
+/// session), else `[tui] prefix_key`, else `ctrl+space`. The ONE owner of that
+/// precedence — the panel driver parses this same string (`prefix::configured`).
+pub(crate) fn prefix_setting() -> String {
+    std::env::var("NEWT_PREFIX_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
+                .ok()
+                .and_then(|c| c.tui)
+                .and_then(|t| t.prefix_key)
+        })
+        .unwrap_or_else(|| "ctrl+space".to_string())
+}
+
+/// Write one `[tui]` scalar to the operator's config, preserving the rest.
+fn persist_tui_key(key: &str, value: &str) -> Result<(), String> {
+    let path = newt_core::Config::user_config_path()
+        .ok_or_else(|| "no config directory to save the setting in".to_string())?;
+    let text = config_fs::read(&path);
+    let updated = newt_core::Config::with_tui_key(&text, key, value).map_err(|e| e.to_string())?;
+    config_fs::write(&path, &updated).map_err(|e| format!("saving {key}: {e}"))
+}
+
+/// The config file, as a seam: the unit tier never touches a real file.
+#[cfg(not(test))]
+mod config_fs {
+    pub(super) fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+    pub(super) fn write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+        std::fs::write(path, text)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod config_fs {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FILES: RefCell<Vec<(PathBuf, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn read(path: &Path) -> String {
+        FILES.with(|files| {
+            files
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(p, _)| p == path)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn write(path: &Path, text: &str) -> std::io::Result<()> {
+        FILES.with(|files| {
+            files
+                .borrow_mut()
+                .push((path.to_path_buf(), text.to_string()));
+        });
+        Ok(())
+    }
+}
+
 /// **THE ONE MUTATION PATH.** Every route — the form, a deep link, a
 /// deprecated verb, `/psyche tenacity`, `/psyche obsessive` — lands here.
 ///
@@ -683,6 +769,16 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
             } else {
                 newt_core::process_env::set_var("NEWT_PROMPT", value);
             }
+        }
+        // The one field here that PERSISTS: a prefix you had to set again every
+        // session would be a trap. `[tui] prefix_key`, through the
+        // comment-preserving writer; and the session, so the next panel uses it
+        // at once.
+        Field::Prefix => {
+            persist_tui_key("prefix_key", value)?;
+            newt_core::process_env::set_var("NEWT_PREFIX_KEY", value);
+            #[cfg(feature = "rich-tui")]
+            crate::prefix::invalidate();
         }
     }
     Ok(format!("{}: {value}", field.label()))
@@ -1619,6 +1715,38 @@ mod tests {
     /// not see it. Two writers for one setting is how they come to disagree,
     /// and it is why the receipt could not record a from→to. Both doors now
     /// go through `NEWT_MARKDOWN`, read back by the one resolver.
+    /// `/settings prefix ctrl+a` persists to `[tui] prefix_key` (through the
+    /// config seam — no real file) and takes effect this session; the
+    /// resolver the panel driver parses reads it back; an unoffered chord is
+    /// refused and writes nothing.
+    #[test]
+    fn the_prefix_field_persists_and_takes_effect_now() {
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var("NEWT_PREFIX_KEY");
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        assert_eq!(
+            apply(Field::Prefix, "ctrl+a"),
+            Ok("meta prefix key: ctrl+a".to_string())
+        );
+        let saved = config_fs::read(&path);
+        assert!(
+            saved.contains("[tui]") && saved.contains("prefix_key = \"ctrl+a\""),
+            "{saved}"
+        );
+        assert_eq!(Field::Prefix.current(), "ctrl+a");
+        assert_eq!(prefix_setting(), "ctrl+a");
+        assert!(
+            apply(Field::Prefix, "ctrl+q").is_err(),
+            "not an offered chord"
+        );
+        assert_eq!(
+            config_fs::read(&path),
+            saved,
+            "a refused value writes nothing"
+        );
+        newt_core::process_env::remove_var("NEWT_PREFIX_KEY");
+    }
+
     #[test]
     fn the_markdown_field_and_its_verb_resolve_to_one_state() {
         let _guard = settings_guard();

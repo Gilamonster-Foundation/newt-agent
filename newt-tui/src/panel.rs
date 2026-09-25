@@ -42,6 +42,7 @@ use newt_core::tty::raw_mode::RawModeGuard;
 
 use crate::inline_viewport::InlineTerm;
 use crate::modal_size::{ModalSize, SizeKey};
+use crate::panel_controls::{Controls, Effect};
 use crate::session_worker::PanelWindow;
 
 /// The component vocabulary is shared directly with NewtUI. Newt retains
@@ -52,7 +53,7 @@ pub(crate) use newtui::{Flow, Key};
 /// Fold control into printable keys so a plain-character binding cannot fire
 /// with control held. Preserve Newt's existing bindings: keys it did not bind
 /// still arrive as `Other`, even if NewtUI names them for another host.
-fn key_from_event(code: KeyCode, ctrl: bool) -> Key {
+pub(crate) fn key_from_event(code: KeyCode, ctrl: bool) -> Key {
     match (code, ctrl) {
         (KeyCode::Char(c), true) => Key::Ctrl(c),
         (KeyCode::Char(c), false) => Key::Char(c),
@@ -160,6 +161,27 @@ fn relet<T>(
     }
 }
 
+/// The driver's one line over the panel's hint row (inside the bottom
+/// border, past the scrollbar gutter) while a mode is live.
+fn draw_overlay(frame: &mut ratatui::Frame, text: &str) {
+    let area = frame.area();
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+    let line = ratatui::layout::Rect {
+        x: area.x + 2,
+        y: area.bottom() - 2,
+        width: area.width - 3,
+        height: 1,
+    };
+    frame.render_widget(ratatui::widgets::Clear, line);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(text.to_string())
+            .style(crate::theme::style(crate::theme::Role::Identity)),
+        line,
+    );
+}
+
 /// What the driver does with one terminal event.
 #[derive(Debug, PartialEq, Eq)]
 enum Input {
@@ -168,6 +190,8 @@ enum Input {
     Remeasure,
     /// The operator sized the modal: Shift-↑/↓, or Ctrl-Z to zoom.
     Size(SizeKey),
+    /// A mouse event, for a drag of the panel's top border.
+    Mouse(crossterm::event::MouseEvent),
     Ignore,
 }
 
@@ -201,6 +225,7 @@ fn classify(event: Event) -> Input {
             key.modifiers.contains(KeyModifiers::CONTROL),
         )),
         Event::Resize(..) => Input::Remeasure,
+        Event::Mouse(mouse) => Input::Mouse(mouse),
         _ => Input::Ignore,
     }
 }
@@ -230,9 +255,23 @@ pub(crate) fn drive(
                 Some(window) => window.terminal()?,
                 None => make_terminal(size.requested())?,
             };
+            let mut controls = Controls::new(crate::prefix::current());
+            // Drag-capable mouse capture for as long as the panel is open, on
+            // the REAL terminal (under the cockpit, stdout is its capture pty).
+            #[cfg(unix)]
+            let _mouse = crate::mouse::MouseCaptureGuard::enable_drag(match window {
+                Some(window) => crate::mouse::MouseSink::Tty(window.output()?),
+                None => crate::mouse::MouseSink::Stdout,
+            });
             terminal.clear()?;
             loop {
-                terminal.draw(|f| screen.draw(f))?;
+                let overlay = controls.overlay();
+                terminal.draw(|f| {
+                    screen.draw(f);
+                    if let Some(text) = &overlay {
+                        draw_overlay(f, text);
+                    }
+                })?;
                 // A poll rather than a blocking read: the panel repaints on a
                 // cadence so a status line or a spinner can change without a
                 // keypress, and a timed-out poll is not an event.
@@ -241,8 +280,16 @@ pub(crate) fn drive(
                 }
                 // `Some(rows)`: lay out again at a new requested height;
                 // `Some(None)`: again at the same request (a terminal resize).
-                let relayout = match classify(event::read()?) {
-                    Input::Key(key) => {
+                let area = window.map_or_else(|| terminal.get_frame().area(), PanelWindow::area);
+                let effect = match classify(event::read()?) {
+                    Input::Key(key) => controls.key(key),
+                    Input::Mouse(mouse) => controls.mouse(mouse, area),
+                    Input::Size(key) => Effect::Size(key),
+                    Input::Remeasure => Effect::Redraw,
+                    Input::Ignore => Effect::Nothing,
+                };
+                let relayout = match effect {
+                    Effect::Forward(key) => {
                         if let Flow::Close(apply) = screen.key(key) {
                             applied = apply;
                             break;
@@ -253,15 +300,11 @@ pub(crate) fn drive(
                     // measured again — by the presenter that lent the rows, or
                     // by a fresh bottom-rows lease — and the region is cleared,
                     // so a narrower terminal leaves no stale cells behind.
-                    Input::Remeasure => Some(None),
-                    Input::Size(key) => {
-                        let granted = window.map_or_else(
-                            || terminal.get_frame().area().height,
-                            |window| window.area().height,
-                        );
-                        size.apply(key, granted).map(Some)
-                    }
-                    Input::Ignore => None,
+                    // A terminal resize and a redraw lay out again at the same
+                    // request; a size change at a new one.
+                    Effect::Redraw => Some(None),
+                    Effect::Size(key) => size.apply(key, area.height).map(Some),
+                    Effect::Nothing => None,
                 };
                 if let Some(rows) = relayout {
                     terminal = match window {
