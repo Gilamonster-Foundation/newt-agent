@@ -2047,7 +2047,7 @@ pub(super) fn dispatch_caveats_for_git_shell(
 
 /// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
 /// the program.
-fn leading_program(cmd: &str) -> Option<&str> {
+pub(super) fn leading_program(cmd: &str) -> Option<&str> {
     cmd.split_ascii_whitespace().find(|tok| !tok.contains('='))
 }
 

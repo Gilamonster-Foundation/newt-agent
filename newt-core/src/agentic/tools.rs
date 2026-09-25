@@ -1191,6 +1191,15 @@ async fn lifecycle_run_with_escalation(
     escalation_result(first, escalated, wall)
 }
 
+/// F38: does a lifecycle `run`'s resolved command start with a build tool?
+/// When it does, the run lane cannot execute it (the tool isn't in the run
+/// lane's profile), so route directly to the build lane — the same path
+/// `action=build` takes. Uses the same `is_build_tool_exec` predicate that
+/// `dispatch_wall` and the routing table read.
+fn lifecycle_run_routes_to_build_lane(cmd: &str) -> bool {
+    shell::leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec)
+}
+
 /// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
 /// source shared by the timed-out/unavailable `action=run` coaching
 /// (`lifecycle_run_result`) and F12's `phase="build"` refusal below, which
@@ -3951,6 +3960,34 @@ async fn execute_authorized_tool(
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {
+                    let (program, argv) = build_check_argv(&joined);
+                    executed(
+                        run_confined_build_lane(
+                            workspace,
+                            effective_path,
+                            program,
+                            argv,
+                            &joined,
+                            smart_harness,
+                            caveats,
+                            &mut permission_gate,
+                            tool_output_lines,
+                            color,
+                            tool_offload,
+                            spill_store,
+                            None,
+                            None,
+                            shell::LIFECYCLE_BUILD_TIMEOUT,
+                            presentation,
+                        )
+                        .await,
+                    )
+                }
+                // F38: when the resolved command starts with a build tool
+                // (cargo/just/make), the run lane cannot execute it — the
+                // tool isn't in the run lane's profile. Route directly to
+                // the build lane, the same path action=build takes.
+                "run" if lifecycle_run_routes_to_build_lane(&joined) => {
                     let (program, argv) = build_check_argv(&joined);
                     executed(
                         run_confined_build_lane(

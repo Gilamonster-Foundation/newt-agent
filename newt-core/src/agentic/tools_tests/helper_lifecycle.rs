@@ -617,3 +617,46 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
         serde_json::json!(["run", "list", "build"])
     );
 }
+
+/// F38: a lifecycle `run` whose resolved command starts with a build tool
+/// (cargo/just/make) must route to the build lane directly, not the run lane.
+/// The model's first instinct (`lifecycle check` with no action) should work
+/// when the resolved command is `just check`.
+#[test]
+fn lifecycle_run_of_build_tool_routes_to_build_lane() {
+    assert!(
+        lifecycle_run_routes_to_build_lane("just check"),
+        "just is a build tool"
+    );
+    assert!(
+        lifecycle_run_routes_to_build_lane("cargo test --workspace"),
+        "cargo is a build tool"
+    );
+    assert!(
+        lifecycle_run_routes_to_build_lane("make test"),
+        "make is a build tool"
+    );
+    assert!(
+        !lifecycle_run_routes_to_build_lane("pytest -x"),
+        "pytest is not a build tool"
+    );
+    assert!(
+        !lifecycle_run_routes_to_build_lane("python -m pytest"),
+        "python is not a build tool"
+    );
+    assert!(
+        !lifecycle_run_routes_to_build_lane(""),
+        "empty command is not a build tool"
+    );
+}
+
+/// F38 part (c): a lifecycle run whose resolved command is NOT a build tool
+/// stays unchanged — it still goes through the run lane with escalation.
+#[test]
+fn lifecycle_run_of_non_build_tool_does_not_route() {
+    // Non-build-tool lifecycle phases (e.g. a python-based test, a custom
+    // script) must not be silently promoted to the build lane.
+    assert!(!lifecycle_run_routes_to_build_lane("ruff check ."));
+    assert!(!lifecycle_run_routes_to_build_lane("black --check ."));
+    assert!(!lifecycle_run_routes_to_build_lane("mypy src/"));
+}
