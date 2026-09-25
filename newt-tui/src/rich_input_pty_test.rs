@@ -94,6 +94,16 @@ fn rich_input_child() {
             }
             assert!(inner().is_err(), "the fixture must take the error path");
         }
+        // #2591 review: the per-turn prompt over a full screen of transcript,
+        // on a terminal that answers the cursor query. Its first draw grows
+        // the viewport from 1 row to what the editor wants.
+        "prompt_growth" => {
+            for n in 0..30 {
+                println!("TRANSCRIPT-{n:02}");
+            }
+            let mut surface = crate::rich_input::RichSurface::new(None).expect("surface");
+            let _ = crate::chat::InputSurface::read_line(&mut surface, "");
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -211,4 +221,56 @@ fn a_panic_in_the_event_loop_still_hands_both_back() {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn an_error_return_still_hands_both_back() {
     assert_restored("error", &drive("error"));
+}
+
+/// #2591 review: `inline_terminal` serves the prompt too. The prompt is a
+/// bottom-anchored `Refuse` lease; when its viewport grows, ratatui scrolls
+/// the transcript up to make room. Parking the cursor on the lease's top
+/// replaced that scroll with painting over the bottom rows, erasing the
+/// transcript's last lines. The park applies only to a lease a holder shifted.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_growing_prompt_scrolls_the_transcript_up_instead_of_erasing_it() {
+    let pty = Pty::open();
+    pty.resize(24, 80);
+    let mut command = std::process::Command::new(
+        std::env::current_exe().expect("the test binary re-invokes itself"),
+    );
+    command
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .env("NEWT_RICH_INPUT_PTY_CHILD", "prompt_growth")
+        .env("NEWT_EDIT_MODE", "emacs")
+        .env("TERM", "xterm-256color")
+        .stdin(pty.slave_stdio())
+        .stdout(pty.slave_stdio())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().expect("spawn the pty child");
+    // The command still owns dups of the slave: drop them, or EOF never comes.
+    drop(command);
+    let mut pump = crate::panel_raw_mode_pty_test::Pump::new(&pty, true, 24);
+    let painted = pump.until("emacs — Enter sends").is_some();
+    // Let the growth and any repaint settle: the query is answered as it comes.
+    for _ in 0..25 {
+        pump.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stream = pump.transcript.clone();
+    // The turn never ends on its own (an empty Enter sends nothing).
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(painted, "the prompt never painted: {stream:?}");
+    assert!(
+        stream.contains("\x1b[6n"),
+        "control: the cursor was queried"
+    );
+    let screen = crate::interaction_view_pty_test::erasing_grid(&stream, 24);
+    for n in [28, 29] {
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains(&format!("TRANSCRIPT-{n:02}"))),
+            "TRANSCRIPT-{n:02} is gone from the screen: {screen:#?}"
+        );
+    }
 }

@@ -189,6 +189,27 @@ fn draw_overlay(frame: &mut ratatui::Frame, text: &str) {
     );
 }
 
+/// Erase the panel's own rows, and only those, then force a full repaint.
+///
+/// ratatui's `clear` on an inline viewport is `CUP(top)` + `ESC[J`: it erases
+/// to the END OF THE SCREEN, taking the rows of whatever holds the space below
+/// the panel (a `Refuse` lease on the bottom rows). The panel owns
+/// `area.top()..area.bottom()` and nothing else.
+fn clear_own_rows(terminal: &mut InlineTerm) -> io::Result<()> {
+    use ratatui::backend::{Backend, ClearType};
+    let area = terminal.get_frame().area();
+    for y in area.top()..area.bottom() {
+        let backend = terminal.backend_mut();
+        backend.set_cursor_position(ratatui::layout::Position { x: 0, y })?;
+        backend.clear_region(ClearType::CurrentLine)?;
+    }
+    // Both buffers reset (each swap resets the inactive one), so the next draw
+    // repaints every cell, as `clear` guaranteed.
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
+}
+
 /// What the driver does with one terminal event.
 #[derive(Debug, PartialEq, Eq)]
 enum Input {
@@ -270,7 +291,7 @@ pub(crate) fn drive(
                 Some(window) => crate::mouse::MouseSink::Tty(window.output()?),
                 None => crate::mouse::MouseSink::Stdout,
             });
-            terminal.clear()?;
+            clear_own_rows(&mut terminal)?;
             loop {
                 let overlay = controls.overlay();
                 terminal.draw(|f| {
@@ -334,10 +355,10 @@ pub(crate) fn drive(
                             terminal
                         }
                     };
-                    terminal.clear()?;
+                    clear_own_rows(&mut terminal)?;
                 }
             }
-            terminal.clear()?;
+            clear_own_rows(&mut terminal)?;
             Ok(())
         })()
     };
