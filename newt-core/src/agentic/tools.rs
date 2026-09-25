@@ -3957,37 +3957,18 @@ async fn execute_authorized_tool(
                 return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
+            // F38: a `run` whose resolved command starts with a build tool
+            // (cargo/just/make) cannot execute in the run lane (the tool is not
+            // in its profile), so it takes the build lane, exactly as
+            // `action=build` does.
+            let action = if action == "run" && lifecycle_run_routes_to_build_lane(&joined) {
+                "build"
+            } else {
+                action
+            };
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {
-                    let (program, argv) = build_check_argv(&joined);
-                    executed(
-                        run_confined_build_lane(
-                            workspace,
-                            effective_path,
-                            program,
-                            argv,
-                            &joined,
-                            smart_harness,
-                            caveats,
-                            &mut permission_gate,
-                            tool_output_lines,
-                            color,
-                            tool_offload,
-                            spill_store,
-                            None,
-                            None,
-                            shell::LIFECYCLE_BUILD_TIMEOUT,
-                            presentation,
-                        )
-                        .await,
-                    )
-                }
-                // F38: when the resolved command starts with a build tool
-                // (cargo/just/make), the run lane cannot execute it — the
-                // tool isn't in the run lane's profile. Route directly to
-                // the build lane, the same path action=build takes.
-                "run" if lifecycle_run_routes_to_build_lane(&joined) => {
                     let (program, argv) = build_check_argv(&joined);
                     executed(
                         run_confined_build_lane(
