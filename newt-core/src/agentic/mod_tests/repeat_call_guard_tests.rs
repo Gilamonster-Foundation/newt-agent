@@ -985,48 +985,6 @@ fn a_kernel_refused_binary_is_a_blocker_no_edit_can_clear() {
     );
 }
 
-/// #2374 review A: the default path's repeat steer is unchanged. With
-/// result-aware verification off, successful calls between two identical
-/// failing calls do not clear the failure memo, whatever those calls were.
-#[test]
-fn default_mode_keeps_steering_a_repeated_failure_across_successful_calls() {
-    let mut guard = RepeatCallGuard::default();
-    let fetch = serde_json::json!({"url": "https://fixture.invalid/doc"});
-    guard.record("web_fetch", &fetch, false, "error: fetch failed", None);
-    guard.record(
-        "update_plan",
-        &serde_json::json!({"plan": []}),
-        true,
-        "plan updated",
-        None,
-    );
-    guard.record(
-        "state_get",
-        &serde_json::json!({"key": "k"}),
-        true,
-        "v",
-        None,
-    );
-    guard.record(
-        "run_command",
-        &serde_json::json!({"command": "echo x"}),
-        true,
-        "x",
-        None,
-    );
-    guard.record(
-        "write_file",
-        &serde_json::json!({"path": "a.txt"}),
-        true,
-        "wrote a.txt",
-        None,
-    );
-    assert!(
-        guard.repeat_steer("web_fetch", &fetch).is_some(),
-        "the default path must still steer the identical failing call"
-    );
-}
-
 /// #2374 review A, result-aware mode: only a real workspace change clears a
 /// failure memo. A read-only probe or a harness-state call keeps it; a
 /// mutating command or a write clears it.
@@ -1071,7 +1029,7 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     ]
     .into_iter()
     .filter_map(|(name, args, clears)| {
-        let mut guard = RepeatCallGuard::for_verification(true);
+        let mut guard = RepeatCallGuard::default();
         guard.record(
             "run_command",
             &check,
@@ -1552,4 +1510,51 @@ fn operator_steering_resets_the_count_and_rearms_the_steer() {
         "steer",
         "the steer-once latch re-armed"
     );
+}
+
+/// F37 regression: the repeat guard refused an identical failed `cargo check`
+/// (and `lifecycle`) AFTER an `edit_file` had changed the tree, so the model
+/// could never re-verify its own repair. The release on a workspace change
+/// must not depend on a verification mode.
+#[test]
+fn identical_failed_call_reruns_after_a_workspace_edit() {
+    let calls = [
+        ("run_command", serde_json::json!({"command": "cargo check"})),
+        ("lifecycle", serde_json::json!({"phase": "check"})),
+    ];
+    for (name, args) in &calls {
+        let mut guard = RepeatCallGuard::default();
+        guard.record(name, args, false, "error: exited 101", None);
+        assert!(
+            guard.repeat_steer(name, args).is_some(),
+            "{name}: true repeat"
+        );
+        guard.record(
+            "edit_file",
+            &serde_json::json!({"path": "a.rs"}),
+            true,
+            "ok",
+            None,
+        );
+        assert!(
+            guard.repeat_steer(name, args).is_none(),
+            "{name} must run after an edit"
+        );
+    }
+}
+
+/// F37: without a change in between, an identical read-only probe stays refused.
+#[test]
+fn identical_read_only_probe_is_still_refused_without_a_change() {
+    let args = serde_json::json!({"command": "grep x a.txt"});
+    let mut guard = RepeatCallGuard::default();
+    guard.record("run_command", &args, true, "hello", None);
+    guard.record(
+        "read_file",
+        &serde_json::json!({"path": "a"}),
+        true,
+        "x",
+        None,
+    );
+    assert!(guard.repeat_steer("run_command", &args).is_some());
 }
