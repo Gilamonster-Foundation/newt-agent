@@ -37,6 +37,7 @@ pub use output_budget::{
 };
 
 mod catalog;
+mod dependency_fetch;
 mod dispatch;
 mod file_capture;
 mod file_change;
@@ -1387,7 +1388,29 @@ async fn run_confined_build_lane(
             );
         }
     }
-    match ConstrainedExecutor::run_async(request).await {
+    let mut run = ConstrainedExecutor::run_async(request.clone()).await;
+    let mut fetch_note = None;
+    if let Ok(out) = &run {
+        if !out.success && dependency_fetch::needs_dependency_fetch(&out.stderr) {
+            let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
+            match dependency_fetch::fetch_locked_dependencies(
+                &root,
+                &cwd,
+                caveats,
+                permission_gate,
+                read,
+            )
+            .await
+            {
+                Ok(()) => {
+                    run = ConstrainedExecutor::run_async(request).await;
+                    fetch_note = Some(dependency_fetch::FETCHED_NOTE.to_owned());
+                }
+                Err(reason) => fetch_note = Some(dependency_fetch::blocked_note(&reason, &cwd)),
+            }
+        }
+    }
+    let (mut text, outcome) = match run {
         Ok(out) => {
             // The build's own exit code (`out.code`) is untouched by `trim` —
             // only the rendered stdout/stderr text is cut, never inside a
@@ -1425,7 +1448,12 @@ async fn run_confined_build_lane(
             )
         }
         Err(error) => (format!("error: {error}"), crate::ExecOutcome::Unavailable),
+    };
+    if let Some(note) = fetch_note {
+        text.push('\n');
+        text.push_str(&note);
     }
+    (text, outcome)
 }
 
 /// The interpreter + argv for the configured build-check string, per platform.

@@ -983,26 +983,92 @@ pub fn build_tool_request(
     program: impl Into<String>,
     args: impl IntoIterator<Item = impl Into<String>>,
 ) -> ExecRequest {
-    let root = workspace.to_string_lossy();
-    let mut request = ExecRequest::new(
+    toolchain_request(
         ExecOrigin::AgentInfluenced,
+        workspace,
+        cwd,
         program,
         args,
-        cwd,
         build_tool_caveats(workspace),
     )
     .net_grant(NetGrant::DenyAll)
-    .env("HOME", root.as_ref())
-    .env("TMPDIR", root.as_ref())
-    .env(
-        "CARGO_TARGET_DIR",
-        workspace.join("target").to_string_lossy(),
-    )
-    // Operator Cargo config may name an out-of-fence compiler cache daemon.
-    // A confined build uses the compiler directly, not that ambient deputy.
     .env("CARGO_NET_OFFLINE", "true")
-    .env("RUSTC_WRAPPER", "")
-    .env("RUSTC_WORKSPACE_WRAPPER", "");
+}
+
+/// The crates.io hosts `cargo fetch` reaches: the sparse index and the
+/// download CDN. The only network [`dependency_fetch_request`] asks for.
+pub const CRATES_IO_FETCH_HOSTS: &[&str] = &["index.crates.io", "static.crates.io"];
+
+/// Fill the operator's Cargo package cache with the crates `Cargo.lock` pins, so
+/// the offline build lane ([`build_tool_request`]) can resolve them.
+///
+/// `cargo fetch --locked` compiles nothing and runs no build script, and
+/// `--locked` binds every download to the lockfile's checksums. The argv is
+/// fixed here, never model-supplied, so it runs as [`ExecOrigin::TrustedInfra`]:
+/// a crates.io host allow-list cannot be kernel-enforced (Seatbelt names only
+/// `*`/`localhost`; Landlock only ports), and the `AgentInfluenced` floor would
+/// refuse it. That residual is registered as `dependency-fetch-egress` in
+/// `docs/security/ocap-deviations.md`; callers must hold the operator's `net`
+/// grant for [`CRATES_IO_FETCH_HOSTS`] before running this.
+#[must_use]
+pub fn dependency_fetch_request(workspace: &Path, cwd: &Path) -> ExecRequest {
+    let writes: Vec<String> = operator_tool_home("CARGO_HOME", ".cargo")
+        .map(|home| cargo_home_fetch_write_roots(&home))
+        .unwrap_or_default();
+    let mut caveats = build_tool_caveats_with_writes(workspace, &writes);
+    caveats.net = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+    toolchain_request(
+        ExecOrigin::TrustedInfra,
+        workspace,
+        cwd,
+        "cargo",
+        ["fetch", "--locked"],
+        caveats,
+    )
+}
+
+/// What a fetch writes under `$CARGO_HOME`: the registry (index cache, `.crate`
+/// files, extracted sources) and cargo's package-cache lock files. Not the
+/// whole directory, which holds `credentials.toml`.
+fn cargo_home_fetch_write_roots(cargo_home: &str) -> Vec<String> {
+    let base = Path::new(cargo_home);
+    [
+        "registry",
+        ".package-cache",
+        ".package-cache-mutate",
+        ".global-cache",
+        ".global-cache-journal",
+        ".global-cache-wal",
+        ".global-cache-shm",
+    ]
+    .into_iter()
+    .map(|entry| base.join(entry).to_string_lossy().into_owned())
+    .collect()
+}
+
+/// The environment every toolchain child shares: an env-empty start, scratch
+/// and target inside the workspace, operator tool homes, and a PATH that finds
+/// the real compiler. Network policy is the caller's.
+fn toolchain_request(
+    origin: ExecOrigin,
+    workspace: &Path,
+    cwd: &Path,
+    program: impl Into<String>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    caveats: Caveats,
+) -> ExecRequest {
+    let root = workspace.to_string_lossy();
+    let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
+        .env("HOME", root.as_ref())
+        .env("TMPDIR", root.as_ref())
+        .env(
+            "CARGO_TARGET_DIR",
+            workspace.join("target").to_string_lossy(),
+        )
+        // Operator Cargo config may name an out-of-fence compiler cache daemon.
+        // A confined build uses the compiler directly, not that ambient deputy.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "");
     for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
         if let Some(path) = operator_tool_home(name, default) {
             request = request.env(name, path);
@@ -1377,6 +1443,39 @@ mod tests {
         assert!(
             matches!(ConstrainedExecutor::run_until_cancelled(&request, Some(&cancel)), Err(ExecRefused::Spawn(error)) if error.kind() == std::io::ErrorKind::Interrupted)
         );
+    }
+
+    #[test]
+    fn dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials() {
+        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws/sub"));
+        assert_eq!(request.origin, ExecOrigin::TrustedInfra);
+        assert_eq!(request.net_grant, NetGrant::Unrestricted);
+        assert_eq!(request.args, ["fetch", "--locked"]);
+        assert_eq!(
+            request.caveats.net,
+            Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()))
+        );
+        assert!(request
+            .env_grants()
+            .iter()
+            .all(|(name, _)| name != "CARGO_NET_OFFLINE"));
+        if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
+            let home = Path::new(&home);
+            let registry = home.join("registry").to_string_lossy().into_owned();
+            let credentials = home.join("credentials.toml").to_string_lossy().into_owned();
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &registry
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &credentials
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &credentials
+            ));
+        }
     }
 
     #[test]
