@@ -152,7 +152,8 @@ pub(crate) fn validate_tool_call(
                     }
                     Err(e) => {
                         return Err(format!(
-                            "tool '{name}' arguments are not valid JSON (call truncated or malformed): {e}"
+                            "tool '{name}' arguments are not valid JSON (call truncated or malformed): {e}. \
+                             If you were writing a large file, write it in smaller pieces."
                         ))
                     }
                 }
