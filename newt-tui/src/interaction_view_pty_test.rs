@@ -498,6 +498,92 @@ fn drive_cockpit_pager_sizes(sizes: &[(u16, u16)]) {
     );
 }
 
+/// The screen after `stream`, honouring what `screen_grid` ignores: erases
+/// (`ED`/`EL`) and scrolling at the bottom row. Approximation: cursor motion
+/// is absolute and there is no reflow, so a resize is not modelled: `rows` is
+/// the height to scroll at, and rows are not lost when the terminal shrinks.
+fn erasing_grid(stream: &str, rows: usize) -> Vec<String> {
+    let mut grid: Vec<Vec<char>> = vec![Vec::new(); rows];
+    let (mut row, mut col) = (0usize, 0usize);
+    let mut chars = stream.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                col = 0;
+                if row + 1 == rows {
+                    grid.remove(0);
+                    grid.push(Vec::new());
+                } else {
+                    row += 1;
+                }
+            }
+            '\r' => col = 0,
+            '\u{1b}' if chars.peek() == Some(&'[') => {
+                chars.next();
+                let mut params = String::new();
+                let mut fin = '\0';
+                for f in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&f) {
+                        fin = f;
+                        break;
+                    }
+                    params.push(f);
+                }
+                let n = |i: usize, d: usize| {
+                    params
+                        .split(';')
+                        .nth(i)
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(d)
+                };
+                match fin {
+                    'H' => (row, col) = ((n(0, 1) - 1).min(rows - 1), n(1, 1) - 1),
+                    'J' | 'K' => {
+                        let mode = n(0, 0);
+                        let cut = |line: &mut Vec<char>, from: usize, to: usize| {
+                            for cell in line.iter_mut().take(to).skip(from) {
+                                *cell = ' ';
+                            }
+                        };
+                        let width = grid[row].len();
+                        match mode {
+                            0 => cut(&mut grid[row], col, width),
+                            1 => cut(&mut grid[row], 0, col + 1),
+                            _ => cut(&mut grid[row], 0, width),
+                        }
+                        if fin == 'J' {
+                            let (from, to) = match mode {
+                                0 => (row + 1, rows),
+                                1 => (0, row),
+                                _ => (0, rows),
+                            };
+                            for line in &mut grid[from..to] {
+                                line.clear();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            '\u{1b}' => {
+                chars.next();
+            }
+            c if !c.is_control() => {
+                let line = &mut grid[row];
+                if line.len() <= col {
+                    line.resize(col + 1, ' ');
+                }
+                line[col] = c;
+                col += 1;
+            }
+            _ => {}
+        }
+    }
+    grid.into_iter()
+        .map(|l| l.into_iter().collect::<String>().trim_end().to_string())
+        .collect()
+}
+
 /// #2573 review: drive a real panel through resizes and keys, then close it.
 /// The selection must survive, no resize may erase from row 0 (the transcript
 /// above the panel stays), the border must sit at each new width, and the
@@ -553,9 +639,30 @@ pub(crate) fn drive_cockpit_panel_loop() {
             ("\x1b[1;2A", Some(9), "Shift-Up grows one row"),
             ("\x1b[1;2B", Some(8), "Shift-Down shrinks one row"),
             ("\x1a", Some(16), "Ctrl-Z fills the 16-row screen"),
+            // Resizes WHILE zoomed: the fill request follows the screen, at
+            // each new height and width, and the selection survives.
+            (
+                "resize:12x60",
+                Some(12),
+                "zoomed, terminal narrowed and shortened",
+            ),
+            (
+                "resize:20x100",
+                Some(20),
+                "zoomed, terminal widened and lengthened",
+            ),
             ("\x1a", Some(8), "Ctrl-Z again restores the prior height"),
         ] {
-            pty.type_in(keys);
+            let mut width = 100;
+            if let Some(size) = keys.strip_prefix("resize:") {
+                let (h, w) = size.split_once('x').expect("HxW");
+                let (h, w): (u16, u16) = (h.parse().unwrap(), w.parse().unwrap());
+                width = w;
+                pty.resize(h, w);
+                signal_winch(child.id());
+            } else {
+                pty.type_in(keys);
+            }
             if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
                 return Err(format!("no repaint after: {what}"));
             }
@@ -567,6 +674,13 @@ pub(crate) fn drive_cockpit_panel_loop() {
                     "{what}: height {:?}: {rows:?}",
                     panel_height(&rows)
                 ));
+            }
+            if keys.starts_with("resize:")
+                && !rows
+                    .iter()
+                    .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
+            {
+                return Err(format!("{what}: border not at width {width}: {rows:?}"));
             }
             if !rows.iter().any(|row| row.contains("❯ panel-row-03")) {
                 return Err(format!("selection lost after: {what}: {rows:?}"));
@@ -583,6 +697,64 @@ pub(crate) fn drive_cockpit_panel_loop() {
         }
         if pty.termios_snapshot() != baseline {
             return Err("panel/cockpit did not restore the exact terminal mode".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    transcript.push_str(&pty.screen_to_eof());
+    assert!(result.is_ok(), "{result:?}: {transcript:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {transcript:?}"
+    );
+}
+
+/// #2573 hardening: closing a panel leaves the transcript above it and none
+/// of the panel. No zoom and no resize, on purpose: a zoomed panel covers the
+/// transcript and the presenter scrolls it into scrollback (by design), and
+/// `erasing_grid` does not model a resize, so this is the case where "still on
+/// screen" is a claim it can make exactly.
+pub(crate) fn drive_cockpit_panel_close() {
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(24, 80);
+    let mut child = spawn_child(&pty, "cockpit_panel_loop");
+    let mut transcript = String::new();
+    let result = (|| -> Result<(), String> {
+        if !pty.wait_for_screen_after("panel-row-00", "╯", REACH_TIMEOUT) {
+            return Err("the panel never painted".into());
+        }
+        pty.type_in("jjj");
+        if !pty.wait_for_screen("panel-row-03", REACH_TIMEOUT) {
+            return Err("the selection did not move".into());
+        }
+        transcript.push_str(&pty.screen());
+        let open = erasing_grid(&transcript, 24);
+        if !open.iter().any(|row| row.contains("panel-row-03")) {
+            return Err(format!(
+                "control: the panel is not on the replayed screen: {open:?}"
+            ));
+        }
+        pty.type_in("\x1b");
+        if !pty.wait_for_screen("PANEL_CLOSED", REACH_TIMEOUT) {
+            return Err("Esc did not close the panel".into());
+        }
+        transcript.push_str(&pty.screen());
+        let live = erasing_grid(&transcript, 24);
+        if !live.iter().any(|row| row.contains("HISTORY_ABOVE_PANEL")) {
+            return Err(format!(
+                "close erased the history above the panel: {live:?}"
+            ));
+        }
+        if let Some(row) = live.iter().find(|row| row.contains("panel-row-")) {
+            return Err(format!("panel text left after close: {row:?}: {live:?}"));
+        }
+        pty.type_in("\r");
+        if !pty.wait_for_screen("PANEL_LOOP_RESTORED", REACH_TIMEOUT) {
+            return Err("the draft was not handed back intact".into());
         }
         pty.type_in("\n");
         Ok(())
