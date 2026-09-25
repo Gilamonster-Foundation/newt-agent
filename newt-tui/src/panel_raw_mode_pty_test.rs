@@ -613,13 +613,7 @@ fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool, answer_dsr:
         let bottom = rows.iter().rposition(|row| row.contains('╰'));
         top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
     };
-    let mut pump = Pump {
-        pty: &pty,
-        transcript: String::new(),
-        mark: 0,
-        answer_dsr,
-        rows: 24,
-    };
+    let mut pump = Pump::new(&pty, answer_dsr, 24);
     let result = (|| -> Result<(), String> {
         let step = |pump: &mut Pump, what: &str, act: &dyn Fn(&mut Pump), want: usize| {
             pump.mark();
@@ -696,18 +690,28 @@ fn drive_held(shrink_to: Option<(u16, usize)>, holder_follows: bool, answer_dsr:
 
 /// Drains the child's output into one transcript, and (when `answer_dsr`)
 /// answers each cursor-position query from a replay of that transcript.
-struct Pump<'a> {
+pub(crate) struct Pump<'a> {
     pty: &'a Pty,
-    transcript: String,
+    pub(crate) transcript: String,
     /// Where the current step's bytes start in `transcript`.
     mark: usize,
     answer_dsr: bool,
     /// The screen height the replay scrolls at.
-    rows: usize,
+    pub(crate) rows: usize,
 }
 
-impl Pump<'_> {
-    fn pump(&mut self) {
+impl<'a> Pump<'a> {
+    pub(crate) fn new(pty: &'a Pty, answer_dsr: bool, rows: usize) -> Self {
+        Self {
+            pty,
+            transcript: String::new(),
+            mark: 0,
+            answer_dsr,
+            rows,
+        }
+    }
+
+    pub(crate) fn pump(&mut self) {
         let chunk = self.pty.screen();
         for (at, _) in chunk.match_indices("\x1b[6n") {
             if self.answer_dsr {
@@ -720,14 +724,14 @@ impl Pump<'_> {
         self.transcript.push_str(&chunk);
     }
 
-    fn mark(&mut self) {
+    pub(crate) fn mark(&mut self) {
         self.pump();
         self.mark = self.transcript.len();
     }
 
     /// Pump until `needle` appears in what arrived since the last `mark`, and
     /// return that text. The mark then moves past it.
-    fn until(&mut self, needle: &str) -> Option<String> {
+    pub(crate) fn until(&mut self, needle: &str) -> Option<String> {
         let deadline = Instant::now() + REACH_TIMEOUT;
         loop {
             self.pump();
