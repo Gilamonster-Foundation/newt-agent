@@ -1107,14 +1107,16 @@ fn escalation_result(
     escalated_after_timeout(escalated, wall)
 }
 
-/// `lifecycle action=run`, with F19's timeout escalation: on the default wall
-/// (never the build wall — see `escalates`), one re-run through the SAME
-/// build lane `action=build` uses (`run_confined_build_lane`
-/// — same `leq`/permission-gate re-check, never bypassed). A dedicated fn (not
-/// inlined in the `lifecycle` dispatch arm) so `permission_gate`'s two sequential
-/// reborrows each end cleanly at their own `.await`, rather than the borrow
-/// checker unifying them against the enclosing dispatch fn's much larger
-/// lifetime graph.
+/// `lifecycle action=run` for NON-build-tool commands, with F19's timeout
+/// escalation: on the default wall (never the build wall — see `escalates`),
+/// one re-run through the SAME build lane `action=build` uses
+/// (`run_confined_build_lane` — same `leq`/permission-gate re-check, never
+/// bypassed). Since F38, runs whose resolved command starts with a build tool
+/// (cargo/just/make) take the build lane directly and never reach this path.
+/// A dedicated fn (not inlined in the `lifecycle` dispatch arm) so
+/// `permission_gate`'s two sequential reborrows each end cleanly at their own
+/// `.await`, rather than the borrow checker unifying them against the enclosing
+/// dispatch fn's much larger lifetime graph.
 #[allow(clippy::too_many_arguments)]
 async fn lifecycle_run_with_escalation(
     args: &serde_json::Value,
@@ -1189,6 +1191,15 @@ async fn lifecycle_run_with_escalation(
     )
     .await;
     escalation_result(first, escalated, wall)
+}
+
+/// F38: does a lifecycle `run`'s resolved command start with a build tool?
+/// When it does, the run lane cannot execute it (the tool isn't in the run
+/// lane's profile), so route directly to the build lane — the same path
+/// `action=build` takes. Uses the same `is_build_tool_exec` predicate that
+/// `dispatch_wall` and the routing table read.
+fn lifecycle_run_routes_to_build_lane(cmd: &str) -> bool {
+    shell::leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec)
 }
 
 /// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
@@ -3948,6 +3959,15 @@ async fn execute_authorized_tool(
                 return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
+            // F38: a `run` whose resolved command starts with a build tool
+            // (cargo/just/make) cannot execute in the run lane (the tool is not
+            // in its profile), so it takes the build lane, exactly as
+            // `action=build` does.
+            let action = if action == "run" && lifecycle_run_routes_to_build_lane(&joined) {
+                "build"
+            } else {
+                action
+            };
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {

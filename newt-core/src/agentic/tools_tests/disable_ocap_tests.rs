@@ -2083,3 +2083,148 @@ async fn a_cd_prefixed_subdirectory_routes_and_says_so() {
         "a genuinely passing build must not be reported as failed: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F38 — lifecycle run of a build-tool command routes to the build lane
+// ---------------------------------------------------------------------------
+
+/// F38 (a): `lifecycle {"phase":"check"}` (no action, defaults to run) when
+/// the resolved command starts with a build tool (cargo) must route to the
+/// build lane and request Build authority — not fail in the run lane.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn lifecycle_run_of_build_tool_requests_build_authority() {
+    struct RecordingDenyGate {
+        seen: Option<super::PermissionRequest>,
+    }
+    impl super::PermissionGate for RecordingDenyGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.seen = requests.first().cloned();
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Cancelled
+        }
+    }
+
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    // Cargo.toml triggers the `rust` pack: check = "cargo fmt -- --check && cargo test"
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"dummy\"\n",
+    )
+    .unwrap();
+    let caveats = caveats_no_exec(ws.path());
+    let mut gate = RecordingDenyGate { seen: None };
+    let out = execute_tool(
+        "lifecycle",
+        &serde_json::json!({"phase": "check"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut gate),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let request = gate
+        .seen
+        .expect("lifecycle run of a build-tool command must consult the build-authority gate");
+    assert_eq!(
+        request.kind,
+        super::DenialKind::Build,
+        "must request Build authority, not exec/fs; got: {:?}",
+        request.kind
+    );
+    assert!(
+        out.contains("build authority") || out.contains("capability denied"),
+        "result must name build authority, not 'just isn't available'; got: {out}"
+    );
+    assert!(
+        !out.contains("isn't available") && !out.contains("Unavailable"),
+        "must not fail in the run lane; got: {out}"
+    );
+}
+
+/// F38 (c): `lifecycle {"phase":"check"}` when the resolved command is NOT a
+/// build tool (e.g. pytest) must NOT route to the build lane — it stays on
+/// the run-lane path with escalation.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn lifecycle_run_of_non_build_tool_does_not_request_build_authority() {
+    struct RecordingDenyGate {
+        seen: Option<super::PermissionRequest>,
+    }
+    impl super::PermissionGate for RecordingDenyGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.seen = requests.first().cloned();
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Cancelled
+        }
+    }
+
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    // pyproject.toml triggers the `python` pack: check = "pytest -x"
+    std::fs::write(
+        ws.path().join("pyproject.toml"),
+        "[project]\nname = \"dummy\"\n",
+    )
+    .unwrap();
+    let caveats = caveats_no_exec(ws.path());
+    let mut gate = RecordingDenyGate { seen: None };
+    let _out = execute_tool(
+        "lifecycle",
+        &serde_json::json!({"phase": "check"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut gate),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let has_build_request = gate
+        .seen
+        .as_ref()
+        .is_some_and(|r| r.kind == super::DenialKind::Build);
+    assert!(
+        !has_build_request,
+        "a non-build-tool lifecycle run must NOT route to the build lane; \
+         gate saw: {:?}",
+        gate.seen
+    );
+}
