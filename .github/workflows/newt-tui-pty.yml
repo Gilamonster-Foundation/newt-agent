@@ -48,6 +48,12 @@ on:
       - "newt-tui/src/lines_panel.rs"
       - "newt-tui/src/session_worker.rs"
       - "newt-tui/src/interaction_view_pty_test.rs"
+      - "newt-tui/src/interaction_view.rs"
+      - "newt-tui/src/clarification_modal.rs"
+      - "newt-tui/src/modal.rs"
+      - "newt-tui/src/completed_spill.rs"
+      # chat.rs is also reached by these tests but is deliberately left out: it
+      # would fire this tier on nearly every PR (see the scoped-gate note above).
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
       - "tests/pty/**"
