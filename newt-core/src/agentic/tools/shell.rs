@@ -796,13 +796,13 @@ pub(super) async fn dispatch_bridled_shell(
     // exec grant — see its doc comment). Call-scoped, exactly like
     // `build_tool_caveats` for the lifecycle build lane.
     let dispatch_caveats = dispatch_caveats_for_command(cmd.unwrap_or(""), caveats);
-    let result = bridle_registry(
+    let registry = bridle_registry(
         shell_engine(),
         live.as_ref().map(LiveOutputSession::relay),
         wall,
-    )
-    .dispatch("shell", args, &dispatch_caveats)
-    .await;
+    );
+    let grant = registry.mint_grant(dispatch_caveats);
+    let result = registry.dispatch("shell", args, &grant).await;
     if let Some(live) = live.as_mut() {
         let ordinary_completion = result
             .as_ref()

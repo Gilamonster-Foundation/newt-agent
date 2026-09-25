@@ -127,10 +127,23 @@ async fn confined_commit(ws: &Path, home: &Path, read_grants: &[String]) -> serd
     // harness binary cannot serve. `run_command` selects between the two per
     // dispatch (`shell_engine`); both honor the identical `Tool` contract and
     // the identical caveats, so the fence under test is the same one.
-    agent_bridle::Registry::builder()
-        .tool(std::sync::Arc::new(agent_bridle::ShellTool::new()))
-        .build()
-        .dispatch("shell", args, &interactive_caveats(ws, read_grants))
+    // agent-bridle 0.8's L3 admission bound only resolves a RESTRICTED `net`
+    // axis when `child_network == DenyDirect`; under the default policy the
+    // axis is `Unknown` and the spawn fails closed before it ever reaches the
+    // `$HOME` read axis this fixture varies. Same floor `run_command` applies
+    // in production (`b1_run_command_sandbox_policy`).
+    let sandbox = agent_bridle::SandboxPolicy {
+        child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
+        ..agent_bridle::SandboxPolicy::default()
+    };
+    let registry = agent_bridle::Registry::builder()
+        .tool(std::sync::Arc::new(
+            agent_bridle::ShellTool::new().with_sandbox_policy(sandbox),
+        ))
+        .build();
+    let grant = registry.mint_grant(interactive_caveats(ws, read_grants));
+    registry
+        .dispatch("shell", args, &grant)
         .await
         .expect("the shell dispatch itself must not error")
 }

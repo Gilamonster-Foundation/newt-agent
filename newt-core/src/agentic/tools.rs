@@ -4985,10 +4985,9 @@ async fn execute_authorized_tool(
                     );
                 }
             }
-            match agent_bridle::registry()
-                .dispatch("web_fetch", fetch_args, effective_caveats)
-                .await
-            {
+            let registry = agent_bridle::registry();
+            let grant = registry.mint_grant(effective_caveats.clone());
+            match registry.dispatch("web_fetch", fetch_args, &grant).await {
                 Ok(result) =>
                     render_web_fetch_result(url, &result, &*mcp, persona_tools, disposition),
                 // A `net`-axis leash denial, or a fetch error (SSRF screen,

@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use agent_bridle::{Caveats, Registry, ToolError};
+use agent_bridle::{Caveats, Grant, Registry, ToolError};
 use newt_core::router::{Router, Tier};
 use newt_inference::BackendRegistry;
 use newt_mcp_client::McpToolset;
@@ -284,6 +284,11 @@ fn register_tools_call(
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
 ) {
+    // Mint once, reused across every `shell_run` / `web_fetch` call this
+    // session (AB-001, #264): a grant minted per call would reset the
+    // `max_calls` budget on every dispatch instead of accounting it
+    // cross-call, as the session's single `granted` leash always did.
+    let grant = Arc::new(bridle.mint_grant((*granted).clone()));
     server.register("tools/call", move |params| {
         // Move clones into the async block so each invocation owns its
         // own Arc (the outer closure is `Fn`, not `FnOnce`).
@@ -291,6 +296,7 @@ fn register_tools_call(
         let router = router.clone();
         let bridle = bridle.clone();
         let granted = granted.clone();
+        let grant = grant.clone();
         let toolset = toolset.clone();
         let persona_tools = persona_tools.clone();
         async move {
@@ -320,8 +326,8 @@ fn register_tools_call(
                 "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
                 "fs_list" => handle_fs_list(&arguments),
                 "git" => handle_git(&arguments, &granted),
-                "shell_run" => Ok(handle_shell_run(arguments, &bridle, &granted).await),
-                "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &granted).await),
+                "shell_run" => Ok(handle_shell_run(arguments, &bridle, &grant).await),
+                "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &grant).await),
                 other if newt_mcp_client::split_namespaced(other).is_some() => {
                     let mut toolset = toolset.lock().await;
                     if !toolset.handles(other) {
@@ -495,7 +501,7 @@ fn handle_fs_list(args: &Value) -> anyhow::Result<Value> {
 /// the model: it sees *why* it was refused without the call collapsing into a
 /// `-32603`. So this function returns a `Value` directly (the `tools/call`
 /// arm wraps it in `Ok`), and never bubbles a leash error up the transport.
-async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> Value {
+async fn handle_shell_run(args: Value, bridle: &Registry, grant: &Grant) -> Value {
     // Validate the one required field. A missing `cmd` is a tool-level mistake,
     // so it comes back as an in-band tool error, matching the leash-denial
     // shape rather than crashing the transport.
@@ -507,7 +513,7 @@ async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> 
     // reads `cmd`, `cwd`, and `timeout_secs` from this exact shape (and clamps
     // the timeout to its own 300s ceiling), so we forward the arguments
     // verbatim — no field translation needed.
-    match bridle.dispatch("shell", args, granted).await {
+    match bridle.dispatch("shell", args, grant).await {
         // The confined shell ran. Its envelope carries
         // `{ exit_code, stdout, stderr, timed_out, sandbox_kind }` plus —
         // when the leash refused a capability — the STRUCTURED denial fields
@@ -547,11 +553,11 @@ async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> 
 /// `ToolError::Denied` from `dispatch` (the `net` scope is checked inside the
 /// tool), so there is no in-envelope `denied` flag to lift — we map `Ok` to MCP
 /// text and any `Err` to an in-band MCP tool error.
-async fn handle_web_fetch(args: Value, bridle: &Registry, granted: &Caveats) -> Value {
+async fn handle_web_fetch(args: Value, bridle: &Registry, grant: &Grant) -> Value {
     if args.get("url").and_then(Value::as_str).is_none() {
         return mcp_error_content("missing required argument: url (must be a string)");
     }
-    match bridle.dispatch("web_fetch", args, granted).await {
+    match bridle.dispatch("web_fetch", args, grant).await {
         // `{ url, final_url, status, title, markdown }` — untrusted page content.
         Ok(result) => match serde_json::to_string_pretty(&result) {
             Ok(text) => mcp_text_content(&text),

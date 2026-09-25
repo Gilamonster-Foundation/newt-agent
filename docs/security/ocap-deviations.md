@@ -188,11 +188,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Compensating controls:** the DIRECT-egress floor stands (no self-opened off-box socket); the
   child is fs- and exec-fenced, limiting what it can DO with a deputy but not stopping it reaching
   one; a hardened host removes ambient network-relaying deputies (not a hard guarantee). FD-hygiene
-  note: the run_command route's inherited-FD hygiene is CLOEXEC-based (std default + agent-bridle
-  `set_cloexec`), NOT the explicit `close_range(3,~0)` the DenyAll `newt-net-guard` route performs
-  (`run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close`) — a non-CLOEXEC network fd
-  would be inherited, so "no pre-opened-fd bypass of the socket() filter" holds only because newt
-  opens its real fds via std (CLOEXEC).
+  note (agent-bridle 0.8+): the run_command route's safe-subset spawner now closes ambient
+  descriptors before exec (`agent-bridle-fdguard`'s `deny_inherited_fds`,
+  `CLOSE_RANGE_CLOEXEC`-based), the same guarantee the DenyAll `newt-net-guard` route's explicit
+  `close_range(3,~0)` gives (`run_command_route_fd_hygiene_is_cloexec_based_via_fdguard`) — a
+  non-CLOEXEC network fd is now closed on both routes, not just inherited-and-CLOEXEC'd. The
+  asymmetry this note previously recorded is closed as of the 0.8.0-rc.4 upgrade.
 - **Closure criterion:** a network namespace (unprivileged netns — blocked by host policy on Ubuntu
   ≥ 23.10) or an equivalent that isolates BOTH the abstract unix namespace AND pathname reachability
   — the mediated-egress / netns floor of #1599 — plus the Windows named-pipe/local-IPC deputy

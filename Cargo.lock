@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle"
-version = "0.7.17"
+version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecf03087631b64b69a197962f28b61d4ff1af97879e0e41b01e8212414fb91c8"
+checksum = "cf06fbce79e7ad4f09a370a9049e4907479173da4acd766851ed1f262f5c0672"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -74,17 +74,20 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-core"
-version = "0.7.17"
+version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e824e659d17599c990bde1f6f947a118690e4d7b298a1f708777ce9b07dd6475"
+checksum = "637952cf3b4fcea947a258b2bf0d553a97b7ab2300e6cfff156fc4202c98dacc"
 dependencies = [
+ "agent-bridle-fdguard",
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "content-addressable",
  "ed25519-dalek",
  "landlock",
  "libc",
  "p256",
+ "rustix 1.1.4",
  "seccompiler",
  "serde",
  "serde_json",
@@ -94,12 +97,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-bridle-tool-shell"
-version = "0.7.17"
+name = "agent-bridle-fdguard"
+version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edf2c0d8e1489075ad3ac5dc88aa6075fdad5689e92484960a8744b742515dbb"
+checksum = "ee359bf6512c0f1864dea3c54870d75856a4a940d5697ebea6d678b4c3e9c404"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "agent-bridle-tool-shell"
+version = "0.8.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f01bee706104999e8fcd2309e45c85dedf6ab2857244dd45c95c4f6f0c12247c"
 dependencies = [
  "agent-bridle-core",
+ "agent-bridle-fdguard",
  "anyhow",
  "async-trait",
  "brush-ocap-builtins",
@@ -117,9 +130,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-web"
-version = "0.7.17"
+version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92823485a2f73fffb62af4ebc6f91a11912dded04af133c2d8b24a50d4ead07"
+checksum = "0b1c4eecc2470683a28543952ca36d76e0c8d2f14ccb56b4613389dbcdba37b3"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -172,11 +185,12 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-protocol"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca4b64ebb314a1060f98ebb8f378983034d72a7547140855edad17556be2805"
+checksum = "7f48aad8c7dc96b395393270a5fecefb8321ca9b13bfd519b56000852c9ef54d"
 dependencies = [
  "blake3",
+ "content-addressable",
  "ed25519-dalek",
  "hex",
  "rand 0.8.7",
@@ -509,7 +523,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -1641,7 +1655,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1866,7 +1880,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2119,7 +2133,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4805,7 +4819,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5759,7 +5773,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6256,7 +6270,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7115,10 +7129,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7146,7 +7160,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8393,7 +8407,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
