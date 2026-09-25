@@ -2257,3 +2257,31 @@ async fn confined_python3_runs_on_macos() {
     .await;
     assert!(out.contains("42"), "{out}");
 }
+
+/// Grounds `git_hardening::sandbox_git_env` against a REAL confined `git`. A
+/// live ornith-1.5-35b run's `git status` died with `unable to access
+/// '~/.gitconfig': Operation not permitted`, because git read the operator's
+/// global config and the fence refused it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn confined_git_ignores_ambient_config_and_carries_the_agent_identity() {
+    let _l = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats {
+        exec: Scope::only(["git".to_string()]),
+        ..caveats_no_exec(ws.path())
+    };
+    let out = run_tool(
+        "run_command",
+        serde_json::json!({"command": "git init -q && git status --short && git config user.email"}),
+        ws.path(),
+        &caveats,
+    )
+    .await;
+    assert!(!out.contains("unable to access"), "{out}");
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    assert!(out.contains(&identity.email), "{out}");
+}

@@ -265,6 +265,49 @@ const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "protocol.ext.allow=never", // no `ext::` transport
 ];
 
+/// The environment for every `git` the model runs in the confined shell.
+///
+/// - No ambient user or system config. The fence cannot read `~/.gitconfig`,
+///   and a live run's `git status` died on exactly that (`unable to access
+///   '~/.gitconfig': Operation not permitted`).
+/// - [`GIT_HARDENING_OVERRIDES`] as git's environment config
+///   (`GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`), which has `-c` precedence and so
+///   beats a hostile repository's `.git/config`, as it does for
+///   [`hardened_git`]. The model can still unset these in its own command; the
+///   threat this answers is the repository, which cannot set the environment.
+/// - `user.name`/`user.email` from the agent identity, so a commit made inside
+///   the sandbox (`stash`, `merge`, `rebase`, `cherry-pick`) is authored by the
+///   agent: never the operator, and never an identity-less failure.
+#[must_use]
+pub fn sandbox_git_env(name: &str, email: &str) -> Vec<(String, String)> {
+    let mut config: Vec<(&str, &str)> = GIT_HARDENING_OVERRIDES
+        .iter()
+        .map(|kv| kv.split_once('=').expect("each override is `key=value`"))
+        .collect();
+    config.extend([
+        // git's XDG defaults (`~/.config/git/ignore`, `…/attributes`) are
+        // ambient config too; unset, git warns that the fence refused them.
+        ("core.excludesFile", "/dev/null"),
+        ("core.attributesFile", "/dev/null"),
+        ("user.name", name),
+        ("user.email", email),
+    ]);
+    let mut env: Vec<(String, String)> = [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    env.push(("GIT_CONFIG_COUNT".to_owned(), config.len().to_string()));
+    for (i, (key, value)) in config.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), key.to_owned()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), value.to_owned()));
+    }
+    env
+}
+
 /// Construct automatic Git metadata only with unrestricted read authority.
 ///
 /// Execution hardening does not confine config includes, object alternates,
@@ -451,6 +494,56 @@ mod tests {
 /// HEAD/dirty line, the ACP worker's diff, and crew — to the ordinary case of
 /// `cd newt-core && newt`. That approach was reverted; this test pins that a
 /// subdirectory launch still finds its repo.
+#[cfg(test)]
+mod sandbox_git_env_tests {
+    use super::*;
+
+    fn config(env: &[(String, String)]) -> Vec<(String, String)> {
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        let count: usize = get("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        (0..count)
+            .map(|i| {
+                (
+                    get(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    get(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ambient_config_is_ignored() {
+        let env = sandbox_git_env("newt-agent", "a@b");
+        assert!(env.contains(&("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())));
+        assert!(env.contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into())));
+    }
+
+    #[test]
+    fn every_hardening_override_rides_the_env_config() {
+        let config = config(&sandbox_git_env("newt-agent", "a@b"));
+        for kv in GIT_HARDENING_OVERRIDES {
+            let (key, value) = kv.split_once('=').unwrap();
+            assert!(
+                config.contains(&(key.into(), value.into())),
+                "{kv} missing: {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn commits_are_authored_by_the_agent_identity() {
+        let config = config(&sandbox_git_env(
+            crate::agent_identity::DEFAULT_AGENT_NAME,
+            crate::agent_identity::DEFAULT_AGENT_EMAIL,
+        ));
+        assert!(config.contains(&("user.name".into(), "newt-agent".into())));
+        assert!(config.contains(&(
+            "user.email".into(),
+            "309460085+newt-agent@users.noreply.github.com".into()
+        )));
+    }
+}
+
 #[cfg(test)]
 mod subdir_discovery_tests {
     use super::*;
