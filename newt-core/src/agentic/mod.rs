@@ -2163,7 +2163,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
@@ -4258,23 +4258,12 @@ struct RepeatCallGuard {
     repeat_memos: std::collections::HashMap<String, RepeatMemo>,
     /// `name` → how many times it has failed this run (any args).
     fails_by_tool: std::collections::HashMap<String, usize>,
-    /// #2374: result-aware verification is on, so a failure memo describes the
-    /// tree it ran against and a workspace change releases it. Off (the
-    /// default path) keeps every failure memo for the turn.
-    clears_failures_on_change: bool,
 }
 
 impl RepeatCallGuard {
     /// How many consecutive failures of one tool before the steer escalates to
     /// "stop using it".
     const ESCALATE_AFTER: usize = 2;
-
-    fn for_verification(result_aware: bool) -> Self {
-        Self {
-            clears_failures_on_change: result_aware,
-            ..Self::default()
-        }
-    }
 
     fn key(name: &str, args: &serde_json::Value) -> String {
         // The model emits byte-identical args when it loops (confirmed by the
@@ -4445,10 +4434,10 @@ impl RepeatCallGuard {
                 )
             });
         }
-        // #2374: in result-aware mode a failure memo describes the tree it ran
-        // against. After a real workspace change the identical call is the
-        // re-check a repair nudge asks for, so the memo is released.
-        if self.clears_failures_on_change && ok && may_change_workspace(name, args) {
+        // #2374/F37: a failure memo describes the tree it ran against. After a
+        // real workspace change the identical call is the re-check the repair
+        // loop needs, so the memo is released in every mode.
+        if ok && may_change_workspace(name, args) {
             self.repeat_memos
                 .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
         }
@@ -6980,7 +6969,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
@@ -9628,7 +9617,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
@@ -11945,7 +11934,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
