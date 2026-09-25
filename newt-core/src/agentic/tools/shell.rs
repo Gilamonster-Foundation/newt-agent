@@ -110,10 +110,13 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     }
     // Model-run git: no ambient config, the hardening overrides, and the
     // agent as author (see `git_hardening::sandbox_git_env`).
-    let identity = session_agent_identity();
+    // Resolved per dispatch, so a `/settings` change applies to the next
+    // command rather than the next session.
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    let (name, email) = identity.sandbox_author();
     map.extend(crate::git_hardening::sandbox_git_env(
-        &identity.name,
-        &identity.email,
+        (&name, &email),
+        &identity.git.config,
     ));
 
     // Identify the confined engine so `env` / scripts can tell they're in newt's
@@ -158,13 +161,6 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     }
 
     map
-}
-
-/// The agent identity sandbox git commits under, resolved once per process
-/// (`agent-identity.toml`, else the compiled-in `newt-agent` default).
-fn session_agent_identity() -> &'static crate::AgentIdentity {
-    static IDENTITY: std::sync::OnceLock<crate::AgentIdentity> = std::sync::OnceLock::new();
-    IDENTITY.get_or_init(|| crate::AgentIdentity::resolve().unwrap_or_default())
 }
 
 /// The confined-shell env passthrough list: `NEWT_SHELL_ENV_PASSTHROUGH`

@@ -860,6 +860,24 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Journal,
         Surface::Native,
     ),
+    cmd_on(
+        // Sandbox git profile fields: never verbs. Journal, because the write
+        // goes through `apply_and_record`; both persist to agent-identity.toml.
+        "git-author",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
+        "git-config",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
     cmd(
         // Absorbed as the form's first `Text` field in #2009 PR5, and
         // still a typed verb until the window closes.

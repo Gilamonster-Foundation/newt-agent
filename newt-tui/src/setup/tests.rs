@@ -3031,3 +3031,35 @@ async fn custom_host_requires_a_host() {
     // The reprompt message was shown.
     assert!(console.transcript().contains("host is required"));
 }
+
+/// Setup asks the sandbox git profile through `/settings`' own fields and
+/// writes it through their one path, into the operator's identity file.
+#[test]
+#[serial_test::serial]
+fn setup_writes_the_sandbox_git_profile_through_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+    // `git-author` menu: [2] operator; `git-config` menu: [1] baseline.
+    let console = ScriptedConsole::new(&["2", "1"]);
+    offer_sandbox_git(&console.operator());
+    let saved = newt_core::AgentIdentity::load(
+        &dir.path()
+            .join(newt_core::agent_identity::AGENT_IDENTITY_FILENAME),
+    )
+    .unwrap();
+    assert_eq!(
+        saved.git.author,
+        newt_core::agent_identity::SandboxAuthor::Operator
+    );
+    assert_eq!(
+        saved.git.config_source,
+        newt_core::agent_identity::GitConfigSource::Baseline
+    );
+    assert!(
+        console
+            .transcript()
+            .contains("sandbox git commit author: operator"),
+        "{}",
+        console.transcript()
+    );
+}

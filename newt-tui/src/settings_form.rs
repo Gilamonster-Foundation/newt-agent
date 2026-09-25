@@ -109,6 +109,8 @@ pub(crate) enum Field {
     Posture,
     Rounds,
     Prefix,
+    GitAuthor,
+    GitConfig,
 }
 
 impl Field {
@@ -128,6 +130,8 @@ impl Field {
         Self::Posture,
         Self::Rounds,
         Self::Prefix,
+        Self::GitAuthor,
+        Self::GitConfig,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -149,6 +153,8 @@ impl Field {
             Self::Posture => "posture",
             Self::Rounds => "rounds",
             Self::Prefix => "prefix",
+            Self::GitAuthor => "git-author",
+            Self::GitConfig => "git-config",
         }
     }
 
@@ -168,6 +174,8 @@ impl Field {
             Self::Posture => "permission posture",
             Self::Rounds => "tool-call round limit",
             Self::Prefix => "meta prefix key",
+            Self::GitAuthor => "sandbox git commit author",
+            Self::GitConfig => "sandbox git settings",
         }
     }
 
@@ -241,6 +249,20 @@ impl Field {
             // on a pipe. The absorbed verb offered all three and so does this.
             // Each choice says what it would shadow, because that is the
             // whole trade: tmux/herdr semantics on a chord of your choosing.
+            Self::GitAuthor => owned(&[
+                (
+                    "agent",
+                    "the agent identity, so sandbox commits never pass for yours (default)",
+                ),
+                ("operator", "your own git name and email"),
+            ]),
+            Self::GitConfig => owned(&[
+                ("baseline", "git's own defaults; nothing copied (default)"),
+                (
+                    "environment",
+                    "copy your ~/.gitconfig's plain settings now (never aliases, credentials or includes)",
+                ),
+            ]),
             Self::Prefix => owned(&[
                 ("ctrl+space", "collides with nothing in newt (default)"),
                 (
@@ -347,6 +369,8 @@ impl Field {
         use newt_core::cognition::cli_cognition;
         match self {
             Self::Prefix => prefix_setting(),
+            Self::GitAuthor => git_profile().author.as_str().to_string(),
+            Self::GitConfig => git_profile().config_source.as_str().to_string(),
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
                 newt_core::EditMode::Emacs => "emacs",
@@ -774,6 +798,30 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // session would be a trap. `[tui] prefix_key`, through the
         // comment-preserving writer; and the session, so the next panel uses it
         // at once.
+        // Persisted to the operator's `agent-identity.toml`: the shell reads
+        // it on every dispatch, so the next command already uses it.
+        Field::GitAuthor => persist_git_profile(|git| {
+            git.author = if value == "operator" {
+                newt_core::agent_identity::SandboxAuthor::Operator
+            } else {
+                newt_core::agent_identity::SandboxAuthor::Agent
+            };
+            Ok(())
+        })?,
+        // Choosing `environment` takes the snapshot NOW, so choosing it again
+        // is how the operator refreshes it.
+        Field::GitConfig => persist_git_profile(|git| {
+            if value == "environment" {
+                let listing = newt_core::git_hardening::ambient_git_config_listing()
+                    .map_err(|e| format!("could not read your git config: {e}"))?;
+                git.config = newt_core::git_hardening::copyable_git_config(&listing);
+                git.config_source = newt_core::agent_identity::GitConfigSource::Environment;
+            } else {
+                git.config.clear();
+                git.config_source = newt_core::agent_identity::GitConfigSource::Baseline;
+            }
+            Ok(())
+        })?,
         Field::Prefix => {
             persist_tui_key("prefix_key", value)?;
             newt_core::process_env::set_var("NEWT_PREFIX_KEY", value);
@@ -782,6 +830,27 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         }
     }
     Ok(format!("{}: {value}", field.label()))
+}
+
+/// The sandbox git profile in force (`[agent-identity.git]`).
+fn git_profile() -> newt_core::agent_identity::GitProfile {
+    newt_core::AgentIdentity::resolve().unwrap_or_default().git
+}
+
+/// Edit the sandbox git profile in the operator's own `agent-identity.toml`,
+/// keeping every other field of that file as it was.
+fn persist_git_profile(
+    edit: impl FnOnce(&mut newt_core::agent_identity::GitProfile) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = newt_core::AgentIdentity::user_identity_path()
+        .ok_or("no home directory to hold agent-identity.toml")?;
+    let mut identity = if path.is_file() {
+        newt_core::AgentIdentity::load(&path).map_err(|e| e.to_string())?
+    } else {
+        newt_core::AgentIdentity::default()
+    };
+    edit(&mut identity.git)?;
+    identity.save(&path).map_err(|e| e.to_string())
 }
 
 /// The change a transition is recorded as, or `None` when the registry
@@ -1111,6 +1180,13 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
 }
 
 fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
+    ask_and_apply(ask, field, "/settings")
+}
+
+/// Ask for one field's value and apply it through [`apply_and_record`],
+/// recorded as reached `via` (`/settings`, `/setup`). Setup asks the git
+/// profile through this, so its questions and its write are `/settings`' own.
+pub(crate) fn ask_and_apply(ask: Ask<'_>, field: Field, via: &str) -> Vec<String> {
     let cancelled = || vec!["settings: cancelled".to_string()];
     let definition = value_menu(field);
     let value = match field.value_space() {
@@ -1156,7 +1232,7 @@ fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
             (*value).to_string()
         }
     };
-    vec![match apply_and_record(field, &value, "/settings") {
+    vec![match apply_and_record(field, &value, via) {
         Ok(msg) | Err(msg) => msg,
     }]
 }
