@@ -1,12 +1,24 @@
 //! Blocker-4 (mandate §4) real-resource proof: a confined child cannot use a
 //! file descriptor the parent left open. An inherited fd is a capability that
 //! BYPASSES pathname confinement — Landlock governs `open`, not an already-open
-//! description — so `newt-net-guard` closes every inherited fd `>= 3` before exec.
+//! description.
 //!
 //! The child reads DIRECTLY from the inherited fd (`cat <&N`), not via
 //! `/proc/self/fd/N` (which would re-`open` and hit Landlock); that is the true
-//! fd-capability bypass. The control (no guard) proves the fd really is inherited
-//! and readable, so the guarded case's denial is the fd closure at work.
+//! fd-capability bypass.
+//!
+//! **Updated for the agent-bridle 0.8 upgrade.** Pre-0.8, `newt-net-guard`
+//! (`NetGrant::DenyAll`) was the ONLY thing that closed an inherited fd, so the
+//! control (no guard, `NetGrant::Unrestricted`) proved the bypass was real by
+//! showing the fd WAS readable there. As of agent-bridle 0.8,
+//! `agent_bridle_fdguard::deny_inherited_fds` runs unconditionally in
+//! `ConfinedCommand::spawn` (agent-bridle#319) — every confined spawn now
+//! closes ambient descriptors, independent of `NetGrant`. So `Unrestricted`
+//! through `ConstrainedExecutor` no longer demonstrates the bypass either; the
+//! control has to step OUTSIDE `ConstrainedExecutor` entirely (a bare
+//! `std::process::Command`, no agent-bridle at all) to show the fd really is
+//! OS-level inheritable, and both in-fence `NetGrant` arms now close it — a
+//! strict improvement over the pre-0.8 behavior this test used to pin.
 //!
 //! Linux, `#[serial]`. Where Landlock is unavailable the guarded spawn fails
 //! closed (nothing runs) and the test is a no-op pass.
@@ -38,6 +50,20 @@ fn inheritable_sentinel_fd() -> (tempfile::TempDir, std::fs::File, i32) {
     (dir, f, fd)
 }
 
+/// Genuinely unconfined: a bare `std::process::Command`, no agent-bridle
+/// anywhere in the path. Proves the OS really does inherit a non-CLOEXEC fd
+/// across `exec` (the ground truth every other branch is measured against).
+fn raw_unconfined_read(fd: i32) -> String {
+    let script = format!("cat <&{fd} 2>/dev/null; echo END");
+    let output = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("raw unconfined spawn must succeed");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn read_inherited_fd(ws: &Path, fd: i32, net: NetGrant) -> Result<String, ExecRefused> {
     // Read straight from the inherited fd (bypasses Landlock's open-time checks).
     let script = format!("cat <&{fd} 2>/dev/null; echo END");
@@ -60,24 +86,36 @@ fn a_confined_guarded_child_cannot_read_an_inherited_out_of_workspace_fd() {
     let (_sentinel, f, fd) = inheritable_sentinel_fd();
     let ws = tempdir().unwrap();
 
-    // CONTROL — no guard (Unrestricted): the fd IS inherited and readable, which
-    // proves the bypass is real (and that Landlock alone does not stop it).
+    // GROUND TRUTH — no agent-bridle involved at all: the fd IS inherited and
+    // readable, proving the OS-level bypass is real (and that Landlock alone,
+    // even if present, does not stop it — this run has no sandbox whatsoever).
+    let raw = raw_unconfined_read(fd);
+    assert!(
+        raw.contains(SECRET),
+        "ground truth: a raw unconfined child should read the inherited fd (else the test \
+         proves nothing) — got: {raw}"
+    );
+
+    // UNRESTRICTED through ConstrainedExecutor — agent-bridle 0.8's
+    // `ConfinedCommand::spawn` now closes ambient descriptors unconditionally
+    // (agent-bridle#319), so even the "no guard" net grant no longer leaks the
+    // fd. Confinement-unenforceable (no Landlock) is a no-op pass, same as before.
     match read_inherited_fd(ws.path(), fd, NetGrant::Unrestricted) {
         Ok(out) => assert!(
-            out.contains(SECRET),
-            "control: the inherited fd should be readable without the guard (else the test \
-             proves nothing) — got: {out}"
+            !out.contains(SECRET),
+            "agent-bridle 0.8's base ConfinedCommand should close inherited fds even under \
+             NetGrant::Unrestricted — fd hygiene regressed:\n{out}"
         ),
         Err(ExecRefused::ConfinementUnenforceable(_)) => {
-            // No Landlock at all → both branches fail closed; nothing to prove.
             unsafe { libc::close(fd) };
             drop(f);
             return;
         }
-        Err(e) => panic!("control run errored: {e}"),
+        Err(e) => panic!("unrestricted run errored: {e}"),
     }
 
-    // GUARDED — DenyAll routes through newt-net-guard, which closes inherited fds.
+    // GUARDED — DenyAll routes through newt-net-guard, which ALSO closes
+    // inherited fds (belt-and-suspenders with agent-bridle's own fdguard).
     let guarded = read_inherited_fd(ws.path(), fd, NetGrant::DenyAll);
     unsafe { libc::close(fd) };
     drop(f);
