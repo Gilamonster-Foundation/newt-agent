@@ -212,3 +212,78 @@ fn permission_policy_offers_session_allow_for_build_on_the_web_surface_too() {
         );
     }
 }
+
+fn fetch_request(host: &str) -> PermissionRequest {
+    PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Net,
+        target: host.into(),
+        reason: "Fetch the crates Cargo.lock pins: `cargo fetch --locked`".into(),
+    }
+}
+
+/// The dependency-fetch prompt (#2595) describes a one-shot `cargo fetch`.
+/// Before the fix it offered session/permanent allow, and a recorded grant
+/// flowed into `recalled_caveats`, widening the SHELL WORKER's net to
+/// crates.io for the rest of the session. It must offer allow-once/deny only.
+#[test]
+fn dependency_fetch_prompt_offers_no_session_or_permanent_allow() {
+    let danger = DangerTable::builtin();
+    for audience in [Audience::Terminal, Audience::Web] {
+        let (actions, _) = permission_policy(&fetch_request("index.crates.io"), &danger, audience);
+        for a in &actions {
+            assert!(
+                !matches!(
+                    a.action,
+                    PromptChoice::AllowSession | PromptChoice::AllowPermanent
+                ),
+                "fetch prompt must be one-shot, offered {:?}",
+                a.label
+            );
+        }
+        assert!(actions.iter().any(|a| a.action == PromptChoice::AllowOnce));
+    }
+    // An ordinary net request keeps its session scope.
+    let (actions, _) = permission_policy(
+        &PermissionRequest {
+            tool: "run_command".into(),
+            ..fetch_request("example.com")
+        },
+        &danger,
+        Audience::Terminal,
+    );
+    assert!(actions
+        .iter()
+        .any(|a| a.action == PromptChoice::AllowSession));
+}
+
+/// Answering the fetch prompt with the strongest allow must not leave the
+/// crates.io hosts in the caveats later tool dispatch (run_command) receives.
+#[test]
+fn answering_the_fetch_prompt_with_the_strongest_allow_records_no_net_grant() {
+    let base = Caveats {
+        net: Scope::only(Vec::<String>::new()),
+        ..Caveats::top()
+    };
+    let mut state = PermissionPromptState::default();
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowPermanent, PromptChoice::AllowPermanent],
+        Rc::new(Cell::new(0)),
+    );
+    let requests = [
+        fetch_request("index.crates.io"),
+        fetch_request("static.crates.io"),
+    ];
+    let _ = gate.ask(&requests);
+    let after = state.recalled_caveats(&base, None);
+    for host in ["index.crates.io", "static.crates.io"] {
+        assert!(
+            !after.permits_net(host),
+            "{host} leaked into the worker's caveats"
+        );
+    }
+}
