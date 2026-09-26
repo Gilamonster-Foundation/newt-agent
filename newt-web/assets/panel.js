@@ -73,9 +73,30 @@
     }
   });
 
+  // Theme toggle. Dark is the default; light is an explicit choice kept in the
+  // `newt_theme` cookie, which the server reads to render `data-theme` on
+  // <html> — so a reload paints the chosen theme first, with no flash. The
+  // button ships `hidden` and is revealed here: without script it could do
+  // nothing, so it is not offered.
+  function wireTheme() {
+    var button = document.querySelector("[data-theme-toggle]");
+    if (!button) return;
+    button.hidden = false;
+    button.addEventListener("click", function () {
+      var root = document.documentElement;
+      var light = root.getAttribute("data-theme") !== "light";
+      if (light) root.setAttribute("data-theme", "light");
+      else root.removeAttribute("data-theme");
+      document.cookie =
+        "newt_theme=" + (light ? "light" : "dark") +
+        "; Path=/; Max-Age=31536000; SameSite=Strict";
+    });
+  }
+
   window.newtAttachStreams = scan;
   document.addEventListener("DOMContentLoaded", function () {
     scan(document);
+    wireTheme();
   });
   document.addEventListener("htmx:afterSwap", function (event) {
     scan(event.detail.target);

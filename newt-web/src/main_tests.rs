@@ -1915,3 +1915,39 @@ mod c3c {
         clear_web_env();
     }
 }
+
+/// Dark is the default and light is opt-in: the page carries
+/// `data-theme="light"` only for the exact cookie value `light`, and a
+/// garbled or hostile value falls back to the default rather than into markup.
+#[serial_test::serial(newt_web_env)]
+#[tokio::test]
+async fn theme_is_dark_by_default_and_light_only_by_explicit_choice() {
+    let render = |cookie: &'static str| async move {
+        let mut b = axum::http::Request::builder().method("GET").uri("/");
+        if !cookie.is_empty() {
+            b = b.header("cookie", cookie);
+        }
+        let resp = app()
+            .oneshot(b.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let light = r#"<html lang="en" data-theme="light">"#;
+    let dark = r#"<html lang="en">"#;
+
+    assert!(render("").await.contains(dark), "no cookie → dark");
+    assert!(render("newt_theme=dark").await.contains(dark));
+    assert!(render("a=1; newt_theme=light").await.contains(light));
+    let hostile = render(r#"newt_theme="><script>x</script>"#).await;
+    assert!(hostile.contains(dark), "hostile value → default");
+    assert!(
+        !hostile.contains("<script>x"),
+        "cookie never reaches markup"
+    );
+    assert!(
+        render("not_newt_theme=light").await.contains(dark),
+        "cookie name is matched exactly, not by suffix"
+    );
+}
