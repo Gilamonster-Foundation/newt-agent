@@ -6586,7 +6586,33 @@ fn prepare_openai_assistant_replay(
             object.remove("reasoning_content");
         }
     }
+    sanitize_replayed_tool_call_arguments(&mut assistant);
     assistant
+}
+
+/// #2558/F39: every replayed assistant turn routes through
+/// [`prepare_openai_assistant_replay`] before entering `messages` — the one
+/// place to make an unparseable `arguments` string harmless everywhere
+/// (chat, the reasoning-continuation replay, and the token-count preflight,
+/// which all resend `messages` verbatim). A call whose `arguments` string
+/// fails to parse as JSON is replayed as `"{}"`: the model already sees a
+/// rejection naming the parse error (`validate_tool_call_batch` /
+/// `ContentInvalid`), and never sees this call dispatched, so a small valid
+/// stand-in cannot be mistaken for real input reaching a tool.
+fn sanitize_replayed_tool_call_arguments(assistant: &mut serde_json::Value) {
+    let Some(calls) = assistant["tool_calls"].as_array_mut() else {
+        return;
+    };
+    for call in calls {
+        let Some(args) = call["function"]["arguments"].as_str() else {
+            continue;
+        };
+        let trimmed = args.trim();
+        if trimmed.is_empty() || serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+            continue;
+        }
+        call["function"]["arguments"] = serde_json::Value::String("{}".to_string());
+    }
 }
 
 /// Count the assembled Chat Completions body only when admission has a bound.

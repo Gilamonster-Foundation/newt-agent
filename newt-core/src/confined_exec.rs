@@ -939,6 +939,56 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
     policy
 }
 
+/// The Xcode binaries a bare-name exec grant already reaches: for each granted
+/// name whose `/usr/bin/<name>` is present, `<developer>/usr/bin/<name>`.
+///
+/// On macOS `/usr/bin/python3`, `/usr/bin/git`, `/usr/bin/clang` and the rest
+/// are xcrun shims that only forward to that binary, and the shell lane puts
+/// `<developer>/usr/bin` first on the child's PATH so the shim's per-user xcrun
+/// cache is never needed. A bare grant resolves only against the system dirs,
+/// though, so without the twin the kernel refused the very binary PATH chose
+/// (`execvp() of 'python3' failed: Operation not permitted`). Admitting it is
+/// the grant the operator already made, as agent-bridle admits `/bin/bash` for
+/// a granted `/bin/sh`. Empty off macOS or with no selected developer dir.
+#[must_use]
+pub(crate) fn developer_exec_twins<'a>(exec: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = selected_developer_directory() {
+        return exec
+            .into_iter()
+            .filter(|name| !name.contains('/') && Path::new("/usr/bin").join(name).is_file())
+            .map(|name| Path::new(developer).join("usr/bin").join(name))
+            .filter_map(|twin| twin.canonicalize().ok())
+            .filter(|twin| twin.is_file())
+            .flat_map(|twin| {
+                // A framework build's `Versions/<v>/bin/<name>` is itself a
+                // launcher that re-spawns a companion inside its bundle.
+                let companions: Vec<PathBuf> = twin
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(|version| {
+                        FRAMEWORK_LAUNCHER_COMPANIONS
+                            .iter()
+                            .map(|relative| version.join(relative))
+                            .filter(|companion| companion.is_file())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                std::iter::once(twin).chain(companions)
+            })
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    }
+    let _ = exec;
+    Vec::new()
+}
+
+/// What a macOS framework launcher (`<Name>.framework/Versions/<v>/bin/<tool>`)
+/// re-spawns, relative to its `Versions/<v>` directory. Python's framework build
+/// runs its interpreter from an app bundle so it gets a bundle identity.
+#[cfg(target_os = "macos")]
+const FRAMEWORK_LAUNCHER_COMPANIONS: &[&str] = &["Resources/Python.app/Contents/MacOS/Python"];
+
 /// The system's selected toolchain, resolved once without repository env/cwd.
 #[cfg(target_os = "macos")]
 pub(crate) fn selected_developer_directory() -> Option<&'static str> {
@@ -1017,8 +1067,9 @@ pub fn build_tool_request(
 /// tree.
 #[must_use]
 pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
-    let id = blake3::hash(workspace.to_string_lossy().as_bytes()).to_hex();
-    std::env::temp_dir().join("newt-build").join(&id[..16])
+    let id =
+        content_addressable::RawContentId::from_content(workspace.to_string_lossy().as_bytes());
+    std::env::temp_dir().join("newt-build").join(id.to_string())
 }
 
 /// The crates.io hosts `cargo fetch` reaches: the sparse index and the

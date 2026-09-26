@@ -265,6 +265,148 @@ const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "protocol.ext.allow=never", // no `ext::` transport
 ];
 
+/// The git settings a sandbox profile may carry, and the only ones copied from
+/// the operator's own config. Fail-closed: a key reaches sandbox git only when
+/// it matches here (exact key, or a `section.` prefix). Everything a config can
+/// use to run a program or reach a credential is absent by construction:
+/// `alias.*` (`!cmd`), `credential.*`, `include*`, `url.*.insteadOf`,
+/// `core.sshCommand`, `gpg.*`, filter and diff drivers.
+const COPYABLE_GIT_CONFIG: &[&str] = &[
+    "init.defaultbranch",
+    "core.autocrlf",
+    "core.eol",
+    "core.safecrlf",
+    "core.quotepath",
+    "core.whitespace",
+    "pull.rebase",
+    "pull.ff",
+    "push.default",
+    "fetch.prune",
+    "merge.conflictstyle",
+    "rebase.autosquash",
+    "rebase.autostash",
+    "rerere.enabled",
+    "diff.algorithm",
+    "diff.renames",
+    "diff.colormoved",
+    "branch.sort",
+    "tag.sort",
+    "commit.verbose",
+    "help.autocorrect",
+    "color.",
+    "column.",
+    "status.",
+    "log.",
+];
+
+/// Is `key` on [`COPYABLE_GIT_CONFIG`]? Git section and variable names are
+/// case-insensitive.
+fn copyable(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    COPYABLE_GIT_CONFIG.iter().any(|allowed| {
+        if allowed.ends_with('.') {
+            key.starts_with(allowed) && !key[allowed.len()..].contains('.')
+        } else {
+            key == *allowed
+        }
+    })
+}
+
+/// The copyable settings in a `git config --list` listing (`key=value` per
+/// line; a later line wins, as in git).
+#[must_use]
+pub fn copyable_git_config(listing: &str) -> std::collections::BTreeMap<String, String> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| copyable(key))
+        .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
+        .collect()
+}
+
+/// The operator's own global git config as a `--list` listing, read in the
+/// harness (never the sandbox) through [`hardened_git`] with an explicit
+/// `--file`: `~/.gitconfig`, then `$XDG_CONFIG_HOME/git/config`. Missing files
+/// contribute nothing.
+///
+/// # Errors
+/// When no git executable can be found.
+pub fn ambient_git_config_listing() -> io::Result<String> {
+    let Some(home) = crate::config::home_dir() else {
+        return Ok(String::new());
+    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let mut listing = String::new();
+    for file in [home.join(".gitconfig"), xdg.join("git").join("config")] {
+        if !file.is_file() {
+            continue;
+        }
+        let file = file.to_string_lossy().into_owned();
+        let output = hardened_git(&home, &["config", "--file", &file, "--list"])?.output()?;
+        if output.status.success() {
+            listing.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    Ok(listing)
+}
+
+/// The environment for every `git` the model runs in the confined shell.
+///
+/// - No ambient user or system config. The fence cannot read `~/.gitconfig`,
+///   and a live run's `git status` died on exactly that (`unable to access
+///   '~/.gitconfig': Operation not permitted`). The operator's own settings
+///   arrive only as the vetted `profile` snapshot.
+/// - `profile`: the sandbox profile's plain settings, filtered again through
+///   [`COPYABLE_GIT_CONFIG`] so a hand-edited or repository-supplied profile
+///   cannot carry what the copy would have refused.
+/// - `user.name`/`user.email` = `author`, so a commit made inside the sandbox
+///   (`stash`, `merge`, `rebase`, `cherry-pick`) is never identity-less.
+/// - [`GIT_HARDENING_OVERRIDES`] LAST, as git's environment config
+///   (`GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`, `-c` precedence, so it beats a
+///   hostile `.git/config`). The model can still unset these in its own
+///   command; the threat this answers is the repository, which cannot set the
+///   environment.
+#[must_use]
+pub fn sandbox_git_env(
+    author: (&str, &str),
+    profile: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut config: Vec<(&str, &str)> = profile
+        .iter()
+        .filter(|(key, _)| copyable(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    config.extend([
+        // git's XDG defaults (`~/.config/git/ignore`, `…/attributes`) are
+        // ambient config too; unset, git warns that the fence refused them.
+        ("core.excludesFile", "/dev/null"),
+        ("core.attributesFile", "/dev/null"),
+        ("user.name", author.0),
+        ("user.email", author.1),
+    ]);
+    config.extend(
+        GIT_HARDENING_OVERRIDES
+            .iter()
+            .map(|kv| kv.split_once('=').expect("each override is `key=value`")),
+    );
+    let mut env: Vec<(String, String)> = [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    env.push(("GIT_CONFIG_COUNT".to_owned(), config.len().to_string()));
+    for (i, (key, value)) in config.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), key.to_owned()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), value.to_owned()));
+    }
+    env
+}
+
 /// Construct automatic Git metadata only with unrestricted read authority.
 ///
 /// Execution hardening does not confine config includes, object alternates,
@@ -451,6 +593,97 @@ mod tests {
 /// HEAD/dirty line, the ACP worker's diff, and crew — to the ordinary case of
 /// `cd newt-core && newt`. That approach was reverted; this test pins that a
 /// subdirectory launch still finds its repo.
+#[cfg(test)]
+mod sandbox_git_env_tests {
+    use super::*;
+
+    fn config(env: &[(String, String)]) -> Vec<(String, String)> {
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        let count: usize = get("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        (0..count)
+            .map(|i| {
+                (
+                    get(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    get(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ambient_config_is_ignored() {
+        let env = sandbox_git_env(("newt-agent", "a@b"), &Default::default());
+        assert!(env.contains(&("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())));
+        assert!(env.contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into())));
+    }
+
+    #[test]
+    fn every_hardening_override_rides_the_env_config() {
+        let config = config(&sandbox_git_env(("newt-agent", "a@b"), &Default::default()));
+        for kv in GIT_HARDENING_OVERRIDES {
+            let (key, value) = kv.split_once('=').unwrap();
+            assert!(
+                config.contains(&(key.into(), value.into())),
+                "{kv} missing: {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn commits_are_authored_by_the_agent_identity() {
+        let config = config(&sandbox_git_env(
+            (
+                crate::agent_identity::DEFAULT_AGENT_NAME,
+                crate::agent_identity::DEFAULT_AGENT_EMAIL,
+            ),
+            &Default::default(),
+        ));
+        assert!(config.contains(&("user.name".into(), "newt-agent".into())));
+        assert!(config.contains(&(
+            "user.email".into(),
+            "309460085+newt-agent@users.noreply.github.com".into()
+        )));
+    }
+    #[test]
+    fn a_copy_keeps_plain_settings_and_drops_every_gadget() {
+        let listing = "user.name=Op\ninit.defaultBranch=main\nalias.x=!curl evil\n\
+            credential.helper=osxkeychain\ncore.sshCommand=ssh -i k\ninclude.path=~/x\n\
+            url.git@h:.insteadof=https://h/\ncolor.ui=auto\ncolor.diff.meta=blue\npull.rebase=true\n";
+        let copied = copyable_git_config(listing);
+        let keys: Vec<&str> = copied.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["color.ui", "init.defaultbranch", "pull.rebase"]);
+    }
+
+    #[test]
+    fn a_profile_cannot_carry_what_the_copy_refuses() {
+        let profile: std::collections::BTreeMap<String, String> = [
+            ("alias.st".to_owned(), "!sh -c evil".to_owned()),
+            ("init.defaultbranch".to_owned(), "trunk".to_owned()),
+        ]
+        .into();
+        let config = config(&sandbox_git_env(("a", "a@b"), &profile));
+        assert!(
+            config.iter().all(|(key, _)| key != "alias.st"),
+            "{config:?}"
+        );
+        assert!(config.contains(&("init.defaultbranch".into(), "trunk".into())));
+    }
+
+    #[test]
+    fn the_hardening_floor_is_applied_after_the_profile() {
+        let config = config(&sandbox_git_env(("a", "a@b"), &Default::default()));
+        let last_user = config
+            .iter()
+            .rposition(|(k, _)| k.starts_with("user."))
+            .unwrap();
+        let first_floor = config
+            .iter()
+            .position(|(k, _)| k == "core.fsmonitor")
+            .unwrap();
+        assert!(first_floor > last_user, "{config:?}");
+    }
+}
+
 #[cfg(test)]
 mod subdir_discovery_tests {
     use super::*;

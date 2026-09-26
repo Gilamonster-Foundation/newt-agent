@@ -140,7 +140,12 @@ fn permission_policy(
     // allow-once already grants. Refusing the session scope bought no extra
     // safety, only a prompt on every build/test/check in a session (up to 7
     // times observed in one run — NOTES-2483 F30).
-    if tier == danger::DangerTier::Low || req.kind == DenialKind::Build {
+    // #2595: the harness's own dependency fetch (`lifecycle` + net) is a
+    // one-shot `cargo fetch`. A recorded session/permanent grant would flow
+    // into `recalled_caveats` and widen the shell worker's net to crates.io,
+    // which the prompt does not say. Offer allow-once/deny only.
+    let one_shot = req.tool == "lifecycle" && req.kind == DenialKind::Net;
+    if !one_shot && (tier == danger::DangerTier::Low || req.kind == DenialKind::Build) {
         actions.push(OfferedAction {
             action: PromptChoice::AllowSession,
             key: "s",

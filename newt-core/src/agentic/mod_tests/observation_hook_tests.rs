@@ -1131,6 +1131,78 @@ async fn openai_content_invalid_tool_batch_emits_no_accepted() {
     );
 }
 
+/// #2558/F39: a tool call whose `arguments` string is TRUNCATED/INVALID JSON
+/// (e.g. a large embedded script cut off mid-generation) must not poison the
+/// replayed history. FAILS on the pre-fix code, which pushed the raw invalid
+/// string into `messages` before validating the batch — so every later
+/// request (including a token-count preflight) carried unparseable JSON.
+struct OpenAiTruncatedArgsThenText;
+impl Respond for OpenAiTruncatedArgsThenText {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let has_tool_result = body_json(req)["messages"]
+            .as_array()
+            .map(|m| m.iter().any(|x| x["role"] == "tool"))
+            .unwrap_or(false);
+        if has_tool_result {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "recovered answer"}}],
+                "usage": {"prompt_tokens": 5_200, "completion_tokens": 4},
+            }))
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": "{\"cmd\": \"python -c 'a huge script"
+                        }
+                    }]
+                }}],
+                "usage": {"prompt_tokens": 6_000, "completion_tokens": 5},
+            }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_truncated_tool_args_never_reach_a_later_request_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(OpenAiTruncatedArgsThenText)
+        .mount(&server)
+        .await;
+
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the rejected batch re-dispatches to a valid answer");
+
+    assert_eq!(reply, "recovered answer");
+    let received = server.received_requests().await.expect("journal");
+    assert_eq!(received.len(), 2, "one generation per round");
+    let second_body = body_json(&received[1]);
+    let raw = second_body.to_string();
+    assert!(
+        !raw.contains("a huge script"),
+        "the truncated raw arguments must not survive into a later request body: {raw}"
+    );
+    assert!(
+        raw.contains("not valid JSON"),
+        "the model must be told its arguments were rejected: {raw}"
+    );
+}
+
 /// OpenAI RR2: a CORRELATION-IMPOSSIBLE batch (duplicate `tool_call_id`)
 /// aborts the turn with an error and emits NO `Accepted` — a mis-routable
 /// batch is never provider-accept evidence. FAILS on the pre-fix code, which

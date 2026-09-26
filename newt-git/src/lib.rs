@@ -214,6 +214,9 @@ pub enum DiffSpec {
 /// An embedded git engine bound to one repository.
 pub struct GitEngine {
     repo: Repository,
+    /// Signs every commit, amend and rebase commit this engine writes
+    /// ([`GitEngine::write_commit`]); `None` writes them unsigned.
+    signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
 }
 
 /// Refuse a ref-move onto the repository's default branch (F32/#2537: newt may
@@ -318,7 +321,7 @@ impl GitEngine {
         newt_core::agentic::check_git_read_scope("open", read_scope)
             .map_err(GitError::Unsupported)?;
         let repo = Repository::discover(Some(root))?;
-        Ok(Self { repo })
+        Ok(Self { repo, signer: None })
     }
 
     fn head_oid(&self) -> Result<Option<ObjectId>, GitError> {
@@ -681,10 +684,7 @@ impl GitEngine {
             message: message.to_string(),
             raw_message: None,
         };
-        let oid = self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
+        let oid = self.write_commit(&commit)?;
         match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot commit on a detached HEAD")),
@@ -736,10 +736,7 @@ impl GitEngine {
             message: message.map(str::to_string).unwrap_or(head_commit.message),
             raw_message: None,
         };
-        let oid = self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
+        let oid = self.write_commit(&commit)?;
         match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
@@ -785,6 +782,21 @@ impl GitEngine {
         Ok(parse_commit(&self.repo.odb.read(oid)?.data)?.tree)
     }
 
+    /// Write `commit` to the object database, signed when this engine has a
+    /// signer. The one write path for `commit`, `amend` and rebase, so no
+    /// commit from them can go out unsigned once the operator asked for
+    /// signatures. A signing failure writes nothing.
+    fn write_commit(&self, commit: &CommitData) -> Result<ObjectId, GitError> {
+        let mut bytes = serialize_commit(commit);
+        if let Some(signer) = &self.signer {
+            let signature = signer
+                .sign(&bytes)
+                .map_err(|e| GitError::Refused(format!("commit signing failed: {e}")))?;
+            bytes = newt_core::commit_signing::with_signature(&bytes, &signature);
+        }
+        Ok(self.repo.odb.write(ObjectKind::Commit, &bytes)?)
+    }
+
     /// Write a single-parent commit with the agent's identity; returns its oid.
     fn write_commit_on(
         &self,
@@ -805,10 +817,7 @@ impl GitEngine {
             message: message.to_string(),
             raw_message: None,
         };
-        Ok(self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?)
+        self.write_commit(&commit)
     }
 
     /// Structured-plan rebase: replay `steps` (in order) onto `onto`, applying
@@ -1449,6 +1458,9 @@ pub struct LocalGitTool {
     /// refreshes the envelope at the top of each iteration. Atomic for the
     /// same cross-thread reason as `commit_succeeded`.
     pub contributors_consumed: std::sync::atomic::AtomicUsize,
+    /// Signs the commits this tool writes, per the operator's
+    /// `[agent-identity.git] signing` (`newt_core::commit_signing::signer_for`).
+    pub signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
 }
 
 impl LocalGitTool {
@@ -1634,6 +1646,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         // ambient GIT_DIR / GIT_WORK_TREE after the filesystem scope check.
         let eng = GitEngine {
             repo: Repository::open(&git_dir, worktree.as_deref()).map_err(|e| e.to_string())?,
+            signer: self.signer.clone(),
         };
         let s = |e: GitError| e.to_string();
         match op {
