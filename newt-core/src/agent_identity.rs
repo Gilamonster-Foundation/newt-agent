@@ -295,6 +295,83 @@ pub struct AgentIdentity {
     /// resolved on demand and never stored here. Empty by default.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tokens: std::collections::BTreeMap<String, SecretRef>,
+
+    /// How `git` run by the model inside the confined shell behaves
+    /// (`[agent-identity.git]`). Projected by `git_hardening::sandbox_git_env`.
+    #[serde(default, skip_serializing_if = "GitProfile::is_default")]
+    pub git: GitProfile,
+}
+
+/// The operator's sandbox git profile: plain data, seeded by setup and edited
+/// through `/settings`. The hardening overrides are not here and cannot be:
+/// they are applied after this profile, so no file can switch them off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitProfile {
+    /// Whose name goes on a commit made inside the sandbox.
+    pub author: SandboxAuthor,
+    /// Where [`GitProfile::config`] came from, so `/settings` can show it.
+    pub config_source: GitConfigSource,
+    /// Plain git settings for sandbox git (`init.defaultBranch = "main"`). Only
+    /// keys on `git_hardening`'s copyable list ever reach git.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config: std::collections::BTreeMap<String, String>,
+}
+
+impl GitProfile {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Whose identity authors a commit made inside the sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxAuthor {
+    /// This agent identity (`name`/`email` above): the default, so nothing the
+    /// sandbox commits can pass for the operator's own work.
+    #[default]
+    Agent,
+    /// The operator's resolved identity; falls back to the agent's when no
+    /// operator email is known, because an email is never invented.
+    Operator,
+}
+
+impl SandboxAuthor {
+    /// Every value, for the `/settings` menu and setup.
+    pub const ALL: [Self; 2] = [Self::Agent, Self::Operator];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+/// Where the sandbox profile's plain git settings came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitConfigSource {
+    /// None copied: sandbox git runs on git's own defaults.
+    #[default]
+    Baseline,
+    /// A vetted snapshot of the operator's own git config.
+    Environment,
+}
+
+impl GitConfigSource {
+    /// Every value, for the `/settings` menu and setup.
+    pub const ALL: [Self; 2] = [Self::Baseline, Self::Environment];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Environment => "environment",
+        }
+    }
 }
 
 impl Default for AgentIdentity {
@@ -312,6 +389,7 @@ impl Default for AgentIdentity {
             public_key: None,
             github_app: None,
             tokens: std::collections::BTreeMap::new(),
+            git: GitProfile::default(),
         }
     }
 }
@@ -559,6 +637,16 @@ impl AgentIdentity {
         Self::resolve_from_dirs(cwd, home, user_config_dir.as_deref())
     }
 
+    /// A repo-shipped identity is untrusted input, like a project overlay's
+    /// control-plane keys (`strip_control_plane`): its `[agent-identity.git]`
+    /// table is dropped, so a checkout cannot set `author = "operator"` and
+    /// have sandbox commits carry the operator's real name and email. Only
+    /// operator-owned layers (user config dir, system) may set it.
+    fn untrusted_workspace(mut self) -> Self {
+        self.git = GitProfile::default();
+        self
+    }
+
     fn resolve_from_dirs(
         cwd: Option<&Path>,
         home: Option<&Path>,
@@ -572,7 +660,7 @@ impl AgentIdentity {
                 let candidate = cfg.with_file_name(AGENT_IDENTITY_FILENAME);
                 if candidate.is_file() {
                     return Ok((
-                        Self::load(&candidate)?,
+                        Self::load(&candidate)?.untrusted_workspace(),
                         IdentitySource::Workspace(candidate),
                     ));
                 }
@@ -581,7 +669,10 @@ impl AgentIdentity {
             // `config.toml`. Also honor a standalone `.newt/agent-identity.toml`
             // with no sibling config (an agent may ship identity alone).
             if let Some(found) = find_identity_walkup(start, home) {
-                return Ok((Self::load(&found)?, IdentitySource::Workspace(found)));
+                return Ok((
+                    Self::load(&found)?.untrusted_workspace(),
+                    IdentitySource::Workspace(found),
+                ));
             }
         }
 
@@ -635,6 +726,18 @@ impl AgentIdentity {
     #[must_use]
     pub fn operator_email(&self) -> Option<String> {
         self.operator_identity().1
+    }
+
+    /// The `(name, email)` a commit made inside the sandbox carries, per
+    /// [`GitProfile::author`].
+    #[must_use]
+    pub fn sandbox_author(&self) -> (String, String) {
+        if self.git.author == SandboxAuthor::Operator {
+            if let (Some(name), Some(email)) = self.operator_identity() {
+                return (name, email);
+            }
+        }
+        (self.name.clone(), self.email.clone())
     }
 
     /// Resolve the human operator's co-author identity as an ATOMIC
@@ -1144,6 +1247,49 @@ name = "standalone[bot]"
         let (id, src) = AgentIdentity::resolve_from(Some(ws.path()), Some(home.path())).unwrap();
         assert_eq!(id.name, "standalone[bot]");
         assert!(matches!(src, IdentitySource::Workspace(_)));
+    }
+
+    const OPERATOR_AUTHOR_TOML: &str = r#"
+[agent-identity]
+name = "agent[bot]"
+email = "agent@example.test"
+operator = "Op Erator"
+operator_email = "op@example.test"
+
+[agent-identity.git]
+author = "operator"
+"#;
+
+    /// #2600 review blocker: a repository shipping
+    /// `.newt/agent-identity.toml` with `author = "operator"` made sandbox
+    /// commits carry the operator's real identity. The workspace layer's
+    /// `git` table is untrusted and must be ignored.
+    #[test]
+    fn workspace_identity_cannot_set_sandbox_author_to_operator() {
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        write_identity(ws.path(), OPERATOR_AUTHOR_TOML);
+        let (id, src) = AgentIdentity::resolve_from(Some(ws.path()), Some(home.path())).unwrap();
+        assert!(matches!(src, IdentitySource::Workspace(_)));
+        assert_eq!(
+            id.sandbox_author(),
+            ("agent[bot]".to_string(), "agent@example.test".to_string())
+        );
+    }
+
+    /// The same setting in the operator's own config still works.
+    #[test]
+    fn operator_config_may_set_sandbox_author_to_operator() {
+        let home = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        write_identity(home.path(), OPERATOR_AUTHOR_TOML);
+        let (id, src) =
+            AgentIdentity::resolve_from(Some(elsewhere.path()), Some(home.path())).unwrap();
+        assert!(matches!(src, IdentitySource::Home(_)));
+        assert_eq!(
+            id.sandbox_author(),
+            ("Op Erator".to_string(), "op@example.test".to_string())
+        );
     }
 
     // ---- #1709 family: atomic operator (name, email) identity resolution ----
