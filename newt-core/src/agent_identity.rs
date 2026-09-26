@@ -668,12 +668,20 @@ impl AgentIdentity {
     }
 
     /// A repo-shipped identity is untrusted input, like a project overlay's
-    /// control-plane keys (`strip_control_plane`): its `[agent-identity.git]`
-    /// table is dropped, so a checkout cannot set `author = "operator"` and
-    /// have sandbox commits carry the operator's real name and email. Only
-    /// operator-owned layers (user config dir, system) may set it.
+    /// control-plane keys (`strip_control_plane`). Everything that selects a
+    /// key, a signer, a credential source or whose name the commits wear is
+    /// dropped: the `[agent-identity.git]` table (author, signing mode), the
+    /// signing/public key paths, the GitHub App, token references, and the
+    /// operator name/email. Only operator-owned layers (user config dir,
+    /// system) may set them. The agent's own `name`/`email`/`model` stay.
     fn untrusted_workspace(mut self) -> Self {
         self.git = GitProfile::default();
+        self.signing_key = None;
+        self.public_key = None;
+        self.github_app = None;
+        self.tokens.clear();
+        self.operator = None;
+        self.operator_email = None;
         self
     }
 
@@ -1320,6 +1328,53 @@ author = "operator"
             id.sandbox_author(),
             ("Op Erator".to_string(), "op@example.test".to_string())
         );
+    }
+
+    fn signing_toml(mode: &str, key: &Path) -> String {
+        // A TOML literal string, so Windows backslashes need no escaping.
+        format!(
+            "[agent-identity]\nname = \"a[bot]\"\nsigning_key = '{}'\noperator = \"Forged Op\"\n\n[agent-identity.git]\nsigning = \"{mode}\"\n",
+            key.display()
+        )
+    }
+
+    /// #2603: a repo-shipped identity file must not choose the signer or the
+    /// key. `signing = "harness"` + `signing_key = <path>` in a workspace file
+    /// selected that key for the harness's commits; `signing = "operator"`
+    /// selected the operator's own signing key.
+    #[test]
+    fn workspace_identity_cannot_select_a_signer_or_key() {
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let key = ws.path().join("repo-key.pem");
+        crate::commit_signing::generate_harness_key(&key).unwrap();
+        for mode in ["harness", "operator"] {
+            write_identity(ws.path(), &signing_toml(mode, &key));
+            let (id, src) =
+                AgentIdentity::resolve_from(Some(ws.path()), Some(home.path())).unwrap();
+            assert!(matches!(src, IdentitySource::Workspace(_)));
+            assert_eq!(id.signing_key, None, "{mode}: key path survived");
+            assert_eq!(id.operator, None, "{mode}: operator name survived");
+            assert!(
+                crate::commit_signing::session_signer(&id).is_none(),
+                "{mode}: a workspace file selected a signer"
+            );
+        }
+    }
+
+    /// The same settings in the operator's own home file are honoured.
+    #[test]
+    fn operator_home_identity_may_select_the_harness_signer() {
+        let home = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let key = home.path().join("harness.pem");
+        crate::commit_signing::generate_harness_key(&key).unwrap();
+        write_identity(home.path(), &signing_toml("harness", &key));
+        let (id, src) =
+            AgentIdentity::resolve_from(Some(elsewhere.path()), Some(home.path())).unwrap();
+        assert!(matches!(src, IdentitySource::Home(_)));
+        assert!(crate::commit_signing::session_signer(&id).is_some());
+        assert_eq!(id.operator.as_deref(), Some("Forged Op"));
     }
 
     // ---- #1709 family: atomic operator (name, email) identity resolution ----
