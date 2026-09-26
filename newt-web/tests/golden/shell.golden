@@ -11,12 +11,12 @@
      script of its own. -->
 <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
 <script nonce="{NONCE}" src="/assets/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
-<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-NpC8tkQQQinNuwOKjXIGGH/n208xjRj5L3wn7jipl3H2n9rIdEpPlc7yZOROzR8/" crossorigin="anonymous"></script>
+<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-UBk/2r/LxPyZNyAsHN4iyhblujDlj5s6oe0T315LHDpMKXQeaDm639Oy3hXb9YhX" crossorigin="anonymous"></script>
 <style nonce="{NONCE}">
   /* Design tokens. One palette, two themes: every colour below is a token,
      so a theme is a token swap, not a rule rewrite. Dark is the default (a
      console you leave open); light is the operator's explicit choice, set by
-     the header toggle and rendered server-side from the `newt_theme` cookie,
+     the header toggle and rendered server-side from the theme cookie,
      so the page never paints dark and then flips. */
   :root {
     color-scheme: dark;
@@ -170,7 +170,7 @@
 </head>
 <body>
 <header><h1>newt-web</h1>
-<button type="button" data-theme-toggle hidden aria-label="toggle light theme">◐</button></header>
+<button type="button" data-theme-toggle="newt_theme" hidden aria-label="toggle light theme">◐</button></header>
 <div class="cockpit">
 <aside class="sidebar" aria-label="agents and sessions">
 <h2 class="side-head">agents</h2>

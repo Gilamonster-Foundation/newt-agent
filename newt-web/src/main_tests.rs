@@ -2044,3 +2044,39 @@ async fn cockpit_regions_hold_their_seams_exactly_once() {
         );
     }
 }
+
+/// The theme cookie is named once, on the server: the toggle carries that name
+/// to `panel.js` in its `data-theme-toggle` attribute. Round trip without
+/// restating the name here — take it from the rendered toggle, send it back
+/// as the cookie, and the server must honour it. A script that wrote a cookie
+/// the server does not read would leave the theme reverting on every reload.
+#[serial_test::serial(newt_web_env)]
+#[tokio::test]
+async fn the_theme_toggle_names_the_cookie_the_server_reads() {
+    let empty_state = tempfile::tempdir().unwrap();
+    std::env::set_var("NEWT_WEB_STATE_DIR", empty_state.path());
+    let (_, html) = req(&app(), "GET", "/", None).await;
+    let attr = r#"data-theme-toggle=""#;
+    let start = html.find(attr).expect("the toggle names its cookie") + attr.len();
+    let name = &html[start..start + html[start..].find('"').unwrap()];
+    assert!(
+        !name.is_empty(),
+        "a toggle with no cookie name cannot persist"
+    );
+
+    let resp = app()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/")
+                .header("cookie", format!("{name}=light"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(r#"<html lang="en" data-theme="light">"#),
+        "the server reads the cookie the toggle writes ({name})"
+    );
+}
