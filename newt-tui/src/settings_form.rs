@@ -111,6 +111,7 @@ pub(crate) enum Field {
     Prefix,
     GitAuthor,
     GitConfig,
+    GitSigning,
 }
 
 impl Field {
@@ -132,6 +133,7 @@ impl Field {
         Self::Prefix,
         Self::GitAuthor,
         Self::GitConfig,
+        Self::GitSigning,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -155,6 +157,7 @@ impl Field {
             Self::Prefix => "prefix",
             Self::GitAuthor => "git-author",
             Self::GitConfig => "git-config",
+            Self::GitSigning => "git-signing",
         }
     }
 
@@ -176,6 +179,7 @@ impl Field {
             Self::Prefix => "meta prefix key",
             Self::GitAuthor => "sandbox git commit author",
             Self::GitConfig => "sandbox git settings",
+            Self::GitSigning => "harness commit signing",
         }
     }
 
@@ -261,6 +265,17 @@ impl Field {
                 (
                     "environment",
                     "copy your ~/.gitconfig's plain settings now (never aliases, credentials or includes)",
+                ),
+            ]),
+            Self::GitSigning => owned(&[
+                ("off", "newt's commits are unsigned (default)"),
+                (
+                    "harness",
+                    "a harness key newt holds (created if `signing_key` is unset)",
+                ),
+                (
+                    "operator",
+                    "your own git signing key (user.signingkey, gpg.format)",
                 ),
             ]),
             Self::Prefix => owned(&[
@@ -371,6 +386,7 @@ impl Field {
             Self::Prefix => prefix_setting(),
             Self::GitAuthor => git_profile().author.as_str().to_string(),
             Self::GitConfig => git_profile().config_source.as_str().to_string(),
+            Self::GitSigning => git_profile().signing.as_str().to_string(),
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
                 newt_core::EditMode::Emacs => "emacs",
@@ -822,6 +838,34 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
             }
             Ok(())
         })?,
+        // `harness` with no `signing_key` creates one, and says where its
+        // public half goes, because a signature nobody can verify is noise.
+        Field::GitSigning => {
+            let mut created = None;
+            persist_identity(|identity| {
+                use newt_core::agent_identity::SigningMode;
+                identity.git.signing = match value {
+                    "harness" => SigningMode::Harness,
+                    "operator" => SigningMode::Operator,
+                    _ => SigningMode::Off,
+                };
+                if value == "harness" && identity.signing_key.is_none() {
+                    let dir = newt_core::Config::user_config_dir()
+                        .ok_or("no config directory for the harness key")?;
+                    let path = dir.join("harness-signing.pem");
+                    created = Some(newt_core::commit_signing::generate_harness_key(&path)?);
+                    identity.signing_key = Some(path.to_string_lossy().into_owned());
+                }
+                Ok(())
+            })?;
+            if let Some(public) = created {
+                return Ok(format!(
+                    "{}: {value}\nnew harness key; add this to the agent's GitHub account \
+                     as a signing key so its commits verify:\n{public}",
+                    field.label()
+                ));
+            }
+        }
         Field::Prefix => {
             persist_tui_key("prefix_key", value)?;
             newt_core::process_env::set_var("NEWT_PREFIX_KEY", value);
@@ -842,6 +886,13 @@ fn git_profile() -> newt_core::agent_identity::GitProfile {
 fn persist_git_profile(
     edit: impl FnOnce(&mut newt_core::agent_identity::GitProfile) -> Result<(), String>,
 ) -> Result<(), String> {
+    persist_identity(|identity| edit(&mut identity.git))
+}
+
+/// Edit the operator's own `agent-identity.toml`, keeping every other field.
+fn persist_identity(
+    edit: impl FnOnce(&mut newt_core::AgentIdentity) -> Result<(), String>,
+) -> Result<(), String> {
     let path = newt_core::AgentIdentity::user_identity_path()
         .ok_or("no home directory to hold agent-identity.toml")?;
     let mut identity = if path.is_file() {
@@ -849,7 +900,7 @@ fn persist_git_profile(
     } else {
         newt_core::AgentIdentity::default()
     };
-    edit(&mut identity.git)?;
+    edit(&mut identity)?;
     identity.save(&path).map_err(|e| e.to_string())
 }
 

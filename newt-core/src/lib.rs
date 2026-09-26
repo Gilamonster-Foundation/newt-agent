@@ -20,6 +20,7 @@ pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a
 /// persona's `cognition:` (psyche sibling of [`tenacity`] and [`initiative`]).
 pub mod cognition;
+pub mod commit_signing;
 pub mod config;
 pub mod confined_exec;
 pub mod conversation;

@@ -3039,8 +3039,8 @@ async fn custom_host_requires_a_host() {
 fn setup_writes_the_sandbox_git_profile_through_settings() {
     let dir = tempfile::tempdir().unwrap();
     let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
-    // `git-author` menu: [2] operator; `git-config` menu: [1] baseline.
-    let console = ScriptedConsole::new(&["2", "1"]);
+    // `git-author`: [2] operator; `git-config`: [1] baseline; `git-signing`: [1] off.
+    let console = ScriptedConsole::new(&["2", "1", "1"]);
     offer_sandbox_git(&console.operator());
     let saved = newt_core::AgentIdentity::load(
         &dir.path()
