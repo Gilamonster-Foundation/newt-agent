@@ -656,7 +656,10 @@ pub(crate) fn cockpit_acceptance_case() {
     // child sets this up before opening the terminal; this one had to, and was
     // missing it. `setsid()` returns the new session id (its own pid) on
     // success, not 0, so `>= 0` is the same guard the other PTY cases use.
-    assert!(unsafe { libc::setsid() } >= 0, "setsid for the controlling tty");
+    assert!(
+        unsafe { libc::setsid() } >= 0,
+        "setsid for the controlling tty"
+    );
     assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
     // The child now owns the controlling terminal, so on exit the tty driver
     // sends SIGHUP to the session (the "session-leader exit hangs up its tty"
