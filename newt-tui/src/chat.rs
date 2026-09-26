@@ -3077,6 +3077,9 @@ fn session_body(
             // reset to 0 at the top of every loop iteration (below) when the
             // envelope is refreshed from the live model + ledger snapshot.
             contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+            // Refreshed each turn below, so a `/settings git-signing` change
+            // applies to the next commit.
+            signer: newt_core::commit_signing::session_signer(&session_identity),
         })
     };
 
@@ -3125,6 +3128,9 @@ fn session_body(
             // that consumed them.
             ca.contributors = attribution_ledger.borrow().contributors().to_vec();
             tool.attribution = Some(ca);
+            tool.signer = newt_core::commit_signing::session_signer(
+                &newt_core::AgentIdentity::resolve().unwrap_or_default(),
+            );
             // #1709 family: reset the contributor-consumption cursor to 0. The
             // envelope above is a FRESH snapshot of the ledger taken at this
             // loop-top, so none of its contributors have been consumed yet by

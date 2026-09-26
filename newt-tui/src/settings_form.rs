@@ -109,6 +109,9 @@ pub(crate) enum Field {
     Posture,
     Rounds,
     Prefix,
+    GitAuthor,
+    GitConfig,
+    GitSigning,
 }
 
 impl Field {
@@ -128,6 +131,9 @@ impl Field {
         Self::Posture,
         Self::Rounds,
         Self::Prefix,
+        Self::GitAuthor,
+        Self::GitConfig,
+        Self::GitSigning,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -149,6 +155,9 @@ impl Field {
             Self::Posture => "posture",
             Self::Rounds => "rounds",
             Self::Prefix => "prefix",
+            Self::GitAuthor => "git-author",
+            Self::GitConfig => "git-config",
+            Self::GitSigning => "git-signing",
         }
     }
 
@@ -168,6 +177,9 @@ impl Field {
             Self::Posture => "permission posture",
             Self::Rounds => "tool-call round limit",
             Self::Prefix => "meta prefix key",
+            Self::GitAuthor => "sandbox git commit author",
+            Self::GitConfig => "sandbox git settings",
+            Self::GitSigning => "harness commit signing",
         }
     }
 
@@ -241,6 +253,31 @@ impl Field {
             // on a pipe. The absorbed verb offered all three and so does this.
             // Each choice says what it would shadow, because that is the
             // whole trade: tmux/herdr semantics on a chord of your choosing.
+            Self::GitAuthor => owned(&[
+                (
+                    "agent",
+                    "the agent identity, so sandbox commits never pass for yours (default)",
+                ),
+                ("operator", "your own git name and email"),
+            ]),
+            Self::GitConfig => owned(&[
+                ("baseline", "git's own defaults; nothing copied (default)"),
+                (
+                    "environment",
+                    "copy your ~/.gitconfig's plain settings now (never aliases, credentials or includes)",
+                ),
+            ]),
+            Self::GitSigning => owned(&[
+                ("off", "newt's commits are unsigned (default)"),
+                (
+                    "harness",
+                    "a harness key newt holds (created if `signing_key` is unset)",
+                ),
+                (
+                    "operator",
+                    "your own git signing key (user.signingkey, gpg.format)",
+                ),
+            ]),
             Self::Prefix => owned(&[
                 ("ctrl+space", "collides with nothing in newt (default)"),
                 (
@@ -347,6 +384,9 @@ impl Field {
         use newt_core::cognition::cli_cognition;
         match self {
             Self::Prefix => prefix_setting(),
+            Self::GitAuthor => git_profile().author.as_str().to_string(),
+            Self::GitConfig => git_profile().config_source.as_str().to_string(),
+            Self::GitSigning => git_profile().signing.as_str().to_string(),
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
                 newt_core::EditMode::Emacs => "emacs",
@@ -774,6 +814,58 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // session would be a trap. `[tui] prefix_key`, through the
         // comment-preserving writer; and the session, so the next panel uses it
         // at once.
+        // Persisted to the operator's `agent-identity.toml`: the shell reads
+        // it on every dispatch, so the next command already uses it.
+        Field::GitAuthor => persist_git_profile(|git| {
+            git.author = if value == "operator" {
+                newt_core::agent_identity::SandboxAuthor::Operator
+            } else {
+                newt_core::agent_identity::SandboxAuthor::Agent
+            };
+            Ok(())
+        })?,
+        // Choosing `environment` takes the snapshot NOW, so choosing it again
+        // is how the operator refreshes it.
+        Field::GitConfig => persist_git_profile(|git| {
+            if value == "environment" {
+                let listing = newt_core::git_hardening::ambient_git_config_listing()
+                    .map_err(|e| format!("could not read your git config: {e}"))?;
+                git.config = newt_core::git_hardening::copyable_git_config(&listing);
+                git.config_source = newt_core::agent_identity::GitConfigSource::Environment;
+            } else {
+                git.config.clear();
+                git.config_source = newt_core::agent_identity::GitConfigSource::Baseline;
+            }
+            Ok(())
+        })?,
+        // `harness` with no `signing_key` creates one, and says where its
+        // public half goes, because a signature nobody can verify is noise.
+        Field::GitSigning => {
+            let mut created = None;
+            persist_identity(|identity| {
+                use newt_core::agent_identity::SigningMode;
+                identity.git.signing = match value {
+                    "harness" => SigningMode::Harness,
+                    "operator" => SigningMode::Operator,
+                    _ => SigningMode::Off,
+                };
+                if value == "harness" && identity.signing_key.is_none() {
+                    let dir = newt_core::Config::user_config_dir()
+                        .ok_or("no config directory for the harness key")?;
+                    let path = dir.join("harness-signing.pem");
+                    created = Some(newt_core::commit_signing::generate_harness_key(&path)?);
+                    identity.signing_key = Some(path.to_string_lossy().into_owned());
+                }
+                Ok(())
+            })?;
+            if let Some(public) = created {
+                return Ok(format!(
+                    "{}: {value}\nnew harness key; add this to the agent's GitHub account \
+                     as a signing key so its commits verify:\n{public}",
+                    field.label()
+                ));
+            }
+        }
         Field::Prefix => {
             persist_tui_key("prefix_key", value)?;
             newt_core::process_env::set_var("NEWT_PREFIX_KEY", value);
@@ -782,6 +874,34 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         }
     }
     Ok(format!("{}: {value}", field.label()))
+}
+
+/// The sandbox git profile in force (`[agent-identity.git]`).
+fn git_profile() -> newt_core::agent_identity::GitProfile {
+    newt_core::AgentIdentity::resolve().unwrap_or_default().git
+}
+
+/// Edit the sandbox git profile in the operator's own `agent-identity.toml`,
+/// keeping every other field of that file as it was.
+fn persist_git_profile(
+    edit: impl FnOnce(&mut newt_core::agent_identity::GitProfile) -> Result<(), String>,
+) -> Result<(), String> {
+    persist_identity(|identity| edit(&mut identity.git))
+}
+
+/// Edit the operator's own `agent-identity.toml`, keeping every other field.
+fn persist_identity(
+    edit: impl FnOnce(&mut newt_core::AgentIdentity) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = newt_core::AgentIdentity::user_identity_path()
+        .ok_or("no home directory to hold agent-identity.toml")?;
+    let mut identity = if path.is_file() {
+        newt_core::AgentIdentity::load(&path).map_err(|e| e.to_string())?
+    } else {
+        newt_core::AgentIdentity::default()
+    };
+    edit(&mut identity)?;
+    identity.save(&path).map_err(|e| e.to_string())
 }
 
 /// The change a transition is recorded as, or `None` when the registry
@@ -1111,6 +1231,13 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
 }
 
 fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
+    ask_and_apply(ask, field, "/settings")
+}
+
+/// Ask for one field's value and apply it through [`apply_and_record`],
+/// recorded as reached `via` (`/settings`, `/setup`). Setup asks the git
+/// profile through this, so its questions and its write are `/settings`' own.
+pub(crate) fn ask_and_apply(ask: Ask<'_>, field: Field, via: &str) -> Vec<String> {
     let cancelled = || vec!["settings: cancelled".to_string()];
     let definition = value_menu(field);
     let value = match field.value_space() {
@@ -1156,7 +1283,7 @@ fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
             (*value).to_string()
         }
     };
-    vec![match apply_and_record(field, &value, "/settings") {
+    vec![match apply_and_record(field, &value, via) {
         Ok(msg) | Err(msg) => msg,
     }]
 }

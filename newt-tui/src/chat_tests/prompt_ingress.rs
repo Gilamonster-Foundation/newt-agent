@@ -55,6 +55,7 @@ fn git_head_snapshot_requires_effective_workspace_read_authority() {
         attribution: None,
         commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
         contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+        signer: None,
     };
     let mut denied = newt_core::Caveats::top();
     denied.fs_read = newt_core::Scope::none();

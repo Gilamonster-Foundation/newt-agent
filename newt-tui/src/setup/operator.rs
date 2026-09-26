@@ -104,6 +104,12 @@ impl<'a> Operator<'a> {
     }
 
     /// Narrate one line.
+    /// The raw question seam, for a flow that already speaks it
+    /// (`settings_form::ask_and_apply`).
+    pub(super) fn ask_seam(&self) -> &dyn Fn(&SurfaceInteraction) -> HumanQuestionOutcome {
+        &*self.ask
+    }
+
     pub(super) fn say(&self, line: &str) {
         (self.say)(line);
     }

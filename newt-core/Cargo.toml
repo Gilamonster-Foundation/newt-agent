@@ -34,6 +34,7 @@ newtui.workspace = true
 # OCAP disclosure filter (ocap.rs): catch a known secret value in its common
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true
+sha2.workspace = true
 # Encrypted token store (`newt_core::secrets`) — see the workspace-level
 # justification comment on this dependency.
 age.workspace = true

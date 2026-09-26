@@ -85,6 +85,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `git-confused-deputy` | every harness `git` subprocess disarms the repo's config-based code-execution gadgets (`core.fsmonitor`, hooks, `diff.external`/`textconv`, pager, sshCommand) | 🟢 closed | (a raw `Command::new("git")` in the workspace re-introduced without `hardened_git`) |
 | `posture-report-honesty` | every security-posture surface is DERIVED from the same `verify_*` invariants the gates enforce, never independent prose | 🟢 closed | (a posture surface that asserts a claim the verifiers don't back — a report/enforcement drift) |
 | `platform-capability-ceiling` | an unsupported/unverified platform reports each guarantee as `unsupported` and REFUSES operations needing it — never a Linux-equivalent OCAP claim | 🟢 closed | (a non-Linux build silently claiming a kernel-backed guarantee it cannot provide) |
+| `dependency-fetch-egress` | a networked child's host allow-list is kernel-enforced | 🟠 ACTIVE (operator-gated) | the build lane's `cargo fetch --locked` without the operator's `net` grant for the crates.io hosts |
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -1029,6 +1030,31 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   CLOSED fs/net invariants named above (`Bounded-by`), so a trampolined tier gets no authority the
   child did not already hold. CLOSES to a kernel-granularity exec fence with `b1`'s OS floor. owner: —
   · review-by: with `b1` / epic #749.
+
+
+### dependency-fetch-egress
+- **Invariant (ideal):** a child granted network for named hosts can reach only those hosts, enforced by the kernel.
+- **Practical caveat (now):** when the offline build lane fails because the Cargo cache lacks a crate
+  `Cargo.lock` pins, the harness runs `cargo fetch --locked` (`dependency_fetch_request`,
+  `newt-core/src/confined_exec.rs`) with `net = index.crates.io, static.crates.io`. Neither backend can
+  enforce a host list (Seatbelt names only `*`/`localhost`; Landlock only ports), so the request is minted
+  `TrustedInfra` and its network is ambient while it runs. Its fs fence stays kernel-enforced: reads are the
+  calibrated toolchain set (no `credentials.toml`), writes are the workspace plus `$CARGO_HOME/registry` and
+  cargo's package-cache lock files.
+- **Residual:** 🟠 ACTIVE while a fetch runs. The child is the operator's `cargo`, its argv is fixed, it compiles
+  nothing and runs no build script, and `--locked` binds each download to a lockfile checksum. The repository
+  still steers it through `Cargo.lock` and `.cargo/config`, which is why both are screened below.
+- **Disabled while open:** the fetch without the operator's `net` grant for both crates.io hosts
+  (`fetch_locked_dependencies`, `OCAP-GATE: dependency-fetch-egress`); it fails closed with no operator present.
+- **Compensating controls:** refused when any `Cargo.lock` package names a source other than crates.io (a git
+  or alternate registry could receive a credential or steer the fetch), and when a repository `.cargo/config`
+  sits between the build directory and the workspace root (it can replace the crates.io source or name a
+  credential-provider program). A refusal tells the model the operator must act.
+- **Closure criterion:** the fetch reaches the network only through a harness egress broker (#1599's mediated
+  egress) that admits the crates.io hosts, so the child itself can run under `NetGrant::DenyAll`.
+- **Ratchet guard:** `confined_exec::tests::dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials`
+  pins the fence; `dependency_fetch::tests` pin the screens and the fail-closed gate.
+- **Status:** OPEN. owner: — · review-by: #1599.
 
 ## 5. How to use this (for the practical-caveat moments)
 

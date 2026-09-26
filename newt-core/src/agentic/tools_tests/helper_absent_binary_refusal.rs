@@ -340,3 +340,32 @@ fn a_127_brush_did_not_attribute_to_a_missing_program_is_not_an_absence() {
     )
     .is_some());
 }
+
+/// A later pipeline stage owns the exit code, so `rg … | head` exits 0 with
+/// brush's `command not found: rg` on stderr. A live ornith-35b run saw only
+/// that bare line three times (`rg`, `timeout`, `mkdir`). The output is kept
+/// and the absence is named after it, and the result stays a success.
+#[test]
+fn a_piped_absence_keeps_its_output_and_names_the_program() {
+    let piped = serde_json::json!({
+        "exit_code": 0,
+        "stdout": "partial\n",
+        "stderr": format!("error: command not found: {ABSENT}\n"),
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        &format!("{ABSENT} x | head"),
+        &piped,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "partial".to_owned(),
+    );
+    assert!(text.starts_with("partial\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "error: {ABSENT}: {}",
+            super::super::shell::ABSENT_BINARY_MARKER
+        )),
+        "{text}"
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Passed);
+}

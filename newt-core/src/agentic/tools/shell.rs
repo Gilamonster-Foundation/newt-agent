@@ -108,6 +108,17 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
             map.insert("TMPDIR".to_string(), tmp);
         }
     }
+    // Model-run git: no ambient config, the hardening overrides, and the
+    // agent as author (see `git_hardening::sandbox_git_env`).
+    // Resolved per dispatch, so a `/settings` change applies to the next
+    // command rather than the next session.
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    let (name, email) = identity.sandbox_author();
+    map.extend(crate::git_hardening::sandbox_git_env(
+        (&name, &email),
+        &identity.git.config,
+    ));
+
     // Identify the confined engine so `env` / scripts can tell they're in newt's
     // shell (e.g. `SHELL=safe-subset` / `brush` / `host`), not the login shell.
     map.insert("SHELL".to_string(), shell_engine().as_str().to_string());
@@ -1164,6 +1175,10 @@ pub(super) fn confined_result(
     if let Some(refusal) = absent_binary_refusal(envelope, &caveats.exec) {
         return (refusal, ExecOutcome::Unavailable);
     }
+    // A later pipeline or `;` stage sets the exit code, so a missing `rg` in
+    // `rg … | head` exits 0 and a live run showed only brush's bare
+    // `command not found: rg`. Keep the output, and name the absence too.
+    let absent = absent_program_note(envelope, &caveats.exec);
     // #2273: a 126 with no structured denial whose program sits
     // outside the fs-read grant is the KERNEL refusing, not a
     // chmod the model forgot. Same structured test, one more state.
@@ -1172,6 +1187,10 @@ pub(super) fn confined_result(
     }
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
+    if let Some(note) = absent {
+        text.push('\n');
+        text.push_str(&note);
+    }
     if outcome == ExecOutcome::TimedOut {
         text.push_str(&timed_out_note(dispatch_wall(cmd)));
     }
@@ -1850,6 +1869,15 @@ pub(crate) fn absent_binary_refusal(
     {
         return None;
     }
+    absent_program_note(envelope, exec)
+}
+
+/// The absence message for the program brush named in `command not found: X`,
+/// whatever the envelope's exit code. `None` for a structured denial.
+fn absent_program_note(
+    envelope: &serde_json::Value,
+    exec: &crate::caveats::Scope<String>,
+) -> Option<String> {
     // A structured refusal is a DENIAL, not an absence. Relabelling one as the
     // other would send the model to the wrong remedy.
     if envelope_denied(envelope)
@@ -2067,15 +2095,15 @@ fn dispatch_caveats_for_command(
     cmd: &str,
     caveats: &crate::caveats::Caveats,
 ) -> crate::caveats::Caveats {
-    let Some(program) = leading_program(cmd) else {
-        return caveats.clone();
-    };
-    if !crate::confined_exec::is_build_tool_exec(program) {
-        return caveats.clone();
-    }
     let mut widened = caveats.clone();
-    if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
-        reads.extend(crate::confined_exec::toolchain_read_roots());
+    if let crate::caveats::Scope::Only(exec) = &mut widened.exec {
+        let twins = crate::confined_exec::developer_exec_twins(exec.iter());
+        exec.extend(twins);
+    }
+    if leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec) {
+        if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
+            reads.extend(crate::confined_exec::toolchain_read_roots());
+        }
     }
     widened
 }
