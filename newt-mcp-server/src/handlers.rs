@@ -1283,6 +1283,9 @@ mod tests {
     /// agent-bridle env-seam branch (#783) the bridle ships the REAL safe-subset
     /// shell (no stub), so the in-scope command succeeds (isError unset) — the
     /// "unavailable in this build" stub error is retired.
+    ///
+    /// Not on Windows: see `shell_run_exec_allowlist_is_refused_on_windows`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn shell_run_in_scope_echo_succeeds() {
         let resp = rpc_with_caveats(
@@ -1310,6 +1313,41 @@ mod tests {
         assert!(
             text.contains("bridled"),
             "the in-scope echo output must be returned: {text}"
+        );
+    }
+
+    /// agent-bridle 0.8 refuses a non-empty exec allowlist under Windows
+    /// AppContainer: the container cannot kernel-bound which images a child
+    /// launches, so the L3 admission resolves the Exec axis `Unknown` and fails
+    /// closed. An allowlisted `shell_run` is refused in-band, never run
+    /// unconfined (`windows-appcontainer-exec-allowlist` in
+    /// `docs/security/ocap-deviations.md`). Flip this back to success when
+    /// agent-bridle can admit an exec allowlist on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_run_exec_allowlist_is_refused_on_windows() {
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 60, "method": "tools/call",
+                "params": {
+                    "name": "shell_run",
+                    "arguments": { "cmd": echo_command() }
+                }
+            }),
+        )
+        .await;
+
+        assert!(
+            resp["error"].is_null(),
+            "result must be in-band, not a transport error: {resp}"
+        );
+        let result = &resp["result"];
+        assert_eq!(result["isError"].as_bool(), Some(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Exec axis") && !text.contains("bridled"),
+            "the allowlisted echo must be refused on the Exec axis, not run: {text}"
         );
     }
 

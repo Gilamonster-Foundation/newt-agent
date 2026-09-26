@@ -70,6 +70,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
 | `windows-inheritable-handle-leak` | no ambient inherited OS object handles cross into an AppContainer child | 🟠 ACTIVE (Windows) | (a Windows confinement limitation on attacker-exec children — not a gated capability) |
 | `windows-shelltool-env-inheritance` | confined Windows `run_command` children start from an explicit env allow-list, not the Newt parent's ambient env | ✅ CLOSED (agent-bridle 0.8.0-rc.4) | — |
+| `windows-appcontainer-exec-allowlist` | a restricted exec grant (`exec = { only = [...] }`) is enforced on every platform | 🟡 FAIL-CLOSED (Windows) | allowlisted `newt-mcp-server` `shell_run` is refused on Windows |
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
@@ -276,6 +277,24 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   control for explicitly allowed handles.
 - **Status:** OPEN — Windows-only ACTIVE residual; owner: — · review-by: Windows AppContainer handle
   hygiene follow-up.
+
+### windows-appcontainer-exec-allowlist
+- **Invariant (ideal):** an operator's exec allowlist (`exec = { only = ["git", "cargo"] }`) confines
+  a child to those programs on every platform.
+- **Practical caveat (now):** agent-bridle 0.8's L3 admission projects what the backend actually
+  installs. AppContainer bounds exec only with the deny-all child-process block, so a non-empty
+  allowlist resolves to `Unknown` on the Exec axis (`AppContainerSandbox::resolved_authority`) and
+  `admit` refuses the spawn. Enforcing an allowlist there is an Interceptor's job, not the container's.
+- **Residual:** 🟡 FAIL-CLOSED (Windows). No authority leaks. Instead, every allowlisted
+  `newt-mcp-server` `shell_run` on Windows is refused in-band with
+  `backend authority on the Exec axis is not decidable … (L3 BOUND)`. Linux and macOS are unaffected.
+- **Disabled while open:** allowlisted `newt-mcp-server` `shell_run` on Windows (refused, not gated).
+- **Compensating controls:** the refusal happens before spawn; nothing runs unconfined.
+- **Closure criterion:** an agent-bridle release that can admit an exec allowlist under AppContainer,
+  for example one bounded by an Interceptor. Flip the pin below back to a success test then.
+- **Ratchet guard:** `shell_run_exec_allowlist_is_refused_on_windows`
+  (`newt-mcp-server/src/handlers.rs`) pins the refusal.
+- **Status:** OPEN — accepted on the agent-bridle 0.8 bump (#2596).
 
 ### windows-shelltool-env-inheritance
 - **Invariant (ideal):** every confined `run_command` child on Windows starts from an explicit
