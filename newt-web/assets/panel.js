@@ -73,14 +73,19 @@
     }
   });
 
-  // Theme toggle. Dark is the default; light is an explicit choice kept in the
-  // `newt_theme` cookie, which the server reads to render `data-theme` on
+  // Theme toggle. Dark is the default; light is an explicit choice kept in a
+  // cookie, which the server reads to render `data-theme` on
   // <html> — so a reload paints the chosen theme first, with no flash. The
   // button ships `hidden` and is revealed here: without script it could do
   // nothing, so it is not offered.
   function wireTheme() {
     var button = document.querySelector("[data-theme-toggle]");
     if (!button) return;
+    // The cookie's name comes from the server (shell::THEME_COOKIE), never a
+    // second copy here. No name, no toggle: a write the server would not read
+    // is worse than no control.
+    var cookie = button.getAttribute("data-theme-toggle");
+    if (!cookie) return;
     var root = document.documentElement;
     // A toggle announces its state, not just its name.
     function sync() {
@@ -94,7 +99,7 @@
       else root.removeAttribute("data-theme");
       sync();
       document.cookie =
-        "newt_theme=" + (light ? "light" : "dark") +
+        cookie + "=" + (light ? "light" : "dark") +
         "; Path=/; Max-Age=31536000; SameSite=Strict";
     });
   }

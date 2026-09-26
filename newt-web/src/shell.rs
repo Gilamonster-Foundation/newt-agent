@@ -242,7 +242,7 @@ const STYLE: &str = r#"
   /* Design tokens. One palette, two themes: every colour below is a token,
      so a theme is a token swap, not a rule rewrite. Dark is the default (a
      console you leave open); light is the operator's explicit choice, set by
-     the header toggle and rendered server-side from the `newt_theme` cookie,
+     the header toggle and rendered server-side from the theme cookie,
      so the page never paints dark and then flips. */
   :root {
     color-scheme: dark;
@@ -591,6 +591,12 @@ pub(crate) struct IndexQuery {
     pub tab: Option<u64>,
 }
 
+/// The cookie that remembers the operator's theme. Named once, here: the page
+/// hands it to `panel.js` through the toggle's `data-theme-toggle` attribute,
+/// so the script that writes the cookie and the server that reads it cannot
+/// disagree about its name.
+pub(crate) const THEME_COOKIE: &str = "newt_theme";
+
 /// The `<html>` attribute for the operator's theme. Dark is the default and
 /// carries no attribute; only the exact value `light` opts out, so a garbled
 /// or hostile cookie can only ever yield the default, never markup.
@@ -598,7 +604,7 @@ pub(crate) fn theme_attr(headers: &axum::http::HeaderMap) -> &'static str {
     let light = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
-        .and_then(|raw| newt_web::cookie_value(raw, "newt_theme"))
+        .and_then(|raw| newt_web::cookie_value(raw, THEME_COOKIE))
         == Some("light");
     if light {
         r#" data-theme="light""#
@@ -690,7 +696,7 @@ pub(crate) async fn index(
 </head>
 <body>
 <header><h1>newt-web</h1>
-<button type="button" data-theme-toggle hidden aria-label="toggle light theme">◐</button></header>
+<button type="button" data-theme-toggle="{THEME_COOKIE}" hidden aria-label="toggle light theme">◐</button></header>
 <div class="cockpit">
 <aside class="sidebar" aria-label="agents and sessions">
 <h2 class="side-head">agents</h2>
