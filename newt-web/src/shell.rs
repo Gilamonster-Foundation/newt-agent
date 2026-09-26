@@ -275,7 +275,10 @@ const STYLE: &str = r#"
      (body is a full-height flex column) so the sidebar and transcript scroll
      independently; the narrow-screen query at the end stacks it for phones. */
   .cockpit { flex: 1; min-height: 0; display: grid; grid-template-columns: 19rem minmax(0, 1fr); }
-  .sidebar { background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; padding: 0.9rem 0.75rem; display: grid; align-content: start; gap: 0.9rem; }
+  /* overflow-wrap: anywhere — session titles, peer labels and agent names are
+     operator- or peer-supplied and may be one unbroken token; they wrap rather
+     than scroll the sidebar sideways and hide the rest of their row. */
+  .sidebar { background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; overflow-wrap: anywhere; padding: 0.9rem 0.75rem; display: grid; align-content: start; gap: 0.9rem; }
   .side-head { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0.5rem -0.6rem; }
   #content { min-height: 0; display: flex; padding: 1rem 1.25rem; }
   #panel { flex: 1; min-width: 0; min-height: 0; max-width: 60rem; margin: 0 auto; display: flex; flex-direction: column; }
@@ -287,7 +290,7 @@ const STYLE: &str = r#"
   /* Controls. Inputs and buttons share one shape so a form reads as a unit. */
   input, select, button { font: inherit; color: inherit; }
   input, select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 0.4rem 0.6rem; min-width: 0; }
-  input:focus, select:focus { border-color: var(--accent); outline: none; }
+  input:focus, select:focus { border-color: var(--accent); }
   button { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 0.35rem 0.85rem; cursor: pointer; font-weight: 500; font-size: 0.9rem; }
   button:hover { border-color: var(--dim); }
 
@@ -323,6 +326,10 @@ const STYLE: &str = r#"
   .agent { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
   .agent.dock-remote { border-style: dashed; }
   .agent h2 { font-size: 0.95rem; font-weight: 600; margin: 0; padding: 0.6rem 1rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; border-bottom: 1px solid var(--line); }
+  /* The name may be one unbroken token. It truncates to one line rather than
+     push the close control past the panel's clipped edge, or grow the header
+     and squeeze the transcript on a short screen; the sidebar shows it whole. */
+  .agent h2 > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   form.close { display: inline; }
   form.close button { background: transparent; border: 0; color: var(--dim); padding: 0.1rem 0.4rem; }
   form.close button:hover { color: var(--ink); }
