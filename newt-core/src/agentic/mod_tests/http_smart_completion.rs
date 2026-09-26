@@ -1093,3 +1093,98 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
         "the re-ask's continue, then the stop's incomplete: {outcomes:?}"
     );
 }
+
+// ---- #2618/F46: run_command shell writes must count toward the brake -------
+
+/// Round 0 is a `write_file` (arms the brake); every round after that is a
+/// `run_command` writing via `>` shell redirection (never `write_file`/
+/// `edit_file`), for `rounds` rounds; then a final plain-text reply.
+struct RunCommandWrites {
+    n: std::sync::atomic::AtomicUsize,
+    rounds: usize,
+}
+
+impl wiremock::Respond for RunCommandWrites {
+    fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+        let n = self.n.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            let call = serde_json::json!({
+                "id": "c0", "type": "function",
+                "function": {"name": "write_file",
+                    "arguments": r#"{"path":"arm.txt","content":"x\n"}"#}
+            });
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                    "finish_reason": "tool_calls"}]
+            }));
+        }
+        if n > self.rounds {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop"}]
+            }));
+        }
+        let call = serde_json::json!({
+            "id": format!("c{n}"),
+            "type": "function",
+            "function": {"name": "run_command",
+                "arguments": format!("{{\"command\":\"echo {n} > out_{n}.txt\"}}")}
+        });
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                "finish_reason": "tool_calls"}]
+        }))
+    }
+}
+
+/// Regression for #2618: an arming `write_file`, then 12 rounds of
+/// `run_command` shell writes (never another `write_file`/`edit_file`), must
+/// NOT trip the no-progress brake. Before the fix, the brake sites judged the
+/// tool by NAME only (`is_workspace_write_call`, which deliberately excludes
+/// `run_command`), so none of these rounds counted as workspace-modifying and
+/// the 12th tripped `stop_after: 12` even though every round wrote a new file.
+#[tokio::test]
+#[serial_test::serial]
+async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
+    let _launch = ConfinedLaunch::new();
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 12,
+        },
+        ..Default::default()
+    });
+    let server = MockServer::start().await;
+    let rounds = 12;
+    Mock::given(method("POST"))
+        .respond_with(RunCommandWrites {
+            n: std::sync::atomic::AtomicUsize::new(0),
+            rounds,
+        })
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let uri = server.uri();
+    let current = msgs();
+    let caveats = Caveats::top();
+    let mut reason = None;
+    let mut context = ctx(&uri, &current, &caveats);
+    context.workspace = workspace.path().to_str().unwrap();
+    context.end_reason = Some(&mut reason);
+    context.kind = BackendKind::Openai;
+    context.max_tool_rounds = rounds + 3;
+    let result = chat_complete(context, &mut NoMcp)
+        .await
+        .map(|(text, streamed, _, _)| (text, streamed));
+    let (text, _) = result.expect("run_command writes must not end the turn as an error");
+    assert_eq!(
+        text, "done",
+        "the turn must run to its normal end, not be cut short by the brake"
+    );
+    assert_ne!(
+        reason,
+        Some(crate::TurnEndReason::NoProgress),
+        "12 rounds that each wrote via run_command must not trip the brake"
+    );
+}

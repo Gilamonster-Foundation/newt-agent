@@ -547,6 +547,25 @@ fn workspace_write_classifier_is_narrow() {
     assert!(!is_workspace_write_call("read_file"));
 }
 
+/// #2618/F46: the brake's own predicate must count a `run_command` that
+/// wrote via shell redirection — `is_workspace_write_call` (the narrow,
+/// name-only classifier used for the headless write-trajectory) never will,
+/// by design, which was the bug: the brake sites used that predicate instead
+/// of `may_change_workspace`.
+#[test]
+fn may_change_workspace_counts_a_run_command_redirect_write() {
+    let args = serde_json::json!({"command": "head -n 9309 x | tail -n 2183 > out.rs"});
+    assert!(may_change_workspace("run_command", &args));
+}
+
+/// A pure read command must still count as no-change under the same predicate
+/// the brake now uses.
+#[test]
+fn may_change_workspace_excludes_a_pure_read_command() {
+    let args = serde_json::json!({"command": "grep -n x f"});
+    assert!(!may_change_workspace("run_command", &args));
+}
+
 #[test]
 fn no_result_reason_classifies_and_routes() {
     // recall / state_get no-result prefixes classify…

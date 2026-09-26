@@ -4041,7 +4041,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            if ok && is_workspace_write_call(name) {
+            if ok && may_change_workspace(name, &args) {
                 round_modified_workspace = true;
             }
             if ok
@@ -8849,7 +8849,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            if ok && is_workspace_write_call(name) {
+            if ok && may_change_workspace(name, &args) {
                 round_modified_workspace = true;
             }
             if ok
@@ -11237,7 +11237,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            if ok && is_workspace_write_call(name) {
+            if ok && may_change_workspace(name, &args) {
                 round_modified_workspace = true;
             }
             if ok
@@ -12844,7 +12844,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_ok(&result, execution.get().copied());
-            if ok && is_workspace_write_call(name) {
+            if ok && may_change_workspace(name, &args) {
                 round_modified_workspace = true;
             }
             if ok
