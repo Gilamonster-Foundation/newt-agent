@@ -1915,3 +1915,132 @@ mod c3c {
         clear_web_env();
     }
 }
+
+/// Dark is the default and light is opt-in: the page carries
+/// `data-theme="light"` only for the exact cookie value `light`, and a
+/// garbled or hostile value falls back to the default rather than into markup.
+#[serial_test::serial(newt_web_env)]
+#[tokio::test]
+async fn theme_is_dark_by_default_and_light_only_by_explicit_choice() {
+    let render = |cookie: &'static str| async move {
+        let mut b = axum::http::Request::builder().method("GET").uri("/");
+        if !cookie.is_empty() {
+            b = b.header("cookie", cookie);
+        }
+        let resp = app()
+            .oneshot(b.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let light = r#"<html lang="en" data-theme="light">"#;
+    let dark = r#"<html lang="en">"#;
+
+    assert!(render("").await.contains(dark), "no cookie → dark");
+    assert!(render("newt_theme=dark").await.contains(dark));
+    assert!(render("a=1; newt_theme=light").await.contains(light));
+    let hostile = render(r#"newt_theme="><script>x</script>"#).await;
+    assert!(hostile.contains(dark), "hostile value → default");
+    assert!(
+        !hostile.contains("<script>x"),
+        "cookie never reaches markup"
+    );
+    assert!(
+        render("not_newt_theme=light").await.contains(dark),
+        "cookie name is matched exactly, not by suffix"
+    );
+}
+
+/// The cockpit's information architecture, pinned structurally rather than as
+/// bytes: the sidebar holds what the operator can drive (`#tabs`, the scratch
+/// spawn form, `#overview`), the main region holds what they are driving
+/// (`#panel`), every HTMX target id occurs exactly once, and the sidebar
+/// precedes the main region in document order — the phone reading order.
+/// The golden pins the exact bytes; this says which regions they belong to,
+/// so a layout change cannot silently move or duplicate a behavioral seam.
+#[serial_test::serial(newt_web_env)]
+#[tokio::test]
+async fn cockpit_regions_hold_their_seams_exactly_once() {
+    let empty_state = tempfile::tempdir().unwrap();
+    std::env::set_var("NEWT_WEB_STATE_DIR", empty_state.path());
+
+    fn region<'a>(html: &'a str, open: &str, close: &str) -> &'a str {
+        let start = html.find(open).unwrap_or_else(|| panic!("missing {open}"));
+        let len = html[start..]
+            .find(close)
+            .unwrap_or_else(|| panic!("unclosed {open}"));
+        &html[start..start + len]
+    }
+    fn check(html: &str) {
+        for once in [
+            r#"id="tabs""#,
+            r#"id="panel""#,
+            r#"id="overview""#,
+            r#"id="content""#,
+            r#"<aside class="sidebar""#,
+            r#"<details class="spawn-wrap">"#,
+            r#"<form class="spawn""#,
+            "data-theme-toggle",
+        ] {
+            assert_eq!(
+                html.matches(once).count(),
+                1,
+                "{once} must occur exactly once"
+            );
+        }
+        let sidebar = region(html, r#"<aside class="sidebar""#, "</aside>");
+        let main = region(html, r#"<main id="content">"#, "</main>");
+        for seam in [r#"id="tabs""#, r#"<form class="spawn""#, r#"id="overview""#] {
+            assert!(sidebar.contains(seam), "{seam} belongs in the sidebar");
+            assert!(
+                !main.contains(seam),
+                "{seam} must not be in the main region"
+            );
+        }
+        assert!(main.contains(r#"id="panel""#), "#panel belongs in main");
+        assert!(
+            !sidebar.contains(r#"id="panel""#),
+            "#panel must not be in the sidebar"
+        );
+        assert!(
+            html.find("<aside").unwrap() < html.find("<main").unwrap(),
+            "sidebar precedes main — the narrow-screen reading order"
+        );
+        // The overview still polls itself; the in-page tab strip is not an
+        // out-of-band fragment (only swap responses carry hx-swap-oob).
+        assert!(sidebar.contains(r#"hx-get="/overview" hx-trigger="every 3s""#));
+        assert!(!region(html, r#"<nav id="tabs""#, "</nav>").contains("hx-swap-oob"));
+    }
+
+    // Empty cockpit.
+    let app = app();
+    let (_, html) = req(&app, "GET", "/", None).await;
+    check(&html);
+
+    // With an agent open: its tab is in the sidebar and current, and its
+    // panel — prompt and close controls included — is in main, once each.
+    let form = "name=seam-agent&url=http%3A%2F%2F127.0.0.1%3A9&model=m&kind=ollama&workspace=.";
+    let (status, _) = req(&app, "POST", "/agents", Some(form)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, html) = req(&app, "GET", "/", None).await;
+    check(&html);
+    let sidebar = region(&html, r#"<aside class="sidebar""#, "</aside>");
+    let main = region(&html, r#"<main id="content">"#, "</main>");
+    assert!(
+        sidebar.contains(r#"aria-current="page""#),
+        "the driven agent is marked current"
+    );
+    assert!(sidebar.contains("seam-agent"));
+    for control in [
+        r#"<form class="prompt""#,
+        r#"<form class="close""#,
+        "data-agent-stream",
+    ] {
+        assert_eq!(main.matches(control).count(), 1, "{control} once, in main");
+        assert!(
+            !sidebar.contains(control),
+            "{control} must not be in the sidebar"
+        );
+    }
+}

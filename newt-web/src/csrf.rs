@@ -77,16 +77,11 @@ pub fn set_cookie(token: &Token) -> String {
     )
 }
 
-/// The token carried by a `Cookie` header, if any.
-///
-/// Tolerates the `a=1; b=2` form and surrounding spaces, and matches the
-/// cookie NAME exactly — a `not_newt_csrf=…` must not satisfy a prefix test.
+/// The token carried by a `Cookie` header, if any — see
+/// [`crate::cookie_value`] for the matching rules.
 #[must_use]
 pub fn from_cookie_header(raw: &str) -> Option<String> {
-    raw.split(';').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name.trim() == COOKIE).then(|| value.trim().to_string())
-    })
+    crate::cookie_value(raw, COOKIE).map(str::to_string)
 }
 
 /// The `csrf` field of an `application/x-www-form-urlencoded` body.

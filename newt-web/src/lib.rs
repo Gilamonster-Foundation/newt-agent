@@ -32,6 +32,19 @@ pub fn escape_attr(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// The value of cookie `name` in a raw `Cookie` header, if present.
+///
+/// Tolerates the `a=1; b=2` form and surrounding spaces, and matches the
+/// cookie NAME exactly — a `not_newt_csrf=…` must not satisfy a prefix test.
+/// One reader for every cookie the cockpit sets (the CSRF token, the theme).
+#[must_use]
+pub fn cookie_value<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    raw.split(';').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key.trim() == name).then(|| value.trim())
+    })
+}
+
 #[cfg(test)]
 mod escape_tests {
     use super::escape_attr;

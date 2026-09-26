@@ -73,11 +73,53 @@
     }
   });
 
+  // Theme toggle. Dark is the default; light is an explicit choice kept in the
+  // `newt_theme` cookie, which the server reads to render `data-theme` on
+  // <html> — so a reload paints the chosen theme first, with no flash. The
+  // button ships `hidden` and is revealed here: without script it could do
+  // nothing, so it is not offered.
+  function wireTheme() {
+    var button = document.querySelector("[data-theme-toggle]");
+    if (!button) return;
+    var root = document.documentElement;
+    // A toggle announces its state, not just its name.
+    function sync() {
+      button.setAttribute("aria-pressed", String(root.getAttribute("data-theme") === "light"));
+    }
+    sync();
+    button.hidden = false;
+    button.addEventListener("click", function () {
+      var light = root.getAttribute("data-theme") !== "light";
+      if (light) root.setAttribute("data-theme", "light");
+      else root.removeAttribute("data-theme");
+      sync();
+      document.cookie =
+        "newt_theme=" + (light ? "light" : "dark") +
+        "; Path=/; Max-Age=31536000; SameSite=Strict";
+    });
+  }
+
   window.newtAttachStreams = scan;
   document.addEventListener("DOMContentLoaded", function () {
     scan(document);
+    wireTheme();
   });
+  // A panel swapped in off-screen is brought into view. On a phone the
+  // sidebar (agents, sessions, docked peers) precedes the panel, so choosing an
+  // agent from a long inventory would otherwise swap content thousands of
+  // pixels below where the operator tapped. On a wide screen the panel is
+  // always on screen, so this never fires there. Instant, not smooth: motion
+  // stays opt-in (see the reduced-motion rule in the stylesheet).
+  function reveal(target) {
+    if (!target || target.id !== "panel") return;
+    var box = target.getBoundingClientRect();
+    if (box.top > window.innerHeight * 0.75 || box.bottom < 0) {
+      target.scrollIntoView({ block: "start" });
+    }
+  }
+
   document.addEventListener("htmx:afterSwap", function (event) {
     scan(event.detail.target);
+    reveal(event.detail.target);
   });
 })();

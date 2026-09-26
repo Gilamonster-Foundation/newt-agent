@@ -11,76 +11,156 @@
      script of its own. -->
 <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
 <script nonce="{NONCE}" src="/assets/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
-<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-aOZDZFMtSrnaDr3KFSLgbkAD13xG3NAIPXsEyxIE46jxqGfBrzoqLNpqC869zHJm" crossorigin="anonymous"></script>
+<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-NpC8tkQQQinNuwOKjXIGGH/n208xjRj5L3wn7jipl3H2n9rIdEpPlc7yZOROzR8/" crossorigin="anonymous"></script>
 <style nonce="{NONCE}">
-  :root { color-scheme: light dark; }
-  body { font-family: ui-monospace, monospace; margin: 0; }
-  header { padding: 0.5rem 1rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
-  header h1 { font-size: 1rem; margin: 0; }
-  #content { padding: 1rem; display: grid; gap: 1rem; }
-  #tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; }
-  #tabs button { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; cursor: pointer; }
-  #tabs button.active { border-bottom-color: transparent; font-weight: bold; }
-  .empty { opacity: 0.7; }
-  .sessions h2 { font-size: 0.9rem; margin: 0 0 0.25rem; }
-  .sessions .hint { opacity: 0.7; font-size: 0.75rem; margin: 0 0 0.5rem; }
-  .sessions ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
-  .sessions li { display: flex; align-items: baseline; gap: 0.5rem; }
-  .sessions .s-title { font-weight: bold; }
-  .spawn-wrap { border: 1px dashed color-mix(in srgb, currentColor 25%, transparent); border-radius: 4px; padding: 0.4rem 0.6rem; }
-  .spawn-wrap summary { cursor: pointer; font-size: 0.85rem; }
-  form.spawn { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin-top: 0.5rem; }
-  form.spawn label { display: grid; font-size: 0.75rem; gap: 0.15rem; }
-  input, select, button { font: inherit; }
-  .agent { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 4px; }
-  .agent h2 { font-size: 0.9rem; margin: 0; padding: 0.4rem 0.75rem; display: flex; justify-content: space-between; gap: 0.5rem; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-  .agent h2 .busy { opacity: 0.7; font-weight: normal; }
-  .transcript { padding: 0.5rem 0.75rem; max-height: 50vh; overflow-y: auto; display: grid; gap: 0.4rem; }
-  .msg { overflow-wrap: anywhere; }
-  .msg .role { opacity: 0.6; font-size: 0.75rem; display: block; }
-  /* Rendered Markdown body (render_markdown -> ammonia). Tight vertical
-     rhythm so a reply reads as one chat bubble, code/tables scroll rather
-     than widen the page. Mirrors scrybe-render/src/themes/default.css. */
+  /* Design tokens. One palette, two themes: every colour below is a token,
+     so a theme is a token swap, not a rule rewrite. Dark is the default (a
+     console you leave open); light is the operator's explicit choice, set by
+     the header toggle and rendered server-side from the `newt_theme` cookie,
+     so the page never paints dark and then flips. */
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115; --surface: #161920; --raised: #1d212a; --line: #2a2f3a;
+    --ink: #e6e8ee; --dim: #8b93a3;
+    --accent: #4fb286; --accent-ink: #06120c;
+    --attn: #e0a44a; --attn-bg: #2a2214;
+    --code-bg: #0b0d11;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --radius: 12px;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f6f6f4; --surface: #ffffff; --raised: #eff0f3; --line: #e0e2e7;
+    --ink: #1b1d22; --dim: #626978;
+    --accent: #2f8f66; --accent-ink: #ffffff;
+    --attn: #a8670f; --attn-bg: #fdf4e4;
+    --code-bg: #f3f4f6;
+  }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.55 var(--sans); margin: 0; background: var(--bg); color: var(--ink); display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+  small { color: var(--dim); font-weight: normal; }
+  header { flex: none; padding: 0.7rem 1.25rem; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; align-items: center; justify-content: space-between; }
+  header button { background: transparent; border-color: transparent; color: var(--dim); font-size: 1rem; padding: 0.15rem 0.5rem; }
+  header button:hover { color: var(--ink); }
+  header h1 { font-size: 1rem; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
+  /* Cockpit layout: header over a sidebar (what you can drive) and a main
+     column (what you are driving). Wide screens pin the page to the viewport
+     (body is a full-height flex column) so the sidebar and transcript scroll
+     independently; the narrow-screen query at the end stacks it for phones. */
+  .cockpit { flex: 1; min-height: 0; display: grid; grid-template-columns: 19rem minmax(0, 1fr); }
+  /* overflow-wrap: anywhere — session titles, peer labels and agent names are
+     operator- or peer-supplied and may be one unbroken token; they wrap rather
+     than scroll the sidebar sideways and hide the rest of their row. */
+  .sidebar { background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; overflow-wrap: anywhere; padding: 0.9rem 0.75rem; display: grid; align-content: start; gap: 0.9rem; }
+  .side-head { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0.5rem -0.6rem; }
+  #content { min-height: 0; display: flex; padding: 1rem 1.25rem; }
+  #panel { flex: 1; min-width: 0; min-height: 0; max-width: 60rem; margin: 0 auto; display: flex; flex-direction: column; }
+  /* minmax(0, 1fr), not the implicit auto track: a grid item's min-width is
+     its content by default, so one long code line would widen the whole page
+     and scroll a phone sideways. Zero lets `pre` and tables scroll instead. */
+  .sidebar, #overview, .transcript { grid-template-columns: minmax(0, 1fr); }
+
+  /* Controls. Inputs and buttons share one shape so a form reads as a unit. */
+  input, select, button { font: inherit; color: inherit; }
+  input, select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 0.4rem 0.6rem; min-width: 0; }
+  input:focus, select:focus { border-color: var(--accent); }
+  button { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 0.35rem 0.85rem; cursor: pointer; font-weight: 500; font-size: 0.9rem; }
+  button:hover { border-color: var(--dim); }
+
+  /* Overview: sessions and docked peers, as cards of rows. */
+  #overview { display: grid; gap: 1.1rem; }
+  .sessions h2, .docked h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0.5rem 0.2rem; }
+  .sidebar .hint, .sidebar .empty { margin: 0 0.5rem 0.4rem; font-size: 0.8rem; }
+  .hint { color: var(--dim); font-size: 0.8rem; margin: 0 0 0.6rem; }
+  .empty { color: var(--dim); }
+  .sessions ul, .docked ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.15rem; }
+  .sessions li, .docked li { display: flex; flex-wrap: wrap; align-items: center; column-gap: 0.5rem; padding: 0.35rem 0.5rem; border-radius: 8px; font-size: 0.9rem; }
+  .sessions li:hover, .docked li:hover { background: var(--raised); }
+  .sessions .s-title { font-weight: 500; }
+  form.attach { display: inline; margin-left: auto; }
+  .peer h3 { font-size: 0.9rem; font-weight: 600; margin: 0.4rem 0.5rem 0.2rem; }
+  button.dock-open { background: transparent; border: 0; padding: 0; font-weight: 500; }
+
+  .spawn-wrap { border: 1px dashed var(--line); border-radius: 10px; padding: 0.45rem 0.6rem; }
+  .spawn-wrap summary { cursor: pointer; font-size: 0.9rem; color: var(--dim); }
+  form.spawn fieldset { border: 0; margin: 0.5rem 0 0; padding: 0; display: grid; gap: 0.25rem; }
+  form.spawn button { margin-top: 0.4rem; }
+  form.spawn legend { font-size: 0.75rem; padding: 0; color: var(--dim); }
+  form.spawn label { font-size: 0.8rem; color: var(--dim); }
+
+  /* Agent switcher: a list; the one being driven is marked with the accent. */
+  #tabs { display: grid; gap: 0.15rem; }
+  #tabs:empty::before { content: "none open"; color: var(--dim); font-size: 0.85rem; padding: 0.3rem 0.6rem; }
+  #tabs a { display: block; padding: 0.45rem 0.6rem; border-radius: 8px; text-decoration: none; color: inherit; font-size: 0.92rem; overflow-wrap: anywhere; }
+  #tabs a:hover { background: var(--raised); }
+  #tabs a[aria-current="page"] { background: var(--raised); box-shadow: inset 3px 0 var(--accent); font-weight: 600; }
+
+  /* The driven session. */
+  .agent { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .agent.dock-remote { border-style: dashed; }
+  .agent h2 { font-size: 0.95rem; font-weight: 600; margin: 0; padding: 0.6rem 1rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; border-bottom: 1px solid var(--line); }
+  /* The name may be one unbroken token. It truncates to one line rather than
+     push the close control past the panel's clipped edge, or grow the header
+     and squeeze the transcript on a short screen; the sidebar shows it whole. */
+  .agent h2 > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  form.close { display: inline; }
+  form.close button { background: transparent; border: 0; color: var(--dim); padding: 0.1rem 0.4rem; }
+  form.close button:hover { color: var(--ink); }
+  .transcript { flex: 1; min-height: 0; padding: 1rem 1.25rem; overflow-y: auto; display: grid; align-content: start; gap: 1rem; }
+  .msg { overflow-wrap: anywhere; max-width: 48rem; }
+  .msg .role { color: var(--dim); font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; display: block; margin-bottom: 0.15rem; }
+
+  /* Rendered Markdown body (render_markdown -> ammonia). Code and tables
+     scroll rather than widen the page. */
   .md > :first-child { margin-top: 0; }
   .md > :last-child { margin-bottom: 0; }
-  .md p { margin: 0.3rem 0; }
-  .md code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
-  .md pre { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.6rem; border-radius: 6px; overflow-x: auto; }
+  .md p { margin: 0.35rem 0; }
+  .md ul, .md ol { margin: 0.35rem 0; padding-left: 1.4rem; }
+  .md code { font-family: var(--mono); background: var(--raised); padding: 0.1em 0.35em; border-radius: 5px; font-size: 0.86em; }
+  .md pre { background: var(--code-bg); border: 1px solid var(--line); padding: 0.75rem 0.9rem; border-radius: 10px; overflow-x: auto; }
   .md pre code { background: none; padding: 0; }
   /* E0b: a server-rendered diagram. `currentColor` strokes mean it inherits
      the page's own ink, so it cannot disagree with the theme. */
   .md .diagram { box-sizing: border-box; max-width: 100%; margin: 0.4rem 0; text-align: center; }
   .md .diagram svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
-  .md .diagram-source { white-space: pre-wrap; border-left: 3px solid color-mix(in srgb, currentColor 30%, transparent); }
-  .md blockquote { margin: 0.3rem 0; padding-left: 0.75rem; border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); opacity: 0.85; }
+  .md .diagram-source { white-space: pre-wrap; border-left: 3px solid var(--line); }
+  .md blockquote { margin: 0.35rem 0; padding-left: 0.75rem; border-left: 3px solid var(--line); color: var(--dim); }
   .md table { border-collapse: collapse; display: block; overflow-x: auto; }
-  .md th, .md td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding: 0.2rem 0.5rem; }
-  .md a { color: inherit; }
-  form.prompt { display: flex; gap: 0.5rem; padding: 0.5rem 0.75rem; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-  form.prompt input[name=text] { flex: 1; }
-  /* A4: pending typed permission form. */
-  .perm { margin: 0.5rem 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); display: grid; gap: 0.35rem; }
-  .perm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
-  .perm-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-  .perm fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.35rem; }
-  .perm legend { font-weight: bold; padding: 0; }
-  form.spawn fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
-  form.spawn legend { font-size: 0.75rem; padding: 0; }
-  form.close { display: inline; }
-  form.close button { background: transparent; border: 0; cursor: pointer; }
-  form.attach { display: inline; }
+  .md th, .md td { border: 1px solid var(--line); padding: 0.25rem 0.6rem; }
+  .md a { color: var(--accent); }
+
+  form.prompt { display: flex; gap: 0.5rem; padding: 0.75rem 1rem; border-top: 1px solid var(--line); background: var(--surface); }
+  form.prompt input[name=text] { flex: 1; padding: 0.6rem 0.9rem; border-radius: 10px; }
+  form.prompt button { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+  /* A4: pending typed permission form — the one thing on the page that is
+     waiting on the operator, so it is the one thing in the attention colour. */
+  .perm { margin: 0.75rem 1rem; padding: 0.8rem 1rem; border-radius: var(--radius); border: 1px solid color-mix(in srgb, var(--attn) 50%, transparent); background: var(--attn-bg); }
+  .perm fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+  .perm legend { font-weight: 600; padding: 0; color: var(--attn); }
+  .perm-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .perm-actions button:first-child { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
   /* C3b: the inject affordance's note. Was an inline style attribute, which
      a nonce-based style-src blocks exactly as it blocks an inline <style>. */
-  .inject-note { padding: 0.4rem 0.75rem 0; margin: 0; }
+  .inject-note { padding: 0.5rem 1rem 0; margin: 0; font-size: 0.8rem; }
   /* A label that a screen reader announces and a sighted user does not need:
      the prompt box is self-evident in context but must still HAVE a name. */
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
-  #tabs a { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); text-decoration: none; color: inherit; }
-  #tabs a[aria-current="page"] { border-bottom-color: transparent; font-weight: bold; }
   /* Focus must be SEEN. The browser default is easy to lose against a
      custom control, and keyboard-only operation is the fallback this whole
      surface exists to keep working. */
-  :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Phones: one column, page scroll. The sidebar comes first so the agent
+     list and spawn form are reachable before the panel. */
+  @media (max-width: 800px) {
+    body { display: block; height: auto; }
+    .cockpit { display: block; }
+    .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+    #content { display: block; padding: 0.75rem; }
+    .transcript { max-height: 65vh; }
+  }
   /* Motion is opt-out, not opt-in: the transcript scrolls itself as tokens
      arrive, and a vestibular trigger is not a styling preference. */
   @media (prefers-reduced-motion: reduce) {
@@ -89,11 +169,14 @@
 </style>
 </head>
 <body>
-<header><h1>newt-web</h1></header>
-<main id="content">
-<div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML"><section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section></div>
+<header><h1>newt-web</h1>
+<button type="button" data-theme-toggle hidden aria-label="toggle light theme">◐</button></header>
+<div class="cockpit">
+<aside class="sidebar" aria-label="agents and sessions">
+<h2 class="side-head">agents</h2>
+<nav id="tabs" aria-label="agents"></nav>
 <details class="spawn-wrap">
-<summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
+<summary>+ new scratch agent <small>(not saved)</small></summary>
 <form class="spawn" method="post" action="/agents" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
 <input type="hidden" name="csrf" value="{CSRF}"><fieldset>
 <legend>new scratch agent</legend>
@@ -106,8 +189,11 @@
 </fieldset>
 </form>
 </details>
-<nav id="tabs" aria-label="agents"></nav>
-<div id="panel"><p class="empty">No agents yet. Spawn one above.</p></div>
+<div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML"><section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent above.</p></section></div>
+</aside>
+<main id="content">
+<div id="panel"><p class="empty">No agent open. Attach a session or start a scratch agent from the sidebar.</p></div>
 </main>
+</div>
 </body>
 </html>
