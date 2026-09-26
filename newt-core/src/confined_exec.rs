@@ -131,9 +131,10 @@ pub struct ExecRequest {
     /// SIGKILLs the child's whole process group at the deadline so a hostile
     /// child cannot hang the harness indefinitely.
     timeout: Option<Duration>,
-    /// Directories the executor creates just before spawning (a build's
-    /// scratch `TMPDIR`), so building a request never touches the filesystem.
-    ensure_dirs: Vec<PathBuf>,
+    /// Per-run scratch directories (a build's `TMPDIR`): created fresh and
+    /// owner-only just before spawning, removed when the run ends, so building
+    /// a request never touches the filesystem.
+    scratch_dirs: Vec<PathBuf>,
 }
 
 impl ExecRequest {
@@ -157,14 +158,16 @@ impl ExecRequest {
             timeout: None,
             net_grant: NetGrant::Unrestricted,
             net_guard_bin: None,
-            ensure_dirs: Vec::new(),
+            scratch_dirs: Vec::new(),
         }
     }
 
-    /// Create `dir` (and its parents) just before spawning.
+    /// Give the run a private scratch `dir`: created just before spawning
+    /// (owner-only, refused if anything already exists there, symlink
+    /// included) and removed when the run ends. See [`ScratchDir`].
     #[must_use]
-    pub fn ensure_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.ensure_dirs.push(dir.into());
+    pub fn scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dirs.push(dir.into());
         self
     }
 
@@ -375,9 +378,12 @@ impl ConstrainedExecutor {
                 "confined execution cancelled before spawn",
             )));
         }
-        for dir in &req.ensure_dirs {
-            std::fs::create_dir_all(dir).map_err(ExecRefused::Spawn)?;
-        }
+        let _scratch = req
+            .scratch_dirs
+            .iter()
+            .map(|dir| ScratchDir::create(dir))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(ExecRefused::Spawn)?;
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
         // escapes the process group — can be terminated with one `cgroup.kill`.
@@ -1059,17 +1065,83 @@ pub fn build_tool_request(
     .env("CARGO_NET_OFFLINE", "true")
 }
 
-/// A build's scratch directory: stable per workspace, under the system temp
-/// dir and so outside any repository. `TMPDIR` used to be the workspace
-/// itself, which put every test fixture meant to be "not a git repo" inside
-/// one (newt-acp-worker's `capture_diff_on_non_git_workspace_returns_empty`
-/// failed in the build lane only) and left test scratch in the operator's
-/// tree.
+/// A build's scratch directory: `<workspace>/target/tmp/<pid>-<n>`, unique per
+/// call. It lies inside the build fence's existing write and read roots (the
+/// workspace), so it widens nothing, and under `target/`, which Rust
+/// repositories already git-ignore, so cc/linker temp files and test fixtures
+/// never land in the repo root. `TMPDIR` used to be the workspace itself, which
+/// put every fixture meant to be "not a git repo" inside one. The executor
+/// creates it fresh (0700) and removes it after the run ([`ScratchDir`]).
+///
+/// A workspace with no `target/` gets one for the run and loses it again if it
+/// is left empty; nothing outside the run's own directory is ever deleted.
 #[must_use]
 pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
-    let id =
-        content_addressable::RawContentId::from_content(workspace.to_string_lossy().as_bytes());
-    std::env::temp_dir().join("newt-build").join(id.to_string())
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    workspace.join("target").join("tmp").join(format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// A run's private scratch directory. [`ScratchDir::create`] makes it owner-only
+/// and refuses if the path already exists (so a pre-planted directory or
+/// symlink is never followed or reused); `Drop` removes exactly that directory,
+/// then the `tmp` and `target` parents only if they are left empty.
+struct ScratchDir {
+    path: PathBuf,
+    /// `target/` did not exist before this run created it.
+    created_target: bool,
+}
+
+impl ScratchDir {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let tmp = path.parent().unwrap_or(path);
+        let target = tmp.parent().unwrap_or(tmp);
+        let created_target = !target.exists();
+        std::fs::create_dir_all(target)?;
+        Self::private_dir(tmp, false)?;
+        Self::private_dir(path, true)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            created_target,
+        })
+    }
+
+    /// Make one directory, owner-only on unix. `exclusive`: fail if it exists.
+    fn private_dir(dir: &Path, exclusive: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        let builder = {
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        match builder.create(dir) {
+            Err(error) if !exclusive && error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        }
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // Never follow a link: only a real directory is removed.
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+        if let Some(tmp) = self.path.parent() {
+            let _ = std::fs::remove_dir(tmp);
+            if self.created_target {
+                if let Some(target) = tmp.parent() {
+                    let _ = std::fs::remove_dir(target);
+                }
+            }
+        }
+    }
 }
 
 /// The crates.io hosts `cargo fetch` reaches: the sparse index and the
@@ -1139,7 +1211,7 @@ fn toolchain_request(
     let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
         .env("HOME", root.as_ref())
         .env("TMPDIR", scratch.to_string_lossy())
-        .ensure_dir(scratch)
+        .scratch_dir(scratch)
         .env(
             "CARGO_TARGET_DIR",
             workspace.join("target").to_string_lossy(),
@@ -1222,11 +1294,9 @@ pub fn build_tool_caveats(workspace: &Path) -> Caveats {
 /// add roots the OPERATOR configured, not anything the repository controls.
 #[must_use]
 pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[String]) -> Caveats {
-    let scratch = build_scratch_dir(workspace).to_string_lossy().into_owned();
-    let mut write_roots = vec![workspace.to_string_lossy().into_owned(), scratch.clone()];
+    let mut write_roots = vec![workspace.to_string_lossy().into_owned()];
     write_roots.extend(extra_write_roots.iter().cloned());
-    let mut read_roots = build_tool_read_roots(workspace);
-    read_roots.push(scratch);
+    let read_roots = build_tool_read_roots(workspace);
     Caveats {
         // Calibrated reads: workspace + the toolchain/package-cache roots build
         // tools need — NOT all of `$HOME` (so ~/.ssh etc. stay unreadable). The
@@ -1618,17 +1688,104 @@ mod tests {
         .contains(&name.as_str())));
         assert_eq!(request.net_grant, NetGrant::DenyAll);
         assert_eq!(request.caveats.exec, Scope::All);
-        let scratch = build_scratch_dir(Path::new("/ws"));
-        assert_eq!(
-            request.caveats.fs_write,
-            Scope::only(["/ws".to_owned(), scratch.to_string_lossy().into_owned()])
-        );
+        // The scratch dir is INSIDE the fence's existing roots: no widening.
+        assert_eq!(request.caveats.fs_write, Scope::only(["/ws".to_owned()]));
+        let scratch = &request.scratch_dirs[0];
+        assert_eq!(request.scratch_dirs.len(), 1);
         assert_eq!(env.get("TMPDIR").map(Path::new), Some(scratch.as_path()));
+        assert!(scratch.starts_with("/ws/target/tmp"), "{scratch:?}");
+        assert!(crate::caveats::permits_path(
+            &request.caveats.fs_write,
+            &scratch.to_string_lossy()
+        ));
+        assert!(crate::caveats::permits_path(
+            &request.caveats.fs_read,
+            &scratch.to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn each_build_scratch_dir_is_unique() {
+        let ws = Path::new("/ws");
+        assert_ne!(build_scratch_dir(ws), build_scratch_dir(ws));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_dir_is_owner_only_and_gone_after_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = tempfile::tempdir().unwrap();
+        let path = build_scratch_dir(ws.path());
+        let guard = ScratchDir::create(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o700);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        std::fs::write(path.join("cc.tmp"), b"x").unwrap();
+        drop(guard);
+        assert!(!path.exists(), "scratch dir must be removed");
         assert!(
-            !scratch.starts_with("/ws"),
-            "scratch must sit outside the workspace"
+            !ws.path().join("target").exists(),
+            "an empty target/ this run created is removed too"
         );
-        assert_eq!(request.ensure_dirs, [scratch]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_cleanup_deletes_nothing_else() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = ws.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("debug/keep"), b"k").unwrap();
+        let other = ScratchDir::create(&build_scratch_dir(ws.path())).unwrap();
+        let path = build_scratch_dir(ws.path());
+        drop(ScratchDir::create(&path).unwrap());
+        assert!(target.join("debug/keep").is_file());
+        assert!(other.path.is_dir(), "a concurrent run's dir is untouched");
+        drop(other);
+        assert!(target.join("debug/keep").is_file());
+    }
+
+    /// A pre-existing symlink (or anything) at the scratch path is refused,
+    /// never followed into another place, and its target is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_scratch_path_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = build_scratch_dir(ws.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &path).unwrap();
+        assert!(ScratchDir::create(&path).is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(elsewhere.path().is_dir());
+    }
+
+    /// End to end: the child's TMPDIR is the scratch dir, and it is gone once
+    /// the lane returns, whether or not this host can enforce the fence.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_lane_run_leaves_no_scratch_behind() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let req = build_tool_request(
+            &ws,
+            &ws,
+            "sh",
+            ["-c", "printf %s \"$TMPDIR\"; touch \"$TMPDIR/x\""],
+        );
+        let scratch = req.scratch_dirs[0].clone();
+        if let Ok(out) = ConstrainedExecutor::run(&req) {
+            if out.success {
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    scratch.to_string_lossy()
+                );
+            }
+        }
+        assert!(!scratch.exists());
     }
 
     #[test]
@@ -1726,7 +1883,7 @@ mod tests {
         assert!(!cav.fs_write.permits(&"/etc".to_string()));
         assert!(
             !cav.fs_write.permits(&"/tmp".to_string()),
-            "no write to shared /tmp — scratch goes in its own per-workspace dir"
+            "no write to shared /tmp — scratch lives under the workspace target/"
         );
         assert!(
             !cav.net.permits(&"evil.example".to_string()),
@@ -1735,11 +1892,11 @@ mod tests {
     }
 
     /// Grounds `build_scratch_dir` against a real build-lane child: its
-    /// `TMPDIR` exists, is writable under the fence, and sits outside the
-    /// workspace, so a "not a git repository" fixture really is one.
+    /// `TMPDIR` is writable under the fence and lies under `target/tmp`, not
+    /// in the workspace root.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_build_lane_child_gets_a_writable_scratch_dir_outside_the_workspace() {
+    fn a_build_lane_child_gets_a_writable_scratch_dir_under_target() {
         let ws = tempfile::tempdir().unwrap();
         let ws = ws.path().canonicalize().unwrap();
         let script = "import os, tempfile\n\
@@ -1749,15 +1906,10 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.success, "stdout: {stdout}\nstderr: {stderr}");
-        let made = std::path::PathBuf::from(stdout.trim())
-            .canonicalize()
-            .unwrap();
         assert!(
-            !made.starts_with(&ws),
-            "{} is inside the workspace",
-            made.display()
+            std::path::Path::new(stdout.trim()).starts_with(ws.join("target/tmp")),
+            "{stdout}"
         );
-        assert!(made.starts_with(build_scratch_dir(&ws).canonicalize().unwrap()));
     }
 
     #[test]
