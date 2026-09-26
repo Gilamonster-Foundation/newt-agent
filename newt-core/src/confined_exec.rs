@@ -1075,15 +1075,37 @@ pub fn build_tool_request(
 ///
 /// A workspace with no `target/` gets one for the run and loses it again if it
 /// is left empty; nothing outside the run's own directory is ever deleted.
+///
+/// The operator can move it out of the repo with
+/// [`crate::scratch::build_scratch_override`]: the run then lives under
+/// [`operator_build_scratch_root`], which the build fence grants, and builds
+/// ask for permission because that root is outside the session's grant.
 #[must_use]
 pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
+    scratch_dir_under(workspace, crate::scratch::build_scratch_override())
+}
+
+fn scratch_dir_under(workspace: &Path, base: Option<PathBuf>) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    workspace.join("target").join("tmp").join(format!(
-        "{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+    operator_build_scratch_root(workspace, base)
+        .unwrap_or_else(|| workspace.join("target").join("tmp"))
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+}
+
+/// `<base>/<workspace id>` for an operator-set build scratch base, else `None`.
+/// Stable per workspace, so the fence can grant it before any run exists.
+fn operator_build_scratch_root(workspace: &Path, base: Option<PathBuf>) -> Option<PathBuf> {
+    base.map(|base| {
+        base.join(
+            content_addressable::RawContentId::from_content(workspace.to_string_lossy().as_bytes())
+                .to_string(),
+        )
+    })
 }
 
 /// A run's private scratch directory. [`ScratchDir::create`] makes it owner-only
@@ -1101,7 +1123,12 @@ impl ScratchDir {
         let tmp = path.parent().unwrap_or(path);
         let target = tmp.parent().unwrap_or(tmp);
         let created_target = !target.exists();
-        std::fs::create_dir_all(target)?;
+        // `create_dir`, not `create_dir_all`: the workspace (or the operator's
+        // base) must already exist. A missing one is a refusal, never created.
+        match std::fs::create_dir(target) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        }
         Self::private_dir(tmp, false)?;
         Self::private_dir(path, true)?;
         Ok(Self {
@@ -1294,9 +1321,25 @@ pub fn build_tool_caveats(workspace: &Path) -> Caveats {
 /// add roots the OPERATOR configured, not anything the repository controls.
 #[must_use]
 pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[String]) -> Caveats {
+    build_caveats_with_scratch(
+        workspace,
+        extra_write_roots,
+        crate::scratch::build_scratch_override(),
+    )
+}
+
+fn build_caveats_with_scratch(
+    workspace: &Path,
+    extra_write_roots: &[String],
+    scratch_base: Option<PathBuf>,
+) -> Caveats {
+    let scratch = operator_build_scratch_root(workspace, scratch_base)
+        .map(|root| root.to_string_lossy().into_owned());
     let mut write_roots = vec![workspace.to_string_lossy().into_owned()];
     write_roots.extend(extra_write_roots.iter().cloned());
-    let read_roots = build_tool_read_roots(workspace);
+    write_roots.extend(scratch.clone());
+    let mut read_roots = build_tool_read_roots(workspace);
+    read_roots.extend(scratch);
     Caveats {
         // Calibrated reads: workspace + the toolchain/package-cache roots build
         // tools need — NOT all of `$HOME` (so ~/.ssh etc. stay unreadable). The
@@ -1763,6 +1806,16 @@ mod tests {
         assert!(elsewhere.path().is_dir());
     }
 
+    /// A missing workspace is a refusal: the scratch guard creates `target/`
+    /// and below, never the workspace itself or its ancestors.
+    #[test]
+    fn a_missing_workspace_is_refused_not_created() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("missing").join("ws");
+        assert!(ScratchDir::create(&build_scratch_dir(&ws)).is_err());
+        assert!(!root.path().join("missing").exists());
+    }
+
     /// End to end: the child's TMPDIR is the scratch dir, and it is gone once
     /// the lane returns, whether or not this host can enforce the fence.
     #[cfg(unix)]
@@ -1910,6 +1963,44 @@ mod tests {
             std::path::Path::new(stdout.trim()).starts_with(ws.join("target/tmp")),
             "{stdout}"
         );
+    }
+
+    /// #2604 escape hatch: an operator build scratch base moves the run out of
+    /// the repo, to `<base>/<workspace id>/<run>`, and the fence grants exactly
+    /// that per-workspace root. With no base, nothing is added.
+    #[test]
+    fn an_operator_build_scratch_base_moves_the_run_and_is_granted() {
+        let ws = Path::new("/ws");
+        let base = std::env::temp_dir().join("operator-build-scratch");
+        let root = operator_build_scratch_root(ws, Some(base.clone())).unwrap();
+        assert_eq!(root.parent(), Some(base.as_path()));
+        assert_eq!(
+            Some(root.clone()),
+            operator_build_scratch_root(ws, Some(base.clone()))
+        );
+        assert_ne!(
+            Some(root.clone()),
+            operator_build_scratch_root(Path::new("/other"), Some(base.clone()))
+        );
+
+        let run = scratch_dir_under(ws, Some(base.clone()));
+        assert_eq!(run.parent(), Some(root.as_path()));
+        assert!(
+            !run.starts_with(ws),
+            "an operator base leaves the workspace"
+        );
+
+        let root = root.to_string_lossy().into_owned();
+        let cav = build_caveats_with_scratch(ws, &[], Some(base));
+        assert!(crate::caveats::permits_path(
+            &cav.fs_write,
+            &run.to_string_lossy()
+        ));
+        assert!(crate::caveats::permits_path(&cav.fs_read, &root));
+
+        let default = build_caveats_with_scratch(ws, &[], None);
+        assert_eq!(default.fs_write, Scope::only(["/ws".to_owned()]));
+        assert!(scratch_dir_under(ws, None).starts_with("/ws/target/tmp"));
     }
 
     #[test]
