@@ -105,6 +105,12 @@ pub struct ScratchConfig {
     /// (`/tmp`, a PVC mount) for a read-only checkout. `NEWT_SCRATCH_DIR` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// The build lane's scratch base (#2604): an absolute dir under which each
+    /// workspace gets its build `TMPDIR`. Unset → `<workspace>/target/tmp`.
+    /// `NEWT_BUILD_SCRATCH_DIR` wins. Setting it makes builds ask for
+    /// permission; see [`crate::scratch::build_scratch_override`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_dir: Option<String>,
 }
 
 /// Top-level Newt-Agent configuration.
@@ -1734,6 +1740,10 @@ impl Config {
         // session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
         if let Some(dir) = self.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
             crate::scratch::set_scratch_dir(dir);
+        }
+        // #2604: the build lane's scratch base; `NEWT_BUILD_SCRATCH_DIR` wins.
+        if let Some(dir) = self.scratch.as_ref().and_then(|s| s.build_dir.as_deref()) {
+            crate::scratch::set_build_scratch_dir(dir);
         }
         // #1789: publish `[network] owned_suffixes` so retry policy can treat
         // operator-owned inference hosts as patiently as loopback ones.

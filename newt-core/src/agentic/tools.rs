@@ -1240,7 +1240,7 @@ fn lifecycle_build_request(
         tool: "lifecycle".into(),
         kind: DenialKind::Build,
         target: workspace.into(),
-        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites and scratch within the workspace; network denied. Compiler, build-script and test subprocesses inherit the same kernel fence.{escalation}"),
+        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites within the workspace and its build scratch directory; network denied. Compiler, build-script and test subprocesses inherit the same kernel fence.{escalation}"),
     }
 }
 
