@@ -297,7 +297,7 @@ secure.
 
 ### Ladder (one concern per PR)
 
-- [ ] **K8-a** — agent-mesh: accept-none bind mode (upstream issue).
+- [ ] **K8-a** — agent-mesh: accept-none bind mode (Gilamonster-Foundation/agent-mesh#92).
 - [ ] **K8-b** — persistent dock `AgentKey` for hub and host (K8.4); regression that an approval
   survives a hub restart.
 - [ ] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
