@@ -131,6 +131,9 @@ pub struct ExecRequest {
     /// SIGKILLs the child's whole process group at the deadline so a hostile
     /// child cannot hang the harness indefinitely.
     timeout: Option<Duration>,
+    /// Directories the executor creates just before spawning (a build's
+    /// scratch `TMPDIR`), so building a request never touches the filesystem.
+    ensure_dirs: Vec<PathBuf>,
 }
 
 impl ExecRequest {
@@ -154,7 +157,15 @@ impl ExecRequest {
             timeout: None,
             net_grant: NetGrant::Unrestricted,
             net_guard_bin: None,
+            ensure_dirs: Vec::new(),
         }
+    }
+
+    /// Create `dir` (and its parents) just before spawning.
+    #[must_use]
+    pub fn ensure_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.ensure_dirs.push(dir.into());
+        self
     }
 
     /// Set the kernel network floor. [`NetGrant::DenyAll`] wraps the child in
@@ -363,6 +374,9 @@ impl ConstrainedExecutor {
                 std::io::ErrorKind::Interrupted,
                 "confined execution cancelled before spawn",
             )));
+        }
+        for dir in &req.ensure_dirs {
+            std::fs::create_dir_all(dir).map_err(ExecRefused::Spawn)?;
         }
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
@@ -995,6 +1009,18 @@ pub fn build_tool_request(
     .env("CARGO_NET_OFFLINE", "true")
 }
 
+/// A build's scratch directory: stable per workspace, under the system temp
+/// dir and so outside any repository. `TMPDIR` used to be the workspace
+/// itself, which put every test fixture meant to be "not a git repo" inside
+/// one (newt-acp-worker's `capture_diff_on_non_git_workspace_returns_empty`
+/// failed in the build lane only) and left test scratch in the operator's
+/// tree.
+#[must_use]
+pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
+    let id = blake3::hash(workspace.to_string_lossy().as_bytes()).to_hex();
+    std::env::temp_dir().join("newt-build").join(&id[..16])
+}
+
 /// The crates.io hosts `cargo fetch` reaches: the sparse index and the
 /// download CDN. The only network [`dependency_fetch_request`] asks for.
 pub const CRATES_IO_FETCH_HOSTS: &[&str] = &["index.crates.io", "static.crates.io"];
@@ -1058,9 +1084,11 @@ fn toolchain_request(
     caveats: Caveats,
 ) -> ExecRequest {
     let root = workspace.to_string_lossy();
+    let scratch = build_scratch_dir(workspace);
     let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
         .env("HOME", root.as_ref())
-        .env("TMPDIR", root.as_ref())
+        .env("TMPDIR", scratch.to_string_lossy())
+        .ensure_dir(scratch)
         .env(
             "CARGO_TARGET_DIR",
             workspace.join("target").to_string_lossy(),
@@ -1143,14 +1171,17 @@ pub fn build_tool_caveats(workspace: &Path) -> Caveats {
 /// add roots the OPERATOR configured, not anything the repository controls.
 #[must_use]
 pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[String]) -> Caveats {
-    let mut write_roots = vec![workspace.to_string_lossy().into_owned()];
+    let scratch = build_scratch_dir(workspace).to_string_lossy().into_owned();
+    let mut write_roots = vec![workspace.to_string_lossy().into_owned(), scratch.clone()];
     write_roots.extend(extra_write_roots.iter().cloned());
+    let mut read_roots = build_tool_read_roots(workspace);
+    read_roots.push(scratch);
     Caveats {
         // Calibrated reads: workspace + the toolchain/package-cache roots build
         // tools need — NOT all of `$HOME` (so ~/.ssh etc. stay unreadable). The
         // system dirs (/usr, /lib, loaders) are covered by the sandbox backend's
         // base read paths; here we add the workspace and the per-user caches.
-        fs_read: Scope::only(build_tool_read_roots(workspace)),
+        fs_read: Scope::only(read_roots),
         fs_write: Scope::only(write_roots),
         exec: Scope::All,
         net: Scope::none(),
@@ -1536,7 +1567,17 @@ mod tests {
         .contains(&name.as_str())));
         assert_eq!(request.net_grant, NetGrant::DenyAll);
         assert_eq!(request.caveats.exec, Scope::All);
-        assert_eq!(request.caveats.fs_write, Scope::only(["/ws".to_owned()]));
+        let scratch = build_scratch_dir(Path::new("/ws"));
+        assert_eq!(
+            request.caveats.fs_write,
+            Scope::only(["/ws".to_owned(), scratch.to_string_lossy().into_owned()])
+        );
+        assert_eq!(env.get("TMPDIR").map(Path::new), Some(scratch.as_path()));
+        assert!(
+            !scratch.starts_with("/ws"),
+            "scratch must sit outside the workspace"
+        );
+        assert_eq!(request.ensure_dirs, [scratch]);
     }
 
     #[test]
@@ -1634,12 +1675,38 @@ mod tests {
         assert!(!cav.fs_write.permits(&"/etc".to_string()));
         assert!(
             !cav.fs_write.permits(&"/tmp".to_string()),
-            "no write to shared /tmp — scratch goes in-workspace via TMPDIR"
+            "no write to shared /tmp — scratch goes in its own per-workspace dir"
         );
         assert!(
             !cav.net.permits(&"evil.example".to_string()),
             "no network — the exfil channel is closed"
         );
+    }
+
+    /// Grounds `build_scratch_dir` against a real build-lane child: its
+    /// `TMPDIR` exists, is writable under the fence, and sits outside the
+    /// workspace, so a "not a git repository" fixture really is one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_build_lane_child_gets_a_writable_scratch_dir_outside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let script = "import os, tempfile\n\
+            d = tempfile.mkdtemp(); open(os.path.join(d, 'x'), 'w').write('ok'); print(d)\n";
+        let req = build_tool_request(&ws, &ws, "python3", ["-c", script]);
+        let out = ConstrainedExecutor::run(&req).expect("the build lane spawns");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.success, "stdout: {stdout}\nstderr: {stderr}");
+        let made = std::path::PathBuf::from(stdout.trim())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            !made.starts_with(&ws),
+            "{} is inside the workspace",
+            made.display()
+        );
+        assert!(made.starts_with(build_scratch_dir(&ws).canonicalize().unwrap()));
     }
 
     #[test]
