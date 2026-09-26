@@ -1175,6 +1175,10 @@ pub(super) fn confined_result(
     if let Some(refusal) = absent_binary_refusal(envelope, &caveats.exec) {
         return (refusal, ExecOutcome::Unavailable);
     }
+    // A later pipeline or `;` stage sets the exit code, so a missing `rg` in
+    // `rg … | head` exits 0 and a live run showed only brush's bare
+    // `command not found: rg`. Keep the output, and name the absence too.
+    let absent = absent_program_note(envelope, &caveats.exec);
     // #2273: a 126 with no structured denial whose program sits
     // outside the fs-read grant is the KERNEL refusing, not a
     // chmod the model forgot. Same structured test, one more state.
@@ -1183,6 +1187,10 @@ pub(super) fn confined_result(
     }
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
+    if let Some(note) = absent {
+        text.push('\n');
+        text.push_str(&note);
+    }
     if outcome == ExecOutcome::TimedOut {
         text.push_str(&timed_out_note(dispatch_wall(cmd)));
     }
@@ -1861,6 +1869,15 @@ pub(crate) fn absent_binary_refusal(
     {
         return None;
     }
+    absent_program_note(envelope, exec)
+}
+
+/// The absence message for the program brush named in `command not found: X`,
+/// whatever the envelope's exit code. `None` for a structured denial.
+fn absent_program_note(
+    envelope: &serde_json::Value,
+    exec: &crate::caveats::Scope<String>,
+) -> Option<String> {
     // A structured refusal is a DENIAL, not an absence. Relabelling one as the
     // other would send the model to the wrong remedy.
     if envelope_denied(envelope)
