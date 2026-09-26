@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle"
-version = "0.8.0-rc.4"
+version = "0.8.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf06fbce79e7ad4f09a370a9049e4907479173da4acd766851ed1f262f5c0672"
+checksum = "4af3d95025f706a101ff13e2c4c4d64b26c01a9f600411a2d5c05a3fd1c855ce"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -74,9 +74,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-core"
-version = "0.8.0-rc.4"
+version = "0.8.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "637952cf3b4fcea947a258b2bf0d553a97b7ab2300e6cfff156fc4202c98dacc"
+checksum = "5853a5aa597c076c9136a2fbd068a12109c6c625cb85ee516a58fb8f69be7216"
 dependencies = [
  "agent-bridle-fdguard",
  "agent-mesh-protocol",
@@ -98,18 +98,18 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-fdguard"
-version = "0.8.0-rc.4"
+version = "0.8.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee359bf6512c0f1864dea3c54870d75856a4a940d5697ebea6d678b4c3e9c404"
+checksum = "a38ea0e0c369827dac26af8dc23c265413d94000d75415131d18b3fff46f8cd8"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "agent-bridle-tool-shell"
-version = "0.8.0-rc.4"
+version = "0.8.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f01bee706104999e8fcd2309e45c85dedf6ab2857244dd45c95c4f6f0c12247c"
+checksum = "e380248f6dde134a589960121af92f9c6ff9cf87b6593693341db85f447bb456"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-fdguard",
@@ -130,9 +130,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-web"
-version = "0.8.0-rc.4"
+version = "0.8.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b1c4eecc2470683a28543952ca36d76e0c8d2f14ccb56b4613389dbcdba37b3"
+checksum = "cb360e4649cde04a34b79d5406710eb335bd760fac5292e2eedef24bb662625c"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
