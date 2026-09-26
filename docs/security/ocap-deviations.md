@@ -69,7 +69,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
 | `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
 | `windows-inheritable-handle-leak` | no ambient inherited OS object handles cross into an AppContainer child | 🟠 ACTIVE (Windows) | (a Windows confinement limitation on attacker-exec children — not a gated capability) |
-| `windows-shelltool-env-inheritance` | confined Windows `run_command` children start from an explicit env allow-list, not the Newt parent's ambient env | 🟠 ACTIVE (Windows run_command) | (provider-bearing Newt processes must not rely on `run_command` env isolation until agent-bridle env-clear parity lands) |
+| `windows-shelltool-env-inheritance` | confined Windows `run_command` children start from an explicit env allow-list, not the Newt parent's ambient env | ✅ CLOSED (agent-bridle 0.8.0-rc.4) | — |
+| `windows-appcontainer-exec-allowlist` | a restricted exec grant (`exec = { only = [...] }`) is enforced on every platform | 🟡 FAIL-CLOSED (Windows) | allowlisted `newt-mcp-server` `shell_run` is refused on Windows |
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
@@ -139,8 +140,9 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   regression test proves a parent-only secret (non-allowlisted name) never reaches that env seam.
   Windows #1633 separately grounds the actual `run_command` child path and exposes a shared
   agent-bridle `ShellTool` Windows spawn residual: the child process still inherits the parent's
-  ambient environment, including provider-shaped secrets, before Newt can observe it. That is tracked
-  as ACTIVE under `windows-shelltool-env-inheritance`; no Newt-local compatibility shim is installed.
+  ambient environment, including provider-shaped secrets, before Newt can observe it. That was tracked
+  under `windows-shelltool-env-inheritance` and is CLOSED by agent-bridle 0.8.0-rc.4; no Newt-local
+  compatibility shim was ever installed.
   **#1601 (inherited-fd hygiene) is CLOSED** (step-8.8):
   `newt-net-guard` calls `close_inherited_fds()` (`close_range(3, ~0)`) before exec, so every
   attacker-influenced child has all fds ≥ 3 closed — an inherited fd (a capability that bypasses
@@ -189,11 +191,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Compensating controls:** the DIRECT-egress floor stands (no self-opened off-box socket); the
   child is fs- and exec-fenced, limiting what it can DO with a deputy but not stopping it reaching
   one; a hardened host removes ambient network-relaying deputies (not a hard guarantee). FD-hygiene
-  note: the run_command route's inherited-FD hygiene is CLOEXEC-based (std default + agent-bridle
-  `set_cloexec`), NOT the explicit `close_range(3,~0)` the DenyAll `newt-net-guard` route performs
-  (`run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close`) — a non-CLOEXEC network fd
-  would be inherited, so "no pre-opened-fd bypass of the socket() filter" holds only because newt
-  opens its real fds via std (CLOEXEC).
+  note (agent-bridle 0.8+): the run_command route's safe-subset spawner now closes ambient
+  descriptors before exec (`agent-bridle-fdguard`'s `deny_inherited_fds`,
+  `CLOSE_RANGE_CLOEXEC`-based), the same guarantee the DenyAll `newt-net-guard` route's explicit
+  `close_range(3,~0)` gives (`run_command_route_fd_hygiene_is_cloexec_based_via_fdguard`) — a
+  non-CLOEXEC network fd is now closed on both routes, not just inherited-and-CLOEXEC'd. The
+  asymmetry this note previously recorded is closed as of the 0.8.0-rc.4 upgrade.
 - **Closure criterion:** a network namespace (unprivileged netns — blocked by host policy on Ubuntu
   ≥ 23.10) or an equivalent that isolates BOTH the abstract unix namespace AND pathname reachability
   — the mediated-egress / netns floor of #1599 — plus the Windows named-pipe/local-IPC deputy
@@ -275,6 +278,24 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** OPEN — Windows-only ACTIVE residual; owner: — · review-by: Windows AppContainer handle
   hygiene follow-up.
 
+### windows-appcontainer-exec-allowlist
+- **Invariant (ideal):** an operator's exec allowlist (`exec = { only = ["git", "cargo"] }`) confines
+  a child to those programs on every platform.
+- **Practical caveat (now):** agent-bridle 0.8's L3 admission projects what the backend actually
+  installs. AppContainer bounds exec only with the deny-all child-process block, so a non-empty
+  allowlist resolves to `Unknown` on the Exec axis (`AppContainerSandbox::resolved_authority`) and
+  `admit` refuses the spawn. Enforcing an allowlist there is an Interceptor's job, not the container's.
+- **Residual:** 🟡 FAIL-CLOSED (Windows). No authority leaks. Instead, every allowlisted
+  `newt-mcp-server` `shell_run` on Windows is refused in-band with
+  `backend authority on the Exec axis is not decidable … (L3 BOUND)`. Linux and macOS are unaffected.
+- **Disabled while open:** allowlisted `newt-mcp-server` `shell_run` on Windows (refused, not gated).
+- **Compensating controls:** the refusal happens before spawn; nothing runs unconfined.
+- **Closure criterion:** an agent-bridle release that can admit an exec allowlist under AppContainer,
+  for example one bounded by an Interceptor. Flip the pin below back to a success test then.
+- **Ratchet guard:** `shell_run_exec_allowlist_is_refused_on_windows`
+  (`newt-mcp-server/src/handlers.rs`) pins the refusal.
+- **Status:** OPEN — accepted on the agent-bridle 0.8 bump (#2596).
+
 ### windows-shelltool-env-inheritance
 - **Invariant (ideal):** every confined `run_command` child on Windows starts from an explicit
   environment allow-list: Newt's structured env seam plus any operator-granted shell env imports, never
@@ -283,16 +304,16 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Practical caveat (now):** the actual Windows `run_command` route is
   `dispatch_bridled_shell` -> agent-bridle `ShellTool` -> `agent-bridle-aclaunch.exe`. In published
   agent-bridle 0.7.15, `agent-bridle-tool-shell` clears the ambient child env only under the Unix
-  implementation; the Windows child env contract is still inherited. The route-level proof
-  `run_command_windows_provider_env_inheritance_is_active`
-  (`newt-core/src/agentic/tools_tests/helper_windows_appcontainer.rs`) launches through the real AppContainer backend and proves a
-  parent-only `OPENAI_API_KEY` reaches the child. The separate `ConstrainedExecutor` seam does not have
+  implementation; the Windows child env contract was inherited. agent-bridle 0.8.0-rc.4 closes it:
+  the route-level proof `run_command_windows_provider_env_is_not_inherited`
+  (`newt-core/src/agentic/tools_tests/helper_windows_appcontainer.rs`) launches through the real
+  AppContainer backend and proves a parent-only `OPENAI_API_KEY` does NOT reach the child (the
+  child prints `EMPTY`). The separate `ConstrainedExecutor` seam does not have
   this leak: `appcontainer_child_does_not_inherit_provider_credentials`
   (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves only explicitly granted env crosses
   there.
-- **Residual:** 🟠 ACTIVE (Windows `run_command`) — reachable when Newt itself holds provider
-  credentials in its process environment and then runs model-influenced `run_command` through the
-  shared ShellTool path.
+- **Residual:** ✅ CLOSED for the leak (agent-bridle 0.8.0-rc.4). Not yet proven on this route:
+  that an explicitly granted env var still reaches a Windows ShellTool child.
 - **Disabled while open:** nothing automatic — this is a shared spawn-abstraction defect on an
   always-reachable attacker-exec route, not a gated capability. Operators who run Newt with live
   provider credentials should treat Windows `run_command` env isolation as unproven until the shared
@@ -305,10 +326,9 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   or explicitly minimal environment, with a real Windows regression test proving a parent-only
   provider credential is absent while explicitly granted env still appears. Tracked upstream as
   Gilamonster-Foundation/agent-bridle#323.
-- **Ratchet guard:** `run_command_windows_provider_env_inheritance_is_active` pins the current leak.
-  When the shared fix lands, flip the test to require `EMPTY` and rename it back to a denial proof.
-- **Status:** OPEN — Windows-only ACTIVE residual in the shared `ShellTool` route; owner:
-  agent-bridle#323.
+- **Ratchet guard:** `run_command_windows_provider_env_is_not_inherited` requires `EMPTY` (flipped
+  from the former `..._inheritance_is_active` leak pin on the 0.8 bump).
+- **Status:** CLOSED — agent-bridle#323, consumed via agent-bridle 0.8.0-rc.4.
 
 ### unconfined-fallback-on-missing-backend
 - **Invariant (ideal):** an attacker-exec route must, on EVERY supported platform, either enforce the

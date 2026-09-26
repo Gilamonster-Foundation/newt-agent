@@ -932,7 +932,19 @@ pub fn kill_process_group(pgid: u32) {
 /// admission. macOS's /usr/bin/git is an xcrun shim; its selected developer
 /// directory can live outside Bridle's default /Library runtime roots.
 pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
-    let policy = agent_bridle::SandboxPolicy::default();
+    // agent-bridle 0.8's L3 admission bound (`AdmittedFence::admit`) only
+    // resolves a RESTRICTED `net` axis when `child_network == DenyDirect`;
+    // under the default `LandlockOnly` the axis is `Unknown` and every
+    // `ConstrainedExecutor` spawn fails closed with "not decidable against
+    // the delegated grant ∪ declared runtime closure (L3 BOUND)". This
+    // STRENGTHENS the fence (adds the seccomp `socket()` + io_uring deny on
+    // top of Landlock's TCP-only rule) — it widens nothing. Matches the
+    // floor `b1_run_command_sandbox_policy` already applies to the
+    // run_command lane (see its doc comment).
+    let policy = agent_bridle::SandboxPolicy {
+        child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
+        ..agent_bridle::SandboxPolicy::default()
+    };
     #[cfg(target_os = "macos")]
     {
         let mut policy = policy;
@@ -1848,9 +1860,11 @@ mod tests {
         // kernel-enforced. TrustedInfra carries the default (advisory) floor.
         let caveats = workspace_confined_caveats(Path::new("/ws"));
         let agent_cx = mint_context(ExecOrigin::AgentInfluenced, &caveats).unwrap();
-        assert_eq!(agent_cx.strength_floor(), AxisEnforcement::Kernel);
+        assert_eq!(agent_cx.strength_floor().exec(), AxisEnforcement::Kernel);
+        assert_eq!(agent_cx.strength_floor().net(), AxisEnforcement::Kernel);
         let trusted_cx = mint_context(ExecOrigin::TrustedInfra, &caveats).unwrap();
-        assert_ne!(trusted_cx.strength_floor(), AxisEnforcement::Kernel);
+        assert_ne!(trusted_cx.strength_floor().exec(), AxisEnforcement::Kernel);
+        assert_ne!(trusted_cx.strength_floor().net(), AxisEnforcement::Kernel);
     }
 
     #[test]

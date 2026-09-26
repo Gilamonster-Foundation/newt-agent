@@ -66,7 +66,10 @@ fn net_posture(caveats: &Caveats, proxied: bool, private_origin_pinned: bool) ->
 // Confined stdio spawn (Unix): the child's stdio comes back as tokio pipe ends
 // from `agent_bridle::ConfinedCommand::spawn_tokio`.
 #[cfg(unix)]
-use agent_bridle::{ConfinedCommand, ConfinedTokioChild, Gate, Tool, ToolContext, ToolResult};
+use agent_bridle::{
+    ChildNetworkPolicy, ConfinedCommand, ConfinedTokioChild, Gate, SandboxPolicy, Tool,
+    ToolContext, ToolResult,
+};
 #[cfg(unix)]
 use tokio::net::unix::pipe;
 // Non-Unix has no OS-sandbox spawn primitive yet, so the stdio child is spawned
@@ -897,7 +900,25 @@ impl StdioTransport {
             format!("authorizing confined spawn of MCP server `{}`", entry.name)
         })?;
 
-        let mut cmd = ConfinedCommand::new(command).args(&entry.args);
+        // agent-bridle 0.8's L3 admission bound only resolves a RESTRICTED
+        // `net` axis when `child_network == DenyDirect`; under the default
+        // `LandlockOnly` a `net: none` server (the common case — no server
+        // config declares an allowlist by default) is `Unknown` and every
+        // confined spawn fails closed with "not decidable ... (L3 BOUND)".
+        // Safe to apply unconditionally: `DenyDirect` is a no-op unless the
+        // `net` caveat is ALREADY deny-all, so a server with a net grant
+        // (the egress-proxy path, `agent_bridle::net_egress_proxy_hosts`) is
+        // untouched — the proxy's own engagement test
+        // (`loopback_net_enforceable`) never inspects `child_network` at
+        // all. Same floor `confined_exec::runtime_sandbox_policy` already
+        // applies to `run_command`.
+        let sandbox_policy = std::sync::Arc::new(SandboxPolicy {
+            child_network: ChildNetworkPolicy::DenyDirect,
+            ..SandboxPolicy::default()
+        });
+        let mut cmd = ConfinedCommand::new(command)
+            .args(&entry.args)
+            .sandbox_policy(sandbox_policy);
         for (k, v) in &grants {
             cmd = cmd.env(k, v);
         }

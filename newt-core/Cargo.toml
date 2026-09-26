@@ -105,7 +105,7 @@ tokio.workspace = true
 # spawned children (before it a confined child's whole environment was
 # PWD/SHLVL/_, so a build could not find `cc`, and the seam — HOME, TMPDIR, the
 # passthrough list — never arrived). No `[patch]`: this is the published crate.
-agent-bridle = { version = "0.7.17", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
+agent-bridle = { version = "0.8.0-rc.5", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
 
 # Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,
 # behind the default `markdown` feature. Stripped under --no-default-features
