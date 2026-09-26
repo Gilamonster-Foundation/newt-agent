@@ -211,6 +211,10 @@ mod theme;
 mod modal_size;
 #[cfg(feature = "rich-tui")]
 mod panel;
+#[cfg(feature = "rich-tui")]
+mod panel_controls;
+#[cfg(feature = "rich-tui")]
+mod prefix;
 // `/settings` as a chooser (slash_registry's `Disposition::Panel`), over the
 // same driver and the same chrome as /psyche and /backends. The typed form
 // stays for every surface that has no region to draw in.

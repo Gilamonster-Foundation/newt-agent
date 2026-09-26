@@ -108,6 +108,17 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
             map.insert("TMPDIR".to_string(), tmp);
         }
     }
+    // Model-run git: no ambient config, the hardening overrides, and the
+    // agent as author (see `git_hardening::sandbox_git_env`).
+    // Resolved per dispatch, so a `/settings` change applies to the next
+    // command rather than the next session.
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    let (name, email) = identity.sandbox_author();
+    map.extend(crate::git_hardening::sandbox_git_env(
+        (&name, &email),
+        &identity.git.config,
+    ));
+
     // Identify the confined engine so `env` / scripts can tell they're in newt's
     // shell (e.g. `SHELL=safe-subset` / `brush` / `host`), not the login shell.
     map.insert("SHELL".to_string(), shell_engine().as_str().to_string());
@@ -784,19 +795,24 @@ pub(super) async fn dispatch_bridled_shell(
     // route anything compound. `dispatch_wall` reads only `args["cmd"]`, so
     // this changes nothing but the wall clock: `caveats` (fs/net/exec
     // authority) passed to `.dispatch()` below is untouched.
-    let wall = args
-        .get("cmd")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || std::time::Duration::from_secs(run_command_wall_secs()),
-            dispatch_wall,
-        );
+    let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
+    let wall = cmd.map_or_else(
+        || std::time::Duration::from_secs(run_command_wall_secs()),
+        dispatch_wall,
+    );
+    // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
+    // read roots for a build-tool command are added ONLY to the caveats used
+    // for THIS dispatch, never folded back into the session's standing
+    // authority (`widen_caveats` deliberately does not touch `fs_read` for an
+    // exec grant — see its doc comment). Call-scoped, exactly like
+    // `build_tool_caveats` for the lifecycle build lane.
+    let dispatch_caveats = dispatch_caveats_for_command(cmd.unwrap_or(""), caveats);
     let result = bridle_registry(
         shell_engine(),
         live.as_ref().map(LiveOutputSession::relay),
         wall,
     )
-    .dispatch("shell", args, caveats)
+    .dispatch("shell", args, &dispatch_caveats)
     .await;
     if let Some(live) = live.as_mut() {
         let ordinary_completion = result
@@ -1159,6 +1175,10 @@ pub(super) fn confined_result(
     if let Some(refusal) = absent_binary_refusal(envelope, &caveats.exec) {
         return (refusal, ExecOutcome::Unavailable);
     }
+    // A later pipeline or `;` stage sets the exit code, so a missing `rg` in
+    // `rg … | head` exits 0 and a live run showed only brush's bare
+    // `command not found: rg`. Keep the output, and name the absence too.
+    let absent = absent_program_note(envelope, &caveats.exec);
     // #2273: a 126 with no structured denial whose program sits
     // outside the fs-read grant is the KERNEL refusing, not a
     // chmod the model forgot. Same structured test, one more state.
@@ -1167,6 +1187,10 @@ pub(super) fn confined_result(
     }
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
+    if let Some(note) = absent {
+        text.push('\n');
+        text.push_str(&note);
+    }
     if outcome == ExecOutcome::TimedOut {
         text.push_str(&timed_out_note(dispatch_wall(cmd)));
     }
@@ -1845,6 +1869,15 @@ pub(crate) fn absent_binary_refusal(
     {
         return None;
     }
+    absent_program_note(envelope, exec)
+}
+
+/// The absence message for the program brush named in `command not found: X`,
+/// whatever the envelope's exit code. `None` for a structured denial.
+fn absent_program_note(
+    envelope: &serde_json::Value,
+    exec: &crate::caveats::Scope<String>,
+) -> Option<String> {
     // A structured refusal is a DENIAL, not an absence. Relabelling one as the
     // other would send the model to the wrong remedy.
     if envelope_denied(envelope)
@@ -1967,10 +2000,112 @@ fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'
         .filter(|name| !name.is_empty())
 }
 
+/// F32/#2537, PR #2577 round 3 (Shawn): when the confined shell is about to
+/// run a bare `git …` command in the session's OWN repository on a
+/// non-default branch, widen the caveats passed to THIS ONE dispatch with
+/// kernel WRITE on the worktree's own gitdir and the common `objects/`
+/// directory (`own_gitdir_shell_write_grant` — round 3 narrowed the grant to
+/// exactly those two directories; round 4 bound it to the identity resolved
+/// at session start rather than a live re-resolve, see that function's doc
+/// comment). This unblocks a confined-shell `git add` under the real kernel
+/// fence (a file-level Landlock rule cannot carry the
+/// `MAKE_REG`/`REFER`/`REMOVE_FILE` rights `index.lock` create+rename and
+/// object insertion need — a directory rule can).
+///
+/// Deliberately scoped to a SIMPLE `git` invocation, not folded into the
+/// session `fs_write` scope: `write_file`/`edit_file` on git metadata stay
+/// refused (`caveats::apply_cli_fs_grants` never grants this), and a shell
+/// `git commit` is refused outright before reaching here
+/// (`run_command_creates_shell_git_commit`), so this widening never needs to
+/// cover a ref move — `refuse_if_default_branch` in `newt-git` is what
+/// prevents that, at the one place a commit can actually land. A compound
+/// command (`git add && rm -rf /`) is not "leading program `git`" in the
+/// sense that matters here either way — it still runs through the confined
+/// engine, which gates each spawn on these SAME (possibly widened) caveats,
+/// so a second program in the pipeline gets the same widened `fs_write` too;
+/// that is the accepted trade-off Shawn signed off on (a confined-shell
+/// `rm -rf <common>/objects` becomes possible on a non-default branch — see
+/// `RESULT-dec2-own-gitdir.md`), not an oversight.
+///
+/// Mirrors the shape a sibling PR's `dispatch_caveats_for_command` (build
+/// tools) uses — a separate function, called at the same call site, so the
+/// two compose without conflict.
+pub(super) fn dispatch_caveats_for_git_shell(
+    cmd: &str,
+    workspace: &str,
+    caveats: &crate::caveats::Caveats,
+) -> crate::caveats::Caveats {
+    if leading_program(cmd) != Some("git") {
+        return caveats.clone();
+    }
+    // Round 4, Blocker 1: NOT `own_gitdir_grants` — that re-resolves via a
+    // live `rev-parse`, which follows model-writable pointers (the workspace
+    // `.git` gitlink, `<gitdir>/commondir`). This bounds the write grant to
+    // the identity cached at session start.
+    let write = crate::git_hardening::own_gitdir_shell_write_grant(std::path::Path::new(workspace));
+    if write.is_empty() {
+        return caveats.clone();
+    }
+    let mut widened = caveats.clone();
+    widened.fs_write = match &widened.fs_write {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => {
+            crate::caveats::Scope::only(set.iter().cloned().chain(write))
+        }
+    };
+    // Real git ALWAYS tries to read the system config (`/etc/gitconfig`),
+    // regardless of repo/branch — not just on a host that happens to have
+    // one. Landlock's base read allowlist does not include it (CI caught
+    // this: a Landlock-confined `git add` on a runner that ships
+    // `/etc/gitconfig` failed with "unknown error occurred while reading
+    // the configuration files", exit 128 — this environment's sandbox
+    // silently worked only because it has no such file). One extra,
+    // non-secret, well-known system path, granted only on this ONE widened
+    // dispatch, same as the write grant above.
+    widened.fs_read = match &widened.fs_read {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(
+            set.iter()
+                .cloned()
+                .chain(std::iter::once("/etc/gitconfig".to_string())),
+        ),
+    };
+    widened
+}
+
 /// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
 /// the program.
-fn leading_program(cmd: &str) -> Option<&str> {
+pub(super) fn leading_program(cmd: &str) -> Option<&str> {
     cmd.split_ascii_whitespace().find(|tok| !tok.contains('='))
+}
+
+/// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the caveats for
+/// ONE confined-shell dispatch — `caveats` as-is, unless `cmd`'s leading
+/// program is a build tool (`confined_exec::is_build_tool_exec`), in which
+/// case its toolchain read roots (`confined_exec::toolchain_read_roots`) are
+/// added to `fs_read`. Call-scoped and NEVER returned to the permission
+/// gate: `widen_caveats` deliberately leaves an exec grant's `fs_read`
+/// untouched, because its result feeds `recalled_caveats` — the caveats
+/// checked for every tool the model calls this session, including
+/// `read_file`. Widening the SESSION's `fs_read` from an `exec:cargo` grant
+/// would let `read_file` read `$CARGO_HOME/credentials.toml` for the rest of
+/// the session; widening only this one dispatch's caveats lets the SPAWNED
+/// cargo process resolve its own toolchain and nothing else gains the read.
+fn dispatch_caveats_for_command(
+    cmd: &str,
+    caveats: &crate::caveats::Caveats,
+) -> crate::caveats::Caveats {
+    let mut widened = caveats.clone();
+    if let crate::caveats::Scope::Only(exec) = &mut widened.exec {
+        let twins = crate::confined_exec::developer_exec_twins(exec.iter());
+        exec.extend(twins);
+    }
+    if leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec) {
+        if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
+            reads.extend(crate::confined_exec::toolchain_read_roots());
+        }
+    }
+    widened
 }
 
 /// The exec grants in force, for the refusal's second line. Naming what IS
@@ -2252,4 +2387,59 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
         });
     }
     Some(requests)
+}
+
+#[cfg(test)]
+mod dispatch_caveats_tests {
+    use super::*;
+    use crate::caveats::{Caveats, CaveatsExt as _, CountBound, Scope};
+
+    fn base(ws: &str) -> Caveats {
+        Caveats {
+            fs_read: Scope::only([ws.to_string()]),
+            fs_write: Scope::only([ws.to_string()]),
+            exec: Scope::only(["cargo".to_string()]),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    /// dec1-build-grant round 2, red test (b): the shell-lane dispatch
+    /// caveats for a build-tool command include its toolchain read root —
+    /// call-scoped, so `read_file` (which checks the SESSION's caveats, not
+    /// this dispatch's) never sees it. Would fail before the fix:
+    /// `dispatch_caveats_for_command` did not exist; `dispatch_bridled_shell`
+    /// passed the raw session `caveats` straight through, unable to read
+    /// `$RUSTUP_HOME`.
+    #[test]
+    fn a_build_tool_command_gets_its_toolchain_read_root_for_this_dispatch_only() {
+        // Pins the toolchain-home resolution so the
+        // assertion does not depend on the machine running the suite.
+        // Platform-absolute (a POSIX `/fake-home` is not absolute on Windows),
+        // and under the process-env lock like every other env-pinning test.
+        let _env = crate::process_env::lock();
+        let fake = std::env::temp_dir().join("fake-home").join(".rustup");
+        let fake = fake.to_string_lossy().into_owned();
+        let saved = std::env::var_os("RUSTUP_HOME");
+        crate::process_env::set_var("RUSTUP_HOME", &fake);
+        let widened = dispatch_caveats_for_command("cargo --version", &base("/ws"));
+        match saved.and_then(|v| v.into_string().ok()) {
+            Some(v) => crate::process_env::set_var("RUSTUP_HOME", &v),
+            None => crate::process_env::remove_var("RUSTUP_HOME"),
+        }
+        assert!(
+            widened.permits_fs_read(&fake),
+            "a build-tool dispatch must be able to read its toolchain home"
+        );
+    }
+
+    /// A non-build-tool command is passed through unchanged — no toolchain
+    /// roots leak into an ordinary `run_command` dispatch.
+    #[test]
+    fn a_non_build_tool_command_is_unchanged() {
+        let base = base("/ws");
+        let widened = dispatch_caveats_for_command("ls -la", &base);
+        assert_eq!(widened.fs_read, base.fs_read);
+    }
 }

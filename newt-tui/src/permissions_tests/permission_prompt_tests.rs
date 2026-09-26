@@ -4072,7 +4072,7 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
 // Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 05:48 EDT | Date: 2026-09-18
 
 #[test]
-fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
+fn confined_build_is_never_a_shell_expansion_and_session_allow_is_call_scoped_too() {
     let base = base_caveats("/ws");
     let request = newt_core::PermissionRequest {
         tool: "lifecycle".into(),
@@ -4080,9 +4080,17 @@ fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
         target: "/ws".into(),
         reason: "cargo test; workspace writes and network denied".into(),
     };
+    // dec1-build-grant (F30): `Build` is now session-allowable — Shawn's
+    // decision that refusing it bought no extra safety over the calibrated
+    // `build_tool_caveats` fence an allow-once already grants, only a repeat
+    // prompt on every build/test/check in a session. What must stay true
+    // either way, and what this test still pins: the returned caveats for
+    // THIS call are the calibrated build fence, never a widened shell
+    // `Caveats::exec`/`fs_write` — session scope means "don't ask again for
+    // this workspace's build", not "the shell may now run cargo unconfined".
     for (choice, permitted) in [
         (PromptChoice::AllowOnce, true),
-        (PromptChoice::AllowSession, false),
+        (PromptChoice::AllowSession, true),
         (PromptChoice::Deny, false),
     ] {
         let mut state = PermissionPromptState::default();
@@ -4099,7 +4107,16 @@ fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
             newt_core::PermissionDecision::Deny => assert!(!permitted),
         }
         drop(gate);
-        assert!(state.session_grants.is_empty());
+        if choice == PromptChoice::AllowSession {
+            assert!(
+                state
+                    .session_grants
+                    .contains(&(DenialKind::Build, "/ws".to_string())),
+                "session allow must remember the workspace's build grant"
+            );
+        } else {
+            assert!(state.session_grants.is_empty());
+        }
     }
     let build = newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/ws"));
     assert!(ceiling_permits(&build, DenialKind::Build, "/ws"));

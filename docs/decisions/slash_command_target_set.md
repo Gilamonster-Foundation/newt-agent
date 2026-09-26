@@ -219,6 +219,9 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/undo-lock` | — | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/cognition` | — | retired → `/settings cognition` | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
 | `/detail` | — | `/` command | Tuning | absorb → `/settings detail` | `~/.newt/receipts.jsonl` |
+| `/settings git-author` | — | field of `/settings` | Tuning | absorb → `/settings git-author` | `~/.newt/receipts.jsonl` |
+| `/settings git-config` | — | field of `/settings` | Tuning | absorb → `/settings git-config` | `~/.newt/receipts.jsonl` |
+| `/settings git-signing` | — | field of `/settings` | Tuning | absorb → `/settings git-signing` | `~/.newt/receipts.jsonl` |
 | `/settings initiative` | — | field of `/settings` | Tuning | absorb → `/settings initiative` | `~/.newt/receipts.jsonl` |
 | `/loadout` | — | retired → `/status loadout` | Tuning | keep — it performs | — read-only |
 | `/markdown` | — | `/` command | Tuning | absorb → `/settings markdown` | `~/.newt/receipts.jsonl` |
@@ -227,6 +230,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/persona` | — | `/` command | Tuning | absorb → `/settings persona` | **none — #1965** |
 | `/plan` | — | retired → `/roadmap` | Tuning | keep — it performs | — read-only |
 | `/posture` | — | `/` command | Tuning | absorb → `/settings posture` | `~/.newt/receipts.jsonl` |
+| `/settings prefix` | — | field of `/settings` | Tuning | absorb → `/settings prefix` | `~/.newt/receipts.jsonl` |
 | `/prompt` | — | `/` command | Tuning | absorb → `/settings prompt` | `~/.newt/receipts.jsonl` |
 | `/psyche` | — | `/` command | Tuning | keep — it performs | `~/.newt/receipts.jsonl` |
 | `/retrieval` | — | retired → `/nav retrieval` | Tuning | keep — it performs | — read-only |
@@ -234,6 +238,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**76 registered, 44 of them typed as `/` commands (55 tokens).** Absorb 16 · keep 57 · panel 3. Receipts: settings 15 · events 6 · read-only 37 · **missing 18**.
+**80 registered, 44 of them typed as `/` commands (55 tokens).** Absorb 20 · keep 57 · panel 3. Receipts: settings 19 · events 6 · read-only 37 · **missing 18**.
 
 <!-- END GENERATED -->

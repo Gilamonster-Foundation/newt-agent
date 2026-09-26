@@ -486,6 +486,34 @@ mod tests {
         assert_eq!(widened.max_calls, CountBound::AtMost(7));
     }
 
+    /// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579, BLOCKER): an
+    /// earlier version of this widen ALSO added a build tool's toolchain read
+    /// roots to `fs_read` here. That was a real leak: `widen_caveats`'s
+    /// result feeds `recalled_caveats`/`fold_ocap_approvals`, which is the
+    /// caveats checked for EVERY tool the model calls this session —
+    /// including `read_file`. Widening `fs_read` here would have let the
+    /// model's own `read_file` tool read `$CARGO_HOME/credentials.toml` (or
+    /// any other file under the toolchain roots) for the rest of the
+    /// session, armed by nothing more than a session `exec:cargo` grant meant
+    /// only to let the confined build's OWN subprocess resolve its
+    /// toolchain. The toolchain reads now live ONLY on the confined shell
+    /// dispatch's call-scoped caveats
+    /// (`agentic::tools::shell::dispatch_caveats_for_command`), never here.
+    /// This test pins the negative: an exec grant, build tool or not, widens
+    /// `exec` alone.
+    #[test]
+    fn widen_of_an_exec_grant_never_touches_fs_read_even_for_a_build_tool() {
+        let widened = widen_caveats(&base(), &[(DenialKind::Exec, "cargo".to_string())]);
+        assert!(widened.permits_exec("cargo"));
+        assert_eq!(
+            widened.fs_read,
+            base().fs_read,
+            "an exec grant — build tool or not — must never widen fs_read; \
+             that axis feeds every tool the model can call this session, \
+             not just the confined child this grant was asked for"
+        );
+    }
+
     #[test]
     fn widen_leaves_base_unchanged_and_all_stays_all() {
         let b = base();

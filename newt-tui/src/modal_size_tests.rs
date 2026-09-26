@@ -1,6 +1,14 @@
 use super::*;
 
-const KEYS: [SizeKey; 3] = [SizeKey::Grow, SizeKey::Shrink, SizeKey::Zoom];
+const KEYS: [SizeKey; 7] = [
+    SizeKey::Grow,
+    SizeKey::Shrink,
+    SizeKey::Zoom,
+    SizeKey::To(0),
+    SizeKey::To(1),
+    SizeKey::To(MIN_ROWS),
+    SizeKey::To(20),
+];
 
 /// A host with a `screen`-row terminal: it grants the request, clamped.
 fn grant(request: u16, screen: u16) -> u16 {
@@ -102,4 +110,19 @@ fn a_shrink_at_the_minimum_changes_nothing() {
     let mut size = ModalSize::new(MIN_ROWS);
     assert_eq!(size.apply(SizeKey::Shrink, MIN_ROWS), None);
     assert_eq!(size.requested(), MIN_ROWS);
+}
+
+/// Mouse drag: exactly the rows asked for, never below the minimum, and it
+/// leaves zoom.
+#[test]
+fn to_sets_the_height_floors_at_the_minimum_and_leaves_zoom() {
+    let mut size = ModalSize::new(8);
+    assert_eq!(size.apply(SizeKey::To(15), 8), Some(15));
+    assert_eq!(size.apply(SizeKey::To(15), 15), None, "unchanged request");
+    assert_eq!(size.apply(SizeKey::To(0), 15), Some(MIN_ROWS));
+    let mut zoomed = ModalSize::new(8);
+    zoomed.apply(SizeKey::Zoom, 8);
+    zoomed.apply(SizeKey::To(10), 30);
+    assert!(!zoomed.zoomed());
+    assert_eq!(zoomed.requested(), 10);
 }

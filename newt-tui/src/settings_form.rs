@@ -108,6 +108,10 @@ pub(crate) enum Field {
     Detail,
     Posture,
     Rounds,
+    Prefix,
+    GitAuthor,
+    GitConfig,
+    GitSigning,
 }
 
 impl Field {
@@ -126,6 +130,10 @@ impl Field {
         Self::Detail,
         Self::Posture,
         Self::Rounds,
+        Self::Prefix,
+        Self::GitAuthor,
+        Self::GitConfig,
+        Self::GitSigning,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -146,6 +154,10 @@ impl Field {
             Self::Detail => "detail",
             Self::Posture => "posture",
             Self::Rounds => "rounds",
+            Self::Prefix => "prefix",
+            Self::GitAuthor => "git-author",
+            Self::GitConfig => "git-config",
+            Self::GitSigning => "git-signing",
         }
     }
 
@@ -164,6 +176,10 @@ impl Field {
             Self::Detail => "tool-output detail rows",
             Self::Posture => "permission posture",
             Self::Rounds => "tool-call round limit",
+            Self::Prefix => "meta prefix key",
+            Self::GitAuthor => "sandbox git commit author",
+            Self::GitConfig => "sandbox git settings",
+            Self::GitSigning => "harness commit signing",
         }
     }
 
@@ -235,6 +251,45 @@ impl Field {
             // `auto` is a real choosable value, not the absence of one: it
             // means "follow colour", which is a different state from `on`
             // on a pipe. The absorbed verb offered all three and so does this.
+            // Each choice says what it would shadow, because that is the
+            // whole trade: tmux/herdr semantics on a chord of your choosing.
+            Self::GitAuthor => owned(&[
+                (
+                    "agent",
+                    "the agent identity, so sandbox commits never pass for yours (default)",
+                ),
+                ("operator", "your own git name and email"),
+            ]),
+            Self::GitConfig => owned(&[
+                ("baseline", "git's own defaults; nothing copied (default)"),
+                (
+                    "environment",
+                    "copy your ~/.gitconfig's plain settings now (never aliases, credentials or includes)",
+                ),
+            ]),
+            Self::GitSigning => owned(&[
+                ("off", "newt's commits are unsigned (default)"),
+                (
+                    "harness",
+                    "a harness key newt holds (created if `signing_key` is unset)",
+                ),
+                (
+                    "operator",
+                    "your own git signing key (user.signingkey, gpg.format)",
+                ),
+            ]),
+            Self::Prefix => owned(&[
+                ("ctrl+space", "collides with nothing in newt (default)"),
+                (
+                    "ctrl+a",
+                    "GNU Screen's; shadows line-start in emacs/nano editing",
+                ),
+                (
+                    "ctrl+b",
+                    "tmux's and herdr's own; inside them it reaches them first",
+                ),
+                ("ctrl+n", "shadows next-line in emacs editing"),
+            ]),
             Self::Markdown => owned(&[
                 ("auto", "render when colour is active (default)"),
                 ("on", "always render (still needs colour)"),
@@ -328,6 +383,10 @@ impl Field {
     pub(crate) fn current(self) -> String {
         use newt_core::cognition::cli_cognition;
         match self {
+            Self::Prefix => prefix_setting(),
+            Self::GitAuthor => git_profile().author.as_str().to_string(),
+            Self::GitConfig => git_profile().config_source.as_str().to_string(),
+            Self::GitSigning => git_profile().signing.as_str().to_string(),
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
                 newt_core::EditMode::Emacs => "emacs",
@@ -572,6 +631,73 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
     newt_core::interaction_form::menu(field.label(), "Esc cancels", &refs)
 }
 
+/// The meta prefix as the operator names it: `NEWT_PREFIX_KEY` (this
+/// session), else `[tui] prefix_key`, else `ctrl+space`. The ONE owner of that
+/// precedence — the panel driver parses this same string (`prefix::configured`).
+pub(crate) fn prefix_setting() -> String {
+    std::env::var("NEWT_PREFIX_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            crate::migration_notices::read(|report| newt_core::Config::resolve_unpublished(report))
+                .ok()
+                .and_then(|c| c.tui)
+                .and_then(|t| t.prefix_key)
+        })
+        .unwrap_or_else(|| "ctrl+space".to_string())
+}
+
+/// Write one `[tui]` scalar to the operator's config, preserving the rest.
+fn persist_tui_key(key: &str, value: &str) -> Result<(), String> {
+    let path = newt_core::Config::user_config_path()
+        .ok_or_else(|| "no config directory to save the setting in".to_string())?;
+    let text = config_fs::read(&path);
+    let updated = newt_core::Config::with_tui_key(&text, key, value).map_err(|e| e.to_string())?;
+    config_fs::write(&path, &updated).map_err(|e| format!("saving {key}: {e}"))
+}
+
+/// The config file, as a seam: the unit tier never touches a real file.
+#[cfg(not(test))]
+mod config_fs {
+    pub(super) fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+    pub(super) fn write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+        std::fs::write(path, text)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod config_fs {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FILES: RefCell<Vec<(PathBuf, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn read(path: &Path) -> String {
+        FILES.with(|files| {
+            files
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(p, _)| p == path)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn write(path: &Path, text: &str) -> std::io::Result<()> {
+        FILES.with(|files| {
+            files
+                .borrow_mut()
+                .push((path.to_path_buf(), text.to_string()));
+        });
+        Ok(())
+    }
+}
+
 /// **THE ONE MUTATION PATH.** Every route — the form, a deep link, a
 /// deprecated verb, `/psyche tenacity`, `/psyche obsessive` — lands here.
 ///
@@ -684,8 +810,98 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 newt_core::process_env::set_var("NEWT_PROMPT", value);
             }
         }
+        // The one field here that PERSISTS: a prefix you had to set again every
+        // session would be a trap. `[tui] prefix_key`, through the
+        // comment-preserving writer; and the session, so the next panel uses it
+        // at once.
+        // Persisted to the operator's `agent-identity.toml`: the shell reads
+        // it on every dispatch, so the next command already uses it.
+        Field::GitAuthor => persist_git_profile(|git| {
+            git.author = if value == "operator" {
+                newt_core::agent_identity::SandboxAuthor::Operator
+            } else {
+                newt_core::agent_identity::SandboxAuthor::Agent
+            };
+            Ok(())
+        })?,
+        // Choosing `environment` takes the snapshot NOW, so choosing it again
+        // is how the operator refreshes it.
+        Field::GitConfig => persist_git_profile(|git| {
+            if value == "environment" {
+                let listing = newt_core::git_hardening::ambient_git_config_listing()
+                    .map_err(|e| format!("could not read your git config: {e}"))?;
+                git.config = newt_core::git_hardening::copyable_git_config(&listing);
+                git.config_source = newt_core::agent_identity::GitConfigSource::Environment;
+            } else {
+                git.config.clear();
+                git.config_source = newt_core::agent_identity::GitConfigSource::Baseline;
+            }
+            Ok(())
+        })?,
+        // `harness` with no `signing_key` creates one, and says where its
+        // public half goes, because a signature nobody can verify is noise.
+        Field::GitSigning => {
+            let mut created = None;
+            persist_identity(|identity| {
+                use newt_core::agent_identity::SigningMode;
+                identity.git.signing = match value {
+                    "harness" => SigningMode::Harness,
+                    "operator" => SigningMode::Operator,
+                    _ => SigningMode::Off,
+                };
+                if value == "harness" && identity.signing_key.is_none() {
+                    let dir = newt_core::Config::user_config_dir()
+                        .ok_or("no config directory for the harness key")?;
+                    let path = dir.join("harness-signing.pem");
+                    created = Some(newt_core::commit_signing::generate_harness_key(&path)?);
+                    identity.signing_key = Some(path.to_string_lossy().into_owned());
+                }
+                Ok(())
+            })?;
+            if let Some(public) = created {
+                return Ok(format!(
+                    "{}: {value}\nnew harness key; add this to the agent's GitHub account \
+                     as a signing key so its commits verify:\n{public}",
+                    field.label()
+                ));
+            }
+        }
+        Field::Prefix => {
+            persist_tui_key("prefix_key", value)?;
+            newt_core::process_env::set_var("NEWT_PREFIX_KEY", value);
+            #[cfg(feature = "rich-tui")]
+            crate::prefix::invalidate();
+        }
     }
     Ok(format!("{}: {value}", field.label()))
+}
+
+/// The sandbox git profile in force (`[agent-identity.git]`).
+fn git_profile() -> newt_core::agent_identity::GitProfile {
+    newt_core::AgentIdentity::resolve().unwrap_or_default().git
+}
+
+/// Edit the sandbox git profile in the operator's own `agent-identity.toml`,
+/// keeping every other field of that file as it was.
+fn persist_git_profile(
+    edit: impl FnOnce(&mut newt_core::agent_identity::GitProfile) -> Result<(), String>,
+) -> Result<(), String> {
+    persist_identity(|identity| edit(&mut identity.git))
+}
+
+/// Edit the operator's own `agent-identity.toml`, keeping every other field.
+fn persist_identity(
+    edit: impl FnOnce(&mut newt_core::AgentIdentity) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = newt_core::AgentIdentity::user_identity_path()
+        .ok_or("no home directory to hold agent-identity.toml")?;
+    let mut identity = if path.is_file() {
+        newt_core::AgentIdentity::load(&path).map_err(|e| e.to_string())?
+    } else {
+        newt_core::AgentIdentity::default()
+    };
+    edit(&mut identity)?;
+    identity.save(&path).map_err(|e| e.to_string())
 }
 
 /// The change a transition is recorded as, or `None` when the registry
@@ -1015,6 +1231,13 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
 }
 
 fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
+    ask_and_apply(ask, field, "/settings")
+}
+
+/// Ask for one field's value and apply it through [`apply_and_record`],
+/// recorded as reached `via` (`/settings`, `/setup`). Setup asks the git
+/// profile through this, so its questions and its write are `/settings`' own.
+pub(crate) fn ask_and_apply(ask: Ask<'_>, field: Field, via: &str) -> Vec<String> {
     let cancelled = || vec!["settings: cancelled".to_string()];
     let definition = value_menu(field);
     let value = match field.value_space() {
@@ -1060,7 +1283,7 @@ fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
             (*value).to_string()
         }
     };
-    vec![match apply_and_record(field, &value, "/settings") {
+    vec![match apply_and_record(field, &value, via) {
         Ok(msg) | Err(msg) => msg,
     }]
 }
@@ -1619,6 +1842,38 @@ mod tests {
     /// not see it. Two writers for one setting is how they come to disagree,
     /// and it is why the receipt could not record a from→to. Both doors now
     /// go through `NEWT_MARKDOWN`, read back by the one resolver.
+    /// `/settings prefix ctrl+a` persists to `[tui] prefix_key` (through the
+    /// config seam — no real file) and takes effect this session; the
+    /// resolver the panel driver parses reads it back; an unoffered chord is
+    /// refused and writes nothing.
+    #[test]
+    fn the_prefix_field_persists_and_takes_effect_now() {
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var("NEWT_PREFIX_KEY");
+        let path = newt_core::Config::user_config_path().expect("a config path");
+        assert_eq!(
+            apply(Field::Prefix, "ctrl+a"),
+            Ok("meta prefix key: ctrl+a".to_string())
+        );
+        let saved = config_fs::read(&path);
+        assert!(
+            saved.contains("[tui]") && saved.contains("prefix_key = \"ctrl+a\""),
+            "{saved}"
+        );
+        assert_eq!(Field::Prefix.current(), "ctrl+a");
+        assert_eq!(prefix_setting(), "ctrl+a");
+        assert!(
+            apply(Field::Prefix, "ctrl+q").is_err(),
+            "not an offered chord"
+        );
+        assert_eq!(
+            config_fs::read(&path),
+            saved,
+            "a refused value writes nothing"
+        );
+        newt_core::process_env::remove_var("NEWT_PREFIX_KEY");
+    }
+
     #[test]
     fn the_markdown_field_and_its_verb_resolve_to_one_state() {
         let _guard = settings_guard();

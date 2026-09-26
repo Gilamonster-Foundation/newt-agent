@@ -107,15 +107,7 @@ fn identity_set_workspace_writes_local_override() {
         .stdout(predicate::str::contains("workspace"));
 }
 
-#[test]
-fn identity_workspace_file_overrides_default_and_hides_secret() {
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let newt_dir = workspace.path().join(".newt");
-    std::fs::create_dir_all(&newt_dir).unwrap();
-    std::fs::write(
-        newt_dir.join("agent-identity.toml"),
-        r#"
+const APP_AND_TOKEN_TOML: &str = r#"
 [agent-identity]
 name = "gilamonster-agent[bot]"
 email = "293450354+gilamonster-agent[bot]@users.noreply.github.com"
@@ -127,12 +119,24 @@ installation_id = 140120359
 
 [agent-identity.tokens]
 ci_deploy = { env = "NEWT_IDENTITY_CLI_SECRET" }
-"#,
-    )
-    .unwrap();
+"#;
+
+fn write_identity(root: &std::path::Path, body: &str) {
+    let dir = root.join(".newt");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent-identity.toml"), body).unwrap();
+}
+
+#[test]
+fn identity_workspace_file_overrides_name_but_not_credentials() {
+    // A workspace file is untrusted (a repo can ship it): it may set the
+    // agent's public name/email, but its GitHub App and token references are
+    // ignored, and no token value ever reaches stdout.
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_identity(workspace.path(), APP_AND_TOKEN_TOML);
 
     newt_identity_in(workspace.path(), home.path())
-        // A token VALUE is present in the env; it must never reach stdout.
         .env("NEWT_IDENTITY_CLI_SECRET", "SECRET-MUST-NOT-PRINT")
         .assert()
         .success()
@@ -141,33 +145,49 @@ ci_deploy = { env = "NEWT_IDENTITY_CLI_SECRET" }
             "293450354+gilamonster-agent[bot]@users.noreply.github.com",
         ))
         .stdout(predicate::str::contains("workspace"))
-        // GitHub App public coordinates show.
+        .stdout(predicate::str::contains("github-app:  <none>"))
+        .stdout(predicate::str::contains("tokens:      <none>"))
+        .stdout(predicate::str::contains("app_id").not())
+        .stdout(predicate::str::contains("ci_deploy").not())
+        .stdout(predicate::str::contains("SECRET-MUST-NOT-PRINT").not());
+}
+
+#[test]
+fn identity_operator_file_shows_app_and_hides_secret() {
+    // The operator's own (home) file is trusted: the App coordinates and token
+    // NAMES show, but the resolved token VALUE never does.
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_identity(home.path(), APP_AND_TOKEN_TOML);
+
+    newt_identity_in(workspace.path(), home.path())
+        .env("NEWT_IDENTITY_CLI_SECRET", "SECRET-MUST-NOT-PRINT")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gilamonster-agent[bot]"))
+        .stdout(predicate::str::contains("home"))
         .stdout(predicate::str::contains("app_id:          4046825"))
         .stdout(predicate::str::contains("installation_id: 140120359"))
-        // Token NAME shows...
         .stdout(predicate::str::contains("ci_deploy"))
         .stdout(predicate::str::contains("names only"))
-        // ...but the resolved token VALUE never does.
         .stdout(predicate::str::contains("SECRET-MUST-NOT-PRINT").not());
 }
 
 #[test]
 fn identity_missing_signing_key_is_clean_not_panic() {
     // A configured signing-key path that doesn't exist must render an
-    // "<unavailable>" note and still exit 0 — never panic, never mint.
+    // "<unavailable>" note and still exit 0 — never panic, never mint. The
+    // key path is operator-owned config, so it lives in the home file.
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let newt_dir = workspace.path().join(".newt");
-    std::fs::create_dir_all(&newt_dir).unwrap();
-    std::fs::write(
-        newt_dir.join("agent-identity.toml"),
+    write_identity(
+        home.path(),
         r#"
 [agent-identity]
 name = "keyed-agent[bot]"
 signing_key = "/nonexistent/vault/path/identity.pem"
 "#,
-    )
-    .unwrap();
+    );
 
     newt_identity_in(workspace.path(), home.path())
         .assert()
@@ -176,4 +196,25 @@ signing_key = "/nonexistent/vault/path/identity.pem"
             "/nonexistent/vault/path/identity.pem",
         ))
         .stdout(predicate::str::contains("<unavailable"));
+}
+
+#[test]
+fn identity_workspace_signing_key_is_ignored() {
+    // A repo-shipped signing_key must not select the key.
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_identity(
+        workspace.path(),
+        r#"
+[agent-identity]
+name = "keyed-agent[bot]"
+signing_key = "/nonexistent/vault/path/identity.pem"
+"#,
+    );
+
+    newt_identity_in(workspace.path(), home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("signing-key: <none>"))
+        .stdout(predicate::str::contains("/nonexistent/vault/path/identity.pem").not());
 }

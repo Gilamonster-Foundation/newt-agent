@@ -37,6 +37,7 @@ pub use output_budget::{
 };
 
 mod catalog;
+mod dependency_fetch;
 mod dispatch;
 mod file_capture;
 mod file_change;
@@ -67,7 +68,8 @@ use shell::{
     shell_envelope_output, venv_env_map,
 };
 use shell::{
-    declared_filesystem_requests, exec_confined_command, resolve_exec_cwd, split_leading_cd,
+    declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,
+    resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
 use shell::{
@@ -151,7 +153,8 @@ pub(crate) fn validate_tool_call(
                     }
                     Err(e) => {
                         return Err(format!(
-                            "tool '{name}' arguments are not valid JSON (call truncated or malformed): {e}"
+                            "tool '{name}' arguments are not valid JSON (call truncated or malformed): {e}. \
+                             If you were writing a large file, write it in smaller pieces."
                         ))
                     }
                 }
@@ -1106,14 +1109,16 @@ fn escalation_result(
     escalated_after_timeout(escalated, wall)
 }
 
-/// `lifecycle action=run`, with F19's timeout escalation: on the default wall
-/// (never the build wall — see `escalates`), one re-run through the SAME
-/// build lane `action=build` uses (`run_confined_build_lane`
-/// — same `leq`/permission-gate re-check, never bypassed). A dedicated fn (not
-/// inlined in the `lifecycle` dispatch arm) so `permission_gate`'s two sequential
-/// reborrows each end cleanly at their own `.await`, rather than the borrow
-/// checker unifying them against the enclosing dispatch fn's much larger
-/// lifetime graph.
+/// `lifecycle action=run` for NON-build-tool commands, with F19's timeout
+/// escalation: on the default wall (never the build wall — see `escalates`),
+/// one re-run through the SAME build lane `action=build` uses
+/// (`run_confined_build_lane` — same `leq`/permission-gate re-check, never
+/// bypassed). Since F38, runs whose resolved command starts with a build tool
+/// (cargo/just/make) take the build lane directly and never reach this path.
+/// A dedicated fn (not inlined in the `lifecycle` dispatch arm) so
+/// `permission_gate`'s two sequential reborrows each end cleanly at their own
+/// `.await`, rather than the borrow checker unifying them against the enclosing
+/// dispatch fn's much larger lifetime graph.
 #[allow(clippy::too_many_arguments)]
 async fn lifecycle_run_with_escalation(
     args: &serde_json::Value,
@@ -1188,6 +1193,15 @@ async fn lifecycle_run_with_escalation(
     )
     .await;
     escalation_result(first, escalated, wall)
+}
+
+/// F38: does a lifecycle `run`'s resolved command start with a build tool?
+/// When it does, the run lane cannot execute it (the tool isn't in the run
+/// lane's profile), so route directly to the build lane — the same path
+/// `action=build` takes. Uses the same `is_build_tool_exec` predicate that
+/// `dispatch_wall` and the routing table read.
+fn lifecycle_run_routes_to_build_lane(cmd: &str) -> bool {
+    shell::leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec)
 }
 
 /// The explicit `{"phase":...,"action":"build"}` call to suggest — one JSON
@@ -1375,7 +1389,29 @@ async fn run_confined_build_lane(
             );
         }
     }
-    match ConstrainedExecutor::run_async(request).await {
+    let mut run = ConstrainedExecutor::run_async(request.clone()).await;
+    let mut fetch_note = None;
+    if let Ok(out) = &run {
+        if !out.success && dependency_fetch::needs_dependency_fetch(&out.stderr) {
+            let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
+            match dependency_fetch::fetch_locked_dependencies(
+                &root,
+                &cwd,
+                caveats,
+                permission_gate,
+                read,
+            )
+            .await
+            {
+                Ok(()) => {
+                    run = ConstrainedExecutor::run_async(request).await;
+                    fetch_note = Some(dependency_fetch::FETCHED_NOTE.to_owned());
+                }
+                Err(reason) => fetch_note = Some(dependency_fetch::blocked_note(&reason, &cwd)),
+            }
+        }
+    }
+    let (mut text, outcome) = match run {
         Ok(out) => {
             // The build's own exit code (`out.code`) is untouched by `trim` —
             // only the rendered stdout/stderr text is cut, never inside a
@@ -1413,7 +1449,12 @@ async fn run_confined_build_lane(
             )
         }
         Err(error) => (format!("error: {error}"), crate::ExecOutcome::Unavailable),
+    };
+    if let Some(note) = fetch_note {
+        text.push('\n');
+        text.push_str(&note);
     }
+    (text, outcome)
 }
 
 /// The interpreter + argv for the configured build-check string, per platform.
@@ -3829,13 +3870,18 @@ async fn execute_authorized_tool(
                 Ok(requests) => requests,
                 Err(error) => return host_return(error),
             };
+            // F32/#2537 round 3: a bare `git …` in this session's own repo, on
+            // a non-default branch, gets kernel WRITE on its own gitdir +
+            // `objects/` for THIS dispatch only — see
+            // `dispatch_caveats_for_git_shell`'s doc comment.
+            let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             executed(
                 exec_confined_command(
                     cmd,
                     &run_cwd,
                     color,
                     tool_output_lines,
-                    caveats,
+                    &git_shell_caveats,
                     &filesystem_requests,
                     exec_floor,
                     &mut permission_gate,
@@ -3942,6 +3988,15 @@ async fn execute_authorized_tool(
                 return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
+            // F38: a `run` whose resolved command starts with a build tool
+            // (cargo/just/make) cannot execute in the run lane (the tool is not
+            // in its profile), so it takes the build lane, exactly as
+            // `action=build` does.
+            let action = if action == "run" && lifecycle_run_routes_to_build_lane(&joined) {
+                "build"
+            } else {
+                action
+            };
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
                 "build" => {

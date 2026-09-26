@@ -555,6 +555,17 @@ fn a_driven_panel_survives_resizes_keeps_its_selection_and_hands_back_the_draft(
     crate::interaction_view_pty_test::drive_cockpit_panel_loop();
 }
 
+/// #2573 hardening: closing a panel leaves the transcript above it and none
+/// of the panel (replayed with erases, no zoom, no resize).
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn closing_a_panel_leaves_the_transcript_above_it_and_none_of_the_panel() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_close();
+}
+
 pub(crate) fn cockpit_panel_loop_case() {
     // This disposable child owns the tty queried by Crossterm's geometry API.
     assert!(unsafe { libc::setsid() } >= 0);

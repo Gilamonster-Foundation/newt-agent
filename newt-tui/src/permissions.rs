@@ -132,7 +132,20 @@ fn permission_policy(
         key: "a",
         label: "allow once",
     }];
-    if tier == danger::DangerTier::Low {
+    // dec1-build-grant (F30): `Build` stays High tier — the blast-radius
+    // banner below still fires — but IS session-allowable. It is not an
+    // open-ended interpreter/broad-root grant; it is bounded by the
+    // calibrated `build_tool_caveats` fence (workspace + toolchain reads,
+    // workspace-only writes, network denied), the same confinement an
+    // allow-once already grants. Refusing the session scope bought no extra
+    // safety, only a prompt on every build/test/check in a session (up to 7
+    // times observed in one run — NOTES-2483 F30).
+    // #2595: the harness's own dependency fetch (`lifecycle` + net) is a
+    // one-shot `cargo fetch`. A recorded session/permanent grant would flow
+    // into `recalled_caveats` and widen the shell worker's net to crates.io,
+    // which the prompt does not say. Offer allow-once/deny only.
+    let one_shot = req.tool == "lifecycle" && req.kind == DenialKind::Net;
+    if !one_shot && (tier == danger::DangerTier::Low || req.kind == DenialKind::Build) {
         actions.push(OfferedAction {
             action: PromptChoice::AllowSession,
             key: "s",
@@ -178,6 +191,12 @@ fn permission_policy(
     // where the enum is DEFINED —
     // `newt_interaction::binding::model_fidelity` (#1837).
     let note = match (tier, audience) {
+        (danger::DangerTier::High, Audience::Terminal) if req.kind == DenialKind::Build => Some(
+            format!("confined build authority: session allow covers build/test/check for this workspace this session\n{MODAL_CONTROL_HINT}"),
+        ),
+        (danger::DangerTier::High, Audience::Web) if req.kind == DenialKind::Build => Some(
+            format!("Confined build authority: session authorization is available.\n{MODAL_CONTROL_HINT}"),
+        ),
         (danger::DangerTier::High, Audience::Terminal) => Some(format!(
             "high-danger: session allow refused; key allow / step-up is the future path, P3\n{MODAL_CONTROL_HINT}"
         )),
@@ -737,6 +756,10 @@ fn is_slash_command_at_prompt(answer: &str) -> bool {
 #[path = "permissions_tests/slash_prompt_tests.rs"]
 mod slash_prompt_tests;
 
+#[cfg(test)]
+#[path = "permissions_tests/build_grant_tests.rs"]
+mod build_grant_tests;
+
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
@@ -810,11 +833,61 @@ fn ceiling_permits(
 }
 
 /// Match the exact approved target, without treating a basename as a path grant.
+///
+/// One exception (dec1-build-grant, F30): a session `Build` grant — the
+/// fully-fenced confined-build authority, `build_tool_caveats` — also covers a
+/// later `Exec` request for a build-tool binary (`cargo`/`just`/`make`, see
+/// [`newt_core::confined_exec::is_build_tool_exec`]). This is one-directional
+/// on purpose: `lifecycle_build_request`'s doc comment is explicit that no
+/// `Exec` grant (including `exec:cargo`) may silently acquire `Build`
+/// authority. The reverse is safe — `Build` is the STRONGER, calibrated fence,
+/// so a prior `Build` session grant already covers running that same tool
+/// through the `run_command` / routed-`build_exec` lane. One session grant,
+/// not three.
 pub(crate) fn session_grant_covers(
     grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
 ) -> bool {
     grants.contains(&(req.kind, req.target.clone()))
+        || (req.kind == newt_core::DenialKind::Exec
+            && newt_core::confined_exec::is_build_tool_exec(&req.target)
+            && grants
+                .iter()
+                .any(|(kind, _)| *kind == newt_core::DenialKind::Build))
+}
+
+/// dec1-build-grant round 2 (Reviewer, item 3): which session `Build` grant
+/// covers a request running under `baseline` — the grant whose workspace
+/// CONTAINS the call's cwd, not just the first `Build` grant found. A
+/// multi-root session can hold more than one; clamping to the wrong
+/// workspace's fence would deny (or, worse, over-grant) an otherwise-lawful
+/// call. `baseline.fs_write` is the caller's own write scope for THIS call —
+/// it is anchored to the effective cwd (`workspace_confined_caveats`,
+/// `build_tool_caveats`), so a `Build` grant is a match when its workspace is
+/// an ancestor of (or equal to) one of those write roots. Falls back to the
+/// first `Build` grant found when nothing matches (the prior behavior) —
+/// better an approximate clamp than none.
+fn covering_build_grant_workspace<'a>(
+    grants: &'a std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    baseline: &newt_core::Caveats,
+) -> Option<&'a str> {
+    let cwd_roots: Vec<&str> = match &baseline.fs_write {
+        newt_core::Scope::Only(set) => set.iter().map(String::as_str).collect(),
+        newt_core::Scope::All => Vec::new(),
+    };
+    let build_workspaces = || {
+        grants
+            .iter()
+            .filter(|(kind, _)| *kind == newt_core::DenialKind::Build)
+            .map(|(_, ws)| ws.as_str())
+    };
+    build_workspaces()
+        .find(|ws| {
+            cwd_roots
+                .iter()
+                .any(|root| std::path::Path::new(root).starts_with(ws))
+        })
+        .or_else(|| build_workspaces().next())
 }
 
 /// Consume only the exact pending target; other requests leave it available.
@@ -1789,6 +1862,17 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             return Deny;
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
+        // dec1-build-grant round 2: a request covered by the Build-grant
+        // fallback in `session_grant_covers` (an Exec of a build tool, e.g.
+        // `cargo`, covered by a session Build grant rather than an exact
+        // stored Exec grant) must run under a fence no wider than
+        // `build_tool_caveats` — never whatever the shell lane's CURRENT
+        // baseline happens to allow (e.g. a net host granted separately
+        // earlier in the session). `widen_caveats` only ADDS to `baseline`;
+        // it cannot narrow a wider net/exec/write axis back down, so the
+        // clamp has to be applied here, after minting, not folded into the
+        // widen itself.
+        let mut build_covered_clamp: Option<newt_core::Caveats> = None;
         let web = self.state.web_store.clone();
         for req in requests {
             // Build grants are non-axis but still bounded by an explicit
@@ -1812,6 +1896,35 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
             if session_grant_covers(&self.state.session_grants, req) {
+                // An exact match needs no further widening — it is already
+                // reachable through `recalled_grants` in `mint`. The
+                // build-tool fallback in `session_grant_covers` is NOT itself
+                // a stored grant, so fold it into this call's `once_grants`
+                // or the returned caveats would never widen `exec`/`fs_read`
+                // for it (dec1-build-grant, F30/F35).
+                if !self
+                    .state
+                    .session_grants
+                    .contains(&(req.kind, req.target.clone()))
+                {
+                    once_grants.push((req.kind, req.target.clone()));
+                    // This IS the build-tool fallback (an exact match took
+                    // the branch above), so pin the clamp to the covering
+                    // Build grant's workspace fence — the grant whose
+                    // workspace contains this call's cwd, when more than one
+                    // is held.
+                    if let Some(workspace) =
+                        covering_build_grant_workspace(&self.state.session_grants, baseline)
+                    {
+                        let fence = newt_core::confined_exec::build_tool_caveats(
+                            std::path::Path::new(workspace),
+                        );
+                        build_covered_clamp = Some(match build_covered_clamp.take() {
+                            Some(existing) => existing.meet(&fence),
+                            None => fence,
+                        });
+                    }
+                }
                 continue;
             }
             if self
@@ -1918,8 +2031,13 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     }
                 }
                 PromptChoice::AllowSession => {
-                    // The form omits this action for high danger; enforce it too.
-                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                    // The form omits this action for high danger; enforce it
+                    // too — except `Build` (dec1-build-grant, F30), which the
+                    // form DOES offer for session scope: it is bounded by the
+                    // calibrated `build_tool_caveats` fence, not open-ended.
+                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High
+                        && req.kind != newt_core::DenialKind::Build
+                    {
                         self.record(req, "deny", "session-allow-refused-high-danger");
                         self.notice(
                             window.as_ref(),
@@ -2120,7 +2238,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
         }
-        Allow(self.mint(baseline, &once_grants))
+        let minted = self.mint(baseline, &once_grants);
+        Allow(match build_covered_clamp {
+            Some(fence) => minted.meet(&fence),
+            None => minted,
+        })
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {

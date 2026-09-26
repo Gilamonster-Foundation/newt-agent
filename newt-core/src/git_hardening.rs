@@ -36,10 +36,220 @@
 //! `--no-textconv --no-ext-diff` in `args` (belt-and-suspenders on top of the
 //! `diff.external=` override).
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+/// Filesystem grants for the session workspace's **own** git metadata (F32,
+/// #2537): the extra read/write roots that let the model commit and move the
+/// ref of the branch it has checked out, without needing to reach outside the
+/// workspace fence for anything else.
+///
+/// Empty on any failure to resolve, on detached HEAD, and on the default
+/// branch (`main`/`master`/the remote's `HEAD`) — those get read-only access
+/// to the metadata, no write roots, so a caller that MEETs these into the
+/// session `fs_write` scope grants nothing extra.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OwnGitGrant {
+    pub read: Vec<String>,
+    pub write: Vec<String>,
+}
+
+/// Compute [`OwnGitGrant`] for `workspace`'s checked-out repository.
+///
+/// Resolves the worktree gitdir and the common (administrative) dir with
+/// `git rev-parse`, never by hand-parsing the `.git` gitlink file.
+///
+/// PR #2577 round 3: `write` is consumed ONLY by the confined-shell lane's
+/// per-dispatch caveats widening for a `git …` command
+/// (`newt_core::agentic::tools::shell::dispatch_caveats_for_git_shell`), never
+/// folded into the session `fs_write` scope (`write_file`/`edit_file` on git
+/// metadata stay refused there — see `caveats::apply_cli_fs_grants`). Real
+/// `git add`/`git commit` need `MAKE_REG`/`REFER`/`REMOVE_FILE` rights to
+/// create `index.lock` and rename it over `index`, plus insert objects —
+/// DIRECTORY rights a file-level Landlock rule cannot carry (round 1's
+/// per-file list was empirically provable to work for the tool's OWN
+/// direct-filesystem writes, but not for a REAL confined shell `git add`
+/// under the kernel fence). So `write` is exactly two DIRECTORIES: the
+/// worktree gitdir itself, and the common dir's `objects/` subtree. `refs/`
+/// and `config`/`hooks/` stay out of it — the default-branch guard in
+/// `newt-git` (`refuse_if_default_branch`) and the shell `git commit`
+/// redirect (`run_command_creates_shell_git_commit`) are what stop a ref
+/// move, not this grant. A confined-shell `rm -rf <common>/objects` IS
+/// possible from a directory-write grant on non-default branches — Shawn
+/// accepted that trade-off (see `RESULT-dec2-own-gitdir.md`).
+pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
+    // PR #2577 round 4, Blocker 1: this is the SESSION-START call
+    // (`caveats::apply_cli_fs_grants`'s sole production caller runs before any
+    // model action). Prime the identity cache HERE, from this resolve, so a
+    // later per-dispatch re-check (`own_gitdir_shell_write_grant`) has a
+    // trustworthy answer to compare against instead of re-trusting whatever a
+    // (by-then possibly model-rewritten) `.git` gitlink / `commondir` says.
+    let resolved = git_dirs(workspace);
+    prime_identity_cache(workspace, resolved.clone());
+    let Some((common_dir, absolute_git_dir)) = resolved else {
+        return OwnGitGrant::default();
+    };
+    let read = vec![
+        path_to_string(&absolute_git_dir),
+        path_to_string(&common_dir),
+    ];
+    let read_only = OwnGitGrant {
+        read: read.clone(),
+        write: Vec::new(),
+    };
+
+    let Some(branch) = own_branch(workspace) else {
+        return read_only; // detached HEAD
+    };
+    if is_default_branch(workspace, &branch) {
+        return read_only;
+    }
+
+    let write = vec![
+        path_to_string(&absolute_git_dir),
+        path_to_string(&common_dir.join("objects")),
+    ];
+    OwnGitGrant { read, write }
+}
+
+/// `(common_dir, absolute_git_dir)`.
+type GitDirPair = (PathBuf, PathBuf);
+
+/// The identity pair `own_gitdir_grants` resolved the ONE time it ran at
+/// session bootstrap, keyed by workspace. `None` for a workspace bootstrap
+/// never resolved (or resolved to "not a repo") is a distinct cache state
+/// from "not yet looked up" — both read back as `None` from
+/// [`cached_identity`], and both correctly deny the per-dispatch grant.
+fn identity_cache() -> &'static Mutex<HashMap<PathBuf, Option<GitDirPair>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<GitDirPair>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prime_identity_cache(workspace: &Path, resolved: Option<GitDirPair>) {
+    identity_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(workspace.to_path_buf(), resolved);
+}
+
+fn cached_identity(workspace: &Path) -> Option<GitDirPair> {
+    identity_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(workspace)
+        .cloned()
+        .flatten()
+}
+
+/// Per-dispatch write grant for the confined-shell `git` lane
+/// (`dispatch_caveats_for_git_shell`, PR #2577 round 3/4). Re-runs `rev-parse`
+/// on EVERY `git` dispatch, but the write grant is bound to the identity
+/// [`own_gitdir_grants`] cached at session start, not to whatever the fresh
+/// resolve says: the workspace's `.git` gitlink and the worktree gitdir's
+/// `commondir` file are both ordinary, model-writable files, so trusting a
+/// live re-resolve would let a rewritten pointer grant kernel write on an
+/// ENTIRELY DIFFERENT repository's `hooks/`/`config`/`objects` (Blocker 1) —
+/// hooks mean code execution the next time anyone runs git there. The fresh
+/// resolve is still run, but ONLY to CONFIRM it still equals the cached
+/// identity; any mismatch — or no cached identity at all (session bootstrap
+/// never ran, or resolved to "not a repo") — grants nothing. The branch check
+/// is re-read fresh every dispatch, same as before: that can only NARROW the
+/// grant (a default branch → nothing), never widen it, so re-reading it is
+/// safe in a way re-trusting the path resolve is not.
+pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
+    let Some((cached_common, cached_git_dir)) = cached_identity(workspace) else {
+        return Vec::new();
+    };
+    let Some((fresh_common, fresh_git_dir)) = git_dirs(workspace) else {
+        return Vec::new();
+    };
+    if fresh_common != cached_common || fresh_git_dir != cached_git_dir {
+        return Vec::new(); // re-pointed since session start — grant nothing
+    }
+    let Some(branch) = own_branch(workspace) else {
+        return Vec::new();
+    };
+    if is_default_branch(workspace, &branch) {
+        return Vec::new();
+    }
+    vec![
+        path_to_string(&cached_git_dir),
+        path_to_string(&cached_common.join("objects")),
+    ]
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// `(git-common-dir, absolute-git-dir)`, both made absolute against
+/// `workspace` (`--git-common-dir` prints relative for a normal checkout).
+fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = hardened_git(
+        workspace,
+        &["rev-parse", "--git-common-dir", "--absolute-git-dir"],
+    )
+    .ok()?
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let common_dir = lines.next()?;
+    let absolute_git_dir = PathBuf::from(lines.next()?);
+    let common_dir = if Path::new(common_dir).is_absolute() {
+        PathBuf::from(common_dir)
+    } else {
+        workspace.join(common_dir)
+    };
+    Some((common_dir, absolute_git_dir))
+}
+
+/// The checked-out branch name (`refs/heads/<name>` stripped), or `None` for
+/// detached HEAD / an unresolvable symbolic ref.
+fn own_branch(workspace: &Path) -> Option<String> {
+    let output = hardened_git(workspace, &["symbolic-ref", "-q", "HEAD"])
+        .ok()?
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/heads/")
+        .map(str::to_owned)
+}
+
+/// Is `branch` the repo's default branch — `main`, `master`, or whatever the
+/// remote's `HEAD` points at? The remote lookup is best-effort: an offline or
+/// remote-less repo just falls back to the hardcoded names.
+fn is_default_branch(workspace: &Path, branch: &str) -> bool {
+    if branch == "main" || branch == "master" {
+        return true;
+    }
+    let Some(output) = hardened_git(
+        workspace,
+        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|mut c| c.output().ok()) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .is_some_and(|default| default == branch)
+}
 
 /// Git config keys/values forced via `-c` so a hostile repo `.git/config` cannot
 /// turn a harness `git` call into code execution. `-c` outranks repo-local
@@ -54,6 +264,148 @@ const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "diff.external=",           // no external diff program
     "protocol.ext.allow=never", // no `ext::` transport
 ];
+
+/// The git settings a sandbox profile may carry, and the only ones copied from
+/// the operator's own config. Fail-closed: a key reaches sandbox git only when
+/// it matches here (exact key, or a `section.` prefix). Everything a config can
+/// use to run a program or reach a credential is absent by construction:
+/// `alias.*` (`!cmd`), `credential.*`, `include*`, `url.*.insteadOf`,
+/// `core.sshCommand`, `gpg.*`, filter and diff drivers.
+const COPYABLE_GIT_CONFIG: &[&str] = &[
+    "init.defaultbranch",
+    "core.autocrlf",
+    "core.eol",
+    "core.safecrlf",
+    "core.quotepath",
+    "core.whitespace",
+    "pull.rebase",
+    "pull.ff",
+    "push.default",
+    "fetch.prune",
+    "merge.conflictstyle",
+    "rebase.autosquash",
+    "rebase.autostash",
+    "rerere.enabled",
+    "diff.algorithm",
+    "diff.renames",
+    "diff.colormoved",
+    "branch.sort",
+    "tag.sort",
+    "commit.verbose",
+    "help.autocorrect",
+    "color.",
+    "column.",
+    "status.",
+    "log.",
+];
+
+/// Is `key` on [`COPYABLE_GIT_CONFIG`]? Git section and variable names are
+/// case-insensitive.
+fn copyable(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    COPYABLE_GIT_CONFIG.iter().any(|allowed| {
+        if allowed.ends_with('.') {
+            key.starts_with(allowed) && !key[allowed.len()..].contains('.')
+        } else {
+            key == *allowed
+        }
+    })
+}
+
+/// The copyable settings in a `git config --list` listing (`key=value` per
+/// line; a later line wins, as in git).
+#[must_use]
+pub fn copyable_git_config(listing: &str) -> std::collections::BTreeMap<String, String> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| copyable(key))
+        .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
+        .collect()
+}
+
+/// The operator's own global git config as a `--list` listing, read in the
+/// harness (never the sandbox) through [`hardened_git`] with an explicit
+/// `--file`: `~/.gitconfig`, then `$XDG_CONFIG_HOME/git/config`. Missing files
+/// contribute nothing.
+///
+/// # Errors
+/// When no git executable can be found.
+pub fn ambient_git_config_listing() -> io::Result<String> {
+    let Some(home) = crate::config::home_dir() else {
+        return Ok(String::new());
+    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let mut listing = String::new();
+    for file in [home.join(".gitconfig"), xdg.join("git").join("config")] {
+        if !file.is_file() {
+            continue;
+        }
+        let file = file.to_string_lossy().into_owned();
+        let output = hardened_git(&home, &["config", "--file", &file, "--list"])?.output()?;
+        if output.status.success() {
+            listing.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    Ok(listing)
+}
+
+/// The environment for every `git` the model runs in the confined shell.
+///
+/// - No ambient user or system config. The fence cannot read `~/.gitconfig`,
+///   and a live run's `git status` died on exactly that (`unable to access
+///   '~/.gitconfig': Operation not permitted`). The operator's own settings
+///   arrive only as the vetted `profile` snapshot.
+/// - `profile`: the sandbox profile's plain settings, filtered again through
+///   [`COPYABLE_GIT_CONFIG`] so a hand-edited or repository-supplied profile
+///   cannot carry what the copy would have refused.
+/// - `user.name`/`user.email` = `author`, so a commit made inside the sandbox
+///   (`stash`, `merge`, `rebase`, `cherry-pick`) is never identity-less.
+/// - [`GIT_HARDENING_OVERRIDES`] LAST, as git's environment config
+///   (`GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`, `-c` precedence, so it beats a
+///   hostile `.git/config`). The model can still unset these in its own
+///   command; the threat this answers is the repository, which cannot set the
+///   environment.
+#[must_use]
+pub fn sandbox_git_env(
+    author: (&str, &str),
+    profile: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut config: Vec<(&str, &str)> = profile
+        .iter()
+        .filter(|(key, _)| copyable(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    config.extend([
+        // git's XDG defaults (`~/.config/git/ignore`, `…/attributes`) are
+        // ambient config too; unset, git warns that the fence refused them.
+        ("core.excludesFile", "/dev/null"),
+        ("core.attributesFile", "/dev/null"),
+        ("user.name", author.0),
+        ("user.email", author.1),
+    ]);
+    config.extend(
+        GIT_HARDENING_OVERRIDES
+            .iter()
+            .map(|kv| kv.split_once('=').expect("each override is `key=value`")),
+    );
+    let mut env: Vec<(String, String)> = [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    env.push(("GIT_CONFIG_COUNT".to_owned(), config.len().to_string()));
+    for (i, (key, value)) in config.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), key.to_owned()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), value.to_owned()));
+    }
+    env
+}
 
 /// Construct automatic Git metadata only with unrestricted read authority.
 ///
@@ -242,6 +594,97 @@ mod tests {
 /// `cd newt-core && newt`. That approach was reverted; this test pins that a
 /// subdirectory launch still finds its repo.
 #[cfg(test)]
+mod sandbox_git_env_tests {
+    use super::*;
+
+    fn config(env: &[(String, String)]) -> Vec<(String, String)> {
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        let count: usize = get("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        (0..count)
+            .map(|i| {
+                (
+                    get(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    get(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ambient_config_is_ignored() {
+        let env = sandbox_git_env(("newt-agent", "a@b"), &Default::default());
+        assert!(env.contains(&("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())));
+        assert!(env.contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into())));
+    }
+
+    #[test]
+    fn every_hardening_override_rides_the_env_config() {
+        let config = config(&sandbox_git_env(("newt-agent", "a@b"), &Default::default()));
+        for kv in GIT_HARDENING_OVERRIDES {
+            let (key, value) = kv.split_once('=').unwrap();
+            assert!(
+                config.contains(&(key.into(), value.into())),
+                "{kv} missing: {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn commits_are_authored_by_the_agent_identity() {
+        let config = config(&sandbox_git_env(
+            (
+                crate::agent_identity::DEFAULT_AGENT_NAME,
+                crate::agent_identity::DEFAULT_AGENT_EMAIL,
+            ),
+            &Default::default(),
+        ));
+        assert!(config.contains(&("user.name".into(), "newt-agent".into())));
+        assert!(config.contains(&(
+            "user.email".into(),
+            "309460085+newt-agent@users.noreply.github.com".into()
+        )));
+    }
+    #[test]
+    fn a_copy_keeps_plain_settings_and_drops_every_gadget() {
+        let listing = "user.name=Op\ninit.defaultBranch=main\nalias.x=!curl evil\n\
+            credential.helper=osxkeychain\ncore.sshCommand=ssh -i k\ninclude.path=~/x\n\
+            url.git@h:.insteadof=https://h/\ncolor.ui=auto\ncolor.diff.meta=blue\npull.rebase=true\n";
+        let copied = copyable_git_config(listing);
+        let keys: Vec<&str> = copied.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["color.ui", "init.defaultbranch", "pull.rebase"]);
+    }
+
+    #[test]
+    fn a_profile_cannot_carry_what_the_copy_refuses() {
+        let profile: std::collections::BTreeMap<String, String> = [
+            ("alias.st".to_owned(), "!sh -c evil".to_owned()),
+            ("init.defaultbranch".to_owned(), "trunk".to_owned()),
+        ]
+        .into();
+        let config = config(&sandbox_git_env(("a", "a@b"), &profile));
+        assert!(
+            config.iter().all(|(key, _)| key != "alias.st"),
+            "{config:?}"
+        );
+        assert!(config.contains(&("init.defaultbranch".into(), "trunk".into())));
+    }
+
+    #[test]
+    fn the_hardening_floor_is_applied_after_the_profile() {
+        let config = config(&sandbox_git_env(("a", "a@b"), &Default::default()));
+        let last_user = config
+            .iter()
+            .rposition(|(k, _)| k.starts_with("user."))
+            .unwrap();
+        let first_floor = config
+            .iter()
+            .position(|(k, _)| k == "core.fsmonitor")
+            .unwrap();
+        assert!(first_floor > last_user, "{config:?}");
+    }
+}
+
+#[cfg(test)]
 mod subdir_discovery_tests {
     use super::*;
 
@@ -276,5 +719,147 @@ mod subdir_discovery_tests {
             "rev-parse HEAD from a repo subdirectory must still succeed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+/// Real `git`, real tempdirs: grounds [`own_gitdir_grants`] against actual
+/// worktree layouts rather than a belief about what `git rev-parse` prints.
+/// Per the workspace testing tiers this is an expensive/real-resource test,
+/// not the mocked unit tier; it is small and self-contained enough to run
+/// inline rather than being split into the weekly suite.
+#[cfg(all(test, unix))]
+mod own_gitdir_grant_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git invocation");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        std::fs::write(dir.join("seed"), "x").unwrap();
+        git(dir, &["add", "seed"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Would have failed before this fix: no grants existed at all, so
+    /// `permits_path` denied every file `git add`/`git commit` touches on a
+    /// linked worktree's own branch (F32, #2537).
+    #[test]
+    fn linked_worktree_on_own_branch_grants_the_two_write_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = root.path().join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+
+        let grant = own_gitdir_grants(&wt);
+        assert!(!grant.write.is_empty(), "own branch must get write roots");
+
+        std::fs::write(wt.join("f.txt"), "hi").unwrap();
+        let scope = crate::caveats::Scope::only(grant.write.clone());
+        let path = |rel: &str| main.join(".git").join(rel).to_string_lossy().into_owned();
+        // What `git add` needs (round 3: the write grant serves the confined
+        // SHELL lane's `git add` only — `git commit` from the shell is refused
+        // outright and redirected to the `git` tool, so refs never need a
+        // filesystem write grant here at all).
+        for touched in [
+            path("worktrees/wt/index"),
+            path("worktrees/wt/index.lock"),
+            path("worktrees/wt/HEAD"),
+            path("worktrees/wt/logs/HEAD"),
+            path("worktrees/wt/COMMIT_EDITMSG"),
+            path("objects/pack/multi-pack-index"),
+        ] {
+            assert!(
+                crate::caveats::permits_path(&scope, &touched),
+                "{touched} must be permitted"
+            );
+        }
+        // Refs, config, and hooks stay out of the write grant — moving a ref
+        // is what `refuse_if_default_branch` (the `git` tool) guards, not a
+        // filesystem grant.
+        for denied in [
+            path("refs/heads/task"),
+            path("refs/heads/main"),
+            path("config"),
+            path("hooks/pre-commit"),
+        ] {
+            assert!(
+                !crate::caveats::permits_path(&scope, &denied),
+                "{denied} must stay denied"
+            );
+        }
+
+        // The grant is real enough for a real (unconfined, this is a plain
+        // subprocess — not the kernel fence) `git add` + `git commit` to
+        // succeed; the confined-shell version of this property is
+        // `newt-core::agentic::tools::shell::git_shell_dispatch_tests`.
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "task work"]);
+    }
+
+    #[test]
+    fn normal_checkout_on_own_branch_grants_add_and_commit_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["checkout", "-q", "-b", "task"]);
+
+        let grant = own_gitdir_grants(repo.path());
+        assert!(!grant.write.is_empty());
+
+        std::fs::write(repo.path().join("f.txt"), "hi").unwrap();
+        git(repo.path(), &["add", "f.txt"]);
+        git(repo.path(), &["commit", "-q", "-m", "task work"]);
+    }
+
+    /// Writing `refs/heads/main`, `config`, or `hooks/pre-commit` must never be
+    /// in the grant, on either layout.
+    #[test]
+    fn default_branch_checkout_grants_no_write_roots() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git(repo.path(), &["branch", "-m", "main"]);
+
+        let grant = own_gitdir_grants(repo.path());
+        assert!(
+            grant.write.is_empty(),
+            "checkout on the default branch must not get commit authority: {:?}",
+            grant.write
+        );
+    }
+
+    #[test]
+    fn detached_head_grants_read_only() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        git(repo.path(), &["checkout", "-q", &head]);
+
+        let grant = own_gitdir_grants(repo.path());
+        assert!(
+            grant.write.is_empty(),
+            "detached HEAD must not get write roots"
+        );
+        assert!(!grant.read.is_empty(), "detached HEAD still gets read");
     }
 }

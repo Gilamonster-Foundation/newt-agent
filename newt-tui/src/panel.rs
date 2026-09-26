@@ -41,7 +41,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use newt_core::tty::raw_mode::RawModeGuard;
 
 use crate::inline_viewport::InlineTerm;
-use crate::modal_size::{ModalSize, SizeKey};
+use crate::modal_size::{ModalSize, SizeKey, MIN_ROWS};
+use crate::panel_controls::{Controls, Effect};
 use crate::session_worker::PanelWindow;
 
 /// The component vocabulary is shared directly with NewtUI. Newt retains
@@ -52,7 +53,7 @@ pub(crate) use newtui::{Flow, Key};
 /// Fold control into printable keys so a plain-character binding cannot fire
 /// with control held. Preserve Newt's existing bindings: keys it did not bind
 /// still arrive as `Other`, even if NewtUI names them for another host.
-fn key_from_event(code: KeyCode, ctrl: bool) -> Key {
+pub(crate) fn key_from_event(code: KeyCode, ctrl: bool) -> Key {
     match (code, ctrl) {
         (KeyCode::Char(c), true) => Key::Ctrl(c),
         (KeyCode::Char(c), false) => Key::Char(c),
@@ -143,21 +144,70 @@ pub(crate) fn make_terminal(height: u16) -> io::Result<InlineTerm> {
 }
 
 /// Lease `wanted` rows, or — when another surface holds what that needs —
-/// the `granted` rows the panel already had. The arbiter's refusal is the
-/// ownership rule: a panel never takes rows it was not lent, and an
-/// ungrantable size change keeps the panel open rather than closing it.
-/// Returns the terminal and the height it got. The lease-taker is injected so
-/// the rule is tested against a fake arbiter.
+/// the `granted` rows the panel already had, or, when a terminal shrink left
+/// fewer free rows than that, the most that fit, down to [`MIN_ROWS`]. The
+/// arbiter's refusal is the ownership rule: a panel never takes rows it was
+/// not lent, and an ungrantable size change degrades the panel rather than
+/// closing it. Only when not even `MIN_ROWS` is granted is the refusal an
+/// error. Returns the terminal and the height it got. The lease-taker is
+/// injected so the rule is tested against a fake arbiter.
 fn relet<T>(
     granted: u16,
     wanted: u16,
     mut lease: impl FnMut(u16) -> io::Result<T>,
 ) -> io::Result<(T, u16)> {
-    match lease(wanted) {
-        Ok(terminal) => Ok((terminal, wanted)),
-        Err(_) if wanted != granted => lease(granted).map(|terminal| (terminal, granted)),
-        Err(error) => Err(error),
+    let refused = match lease(wanted) {
+        Ok(terminal) => return Ok((terminal, wanted)),
+        Err(error) => error,
+    };
+    for rows in (MIN_ROWS..=granted).rev().filter(|rows| *rows != wanted) {
+        if let Ok(terminal) = lease(rows) {
+            return Ok((terminal, rows));
+        }
     }
+    Err(refused)
+}
+
+/// The driver's one line over the panel's hint row (inside the bottom
+/// border, past the scrollbar gutter) while a mode is live.
+fn draw_overlay(frame: &mut ratatui::Frame, text: &str) {
+    let area = frame.area();
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+    let line = ratatui::layout::Rect {
+        x: area.x + 2,
+        y: area.bottom() - 2,
+        width: area.width - 3,
+        height: 1,
+    };
+    frame.render_widget(ratatui::widgets::Clear, line);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(text.to_string())
+            .style(crate::theme::style(crate::theme::Role::Identity)),
+        line,
+    );
+}
+
+/// Erase the panel's own rows, and only those, then force a full repaint.
+///
+/// ratatui's `clear` on an inline viewport is `CUP(top)` + `ESC[J`: it erases
+/// to the END OF THE SCREEN, taking the rows of whatever holds the space below
+/// the panel (a `Refuse` lease on the bottom rows). The panel owns
+/// `area.top()..area.bottom()` and nothing else.
+fn clear_own_rows(terminal: &mut InlineTerm) -> io::Result<()> {
+    use ratatui::backend::{Backend, ClearType};
+    let area = terminal.get_frame().area();
+    for y in area.top()..area.bottom() {
+        let backend = terminal.backend_mut();
+        backend.set_cursor_position(ratatui::layout::Position { x: 0, y })?;
+        backend.clear_region(ClearType::CurrentLine)?;
+    }
+    // Both buffers reset (each swap resets the inactive one), so the next draw
+    // repaints every cell, as `clear` guaranteed.
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
 }
 
 /// What the driver does with one terminal event.
@@ -168,6 +218,8 @@ enum Input {
     Remeasure,
     /// The operator sized the modal: Shift-↑/↓, or Ctrl-Z to zoom.
     Size(SizeKey),
+    /// A mouse event, for a drag of the panel's top border.
+    Mouse(crossterm::event::MouseEvent),
     Ignore,
 }
 
@@ -201,6 +253,7 @@ fn classify(event: Event) -> Input {
             key.modifiers.contains(KeyModifiers::CONTROL),
         )),
         Event::Resize(..) => Input::Remeasure,
+        Event::Mouse(mouse) => Input::Mouse(mouse),
         _ => Input::Ignore,
     }
 }
@@ -230,9 +283,23 @@ pub(crate) fn drive(
                 Some(window) => window.terminal()?,
                 None => make_terminal(size.requested())?,
             };
-            terminal.clear()?;
+            let mut controls = Controls::new(crate::prefix::current());
+            // Drag-capable mouse capture for as long as the panel is open, on
+            // the REAL terminal (under the cockpit, stdout is its capture pty).
+            #[cfg(unix)]
+            let _mouse = crate::mouse::MouseCaptureGuard::enable_drag(match window {
+                Some(window) => crate::mouse::MouseSink::Tty(window.output()?),
+                None => crate::mouse::MouseSink::Stdout,
+            });
+            clear_own_rows(&mut terminal)?;
             loop {
-                terminal.draw(|f| screen.draw(f))?;
+                let overlay = controls.overlay();
+                terminal.draw(|f| {
+                    screen.draw(f);
+                    if let Some(text) = &overlay {
+                        draw_overlay(f, text);
+                    }
+                })?;
                 // A poll rather than a blocking read: the panel repaints on a
                 // cadence so a status line or a spinner can change without a
                 // keypress, and a timed-out poll is not an event.
@@ -241,8 +308,16 @@ pub(crate) fn drive(
                 }
                 // `Some(rows)`: lay out again at a new requested height;
                 // `Some(None)`: again at the same request (a terminal resize).
-                let relayout = match classify(event::read()?) {
-                    Input::Key(key) => {
+                let area = window.map_or_else(|| terminal.get_frame().area(), PanelWindow::area);
+                let effect = match classify(event::read()?) {
+                    Input::Key(key) => controls.key(key),
+                    Input::Mouse(mouse) => controls.mouse(mouse, area),
+                    Input::Size(key) => Effect::Size(key),
+                    Input::Remeasure => Effect::Redraw,
+                    Input::Ignore => Effect::Nothing,
+                };
+                let relayout = match effect {
+                    Effect::Forward(key) => {
                         if let Flow::Close(apply) = screen.key(key) {
                             applied = apply;
                             break;
@@ -253,15 +328,11 @@ pub(crate) fn drive(
                     // measured again — by the presenter that lent the rows, or
                     // by a fresh bottom-rows lease — and the region is cleared,
                     // so a narrower terminal leaves no stale cells behind.
-                    Input::Remeasure => Some(None),
-                    Input::Size(key) => {
-                        let granted = window.map_or_else(
-                            || terminal.get_frame().area().height,
-                            |window| window.area().height,
-                        );
-                        size.apply(key, granted).map(Some)
-                    }
-                    Input::Ignore => None,
+                    // A terminal resize and a redraw lay out again at the same
+                    // request; a size change at a new one.
+                    Effect::Redraw => Some(None),
+                    Effect::Size(key) => size.apply(key, area.height).map(Some),
+                    Effect::Nothing => None,
                 };
                 if let Some(rows) = relayout {
                     terminal = match window {
@@ -284,10 +355,10 @@ pub(crate) fn drive(
                             terminal
                         }
                     };
-                    terminal.clear()?;
+                    clear_own_rows(&mut terminal)?;
                 }
             }
-            terminal.clear()?;
+            clear_own_rows(&mut terminal)?;
             Ok(())
         })()
     };
@@ -324,9 +395,28 @@ mod tests {
             vec![10, 20, 8],
             "the fallback asks the arbiter too"
         );
+        // #2573 hardening: a shrink that leaves fewer free rows than the panel
+        // had degrades to what fits; it does not close the panel.
+        assert_eq!(
+            relet(20, 20, &mut arbiter).unwrap(),
+            (12, 12),
+            "degrades to the free rows"
+        );
+        let mut five_free = |rows: u16| {
+            if rows <= 5 {
+                Ok(rows)
+            } else {
+                Err(io::Error::other("another surface already owns these rows"))
+            }
+        };
+        assert_eq!(relet(7, 7, &mut five_free).unwrap(), (5, 5));
+        let mut none_free = |rows: u16| -> io::Result<u16> {
+            let _ = rows;
+            Err(io::Error::other("another surface already owns these rows"))
+        };
         assert!(
-            relet(20, 20, &mut arbiter).is_err(),
-            "nothing to fall back to"
+            relet(7, 7, &mut none_free).is_err(),
+            "not even MIN_ROWS fits: the only error"
         );
     }
 

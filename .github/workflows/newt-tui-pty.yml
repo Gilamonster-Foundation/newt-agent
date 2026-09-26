@@ -1,8 +1,10 @@
 name: newt-tui real-PTY tier (#1520, #1677)
 
 # Real-terminal integration tier for prompt CONTROL-key delivery, transcript
-# pager terminal restoration, and the cockpit's ownership of fd 0/1 and the
-# terminal's modes (#1744). Runs on Linux AND macOS: the code is POSIX, and the
+# pager terminal restoration, the operator panel driver (raw-mode lifecycle,
+# row holders, resize), the rich prompt and the interaction frame's terminal
+# lifecycle, and the cockpit's ownership of fd 0/1 and the terminal's modes
+# (#1744). Runs on Linux AND macOS: the code is POSIX, and the
 # unit tier in ci.yml is Linux + Windows only. It drives real PTY children to prove raw control
 # bytes reach modal readers and that every pager exit path restores kernel tty
 # state plus the alternate screen — properties mocks cannot observe.
@@ -13,6 +15,17 @@ name: newt-tui real-PTY tier (#1520, #1677)
 # and run HERE in the WEEKLY tier (schedule), RELEASE tier (v* tags), and scoped
 # terminal-code PR gate, always single-threaded. They ground the mocked prompt
 # control-key tests and the transcript pager's pure row-model tests.
+#
+# COVERAGE (every `#[ignore]`d real-PTY test in newt-tui runs in exactly one
+# place): prompt_visibility_test, transcript_pager_pty_test,
+# panel_raw_mode_pty_test, rich_input_pty_test, interaction_view_pty_test and
+# `cockpit::` run HERE. esc_ladder_pty_test, settings_form_pty_test,
+# interrupt_ack_pty_test, compaction_progress_tests and live_spill's PTY test
+# are deliberately NOT `#[ignore]`d (their parents are the per-PR guards), so
+# they run in ci.yml's workspace unit tier, not here; only their child
+# processes are `#[ignore]`d. newt-agent's `terminal_exit_pty` runs in ci.yml
+# (unit tier, Linux) and on the macOS leg below. `inline_terminal` is shared by
+# the prompt, the panel and both modals, so a change to it must be caught here.
 #
 # HOOK PARITY EXCEPTION: like eval-live.yml / nightly-eval.yml / mesh-
 # integration.yml / output-oracle-real.yml, this workflow is intentionally
@@ -37,10 +50,24 @@ on:
       - "newt-tui/src/cockpit/**"
       - "newt-tui/src/rich_input.rs"
       - "newt-tui/src/rich_input/**"
+      - "newt-tui/src/rich_input_pty_test.rs"
       - "newt-cli/tests/terminal_exit_pty.rs"
       - "newt-tui/src/transcript_pager.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
+      - "newt-tui/src/panel.rs"
+      - "newt-tui/src/panel_raw_mode_pty_test.rs"
+      - "newt-tui/src/modal_size.rs"
+      - "newt-tui/src/inline_viewport.rs"
+      - "newt-tui/src/lines_panel.rs"
+      - "newt-tui/src/session_worker.rs"
+      - "newt-tui/src/interaction_view_pty_test.rs"
+      - "newt-tui/src/interaction_view.rs"
+      - "newt-tui/src/clarification_modal.rs"
+      - "newt-tui/src/modal.rs"
+      - "newt-tui/src/completed_spill.rs"
+      # chat.rs is also reached by these tests but is deliberately left out: it
+      # would fire this tier on nearly every PR (see the scoped-gate note above).
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
       - "tests/pty/**"
@@ -92,6 +119,31 @@ jobs:
         run: |
           cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
             -- --ignored --test-threads=1
+
+      # The panel driver on a real terminal with no cockpit (`panel::drive(..,
+      # None)`): raw-mode lifecycle on every exit path, and a panel beside a
+      # holder of the bottom rows. `#[ignore]`d, and nothing else ran them.
+      - name: Run panel raw-mode and row-holder real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui panel_raw_mode_pty_test \
+            -- --ignored --test-threads=1
+
+      # The rich prompt on a real terminal, DSR answered by the parent: raw
+      # mode and bracketed paste on every exit path, and a growing prompt
+      # scrolling the transcript up instead of erasing it. `--include-ignored`:
+      # the parents are `#[ignore]`d and the child no-ops without its env marker.
+      - name: Run rich prompt real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui,live-spill rich_input_pty_test \
+            -- --include-ignored --test-threads=1
+
+      # The interaction frame (permission / clarification prompts) on a real
+      # terminal: cooked/raw restoration on every exit path, wrapping, resize.
+      # Its `cockpit::` wrappers cover only the cockpit-hosted cases.
+      - name: Run interaction frame real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui,live-spill interaction_view_pty_test \
+            -- --include-ignored --test-threads=1
 
       # The cockpit owns fd 0/1 and the terminal's modes for a whole session,
       # so its acceptance tests are real-terminal tests. They are `#[ignore]`d

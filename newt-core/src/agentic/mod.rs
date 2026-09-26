@@ -2163,7 +2163,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
@@ -4258,23 +4258,12 @@ struct RepeatCallGuard {
     repeat_memos: std::collections::HashMap<String, RepeatMemo>,
     /// `name` → how many times it has failed this run (any args).
     fails_by_tool: std::collections::HashMap<String, usize>,
-    /// #2374: result-aware verification is on, so a failure memo describes the
-    /// tree it ran against and a workspace change releases it. Off (the
-    /// default path) keeps every failure memo for the turn.
-    clears_failures_on_change: bool,
 }
 
 impl RepeatCallGuard {
     /// How many consecutive failures of one tool before the steer escalates to
     /// "stop using it".
     const ESCALATE_AFTER: usize = 2;
-
-    fn for_verification(result_aware: bool) -> Self {
-        Self {
-            clears_failures_on_change: result_aware,
-            ..Self::default()
-        }
-    }
 
     fn key(name: &str, args: &serde_json::Value) -> String {
         // The model emits byte-identical args when it loops (confirmed by the
@@ -4445,10 +4434,10 @@ impl RepeatCallGuard {
                 )
             });
         }
-        // #2374: in result-aware mode a failure memo describes the tree it ran
-        // against. After a real workspace change the identical call is the
-        // re-check a repair nudge asks for, so the memo is released.
-        if self.clears_failures_on_change && ok && may_change_workspace(name, args) {
+        // #2374/F37: a failure memo describes the tree it ran against. After a
+        // real workspace change the identical call is the re-check the repair
+        // loop needs, so the memo is released in every mode.
+        if ok && may_change_workspace(name, args) {
             self.repeat_memos
                 .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
         }
@@ -6597,7 +6586,33 @@ fn prepare_openai_assistant_replay(
             object.remove("reasoning_content");
         }
     }
+    sanitize_replayed_tool_call_arguments(&mut assistant);
     assistant
+}
+
+/// #2558/F39: every replayed assistant turn routes through
+/// [`prepare_openai_assistant_replay`] before entering `messages` — the one
+/// place to make an unparseable `arguments` string harmless everywhere
+/// (chat, the reasoning-continuation replay, and the token-count preflight,
+/// which all resend `messages` verbatim). A call whose `arguments` string
+/// fails to parse as JSON is replayed as `"{}"`: the model already sees a
+/// rejection naming the parse error (`validate_tool_call_batch` /
+/// `ContentInvalid`), and never sees this call dispatched, so a small valid
+/// stand-in cannot be mistaken for real input reaching a tool.
+fn sanitize_replayed_tool_call_arguments(assistant: &mut serde_json::Value) {
+    let Some(calls) = assistant["tool_calls"].as_array_mut() else {
+        return;
+    };
+    for call in calls {
+        let Some(args) = call["function"]["arguments"].as_str() else {
+            continue;
+        };
+        let trimmed = args.trim();
+        if trimmed.is_empty() || serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+            continue;
+        }
+        call["function"]["arguments"] = serde_json::Value::String("{}".to_string());
+    }
 }
 
 /// Count the assembled Chat Completions body only when admission has a bound.
@@ -6980,7 +6995,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
@@ -9628,7 +9643,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,
@@ -11945,7 +11960,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     // #2315: result-aware verification for this turn, decided once.
     let result_aware = self_verify::enabled() && verify_outcomes;
-    let mut repeat_calls = RepeatCallGuard::for_verification(result_aware);
+    let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
     let mut verification = self_verify::VerificationLedger::for_workspace(
         task,

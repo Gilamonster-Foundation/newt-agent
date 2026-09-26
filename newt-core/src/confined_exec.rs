@@ -925,6 +925,56 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
     policy
 }
 
+/// The Xcode binaries a bare-name exec grant already reaches: for each granted
+/// name whose `/usr/bin/<name>` is present, `<developer>/usr/bin/<name>`.
+///
+/// On macOS `/usr/bin/python3`, `/usr/bin/git`, `/usr/bin/clang` and the rest
+/// are xcrun shims that only forward to that binary, and the shell lane puts
+/// `<developer>/usr/bin` first on the child's PATH so the shim's per-user xcrun
+/// cache is never needed. A bare grant resolves only against the system dirs,
+/// though, so without the twin the kernel refused the very binary PATH chose
+/// (`execvp() of 'python3' failed: Operation not permitted`). Admitting it is
+/// the grant the operator already made, as agent-bridle admits `/bin/bash` for
+/// a granted `/bin/sh`. Empty off macOS or with no selected developer dir.
+#[must_use]
+pub(crate) fn developer_exec_twins<'a>(exec: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = selected_developer_directory() {
+        return exec
+            .into_iter()
+            .filter(|name| !name.contains('/') && Path::new("/usr/bin").join(name).is_file())
+            .map(|name| Path::new(developer).join("usr/bin").join(name))
+            .filter_map(|twin| twin.canonicalize().ok())
+            .filter(|twin| twin.is_file())
+            .flat_map(|twin| {
+                // A framework build's `Versions/<v>/bin/<name>` is itself a
+                // launcher that re-spawns a companion inside its bundle.
+                let companions: Vec<PathBuf> = twin
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(|version| {
+                        FRAMEWORK_LAUNCHER_COMPANIONS
+                            .iter()
+                            .map(|relative| version.join(relative))
+                            .filter(|companion| companion.is_file())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                std::iter::once(twin).chain(companions)
+            })
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    }
+    let _ = exec;
+    Vec::new()
+}
+
+/// What a macOS framework launcher (`<Name>.framework/Versions/<v>/bin/<tool>`)
+/// re-spawns, relative to its `Versions/<v>` directory. Python's framework build
+/// runs its interpreter from an app bundle so it gets a bundle identity.
+#[cfg(target_os = "macos")]
+const FRAMEWORK_LAUNCHER_COMPANIONS: &[&str] = &["Resources/Python.app/Contents/MacOS/Python"];
+
 /// The system's selected toolchain, resolved once without repository env/cwd.
 #[cfg(target_os = "macos")]
 pub(crate) fn selected_developer_directory() -> Option<&'static str> {
@@ -983,26 +1033,92 @@ pub fn build_tool_request(
     program: impl Into<String>,
     args: impl IntoIterator<Item = impl Into<String>>,
 ) -> ExecRequest {
-    let root = workspace.to_string_lossy();
-    let mut request = ExecRequest::new(
+    toolchain_request(
         ExecOrigin::AgentInfluenced,
+        workspace,
+        cwd,
         program,
         args,
-        cwd,
         build_tool_caveats(workspace),
     )
     .net_grant(NetGrant::DenyAll)
-    .env("HOME", root.as_ref())
-    .env("TMPDIR", root.as_ref())
-    .env(
-        "CARGO_TARGET_DIR",
-        workspace.join("target").to_string_lossy(),
-    )
-    // Operator Cargo config may name an out-of-fence compiler cache daemon.
-    // A confined build uses the compiler directly, not that ambient deputy.
     .env("CARGO_NET_OFFLINE", "true")
-    .env("RUSTC_WRAPPER", "")
-    .env("RUSTC_WORKSPACE_WRAPPER", "");
+}
+
+/// The crates.io hosts `cargo fetch` reaches: the sparse index and the
+/// download CDN. The only network [`dependency_fetch_request`] asks for.
+pub const CRATES_IO_FETCH_HOSTS: &[&str] = &["index.crates.io", "static.crates.io"];
+
+/// Fill the operator's Cargo package cache with the crates `Cargo.lock` pins, so
+/// the offline build lane ([`build_tool_request`]) can resolve them.
+///
+/// `cargo fetch --locked` compiles nothing and runs no build script, and
+/// `--locked` binds every download to the lockfile's checksums. The argv is
+/// fixed here, never model-supplied, so it runs as [`ExecOrigin::TrustedInfra`]:
+/// a crates.io host allow-list cannot be kernel-enforced (Seatbelt names only
+/// `*`/`localhost`; Landlock only ports), and the `AgentInfluenced` floor would
+/// refuse it. That residual is registered as `dependency-fetch-egress` in
+/// `docs/security/ocap-deviations.md`; callers must hold the operator's `net`
+/// grant for [`CRATES_IO_FETCH_HOSTS`] before running this.
+#[must_use]
+pub fn dependency_fetch_request(workspace: &Path, cwd: &Path) -> ExecRequest {
+    let writes: Vec<String> = operator_tool_home("CARGO_HOME", ".cargo")
+        .map(|home| cargo_home_fetch_write_roots(&home))
+        .unwrap_or_default();
+    let mut caveats = build_tool_caveats_with_writes(workspace, &writes);
+    caveats.net = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+    toolchain_request(
+        ExecOrigin::TrustedInfra,
+        workspace,
+        cwd,
+        "cargo",
+        ["fetch", "--locked"],
+        caveats,
+    )
+}
+
+/// What a fetch writes under `$CARGO_HOME`: the registry (index cache, `.crate`
+/// files, extracted sources) and cargo's package-cache lock files. Not the
+/// whole directory, which holds `credentials.toml`.
+fn cargo_home_fetch_write_roots(cargo_home: &str) -> Vec<String> {
+    let base = Path::new(cargo_home);
+    [
+        "registry",
+        ".package-cache",
+        ".package-cache-mutate",
+        ".global-cache",
+        ".global-cache-journal",
+        ".global-cache-wal",
+        ".global-cache-shm",
+    ]
+    .into_iter()
+    .map(|entry| base.join(entry).to_string_lossy().into_owned())
+    .collect()
+}
+
+/// The environment every toolchain child shares: an env-empty start, scratch
+/// and target inside the workspace, operator tool homes, and a PATH that finds
+/// the real compiler. Network policy is the caller's.
+fn toolchain_request(
+    origin: ExecOrigin,
+    workspace: &Path,
+    cwd: &Path,
+    program: impl Into<String>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    caveats: Caveats,
+) -> ExecRequest {
+    let root = workspace.to_string_lossy();
+    let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
+        .env("HOME", root.as_ref())
+        .env("TMPDIR", root.as_ref())
+        .env(
+            "CARGO_TARGET_DIR",
+            workspace.join("target").to_string_lossy(),
+        )
+        // Operator Cargo config may name an out-of-fence compiler cache daemon.
+        // A confined build uses the compiler directly, not that ambient deputy.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "");
     for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
         if let Some(path) = operator_tool_home(name, default) {
             request = request.env(name, path);
@@ -1101,15 +1217,34 @@ pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[Str
 /// reopen the read-then-disclose path.
 fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     let mut roots = vec![workspace.to_string_lossy().into_owned()];
-    // (env var that overrides the default, default subdir under HOME)
-    for (var, default) in [
-        ("CARGO_HOME", ".cargo"),
-        ("RUSTUP_HOME", ".rustup"),
-        ("XDG_CACHE_HOME", ".cache"),
-    ] {
-        if let Some(path) = operator_tool_home(var, default) {
-            roots.push(path);
-        }
+    roots.extend(toolchain_read_roots());
+    roots
+}
+
+/// The per-user toolchain / package-cache roots alone (no workspace), derived
+/// from the operator's environment. Shared by [`build_tool_read_roots`] and by
+/// [`crate::agentic::permissions::widen_caveats`]'s build-tool exec arm — an
+/// `exec` grant for `cargo`/`just`/`make` carries the same calibrated reads a
+/// lifecycle build gets, one derivation, not two (dec1-build-grant, F35).
+///
+/// dec1-build-grant round 3 (architect review, PR #2579): every root here is
+/// non-secret by construction — narrow this list rather than the callers, and
+/// every caller inherits the fix. `$CARGO_HOME` is narrowed to
+/// [`cargo_home_read_roots`] (never the whole directory — that grant let
+/// `cargo --version; cat $CARGO_HOME/credentials.toml` read the secret
+/// straight through it), and `$XDG_CACHE_HOME` is dropped entirely: nothing
+/// in this repo has shown a build needs it, and it can hold arbitrary
+/// per-tool state (an ML CLI's auth token cache, for one). If a real build
+/// ever needs a specific cache subdirectory, grant that subdirectory with a
+/// comment naming why — never the whole cache root.
+#[must_use]
+pub fn toolchain_read_roots() -> Vec<String> {
+    let mut roots = Vec::new();
+    if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
+        roots.extend(cargo_home_read_roots(&home));
+    }
+    if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
+        roots.push(path);
     }
     // System C toolchain headers: world-readable OS files with zero
     // disclosure value (P0 U6e) — this is a read-then-disclose fence, and
@@ -1130,9 +1265,62 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     roots
 }
 
+/// `$CARGO_HOME`'s narrow, non-secret read set (dec1-build-grant round 3):
+/// `bin/` (cached toolchain binaries), `registry/` (downloaded crate
+/// sources), `git/` (vendored git dependencies) — what `cargo build`/`cargo
+/// test` reads to resolve dependencies with the network denied — plus the
+/// config file, if the operator has one. NEVER `credentials.toml` /
+/// `credentials`: those hold registry auth tokens, and the whole-directory
+/// grant this replaces handed them to ANY confined command whose leading
+/// token merely looked like a build tool. A subdir that doesn't exist yet is
+/// a harmless no-op grant, so this never probes the filesystem — same style
+/// as the rest of this module's root derivation.
+fn cargo_home_read_roots(cargo_home: &str) -> Vec<String> {
+    let base = Path::new(cargo_home);
+    let mut roots: Vec<String> = ["bin", "registry", "git"]
+        .into_iter()
+        .map(|subdir| base.join(subdir).to_string_lossy().into_owned())
+        .collect();
+    roots.push(base.join("config.toml").to_string_lossy().into_owned());
+    roots.push(base.join("config").to_string_lossy().into_owned());
+    roots
+}
+
+/// Build-tool exec names whose grant carries the toolchain read roots and, in
+/// the TUI danger table, is covered by an existing session build grant —
+/// pure DATA (three-Cs), not a `match` arm, so a new build tool is a data
+/// edit. Compared against the target's file-name component, so a pathful
+/// `/usr/bin/cargo` matches too.
+pub const BUILD_TOOL_EXEC: &[&str] = &["cargo", "just", "make"];
+
+/// Is `target` a build-tool exec name (see [`BUILD_TOOL_EXEC`])? Compares the
+/// file-name component, matching the danger table's `is_interpreter` convention.
+#[must_use]
+pub fn is_build_tool_exec(target: &str) -> bool {
+    let trimmed = target.trim();
+    let name = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(trimmed);
+    BUILD_TOOL_EXEC.contains(&name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dec1-build-grant: the build-tool predicate matches a bare name and a
+    /// pathful target on its file-name component, and rejects an unrelated
+    /// command — the same convention `DangerTable::is_interpreter` uses.
+    #[test]
+    fn is_build_tool_exec_matches_known_names_only() {
+        assert!(is_build_tool_exec("cargo"));
+        assert!(is_build_tool_exec("just"));
+        assert!(is_build_tool_exec("make"));
+        assert!(is_build_tool_exec("/usr/bin/cargo"));
+        assert!(!is_build_tool_exec("rm"));
+        assert!(!is_build_tool_exec("bash"));
+    }
 
     /// RAII guard that restores an env var to its value at construction on
     /// drop, so a failed assertion mid-test does not leak the fake `HOME` (or
@@ -1231,6 +1419,67 @@ mod tests {
         assert!(!roots_relative.contains(&local_bin));
     }
 
+    /// dec1-build-grant round 3 (architect review, PR #2579), red test (a):
+    /// the whole `$CARGO_HOME` directory is no longer a root — a hostile
+    /// `cargo --version; cat $CARGO_HOME/credentials.toml` read the secret
+    /// straight through that grant. `toolchain_read_roots` now narrows
+    /// `$CARGO_HOME` to `bin/`/`registry/`/`git/` + a config file, and drops
+    /// `$XDG_CACHE_HOME` entirely. Would fail before the fix: `roots`
+    /// contained the bare `$CARGO_HOME` and `$XDG_CACHE_HOME` strings, which
+    /// `permits_path` (ancestor-or-equal, the same check the fence itself
+    /// uses) would have found to cover `credentials.toml` and
+    /// `huggingface/token`.
+    #[test]
+    fn toolchain_read_roots_narrows_cargo_home_and_drops_the_cache_dir() {
+        let _env = crate::process_env::lock();
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_cargo = EnvRestore::capture("CARGO_HOME");
+        let _restore_xdg_cache = EnvRestore::capture("XDG_CACHE_HOME");
+        let fake_home = std::env::temp_dir().join("fake-home-for-toolchain-read-roots-test");
+        crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
+        crate::process_env::remove_var("CARGO_HOME");
+        crate::process_env::remove_var("XDG_CACHE_HOME");
+
+        let roots = toolchain_read_roots();
+        let cargo_home = fake_home.join(".cargo");
+
+        // The narrow subdirs a real build needs ARE granted.
+        for subdir in ["bin", "registry", "git"] {
+            let expected = cargo_home.join(subdir).to_string_lossy().into_owned();
+            assert!(roots.contains(&expected), "missing {expected} in {roots:?}");
+        }
+        for config in ["config.toml", "config"] {
+            let expected = cargo_home.join(config).to_string_lossy().into_owned();
+            assert!(roots.contains(&expected), "missing {expected} in {roots:?}");
+        }
+        // The whole CARGO_HOME directory itself is never a root — a
+        // directory grant would also cover credentials.toml.
+        assert!(!roots
+            .iter()
+            .any(|r| r == cargo_home.to_string_lossy().as_ref()));
+
+        // The credential files are never covered — ancestor-or-equal check,
+        // the same containment logic the fence itself enforces.
+        let read_scope = Scope::only(roots.clone());
+        for secret in ["credentials.toml", "credentials"] {
+            let forbidden = cargo_home.join(secret).to_string_lossy().into_owned();
+            assert!(
+                !crate::caveats::permits_path(&read_scope, &forbidden),
+                "toolchain_read_roots must never grant read over {forbidden}"
+            );
+        }
+
+        // $XDG_CACHE_HOME is dropped entirely — not a root, and no path
+        // beneath the default cache dir is covered either.
+        let default_cache = fake_home.join(".cache").to_string_lossy().into_owned();
+        assert!(!roots.iter().any(|r| r == &default_cache));
+        let hf_token = fake_home
+            .join(".cache/huggingface/token")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!crate::caveats::permits_path(&read_scope, &hf_token));
+    }
+
     #[test]
     fn already_cancelled_request_never_attempts_spawn() {
         let request = ExecRequest::new(
@@ -1247,6 +1496,39 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials() {
+        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws/sub"));
+        assert_eq!(request.origin, ExecOrigin::TrustedInfra);
+        assert_eq!(request.net_grant, NetGrant::Unrestricted);
+        assert_eq!(request.args, ["fetch", "--locked"]);
+        assert_eq!(
+            request.caveats.net,
+            Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()))
+        );
+        assert!(request
+            .env_grants()
+            .iter()
+            .all(|(name, _)| name != "CARGO_NET_OFFLINE"));
+        if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
+            let home = Path::new(&home);
+            let registry = home.join("registry").to_string_lossy().into_owned();
+            let credentials = home.join("credentials.toml").to_string_lossy().into_owned();
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &registry
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &credentials
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &credentials
+            ));
+        }
+    }
+
+    #[test]
     fn build_request_discovers_toolchain_before_replacing_home() {
         let request = build_tool_request(Path::new("/ws"), Path::new("/ws"), "cargo", ["test"]);
         let env: std::collections::BTreeMap<_, _> = request.env_grants().iter().cloned().collect();
@@ -1255,25 +1537,39 @@ mod tests {
             env.get("CARGO_TARGET_DIR").map(std::path::Path::new),
             Some(Path::new("/ws").join("target").as_path())
         );
-        for name in ["CARGO_HOME", "RUSTUP_HOME"] {
-            if let Some(path) = operator_tool_home(
-                name,
-                if name == "CARGO_HOME" {
-                    ".cargo"
-                } else {
-                    ".rustup"
-                },
-            ) {
-                assert_eq!(env.get(name), Some(&path));
+        // `RUSTUP_HOME` env matches an operator override and is fully
+        // readable (never a secret; toolchains only).
+        if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
+            assert_eq!(env.get("RUSTUP_HOME"), Some(&path));
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &path
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &path
+            ));
+        }
+        // `CARGO_HOME` env still resolves to the whole home (cargo itself
+        // needs that to find its own layout) — but the READ grant is the
+        // narrowed `cargo_home_read_roots` set (round 3, PR #2579): the
+        // subdirs a build needs are readable, `credentials.toml` is not.
+        if let Some(path) = operator_tool_home("CARGO_HOME", ".cargo") {
+            assert_eq!(env.get("CARGO_HOME"), Some(&path));
+            for subdir in ["bin", "registry", "git"] {
                 assert!(crate::caveats::permits_path(
                     &request.caveats.fs_read,
-                    &path
-                ));
-                assert!(!crate::caveats::permits_path(
-                    &request.caveats.fs_write,
-                    &path
+                    &Path::new(&path).join(subdir).to_string_lossy()
                 ));
             }
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &Path::new(&path).join("credentials.toml").to_string_lossy()
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &path
+            ));
         }
         assert!(env.keys().all(|name| [
             "HOME",

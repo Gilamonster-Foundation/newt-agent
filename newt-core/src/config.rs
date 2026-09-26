@@ -531,6 +531,13 @@ pub struct TuiConfig {
     #[serde(default)]
     pub edit_mode: EditMode,
 
+    /// The meta prefix chord (e.g. `"ctrl+space"`, `"ctrl+a"`): pressed before
+    /// a key, it reaches newt's own operations — zoom, resize, redraw — the
+    /// way tmux and herdr use `ctrl+b`. Unset means the shipped default,
+    /// `ctrl+space`. Set from `/settings prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_key: Option<String>,
+
     /// Rich-tui (issue #416) input gutter width, in columns. Unset = `auto`
     /// (the responsive default: a prompt gutter when it fits under ~1/3 of the
     /// width, else a stacked prompt row). `0` turns the gutter off (prompt on
@@ -881,6 +888,7 @@ impl Default for TuiConfig {
             no_splash: false,
             mouse_viewport: false,
             edit_mode: EditMode::Nano,
+            prefix_key: None,
             gutter: None,
             footer: FooterMode::Auto,
             color: ColorMode::Auto,
@@ -2104,6 +2112,28 @@ impl Config {
         } else {
             root.insert("default_backend", toml_edit::value(name));
         }
+        Ok(doc.to_string())
+    }
+
+    /// Set one scalar `key` in the `[tui]` table, creating the table if it is
+    /// absent and preserving the rest of the document — comments, formatting,
+    /// and any `[tui.*]` subtables (#2569 is what happens when a subtable is
+    /// treated as the table). PURE: the caller owns the filesystem write.
+    pub fn with_tui_key(text: &str, key: &str, value: &str) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let tui = doc
+            .as_table_mut()
+            .entry("tui")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`tui` is not a table".to_string()))?;
+        tui.insert(key, toml_edit::value(value));
         Ok(doc.to_string())
     }
 
