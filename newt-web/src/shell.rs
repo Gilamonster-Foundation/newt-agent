@@ -264,17 +264,25 @@ const STYLE: &str = r#"
     --code-bg: #f3f4f6;
   }
   * { box-sizing: border-box; }
-  body { font: 15px/1.55 var(--sans); margin: 0; background: var(--bg); color: var(--ink); }
+  body { font: 15px/1.55 var(--sans); margin: 0; background: var(--bg); color: var(--ink); display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
   small { color: var(--dim); font-weight: normal; }
-  header { padding: 0.7rem 1.25rem; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; align-items: center; justify-content: space-between; }
+  header { flex: none; padding: 0.7rem 1.25rem; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; align-items: center; justify-content: space-between; }
   header button { background: transparent; border-color: transparent; color: var(--dim); font-size: 1rem; padding: 0.15rem 0.5rem; }
   header button:hover { color: var(--ink); }
   header h1 { font-size: 1rem; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
-  #content { padding: 1.25rem; display: grid; gap: 1rem; max-width: 72rem; margin: 0 auto; }
+  /* Cockpit layout: header over a sidebar (what you can drive) and a main
+     column (what you are driving). Wide screens pin the page to the viewport
+     (body is a full-height flex column) so the sidebar and transcript scroll
+     independently; the narrow-screen query at the end stacks it for phones. */
+  .cockpit { flex: 1; min-height: 0; display: grid; grid-template-columns: 19rem minmax(0, 1fr); }
+  .sidebar { background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; padding: 0.9rem 0.75rem; display: grid; align-content: start; gap: 0.9rem; }
+  .side-head { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0.5rem -0.6rem; }
+  #content { min-height: 0; display: flex; padding: 1rem 1.25rem; }
+  #panel { flex: 1; min-width: 0; min-height: 0; max-width: 60rem; margin: 0 auto; display: flex; flex-direction: column; }
   /* minmax(0, 1fr), not the implicit auto track: a grid item's min-width is
      its content by default, so one long code line would widen the whole page
      and scroll a phone sideways. Zero lets `pre` and tables scroll instead. */
-  #content, #overview, .transcript { grid-template-columns: minmax(0, 1fr); }
+  .sidebar, #overview, .transcript { grid-template-columns: minmax(0, 1fr); }
 
   /* Controls. Inputs and buttons share one shape so a form reads as a unit. */
   input, select, button { font: inherit; color: inherit; }
@@ -284,39 +292,41 @@ const STYLE: &str = r#"
   button:hover { border-color: var(--dim); }
 
   /* Overview: sessions and docked peers, as cards of rows. */
-  .sessions, .docked { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.9rem 1rem; }
-  #overview { display: grid; gap: 1rem; }
-  .sessions h2, .docked h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0 0.2rem; }
+  #overview { display: grid; gap: 1.1rem; }
+  .sessions h2, .docked h2 { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--dim); margin: 0 0.5rem 0.2rem; }
+  .sidebar .hint, .sidebar .empty { margin: 0 0.5rem 0.4rem; font-size: 0.8rem; }
   .hint { color: var(--dim); font-size: 0.8rem; margin: 0 0 0.6rem; }
   .empty { color: var(--dim); }
   .sessions ul, .docked ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.15rem; }
-  .sessions li, .docked li { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0.5rem; border-radius: 8px; }
+  .sessions li, .docked li { display: flex; flex-wrap: wrap; align-items: center; column-gap: 0.5rem; padding: 0.35rem 0.5rem; border-radius: 8px; font-size: 0.9rem; }
   .sessions li:hover, .docked li:hover { background: var(--raised); }
   .sessions .s-title { font-weight: 500; }
   form.attach { display: inline; margin-left: auto; }
-  .peer h3 { font-size: 0.9rem; font-weight: 600; margin: 0.4rem 0 0.2rem; }
+  .peer h3 { font-size: 0.9rem; font-weight: 600; margin: 0.4rem 0.5rem 0.2rem; }
   button.dock-open { background: transparent; border: 0; padding: 0; font-weight: 500; }
 
-  .spawn-wrap { border: 1px dashed var(--line); border-radius: var(--radius); padding: 0.55rem 0.9rem; }
+  .spawn-wrap { border: 1px dashed var(--line); border-radius: 10px; padding: 0.45rem 0.6rem; }
   .spawn-wrap summary { cursor: pointer; font-size: 0.9rem; color: var(--dim); }
-  form.spawn fieldset { border: 0; margin: 0.6rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+  form.spawn fieldset { border: 0; margin: 0.5rem 0 0; padding: 0; display: grid; gap: 0.25rem; }
+  form.spawn button { margin-top: 0.4rem; }
   form.spawn legend { font-size: 0.75rem; padding: 0; color: var(--dim); }
   form.spawn label { font-size: 0.8rem; color: var(--dim); }
 
-  /* Agent switcher: pills; the current one filled. */
-  #tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; }
-  #tabs a { padding: 0.3rem 0.85rem; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); text-decoration: none; color: inherit; font-size: 0.9rem; }
-  #tabs a:hover { border-color: var(--dim); }
-  #tabs a[aria-current="page"] { background: var(--raised); border-color: var(--accent); font-weight: 600; }
+  /* Agent switcher: a list; the one being driven is marked with the accent. */
+  #tabs { display: grid; gap: 0.15rem; }
+  #tabs:empty::before { content: "none open"; color: var(--dim); font-size: 0.85rem; padding: 0.3rem 0.6rem; }
+  #tabs a { display: block; padding: 0.45rem 0.6rem; border-radius: 8px; text-decoration: none; color: inherit; font-size: 0.92rem; overflow-wrap: anywhere; }
+  #tabs a:hover { background: var(--raised); }
+  #tabs a[aria-current="page"] { background: var(--raised); box-shadow: inset 3px 0 var(--accent); font-weight: 600; }
 
   /* The driven session. */
-  .agent { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .agent { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
   .agent.dock-remote { border-style: dashed; }
   .agent h2 { font-size: 0.95rem; font-weight: 600; margin: 0; padding: 0.6rem 1rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; border-bottom: 1px solid var(--line); }
   form.close { display: inline; }
   form.close button { background: transparent; border: 0; color: var(--dim); padding: 0.1rem 0.4rem; }
   form.close button:hover { color: var(--ink); }
-  .transcript { padding: 1rem 1.25rem; max-height: 65vh; overflow-y: auto; display: grid; gap: 1rem; }
+  .transcript { flex: 1; min-height: 0; padding: 1rem 1.25rem; overflow-y: auto; display: grid; align-content: start; gap: 1rem; }
   .msg { overflow-wrap: anywhere; max-width: 48rem; }
   .msg .role { color: var(--dim); font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; display: block; margin-bottom: 0.15rem; }
 
@@ -361,6 +371,15 @@ const STYLE: &str = r#"
      custom control, and keyboard-only operation is the fallback this whole
      surface exists to keep working. */
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Phones: one column, page scroll. The sidebar comes first so the agent
+     list and spawn form are reachable before the panel. */
+  @media (max-width: 800px) {
+    body { display: block; height: auto; }
+    .cockpit { display: block; }
+    .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+    #content { display: block; padding: 0.75rem; }
+    .transcript { max-height: 65vh; }
+  }
   /* Motion is opt-out, not opt-in: the transcript scrolls itself as tokens
      arrive, and a vestibular trigger is not a styling preference. */
   @media (prefers-reduced-motion: reduce) {
@@ -640,7 +659,7 @@ pub(crate) async fn index(
         Some((id, name, model, readonly, snap)) => {
             agent_panel(*id, name, model, *readonly, snap, &csrf)
         }
-        None => r#"<p class="empty">No agents yet. Spawn one above.</p>"#.to_string(),
+        None => r#"<p class="empty">No agent open. Attach a session or start a scratch agent from the sidebar.</p>"#.to_string(),
     };
     let sessions = crate::sessions_section(&csrf).await;
     let docked = crate::dock::docked_section(&csrf).await;
@@ -665,10 +684,12 @@ pub(crate) async fn index(
 <body>
 <header><h1>newt-web</h1>
 <button type="button" data-theme-toggle hidden aria-label="toggle light theme">◐</button></header>
-<main id="content">
-<div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML">{docked}{sessions}</div>
+<div class="cockpit">
+<aside class="sidebar" aria-label="agents and sessions">
+<h2 class="side-head">agents</h2>
+{strip}
 <details class="spawn-wrap">
-<summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
+<summary>+ new scratch agent <small>(not saved)</small></summary>
 <form class="spawn" method="post" action="/agents" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
 {csrf_field}<fieldset>
 <legend>new scratch agent</legend>
@@ -681,9 +702,12 @@ pub(crate) async fn index(
 </fieldset>
 </form>
 </details>
-{strip}
+<div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML">{docked}{sessions}</div>
+</aside>
+<main id="content">
 <div id="panel">{panel}</div>
 </main>
+</div>
 </body>
 </html>
 "##,

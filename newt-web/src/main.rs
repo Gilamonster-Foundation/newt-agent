@@ -800,7 +800,7 @@ pub(crate) async fn sessions_section(csrf: &str) -> String {
     );
     if list.is_empty() {
         out.push_str(
-            r#"<p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section>"#,
+            r#"<p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent above.</p></section>"#,
         );
         return out;
     }
