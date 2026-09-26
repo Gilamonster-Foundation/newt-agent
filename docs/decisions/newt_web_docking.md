@@ -186,3 +186,123 @@ responder dock-agent identity (today's is ephemeral). Tracked as a security-hard
 Regression: `dock_registry.rs::a_dock_grant_is_a_location_scoped_bearer_record_gated_by_root_key_possession`
 pins both halves — a copied grant resolves under a registry that holds the operator root key, and is
 **inert** under one that does not.
+
+## Amendment K8 — the docked host dials out (proposed 2026-09-26)
+
+**Status:** Proposed. Operator direction, 2026-09-26; not implemented. Where it lands, it supersedes
+K7's dial direction and nothing else: K1 (mirror + inject, single writer), K3 as-built
+(authorization at the docked host, per request), the `DockScope` typed authority and the K5 kill
+switch all stand unchanged.
+
+### The thing being decided
+
+The operator's workflow: on a laptop, `/dock newt.home.lab` makes that newt's sessions drivable
+from the hub cockpit on the home cluster, **without the laptop running a web server or accepting
+inbound connections**. The same shape serves always-on hosts: a k8s-hosted hub routes the operator
+to sessions on `gnuc`, `nuc1` and `nuc2`.
+
+### Why the as-built K7 cannot serve it
+
+Each fact below is what forces a decision here.
+
+- **The hub dials the docked host.** A mesh peer is configured on the hub as
+  `label=mesh:<agent_pubkey_hex>@<ip>:<port>` and direct-dialed (`newt-web/src/dock.rs`,
+  `parse_peers`). The docked host must therefore be reachable at a stable address and accepting.
+- **The docked side is a newt-web process.** It becomes dockable by setting `NEWT_WEB_MESH_BIND`,
+  which binds a `NewtDockService` on a UDP port inside newt-web (`newt-web/src/main.rs`,
+  `init_mesh_dock`). A laptop would run the web binary and a listening socket: the thing the
+  operator wants to avoid.
+- **agent-mesh dial-back does not reach an idle laptop.** A reply "dial-back" is a fresh QUIC dial
+  to the address a request arrived from (`agent-mesh-bus/src/bus.rs`, `dial_reply_peer` /
+  `reply_dial_candidates`). Behind NAT it succeeds only while the laptop's outbound mapping is
+  alive — seconds after the laptop last spoke, not hours later when the operator wants to take
+  over. `BusOptions` has only `announce`; a quiet bind still accepts inbound connections.
+- **Both dock keys are minted per process.** The hub's dock client and the docked host's responder
+  each call `mint_agent` at startup (`newt-web/src/main.rs`, `init_mesh_dock`). An approval that
+  names the hub's key is void after the hub restarts, and a hub cannot keep a durable list of the
+  hosts that dock into it.
+
+### Decisions
+
+**K8.1 — The docked host initiates; the hub never dials a docked host.** A docked host holds one
+long-lived outbound connection to each hub it is docked to, with keepalive and jittered
+reconnect-with-backoff. It accepts no inbound connection for docking.
+
+**K8.2 — Connection direction is decoupled from authority.** After the uplink opens, the hub is
+still the *requester* (list, transcript, inject) and the docked host is still the *authorizer*: it
+checks the verified caller — the hub — against its own signed dock registry on every request,
+exactly as K3 as-built. Inject still only enqueues (K1); the docked host's running session remains
+the sole writer. Opening an uplink grants the hub nothing the registry does not.
+
+**K8.3 — Carrier: `session_streams`, with a named interim.** The preferred carrier is a
+`session_streams` duplex session *initiated by the docked host*, over which the existing
+`DockRequest` protocol runs unchanged; the hub is the session responder and checks the host's
+caveats at open. That primitive is still design-only upstream (`agent-mesh`
+`docs/decisions/session_streams.md`, status "proposed"; no `open_session` at `c137d9e`). Until it
+lands, the interim is an **outbound long-poll over today's request/reply**: the host sends a
+`dock/uplink/poll` request, the hub holds it until it has a `DockRequest` to deliver, and the
+host's next request carries the result. Each reply follows a request by seconds, so dial-back
+reaches the host while its NAT mapping is still alive. The interim is replaced, not extended, when
+`session_streams` ships.
+
+**K8.4 — Persistent dock identities on both ends.** The hub and every docked host hold a
+persistent dock `AgentKey` under the operator `UserKey`, stored beside `identity.pem` in their
+state dir. This is a prerequisite for K8.5, and it also closes the "persistent responder dock-agent
+identity" hardening residual recorded above. A hub name such as `newt.home.lab` is an **address
+candidate only** (agent-mesh `floating_identity.md`): the hub's identity is the pubkey pinned at
+the ceremony, and a hub answering at that name with any other key is refused.
+
+**K8.5 — The ceremony is two-sided and terminal-promoted.**
+- *Host side.* The first `/dock <hub>` prints the hub's 6 pubkey words (`pubkey_words`) and the
+  requested scope, and the operator confirms at the host's terminal. That writes the signed
+  `DockRecord` approving the hub, `Mirror` by default and `MirrorInject` only on explicit request.
+- *Hub side.* An unknown host's first uplink is only a staged, expiring proposal showing its words
+  — the K4 stage-then-promote rule. It is promoted by `newt dock approve` on the hub's terminal
+  (for a k8s hub, `kubectl exec` into the pod that holds the root key). An unpromoted host's
+  sessions never appear in the cockpit.
+
+**K8.6 — Verbs: serve and dock are different acts.**
+- `/web` serves newt-web from this process: loopback by default, under the D3 auth tiers.
+- `/dock <hub>` opens (and, the first time, pairs) an uplink.
+- `/undock <hub>|all` revokes the grant and closes the uplink (K5).
+- `/dock disable` is the existing kill switch and now also closes every uplink.
+- `/dock status` adds each uplink's state (connected, retrying, revoked).
+
+A `/remote-control` alias is a presentation choice outside this decision.
+
+**K8.7 — The hub is a router for many hosts.** The hub cockpit lists the sessions of every
+promoted host, grouped by host and addressed as `session@host`, in the same sidebar
+(`docs/decisions/newt_web_htmx.md`, as restyled in #2605). The LAN direct-dial path of K7 remains
+until K8 is proven, then is reviewed for retirement: two dock directions are two protocols to keep
+secure.
+
+### Non-goals
+
+- NAT hole-punching, iroh relays, or hub-to-hub relaying: the host must be able to reach the hub
+  (LAN, VPN, or an exposed hub endpoint).
+- Cross-operator docking (K2, still deferred).
+- Seat status, forwarded permission prompts and chat adapters in the hub — later rungs that build
+  on K8, not part of it.
+
+### Consequences
+
+- **The hub concentrates authority.** It can inject into every host that granted `MirrorInject`.
+  The mitigations are the ones already specified: `Mirror` by default, per-request authorization
+  at each host, the host-side kill switch, and the hub behind the D3 ingress gate.
+- **The host needs no web binary to be dockable.** The uplink lives in the newt process (via
+  `newt-mesh`); newt-web runs only where the cockpit is served.
+- **One upstream dependency.** agent-mesh needs a bind mode that accepts no inbound connection,
+  so a docked host's "outbound only" is enforced by the transport rather than by the absence of
+  a peer that knows its address.
+
+### Ladder (one concern per PR)
+
+- [ ] **K8-a** — agent-mesh: accept-none bind mode (upstream issue).
+- [ ] **K8-b** — persistent dock `AgentKey` for hub and host (K8.4); regression that an approval
+  survives a hub restart.
+- [ ] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
+  serves list/transcript/inject while accepting no inbound connection.
+- [ ] **K8-d** — hub side: accept uplinks, stage and promote hosts (K8.5), list sessions by host
+  (K8.7).
+- [ ] **K8-e** — TUI verbs `/dock <hub>`, `/undock`, `/dock status` (K8.6).
+- [ ] **K8-f** — swap the carrier to `session_streams` when agent-mesh ships it.
