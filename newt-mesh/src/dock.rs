@@ -24,13 +24,92 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_mesh_bus::{Bus, PeerEndpoint, RequestContext, Topic};
-use agent_mesh_core::{AgentKey, Fingerprint, UserKey};
+use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
 use serde::{Deserialize, Serialize};
 
 /// Topic (under the operator's user namespace) for dock requests.
 pub const DOCK_TOPIC: &str = "newt/dock/v1";
 /// Capability tag a dockable agent advertises in mDNS so a hub can pre-filter.
 pub const DOCK_CAPABILITY_TAG: &str = "newt-session";
+
+/// Which end of a dock this process is. Each end has its own identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockRole {
+    /// The cockpit that lists, mirrors and injects: newt-web's [`DockClient`].
+    Hub,
+    /// The machine whose sessions are docked: the [`NewtDockService`] responder.
+    Host,
+}
+
+impl DockRole {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hub => "hub",
+            Self::Host => "host",
+        }
+    }
+
+    fn capabilities(self) -> Vec<String> {
+        match self {
+            Self::Hub => Vec::new(),
+            Self::Host => vec![DOCK_CAPABILITY_TAG.to_string()],
+        }
+    }
+}
+
+/// This installation's dock agent key for `role`: **derived, never stored**
+/// (`docs/decisions/newt_web_docking.md` K8.4).
+///
+/// A dock approval pins an agent's fingerprint, so that fingerprint must
+/// survive a restart. The key is recomputed from the operator's root key with
+/// `AgentKey::issue_derived`, which leaves agent-mesh's "agent private bytes are
+/// never persisted" contract intact. The label carries `instance` because every
+/// machine of one operator shares that root: without it, two hosts would derive
+/// the same key — and the same mesh endpoint id.
+#[must_use]
+pub fn dock_agent(user: &UserKey, role: DockRole, instance: &str) -> AgentKey {
+    let label = format!("newt/dock/v1/{}/{instance}", role.name());
+    AgentKey::issue_derived(
+        user,
+        &label,
+        AgentMetadata {
+            role: format!("newt-dock-{}", role.name()),
+            host: instance.to_string(),
+            capabilities: role.capabilities(),
+            issued_at: "2026-01-01T00:00:00Z".into(), // a claim; expiry is generation-based
+            expires_at: None,
+            caveats: Caveats::top(),
+        },
+    )
+}
+
+/// The file, in a state dir, naming this installation for [`dock_agent`].
+pub const DOCK_INSTANCE_FILE: &str = "dock-instance";
+
+/// This installation's dock instance name, from [`DOCK_INSTANCE_FILE`] in
+/// `state_dir`, created with a random name on first use.
+///
+/// The name is not a secret — it only keeps two installations' derived keys
+/// apart — so it may be stored. It is also the operator's to choose: write
+/// `nuc1` into the file to name the machine. Changing it changes this
+/// installation's dock identity, so existing approvals must be re-granted.
+///
+/// # Errors
+/// An unreadable file, or a state dir the name cannot be written to. An empty
+/// file is treated as absent.
+pub fn dock_instance(state_dir: &Path) -> std::io::Result<String> {
+    let path = state_dir.join(DOCK_INSTANCE_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(name) if !name.trim().is_empty() => return Ok(name.trim().to_string()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let name = newt_core::new_conversation_id();
+    std::fs::create_dir_all(state_dir)?;
+    std::fs::write(&path, format!("{name}\n"))?;
+    Ok(name)
+}
 
 const DOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -418,6 +497,70 @@ mod tests {
             &config, &identity, &fp, "hub", &hex, scope, "tx",
         )
         .unwrap();
+    }
+
+    /// K8-b: a dock approval survives a restart. The approval pins the hub's
+    /// fingerprint; a restarted hub re-derives the same key, so the responder
+    /// still authorizes it. Negative control: a per-process random key (what
+    /// `mint_agent` issued before K8-b) is refused under the same registry.
+    #[test]
+    fn a_dock_approval_survives_a_restart_of_the_derived_hub() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let hub = dock_agent(&user, DockRole::Hub, "home-hub");
+        approve_caller(&user, dir.path(), &hub.public_bytes(), DockScope::Mirror);
+        drop(hub); // the hub process exits
+
+        let restarted = dock_agent(&user, DockRole::Hub, "home-hub");
+        let fp = restarted.fingerprint().hex();
+        assert_eq!(
+            authorize_caller(dir.path(), &fp).ok(),
+            Some(Some(DockScope::Mirror)),
+            "the re-derived hub is still the approved hub"
+        );
+
+        let random = agent(&user, "hub", Vec::new());
+        assert!(
+            authorize_caller(dir.path(), &random.fingerprint().hex()).is_err(),
+            "a per-process key is a stranger to the registry"
+        );
+    }
+
+    /// Two installations of one operator derive distinct identities, and each
+    /// end of one installation is distinct from the other.
+    #[test]
+    fn dock_identities_are_distinct_per_instance_and_role() {
+        let user = UserKey::generate();
+        let fp = |role, instance| dock_agent(&user, role, instance).fingerprint();
+        assert_eq!(fp(DockRole::Host, "nuc1"), fp(DockRole::Host, "nuc1"));
+        assert_ne!(fp(DockRole::Host, "nuc1"), fp(DockRole::Host, "nuc2"));
+        assert_ne!(fp(DockRole::Hub, "nuc1"), fp(DockRole::Host, "nuc1"));
+        let host = dock_agent(&user, DockRole::Host, "nuc1");
+        assert_eq!(host.cert().metadata.capabilities, vec![DOCK_CAPABILITY_TAG]);
+        host.cert()
+            .verify()
+            .expect("a derived dock key is a normal user-rooted cert");
+    }
+
+    /// The instance name is created once, then read back; an operator-written
+    /// name wins; an empty file is treated as absent.
+    #[test]
+    fn dock_instance_is_created_once_and_operator_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dock_instance(dir.path()).unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(
+            dock_instance(dir.path()).unwrap(),
+            first,
+            "stable once created"
+        );
+
+        std::fs::write(dir.path().join(DOCK_INSTANCE_FILE), "nuc1\n").unwrap();
+        assert_eq!(dock_instance(dir.path()).unwrap(), "nuc1");
+
+        std::fs::write(dir.path().join(DOCK_INSTANCE_FILE), "  \n").unwrap();
+        let regenerated = dock_instance(dir.path()).unwrap();
+        assert!(!regenerated.trim().is_empty() && regenerated != "nuc1");
     }
 
     /// Pure dock-request handling against a seeded store — the DETERMINISTIC

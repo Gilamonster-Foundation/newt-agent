@@ -245,12 +245,19 @@ host's next request carries the result. Each reply follows a request by seconds,
 reaches the host while its NAT mapping is still alive. The interim is replaced, not extended, when
 `session_streams` ships.
 
-**K8.4 — Persistent dock identities on both ends.** The hub and every docked host hold a
-persistent dock `AgentKey` under the operator `UserKey`, stored beside `identity.pem` in their
-state dir. This is a prerequisite for K8.5, and it also closes the "persistent responder dock-agent
-identity" hardening residual recorded above. A hub name such as `newt.home.lab` is an **address
-candidate only** (agent-mesh `floating_identity.md`): the hub's identity is the pubkey pinned at
-the ceremony, and a hub answering at that name with any other key is refused.
+**K8.4 — Stable dock identities on both ends, derived rather than stored.** The hub and every
+docked host hold a dock `AgentKey` whose fingerprint survives a restart, so an approval that pins it
+stays valid. The key is **derived**, never persisted: agent-mesh states that an agent's private
+bytes must not be persisted (`AgentKey::signing_key_bytes`), so each process recomputes its key with
+`AgentKey::issue_derived(user, label, …)` from the operator `UserKey` it already loads. The label is
+`newt/dock/v1/<hub|host>/<instance>`. `instance` is required because every machine of one operator
+shares that root: without it, two hosts would derive the same key and the same mesh endpoint id. It
+comes from a `dock-instance` file in the state dir — random on first start, not a secret, and the
+operator's to rename (`nuc1`); renaming it changes the identity. This also closes the "persistent
+responder dock-agent identity" hardening residual recorded above. A hub name such as
+`newt.home.lab` is an **address candidate only** (agent-mesh `floating_identity.md`): the hub's
+identity is the pubkey pinned at the ceremony, and a hub answering at that name with any other key
+is refused.
 
 **K8.5 — The ceremony is two-sided and terminal-promoted.**
 - *Host side.* The first `/dock <hub>` prints the hub's 6 pubkey words (`pubkey_words`) and the
@@ -298,7 +305,8 @@ secure.
 ### Ladder (one concern per PR)
 
 - [ ] **K8-a** — agent-mesh: accept-none bind mode (Gilamonster-Foundation/agent-mesh#92).
-- [ ] **K8-b** — persistent dock `AgentKey` for hub and host (K8.4); regression that an approval
+- [ ] **K8-b** — derived dock `AgentKey` for hub and host (K8.4; needs agent-mesh
+  `AgentKey::issue_derived`, Gilamonster-Foundation/agent-mesh#93); regression that an approval
   survives a hub restart.
 - [ ] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
   serves list/transcript/inject while accepting no inbound connection.

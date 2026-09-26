@@ -868,25 +868,6 @@ async fn follow_session(
     Html(format!("{panel}\n{strip}")).into_response()
 }
 
-/// Mint a short-lived agent key for a mesh role under the operator's `UserKey`.
-fn mint_agent(
-    user: &agent_mesh_core::UserKey,
-    role: &str,
-    caps: Vec<String>,
-) -> agent_mesh_core::AgentKey {
-    agent_mesh_core::AgentKey::issue(
-        user,
-        agent_mesh_core::AgentMetadata {
-            role: role.into(),
-            host: "newt-web".into(),
-            capabilities: caps,
-            issued_at: "2026-01-01T00:00:00Z".into(), // a claim; expiry is generation-based
-            expires_at: None,
-            caveats: agent_mesh_core::Caveats::top(),
-        },
-    )
-}
-
 /// Bring up the agent-mesh dock (Phase 2). Loads the operator `UserKey` from the
 /// state dir (the SAME identity the TUI signs under, so a same-operator peer
 /// auto-teams); binds a dial `DockClient` so `/dock` can reach mesh peers; and,
@@ -911,12 +892,27 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
     // mesh dial. The gate is fail-closed by default; NEWT_INSECURE_DOCK_NO_APPROVAL
     // is the only (named, unsafe) way off.
     dock::set_dock_identity(state.join("config.toml"), id_path.clone());
-    match newt_mesh::DockClient::bind(&user, mint_agent(&user, "newt-web-dock-client", vec![]), 0)
-        .await
-    {
+    // K8.4: both dock keys are DERIVED from the operator root and this
+    // installation's name, so an approval that pins either survives a restart.
+    let instance = match newt_mesh::dock_instance(&state) {
+        Ok(name) => name,
+        Err(why) => {
+            eprintln!("newt-web: mesh dock DISABLED — no dock instance name ({why})");
+            return None;
+        }
+    };
+    let hub = newt_mesh::dock_agent(&user, newt_mesh::DockRole::Hub, &instance);
+    let hub_pubkey = hub.public_bytes();
+    match newt_mesh::DockClient::bind(&user, hub, 0).await {
         Ok(client) => {
             dock::set_dock_client(std::sync::Arc::new(client));
-            eprintln!("newt-web: mesh dock dial client bound");
+            // Stable across restarts now (K8.4), so a host can approve it once:
+            // `newt dock approve` there takes this pubkey and shows these words.
+            eprintln!(
+                "newt-web: mesh dock dial client bound (instance {instance}, hub pubkey {}, words: {})",
+                hex_lower(&hub_pubkey),
+                newt_core::dock_registry::pubkey_words(&hub_pubkey).join(" ")
+            );
         }
         Err(why) => eprintln!("newt-web: mesh dock client bind failed: {why}"),
     }
@@ -924,11 +920,7 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
         return None; // not opted in to being dockable over the mesh
     };
     let port: u16 = port_str.trim().parse().unwrap_or(0);
-    let agent = mint_agent(
-        &user,
-        "newt-web-dock",
-        vec![newt_mesh::DOCK_CAPABILITY_TAG.to_string()],
-    );
+    let agent = newt_mesh::dock_agent(&user, newt_mesh::DockRole::Host, &instance);
     match newt_mesh::NewtDockService::bind(&user, agent, state.clone(), port).await {
         Ok(svc) => {
             eprintln!(
