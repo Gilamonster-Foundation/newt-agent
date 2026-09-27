@@ -29,7 +29,14 @@
 //! - [`DockUplink::close`] stops polling and closes the bus, but lets a request
 //!   already being served finish; its answer is discarded.
 //!
-//! Nothing is persisted on either side. Replaced, not extended, when
+//! **Admission (K8.5).** A hub serves only a host it has promoted — approved
+//! in its own signed dock registry. Each poll carries the host's key and
+//! instance name; the key must be the poll's verified signer. An unpromoted
+//! host is staged for `newt dock approve --staged` on the hub's terminal and is
+//! told so ([`UplinkState::Staged`]); it gets no request.
+//!
+//! Jobs and answers are never persisted; only a staged host's key and name
+//! are, on the hub, until approved or expired. Replaced, not extended, when
 //! agent-mesh ships `session_streams` (K8-f).
 
 use std::collections::{HashMap, VecDeque};
@@ -38,19 +45,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_mesh_bus::{Bus, CorrelationId, PeerEndpoint, RequestContext, Topic};
-use agent_mesh_core::{AgentKey, Fingerprint, UserKey};
+use agent_mesh_core::{Fingerprint, UserKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::dock::{serve_dock, DockReply, DockRequest};
+use crate::dock::{dock_agent, serve_dock, DockReply, DockRequest, DockRole};
 
 /// Topic (under the operator's user namespace) a docked host polls its hub on.
 pub const DOCK_UPLINK_TOPIC: &str = "newt/dock/uplink/v1";
 
 /// How long the hub holds a poll that has no request for its host.
 const HOLD: Duration = Duration::from_secs(20);
+/// How long the hub holds a poll from a host it has only staged: short, so an
+/// approval takes effect promptly, but long enough that the host does not spin.
+const STAGED_HOLD: Duration = Duration::from_secs(5);
 /// How long a host waits for its poll's reply: the hold plus headroom.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a hub request waits for the host's answer.
@@ -59,16 +69,29 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// One poll from a host: the answer to the previous job, if any.
+/// Who is polling: the host's dock key, which the hub checks against the
+/// poll's verified signer, and its instance name, which is display only. A hub
+/// stages a host it has not approved under these (K8.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Hello {
+    pub(crate) pubkey: [u8; 32],
+    pub(crate) instance: String,
+}
+
+/// One poll from a host: who it is, and the answer to the previous job, if any.
 #[derive(Debug, Serialize, Deserialize)]
 struct Poll {
+    host: Hello,
     answer: Option<(JobId, DockReply)>,
 }
 
-/// The hub's reply to a poll: the next job for this host, if any.
-#[derive(Debug, Serialize, Deserialize)]
+/// The hub's reply to a poll: the next job for this host, if any, or that the
+/// hub has only staged this host and will send it none until it is approved.
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Work {
     job: Option<(JobId, DockRequest)>,
+    #[serde(default)]
+    staged: bool,
 }
 
 // ── Host side ────────────────────────────────────────────────────────────────
@@ -82,6 +105,9 @@ pub enum UplinkState {
     Serving,
     /// The last poll failed; waiting to retry.
     Backoff,
+    /// The hub has not approved this host yet: it has staged it for
+    /// `newt dock approve --staged` on the hub's terminal. Polling continues.
+    Staged,
     /// Stopped: no further polls, and the bus is closed.
     Closed,
 }
@@ -104,25 +130,32 @@ pub struct DockUplink {
 }
 
 impl DockUplink {
-    /// Open an uplink from this host (`agent`, serving the store at
+    /// Open an uplink from this host (dock `instance`, serving the store at
     /// `state_dir`) to `hub`, and keep it open, reconnecting with jittered
-    /// backoff after a failure. The hub is identified by `hub`'s pubkey — the
-    /// one approved at the ceremony — never by its address.
+    /// backoff after a failure. The host's dock key is derived here from
+    /// `instance`, so the name it reports always matches the key it signs
+    /// with. The hub is identified by `hub`'s pubkey — the one approved at the
+    /// ceremony — never by its address.
     ///
     /// # Errors
     /// The outbound-only bus failed to bind.
     pub async fn start(
         user: &UserKey,
-        agent: AgentKey,
+        instance: &str,
         state_dir: PathBuf,
         hub: PeerEndpoint,
     ) -> anyhow::Result<Self> {
         let topic = Topic::new(user.fingerprint(), DOCK_UPLINK_TOPIC);
+        let agent = dock_agent(user, DockRole::Host, instance);
+        let hello = Hello {
+            pubkey: agent.public_bytes(),
+            instance: instance.to_owned(),
+        };
         let bus = Bus::bind_outbound_only(user, agent).await?;
         let local_port = bus.local_port();
         let (stop, stopped) = oneshot::channel();
         let (state_tx, state) = watch::channel(UplinkState::Polling);
-        let runner = tokio::spawn(run(bus, topic, state_dir, hub, stopped, state_tx));
+        let runner = tokio::spawn(run(bus, topic, hello, state_dir, hub, stopped, state_tx));
         Ok(Self {
             stop: Some(stop),
             runner: Some(runner),
@@ -145,7 +178,7 @@ impl DockUplink {
 
     /// Wait until the uplink reaches `want`.
     #[cfg(test)]
-    async fn reached(&mut self, want: UplinkState) {
+    pub(crate) async fn reached(&mut self, want: UplinkState) {
         let _ = self.state.wait_for(|s| *s == want).await;
     }
 
@@ -169,6 +202,7 @@ impl Drop for DockUplink {
 async fn run(
     bus: Bus,
     topic: Topic,
+    hello: Hello,
     state_dir: PathBuf,
     hub: PeerEndpoint,
     mut stopped: oneshot::Receiver<()>,
@@ -178,9 +212,15 @@ async fn run(
     let hub_fp = hub.fingerprint().hex();
     let mut answer: Option<(JobId, DockReply)> = None;
     let mut backoff = BACKOFF_MIN;
+    let mut staged = false;
     loop {
-        state.send_replace(UplinkState::Polling);
+        state.send_replace(if staged {
+            UplinkState::Staged
+        } else {
+            UplinkState::Polling
+        });
         let poll = Poll {
+            host: hello.clone(),
             answer: answer.clone(),
         };
         let body = serde_json::to_vec(&poll).unwrap_or_default();
@@ -193,9 +233,12 @@ async fn run(
             Ok(reply) => {
                 answer = None;
                 backoff = BACKOFF_MIN;
-                match serde_json::from_slice::<Work>(&reply) {
+                let work = serde_json::from_slice::<Work>(&reply);
+                staged = matches!(work, Ok(Work { staged: true, .. }));
+                match work {
                     Ok(Work {
                         job: Some((id, request)),
+                        ..
                     }) => {
                         // Not raced against `stopped`: a started operation
                         // runs to completion.
@@ -204,7 +247,7 @@ async fn run(
                             serve_dock(state_dir.clone(), hub_fp.clone(), Ok(request)).await;
                         answer = Some((id, reply));
                     }
-                    Ok(Work { job: None }) => {}
+                    Ok(Work { job: None, .. }) => {}
                     Err(e) => tracing::warn!(error = %e, "dock uplink: unreadable work from hub"),
                 }
             }
@@ -259,6 +302,9 @@ struct Job {
 struct HostWork {
     queued: VecDeque<Job>,
     dispatched: HashMap<JobId, oneshot::Sender<DockReply>>,
+    /// Set when the host is staged: nothing is queued or dispatched on this
+    /// link again, whoever still holds it.
+    closed: bool,
 }
 
 impl HostWork {
@@ -272,6 +318,9 @@ impl HostWork {
     /// Take the next live job and mark it dispatched — the point after which
     /// its outcome belongs to the host.
     fn dispatch(&mut self, now: Instant) -> Option<(JobId, DockRequest)> {
+        if self.closed {
+            return None;
+        }
         self.prune(now);
         let job = self.queued.pop_front()?;
         self.dispatched.insert(job.id, job.answer);
@@ -321,21 +370,54 @@ impl Drop for Withdraw {
 /// here rolls it back or retries it.
 #[derive(Default)]
 pub(crate) struct UplinkHub {
-    hosts: Mutex<HashMap<Fingerprint, Arc<HostLink>>>,
+    hosts: Mutex<Hosts>,
     polled: Notify,
 }
 
+/// Each host's link, and its admission epoch: how many times it has been
+/// staged. One lock, so admitting and staging a host are linearized.
+#[derive(Default)]
+struct Hosts {
+    links: HashMap<Fingerprint, Arc<HostLink>>,
+    epochs: HashMap<Fingerprint, u64>,
+}
+
+/// A host's admission epoch, taken before its registry is read. If the host
+/// is staged after that, the admission is stale and opens no link.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Admission {
+    host: Fingerprint,
+    epoch: u64,
+}
+
 impl UplinkHub {
-    fn link(&self, host: Fingerprint) -> Arc<HostLink> {
+    /// Take `host`'s admission epoch. Call it before deciding whether the host
+    /// is promoted, and pass it to [`Self::poll`].
+    pub(crate) fn admission(&self, host: Fingerprint) -> Admission {
+        let epoch = self.hosts.lock().unwrap().epochs.get(&host).copied();
+        Admission {
+            host,
+            epoch: epoch.unwrap_or(0),
+        }
+    }
+
+    /// The host's link, opened if need be — unless it was staged since
+    /// `admission` was taken.
+    fn link(&self, admission: Admission) -> Option<Arc<HostLink>> {
         let mut hosts = self.hosts.lock().unwrap();
-        hosts
-            .entry(host)
-            .or_insert_with(|| Arc::new(HostLink::new()))
-            .clone()
+        let epoch = hosts.epochs.get(&admission.host).copied().unwrap_or(0);
+        if epoch != admission.epoch {
+            return None;
+        }
+        let link = hosts
+            .links
+            .entry(admission.host)
+            .or_insert_with(|| Arc::new(HostLink::new()));
+        Some(link.clone())
     }
 
     fn live_link(&self, host: Fingerprint) -> Option<Arc<HostLink>> {
-        let link = self.hosts.lock().unwrap().get(&host).cloned()?;
+        let link = self.hosts.lock().unwrap().links.get(&host).cloned()?;
         let fresh = link.last_poll.lock().unwrap().elapsed() < POLL_TIMEOUT;
         fresh.then_some(link)
     }
@@ -355,8 +437,10 @@ impl UplinkHub {
     /// Answer one poll from `host`: deliver the answer it carries, then hold
     /// until there is a live job for it or [`HOLD`] lapses. An answer is
     /// matched only within this host's own dispatched work.
-    async fn poll(&self, host: Fingerprint, poll: Poll) -> Work {
-        let link = self.link(host);
+    async fn poll(&self, host: Fingerprint, poll: Poll, admission: Admission) -> Work {
+        let Some(link) = self.link(admission) else {
+            return self.stage(host).await;
+        };
         *link.last_poll.lock().unwrap() = Instant::now();
         self.polled.notify_waiters();
         if let Some((id, reply)) = poll.answer {
@@ -368,13 +452,51 @@ impl UplinkHub {
         let hold = Instant::now() + HOLD;
         loop {
             let queued = link.queued.notified();
-            let job = link.work.lock().unwrap().dispatch(Instant::now());
+            let (job, closed) = {
+                let mut work = link.work.lock().unwrap();
+                (work.dispatch(Instant::now()), work.closed)
+            };
+            if closed {
+                return Work {
+                    job: None,
+                    staged: true,
+                };
+            }
             if job.is_some() {
-                return Work { job };
+                return Work { job, staged: false };
             }
             if tokio::time::timeout_at(hold, queued).await.is_err() {
-                return Work { job: None };
+                return Work::default();
             }
+        }
+    }
+
+    /// Answer a poll from a host this hub has not approved: hold the poll so
+    /// the host does not spin, and tell it it is only staged. It gets no job.
+    ///
+    /// A revoked host loses its uplink here, for every holder: the host's
+    /// admission epoch moves on, so an admission taken before now cannot open
+    /// a new link, and its current link is closed, dropping its queued and
+    /// dispatched work (their requesters fail at once) and waking any poll
+    /// holding it.
+    async fn stage(&self, host: Fingerprint) -> Work {
+        let link = {
+            let mut hosts = self.hosts.lock().unwrap();
+            *hosts.epochs.entry(host).or_default() += 1;
+            hosts.links.remove(&host)
+        };
+        if let Some(link) = link {
+            let mut work = link.work.lock().unwrap();
+            work.closed = true;
+            work.queued.clear();
+            work.dispatched.clear();
+            drop(work);
+            link.queued.notify_waiters();
+        }
+        tokio::time::sleep(STAGED_HOLD).await;
+        Work {
+            job: None,
+            staged: true,
         }
     }
 
@@ -394,6 +516,9 @@ impl UplinkHub {
         let (answer, answered) = oneshot::channel();
         {
             let mut work = link.work.lock().unwrap();
+            if work.closed {
+                anyhow::bail!("host {} has no open uplink", host.short());
+            }
             work.prune(now);
             if work.queued.len() + work.dispatched.len() >= MAX_OUTSTANDING {
                 anyhow::bail!(
@@ -425,14 +550,39 @@ impl UplinkHub {
 }
 
 /// Serve uplink polls on `bus` into `hub`. The poller is the verified envelope
-/// signer, so a host can only take jobs addressed to its own fingerprint.
-pub(crate) fn serve(bus: &Bus, user_fp: Fingerprint, hub: Arc<UplinkHub>) {
+/// signer, so a host can only take jobs addressed to its own fingerprint, and a
+/// poll naming any other key gets no work and stages nothing. `promoted`
+/// decides, per poll, whether the host is served or only staged (K8.5); it may
+/// touch the disk, so it runs on a blocking thread.
+pub(crate) fn serve(
+    bus: &Bus,
+    user_fp: Fingerprint,
+    hub: Arc<UplinkHub>,
+    promoted: impl Fn(&Hello) -> bool + Send + Sync + 'static,
+) {
     let topic = Topic::new(user_fp, DOCK_UPLINK_TOPIC);
+    let promoted = Arc::new(promoted);
     bus.handle_requests_with_context(topic, move |ctx: RequestContext, body| {
         let hub = hub.clone();
+        let promoted = promoted.clone();
         async move {
             let poll: Poll = serde_json::from_slice(&body)?;
-            let work = hub.poll(ctx.caller_agent_fp, poll).await;
+            let host = ctx.caller_agent_fp;
+            if Fingerprint::of_bytes(&poll.host.pubkey) != host {
+                tracing::warn!(host = %host.short(), "dock uplink: poll names another key; ignored");
+                return Ok(serde_json::to_vec(&Work::default())?);
+            }
+            // Taken before the registry is read, so a revocation that stages
+            // this host meanwhile makes this admission stale.
+            let admission = hub.admission(host);
+            let hello = poll.host.clone();
+            // Fail closed: a check that could not run promotes nobody.
+            let admitted = tokio::task::spawn_blocking(move || promoted(&hello)).await;
+            let work = if admitted.unwrap_or(false) {
+                hub.poll(host, poll, admission).await
+            } else {
+                hub.stage(host).await
+            };
             Ok(serde_json::to_vec(&work)?)
         }
     });
@@ -446,6 +596,32 @@ mod tests {
         Fingerprint([byte; 32])
     }
 
+    impl UplinkHub {
+        /// Poll with an admission taken now: a promoted host.
+        async fn poll_now(&self, host: Fingerprint, poll: Poll) -> Work {
+            self.poll(host, poll, self.admission(host)).await
+        }
+
+        /// Open `host`'s link as a promoted poll would.
+        fn open(&self, host: Fingerprint) -> Arc<HostLink> {
+            self.link(self.admission(host)).unwrap()
+        }
+    }
+
+    impl Poll {
+        /// A poll carrying `answer`. `UplinkHub::poll` does not read the
+        /// hello; `serve` checks it before calling it.
+        fn answering(answer: Option<(JobId, DockReply)>) -> Self {
+            Self {
+                host: Hello {
+                    pubkey: [0; 32],
+                    instance: "test".into(),
+                },
+                answer,
+            }
+        }
+    }
+
     fn inject() -> DockRequest {
         DockRequest::Inject {
             conv: "c".into(),
@@ -457,12 +633,12 @@ mod tests {
         /// Record a poll from `host` without holding one open, as a host that
         /// keeps polling would between the steps of a test.
         fn polled_now(&self, host: Fingerprint) {
-            *self.link(host).last_poll.lock().unwrap() = Instant::now();
+            *self.open(host).last_poll.lock().unwrap() = Instant::now();
         }
 
         /// Registrations still held for `host` (queued or dispatched).
         fn outstanding(&self, host: Fingerprint) -> usize {
-            let link = self.link(host);
+            let link = self.open(host);
             let work = link.work.lock().unwrap();
             work.queued.len() + work.dispatched.len()
         }
@@ -498,7 +674,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_that_stopped_polling_takes_no_requests() {
         let hub = UplinkHub::default();
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         tokio::time::advance(POLL_TIMEOUT + Duration::from_secs(1)).await;
         let err = hub
             .request(fp(1), DockRequest::ListSessions)
@@ -512,11 +688,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_job_rides_a_held_poll_and_its_answer_rides_the_next() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((id, DockRequest::ListSessions)),
-        } = hub.poll(fp(1), Poll { answer: None }).await
+            ..
+        } = hub.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("the poll carries the job");
         };
@@ -524,7 +701,7 @@ mod tests {
             let hub = hub.clone();
             async move {
                 let answer = Some((id, DockReply::Sessions(Vec::new())));
-                hub.poll(fp(1), Poll { answer }).await
+                hub.poll_now(fp(1), Poll::answering(answer)).await
             }
         });
         assert!(matches!(asking.await.unwrap(), Ok(DockReply::Sessions(s)) if s.is_empty()));
@@ -537,9 +714,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_never_receives_another_hosts_job() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), DockRequest::ListSessions).await;
-        assert!(hub.poll(fp(2), Poll { answer: None }).await.job.is_none());
+        assert!(hub
+            .poll_now(fp(2), Poll::answering(None))
+            .await
+            .job
+            .is_none());
         assert!(asking.await.unwrap().is_err(), "host 1 never polled for it");
     }
 
@@ -548,10 +729,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_expired_inject_is_never_dispatched() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), inject()).await;
         assert!(asking.await.unwrap().is_err(), "times out before any poll");
-        let work = hub.poll(fp(1), Poll { answer: None }).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(work.job.is_none(), "expired work delivered: {:?}", work.job);
     }
 
@@ -561,7 +742,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn work_past_its_deadline_is_not_dispatched_before_its_requester_wakes() {
         let hub = UplinkHub::default();
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = hub.request(fp(1), inject());
         tokio::pin!(asking);
         // Poll the request once: it queues its job and waits.
@@ -572,7 +753,7 @@ mod tests {
         hub.polled_now(fp(1));
         // `asking` is still alive and has not observed its deadline.
         assert_eq!(hub.outstanding(fp(1)), 1);
-        let work = hub.poll(fp(1), Poll { answer: None }).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(work.job.is_none(), "expired work delivered: {:?}", work.job);
     }
 
@@ -581,13 +762,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_aborted_request_is_withdrawn_before_dispatch() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), inject()).await;
         assert_eq!(hub.outstanding(fp(1)), 1);
         asking.abort();
         assert!(asking.await.unwrap_err().is_cancelled());
         assert_eq!(hub.outstanding(fp(1)), 0, "registration removed");
-        let work = hub.poll(fp(1), Poll { answer: None }).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(
             work.job.is_none(),
             "withdrawn work delivered: {:?}",
@@ -599,12 +780,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_live_request_is_dispatched_past_expired_work() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let stale = ask(&hub, fp(1), inject()).await;
         assert!(stale.await.unwrap().is_err());
         hub.polled_now(fp(1));
         let _live = ask(&hub, fp(1), DockRequest::ListSessions).await;
-        let work = hub.poll(fp(1), Poll { answer: None }).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(
             matches!(work.job, Some((_, DockRequest::ListSessions))),
             "poll carried {:?} instead of the live request",
@@ -617,11 +798,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_late_answer_completes_no_other_request() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let first = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((late, _)),
-        } = hub.poll(fp(1), Poll { answer: None }).await
+            ..
+        } = hub.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("the first request is dispatched");
         };
@@ -632,7 +814,7 @@ mod tests {
             let hub = hub.clone();
             async move {
                 let answer = Some((late, DockReply::Injected));
-                hub.poll(fp(1), Poll { answer }).await
+                hub.poll_now(fp(1), Poll::answering(answer)).await
             }
         });
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
@@ -645,27 +827,32 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_answer_from_before_a_hub_restart_resolves_nothing() {
         let old = Arc::new(UplinkHub::default());
-        drop(old.link(fp(1)));
+        drop(old.open(fp(1)));
         let _pending = ask(&old, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((old_id, _)),
-        } = old.poll(fp(1), Poll { answer: None }).await
+            ..
+        } = old.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("the old hub dispatches");
         };
         drop(old); // the hub restarts
 
         let new = Arc::new(UplinkHub::default());
-        drop(new.link(fp(1)));
+        drop(new.open(fp(1)));
         let early = Some((old_id, DockReply::Injected));
-        assert!(new.poll(fp(1), Poll { answer: early }).await.job.is_none());
+        assert!(new
+            .poll_now(fp(1), Poll::answering(early))
+            .await
+            .job
+            .is_none());
         let mut asking = ask(&new, fp(1), DockRequest::ListSessions).await;
-        let _lost = new.poll(fp(1), Poll { answer: None }).await; // response lost
+        let _lost = new.poll_now(fp(1), Poll::answering(None)).await; // response lost
         let _retry = tokio::spawn({
             let new = new.clone();
             async move {
                 let retained = Some((old_id, DockReply::Sessions(Vec::new())));
-                new.poll(fp(1), Poll { answer: retained }).await
+                new.poll_now(fp(1), Poll::answering(retained)).await
             }
         });
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut asking).await;
@@ -680,16 +867,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn duplicate_and_wrong_host_answers_are_ignored() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
-        drop(hub.link(fp(2)));
+        drop(hub.open(fp(1)));
+        drop(hub.open(fp(2)));
         let mut asking = ask(&hub, fp(1), DockRequest::ListSessions).await;
-        let Work { job: Some((id, _)) } = hub.poll(fp(1), Poll { answer: None }).await else {
+        let Work {
+            job: Some((id, _)), ..
+        } = hub.poll_now(fp(1), Poll::answering(None)).await
+        else {
             panic!("dispatched to host 1");
         };
         let wrong = Some((id, DockReply::Injected));
         let _other = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.poll(fp(2), Poll { answer: wrong }).await }
+            async move { hub.poll_now(fp(2), Poll::answering(wrong)).await }
         });
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut asking).await;
         assert!(settled.is_err(), "host 2 answered host 1's job");
@@ -697,14 +887,14 @@ mod tests {
         let right = Some((id, DockReply::Sessions(Vec::new())));
         let _answer = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.poll(fp(1), Poll { answer: right }).await }
+            async move { hub.poll_now(fp(1), Poll::answering(right)).await }
         });
         assert!(matches!(asking.await.unwrap(), Ok(DockReply::Sessions(_))));
         let again = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let dup = Some((id, DockReply::Injected));
         let _dup = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.poll(fp(1), Poll { answer: dup }).await }
+            async move { hub.poll_now(fp(1), Poll::answering(dup)).await }
         });
         let mut again = again;
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut again).await;
@@ -719,7 +909,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn outstanding_work_per_host_is_bounded() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let mut asks = Vec::new();
         for _ in 0..MAX_OUTSTANDING {
             asks.push(ask(&hub, fp(1), DockRequest::ListSessions).await);
@@ -738,6 +928,107 @@ mod tests {
         assert_eq!(hub.outstanding(fp(1)), 0);
         let _fits = ask(&hub, fp(1), DockRequest::ListSessions).await;
         assert_eq!(hub.outstanding(fp(1)), 1, "room again once withdrawn");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_staged_poll_drops_the_hosts_link_and_carries_no_job() {
+        let hub = UplinkHub::default();
+        hub.poll_now(fp(1), Poll::answering(None)).await;
+        assert!(
+            hub.live_link(fp(1)).is_some(),
+            "a promoted poll opens a link"
+        );
+
+        let work = hub.stage(fp(1)).await;
+        assert!(work.staged && work.job.is_none());
+        assert!(hub.live_link(fp(1)).is_none(), "staging drops the link");
+        let unreached = hub.request(fp(1), DockRequest::ListSessions).await;
+        assert!(unreached.is_err(), "the hub cannot reach a staged host");
+    }
+
+    /// Poll A reads the registry while the host is approved, then the host is
+    /// revoked and poll B stages it, then A resumes: A's admission is stale,
+    /// so it opens no link and nothing can be delivered to the host.
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_taken_before_a_revocation_opens_no_link() {
+        let hub = Arc::new(UplinkHub::default());
+        hub.poll_now(fp(1), Poll::answering(None)).await;
+        let a = hub.admission(fp(1));
+        hub.stage(fp(1)).await;
+
+        let work = hub.poll(fp(1), Poll::answering(None), a).await;
+        assert!(work.staged && work.job.is_none(), "{work:?}");
+        assert!(
+            hub.live_link(fp(1)).is_none(),
+            "the stale admission opened a link"
+        );
+        let unreached = hub.request(fp(1), DockRequest::ListSessions).await;
+        assert!(
+            unreached.is_err(),
+            "nothing is delivered to the revoked host"
+        );
+
+        let fresh = hub.poll_now(fp(1), Poll::answering(None)).await;
+        assert!(
+            !fresh.staged,
+            "an admission taken after staging still admits"
+        );
+    }
+
+    /// Staging closes a link for everyone still holding it: a queued request
+    /// fails at once instead of waiting out its deadline, a poll holding the
+    /// link returns staged with no job, and the retained link dispatches
+    /// nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn staging_closes_a_link_its_holders_still_retain() {
+        let hub = Arc::new(UplinkHub::default());
+        let retained = hub.open(fp(1));
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.poll_now(fp(1), Poll::answering(None)).await }
+        });
+        tokio::task::yield_now().await;
+        let queued = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                // Enqueue without waking the held poll, so the job stays queued.
+                let link = hub.live_link(fp(1)).unwrap();
+                let (answer, answered) = oneshot::channel();
+                link.work.lock().unwrap().queued.push_back(Job {
+                    id: [7; 16],
+                    request: DockRequest::ListSessions,
+                    deadline: Instant::now() + ANSWER_TIMEOUT,
+                    answer,
+                });
+                answered.await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let staging = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.stage(fp(1)).await }
+        });
+        let soon = Duration::from_millis(1);
+        let queued = tokio::time::timeout(soon, queued)
+            .await
+            .expect("fails at once");
+        assert!(
+            queued.unwrap().is_err(),
+            "the queued request's answer is dropped"
+        );
+        let held = tokio::time::timeout(soon, held)
+            .await
+            .expect("returns at once");
+        let held = held.unwrap();
+        assert!(held.staged && held.job.is_none(), "{held:?}");
+        assert!(retained
+            .work
+            .lock()
+            .unwrap()
+            .dispatch(Instant::now())
+            .is_none());
+        staging.await.unwrap();
     }
 
     // ── Shutdown, over real loopback QUIC (the dock-security lanes run these) ──
@@ -768,7 +1059,7 @@ mod tests {
         let agent = dock_agent(user, DockRole::Hub, "hub");
         let pubkey = agent.public_bytes();
         let hub = DockClient::bind(user, agent, 0).await.unwrap();
-        hub.serve_uplinks();
+        hub.serve_all_uplinks();
         let addr = (Ipv4Addr::LOCALHOST, hub.local_port()).into();
         (hub, PeerEndpoint::new(pubkey, addr))
     }
@@ -779,10 +1070,9 @@ mod tests {
         instance: &str,
         hub: PeerEndpoint,
     ) -> (DockUplink, Fingerprint) {
-        let host = dock_agent(user, DockRole::Host, instance);
-        let host_fp = host.fingerprint();
+        let host_fp = dock_agent(user, DockRole::Host, instance).fingerprint();
         let dir = std::env::temp_dir();
-        let uplink = DockUplink::start(user, host, dir, hub).await.unwrap();
+        let uplink = DockUplink::start(user, instance, dir, hub).await.unwrap();
         (uplink, host_fp)
     }
 

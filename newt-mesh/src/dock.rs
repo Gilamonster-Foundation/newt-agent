@@ -206,17 +206,46 @@ fn authorize_caller(state_dir: &Path, caller_agent_fp: &str) -> Result<Authz, Do
     if dock_approval_disabled() {
         return Ok(None);
     }
-    let config = state_dir.join("config.toml");
-    let identity = state_dir.join("identity.pem");
-    let (registry, _warnings) =
-        newt_core::dock_registry::load_docks_with_identity(&config, &identity);
-    match registry.approved(caller_agent_fp) {
-        Some(record) => Ok(Some(record.scope)),
+    match approved_scope(state_dir, caller_agent_fp) {
+        Some(scope) => Ok(Some(scope)),
         None => Err(DockReply::Error(format!(
             "caller {}… is not an approved dock on this peer (run `newt dock approve` here)",
             &caller_agent_fp[..12.min(caller_agent_fp.len())]
         ))),
     }
+}
+
+/// The scope `agent_fp` is approved at in `state_dir`'s signed dock registry,
+/// re-read and re-verified from disk. `None` when it is not approved.
+fn approved_scope(state_dir: &Path, agent_fp: &str) -> Option<newt_core::dock_registry::DockScope> {
+    let config = state_dir.join("config.toml");
+    let identity = state_dir.join("identity.pem");
+    let (registry, _warnings) =
+        newt_core::dock_registry::load_docks_with_identity(&config, &identity);
+    registry.approved(agent_fp).map(|record| record.scope)
+}
+
+/// Whether the host that sent `host` is promoted on this hub: approved in the
+/// hub's own signed registry. A host that is not is staged instead, for the
+/// operator to promote with `newt dock approve --staged` (K8.5).
+///
+/// Only the registry decides. The responder's insecure opt-out
+/// (`NEWT_INSECURE_DOCK_NO_APPROVAL`) is not consulted here: it may loosen who
+/// a host answers, never which hosts a hub serves.
+fn host_promoted(state_dir: &Path, host: &crate::uplink::Hello) -> bool {
+    let host_fp = Fingerprint::of_bytes(&host.pubkey).hex();
+    if approved_scope(state_dir, &host_fp).is_some() {
+        return true;
+    }
+    if let Err(e) = newt_core::dock_registry::stage_host(
+        &state_dir.join("config.toml"),
+        &host.pubkey,
+        &host.instance,
+        std::time::SystemTime::now(),
+    ) {
+        tracing::warn!(error = %e, host = %host_fp, "dock uplink: could not stage host");
+    }
+    false
 }
 
 /// Synchronous (SQLite); the async handler runs it on a blocking thread.
@@ -440,11 +469,30 @@ impl DockClient {
 
     /// Accept uplinks from docked hosts (K8): hold each host's poll and hand
     /// it the requests addressed to [`DockPeer::Uplink`]. Opt-in, so a hub
-    /// only serves uplinks when it means to. Which hosts may uplink is not
-    /// decided here (staging and promotion are K8.5); a host still authorizes
-    /// every request against its own registry.
-    pub fn serve_uplinks(&self) {
-        crate::uplink::serve(&self.bus, self.user_fp, self.uplinks.clone());
+    /// only serves uplinks when it means to.
+    ///
+    /// Only a **promoted** host is served: one approved in this hub's own
+    /// signed dock registry in `state_dir` (K8.5). Any other host is staged
+    /// there for `newt dock approve --staged` on the hub's terminal and gets
+    /// no request; the registry is re-read on every poll, so a revoked host
+    /// loses its uplink at its next poll. A served host still authorizes every
+    /// request against its own registry (K8.2).
+    pub fn serve_uplinks(&self, state_dir: PathBuf) {
+        self.serve_uplinks_with(move |host| host_promoted(&state_dir, host));
+    }
+
+    fn serve_uplinks_with(
+        &self,
+        promoted: impl Fn(&crate::uplink::Hello) -> bool + Send + Sync + 'static,
+    ) {
+        crate::uplink::serve(&self.bus, self.user_fp, self.uplinks.clone(), promoted);
+    }
+
+    /// Serve every uplink without consulting a registry, for tests of the
+    /// carrier itself.
+    #[cfg(test)]
+    pub(crate) fn serve_all_uplinks(&self) {
+        self.serve_uplinks_with(|_| true);
     }
 
     /// The hub state behind [`Self::serve_uplinks`].
@@ -700,6 +748,29 @@ mod tests {
     /// transport is grounded by the ignored loopback-QUIC test below.
     use newt_core::dock_registry::DockScope;
     const MI: Authz = Some(DockScope::MirrorInject);
+
+    #[test]
+    fn a_hub_promotes_only_a_host_its_registry_approves_and_stages_the_rest() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dock_agent(&user, DockRole::Host, "nuc1");
+        let hello = crate::uplink::Hello {
+            pubkey: host.public_bytes(),
+            instance: "nuc1".into(),
+        };
+        let config = dir.path().join("config.toml");
+        let staged =
+            || newt_core::dock_registry::staged_hosts(&config, std::time::SystemTime::now());
+
+        assert!(!host_promoted(dir.path(), &hello), "unapproved");
+        assert_eq!(staged().len(), 1, "an unapproved host is staged");
+
+        approve_caller(&user, dir.path(), &hello.pubkey, DockScope::Mirror);
+        assert!(
+            host_promoted(dir.path(), &hello),
+            "approved in the hub's registry"
+        );
+    }
 
     #[test]
     fn handle_dock_lists_mirrors_and_injects() {
@@ -1079,6 +1150,106 @@ mod tests {
         c.close().await.unwrap();
     }
 
+    /// K8-d acceptance (K8.5, hub side): a host the hub has not approved is
+    /// only staged. Its poll gets no request, it reports `Staged`, the hub's
+    /// staging dir lists its key and instance name, and the hub cannot reach
+    /// it. Once the operator promotes it — a signed approval in the hub's own
+    /// registry — its next poll is served. A poll naming another host's key is
+    /// refused and stages nothing. Real loopback QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn hub_stages_an_unapproved_host_and_serves_it_once_promoted() {
+        use crate::uplink::UplinkState;
+        let user = UserKey::generate();
+        let hub_dir = tempfile::tempdir().unwrap();
+        let host_dir = tempfile::tempdir().unwrap();
+        let store =
+            newt_core::ConversationStore::new(host_dir.path(), host_dir.path(), 100).unwrap();
+        store.create("nuc1 session", None).unwrap();
+        user.save(&hub_dir.path().join("identity.pem")).unwrap();
+        let hub_config = hub_dir.path().join("config.toml");
+
+        let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
+        let hub_pubkey = hub_agent.public_bytes();
+        let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        hub.serve_uplinks(hub_dir.path().to_path_buf());
+        approve_caller(&user, host_dir.path(), &hub_pubkey, DockScope::Mirror);
+
+        let host_agent = dock_agent(&user, DockRole::Host, "nuc1");
+        let (host_fp, host_pubkey) = (host_agent.fingerprint(), host_agent.public_bytes());
+        let hub_ep = loopback(hub_pubkey, hub.local_port());
+        let mut host =
+            crate::DockUplink::start(&user, "nuc1", host_dir.path().to_path_buf(), hub_ep)
+                .await
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.reached(UplinkState::Staged))
+            .await
+            .expect("an unapproved host is told it is staged");
+
+        let staged =
+            newt_core::dock_registry::staged_hosts(&hub_config, std::time::SystemTime::now());
+        assert_eq!(staged.len(), 1, "{staged:?}");
+        assert_eq!(staged[0].peer_label, "nuc1");
+        assert_eq!(staged[0].peer_agent_fingerprint, host_fp.hex());
+        let unreached = hub
+            .list_sessions(DockPeer::Uplink(host_fp))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(unreached.contains("has no open uplink"), "{unreached}");
+
+        // A poll signed by one agent but naming another's key: refused, and
+        // the named key is not staged.
+        let spoofer = Bus::bind_outbound_only(&user, dock_agent(&user, DockRole::Host, "spoofer"))
+            .await
+            .unwrap();
+        let spoofed = crate::uplink::Hello {
+            pubkey: [9; 32],
+            instance: "victim".into(),
+        };
+        let poll = serde_json::json!({ "host": spoofed, "answer": null });
+        let topic = Topic::new(user.fingerprint(), crate::uplink::DOCK_UPLINK_TOPIC);
+        let reply = spoofer
+            .request_direct(
+                hub_ep,
+                &topic,
+                poll.to_string().into_bytes(),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let work: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(
+            work,
+            serde_json::json!({ "job": null, "staged": false }),
+            "a poll naming another key gets no work"
+        );
+        spoofer.close().await.unwrap();
+        let labels: Vec<String> =
+            newt_core::dock_registry::staged_hosts(&hub_config, std::time::SystemTime::now())
+                .into_iter()
+                .map(|h| h.peer_label)
+                .collect();
+        assert_eq!(labels, ["nuc1"], "nothing staged under the spoofed key");
+
+        // Promote: what `newt dock approve --staged` signs.
+        approve_caller(&user, hub_dir.path(), &host_pubkey, DockScope::Mirror);
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            hub.uplinks().wait_for_uplink(host_fp),
+        )
+        .await
+        .expect("a promoted host is served at its next poll");
+        let sessions = hub.list_sessions(DockPeer::Uplink(host_fp)).await.unwrap();
+        assert!(
+            sessions.iter().any(|s| s.title == "nuc1 session"),
+            "{sessions:?}"
+        );
+
+        host.close().await;
+        hub.close().await.unwrap();
+    }
+
     /// K8-c acceptance: a docked host serves list, transcript and inject to its
     /// hub over an uplink it dialed, while accepting no inbound connection. The
     /// host authorizes the hub against its own registry on every request
@@ -1099,12 +1270,15 @@ mod tests {
         let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
         let hub_pubkey = hub_agent.public_bytes();
         let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
-        hub.serve_uplinks();
+        hub.serve_uplinks(dir.path().to_path_buf());
         let host_agent = dock_agent(&user, DockRole::Host, "laptop");
         let (host_fp, host_pubkey) = (host_agent.fingerprint(), host_agent.public_bytes());
+        // The hub serves only a host it has promoted (K8-d); this test shares
+        // one state dir between hub and host.
+        approve_caller(&user, dir.path(), &host_pubkey, DockScope::Mirror);
         let host = crate::DockUplink::start(
             &user,
-            host_agent,
+            "laptop",
             dir.path().to_path_buf(),
             loopback(hub_pubkey, hub.local_port()),
         )

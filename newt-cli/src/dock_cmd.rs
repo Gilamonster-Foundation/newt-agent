@@ -29,14 +29,21 @@ pub enum DockCmd {
     /// mnemonic — the SAME words the peer's own newt-web prints when it binds its
     /// dock service — for you to compare, then (on confirmation) writes a signed
     /// approval to `~/.newt/ocap/docks.d/peers.toml`.
+    ///
+    /// `--staged` promotes a host that uplinked to this hub and was staged
+    /// (see `newt dock list`), taking its key and name from the staged entry.
     Approve {
         /// The peer's mesh agent public key, 64 hex chars (the `pubkey` the
         /// peer's `newt-web` prints when it binds its dock service).
-        #[arg(long, value_name = "HEX")]
-        pubkey: String,
-        /// Operator-facing label for the peer (e.g. `laptop-b`).
-        #[arg(long, value_name = "LABEL")]
-        label: String,
+        #[arg(long, value_name = "HEX", required_unless_present = "staged")]
+        pubkey: Option<String>,
+        /// A staged host's agent fingerprint, or any unambiguous prefix of one.
+        #[arg(long, value_name = "PEER-SHORT", conflicts_with = "pubkey")]
+        staged: Option<String>,
+        /// Operator-facing label for the peer (e.g. `laptop-b`). Defaults to a
+        /// staged host's instance name.
+        #[arg(long, value_name = "LABEL", required_unless_present = "staged")]
+        label: Option<String>,
         /// Approval scope: `mirror` (read only, the default) or `mirror-inject`
         /// (also enqueue prompts, D2). Least authority by default.
         #[arg(long, default_value = DEFAULT_SCOPE)]
@@ -75,16 +82,40 @@ pub fn run(cmd: DockCmd, config: Option<&Path>) -> anyhow::Result<i32> {
     match cmd {
         DockCmd::Approve {
             pubkey,
+            staged,
             label,
             scope,
             operator_key_path,
-        } => run_approve(&pubkey, &label, &scope, operator_key_path, config),
+        } => {
+            let (pubkey, label) = match staged {
+                Some(prefix) => {
+                    let host = staged_host(&config_path(config)?, &prefix)?;
+                    (host.peer_pubkey, label.unwrap_or(host.peer_label))
+                }
+                None => (pubkey.unwrap_or_default(), label.unwrap_or_default()),
+            };
+            run_approve(&pubkey, &label, &scope, operator_key_path, config)
+        }
         DockCmd::Revoke {
             peer,
             operator_key_path,
         } => run_revoke(&peer, operator_key_path, config),
         DockCmd::RevokeAll { operator_key_path } => run_revoke_all(operator_key_path, config),
         DockCmd::List { operator_key_path } => run_list(operator_key_path, config),
+    }
+}
+
+/// The one live staged host whose fingerprint starts with `prefix`.
+fn staged_host(config_path: &Path, prefix: &str) -> anyhow::Result<dock_registry::StagedHost> {
+    let mut matches: Vec<_> =
+        dock_registry::staged_hosts(config_path, std::time::SystemTime::now())
+            .into_iter()
+            .filter(|host| !prefix.is_empty() && host.peer_agent_fingerprint.starts_with(prefix))
+            .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => anyhow::bail!("no staged host matches `{prefix}` (see `newt dock list`)"),
+        n => anyhow::bail!("`{prefix}` matches {n} staged hosts; use a longer prefix"),
     }
 }
 
@@ -187,6 +218,9 @@ fn run_approve(
                 &peer_fp[..16.min(peer_fp.len())],
                 path.display()
             ))?;
+            if let Err(error) = dock_registry::unstage_host(&config_path, &peer_fp) {
+                window.notice(&format!("(could not clear its staged entry: {error})"))?;
+            }
             Ok(0)
         }
         Err(error) => {
@@ -276,6 +310,21 @@ fn run_list(operator_key_path: Option<PathBuf>, config: Option<&Path>) -> anyhow
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
+    let staged = dock_registry::staged_hosts(&config_path, std::time::SystemTime::now());
+    if !staged.is_empty() {
+        println!("staged hosts (promote with `newt dock approve --staged <PEER-FP>`):");
+        let rows: Vec<[String; 3]> = staged
+            .iter()
+            .map(|host| {
+                [
+                    host.peer_label.clone(),
+                    host.peer_agent_fingerprint[..16].to_string(),
+                    "staged".to_string(),
+                ]
+            })
+            .collect();
+        print!("{}", dock_table(&rows));
+    }
     let docks = registry.live();
     if docks.is_empty() {
         println!("no approved docks");
@@ -343,5 +392,62 @@ mod tests {
         assert_eq!(parse_pubkey(&hex).unwrap(), [0xaau8; 32]);
         assert!(parse_pubkey("short").is_err());
         assert!(parse_pubkey(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn staged_resolves_one_unambiguous_live_host() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let now = std::time::SystemTime::now();
+        dock_registry::stage_host(&config, &[1; 32], "nuc1", now).unwrap();
+        dock_registry::stage_host(&config, &[2; 32], "nuc2", now).unwrap();
+        let nuc1 = dock_registry::agent_fingerprint_of_pubkey(&[1; 32]);
+
+        let host = staged_host(&config, &nuc1[..12]).unwrap();
+        assert_eq!(
+            (host.peer_label.as_str(), host.peer_pubkey),
+            ("nuc1", "01".repeat(32))
+        );
+        assert!(
+            staged_host(&config, "").is_err(),
+            "an empty prefix names nothing"
+        );
+        assert!(staged_host(&config, "zz").is_err(), "no match");
+
+        let twin = (3..=u8::MAX)
+            .map(|b| [b; 32])
+            .find(|k| dock_registry::agent_fingerprint_of_pubkey(k)[..1] == nuc1[..1])
+            .unwrap();
+        dock_registry::stage_host(&config, &twin, "twin", now).unwrap();
+        assert!(
+            staged_host(&config, &nuc1[..1]).is_err(),
+            "a prefix two hosts share is ambiguous"
+        );
+    }
+
+    #[test]
+    fn approve_takes_either_a_pubkey_and_label_or_a_staged_host() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: DockCmd,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from([&["newt"], args].concat()).map(|c| c.cmd);
+        assert!(matches!(
+            parse(&["approve", "--staged", "ab12"]),
+            Ok(DockCmd::Approve {
+                staged: Some(_),
+                pubkey: None,
+                label: None,
+                ..
+            })
+        ));
+        assert!(parse(&["approve", "--pubkey", "aa", "--label", "x"]).is_ok());
+        assert!(
+            parse(&["approve", "--label", "x"]).is_err(),
+            "no key and no staged host"
+        );
+        assert!(parse(&["approve", "--staged", "ab", "--pubkey", "aa"]).is_err());
     }
 }
