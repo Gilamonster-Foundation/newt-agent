@@ -240,10 +240,11 @@ the sole writer. Opening an uplink grants the hub nothing the registry does not.
 caveats at open. That primitive is still design-only upstream (`agent-mesh`
 `docs/decisions/session_streams.md`, status "proposed"; no `open_session` at `c137d9e`). Until it
 lands, the interim is an **outbound long-poll over today's request/reply**: the host sends a
-`dock/uplink/poll` request, the hub holds it until it has a `DockRequest` to deliver, and the
-host's next request carries the result. Each reply follows a request by seconds, so dial-back
-reaches the host while its NAT mapping is still alive. The interim is replaced, not extended, when
-`session_streams` ships.
+`newt/dock/uplink/v1` request, the hub holds it until it has a `DockRequest` to deliver, and the
+host's next request carries the result. The host's bus is outbound-only (agent-mesh
+`Bus::bind_outbound_only`, #95): it refuses every connection it did not dial, and each poll's reply
+returns on the connection the poll went out on, so no dial-back and no NAT mapping is involved. The
+interim is replaced, not extended, when `session_streams` ships.
 
 **K8.4 — Stable dock identities on both ends, derived rather than stored.** The hub and every
 docked host hold a dock `AgentKey` whose fingerprint survives a restart, so an approval that pins it
@@ -304,12 +305,14 @@ secure.
 
 ### Ladder (one concern per PR)
 
-- [ ] **K8-a** — agent-mesh: accept-none bind mode (Gilamonster-Foundation/agent-mesh#92).
-- [ ] **K8-b** — derived dock `AgentKey` for hub and host (K8.4; needs agent-mesh
+- [x] **K8-a** — agent-mesh: accept-none bind mode, with replies on the requester's own connection
+  (Gilamonster-Foundation/agent-mesh#95, closing #92).
+- [x] **K8-b** — derived dock `AgentKey` for hub and host (K8.4; agent-mesh
   `AgentKey::issue_derived`, Gilamonster-Foundation/agent-mesh#93); regression that an approval
   survives a hub restart.
-- [ ] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
-  serves list/transcript/inject while accepting no inbound connection.
+- [x] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
+  serves list/transcript/inject while accepting no inbound connection. The hub half is
+  `DockClient::serve_uplinks` (opt-in) plus `DockPeer::Uplink`; which hosts it serves is K8-d.
 - [ ] **K8-d** — hub side: accept uplinks, stage and promote hosts (K8.5), list sessions by host
   (K8.7).
 - [ ] **K8-e** — TUI verbs `/dock <hub>`, `/undock`, `/dock status` (K8.6).
