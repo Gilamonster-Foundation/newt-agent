@@ -87,14 +87,31 @@ pub fn run(cmd: DockCmd, config: Option<&Path>) -> anyhow::Result<i32> {
             scope,
             operator_key_path,
         } => {
-            let (pubkey, label) = match staged {
+            let (pubkey, label, pairing) = match staged {
                 Some(prefix) => {
                     let host = staged_host(&config_path(config)?, &prefix)?;
-                    (host.peer_pubkey, label.unwrap_or(host.peer_label))
+                    let Some(pairing) = host.pairing() else {
+                        anyhow::bail!(
+                            "host `{}` has not completed pairing: run `newt-mesh dock` on it",
+                            host.peer_label
+                        );
+                    };
+                    (
+                        host.peer_pubkey,
+                        label.unwrap_or(host.peer_label),
+                        Some(pairing),
+                    )
                 }
-                None => (pubkey.unwrap_or_default(), label.unwrap_or_default()),
+                None => (pubkey.unwrap_or_default(), label.unwrap_or_default(), None),
             };
-            run_approve(&pubkey, &label, &scope, operator_key_path, config)
+            run_approve(
+                &pubkey,
+                &label,
+                &scope,
+                pairing.as_ref(),
+                operator_key_path,
+                config,
+            )
         }
         DockCmd::Revoke {
             peer,
@@ -154,6 +171,7 @@ fn run_approve(
     pubkey_hex: &str,
     label: &str,
     scope: &str,
+    pairing: Option<&dock_registry::Pairing>,
     operator_key_path: Option<PathBuf>,
     config: Option<&Path>,
 ) -> anyhow::Result<i32> {
@@ -188,6 +206,13 @@ fn run_approve(
         &pubkey_hex[..16.min(pubkey_hex.len())],
         ceremony.sas_words.join(" "),
     ))?;
+    if let Some(pairing) = pairing {
+        window.notice(&format!(
+            "  pairing code  : {}\nThe host's `newt-mesh dock` shows this SAME code for this pairing. \
+             Approve only if they match.",
+            pairing.code
+        ))?;
+    }
     if !newt_core::interaction_terminal::confirmed_on_terminal(
         &window,
         &newt_core::interaction_form::confirm(
@@ -209,7 +234,8 @@ fn run_approve(
         label,
         pubkey_hex.trim(),
         scope,
-        &ceremony.transcript_id,
+        // A paired host's approval commits to the pairing transcript.
+        pairing.map_or(&ceremony.transcript_id, |p| &p.transcript_id),
         &root_key,
     ) {
         Ok(path) => {
@@ -399,8 +425,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
         let now = std::time::SystemTime::now();
-        dock_registry::stage_host(&config, &[1; 32], "nuc1", now).unwrap();
-        dock_registry::stage_host(&config, &[2; 32], "nuc2", now).unwrap();
+        dock_registry::stage_host(&config, &[1; 32], "nuc1", &[9; 32], now).unwrap();
+        dock_registry::stage_host(&config, &[2; 32], "nuc2", &[9; 32], now).unwrap();
         let nuc1 = dock_registry::agent_fingerprint_of_pubkey(&[1; 32]);
 
         let host = staged_host(&config, &nuc1[..12]).unwrap();
@@ -418,7 +444,7 @@ mod tests {
             .map(|b| [b; 32])
             .find(|k| dock_registry::agent_fingerprint_of_pubkey(k)[..1] == nuc1[..1])
             .unwrap();
-        dock_registry::stage_host(&config, &twin, "twin", now).unwrap();
+        dock_registry::stage_host(&config, &twin, "twin", &[9; 32], now).unwrap();
         assert!(
             staged_host(&config, &nuc1[..1]).is_err(),
             "a prefix two hosts share is ambiguous"
