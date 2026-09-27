@@ -14,7 +14,7 @@ use crate::agentic::prompt_intake::PromptDisposition;
 use crate::agentic::prompt_read::PromptReadContext;
 use crate::agentic::recall::RecallSource;
 use crate::agentic::tools::live_output::ToolSpinner;
-use crate::agentic::tools::{execute_tool_inner, tool_presentation};
+use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
 
 #[allow(clippy::too_many_arguments)]
 /// The optional collaborator seams a tool dispatch may carry, bundled into ONE
@@ -29,6 +29,8 @@ use crate::agentic::tools::{execute_tool_inner, tool_presentation};
 /// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a, 'gate> {
+    /// Call-local command default supplied by the operator, without granting authority.
+    pub(crate) default_command_cwd: Option<&'a std::path::Path>,
     pub(crate) invocation: Option<&'a agentic::smart_harness::ToolInvocation<'a>>,
     pub(crate) build_check_cmd: Option<&'a str>,
     /// #1947: the turn's tool ledger, distilled — what `render_report`'s
@@ -363,9 +365,14 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Option<String>> {
+    // Prediction and execution share the same call-local cwd projection; the
+    // original model arguments still reach the invocation/audit boundary.
+    let presentation_args =
+        shell::command_args_with_default_cwd(name, args, workspace, collab.default_command_cwd)
+            .unwrap_or(std::borrow::Cow::Borrowed(args));
     let (presentation_name, presentation_detail) = tool_presentation(
         name,
-        args,
+        presentation_args.as_ref(),
         std::path::Path::new(workspace),
         &caveats.fs_read,
     );

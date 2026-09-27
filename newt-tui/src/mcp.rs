@@ -17,8 +17,8 @@
 
 use newt_core::mcp::{McpServerEntry, TransportKind};
 use newt_mcp_client::{
-    connect_http_with_runtime_bearer, connect_stdio, openai_tool_definition, split_namespaced,
-    ConnectedServer as ClientConnectedServer,
+    connect_http_with_runtime_bearer, connect_stdio_with_protection, openai_tool_definition,
+    split_namespaced, ConnectedServer as ClientConnectedServer,
 };
 use serde_json::Value;
 
@@ -125,7 +125,18 @@ struct ReconnectableServer<Live = ClientConnectedServer> {
     http: Option<HttpReconnectState>,
 }
 
+/// Session authority and its operator-resource boundary travel together at launch.
+pub(crate) struct McpLaunchAuthority<'a> {
+    /// Full session leash for local children and HTTP network admission.
+    pub(crate) caveats: &'a newt_core::Caveats,
+    pub(crate) protection:
+        Option<std::sync::Arc<newt_core::workspace_protection::WorkspaceProtection>>,
+}
+
 pub(crate) struct Mcp {
+    /// Startup protection also applies when replacing or reconnecting servers.
+    #[cfg(any(feature = "rich-tui", test))]
+    protection: Option<std::sync::Arc<newt_core::workspace_protection::WorkspaceProtection>>,
     /// (server name, launch outcome) for every DISCOVERED entry — the `/mcp`
     /// status table (#1149). Includes disabled + skipped servers.
     pub(crate) statuses: Vec<(String, McpStatus)>,
@@ -654,6 +665,7 @@ impl Mcp {
         Self {
             statuses: Vec::new(),
             servers: Vec::new(),
+            protection: None,
             session_muted: std::collections::BTreeSet::new(),
             sanitize_server_names: true,
         }
@@ -667,14 +679,14 @@ impl Mcp {
         cfg_servers: &[McpServerEntry],
         sanitize_server_names: bool,
         allow_insecure_hosts: &[String],
-        // The session's Caveats leash. #1156: an HTTP MCP server's egress is
-        // gated by its `net` axis (same allow-list as a shell `curl`), so a
-        // confined session can't reach an un-granted host via a rogue MCP config.
-        // #1243 Leg 3: a spawned stdio server is confined to this whole leash.
-        caveats: &newt_core::caveats::Caveats,
+        authority: McpLaunchAuthority<'_>,
         explicit_net_hosts: &[String],
         grant_net: Option<(&mut McpNetGrantPrompt<'_>, &std::sync::atomic::AtomicBool)>,
     ) -> Self {
+        let McpLaunchAuthority {
+            caveats,
+            protection,
+        } = authority;
         let (mut grant_net, startup_cancel) = match grant_net {
             Some((prompt, cancel)) => (Some(prompt), Some(cancel)),
             None => (None, None),
@@ -703,6 +715,7 @@ impl Mcp {
                 &mut http_startup,
                 allow_insecure_hosts,
                 &mut grant_net,
+                protection.as_deref(),
             )
             .await;
             match result {
@@ -734,6 +747,8 @@ impl Mcp {
         Self {
             statuses,
             servers,
+            #[cfg(any(feature = "rich-tui", test))]
+            protection,
             session_muted: std::collections::BTreeSet::new(),
             sanitize_server_names,
         }
@@ -1948,3 +1963,7 @@ mod tests {
 }
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 12:27 EDT | Date: 2026-09-15
+
+#[cfg(test)]
+#[path = "mcp_tests/workspace_protection.rs"]
+mod workspace_protection_tests;

@@ -825,6 +825,90 @@ mod terminal {
         }
 
         #[test]
+        fn workspace_review_wraps_and_scrolls_without_losing_save_or_cancel() {
+            let _env = crate::test_env_guard::env_read_guard();
+            let (_directory, interaction) = crate::workspace_settings::tests::review_for_renderer();
+            for (width, height) in [(80, 20), (40, 12)] {
+                let area = Rect::new(0, 0, width, height);
+                let mut input = ModalInput::new(&interaction);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+                let mut snapshots = Vec::new();
+                let mut all_visible = String::new();
+                let mut reached_end = false;
+                for _ in 0..512 {
+                    terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let rows: Vec<String> = (0..height)
+                        .map(|y| {
+                            (0..width)
+                                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                                .collect()
+                        })
+                        .collect();
+                    for y in 1..height.saturating_sub(2) {
+                        for x in 1..width.saturating_sub(1) {
+                            all_visible.extend(
+                                buffer
+                                    .cell((x, y))
+                                    .unwrap()
+                                    .symbol()
+                                    .chars()
+                                    .filter(|ch| !ch.is_whitespace()),
+                            );
+                        }
+                    }
+                    snapshots.push(rows.join("\n"));
+                    let before = input.scroll;
+                    assert_eq!(
+                        input.event(key(KeyCode::PageDown, KeyModifiers::NONE), area),
+                        None
+                    );
+                    if input.scroll == before {
+                        reached_end = true;
+                        break;
+                    }
+                }
+                assert!(reached_end, "the finite review can be fully inspected");
+                for text in [
+                    "Active this session",
+                    "Saved for next launch",
+                    "Draft for next launch",
+                    "workspace-tail-marker",
+                    "[y]es, save for next launch",
+                    "[n]o, cancel (default)",
+                ] {
+                    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+                    assert!(
+                        all_visible.contains(&compact),
+                        "missing {text:?} at {width}x{height}\n{}",
+                        snapshots.join("\n--- scroll ---\n")
+                    );
+                }
+                println!(
+                    "WORKSPACE REVIEW {width}x{height} FIRST\n{}\nLAST\n{}",
+                    snapshots.first().unwrap(),
+                    snapshots.last().unwrap()
+                );
+                assert_eq!(
+                    input.event(key(KeyCode::Enter, KeyModifiers::NONE), area),
+                    Some(PromptLine::Line("no".into())),
+                    "scrolling never changes Cancel as the default"
+                );
+                let mut explicit_save = ModalInput::new(&interaction);
+                assert_eq!(
+                    explicit_save.event(key(KeyCode::Char('y'), KeyModifiers::NONE), area),
+                    None
+                );
+                assert_eq!(
+                    explicit_save.event(key(KeyCode::Enter, KeyModifiers::NONE), area),
+                    Some(PromptLine::Line("yes".into()))
+                );
+            }
+        }
+
+        #[test]
         fn modal_input_masks_secret_answer_in_the_shared_renderer() {
             let mut definition = crate::permissions::free_text_form("Enter the credential");
             definition.controls[0].kind = ControlKind::Secret;

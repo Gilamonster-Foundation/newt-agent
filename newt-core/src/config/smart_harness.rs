@@ -416,7 +416,10 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
 
 /// Landlock opens grant roots after admission. Refuse roots or traversed
 /// symlink targets whose parents the model could replace before that open.
-fn validate_stable_anchor(path: &Path, writable: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+pub(crate) fn validate_stable_anchor(
+    path: &Path,
+    writable: &[(PathBuf, PathBuf)],
+) -> anyhow::Result<()> {
     let mut pending = vec![path.to_path_buf()];
     let mut expanded = std::collections::BTreeSet::new();
     while let Some(path) = pending.pop() {
@@ -462,7 +465,7 @@ fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
     let path = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("frame authority paths must have lossless UTF-8 names"))?;
@@ -471,7 +474,7 @@ fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 /// Resolve existing ancestors without creating paths named by untrusted grants.
 /// Unlike ResolvedPath's write setup, admission must have no filesystem effects.
-fn resolve_uncreated_path(path: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_uncreated_path(path: &Path) -> anyhow::Result<PathBuf> {
     for ancestor in path.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Ok(_) => {

@@ -105,6 +105,7 @@ pub(super) fn command_help_page(cmd: &str) -> Option<&'static str> {
 On a rich terminal, /settings opens an index:
   Session      model, editor, reasoning, effort dials, prompt, and rounds
   Permissions  permission posture and prompted-decision audit
+  Workspaces   saved directories and access for the next process launch
   Audit        settings receipts and verification
   Backends     choose, edit, add, or remove a backend
   Themes       presets, per-role colors and attributes, live preview, and save
@@ -119,8 +120,9 @@ separate chooser, which returns to chat when closed.
 The text form works everywhere; bare /settings uses it outside a rich terminal:
   /settings thinking fold
   /settings rounds 40
+  /settings workspaces       interactive operator editor for next-launch access
 
-/model, /backends, and /permissions remain direct shortcuts."
+/model, /backends, /permissions, and /workspace remain direct shortcuts."
         }
         "models" => {
             "\
@@ -421,15 +423,16 @@ changes). Define personas in config."
 /permissions — review prompted permission decisions + the active posture
 
 Read-only: what you've allowed/denied this session and the posture's optional
-authority floor, when configured. Durable grants are made by editing
-[tui.permissions] in config, not here.
+authority floor, when configured. This view does not change grants. Eligible
+permission prompts can save approvals; /settings workspaces edits saved
+directory profiles for the next process launch.
 
 For full access inside one directory, start:
   newt --workspace-access code <directory>
 Commands can create, change, rename, and delete inside that workspace; native
 filesystem confinement still rejects outside targets, including symlink and
 parent-directory escapes. Network access remains separately configured.
-The trusted-config equivalent is [tui.permissions] preset = \"workspace_full_access\".
+The default preset can also be set in trusted [tui.permissions] configuration.
 This startup choice does not change a running session's authority.
 
 Usage:
@@ -556,10 +559,21 @@ actually resolved to, so you can see why the session is configured as it is."
         }
         "workspace" => {
             "\
-/workspace — print the current workspace path
+/workspace — operator editor for saved workspace access
 
-The workspace fences conversations, recall, and NOTES. It's the directory newt
-was launched in unless overridden."
+  /settings workspaces      the same interactive editor
+  /status workspace         read-only current workspace path
+
+Choose a workspace, additional read/write directories, a confined command/write
+preset, and a default working directory inside the workspace. Optionally select
+a default workspace for future launches. Review the resolved paths and confirm;
+Cancel is the default. Settings and keys must remain protected from model access.
+
+Saved changes require a real Newt process restart; /restart only resets the
+conversation. Current authority and jobs stay unchanged. Removing a profile or
+directory does not remove separate approvals or access through a parent grant.
+Network permissions and configured development-command extras remain separate.
+The model and noninteractive surfaces cannot approve changes in this editor."
         }
         "spill" => {
             "\
@@ -838,6 +852,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /mode [name]             - show/set operating style: chat, dev, admin, plan, diagnose, auto, full-auto",
         "  /posture [name]          - show/set configured posture; permission floor is optional",
         "  /permissions             - prompted decisions + active permission posture",
+        "  /workspace               - review and save workspace access for the next process launch",
+        "  /settings workspaces     - open the same operator workspace editor",
         "  /status                  - session and environment summary (the default view)",
         "  /status <topic>          - config · version · workspace · loadout · byline · memory · models · info",
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",

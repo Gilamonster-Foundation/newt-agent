@@ -21,7 +21,7 @@ pub fn tool_definitions() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to run" },
-                        "cwd": { "type": "string", "description": "Optional working directory, relative to the workspace root or absolute. Access follows the session filesystem grants. A leading `cd <path> && ...` also selects this command's working directory." },
+                        "cwd": { "type": "string", "description": "Optional working directory, relative to the workspace root or absolute. When omitted, uses the current command working directory reported in the turn context. Access follows the session filesystem grants. A leading `cd <path> && ...` also selects this command's working directory." },
                         "fs_read": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for reading by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." },
                         "fs_write": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for writing by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." }
                     },

@@ -8,11 +8,12 @@ pub(super) async fn connect_entry(
     http_policy: &mut (newt_core::Caveats, Vec<String>),
     allow_insecure_hosts: &[String],
     grant_net: &mut Option<&mut McpNetGrantPrompt<'_>>,
+    protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
 ) -> anyhow::Result<ReconnectableServer> {
     anyhow::ensure!(entry.enabled, "server is disabled in configuration");
     let admitted = newt_core::mcp::admit(entry).map_err(|denied| anyhow::anyhow!("{denied}"))?;
     match entry.transport {
-        TransportKind::Stdio => connect_stdio(&admitted, caveats)
+        TransportKind::Stdio => connect_stdio_with_protection(&admitted, caveats, protection)
             .await
             .map(|live| ReconnectableServer { live, http: None }),
         TransportKind::Http => {
@@ -60,6 +61,7 @@ impl Mcp {
             &mut policy,
             allow_insecure_hosts,
             &mut grant_net,
+            self.protection.as_deref(),
         )
         .await;
         synchronize_http_reconnect_policy(&mut self.servers, &policy);

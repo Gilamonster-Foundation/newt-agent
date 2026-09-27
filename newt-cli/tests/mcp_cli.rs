@@ -462,6 +462,7 @@ mod composed_private_mcp_uat {
                 messages: &messages,
                 task: &task,
                 workspace: sb.cwd.to_str().unwrap(),
+                default_command_cwd: None,
                 color: false,
                 markdown: false,
                 tool_offload: false,

@@ -1705,3 +1705,186 @@ async fn lifecycle_build_grant_runs_real_cargo() {
         }
     }
 }
+
+#[cfg(unix)]
+async fn command_cwd_fixture_call(
+    workspace: &std::path::Path,
+    default_cwd: Option<&std::path::Path>,
+    args: serde_json::Value,
+    caveats: &Caveats,
+) -> (String, Option<ExecOutcome>) {
+    let execution = std::sync::OnceLock::new();
+    let result = execute_tool_with_collaborators(
+        "run_command",
+        &args,
+        workspace.to_str().unwrap(),
+        false,
+        100,
+        caveats,
+        &mut NoMcp,
+        ToolCollaborators {
+            default_command_cwd: default_cwd,
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (result, execution.into_inner())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_cwd_default_places_actual_effects_without_changing_authority() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([workspace.to_string_lossy().into_owned()]),
+        fs_write: Scope::only([workspace.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let before = serde_json::to_value(&caveats).unwrap();
+    let args = serde_json::json!({"command": "/bin/sh -c 'printf selected > marker'"});
+    let original = args.clone();
+    for name in ["selected", "selected "] {
+        let selected = workspace.join(name);
+        std::fs::create_dir(&selected).unwrap();
+        let (result, outcome) =
+            command_cwd_fixture_call(&workspace, Some(&selected), args.clone(), &caveats).await;
+        assert_eq!(outcome, Some(ExecOutcome::Passed), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(selected.join("marker")).unwrap(),
+            "selected"
+        );
+    }
+    assert!(!workspace.join("marker").exists());
+    assert_eq!(args, original);
+    assert_eq!(serde_json::to_value(&caveats).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_cwd_explicit_wins_and_leading_cd_is_relative_to_it() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let selected = workspace.join("selected");
+    let explicit = workspace.join("explicit");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::create_dir_all(explicit.join("child")).unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([workspace.to_string_lossy().into_owned()]),
+        fs_write: Scope::only([workspace.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    for (command, expected) in [
+        (
+            "/bin/sh -c 'printf explicit > direct'",
+            explicit.join("direct"),
+        ),
+        (
+            "cd child && /bin/sh -c 'printf explicit > nested'",
+            explicit.join("child/nested"),
+        ),
+    ] {
+        let (result, outcome) = command_cwd_fixture_call(
+            &workspace,
+            Some(&selected),
+            serde_json::json!({"command": command, "cwd": "explicit"}),
+            &caveats,
+        )
+        .await;
+        assert_eq!(outcome, Some(ExecOutcome::Passed), "{result}");
+        assert_eq!(std::fs::read_to_string(expected).unwrap(), "explicit");
+    }
+    assert_eq!(std::fs::read_dir(&selected).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_cwd_outside_default_is_denied_before_effects() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().canonicalize().unwrap();
+    let workspace = parent.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([workspace.to_string_lossy().into_owned()]),
+        fs_write: Scope::only([workspace.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let (result, outcome) = command_cwd_fixture_call(
+        &workspace,
+        Some(&parent),
+        serde_json::json!({"command": "/bin/sh -c 'printf forbidden > marker'"}),
+        &caveats,
+    )
+    .await;
+    assert_eq!(outcome, Some(ExecOutcome::Denied), "{result}");
+    assert!(!parent.join("marker").exists());
+    assert!(!workspace.join("marker").exists());
+}
+
+#[tokio::test]
+async fn command_cwd_does_not_change_file_tools_or_baseline_read_routing() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _routing = super::disable_ocap_tests::EnvVar::unset("NEWT_NO_ROUTE");
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let selected = workspace.join("selected");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::write(workspace.join("marker"), "WORKSPACE_CONTENT").unwrap();
+    std::fs::write(selected.join("marker"), "SELECTED_CONTENT").unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([workspace.to_string_lossy().into_owned()]),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        ..Caveats::top()
+    };
+    for (tool, args, default_cwd) in [
+        (
+            "read_file",
+            serde_json::json!({"path": "marker"}),
+            Some(selected.as_path()),
+        ),
+        (
+            "run_command",
+            serde_json::json!({"command": "cat marker"}),
+            None,
+        ),
+    ] {
+        let result = execute_tool_with_collaborators(
+            tool,
+            &args,
+            workspace.to_str().unwrap(),
+            false,
+            100,
+            &caveats,
+            &mut NoMcp,
+            ToolCollaborators {
+                default_command_cwd: default_cwd,
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("WORKSPACE_CONTENT"), "{result}");
+        assert!(!result.contains("SELECTED_CONTENT"), "{result}");
+    }
+}

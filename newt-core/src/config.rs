@@ -51,6 +51,7 @@ pub use profile::{
 };
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
+pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
 pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
 pub use tool_exposure::{ExposureProfile, ToolExposureConfig};

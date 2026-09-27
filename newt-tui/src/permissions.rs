@@ -760,9 +760,16 @@ mod slash_prompt_tests;
 #[path = "permissions_tests/build_grant_tests.rs"]
 mod build_grant_tests;
 
+#[cfg(test)]
+#[path = "permissions_tests/workspace_protection.rs"]
+mod workspace_protection_tests;
+
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
+    /// Immutable operator resources excluded from all permission expansions.
+    pub(crate) protection:
+        Option<std::sync::Arc<newt_core::workspace_protection::WorkspaceProtection>>,
     pub(crate) prompt_default: Option<PromptChoice>,
     /// Trusted configured terminal MCP default; None uses the shipped choice.
     pub(crate) mcp_net_prompt_default: Option<PromptChoice>,
@@ -957,6 +964,10 @@ impl PermissionPromptState {
             .filter(|(kind, target)| {
                 !self.recall_conflicts_with_denial(*kind, target)
                     && danger.classify(*kind, target) != danger::DangerTier::High
+                    && self
+                        .protection
+                        .as_ref()
+                        .is_none_or(|guard| guard.validate_request(*kind, target).is_ok())
             })
     }
 
@@ -1006,13 +1017,60 @@ impl PermissionPromptState {
         &self,
         base: &newt_core::Caveats,
         ceiling: Option<&newt_core::Caveats>,
-    ) -> newt_core::Caveats {
+    ) -> anyhow::Result<newt_core::Caveats> {
         let grants = self
             .recalled_grants(&production_danger_table())
             .cloned()
             .collect::<Vec<_>>();
-        let policy = newt_core::widen_caveats(base, &grants);
-        ceiling.map_or_else(|| policy.clone(), |ceiling| policy.meet(ceiling))
+        let policy = self.widen_caveats(base, &grants);
+        let policy = ceiling.map_or_else(|| policy.clone(), |ceiling| policy.meet(ceiling));
+        self.validate_caveats(&policy)?;
+        Ok(policy)
+    }
+
+    /// Avoid emitting redundant filesystem roots from old exact approvals.
+    /// Only existing, byte-exact canonical paths can be already covered here;
+    /// aliases and unresolved paths must still reach the protection guard.
+    fn widen_caveats(
+        &self,
+        base: &newt_core::Caveats,
+        grants: &[(newt_core::DenialKind, String)],
+    ) -> newt_core::Caveats {
+        if self.protection.is_none() {
+            return newt_core::widen_caveats(base, grants);
+        }
+        let needed = grants
+            .iter()
+            .filter(|(kind, target)| {
+                let scope = match kind {
+                    newt_core::DenialKind::FsRead => &base.fs_read,
+                    newt_core::DenialKind::FsWrite => &base.fs_write,
+                    _ => return true,
+                };
+                let target = std::path::Path::new(target);
+                let canonical = |path: &std::path::Path| {
+                    path.canonicalize()
+                        .is_ok_and(|resolved| resolved.as_os_str() == path.as_os_str())
+                };
+                let newt_core::Scope::Only(roots) = scope else {
+                    return false;
+                };
+                !canonical(target)
+                    || !roots.iter().any(|root| {
+                        let root = std::path::Path::new(root);
+                        canonical(root) && target.starts_with(root)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        newt_core::widen_caveats(base, &needed)
+    }
+
+    fn validate_caveats(&self, caveats: &newt_core::Caveats) -> anyhow::Result<()> {
+        if let Some(protection) = &self.protection {
+            protection.validate_caveats(caveats)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn retained_net_hosts(&self) -> Vec<String> {
@@ -1169,16 +1227,16 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         self.state.decisions.push(rec);
     }
 
-    /// Re-mint baseline plus grants from the root; never widen the live key.
-    fn mint(
+    /// Derive the final policy without reading keys or recording a decision.
+    fn policy_with_grants(
         &self,
         base: &newt_core::Caveats,
         once_grants: &[(newt_core::DenialKind, String)],
-    ) -> newt_core::Caveats {
+    ) -> anyhow::Result<newt_core::Caveats> {
         let mut grants: Vec<(newt_core::DenialKind, String)> =
             self.state.recalled_grants(&self.danger).cloned().collect();
         grants.extend(once_grants.iter().cloned());
-        let mut policy = newt_core::widen_caveats(base, &grants);
+        let mut policy = self.state.widen_caveats(base, &grants);
         // Re-clamping is load-bearing: widening may repopulate an emptied scope.
         if let Some(clamp) = &self.preset_clamp {
             policy = policy.meet(clamp);
@@ -1194,27 +1252,38 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         // be re-widened away on the first granted prompt.
         if let Some(d) = self.delegation {
             policy = policy.meet(d.caveats());
-            // And it stops here. A delegated session does not re-root a grant:
-            // minting from `key_path` would produce a key chained to the
-            // OPERATOR root rather than to the parent's certificate, which is a
-            // fresh authority rather than an attenuation of the inherited one.
-            // The clamped caveats ARE the receipt; there is no key to enforce
-            // them with, and `establish` has already left `op` as `None` for
-            // the same reason.
-            return policy;
         }
-        match self
+        self.state.validate_caveats(&policy)?;
+        Ok(policy)
+    }
+
+    /// Re-mint baseline plus grants from the root; never widen the live key.
+    fn mint(
+        &self,
+        base: &newt_core::Caveats,
+        once_grants: &[(newt_core::DenialKind, String)],
+    ) -> anyhow::Result<newt_core::Caveats> {
+        let policy = self.policy_with_grants(base, once_grants)?;
+        // A delegated session never re-roots a grant through the operator key.
+        if self.delegation.is_some() {
+            return Ok(policy);
+        }
+        let policy = match self
             .key_path
             .as_deref()
             .and_then(|p| mint_operating_key(p, &policy).ok())
         {
             Some(key) => newt_identity::enforced_caveats(&key).unwrap_or(policy),
             None => policy,
-        }
+        };
+        // Key creation can resolve a previously absent name. Check the actual
+        // returned authority again, rather than relying on the pre-mint shape.
+        self.state.validate_caveats(&policy)?;
+        Ok(policy)
     }
 
     /// Live policy, through the same grant and delegation clamps as tool calls.
-    pub(crate) fn current_caveats(&self) -> newt_core::Caveats {
+    pub(crate) fn current_caveats(&self) -> anyhow::Result<newt_core::Caveats> {
         self.mint(&self.base, &[])
     }
 
@@ -1779,7 +1848,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
     for PromptPermissionGate<'_, F>
 {
     fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
-        newt_core::PermissionDecision::Allow(self.mint(baseline, &[]))
+        self.mint(baseline, &[]).map_or(
+            newt_core::PermissionDecision::Deny,
+            newt_core::PermissionDecision::Allow,
+        )
     }
 
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
@@ -1794,6 +1866,25 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         use newt_core::PermissionDecision::{Allow, Deny};
         if requests.is_empty() {
             return Deny;
+        }
+        if let Some(protection) = &self.state.protection {
+            // Preflight the whole batch before consuming pending grants,
+            // showing a prompt, or writing a permanent approval. Checking only
+            // each path misses an allowed read alias plus its writable parent.
+            let proposed = requests
+                .iter()
+                .map(|request| (request.kind, request.target.clone()))
+                .collect::<Vec<_>>();
+            if protection.validate_caveats(baseline).is_err()
+                || requests.iter().any(|request| {
+                    protection
+                        .validate_request(request.kind, &request.target)
+                        .is_err()
+                })
+                || self.policy_with_grants(baseline, &proposed).is_err()
+            {
+                return Deny;
+            }
         }
         // A prepared build request carries its exact projected fence. Check
         // that fence before prompting as well as the named Build capability;
@@ -1918,6 +2009,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                             std::path::Path::new(workspace),
                         );
                         fence.net = baseline.net.clone();
+                        if self.state.validate_caveats(&fence).is_err() {
+                            return Deny;
+                        }
                         build_covered_clamp = Some(match build_covered_clamp.take() {
                             Some(existing) => existing.meet(&fence),
                             None => fence,
@@ -2237,11 +2331,17 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
         }
-        let minted = self.mint(baseline, &once_grants);
-        Allow(match build_covered_clamp {
+        let Ok(minted) = self.mint(baseline, &once_grants) else {
+            return Deny;
+        };
+        let allowed = match build_covered_clamp {
             Some(fence) => minted.meet(&fence),
             None => minted,
-        })
+        };
+        if self.state.validate_caveats(&allowed).is_err() {
+            return Deny;
+        }
+        Allow(allowed)
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
