@@ -302,6 +302,9 @@ struct Job {
 struct HostWork {
     queued: VecDeque<Job>,
     dispatched: HashMap<JobId, oneshot::Sender<DockReply>>,
+    /// Set when the host is staged: nothing is queued or dispatched on this
+    /// link again, whoever still holds it.
+    closed: bool,
 }
 
 impl HostWork {
@@ -315,6 +318,9 @@ impl HostWork {
     /// Take the next live job and mark it dispatched — the point after which
     /// its outcome belongs to the host.
     fn dispatch(&mut self, now: Instant) -> Option<(JobId, DockRequest)> {
+        if self.closed {
+            return None;
+        }
         self.prune(now);
         let job = self.queued.pop_front()?;
         self.dispatched.insert(job.id, job.answer);
@@ -364,21 +370,54 @@ impl Drop for Withdraw {
 /// here rolls it back or retries it.
 #[derive(Default)]
 pub(crate) struct UplinkHub {
-    hosts: Mutex<HashMap<Fingerprint, Arc<HostLink>>>,
+    hosts: Mutex<Hosts>,
     polled: Notify,
 }
 
+/// Each host's link, and its admission epoch: how many times it has been
+/// staged. One lock, so admitting and staging a host are linearized.
+#[derive(Default)]
+struct Hosts {
+    links: HashMap<Fingerprint, Arc<HostLink>>,
+    epochs: HashMap<Fingerprint, u64>,
+}
+
+/// A host's admission epoch, taken before its registry is read. If the host
+/// is staged after that, the admission is stale and opens no link.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Admission {
+    host: Fingerprint,
+    epoch: u64,
+}
+
 impl UplinkHub {
-    fn link(&self, host: Fingerprint) -> Arc<HostLink> {
+    /// Take `host`'s admission epoch. Call it before deciding whether the host
+    /// is promoted, and pass it to [`Self::poll`].
+    pub(crate) fn admission(&self, host: Fingerprint) -> Admission {
+        let epoch = self.hosts.lock().unwrap().epochs.get(&host).copied();
+        Admission {
+            host,
+            epoch: epoch.unwrap_or(0),
+        }
+    }
+
+    /// The host's link, opened if need be — unless it was staged since
+    /// `admission` was taken.
+    fn link(&self, admission: Admission) -> Option<Arc<HostLink>> {
         let mut hosts = self.hosts.lock().unwrap();
-        hosts
-            .entry(host)
-            .or_insert_with(|| Arc::new(HostLink::new()))
-            .clone()
+        let epoch = hosts.epochs.get(&admission.host).copied().unwrap_or(0);
+        if epoch != admission.epoch {
+            return None;
+        }
+        let link = hosts
+            .links
+            .entry(admission.host)
+            .or_insert_with(|| Arc::new(HostLink::new()));
+        Some(link.clone())
     }
 
     fn live_link(&self, host: Fingerprint) -> Option<Arc<HostLink>> {
-        let link = self.hosts.lock().unwrap().get(&host).cloned()?;
+        let link = self.hosts.lock().unwrap().links.get(&host).cloned()?;
         let fresh = link.last_poll.lock().unwrap().elapsed() < POLL_TIMEOUT;
         fresh.then_some(link)
     }
@@ -398,8 +437,10 @@ impl UplinkHub {
     /// Answer one poll from `host`: deliver the answer it carries, then hold
     /// until there is a live job for it or [`HOLD`] lapses. An answer is
     /// matched only within this host's own dispatched work.
-    async fn poll(&self, host: Fingerprint, poll: Poll) -> Work {
-        let link = self.link(host);
+    async fn poll(&self, host: Fingerprint, poll: Poll, admission: Admission) -> Work {
+        let Some(link) = self.link(admission) else {
+            return self.stage(host).await;
+        };
         *link.last_poll.lock().unwrap() = Instant::now();
         self.polled.notify_waiters();
         if let Some((id, reply)) = poll.answer {
@@ -411,7 +452,16 @@ impl UplinkHub {
         let hold = Instant::now() + HOLD;
         loop {
             let queued = link.queued.notified();
-            let job = link.work.lock().unwrap().dispatch(Instant::now());
+            let (job, closed) = {
+                let mut work = link.work.lock().unwrap();
+                (work.dispatch(Instant::now()), work.closed)
+            };
+            if closed {
+                return Work {
+                    job: None,
+                    staged: true,
+                };
+            }
             if job.is_some() {
                 return Work { job, staged: false };
             }
@@ -421,11 +471,28 @@ impl UplinkHub {
         }
     }
 
-    /// Answer a poll from a host this hub has not approved: drop any link it
-    /// held (a revoked host loses its uplink here), hold the poll so the host
-    /// does not spin, and tell it it is only staged. It gets no job.
+    /// Answer a poll from a host this hub has not approved: hold the poll so
+    /// the host does not spin, and tell it it is only staged. It gets no job.
+    ///
+    /// A revoked host loses its uplink here, for every holder: the host's
+    /// admission epoch moves on, so an admission taken before now cannot open
+    /// a new link, and its current link is closed, dropping its queued and
+    /// dispatched work (their requesters fail at once) and waking any poll
+    /// holding it.
     async fn stage(&self, host: Fingerprint) -> Work {
-        self.hosts.lock().unwrap().remove(&host);
+        let link = {
+            let mut hosts = self.hosts.lock().unwrap();
+            *hosts.epochs.entry(host).or_default() += 1;
+            hosts.links.remove(&host)
+        };
+        if let Some(link) = link {
+            let mut work = link.work.lock().unwrap();
+            work.closed = true;
+            work.queued.clear();
+            work.dispatched.clear();
+            drop(work);
+            link.queued.notify_waiters();
+        }
         tokio::time::sleep(STAGED_HOLD).await;
         Work {
             job: None,
@@ -449,6 +516,9 @@ impl UplinkHub {
         let (answer, answered) = oneshot::channel();
         {
             let mut work = link.work.lock().unwrap();
+            if work.closed {
+                anyhow::bail!("host {} has no open uplink", host.short());
+            }
             work.prune(now);
             if work.queued.len() + work.dispatched.len() >= MAX_OUTSTANDING {
                 anyhow::bail!(
@@ -502,11 +572,14 @@ pub(crate) fn serve(
                 tracing::warn!(host = %host.short(), "dock uplink: poll names another key; ignored");
                 return Ok(serde_json::to_vec(&Work::default())?);
             }
+            // Taken before the registry is read, so a revocation that stages
+            // this host meanwhile makes this admission stale.
+            let admission = hub.admission(host);
             let hello = poll.host.clone();
             // Fail closed: a check that could not run promotes nobody.
             let admitted = tokio::task::spawn_blocking(move || promoted(&hello)).await;
             let work = if admitted.unwrap_or(false) {
-                hub.poll(host, poll).await
+                hub.poll(host, poll, admission).await
             } else {
                 hub.stage(host).await
             };
@@ -521,6 +594,18 @@ mod tests {
 
     fn fp(byte: u8) -> Fingerprint {
         Fingerprint([byte; 32])
+    }
+
+    impl UplinkHub {
+        /// Poll with an admission taken now: a promoted host.
+        async fn poll_now(&self, host: Fingerprint, poll: Poll) -> Work {
+            self.poll(host, poll, self.admission(host)).await
+        }
+
+        /// Open `host`'s link as a promoted poll would.
+        fn open(&self, host: Fingerprint) -> Arc<HostLink> {
+            self.link(self.admission(host)).unwrap()
+        }
     }
 
     impl Poll {
@@ -548,12 +633,12 @@ mod tests {
         /// Record a poll from `host` without holding one open, as a host that
         /// keeps polling would between the steps of a test.
         fn polled_now(&self, host: Fingerprint) {
-            *self.link(host).last_poll.lock().unwrap() = Instant::now();
+            *self.open(host).last_poll.lock().unwrap() = Instant::now();
         }
 
         /// Registrations still held for `host` (queued or dispatched).
         fn outstanding(&self, host: Fingerprint) -> usize {
-            let link = self.link(host);
+            let link = self.open(host);
             let work = link.work.lock().unwrap();
             work.queued.len() + work.dispatched.len()
         }
@@ -589,7 +674,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_that_stopped_polling_takes_no_requests() {
         let hub = UplinkHub::default();
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         tokio::time::advance(POLL_TIMEOUT + Duration::from_secs(1)).await;
         let err = hub
             .request(fp(1), DockRequest::ListSessions)
@@ -603,12 +688,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_job_rides_a_held_poll_and_its_answer_rides_the_next() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((id, DockRequest::ListSessions)),
             ..
-        } = hub.poll(fp(1), Poll::answering(None)).await
+        } = hub.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("the poll carries the job");
         };
@@ -616,7 +701,7 @@ mod tests {
             let hub = hub.clone();
             async move {
                 let answer = Some((id, DockReply::Sessions(Vec::new())));
-                hub.poll(fp(1), Poll::answering(answer)).await
+                hub.poll_now(fp(1), Poll::answering(answer)).await
             }
         });
         assert!(matches!(asking.await.unwrap(), Ok(DockReply::Sessions(s)) if s.is_empty()));
@@ -629,9 +714,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_never_receives_another_hosts_job() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), DockRequest::ListSessions).await;
-        assert!(hub.poll(fp(2), Poll::answering(None)).await.job.is_none());
+        assert!(hub
+            .poll_now(fp(2), Poll::answering(None))
+            .await
+            .job
+            .is_none());
         assert!(asking.await.unwrap().is_err(), "host 1 never polled for it");
     }
 
@@ -640,10 +729,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_expired_inject_is_never_dispatched() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), inject()).await;
         assert!(asking.await.unwrap().is_err(), "times out before any poll");
-        let work = hub.poll(fp(1), Poll::answering(None)).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(work.job.is_none(), "expired work delivered: {:?}", work.job);
     }
 
@@ -653,7 +742,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn work_past_its_deadline_is_not_dispatched_before_its_requester_wakes() {
         let hub = UplinkHub::default();
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = hub.request(fp(1), inject());
         tokio::pin!(asking);
         // Poll the request once: it queues its job and waits.
@@ -664,7 +753,7 @@ mod tests {
         hub.polled_now(fp(1));
         // `asking` is still alive and has not observed its deadline.
         assert_eq!(hub.outstanding(fp(1)), 1);
-        let work = hub.poll(fp(1), Poll::answering(None)).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(work.job.is_none(), "expired work delivered: {:?}", work.job);
     }
 
@@ -673,13 +762,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_aborted_request_is_withdrawn_before_dispatch() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let asking = ask(&hub, fp(1), inject()).await;
         assert_eq!(hub.outstanding(fp(1)), 1);
         asking.abort();
         assert!(asking.await.unwrap_err().is_cancelled());
         assert_eq!(hub.outstanding(fp(1)), 0, "registration removed");
-        let work = hub.poll(fp(1), Poll::answering(None)).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(
             work.job.is_none(),
             "withdrawn work delivered: {:?}",
@@ -691,12 +780,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_live_request_is_dispatched_past_expired_work() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let stale = ask(&hub, fp(1), inject()).await;
         assert!(stale.await.unwrap().is_err());
         hub.polled_now(fp(1));
         let _live = ask(&hub, fp(1), DockRequest::ListSessions).await;
-        let work = hub.poll(fp(1), Poll::answering(None)).await;
+        let work = hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(
             matches!(work.job, Some((_, DockRequest::ListSessions))),
             "poll carried {:?} instead of the live request",
@@ -709,12 +798,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_late_answer_completes_no_other_request() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let first = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((late, _)),
             ..
-        } = hub.poll(fp(1), Poll::answering(None)).await
+        } = hub.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("the first request is dispatched");
         };
@@ -725,7 +814,7 @@ mod tests {
             let hub = hub.clone();
             async move {
                 let answer = Some((late, DockReply::Injected));
-                hub.poll(fp(1), Poll::answering(answer)).await
+                hub.poll_now(fp(1), Poll::answering(answer)).await
             }
         });
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
@@ -738,28 +827,32 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_answer_from_before_a_hub_restart_resolves_nothing() {
         let old = Arc::new(UplinkHub::default());
-        drop(old.link(fp(1)));
+        drop(old.open(fp(1)));
         let _pending = ask(&old, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((old_id, _)),
             ..
-        } = old.poll(fp(1), Poll::answering(None)).await
+        } = old.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("the old hub dispatches");
         };
         drop(old); // the hub restarts
 
         let new = Arc::new(UplinkHub::default());
-        drop(new.link(fp(1)));
+        drop(new.open(fp(1)));
         let early = Some((old_id, DockReply::Injected));
-        assert!(new.poll(fp(1), Poll::answering(early)).await.job.is_none());
+        assert!(new
+            .poll_now(fp(1), Poll::answering(early))
+            .await
+            .job
+            .is_none());
         let mut asking = ask(&new, fp(1), DockRequest::ListSessions).await;
-        let _lost = new.poll(fp(1), Poll::answering(None)).await; // response lost
+        let _lost = new.poll_now(fp(1), Poll::answering(None)).await; // response lost
         let _retry = tokio::spawn({
             let new = new.clone();
             async move {
                 let retained = Some((old_id, DockReply::Sessions(Vec::new())));
-                new.poll(fp(1), Poll::answering(retained)).await
+                new.poll_now(fp(1), Poll::answering(retained)).await
             }
         });
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut asking).await;
@@ -774,19 +867,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn duplicate_and_wrong_host_answers_are_ignored() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
-        drop(hub.link(fp(2)));
+        drop(hub.open(fp(1)));
+        drop(hub.open(fp(2)));
         let mut asking = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let Work {
             job: Some((id, _)), ..
-        } = hub.poll(fp(1), Poll::answering(None)).await
+        } = hub.poll_now(fp(1), Poll::answering(None)).await
         else {
             panic!("dispatched to host 1");
         };
         let wrong = Some((id, DockReply::Injected));
         let _other = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.poll(fp(2), Poll::answering(wrong)).await }
+            async move { hub.poll_now(fp(2), Poll::answering(wrong)).await }
         });
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut asking).await;
         assert!(settled.is_err(), "host 2 answered host 1's job");
@@ -794,14 +887,14 @@ mod tests {
         let right = Some((id, DockReply::Sessions(Vec::new())));
         let _answer = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.poll(fp(1), Poll::answering(right)).await }
+            async move { hub.poll_now(fp(1), Poll::answering(right)).await }
         });
         assert!(matches!(asking.await.unwrap(), Ok(DockReply::Sessions(_))));
         let again = ask(&hub, fp(1), DockRequest::ListSessions).await;
         let dup = Some((id, DockReply::Injected));
         let _dup = tokio::spawn({
             let hub = hub.clone();
-            async move { hub.poll(fp(1), Poll::answering(dup)).await }
+            async move { hub.poll_now(fp(1), Poll::answering(dup)).await }
         });
         let mut again = again;
         let settled = tokio::time::timeout(Duration::from_secs(1), &mut again).await;
@@ -816,7 +909,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn outstanding_work_per_host_is_bounded() {
         let hub = Arc::new(UplinkHub::default());
-        drop(hub.link(fp(1)));
+        drop(hub.open(fp(1)));
         let mut asks = Vec::new();
         for _ in 0..MAX_OUTSTANDING {
             asks.push(ask(&hub, fp(1), DockRequest::ListSessions).await);
@@ -840,7 +933,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_staged_poll_drops_the_hosts_link_and_carries_no_job() {
         let hub = UplinkHub::default();
-        hub.poll(fp(1), Poll::answering(None)).await;
+        hub.poll_now(fp(1), Poll::answering(None)).await;
         assert!(
             hub.live_link(fp(1)).is_some(),
             "a promoted poll opens a link"
@@ -851,6 +944,91 @@ mod tests {
         assert!(hub.live_link(fp(1)).is_none(), "staging drops the link");
         let unreached = hub.request(fp(1), DockRequest::ListSessions).await;
         assert!(unreached.is_err(), "the hub cannot reach a staged host");
+    }
+
+    /// Poll A reads the registry while the host is approved, then the host is
+    /// revoked and poll B stages it, then A resumes: A's admission is stale,
+    /// so it opens no link and nothing can be delivered to the host.
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_taken_before_a_revocation_opens_no_link() {
+        let hub = Arc::new(UplinkHub::default());
+        hub.poll_now(fp(1), Poll::answering(None)).await;
+        let a = hub.admission(fp(1));
+        hub.stage(fp(1)).await;
+
+        let work = hub.poll(fp(1), Poll::answering(None), a).await;
+        assert!(work.staged && work.job.is_none(), "{work:?}");
+        assert!(
+            hub.live_link(fp(1)).is_none(),
+            "the stale admission opened a link"
+        );
+        let unreached = hub.request(fp(1), DockRequest::ListSessions).await;
+        assert!(
+            unreached.is_err(),
+            "nothing is delivered to the revoked host"
+        );
+
+        let fresh = hub.poll_now(fp(1), Poll::answering(None)).await;
+        assert!(
+            !fresh.staged,
+            "an admission taken after staging still admits"
+        );
+    }
+
+    /// Staging closes a link for everyone still holding it: a queued request
+    /// fails at once instead of waiting out its deadline, a poll holding the
+    /// link returns staged with no job, and the retained link dispatches
+    /// nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn staging_closes_a_link_its_holders_still_retain() {
+        let hub = Arc::new(UplinkHub::default());
+        let retained = hub.open(fp(1));
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.poll_now(fp(1), Poll::answering(None)).await }
+        });
+        tokio::task::yield_now().await;
+        let queued = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                // Enqueue without waking the held poll, so the job stays queued.
+                let link = hub.live_link(fp(1)).unwrap();
+                let (answer, answered) = oneshot::channel();
+                link.work.lock().unwrap().queued.push_back(Job {
+                    id: [7; 16],
+                    request: DockRequest::ListSessions,
+                    deadline: Instant::now() + ANSWER_TIMEOUT,
+                    answer,
+                });
+                answered.await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let staging = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.stage(fp(1)).await }
+        });
+        let soon = Duration::from_millis(1);
+        let queued = tokio::time::timeout(soon, queued)
+            .await
+            .expect("fails at once");
+        assert!(
+            queued.unwrap().is_err(),
+            "the queued request's answer is dropped"
+        );
+        let held = tokio::time::timeout(soon, held)
+            .await
+            .expect("returns at once");
+        let held = held.unwrap();
+        assert!(held.staged && held.job.is_none(), "{held:?}");
+        assert!(retained
+            .work
+            .lock()
+            .unwrap()
+            .dispatch(Instant::now())
+            .is_none());
+        staging.await.unwrap();
     }
 
     // ── Shutdown, over real loopback QUIC (the dock-security lanes run these) ──

@@ -206,12 +206,8 @@ fn authorize_caller(state_dir: &Path, caller_agent_fp: &str) -> Result<Authz, Do
     if dock_approval_disabled() {
         return Ok(None);
     }
-    let config = state_dir.join("config.toml");
-    let identity = state_dir.join("identity.pem");
-    let (registry, _warnings) =
-        newt_core::dock_registry::load_docks_with_identity(&config, &identity);
-    match registry.approved(caller_agent_fp) {
-        Some(record) => Ok(Some(record.scope)),
+    match approved_scope(state_dir, caller_agent_fp) {
+        Some(scope) => Ok(Some(scope)),
         None => Err(DockReply::Error(format!(
             "caller {}… is not an approved dock on this peer (run `newt dock approve` here)",
             &caller_agent_fp[..12.min(caller_agent_fp.len())]
@@ -219,13 +215,26 @@ fn authorize_caller(state_dir: &Path, caller_agent_fp: &str) -> Result<Authz, Do
     }
 }
 
+/// The scope `agent_fp` is approved at in `state_dir`'s signed dock registry,
+/// re-read and re-verified from disk. `None` when it is not approved.
+fn approved_scope(state_dir: &Path, agent_fp: &str) -> Option<newt_core::dock_registry::DockScope> {
+    let config = state_dir.join("config.toml");
+    let identity = state_dir.join("identity.pem");
+    let (registry, _warnings) =
+        newt_core::dock_registry::load_docks_with_identity(&config, &identity);
+    registry.approved(agent_fp).map(|record| record.scope)
+}
+
 /// Whether the host that sent `host` is promoted on this hub: approved in the
-/// hub's own signed registry, by the same check a responder applies to its
-/// caller. A host that is not is staged instead, for the operator to promote
-/// with `newt dock approve --staged` (K8.5).
+/// hub's own signed registry. A host that is not is staged instead, for the
+/// operator to promote with `newt dock approve --staged` (K8.5).
+///
+/// Only the registry decides. The responder's insecure opt-out
+/// (`NEWT_INSECURE_DOCK_NO_APPROVAL`) is not consulted here: it may loosen who
+/// a host answers, never which hosts a hub serves.
 fn host_promoted(state_dir: &Path, host: &crate::uplink::Hello) -> bool {
     let host_fp = Fingerprint::of_bytes(&host.pubkey).hex();
-    if authorize_caller(state_dir, &host_fp).is_ok() {
+    if approved_scope(state_dir, &host_fp).is_some() {
         return true;
     }
     if let Err(e) = newt_core::dock_registry::stage_host(
@@ -739,6 +748,29 @@ mod tests {
     /// transport is grounded by the ignored loopback-QUIC test below.
     use newt_core::dock_registry::DockScope;
     const MI: Authz = Some(DockScope::MirrorInject);
+
+    #[test]
+    fn a_hub_promotes_only_a_host_its_registry_approves_and_stages_the_rest() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dock_agent(&user, DockRole::Host, "nuc1");
+        let hello = crate::uplink::Hello {
+            pubkey: host.public_bytes(),
+            instance: "nuc1".into(),
+        };
+        let config = dir.path().join("config.toml");
+        let staged =
+            || newt_core::dock_registry::staged_hosts(&config, std::time::SystemTime::now());
+
+        assert!(!host_promoted(dir.path(), &hello), "unapproved");
+        assert_eq!(staged().len(), 1, "an unapproved host is staged");
+
+        approve_caller(&user, dir.path(), &hello.pubkey, DockScope::Mirror);
+        assert!(
+            host_promoted(dir.path(), &hello),
+            "approved in the hub's registry"
+        );
+    }
 
     #[test]
     fn handle_dock_lists_mirrors_and_injects() {
