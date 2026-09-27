@@ -89,13 +89,11 @@ pub enum UplinkState {
 /// A docked host's uplink to one hub.
 ///
 /// **Shutdown.** [`Self::close`] stops polling, closes the uplink's bus, and
-/// waits for the runner to finish. The UDP socket is released when the bus's
-/// last connection closes: with agent-mesh at `4f34726` that can be as late as
-/// the end of the poll's reply window (`POLL_TIMEOUT`), because `Bus::close`
-/// does not close the endpoint. A dock request the host is already serving
-/// is not interrupted: it runs to completion (an `Inject` it has started still
-/// lands) and its answer is discarded, so the hub sees that request time out
-/// with an unknown outcome. Dropping a `DockUplink` without `close` only
+/// waits for the runner to finish; closing the bus closes its endpoint, so the
+/// UDP socket is released promptly, even with a poll's reply window open. A
+/// dock request the host is already serving is not interrupted: it runs to
+/// completion (an `Inject` it has started still lands) and its answer is
+/// discarded, so the hub sees that request time out with an unknown outcome. Dropping a `DockUplink` without `close` only
 /// signals the runner: it stops at its next await point and closes the bus
 /// itself while the runtime is alive, but nothing waits for that.
 pub struct DockUplink {
@@ -761,12 +759,10 @@ mod tests {
         false
     }
 
-    /// How long a closed uplink's port may stay bound with agent-mesh at
-    /// `4f34726`: `Bus::close` does not close the endpoint, so a poll's reply
-    /// window (`await_reply_on`) keeps its connection — and the socket — until
-    /// the window lapses (`POLL_TIMEOUT`). Tightened to a prompt release once
-    /// agent-mesh closes the endpoint in `IrohTransport::close`.
-    const RELEASE_BOUND: Duration = Duration::from_secs(35);
+    /// How long a closed uplink's port may stay bound: `Bus::close` closes the
+    /// endpoint (agent-mesh#98), so release is prompt even with a poll's reply
+    /// window (`POLL_TIMEOUT`) still open.
+    const RELEASE_BOUND: Duration = Duration::from_secs(5);
 
     async fn hub_for(user: &UserKey) -> (DockClient, PeerEndpoint) {
         let agent = dock_agent(user, DockRole::Hub, "hub");
@@ -826,8 +822,8 @@ mod tests {
     }
 
     /// Close while backing off after failed polls (the "hub" refuses every
-    /// connection): `close` returns promptly, and with no reply window open the
-    /// port is released promptly too.
+    /// connection): `close` returns promptly and the port is released within
+    /// [`RELEASE_BOUND`].
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn dock_uplink_closes_during_backoff() {
@@ -848,10 +844,7 @@ mod tests {
         .expect("a refused poll puts the uplink in backoff");
         let port = uplink.local_port();
         close_within_5s(uplink, "backoff").await;
-        assert!(
-            port_released(port, Duration::from_secs(5)).await,
-            "port still bound"
-        );
+        assert!(port_released(port, RELEASE_BOUND).await, "port still bound");
         refusing.close().await.unwrap();
     }
 
