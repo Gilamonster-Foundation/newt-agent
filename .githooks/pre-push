@@ -101,11 +101,13 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 # ADDED lines in the commits being pushed. Mirrors the `pr-pre-review` skill.
 # Use RFC5737 TEST-NET (192.0.2.x / 198.51.100.x / 203.0.113.x) or a placeholder
 # in examples, and keep real values in ~/.newt. Do NOT bypass with --no-verify.
-NET_LEAK_RE='(\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b169\.254\.[0-9]{1,3}\.[0-9]{1,3}\b)|([A-Za-z0-9_-]+\.(home\.(lan|lab)|ts\.net)\b)|(tail[a-z0-9]+\.ts\.net)'
-# Allowed: RFC5737 TEST-NET, loopback/unspecified, and the canonical generic
-# private examples (10.0.0.1 etc.) that tests/docs legitimately need (e.g. the
-# notes-scanner's RFC-1918 locality fixture). These reveal no home topology.
-NET_LEAK_ALLOW='192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|127\.0\.0\.1|0\.0\.0\.0|\b10\.0\.0\.1\b|\b192\.168\.0\.1\b'
+NET_LEAK_RE='(\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b|\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b|\b169\.254\.[0-9]{1,3}\.[0-9]{1,3}\b)(/[0-9]+)?|[A-Za-z0-9_-]+\.(home\.(lan|lab)|ts\.net)\b|tail[a-z0-9]+\.ts\.net'
+# Filter individual matches, never whole lines: a public example must not hide
+# a private neighbor. TEST-NET, loopback and unspecified addresses do not match
+# above. Retain the generic private examples and recognize only the public AWS
+# metadata constant (also in IPv4-mapped form) and exact RFC6598 range notation.
+# These source constants reveal no home topology; this grants no network access.
+NET_LEAK_ALLOW='10\.0\.0\.1|192\.168\.0\.1|169\.254\.169\.254|100\.64\.0\.0/10'
 _leaks=""
 _changed=""
 while read -r _lref _lsha _rref _rsha; do
@@ -131,9 +133,40 @@ $(git diff --name-only "$_range" 2>/dev/null || true)"
         _leak_range="origin/main..$_lsha"
     fi
     # Exclude .githooks/ — these scripts legitimately contain the IP/DNS regex.
-    _hits="$(git diff "$_leak_range" -- . ':(exclude).githooks/*' 2>/dev/null \
-             | grep -E '^\+' | grep -vE '^\+\+\+' \
-             | grep -nEi "$NET_LEAK_RE" | grep -vEi "$NET_LEAK_ALLOW" || true)"
+    # Python is also required by the existing docs/test gates. Scanner errors,
+    # a missing interpreter, and unreadable diffs must fail closed, not look
+    # like an empty set of matches. Pipefail covers the producer as well.
+    if ! _hits="$(set -o pipefail
+        git diff "$_leak_range" -- . ':(exclude).githooks/*' \
+            | python3 -c '
+import re
+import sys
+
+private = re.compile(sys.argv[1], re.IGNORECASE)
+allowed = re.compile(sys.argv[2], re.IGNORECASE)
+added_line = 0
+for line in sys.stdin:
+    if not line.startswith("+") or line.startswith("+++"):
+        continue
+    added_line += 1
+    for match in private.finditer(line):
+        token = match.group()
+        if allowed.fullmatch(token):
+            if token == "100.64.0.0/10":
+                before = line[match.start() - 1:match.start()]
+                after = line[match.end():match.end() + 1]
+                # A URL path or IPv6 suffix is not RFC6598 range notation.
+                # Nor may a longer CIDR/token inherit this exact exception.
+                if before in ("/", ":", "@") or (after and (after.isalnum() or after in "._/-")):
+                    print(f"{added_line}:{line}", end="")
+                    break
+            continue
+        print(f"{added_line}:{line}", end="")
+        break
+' "$NET_LEAK_RE" "$NET_LEAK_ALLOW")"; then
+        echo "[pre-push] network-leak scan failed; refusing to push without a complete privacy check."
+        exit 1
+    fi
     [ -n "$_hits" ] && _leaks="$_leaks
 [$_lref]
 $_hits"

@@ -20,6 +20,9 @@ FULL_GATE = ["check", "audit", "msrv", "cov-ci"]
 # Generated synthetic addresses exercise the guard without embedding a host.
 PRIVATE_FIXTURE = str(ipaddress.IPv4Network("10.0.0.0/8")[7])
 PRIVATE_ADDITION = str(ipaddress.IPv4Network("10.0.0.0/8")[8])
+METADATA_CONSTANT = "169.254.169.254"
+CGNAT_CONSTANT = "100.64.0.0/10"
+LINK_LOCAL_FIXTURE = str(ipaddress.IPv4Address(0xA9FE0007))
 # The hook prepends ~/.cargo/bin. Exported Bash functions keep these stubs ahead
 # of that path without changing HOME or accidentally invoking a real build.
 STUBS = r'''
@@ -69,10 +72,12 @@ class PrePushTests(unittest.TestCase):
         self.git("commit", "-qm", "Synthetic test fixture")
         return self.git("rev-parse", "HEAD")
 
-    def hook(self, local, remote):
+    def hook(self, local, remote, setup=""):
+        self.log.unlink(missing_ok=True)
         refs = f"refs/heads/feature {local} refs/heads/feature {remote}\n"
         result = subprocess.run(
-            ["bash", "-c", STUBS, "pre-push-test", str(HOOK)],
+            ["bash", "-c", STUBS.replace('exec bash "$1"', setup + '\nexec bash "$1"'),
+             "pre-push-test", str(HOOK)],
             cwd=self.root, env=self.env, input=refs, text=True,
             capture_output=True, timeout=30,
         )
@@ -129,6 +134,59 @@ class PrePushTests(unittest.TestCase):
     def test_new_branch_private_addition_still_fails(self):
         local = self.commit("addition.rs", PRIVATE_ADDITION + "\n")
         self.assert_blocked(local, ZERO, PRIVATE_ADDITION)
+
+    def test_public_network_constants_are_not_private_disclosures(self):
+        for literal in [METADATA_CONSTANT, "::ffff:" + METADATA_CONSTANT, CGNAT_CONSTANT,
+                        "10.0.0.1", "192.168.0.1", "127.0.0.1", "192.0.2.1"]:
+            with self.subTest(literal=literal):
+                local = self.commit("constant.rs", f'let public_constant = "{literal}";\n')
+                result, calls = self.hook(local, self.base)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(calls, FULL_GATE)
+
+    def test_noncanonical_link_local_and_cgnat_literals_stay_blocked(self):
+        cgnat = ipaddress.IPv4Network(CGNAT_CONSTANT)
+        for literal in [LINK_LOCAL_FIXTURE, "::ffff:" + LINK_LOCAL_FIXTURE,
+                        str(cgnat[0]), str(cgnat[7]), str(cgnat[0]) + "/11",
+                        str(cgnat[0]) + "/100", str(cgnat[0]) + "/010",
+                        CGNAT_CONSTANT + "suffix", METADATA_CONSTANT + "/24"]:
+            with self.subTest(literal=literal):
+                local = self.commit("constant.rs", f'let synthetic_endpoint = "{literal}";\n')
+                self.assert_blocked(local, self.base, literal)
+
+    def test_allowed_literal_does_not_mask_private_neighbor_on_same_line(self):
+        cgnat_host = str(ipaddress.IPv4Network(CGNAT_CONSTANT)[7])
+        private_dns = ".".join(("fixture", "home", "lan"))
+        for allowed in [METADATA_CONSTANT, "::ffff:" + METADATA_CONSTANT, CGNAT_CONSTANT,
+                        "10.0.0.1", "192.168.0.1", "127.0.0.1", "192.0.2.1"]:
+            for private in [PRIVATE_ADDITION, LINK_LOCAL_FIXTURE, cgnat_host, private_dns]:
+                for literals in [(allowed, private), (private, allowed)]:
+                    with self.subTest(literals=literals):
+                        local = self.commit("constant.rs", f'let values = {literals!r};\n')
+                        self.assert_blocked(local, self.base, private)
+
+    def test_cgnat_range_exception_is_not_an_endpoint_exception(self):
+        for literal in ["http://" + CGNAT_CONSTANT, "https://user@" + CGNAT_CONSTANT,
+                        "::ffff:" + CGNAT_CONSTANT]:
+            with self.subTest(literal=literal):
+                local = self.commit("constant.rs", f'let synthetic_endpoint = "{literal}";\n')
+                self.assert_blocked(local, self.base, literal)
+
+    def test_scanner_failure_refuses_before_builds(self):
+        local = self.commit("feature.rs", "fn fixture() {}\n")
+        result, calls = self.hook(
+            local, self.base, "python3() { return 73; }; export -f python3",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("network-leak scan failed", result.stdout)
+        self.assertEqual(calls, [])
+
+    def test_unreadable_diff_refuses_before_builds(self):
+        local = self.commit("feature.rs", "fn fixture() {}\n")
+        result, calls = self.hook(local, "f" * 40)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("network-leak scan failed", result.stdout)
+        self.assertEqual(calls, [])
 
     def test_docs_only_update_keeps_fast_path(self):
         local = self.commit("feature.md", "Safe documentation.\n")
