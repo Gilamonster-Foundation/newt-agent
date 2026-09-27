@@ -145,6 +145,12 @@ fn newt_is_only_constructed_through_the_isolation_helper() {
     ];
     for (name, src, baseline) in [
         ("cli_tests.rs", include_str!("cli_tests.rs"), 0usize),
+        ("headless_cli.rs", include_str!("headless_cli.rs"), 0),
+        (
+            "headless_cli/cognition.rs",
+            include_str!("headless_cli/cognition.rs"),
+            0,
+        ),
         ("worker_cli.rs", include_str!("worker_cli.rs"), 2),
         ("stdout_purity.rs", include_str!("stdout_purity.rs"), 0),
     ] {

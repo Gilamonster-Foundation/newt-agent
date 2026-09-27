@@ -142,11 +142,7 @@ pub(super) fn windows_appcontainer_native_git_refusal(
             agent_bridle::best_available_sandbox(&policy).kind(),
             caveats,
         );
-        appcontainer_native_git_refusal_for(
-            program.as_deref(),
-            effective_sandbox,
-            exec_allowed,
-        )
+        appcontainer_native_git_refusal_for(program.as_deref(), effective_sandbox, exec_allowed)
     }
 
     #[cfg(not(target_os = "windows"))]

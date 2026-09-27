@@ -3,7 +3,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use assert_cmd::Command;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -269,8 +268,7 @@ nemotron = "relentless"
     std::fs::write(workspace.path().join("tool-ground-truth.txt"), "present\n")
         .expect("write list_dir ground-truth marker");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -384,8 +382,7 @@ nemotron = "eager"
     .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Complete the task.\n").expect("write instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -476,7 +473,7 @@ bounded_reasoning_continuation = true
         let workspace = fixture.path().join(format!("ws-{name}"));
         std::fs::create_dir(&workspace).expect("create headless workspace");
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command.env_remove("NEWT_TEAM");
         if obsessive {
             command.arg("--obsessive");
@@ -570,8 +567,7 @@ async fn headless_refuses_an_invalid_output_allowance_before_inference() {
             "output_allowance 40000 leaves no input room in the declared 32768-token context window",
         ),
     ] {
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
@@ -654,7 +650,7 @@ output_allowance = 12000
         let config_path = fixture.path().join(format!("{name}.toml"));
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
         std::fs::write(&config_path, config).expect("write headless config");
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command
             .env_remove("NEWT_TEAM")
             .arg("--config")
@@ -709,8 +705,7 @@ async fn headless_with_an_exhausted_run_allowance_refuses_dispatch_before_any_re
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
@@ -780,8 +775,7 @@ async fn headless_run_allowance_is_reported_when_set_and_absent_when_not() {
         ("unconfigured", vec![], false),
     ] {
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
@@ -843,7 +837,7 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
         .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
     let headless = |extra: &[&std::ffi::OsStr]| {
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
@@ -921,8 +915,7 @@ async fn headless_scratchpad_state_reaches_wire_and_receipt() {
         .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
@@ -1011,8 +1004,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
     for kind in ["openai", "anthropic"] {
-        let output = Command::cargo_bin("newt")
-            .expect("newt binary")
+        let output = common::newt()
             .env_remove("NEWT_TEAM")
             .env_remove("NEWT_ANTHROPIC_STREAM")
             .args(["--backend-endpoint", &server.uri()])
@@ -1036,8 +1028,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
 
     // The answer is shown before anything that can fail: an unwritable
     // --events path (a directory) fails the run, and the claim is still there.
-    let output = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let output = common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
@@ -1087,8 +1078,7 @@ async fn headless_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
-    let output = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let output = common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
@@ -1158,8 +1148,7 @@ kind = "openai"
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "operator-model"])
@@ -1237,8 +1226,7 @@ api = "chat_completions"
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--cognition", "meticulous"])
         .arg("--config")
@@ -1459,8 +1447,7 @@ kind = "openai"
     )
     .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -1622,8 +1609,7 @@ kind = "openai"
     .expect("write headless config");
     std::fs::write(&instruction_path, "Read the seed file.\n").expect("write headless instruction");
 
-    let _ = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let _ = common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -1732,8 +1718,7 @@ kind = "openai"
     std::fs::write(&instruction_path, "Verify the change builds.\n")
         .expect("write headless instruction");
 
-    let _ = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let _ = common::newt()
         .env_remove("NEWT_TEAM")
         .env_remove("NEWT_SCRATCH_DIR")
         .env_remove("NEWT_BUILD_SCRATCH_DIR")
@@ -1876,8 +1861,7 @@ async fn headless_reports_verification_off_where_the_loop_has_no_gate() {
         let events_path = fixture.path().join("events.jsonl");
         std::fs::write(&instruction_path, "Finish without calling a tool.\n")
             .expect("write headless instruction");
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .env("NEWT_SELF_VERIFY", "1")
             .env("NEWT_VERIFY_OUTCOMES", "1")
@@ -1948,7 +1932,7 @@ kind = "openai"
     }
     std::fs::write(&config_path, config).expect("write headless config");
     std::fs::write(&instruction_path, "Say done.\n").expect("write headless instruction");
-    let mut command = Command::cargo_bin("newt").expect("newt binary");
+    let mut command = common::newt();
     command
         .env_remove("NEWT_TEAM")
         .arg("--config")
@@ -2142,8 +2126,7 @@ async fn a_run_that_fails_after_a_write_hands_back_what_it_changed() {
     std::fs::write(&instruction, "Write out.txt.\n").expect("write instruction");
     let events_path = control.path().join("events.jsonl");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .env("NEWT_HTTP_MAX_RETRIES", "0")
         .arg("--config")
@@ -2215,8 +2198,7 @@ async fn handback_from_a_no_op_run(
     std::fs::write(&instruction, "Just answer, don't touch anything.\n")
         .expect("write instruction");
     let events_path = control.join("events.jsonl");
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -2741,8 +2723,7 @@ async fn assert_write_then_no_progress_stops(api: &str) {
     std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
     let events_path = control.path().join("events.jsonl");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -2873,8 +2854,7 @@ async fn an_idless_reask_round_is_counted_by_the_brake_and_does_not_reset_it() {
     std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
     let events_path = control.path().join("events.jsonl");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
