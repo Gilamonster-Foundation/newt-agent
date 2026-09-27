@@ -1302,7 +1302,10 @@ api = "chat_completions"
 // read-only round a DISTINCT path, so the rounds are burned the way the
 // captured run burned them — by legitimate, succeeding, redundant work — and
 // not by a mechanism that already has its own guard.
-const CAP_ROUNDS: usize = 8;
+// Three writes + one fresh read + seven duplicate observations exceed the
+// bundled workflows' six-round recent-progress horizon without hitting the
+// twelve-round no-progress brake. This tests the renewable allowance expiring.
+const CAP_ROUNDS: usize = 11;
 const EARLY_WRITES: usize = 3;
 
 /// Reads the ONE `solve_result` line. Sibling of [`contract_from`], which
@@ -1386,6 +1389,16 @@ impl Respond for WritesEarlyThenGrindsReadOnly {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn round_cap_exit_is_not_reported_as_a_completed_run() {
+    assert_round_cap_exit(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_zero_grace_stops_fresh_evidence_at_the_round_cap() {
+    assert_round_cap_exit(true).await;
+}
+
+async fn assert_round_cap_exit(hard_cap: bool) {
+    let cap_rounds = if hard_cap { 8 } else { CAP_ROUNDS };
     let server = MockServer::start().await;
     let rounds_served = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -1400,17 +1413,27 @@ async fn round_cap_exit_is_not_reported_as_a_completed_run() {
     let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let src = workspace.path().join("src");
     std::fs::create_dir_all(&src).expect("workspace src dir");
-    // One readable seed per grinding round, so every read SUCCEEDS. A grind
-    // made of failures would be a different defect (thrash), already covered by
-    // `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit`.
-    for n in 0..(CAP_ROUNDS + 4) {
+    // Distinct paths ensure every read executes. Identical bytes provide no new
+    // evidence after the first read, giving the default cap a controlled stall.
+    // The explicit hard-cap case instead supplies fresh evidence every round:
+    // zero grace must stop even useful work at the operator's chosen bound.
+    for n in 0..(cap_rounds + 4) {
         std::fs::write(
             src.join(format!("seed_{n}.rs")),
-            format!("pub const SEED_{n}: u32 = {n};\n"),
+            if hard_cap {
+                format!("pub const SEED_{n}: u32 = {n};\n")
+            } else {
+                "pub const OBSERVED: u32 = 0;\n".to_string()
+            },
         )
         .expect("write seed file");
     }
 
+    let round_policy = if hard_cap {
+        "\n[tui]\nworkflow_grace_rounds = 0\n"
+    } else {
+        ""
+    };
     let config_path = workspace.path().join("headless.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
@@ -1424,6 +1447,7 @@ name = "capped"
 endpoint = "{}"
 model = "{NEMOTRON_MODEL}"
 kind = "openai"
+{round_policy}
 "#,
             server.uri()
         ),
@@ -1446,7 +1470,7 @@ kind = "openai"
         .arg(&instruction_path)
         .arg("--events")
         .arg(&events_path)
-        .args(["--max-rounds", &CAP_ROUNDS.to_string()])
+        .args(["--max-rounds", &cap_rounds.to_string()])
         .assert()
         .success();
 
@@ -1459,12 +1483,12 @@ kind = "openai"
     // rather than any capped run.
     let served = rounds_served.load(Ordering::SeqCst);
     assert_eq!(
-        served, CAP_ROUNDS,
-        "the scripted model must have served exactly {CAP_ROUNDS} tool rounds; \
+        served, cap_rounds,
+        "the scripted model must have served exactly {cap_rounds} tool rounds; \
          served {served} — the replay did not run the trajectory it claims to"
     );
     assert_eq!(
-        result["tool_calls"], CAP_ROUNDS as u64,
+        result["tool_calls"], cap_rounds as u64,
         "the harness must have dispatched every scripted round: {result}"
     );
     assert_eq!(
@@ -1486,6 +1510,17 @@ kind = "openai"
         writes_ok, EARLY_WRITES,
         "the early writes must have SUCCEEDED, not merely been attempted: {result}"
     );
+    let reads_ok = result["trajectory"]
+        .as_array()
+        .expect("trajectory is an array")
+        .iter()
+        .filter(|e| e["tool"] == "read_file" && e["ok"] == true)
+        .count();
+    assert_eq!(
+        reads_ok,
+        cap_rounds - EARLY_WRITES,
+        "every distinct-path tail read must execute successfully: {result}"
+    );
 
     // ── the typed grind measurement (#2214) ───────────────────────────────
     // RED against e3f42a36: the record has no such key, so this reads `null`.
@@ -1495,14 +1530,14 @@ kind = "openai"
     // from a genuinely-too-small cap, all three of which say `RoundCap` today.
     //
     // The expected value is in CALLS, not rounds. It equals
-    // `CAP_ROUNDS - EARLY_WRITES` only because this scripted model issues
+    // `cap_rounds - EARLY_WRITES` only because this scripted model issues
     // exactly one call per round; a fixture that ever batches two calls into a
     // round must recompute it from the trajectory rather than from the round
-    // counts. 5 is neither 0 nor `tool_calls` (8), so neither a constant-zero
-    // implementation nor an off-by-the-whole-length one passes.
+    // counts. The tail is neither zero nor the whole trajectory, so neither
+    // a constant-zero implementation nor an off-by-the-whole-length one passes.
     assert_eq!(
         result["calls_after_last_write"],
-        (CAP_ROUNDS - EARLY_WRITES) as u64,
+        (cap_rounds - EARLY_WRITES) as u64,
         "the run spent its whole tail after the work was done; that must be a \
          value a gate can assert, not prose in the reply: {result}"
     );
@@ -2707,21 +2742,21 @@ async fn assert_write_then_no_progress_stops(api: &str) {
     let requests = requests.lock().expect("capture");
     assert_eq!(
         requests.len(),
-        4,
-        "write, then three grinding rounds; no summary call"
+        5,
+        "write, new directory evidence, then three grinding rounds; no summary call"
     );
     assert!(
         requests.iter().all(|r| r.get("tools").is_some()),
         "no tools-disabled summary"
     );
     // Chat bodies carry `messages`; Responses bodies carry `input`.
-    let last_messages = requests[3]
+    let last_messages = requests[4]
         .get("messages")
-        .or_else(|| requests[3].get("input"))
+        .or_else(|| requests[4].get("input"))
         .expect("messages or input")
         .to_string();
     assert!(
-        last_messages.contains("rounds have passed since your last successful change"),
+        last_messages.contains("rounds produced no new evidence"),
         "the steer must precede the final round: {last_messages}"
     );
 }

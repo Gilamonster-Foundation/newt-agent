@@ -414,7 +414,13 @@ fn a_real_confined_cargo_check_succeeds_under_the_narrowed_read_set() {
     std::fs::create_dir_all(ws.path().join("src")).unwrap();
     std::fs::write(ws.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
 
-    let req = build_tool_request(ws.path(), ws.path(), "cargo", ["check", "--offline"]);
+    let req = build_tool_request(
+        ws.path(),
+        ws.path(),
+        "cargo",
+        ["check", "--offline"],
+        &Scope::none(),
+    );
     let out = ConstrainedExecutor::run(&req)
         .expect("a confined cargo check must run under Landlock on this host");
     assert_eq!(

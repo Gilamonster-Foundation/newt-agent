@@ -1059,20 +1059,6 @@ pub(crate) fn advertise(mut tools: Value, harness: Option<&SmartHarness>) -> Val
         if let Some(tools) = tools.as_array_mut() {
             tools
                 .retain(|tool| !matches!(tool["function"]["name"].as_str(), Some("crew" | "find")));
-            for tool in tools.iter_mut() {
-                if tool["function"]["name"] == "run_command" {
-                    tool["function"]["description"] = Value::String(
-                        "Run a command in the confined workspace shell. File access must remain \
-                         within fs_read/fs_write grants. Prefer dedicated file and lifecycle tools. \
-                         Use lifecycle action=build for explicit offline Cargo/compiler validation. \
-                         Use shell find for recursive searches. \
-                         Scoped shell Git reads and staging are supported; shell Git commits are \
-                         refused to preserve harness attribution. Other commands with advertised \
-                         dedicated tools must invoke those tools directly."
-                            .into(),
-                    );
-                }
-            }
             tools.push(
                 serde_json::from_str(include_str!("re_read.json"))
                     .expect("bundled re_read tool is valid JSON"),
@@ -1428,11 +1414,10 @@ mod tests {
         assert!(definition(&smart, "compose_roster").is_some());
         assert!(definition(&smart, "re_read").is_some());
         assert_eq!(definition(&smart, "git"), definition(&legacy, "git"));
-        let command = definition(&smart, "run_command").unwrap();
-        let description = command["function"]["description"].as_str().unwrap();
-        assert!(description.contains("lifecycle action=build"));
-        assert!(description.contains("Scoped shell Git reads and staging"));
-        assert!(description.contains("Git commits are refused"));
+        assert_eq!(
+            definition(&smart, "run_command"),
+            definition(&legacy, "run_command")
+        );
         assert_eq!(advertise(legacy.clone(), None), legacy);
     }
 

@@ -137,8 +137,8 @@ fn tool(dir: &Path) -> LocalGitTool {
             None,
             "noreply@newt-agent.com",
         )),
-        commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
-        contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+        commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         signer: None,
     }
 }

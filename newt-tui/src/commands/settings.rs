@@ -246,7 +246,7 @@ fn explicit_relentless_round_note() -> Option<&'static str> {
         Some(newt_core::Tenacity::Relentless)
     )
     .then_some(
-        "explicit relentless tenacity makes the default tool-round budget effectively unlimited; an explicit `/rounds` override still wins",
+        "explicit relentless tenacity makes the initial tool-round allowance effectively unlimited; an explicit `/rounds` overrides the initial value; progress renewal still applies",
     )
 }
 
@@ -313,7 +313,7 @@ fn tenacity_command(arg: &str) -> String {
                 // arm below mutates nothing and records nothing.
                 apply_setting(Field::Tenacity, level.label(), "/psyche tenacity");
                 let rounds = if level == Tenacity::Relentless {
-                    "; default tool-round budget → effectively unlimited (an explicit `/rounds` override still wins)"
+                    "; initial tool-round allowance → effectively unlimited (an explicit `/rounds` overrides the initial value; progress renewal still applies)"
                 } else {
                     ""
                 };
@@ -476,8 +476,8 @@ fn psyche_command(rest: &str) -> String {
         apply_setting(Field::Tenacity, ten.label(), "/psyche obsessive");
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}, \
-             default tool-round budget → effectively unlimited (an explicit \
-             `/rounds` override still wins); initiative stays {}.\n\
+             initial tool-round allowance → effectively unlimited (an explicit \
+             `/rounds` overrides the initial value; progress renewal still applies); initiative stays {}.\n\
              crew is a launch gate — relaunch with `newt --obsessive` (or set \
              NEWT_TEAM) to add the crew this session.",
             cog.label(),

@@ -1,17 +1,14 @@
 use super::*;
 
-/// **The fix.** A statement of fact no longer buys execution authority.
-///
-/// Before this, the prompt matched no action, research or explain needle,
-/// did not end in `?`, and fell through to `Act` — full authority and the
-/// full round budget, granted on the absence of any evidence of intent.
+/// A statement of fact calls for an explanation rather than inventing an
+/// action request. Classification itself neither grants nor revokes authority.
 #[test]
-fn an_informational_prompt_does_not_grant_act_authority() {
+fn an_informational_prompt_does_not_invent_an_action_request() {
     let intake = PromptIntake::analyze(GIT_REMOTE_FYI);
     assert_eq!(
         intake.disposition(),
         PromptDisposition::Explain,
-        "a stated fact authorizes nothing"
+        "a stated fact does not request a new action"
     );
     assert!(
         intake.atomic_asks().iter().all(AtomicAsk::is_informational),
@@ -20,29 +17,16 @@ fn an_informational_prompt_does_not_grant_act_authority() {
     );
 }
 
-/// **Why `Explain` and not `Research`** — the decision, made visible so it
-/// can be overruled in one enum value.
-///
-/// The defect is AUTHORITY, not budget: an informational turn was granted
-/// the power to mutate, and mutate is what it did. `Explain` removes that
-/// and keeps the ordinary round budget, because a stated fact often
-/// deserves a read before answering — "the remote is X" may reasonably be
-/// checked against the remote actually configured. `Research` would also
-/// cap rounds at 3, which is a COST heuristic wearing an authorization
-/// rule's clothes, and would tell the model to go gather evidence when what
-/// it was given was a fact.
-///
-/// `Ask` is excluded for a different reason: it is terminal with a ZERO
-/// round limit, so routing every unclassified statement there would end the
-/// turn without a reply and nag on each one.
+/// Ordinary observations may require commands. Preserve session authority and
+/// budget; an informational clause still cannot resolve a pending decision.
 #[test]
-fn an_informational_turn_keeps_its_budget_and_loses_its_authority() {
+fn an_informational_turn_preserves_session_authority_and_budget() {
     let intake = PromptIntake::analyze(GIT_REMOTE_FYI);
     assert_eq!(intake.disposition(), PromptDisposition::Explain);
     assert_eq!(
         intake.disposition().tool_round_limit(8),
         8,
-        "the budget is unchanged — this fix is about authority"
+        "inferred response style does not narrow the configured budget"
     );
     assert_eq!(
         PromptDisposition::Ask.tool_round_limit(8),
@@ -50,8 +34,8 @@ fn an_informational_turn_keeps_its_budget_and_loses_its_authority() {
         "…and Ask is excluded because it is terminal, not merely strict"
     );
     assert!(
-        intake.model_card().contains("answer without mutation"),
-        "the model is told it may not mutate: {}",
+        intake.model_card().contains("session grants"),
+        "the model is told which authority governs its tools: {}",
         intake.model_card()
     );
 }

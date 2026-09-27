@@ -530,13 +530,20 @@ fn approval_without_a_receipt_queues_nothing() {
 #[test]
 fn exit_plan_mode_only_requests_and_the_request_is_read_once() {
     let states = ConversationModeStates::default();
+    assert!(!states.plan.exit_requested());
     states.plan.set_plan_mode(true).unwrap();
     states.plan.request_exit().unwrap();
     assert!(
         states.plan.is_plan_mode(),
         "request does not lift the clamp"
     );
+    assert!(states.plan.exit_requested());
+    assert!(
+        states.plan.exit_requested(),
+        "the loop only observes the request"
+    );
     assert!(states.plan.take_exit_requested());
+    assert!(!states.plan.exit_requested());
     assert!(!states.plan.take_exit_requested(), "consumed once");
     assert!(states.plan.is_plan_mode());
 }

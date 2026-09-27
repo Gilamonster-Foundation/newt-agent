@@ -194,6 +194,9 @@ mod authentication;
 #[path = "tool_round_cap/loop_controls.rs"]
 mod loop_controls;
 
+#[path = "tool_round_cap/progress_continuation.rs"]
+mod progress_continuation;
+
 #[cfg(test)]
 #[path = "tool_round_cap/responses_protocol.rs"]
 mod responses_protocol;

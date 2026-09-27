@@ -2709,6 +2709,78 @@ fn session_grant_cannot_pierce_the_preset_floor() {
 }
 
 #[test]
+fn explicit_operating_mode_ceiling_survives_permission_grants() {
+    use crate::OperatingMode;
+
+    for (configured, model_plan_phase) in [
+        (OperatingMode::Diagnose, false),
+        (OperatingMode::Plan, false),
+        (OperatingMode::Auto, true),
+    ] {
+        let mut state = PermissionPromptState::default();
+        state.session_grants.extend([
+            (DenialKind::Exec, "git".into()),
+            (DenialKind::FsWrite, "/outside/recalled".into()),
+        ]);
+        let base = crate::operating_mode_caveats(configured, model_plan_phase, base_caveats("/ws"));
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce, PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        gate.preset_clamp =
+            crate::operating_mode_permission_clamp(configured, model_plan_phase, None);
+        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+            panic!("refresh returns the attenuated authority");
+        };
+        assert_eq!(
+            refreshed.fs_read, base.fs_read,
+            "the existing read grant survives"
+        );
+        assert!(
+            !refreshed.permits_exec("git"),
+            "recalled exec bypassed {configured:?}"
+        );
+        assert_eq!(
+            refreshed.fs_write,
+            Scope::none(),
+            "recalled write bypassed {configured:?}"
+        );
+
+        for _ in 0..2 {
+            let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")])
+            else {
+                panic!("scripted operator allowed the request");
+            };
+            assert!(
+                !granted.permits_exec("npm"),
+                "new grant bypassed {configured:?}"
+            );
+        }
+        assert_eq!(prompts.get(), 2, "once and session choices were exercised");
+        let request = PermissionRequest {
+            tool: "write_file".into(),
+            kind: DenialKind::FsWrite,
+            target: "/outside/new".into(),
+            reason: "test explicit mode ceiling".into(),
+        };
+        assert!(matches!(
+            gate.ask(&[request]),
+            newt_core::PermissionDecision::Deny
+        ));
+    }
+
+    assert!(
+        crate::operating_mode_permission_clamp(OperatingMode::Auto, false, None).is_none(),
+        "an inferred working style must not introduce a grant ceiling"
+    );
+}
+
+#[test]
 fn allow_session_never_reprompts_until_restart() {
     let prompts = Rc::new(Cell::new(0));
     let base = base_caveats("/ws");
@@ -3372,6 +3444,9 @@ async fn native_once_filesystem_pending_grants_survive_until_the_declared_retry(
     std::fs::write(&output, "BEFORE\n").unwrap();
     let baseline = Caveats {
         exec: Scope::only(["/bin/echo".into()]),
+        // This macOS fixture tests one-shot filesystem/exec attenuation.
+        // Restricted networking is unavailable independently of those grants.
+        net: Scope::All,
         ..newt_core::confined_exec::workspace_confined_caveats(&root)
     };
     let mut state = PermissionPromptState::default();
@@ -4151,6 +4226,62 @@ fn preset_build_ceiling_refuses_before_prompting() {
         newt_core::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
+}
+
+#[test]
+fn managed_build_scratch_reuses_session_approval_without_widening_the_shell() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let target = workspace.to_string_lossy().into_owned();
+    let base = base_caveats(&target);
+    let mut build = newt_core::confined_exec::build_tool_caveats(&workspace);
+    build.net = Scope::All;
+    let request = PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Build,
+        target,
+        reason: "native cargo with private build scratch".into(),
+    };
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowSession],
+        prompts.clone(),
+    );
+    for _ in 0..2 {
+        let decision = gate.ask_with_caveats(&build, std::slice::from_ref(&request));
+        let newt_core::PermissionDecision::Allow(actual) = decision else {
+            panic!("approved Build refused")
+        };
+        assert_eq!(actual, build);
+    }
+    assert_eq!(
+        prompts.get(),
+        1,
+        "one session approval covers subsequent builds"
+    );
+    assert_eq!(
+        base.fs_write,
+        Scope::only([workspace.to_string_lossy().into_owned()])
+    );
+    let scratch = newt_core::confined_exec::build_scratch_dir(&workspace);
+    assert!(
+        !scratch.exists(),
+        "permission projection creates no scratch"
+    );
+    assert!(!newt_core::caveats::permits_path(
+        &base.fs_write,
+        &scratch.to_string_lossy()
+    ));
+    assert!(newt_core::caveats::permits_path(
+        &build.fs_write,
+        &scratch.to_string_lossy()
+    ));
+    assert!(!ceiling_permits(&base, DenialKind::Build, &request.target));
 }
 
 #[test]

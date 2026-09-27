@@ -633,6 +633,9 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
     let ws = tempfile::TempDir::new().unwrap();
     let denied = Caveats {
         exec: Scope::none(),
+        // Isolate exec retry lifecycle from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
         ..caveats_rw(ws.path())
     };
     let mut gate = MockGate::new(true, &denied);
@@ -709,6 +712,9 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
     let ws = tempfile::TempDir::new().unwrap();
     let denied = Caveats {
         exec: Scope::none(),
+        // Isolate gate reuse from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
         ..caveats_rw(ws.path())
     };
     let mut gate = MockGate::new(true, &denied);
@@ -797,6 +803,8 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
             image.to_string_lossy().into_owned(),
         ]),
         fs_write: Scope::none(),
+        // This tests exact exec authority, not unsupported macOS network rules.
+        net: Scope::All,
         ..caveats_rw(&root)
     };
     let mut gate = MockGate::new(true, &base);
@@ -1040,6 +1048,9 @@ async fn native_once_filesystem_declarations_reach_only_the_admitted_child() {
     std::fs::write(&sibling, "SIBLING_UNCHANGED\n").unwrap();
     let baseline = Caveats {
         exec: Scope::only(["/bin/cp".into()]),
+        // This fixture tests filesystem admission. Restricted network authority
+        // is unsupported by the macOS backend and would fail before the copy.
+        net: Scope::All,
         ..crate::confined_exec::workspace_confined_caveats(&root)
     };
     let command = format!("/bin/cp '{}' '{}'", input.display(), output.display());
@@ -1167,6 +1178,8 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
     }
     let baseline = Caveats {
         exec: Scope::only(["/usr/bin/head".into()]),
+        // Reach the filesystem denial; macOS cannot admit restricted networking.
+        net: Scope::All,
         ..crate::confined_exec::workspace_confined_caveats(&root)
     };
     let mut gate = SessionGate {

@@ -52,6 +52,14 @@ async fn run_command_allowed_external_succeeds() {
     let _engine = ShellEngineGuard::safe_subset();
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_exec_only(&["env"]);
+    // This positive control exercises executable admission. macOS cannot
+    // establish a restricted network boundary; declare that independent
+    // fixture authority while retaining the exact exec allowlist.
+    #[cfg(target_os = "macos")]
+    let caveats = Caveats {
+        net: Scope::All,
+        ..caveats
+    };
     let args = serde_json::json!({ "command": "env" });
     let out = execute_tool(
         "run_command",

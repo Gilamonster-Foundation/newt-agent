@@ -71,14 +71,14 @@ pub const KNOWN_KNOBS: &[KnownKnob] = &[
         scope: KnobScope::PerModelEff,
         min: 1,
         max: 10_000,
-        doc: "tool-call rounds before the loop stops (10000 = effectively unlimited)",
+        doc: "initial tool-call round allowance; fresh progress can renew it",
     },
     KnownKnob {
         key: "workflow_grace_rounds",
         scope: KnobScope::PerModelEff,
         min: 0,
         max: 1_000,
-        doc: "extra rounds granted after a workflow reports done",
+        doc: "renewable rounds per fresh-progress window (0 = hard round cap)",
     },
     KnownKnob {
         key: "narration_nudge_cap",

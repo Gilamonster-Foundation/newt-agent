@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn explain_and_research_receive_their_intended_bounded_tool_loops() {
+fn response_style_preserves_the_configured_round_allowance() {
     let explain = PromptIntake::analyze("Explain how prompt receipts survive compaction.");
     let research = PromptIntake::analyze("Investigate the current compaction behavior.");
 
@@ -9,7 +9,7 @@ fn explain_and_research_receive_their_intended_bounded_tool_loops() {
     assert_eq!(research.disposition(), PromptDisposition::Research);
     assert_eq!(PromptDisposition::Ask.tool_round_limit(40), 0);
     assert_eq!(PromptDisposition::Explain.tool_round_limit(40), 40);
-    assert_eq!(PromptDisposition::Research.tool_round_limit(40), 3);
+    assert_eq!(PromptDisposition::Research.tool_round_limit(40), 40);
     assert_eq!(PromptDisposition::Plan.tool_round_limit(40), 40);
 }
 

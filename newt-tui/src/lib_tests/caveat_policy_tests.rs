@@ -44,6 +44,40 @@ fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
 }
 
 #[test]
+fn workspace_access_launch_keeps_directory_fence_and_configured_network() {
+    let _env = crate::test_env_guard::env_write_guard();
+    let mut tui = tui_with(newt_core::PermissionPreset::ReadOnly);
+    tui.permissions.net = vec!["docs.rs".into()];
+    let policy = super::policy_for_launch(
+        Some(tui),
+        "/workspace",
+        newt_core::launch_authority::LaunchAuthority::WORKSPACE_ACCESS,
+    );
+    assert!(policy.permits_exec("rm"));
+    assert!(policy.permits_exec("arbitrary-workspace-program"));
+    assert!(newt_core::caveats::permits_path(
+        &policy.fs_write,
+        "/workspace/dir/file"
+    ));
+    assert!(!newt_core::caveats::permits_path(
+        &policy.fs_write,
+        "/workspace/../sibling/file"
+    ));
+    assert!(!newt_core::caveats::permits_path(
+        &policy.fs_read,
+        "/outside/file"
+    ));
+    assert_eq!(policy.net, newt_core::Scope::only(["docs.rs".into()]));
+    let no_config = super::policy_for_launch(
+        None,
+        "/workspace",
+        newt_core::launch_authority::LaunchAuthority::WORKSPACE_ACCESS,
+    );
+    assert_eq!(no_config.net, newt_core::Scope::none());
+    assert!(no_config.permits_exec("rm"));
+}
+
+#[test]
 fn absent_config_is_read_only() {
     // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
     // / NEWT_VENV via scan_cli_exec_grants. We also neutralize an ambient

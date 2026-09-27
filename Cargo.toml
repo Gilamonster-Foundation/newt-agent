@@ -28,6 +28,7 @@ members = [
     "agent-frame",
     "agent-harness",
     "agent-harness-py",
+    "agent-toolchain",
     "plugins-protocol",
     "providers/openai",
     "tests/common",
@@ -43,7 +44,19 @@ members = [
 #   cargo test --manifest-path newt-mesh/Cargo.toml
 #
 # See docs/decisions/mesh_integration.md for the full rationale.
-exclude = ["newt-mesh", "newt-web"]
+exclude = [
+    "newt-mesh",
+    "newt-web",
+    "vendor/agent-bridle-tool-shell",
+    "vendor/agent-bridle-core",
+    "vendor/agent-bridle-fdguard",
+]
+
+# Temporary, reproducible integration patch; see vendor/agent-bridle-tool-shell/NEWT_PATCHES.md.
+[patch.crates-io]
+agent-bridle-tool-shell = { path = "vendor/agent-bridle-tool-shell" }
+agent-bridle-core = { path = "vendor/agent-bridle-core" }
+agent-bridle-fdguard = { path = "vendor/agent-bridle-fdguard" }
 
 [workspace.package]
 # Semver — 0.7.1 (see the version block above); 0.6.8 was: the honest, measurable, family-aware harness — verify oracle
@@ -108,6 +121,7 @@ authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 agent-frame = { path = "agent-frame", version = "=0.8.0" }
 agent-harness = { path = "agent-harness", version = "=0.8.0" }
 agent-harness-py = { path = "agent-harness-py", version = "=0.8.0" }
+agent-toolchain = { path = "agent-toolchain", version = "0.1.0" }
 # Core utilities
 anyhow = "1.0"
 thiserror = "2.0"

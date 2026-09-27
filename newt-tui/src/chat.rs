@@ -658,10 +658,10 @@ fn intake_for_accepted_prompt(
 }
 
 /// Comprehend an accepted prompt, record its disposition, then apply the
-/// turn's operating mode — in that order (#2332). The record holds what the
-/// prompt asked for; the mode is the operator's CURRENT narrowing, so a
-/// resumed task keeps its recorded disposition and current permissions still
-/// win. `mode_for` picks the turn's mode from the comprehended intake.
+/// explicitly selected authority mode — in that order (#2332). The record
+/// holds what the prompt asked for. `mode_for` returns the working style and
+/// the authority mode separately: inferred style never narrows accepted work,
+/// while an operator mode or an active model Plan phase still does.
 fn comprehend_accepted_prompt(
     origin: &ModelInputOrigin,
     task: &str,
@@ -669,14 +669,14 @@ fn comprehend_accepted_prompt(
     context: Option<&newt_core::TurnPromptContext>,
     recorded: &mut RecordedDispositions,
     lexicon: &newt_core::agentic::DispositionLexicon,
-    mode_for: impl FnOnce(&newt_core::agentic::PromptIntake) -> OperatingMode,
+    mode_for: impl FnOnce(&newt_core::agentic::PromptIntake) -> (OperatingMode, OperatingMode),
 ) -> (newt_core::agentic::PromptIntake, OperatingMode) {
     let mut intake = intake_for_accepted_prompt(origin, task, pending, recorded, lexicon);
     if let Some(context) = context {
         record_turn_disposition(recorded, context, &intake);
     }
-    let mode = mode_for(&intake);
-    apply_operating_mode_to_intake(mode, &mut intake);
+    let (mode, authority_mode) = mode_for(&intake);
+    apply_operating_mode_to_intake(authority_mode, &mut intake);
     (intake, mode)
 }
 
@@ -3072,11 +3072,11 @@ fn session_body(
             // zero; the `commit`/`amend`/`rebase` arms increment it on a
             // confirmed successful `eng.*` call, and the loop drains it below
             // to clear the ledger ONLY on a real Newt commit (not a `HEAD` diff).
-            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // #1709 family: the contributor-consumption cursor — starts at 0,
             // reset to 0 at the top of every loop iteration (below) when the
             // envelope is refreshed from the live model + ledger snapshot.
-            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+            contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // Refreshed each turn below, so a `/settings git-signing` change
             // applies to the next commit.
             signer: newt_core::commit_signing::session_signer(&session_identity),
@@ -3123,9 +3123,9 @@ fn session_body(
             // active model driving THIS turn is merged in by the finalizer
             // regardless, so this snapshot + the active-model merge credits
             // every contributor on the one commit. The ledger is cleared on
-            // commit success below, and the next refresh re-snapshots the
-            // (now empty) ledger, so contributors never carry past the commit
-            // that consumed them.
+            // confirmed publication inside the tool loop. The next refresh
+            // includes only later work plus conservative active-model credit
+            // for native shell calls that may write after committing.
             ca.contributors = attribution_ledger.borrow().contributors().to_vec();
             tool.attribution = Some(ca);
             tool.signer = newt_core::commit_signing::session_signer(
@@ -3507,6 +3507,7 @@ fn session_body(
                                 state: &mut permission_state,
                                 base: operating_mode_caveats(
                                     active_operating_mode,
+                                    conversation_mode_states.plan.is_active(),
                                     effective_caveats(cap.caveats(), posture.as_ref()),
                                 ),
                                 key_path: key_path.clone(),
@@ -3514,10 +3515,14 @@ fn session_body(
                                 log_path: permission_log_path.clone(),
                                 denials_path: permission_denials_path.clone(),
                                 config_path: permission_config_path.clone(),
-                                preset_clamp: posture
-                                    .as_ref()
-                                    .and_then(ActivePosture::permission_clamp)
-                                    .cloned(),
+                                preset_clamp: operating_mode_permission_clamp(
+                                    active_operating_mode,
+                                    conversation_mode_states.plan.is_active(),
+                                    posture
+                                        .as_ref()
+                                        .and_then(ActivePosture::permission_clamp)
+                                        .cloned(),
+                                ),
                                 delegation: cap.delegation(),
                                 danger: production_danger_table(),
                                 color,
@@ -7339,12 +7344,18 @@ fn session_body(
                                         .take_for(&active_conversation_id)
                                 })
                                 .flatten();
-                            effective_operating_mode(
+                            let style = effective_operating_mode(
                                 active_operating_mode,
                                 intake,
                                 plan_mode_active,
                                 auto_selected,
-                            )
+                            );
+                            let authority_mode = if plan_mode_active {
+                                OperatingMode::Plan
+                            } else {
+                                active_operating_mode
+                            };
+                            (style, authority_mode)
                         },
                     );
 
@@ -7823,7 +7834,8 @@ fn session_body(
                     let recalled_caveats = permission_state
                         .recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()));
                     let turn_caveats = operating_mode_caveats(
-                        turn_operating_mode,
+                        active_operating_mode,
+                        conversation_mode_states.plan.is_active(),
                         meet_persona_caveats(
                             effective_caveats(&recalled_caveats, turn_posture.as_ref()),
                             active_persona.as_ref(),
@@ -8166,13 +8178,17 @@ fn session_body(
                             cognition_scope_noted = true;
                         }
                     }
-                    // The active posture's optional clamp is threaded to the
-                    // gate (re-clamps any session grant). A skill/framing-only
-                    // compatibility binding is genuinely `None` here.
-                    let preset_clamp = turn_posture
-                        .as_ref()
-                        .and_then(ActivePosture::permission_clamp)
-                        .cloned();
+                    // Explicit operating modes, model Plan, and any posture
+                    // clamp remain ceilings when the gate replays old grants
+                    // or admits new ones. An inferred style adds no ceiling.
+                    let preset_clamp = operating_mode_permission_clamp(
+                        active_operating_mode,
+                        conversation_mode_states.plan.is_active(),
+                        turn_posture
+                            .as_ref()
+                            .and_then(ActivePosture::permission_clamp)
+                            .cloned(),
+                    );
                     // #774 (P0): the exec FLOOR threaded to the bypass is the
                     // operator's `[tui.permissions]` exec clamp — a NON-OPTIONAL
                     // floor enforced even with no active `/posture`.
@@ -8726,28 +8742,18 @@ fn session_body(
                     // error; preserve that transition as unattributed evidence.
                     let artifact_head_after_turn =
                         git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
-                    // #1709 family — attribution EPOCH boundary. The contributor
-                    // ledger is now consumed AT THE COMMIT BOUNDARY (inside the
-                    // tool round, in newt-core's `ledger_consume_at_commit_epoch`
-                    // — invoked right after a confirmed-successful
-                    // `commit`/`amend`/`rebase` git call), NOT here at the
-                    // end-of-turn drain. Clearing at the epoch boundary consumes
-                    // exactly the contributors that existed BEFORE that commit
-                    // (already credited on it via the loop-top snapshot) and
-                    // resets the ledger's dedup set, so work landing AFTER a
-                    // mid-turn commit (A edits → C1 → A edits more → turn ends →
-                    // switch B → C2) re-records fresh and survives to the next
-                    // commit — C2 credits A + B. The previous end-of-turn blanket
-                    // `clear()` erased that post-commit work, so it is REMOVED
-                    // (req 5): nothing here may clear the ledger. A failed commit
-                    // consumes nothing (the epoch clear is gated on `ok`).
+                    // Core's per-call AttributionEpoch reconciles the same
+                    // host-confirmed publication counter for embedded and
+                    // native Git. It consumes earlier contributors even if a
+                    // compound shell call later fails, while retaining the
+                    // active model for possible post-commit shell effects.
+                    // Later tool calls re-record fresh contributions normally.
                     //
-                    // `drain_commit_success` is retained as the explicit
-                    // confirmed-commit telemetry signal (and resets the counter);
-                    // it no longer drives a ledger clear. A `HEAD` move from an
-                    // external/manual action (a user `git reset`, a fetch
-                    // advancing the branch, a checkout, …) is NOT a Newt commit
-                    // and never was a clear trigger.
+                    // This telemetry drain runs only AFTER the awaited agent
+                    // run above; never drain concurrently with its per-call
+                    // before/after observations. Do not clear the ledger here:
+                    // doing so would erase work after a mid-turn commit. Output
+                    // text and external/manual HEAD moves are not this signal.
                     let new_commits = session_git_tool
                         .as_ref()
                         .map_or(0, |t| t.drain_commit_success());

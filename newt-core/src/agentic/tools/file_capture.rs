@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::caveats::Scope;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum TextSnapshot {
+pub(in crate::agentic) enum TextSnapshot {
     Absent,
     Present(String),
     Unavailable(&'static str),
@@ -56,7 +56,7 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
     }
 }
 
-pub(super) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
+pub(in crate::agentic) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
     if !super::tui_permits_path(scope, &path.to_string_lossy()) {
         return TextSnapshot::Unavailable("fs_read was not granted");
     }
@@ -108,7 +108,7 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
     use TextSnapshot::{Absent, Present, Unavailable};
     let (old, new) = match (before, after) {
         (Unavailable(reason), _) | (_, Unavailable(reason)) => {
-            return Receipt::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
+            return Receipt::unavailable(reason);
         }
         (Absent, Absent) => {
             return Receipt::plain("\n\nNo file was present before or after the operation.".into())
@@ -140,7 +140,7 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
                 captured,
             }
         }
-        Err(error) => Receipt::plain(format!("\n\nfile-change receipt unavailable: {error}")),
+        Err(error) => Receipt::unavailable(error),
     }
 }
 
@@ -153,12 +153,20 @@ struct CapturedChange {
 
 pub(super) struct Receipt {
     text: String,
-    /// The model-facing first line of `text` (`\n\nModified (+1 -1)`).
+    /// The model-facing summary used only after a successful operation.
     headline: String,
     captured: Option<CapturedChange>,
 }
 
 impl Receipt {
+    fn unavailable(reason: impl std::fmt::Display) -> Self {
+        let mut receipt = Self::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
+        // Failed operations use `text`; only `present_success` uses this summary.
+        receipt.headline =
+            "\n\nFile operation succeeded; optional change preview unavailable".into();
+        receipt
+    }
+
     fn plain(text: String) -> Self {
         Self {
             headline: text.clone(),

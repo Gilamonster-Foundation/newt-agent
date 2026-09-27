@@ -83,7 +83,7 @@ fn attribution_ledger_uses_resolved_identity_email() {
 }
 
 #[test]
-fn runtime_context_block_instructs_shell_git_identity() {
+fn runtime_context_block_reports_identity_without_a_special_git_dialect() {
     let id = newt_core::AgentIdentity::default();
     let blk = runtime_context_block(
         "m",
@@ -92,11 +92,10 @@ fn runtime_context_block_instructs_shell_git_identity() {
         &id,
         newt_core::agentic::PromptDisposition::Act,
     );
-    // The shell-git fallback (for a model that bypasses the embedded tool)
-    // must carry the resolved User no-reply email.
-    assert!(blk.contains("user.email='309460085+newt-agent@users.noreply.github.com'"));
-    assert!(blk.contains("user.name='newt-agent'"));
-    assert!(blk.contains("git -c user.name="));
+    assert!(blk.contains("newt-agent <309460085+newt-agent@users.noreply.github.com>"));
+    assert!(!blk.contains("Prefer the `git` tool"));
+    assert!(!blk.contains("op=amend"));
+    assert!(!blk.contains("git -c user.name="));
 
     let custom = newt_core::AgentIdentity {
         name: "custom".into(),
@@ -110,8 +109,7 @@ fn runtime_context_block_instructs_shell_git_identity() {
         &custom,
         newt_core::agentic::PromptDisposition::Act,
     );
-    assert!(custom_blk.contains("user.email='custom@example.com'"));
-    assert!(custom_blk.contains("user.name='custom'"));
+    assert!(custom_blk.contains("custom <custom@example.com>"));
 }
 
 #[test]
@@ -614,19 +612,19 @@ fn tool_round_limit_override_resolves_and_reports() {
     );
     assert_eq!(
         tool_round_limit_status(25, None, None),
-        "tool-call round limit: 25 (config/model default)"
+        "initial tool-call round allowance: 25 (config/model default)"
     );
     assert_eq!(
         tool_round_limit_status(25, None, Some(50)),
-        "tool-call round limit: 50 this session (config/model default 25)"
+        "initial tool-call round allowance: 50 this session (config/model default 25)"
     );
     assert_eq!(
         tool_round_limit_status(25, Some(Tenacity::Relentless), None),
-        "tool-call round limit: 10000 (effectively unlimited; explicit relentless tenacity; config/model default 25)"
+        "initial tool-call round allowance: 10000 (effectively unlimited; explicit relentless tenacity; config/model default 25)"
     );
     assert_eq!(
         tool_round_limit_status(25, Some(Tenacity::Relentless), Some(7)),
-        "tool-call round limit: 7 this session (explicit relentless tenacity default 10000 (effectively unlimited); config/model default 25)"
+        "initial tool-call round allowance: 7 this session (explicit relentless tenacity default 10000 (effectively unlimited); config/model default 25)"
     );
     assert!(
         tool_round_limit_status(25, None, Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS))
@@ -679,7 +677,7 @@ fn psyche_apply_summary_includes_the_effective_round_source() {
         "{summary}"
     );
     assert!(
-        summary.contains("tool-call round limit: 7 this session"),
+        summary.contains("initial tool-call round allowance: 7 this session"),
         "{summary}"
     );
     assert!(

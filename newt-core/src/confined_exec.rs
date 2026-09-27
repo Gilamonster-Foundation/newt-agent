@@ -32,8 +32,9 @@
 //!   are migrated away and inventory-gated),
 //! - **#8** the child cannot inherit credentials or authority switches — its
 //!   environment is EMPTY plus only the explicit grants,
-//! - **#9** an empty `net` fence becomes a kernel deny-all (Landlock ABI-v4 /
-//!   Seatbelt), so untrusted code has no network without an explicit grant,
+//! - **#9** an empty `net` fence requires deny-all enforcement. A platform whose
+//!   complete network authority is unknown refuses the spawn (including current
+//!   Seatbelt restricted-net admission), rather than imply a proved boundary,
 //! - **#10** where the required kernel enforcement is unavailable the spawn is
 //!   **refused**, never silently downgraded to an unconfined run.
 //!
@@ -94,12 +95,10 @@ pub enum NetGrant {
     /// * **Linux** — the child is wrapped in `newt-net-guard`, which installs
     ///   the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition to*
     ///   the inherited Landlock fs fence.
-    /// * **macOS** — the child's `net` caveat is narrowed to deny-all, so the
-    ///   Seatbelt fence is generated with `(deny network*)` — kernel-denies
-    ///   TCP/UDP/loopback **and AF_UNIX `connect`** (strictly stronger than the
-    ///   Linux seccomp deny, which allows AF_UNIX). Proven by the
-    ///   `macos_seatbelt_adversarial` suite; see
-    ///   `docs/security/platform/macos-evidence.md`.
+    /// * **macOS** — the child's `net` caveat is narrowed to deny-all. Current
+    ///   Bridle admission refuses every restricted Seatbelt net scope because
+    ///   OS-deputy egress is not proven bounded. Generated direct-socket rules
+    ///   are defense in depth, not evidence of a complete network boundary.
     ///
     /// On a platform with neither floor the spawn is **refused**
     /// (`ExecRefused::ConfinementUnenforceable`), never run with a weaker net
@@ -225,6 +224,18 @@ impl ExecRequest {
     #[must_use]
     pub fn caveats(&self) -> &Caveats {
         &self.caveats
+    }
+
+    /// Acquire this request's private scratch only after admission. The guards
+    /// keep the same cleanup lifetime for native argv and confined shell runs.
+    pub(crate) fn prepare_scratch(&self) -> std::io::Result<Vec<ScratchDir>> {
+        self.scratch_dirs
+            .iter()
+            .map(|dir| {
+                crate::scratch::validate_build_grant(dir, &self.caveats.fs_write)?;
+                ScratchDir::create(dir)
+            })
+            .collect()
     }
 }
 
@@ -378,12 +389,7 @@ impl ConstrainedExecutor {
                 "confined execution cancelled before spawn",
             )));
         }
-        let _scratch = req
-            .scratch_dirs
-            .iter()
-            .map(|dir| ScratchDir::create(dir))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(ExecRefused::Spawn)?;
+        let _scratch = req.prepare_scratch().map_err(ExecRefused::Spawn)?;
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
         // escapes the process group — can be terminated with one `cgroup.kill`.
@@ -550,15 +556,11 @@ impl ConstrainedExecutor {
             }
             #[cfg(target_os = "macos")]
             NetGrant::DenyAll => {
-                // macOS has no seccomp guard, but it has a KERNEL egress denial
-                // of its own: the Seatbelt fence generated from an empty `net`
-                // scope is `(deny network*)`, which denies TCP/UDP/loopback AND
-                // AF_UNIX `connect` — strictly stronger than the Linux
-                // socket()-family deny (macos-evidence §2). Narrow the net axis
-                // to deny-all and let Seatbelt back it; the caller's strength
-                // floor (Kernel for AgentInfluenced) then verifies at mint that
-                // the fence really is kernel-grade. Fail-closed: no Seatbelt on
-                // this host → refuse, never run with a weaker floor than asked.
+                // Preserve the requested deny-all scope for Bridle admission.
+                // Seatbelt availability alone does not prove the network floor:
+                // current Bridle reports restricted macOS networking as
+                // unenforceable and refuses it before spawning. Never weaken
+                // the requested boundary merely because sandbox-exec exists.
                 if !agent_bridle::seatbelt_is_supported() {
                     return Err(ExecRefused::ConfinementUnenforceable(
                         "NetGrant::DenyAll needs a kernel egress floor; the Seatbelt \
@@ -943,6 +945,7 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
     // run_command lane (see its doc comment).
     let policy = agent_bridle::SandboxPolicy {
         child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
+        macos_private_ptys: cfg!(target_os = "macos"),
         ..agent_bridle::SandboxPolicy::default()
     };
     #[cfg(target_os = "macos")]
@@ -950,6 +953,20 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
         let mut policy = policy;
         if let Some(developer) = selected_developer_directory() {
             policy.base_read_paths.extra.push(developer.to_owned());
+            // Xcode's launchers load libraries beside Contents/Developer.
+            // Reading the selected tools without these sibling frameworks
+            // admits the executable but leaves dyld unable to start it.
+            if let Some(contents) = Path::new(developer).parent() {
+                for name in ["Frameworks", "SharedFrameworks"] {
+                    let frameworks = contents.join(name);
+                    if frameworks.is_dir() {
+                        policy
+                            .base_read_paths
+                            .extra
+                            .push(frameworks.to_string_lossy().into_owned());
+                    }
+                }
+            }
         }
         policy
     }
@@ -1058,43 +1075,42 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
 /// tool homes before replacing HOME; no shell credentials or global target /
 /// compiler-cache authority are inherited. Cargo build scripts and tests inherit
 /// the same kernel fence as the compiler.
+/// `network` is the caller's existing operator-granted scope, never authority
+/// acquired by approving a build. Restricted scopes remain subject to Bridle's
+/// admission checks; an unsupported host boundary is refused, not widened.
 #[must_use]
 pub fn build_tool_request(
     workspace: &Path,
     cwd: &Path,
     program: impl Into<String>,
     args: impl IntoIterator<Item = impl Into<String>>,
+    network: &Scope<String>,
 ) -> ExecRequest {
+    let mut caveats = build_tool_caveats(workspace);
+    caveats.net = network.clone();
     toolchain_request(
         ExecOrigin::AgentInfluenced,
         workspace,
         cwd,
         program,
         args,
-        build_tool_caveats(workspace),
+        caveats,
     )
-    .net_grant(NetGrant::DenyAll)
+    .net_grant(if network == &Scope::none() {
+        NetGrant::DenyAll
+    } else {
+        NetGrant::Unrestricted
+    })
     .env("CARGO_NET_OFFLINE", "true")
 }
 
-/// A build's scratch directory: `<workspace>/target/tmp/<pid>-<n>`, unique per
-/// call. It lies inside the build fence's existing write and read roots (the
-/// workspace), so it widens nothing, and under `target/`, which Rust
-/// repositories already git-ignore, so cc/linker temp files and test fixtures
-/// never land in the repo root. `TMPDIR` used to be the workspace itself, which
-/// put every fixture meant to be "not a git repo" inside one. The executor
-/// creates it fresh (0700) and removes it after the run ([`ScratchDir`]).
-///
-/// A workspace with no `target/` gets one for the run and loses it again if it
-/// is left empty; nothing outside the run's own directory is ever deleted.
-///
-/// The operator can move it out of the repo with
-/// [`crate::scratch::build_scratch_override`]: the run then lives under
-/// [`operator_build_scratch_root`], which the build fence grants, and builds
-/// ask for permission because that root is outside the session's grant.
+/// A build's unique temporary directory under a private managed base outside
+/// Git worktrees, or the explicit operator override. The Build gate admits its
+/// workspace-specific root before the executor creates anything. The existing
+/// execution lease retains scratch through completion and cancellation.
 #[must_use]
 pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
-    scratch_dir_under(workspace, crate::scratch::build_scratch_override())
+    scratch_dir_under(workspace, Some(crate::scratch::build_scratch_base()))
 }
 
 fn scratch_dir_under(workspace: &Path, base: Option<PathBuf>) -> PathBuf {
@@ -1124,14 +1140,22 @@ fn operator_build_scratch_root(workspace: &Path, base: Option<PathBuf>) -> Optio
 /// and refuses if the path already exists (so a pre-planted directory or
 /// symlink is never followed or reused); `Drop` removes exactly that directory,
 /// then the `tmp` and `target` parents only if they are left empty.
-struct ScratchDir {
+pub(crate) struct ScratchDir {
     path: PathBuf,
     /// `target/` did not exist before this run created it.
     created_target: bool,
+    managed: Option<crate::scratch::ManagedRun>,
 }
 
 impl ScratchDir {
     fn create(path: &Path) -> std::io::Result<Self> {
+        if let Some(managed) = crate::scratch::acquire_build_run(path)? {
+            return Ok(Self {
+                path: path.to_owned(),
+                created_target: false,
+                managed: Some(managed),
+            });
+        }
         let tmp = path.parent().unwrap_or(path);
         let target = tmp.parent().unwrap_or(tmp);
         let created_target = !target.exists();
@@ -1146,6 +1170,7 @@ impl ScratchDir {
         Ok(Self {
             path: path.to_path_buf(),
             created_target,
+            managed: None,
         })
     }
 
@@ -1168,6 +1193,9 @@ impl ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
+        if self.managed.is_some() {
+            return;
+        }
         // Never follow a link: only a real directory is removed.
         if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.is_dir()) {
             let _ = std::fs::remove_dir_all(&self.path);
@@ -1184,7 +1212,7 @@ impl Drop for ScratchDir {
 }
 
 /// The crates.io hosts `cargo fetch` reaches: the sparse index and the
-/// download CDN. The only network [`dependency_fetch_request`] asks for.
+/// download CDN. These are the destinations the dependency-fetch gate asks for.
 pub const CRATES_IO_FETCH_HOSTS: &[&str] = &["index.crates.io", "static.crates.io"];
 
 /// Fill the operator's Cargo package cache with the crates `Cargo.lock` pins, so
@@ -1193,18 +1221,23 @@ pub const CRATES_IO_FETCH_HOSTS: &[&str] = &["index.crates.io", "static.crates.i
 /// `cargo fetch --locked` compiles nothing and runs no build script, and
 /// `--locked` binds every download to the lockfile's checksums. The argv is
 /// fixed here, never model-supplied, so it runs as [`ExecOrigin::TrustedInfra`]:
-/// a crates.io host allow-list cannot be kernel-enforced (Seatbelt names only
-/// `*`/`localhost`; Landlock only ports), and the `AgentInfluenced` floor would
-/// refuse it. That residual is registered as `dependency-fetch-egress` in
+/// host restrictions remain subject to Bridle's platform admission checks.
+/// The fetch path is registered as `dependency-fetch-egress` in
 /// `docs/security/ocap-deviations.md`; callers must hold the operator's `net`
-/// grant for [`CRATES_IO_FETCH_HOSTS`] before running this.
+/// grant for [`CRATES_IO_FETCH_HOSTS`] before running this. `network` carries
+/// that authority (including an explicit unrestricted grant); this builder
+/// never grants a host the caller did not provide.
 #[must_use]
-pub fn dependency_fetch_request(workspace: &Path, cwd: &Path) -> ExecRequest {
+pub fn dependency_fetch_request(
+    workspace: &Path,
+    cwd: &Path,
+    network: &Scope<String>,
+) -> ExecRequest {
     let writes: Vec<String> = operator_tool_home("CARGO_HOME", ".cargo")
         .map(|home| cargo_home_fetch_write_roots(&home))
         .unwrap_or_default();
     let mut caveats = build_tool_caveats_with_writes(workspace, &writes);
-    caveats.net = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+    caveats.net = network.clone();
     toolchain_request(
         ExecOrigin::TrustedInfra,
         workspace,
@@ -1250,6 +1283,8 @@ fn toolchain_request(
     let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
         .env("HOME", root.as_ref())
         .env("TMPDIR", scratch.to_string_lossy())
+        .env("TMP", scratch.to_string_lossy())
+        .env("TEMP", scratch.to_string_lossy())
         .scratch_dir(scratch)
         .env(
             "CARGO_TARGET_DIR",
@@ -1316,10 +1351,10 @@ fn selected_macos_sdk() -> Option<String> {
 /// key in the tool output the model sees, and the net fence alone (which stops
 /// the *child* exfiltrating) does not close the child→output→model channel.
 ///
-/// The dangerous halves stay fully fenced — `fs_write` is the workspace only (no
-/// poisoning the shared cache, no shared `/tmp`), `net` is an empty deny-all, and
-/// scratch belongs in the fence (callers point `TMPDIR` at the workspace). A
-/// child a hostile build spawns inherits the same Landlock fence.
+/// Writes cover the workspace and its private build scratch partition, never
+/// the shared cache or shared temporary parent. The baseline denies networking;
+/// build requests retain the caller's separately authorized network scope.
+/// Descendants inherit the same filesystem fence.
 #[must_use]
 pub fn build_tool_caveats(workspace: &Path) -> Caveats {
     build_tool_caveats_with_writes(workspace, &[])
@@ -1336,7 +1371,7 @@ pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[Str
     build_caveats_with_scratch(
         workspace,
         extra_write_roots,
-        crate::scratch::build_scratch_override(),
+        Some(crate::scratch::build_scratch_base()),
     )
 }
 
@@ -1654,7 +1689,9 @@ mod tests {
 
     #[test]
     fn dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials() {
-        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws/sub"));
+        let _env = crate::process_env::lock();
+        let network = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws/sub"), &network);
         assert_eq!(request.origin, ExecOrigin::TrustedInfra);
         assert_eq!(request.net_grant, NetGrant::Unrestricted);
         assert_eq!(request.args, ["fetch", "--locked"]);
@@ -1686,8 +1723,30 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fetch_network_grant_does_not_expand_filesystem_authority() {
+        let _env = crate::process_env::lock();
+        let ws = Path::new("/ws");
+        let narrow = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+        let baseline = dependency_fetch_request(ws, ws, &narrow);
+        let request = dependency_fetch_request(ws, ws, &Scope::All);
+        assert_eq!(request.caveats.net, Scope::All);
+        assert_eq!(request.caveats.fs_read, baseline.caveats.fs_read);
+        assert_eq!(request.caveats.fs_write, baseline.caveats.fs_write);
+        assert_eq!(request.args, baseline.args);
+        let denied = dependency_fetch_request(ws, ws, &Scope::none());
+        assert_eq!(denied.caveats.net, Scope::none());
+    }
+
+    #[test]
     fn build_request_discovers_toolchain_before_replacing_home() {
-        let request = build_tool_request(Path::new("/ws"), Path::new("/ws"), "cargo", ["test"]);
+        let _env = crate::process_env::lock();
+        let request = build_tool_request(
+            Path::new("/ws"),
+            Path::new("/ws"),
+            "cargo",
+            ["test"],
+            &Scope::none(),
+        );
         let env: std::collections::BTreeMap<_, _> = request.env_grants().iter().cloned().collect();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/ws"));
         assert_eq!(
@@ -1731,6 +1790,8 @@ mod tests {
         assert!(env.keys().all(|name| [
             "HOME",
             "TMPDIR",
+            "TMP",
+            "TEMP",
             "PATH",
             "CARGO_HOME",
             "RUSTUP_HOME",
@@ -1743,12 +1804,16 @@ mod tests {
         .contains(&name.as_str())));
         assert_eq!(request.net_grant, NetGrant::DenyAll);
         assert_eq!(request.caveats.exec, Scope::All);
-        // The scratch dir is INSIDE the fence's existing roots: no widening.
-        assert_eq!(request.caveats.fs_write, Scope::only(["/ws".to_owned()]));
+        // The proposed Build fence includes only this workspace's private
+        // scratch partition, not its shared temporary parent.
+        assert_eq!(
+            request.caveats.fs_write,
+            build_tool_caveats(Path::new("/ws")).fs_write
+        );
         let scratch = &request.scratch_dirs[0];
         assert_eq!(request.scratch_dirs.len(), 1);
         assert_eq!(env.get("TMPDIR").map(Path::new), Some(scratch.as_path()));
-        assert!(scratch.starts_with("/ws/target/tmp"), "{scratch:?}");
+        assert!(!scratch.starts_with("/ws"), "{scratch:?}");
         assert!(crate::caveats::permits_path(
             &request.caveats.fs_write,
             &scratch.to_string_lossy()
@@ -1763,6 +1828,36 @@ mod tests {
     fn each_build_scratch_dir_is_unique() {
         let ws = Path::new("/ws");
         assert_ne!(build_scratch_dir(ws), build_scratch_dir(ws));
+    }
+
+    #[test]
+    fn build_network_authority_preserves_granted_scope_and_filesystem_fence() {
+        let _env = crate::process_env::lock();
+        let ws = Path::new("/ws");
+        let baseline = build_tool_caveats(ws);
+        for network in [
+            Scope::none(),
+            Scope::only(["example.test".into()]),
+            Scope::All,
+        ] {
+            let request = build_tool_request(ws, ws, "cargo", ["test"], &network);
+            assert_eq!(request.caveats.net, network);
+            assert_eq!(request.caveats.fs_read, baseline.fs_read);
+            assert_eq!(request.caveats.fs_write, baseline.fs_write);
+            assert_eq!(request.caveats.exec, baseline.exec);
+            assert_eq!(request.origin, ExecOrigin::AgentInfluenced);
+            assert_eq!(
+                request.net_grant,
+                if network == Scope::none() {
+                    NetGrant::DenyAll
+                } else {
+                    NetGrant::Unrestricted
+                }
+            );
+            assert!(request
+                .env_grants()
+                .contains(&("CARGO_NET_OFFLINE".into(), "true".into())));
+        }
     }
 
     #[cfg(unix)]
@@ -1807,7 +1902,7 @@ mod tests {
     fn a_symlink_at_the_scratch_path_is_refused() {
         let ws = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        let path = build_scratch_dir(ws.path());
+        let path = scratch_dir_under(ws.path(), None);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), &path).unwrap();
         assert!(ScratchDir::create(&path).is_err());
@@ -1824,7 +1919,7 @@ mod tests {
     fn a_missing_workspace_is_refused_not_created() {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("missing").join("ws");
-        assert!(ScratchDir::create(&build_scratch_dir(&ws)).is_err());
+        assert!(ScratchDir::create(&scratch_dir_under(&ws, None)).is_err());
         assert!(!root.path().join("missing").exists());
     }
 
@@ -1840,6 +1935,7 @@ mod tests {
             &ws,
             "sh",
             ["-c", "printf %s \"$TMPDIR\"; touch \"$TMPDIR/x\""],
+            &Scope::none(),
         );
         let scratch = req.scratch_dirs[0].clone();
         if let Ok(out) = ConstrainedExecutor::run(&req) {
@@ -1950,7 +2046,7 @@ mod tests {
         assert!(!cav.fs_write.permits(&"/etc".to_string()));
         assert!(
             !cav.fs_write.permits(&"/tmp".to_string()),
-            "no write to shared /tmp — scratch lives under the workspace target/"
+            "no write to shared /tmp — only the private workspace scratch partition"
         );
         assert!(
             !cav.net.permits(&"evil.example".to_string()),
@@ -1959,22 +2055,22 @@ mod tests {
     }
 
     /// Grounds `build_scratch_dir` against a real build-lane child: its
-    /// `TMPDIR` is writable under the fence and lies under `target/tmp`, not
-    /// in the workspace root.
+    /// `TMPDIR` is writable under the fence and lies outside the workspace.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_build_lane_child_gets_a_writable_scratch_dir_under_target() {
+    fn a_build_lane_child_gets_a_writable_scratch_dir_outside_the_workspace() {
         let ws = tempfile::tempdir().unwrap();
         let ws = ws.path().canonicalize().unwrap();
         let script = "import os, tempfile\n\
             d = tempfile.mkdtemp(); open(os.path.join(d, 'x'), 'w').write('ok'); print(d)\n";
-        let req = build_tool_request(&ws, &ws, "python3", ["-c", script]);
+        // Exercise scratch filesystem confinement; macOS cannot enforce restricted net.
+        let req = build_tool_request(&ws, &ws, "python3", ["-c", script], &Scope::All);
         let out = ConstrainedExecutor::run(&req).expect("the build lane spawns");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.success, "stdout: {stdout}\nstderr: {stderr}");
         assert!(
-            std::path::Path::new(stdout.trim()).starts_with(ws.join("target/tmp")),
+            !std::path::Path::new(stdout.trim()).starts_with(&ws),
             "{stdout}"
         );
     }

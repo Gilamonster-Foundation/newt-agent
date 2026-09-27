@@ -5,7 +5,7 @@
 //! `newt_core::config::ShellEngine` remain byte-identical paths for consumers
 //! (newt-cli doctor, the TUI, newt-mcp-client).
 //!
-//! The 12 shell-engine tests live HERE, beside the resolution chain they pin —
+//! Shell-engine tests live HERE, beside the resolution chain they pin —
 //! parse aliases, precedence order, and the L3 gate must fail in this file.
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 /// axis (Landlock/Seatbelt/AppContainer, the kernel fence) is auto-selected
 /// per-OS and is **not** chosen here. "Landlock vs brush" is really "the `host`
 /// engine (guarantee rests entirely on the kernel fence) vs the `brush` engine
-/// (L2 interceptor confines in-process, with the fence as an added backstop)."
+/// (static command/file filters mediate worker operations; the kernel fence
+/// confines external commands and their descendants)."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ShellEngine {
@@ -23,16 +24,15 @@ pub enum ShellEngine {
     /// constructs by design and spawns argv directly. Portable default.
     #[default]
     SafeSubset,
-    /// The sandboxed-host engine (ADR 0019): real `/bin/sh -c` with the whole
-    /// process tree in the L3 jail. Full grammar; the guarantee rests entirely
-    /// on the kernel fence. Refuses a *restricted* `exec`/`net` grant. Needs a
-    /// host `/bin/sh`. `--full-access` auto-selects this.
+    /// The host engine (ADR 0019): real `/bin/sh -c`, with native confinement
+    /// when required by the grant. Full grammar; enforcement rests on the
+    /// kernel fence. Each restricted axis must meet its admission floor.
+    /// Needs a host `/bin/sh`; full access selects it on Linux and macOS.
     Host,
-    /// The carried brush engine (bash-in-Rust + the L2 `CommandInterceptor`):
-    /// full grammar, in-process, cross-platform, and the only engine that also
-    /// confines a *restricted* `exec`/`net` grant. Requires the `brush` build
-    /// (agent-bridle#20 / Track 2); until that ships, selecting `brush` falls
-    /// back to `host` with a warning.
+    /// Carried bash-in-Rust in an authenticated worker with static command and
+    /// file-open policies. Linux/macOS provide its required private transport;
+    /// unsupported targets refuse selection. Network authority depends on the
+    /// native backend; worker-local filters do not confine descendant sockets.
     Brush,
 }
 
@@ -45,6 +45,18 @@ impl ShellEngine {
             Self::Host => "host",
             Self::Brush => "brush",
         }
+    }
+
+    /// Validate that this platform provides the engine's required worker transport.
+    pub fn validate_available(self) -> Result<(), String> {
+        self.validate_worker_transport(agent_bridle_tool_shell::brush_private_control_supported())
+    }
+
+    fn validate_worker_transport(self, supported: bool) -> Result<(), String> {
+        if self == Self::Brush && !supported {
+            return Err("brush is unavailable on this platform: authenticated worker transport is not implemented; select safe-subset (portable, limited shell grammar)".into());
+        }
+        Ok(())
     }
 }
 
@@ -162,7 +174,7 @@ impl IntakeConfig {
     }
 }
 
-/// `--full-access` auto-upgrade to `host` (see [`resolve_shell_engine`]).
+/// Shell selection and environment for a session (see [`resolve_shell_engine`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
@@ -219,13 +231,20 @@ pub fn mcp_stdio_env_passthrough() -> Vec<&'static str> {
     ]
 }
 
-/// The engine `--full-access` auto-selects when none is set explicitly: `host`
-/// on unix (a real `/bin/sh` in the kernel jail), but **`brush` on Windows** —
-/// host-shell spawns `/bin/sh -c`, which Windows lacks, so the cross-platform
-/// carried brush engine is the full-grammar option there (with a Windows-usage
-/// warning surfaced at selection).
+/// Full-access default: `host` on Linux/macOS, where the authenticated worker
+/// substrate is available, otherwise portable `safe-subset`. Windows full-grammar
+/// worker support remains unavailable.
 #[must_use]
 pub fn full_access_default_engine() -> ShellEngine {
+    full_access_default_with_worker_transport(
+        agent_bridle_tool_shell::brush_private_control_supported(),
+    )
+}
+
+fn full_access_default_with_worker_transport(supported: bool) -> ShellEngine {
+    if !supported {
+        return ShellEngine::SafeSubset;
+    }
     #[cfg(windows)]
     {
         ShellEngine::Brush
@@ -238,8 +257,8 @@ pub fn full_access_default_engine() -> ShellEngine {
 
 /// Resolve the effective shell engine in precedence order: an explicit CLI
 /// `--shell-engine` wins, then the `[shell] engine` config key, then — only when
-/// neither was set — `--full-access` auto-upgrades (to `host` on unix, `brush`
-/// on Windows), otherwise the `safe-subset` default. Keeping the auto-upgrade
+/// neither was set — full access selects the supported platform default,
+/// otherwise the `safe-subset` default. Keeping automatic selection
 /// *last* means an explicit choice is never silently overridden.
 #[must_use]
 pub fn resolve_shell_engine(
@@ -262,8 +281,8 @@ pub fn resolve_shell_engine(
 /// startup — the CLI publishes `NEWT_SHELL_ENGINE` only for the `Some` case, so
 /// the deep dispatch re-checks the fence at exec time. This closes the
 /// mechanized TOCTOU (agent-bridle #239 `EnforcementGate.tla`): a fence that
-/// dropped between a grant and an exec must not leave a stale brush selection
-/// running a dynamic construct advisory.
+/// dropped between a grant and an exec must not leave a stale Brush selection.
+/// Explicit choices must pass [`ShellEngine::validate_available`] at startup.
 #[must_use]
 pub fn resolve_shell_engine_choice(
     cli: Option<ShellEngine>,
@@ -280,19 +299,20 @@ pub fn resolve_shell_engine_choice(
     None
 }
 
-/// #1243 Leg 1: the confined default engine, gated on whether an L3 kernel fence
-/// is enforcing on this host RIGHT NOW (`l3_active`, from [`ocap_l3_backend`]).
-///
-/// - **L3 enforcing ⇒ `Brush`** — the carried bash-in-Rust engine intercepts
-///   every real spawn at the primitive `before_exec` funnel (pipes, subshells,
-///   `$(…)`) and its dynamic constructs are actually confined by the kernel.
-/// - **No L3 ⇒ `SafeSubset`** — brush would run those constructs advisory-only
-///   (`sandbox_kind = None`), a honesty regression, so fall back to the static
-///   parser's STRUCTURAL REFUSAL of dynamic constructs (least authority by
-///   construction). Pure so the gate is unit-tested without a kernel.
+/// The confined default requires both a current native fence and Brush's
+/// authenticated worker transport. Otherwise select the portable safe subset.
+/// Each invocation still checks all authority axes and refuses an unenforceable
+/// restricted grant; parser selection does not weaken that admission check.
 #[must_use]
 pub fn confined_default_engine(l3_active: bool) -> ShellEngine {
-    if l3_active {
+    confined_default_with_worker_transport(
+        l3_active,
+        agent_bridle_tool_shell::brush_private_control_supported(),
+    )
+}
+
+fn confined_default_with_worker_transport(l3_active: bool, supported: bool) -> ShellEngine {
+    if l3_active && supported {
         ShellEngine::Brush
     } else {
         ShellEngine::SafeSubset
@@ -302,13 +322,8 @@ pub fn confined_default_engine(l3_active: bool) -> ShellEngine {
 /// #1243 Leg 1: the confined default engine resolved for THIS host — the single
 /// source of truth for both `shell_engine()`'s dispatch and doctor's display.
 ///
-/// The brush flip is scoped to platforms with a **real per-run kernel fence**:
-/// Linux (landlock) and macOS (seatbelt), where [`ocap_l3_backend`] is a live
-/// capability probe. Windows is deliberately left on `safe-subset`: its
-/// AppContainer backend reports active *unconditionally* (not a per-run probe),
-/// and brush is already the Windows `--full-access` default — a brush-confined
-/// Windows default is its own follow-up, not part of the landlock/seatbelt gate
-/// this leg proves. Evaluated live per call, so the fence is never cached.
+/// Brush requires the Linux/macOS authenticated worker substrate. The native
+/// fence is probed on each call; unsupported targets retain `safe-subset`.
 #[must_use]
 pub fn resolved_confined_default() -> ShellEngine {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -326,8 +341,8 @@ pub fn resolved_confined_default() -> ShellEngine {
 /// ([`ShellEngine`]): the engine parses/runs the command line (L2), the backend
 /// confines it in the kernel (L3). Surfaced by `newt doctor` (#926) so the
 /// operator can see what actually enforces a restricted grant here. A restricted
-/// `fs` grant is only real when the backend is available; otherwise it is
-/// honestly advisory (agent-bridle reports `sandbox_kind = None`).
+/// filesystem grant requires a kernel boundary. When that floor cannot be met,
+/// admission refuses the command rather than allowing advisory access.
 #[must_use]
 pub fn ocap_l3_backend() -> (&'static str, bool) {
     #[cfg(target_os = "linux")]
@@ -351,9 +366,10 @@ pub fn ocap_l3_backend() -> (&'static str, bool) {
 #[cfg(test)]
 mod shell_engine_tests {
     use super::{
-        confined_default_engine, full_access_default_engine, resolve_shell_engine,
-        resolve_shell_engine_choice, shell_env_passthrough_default, IntakeConfig, ShellConfig,
-        ShellEngine,
+        confined_default_engine, confined_default_with_worker_transport,
+        full_access_default_engine, full_access_default_with_worker_transport,
+        resolve_shell_engine, resolve_shell_engine_choice, shell_env_passthrough_default,
+        IntakeConfig, ShellConfig, ShellEngine,
     };
     use crate::config::Config;
 
@@ -366,6 +382,48 @@ mod shell_engine_tests {
             shell_env_passthrough_default(),
             vec!["HOME".to_string(), "USER".to_string(), "TZ".to_string()]
         );
+    }
+
+    #[test]
+    fn unavailable_worker_transport_keeps_full_access_portable() {
+        assert_eq!(
+            full_access_default_with_worker_transport(false),
+            ShellEngine::SafeSubset
+        );
+        assert_eq!(
+            full_access_default_with_worker_transport(true),
+            if cfg!(windows) {
+                ShellEngine::Brush
+            } else {
+                ShellEngine::Host
+            }
+        );
+        assert_eq!(
+            confined_default_with_worker_transport(true, false),
+            ShellEngine::SafeSubset
+        );
+        assert_eq!(
+            confined_default_with_worker_transport(false, true),
+            ShellEngine::SafeSubset
+        );
+        assert_eq!(
+            confined_default_with_worker_transport(true, true),
+            ShellEngine::Brush
+        );
+    }
+
+    #[test]
+    fn explicit_brush_requires_transport_while_explicit_host_is_preserved() {
+        let unavailable = ShellEngine::Brush
+            .validate_worker_transport(false)
+            .unwrap_err();
+        assert!(unavailable.contains("authenticated worker transport"));
+        assert!(unavailable.contains("safe-subset"));
+        assert!(ShellEngine::Brush.validate_worker_transport(true).is_ok());
+        assert!(ShellEngine::Host.validate_worker_transport(false).is_ok());
+        assert!(ShellEngine::SafeSubset
+            .validate_worker_transport(false)
+            .is_ok());
     }
 
     #[test]
@@ -428,15 +486,18 @@ mod shell_engine_tests {
 
     #[test]
     fn resolve_full_access_auto_upgrades_when_unset() {
-        // `host` on unix, `brush` on Windows (host-shell needs `/bin/sh`).
+        // Full grammar is only selected where the required worker exists.
         assert_eq!(
             resolve_shell_engine(None, None, true),
             full_access_default_engine()
         );
-        #[cfg(not(windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_eq!(resolve_shell_engine(None, None, true), ShellEngine::Host);
-        #[cfg(windows)]
-        assert_eq!(resolve_shell_engine(None, None, true), ShellEngine::Brush);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(
+            resolve_shell_engine(None, None, true),
+            ShellEngine::SafeSubset
+        );
     }
 
     #[test]
@@ -448,10 +509,17 @@ mod shell_engine_tests {
     }
 
     /// #1243 Leg 1: the confined default is L3-gated — brush only where a
-    /// kernel fence enforces; safe-subset's structural refusal otherwise.
+    /// kernel fence enforces and worker transport exists; safe-subset otherwise.
     #[test]
     fn confined_default_is_l3_gated() {
-        assert_eq!(confined_default_engine(true), ShellEngine::Brush);
+        assert_eq!(
+            confined_default_engine(true),
+            if agent_bridle_tool_shell::brush_private_control_supported() {
+                ShellEngine::Brush
+            } else {
+                ShellEngine::SafeSubset
+            }
+        );
         assert_eq!(confined_default_engine(false), ShellEngine::SafeSubset);
     }
 

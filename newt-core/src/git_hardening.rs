@@ -22,7 +22,7 @@
 //!
 //! - **`-c` overrides** beat repo-local `.git/config`, so `core.fsmonitor=`,
 //!   `core.hooksPath=/dev/null`, `core.pager=cat`, `core.sshCommand=false`,
-//!   `diff.external=`, and `protocol.ext.allow=never` disarm those gadgets even
+//!   and `protocol.ext.allow=never` disarm those gadgets even
 //!   when the attacker wrote them into the repo.
 //! - **`env_clear` + a minimal allowlist** drops every ambient gadget variable
 //!   (`GIT_EXTERNAL_DIFF`, `GIT_SSH*`, `GIT_PAGER`, `GIT_ASKPASS`, …) AND newt's
@@ -31,10 +31,13 @@
 //! - **`GIT_CONFIG_GLOBAL=/dev/null` + `GIT_CONFIG_SYSTEM=/dev/null`** ignore the
 //!   user/system git config entirely.
 //!
-//! `textconv` uses *named* drivers that `-c` cannot wildcard away, so a caller
-//! that runs `git diff` / `git log -p` / `git show` should ALSO pass
-//! `--no-textconv --no-ext-diff` in `args` (belt-and-suspenders on top of the
-//! `diff.external=` override).
+//! `textconv` uses *named* drivers that `-c` cannot wildcard away, so an internal
+//! caller that runs `git diff` / `git log -p` / `git show` must pass
+//! `--no-textconv --no-ext-diff` in `args`. The host-only `diff.external=`
+//! override fails closed by selecting an invalid empty program if external
+//! diff is accidentally enabled; it does not select Git's built-in diff.
+//! Model commands already run under the command's filesystem/exec fence and
+//! omit that override so ordinary native diffs retain their meaning.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -261,9 +264,13 @@ const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "core.sshCommand=false",    // no ssh gadget
     "core.askpass=",            // no askpass gadget
     "core.editor=false",        // no editor gadget
-    "diff.external=",           // no external diff program
     "protocol.ext.allow=never", // no `ext::` transport
 ];
+
+/// Host metadata callers must explicitly disable external diff in their argv.
+/// This invalid command is a fail-closed backstop for those trusted callers,
+/// not a usable default for a model's ordinary, already-confined Git command.
+const GIT_HOST_ONLY_OVERRIDES: &[&str] = &["diff.external="];
 
 /// The git settings a sandbox profile may carry, and the only ones copied from
 /// the operator's own config. Fail-closed: a key reaches sandbox git only when
@@ -368,6 +375,9 @@ pub fn ambient_git_config_listing() -> io::Result<String> {
 ///   hostile `.git/config`). The model can still unset these in its own
 ///   command; the threat this answers is the repository, which cannot set the
 ///   environment.
+/// - No forced `diff.external`: even an empty value selects an external diff
+///   and breaks Git's built-in diff. Any repository-selected diff program runs
+///   inside the same admitted native process fence.
 #[must_use]
 pub fn sandbox_git_env(
     author: (&str, &str),
@@ -445,7 +455,10 @@ pub fn hardened_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
     // A top-level option: never take the optional fsmonitor/index locks that can
     // trigger the fsmonitor hook as a side effect.
     c.arg("--no-optional-locks");
-    for kv in GIT_HARDENING_OVERRIDES {
+    for kv in GIT_HARDENING_OVERRIDES
+        .iter()
+        .chain(GIT_HOST_ONLY_OVERRIDES)
+    {
         c.arg("-c").arg(kv);
     }
     c.args(args).current_dir(cwd);
@@ -630,6 +643,15 @@ mod sandbox_git_env_tests {
     }
 
     #[test]
+    fn invalid_external_diff_override_is_reserved_for_host_metadata() {
+        let config = config(&sandbox_git_env(("newt-agent", "a@b"), &Default::default()));
+        assert!(config.iter().all(|(key, _)| key != "diff.external"));
+        let host =
+            hardened_git(Path::new("."), &["diff", "--no-ext-diff", "--no-textconv"]).unwrap();
+        assert!(host.get_args().any(|arg| arg == "diff.external="));
+    }
+
+    #[test]
     fn commits_are_authored_by_the_agent_identity() {
         let config = config(&sandbox_git_env(
             (
@@ -758,10 +780,12 @@ mod own_gitdir_grant_tests {
     #[test]
     fn linked_worktree_on_own_branch_grants_the_two_write_directories() {
         let root = tempfile::tempdir().unwrap();
-        let main = root.path().join("main");
+        // Git resolves macOS's /var alias; compare the same physical paths.
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
         std::fs::create_dir(&main).unwrap();
         init_repo(&main);
-        let wt = root.path().join("wt");
+        let wt = root_path.join("wt");
         git(
             &main,
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],

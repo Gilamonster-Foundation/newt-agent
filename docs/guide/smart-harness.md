@@ -154,9 +154,12 @@ in-tree links. Stable operator root aliases such as `/var` remain supported.
 Shrink checks and artifact capture use the same filesystem boundary.
 
 This enables macOS filesystem confinement; it does not certify deputy-complete
-network isolation. The pinned Bridle 0.7.15 backend predates later Mach-deputy
-hardening. Newer Bridle releases retain a refusal for restricted macOS network
-authority, including `net:none`, because that evidence remains incomplete.
+network isolation. The current Bridle 0.8.0-rc.5 integration, including its
+temporary workspace patches, refuses restricted macOS network authority,
+including `net:none`, because that evidence remains incomplete. Confined
+commands on macOS currently require explicit operator network-all authority;
+see the [trusted configuration example](full-access.md). This preserves the
+filesystem fence and does not implement the proposed network-monitor controls.
 Seatbelt also permits filesystem metadata discovery outside content-read grants;
 its content boundary is not total filesystem non-observability.
 Local MCP processes are checked against the frame boundary before they start;
@@ -171,17 +174,20 @@ tools; a shell `cd` does not change the session root. A worktree outside the
 workspace needs an explicit read/write grant to its destination and access to
 the original repository's shared Git metadata. Grant an existing empty task
 directory, not its entire parent. Creating, editing, inspecting, and staging
-worktree changes use these same grants. The commit restriction below still
-applies.
+worktree changes use these same grants. Broader linked-worktree commit coverage
+remains outside the native adapter's validated scope.
 
 Smart mode refuses crew execution and native `find` because those adapters do
 not retain protected filesystem access throughout their reads. Use
-`run_command` for searches in the confined shell. Native Git retains its existing
-scoped `branch-list` surface; other permitted Git commands use the confined
-shell and may need explicit grants for Git configuration files. The existing
-refusal of shell-created commits still applies, so this
-mode does not currently provide a commit path. These restrictions do not apply
-to the reusable frame and session APIs themselves.
+`run_command` for searches and ordinary Git commands in the confined shell;
+Git configuration outside the workspace may need an explicit read grant.
+Supported native `git commit` commands use the harness attribution/signing
+adapter and retain default-branch protection. Its helper directory must remain
+outside every writable root. Merge/rebase families and native Windows commit
+transport are not yet supported; see the
+[native commit adapter's scope and validation limits](../design/agent-toolchain.md#native-commit-adapter-scoped-implementation).
+These adapter restrictions do not apply to the reusable frame and session APIs
+themselves.
 
 `--hermetic` admits the current task, system instructions, tool definitions,
 workspace, configuration, and auxiliary model. It excludes inherited

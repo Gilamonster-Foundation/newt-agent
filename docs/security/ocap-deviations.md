@@ -1055,9 +1055,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** a child granted network for named hosts can reach only those hosts, enforced by the kernel.
 - **Practical caveat (now):** when the offline build lane fails because the Cargo cache lacks a crate
   `Cargo.lock` pins, the harness runs `cargo fetch --locked` (`dependency_fetch_request`,
-  `newt-core/src/confined_exec.rs`) with `net = index.crates.io, static.crates.io`. Neither backend can
-  enforce a host list (Seatbelt names only `*`/`localhost`; Landlock only ports), so the request is minted
-  `TrustedInfra` and its network is ambient while it runs. Its fs fence stays kernel-enforced: reads are the
+  `newt-core/src/confined_exec.rs`) with the existing operator network grant. An explicit `All` grant
+  remains `All`; otherwise fetch is narrowed to `index.crates.io, static.crates.io` after approval.
+  A fresh approval must remain bounded by the invocation and the requested hosts, even if the session's
+  base authority is broader. The `TrustedInfra` label does not bypass platform admission: current Bridle
+  refuses restricted networking on macOS before spawn. On backends that admit the host list without a
+  kernel destination boundary, the network residual remains open. Its fs fence stays kernel-enforced: reads are the
   calibrated toolchain set (no `credentials.toml`), writes are the workspace plus `$CARGO_HOME/registry` and
   cargo's package-cache lock files.
 - **Residual:** 🟠 ACTIVE while a fetch runs. The child is the operator's `cargo`, its argv is fixed, it compiles
@@ -1068,7 +1071,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Compensating controls:** refused when any `Cargo.lock` package names a source other than crates.io (a git
   or alternate registry could receive a credential or steer the fetch), and when a repository `.cargo/config`
   sits between the build directory and the workspace root (it can replace the crates.io source or name a
-  credential-provider program). A refusal tells the model the operator must act.
+  credential-provider program). A refusal identifies the actual permission or setup failure.
 - **Closure criterion:** the fetch reaches the network only through a harness egress broker (#1599's mediated
   egress) that admits the crates.io hosts, so the child itself can run under `NetGrant::DenyAll`.
 - **Ratchet guard:** `confined_exec::tests::dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials`

@@ -91,6 +91,7 @@ pub struct HeadlessArgs {
     /// nothing here re-checks it. Carried rather than re-derived so the record
     /// can state what the run could and could not inherit.
     pub launch: newt_launch::LaunchConfig,
+    /// Initial round allowance; progress renewal follows the configured grace.
     pub max_rounds: Option<usize>,
     /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
     /// Newt gates input at the tighter of `[context].input_ceiling_pct` and the
@@ -529,6 +530,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         newt_core::tenacity::cli_tenacity(),
         args.max_rounds,
     );
+    if let Some(tui) = &cfg.tui {
+        dc.workflow_grace_rounds = tui.workflow_grace_rounds;
+    }
     // OCAP-ON confined lane: replace the default unconfined caveat with a
     // workspace-fenced authority. The tool gate consults `dc.caveats` and the
     // permission_gate stays `None` — an in-fence write auto-consents; an
@@ -552,8 +556,8 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         // the seam delivers this value, and without it the child's tools would
         // fall back to the platform temp dir, which a configured fence need not
         // grant).
-        // Not for the smart lane, whose fence is workspace-only and whose callers
-        // point temp at the workspace.
+        // The smart lane instead keeps only calibrated build paths already
+        // covered by this baseline; it must not gain an external scratch grant.
         let scratch = resolve_fence_scratch();
         if let (false, Some(root)) = (smart_enabled, scratch.first()) {
             // Same single-threaded-at-this-point contract as the lane's other
@@ -561,15 +565,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             unsafe { std::env::set_var("NEWT_CHILD_TMPDIR", root) };
         }
         dc.caveats = confined_bench_caveats(&workspace, &scratch);
+        let scoped = newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
+        calibrate_headless_filesystem(&mut dc.caveats, &scoped, smart_enabled);
         if smart_enabled {
-            let scoped =
-                newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
-            // The smart lane's isolation needs a write fence with NO model-writable
-            // ancestor of the workspace/frame, so it drops `/tmp` and takes the
-            // workspace-only set; the default lane's fence must contain it
-            // (`smart_fence_is_within_the_default_fence`).
-            dc.caveats.fs_read = scoped.fs_read;
-            dc.caveats.fs_write = scoped.fs_write;
             newt_core::caveats::apply_cli_fs_grants(&mut dc.caveats, &workspace);
         }
         // Fold AFTER the lane's own fence (and any smart-lane narrowing +
@@ -653,7 +651,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         apply_context_window(&mut dc, cw);
     }
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
-    // uses (post `--max-rounds`), for the contract's effective_config.
+    // uses initially (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
     let read_scope = dc.caveats.fs_read.clone();
     let mut driver =
@@ -1188,6 +1186,89 @@ fn confined_bench_caveats(workspace: &str, scratch: &[String]) -> Caveats {
     confined_bench_caveats_with_grants(workspace, scratch, &extra)
 }
 
+/// Smart isolation narrows the startup fence; calibration cannot grant a new
+/// scratch or toolchain path. The ordinary lane keeps its baseline and names
+/// already-covered Build roots explicitly because Build admission uses the
+/// lattice's exact-set `leq`, while filesystem grants cover descendants.
+/// Neither projection creates scratch or bypasses per-invocation Build admission.
+fn calibrate_headless_filesystem(baseline: &mut Caveats, build: &Caveats, smart: bool) {
+    for (scope, requested) in [
+        (&mut baseline.fs_read, &build.fs_read),
+        (&mut baseline.fs_write, &build.fs_write),
+    ] {
+        let covered = headless_fs_intersection(scope, requested);
+        if smart {
+            *scope = covered;
+        } else if let (Scope::Only(roots), Scope::Only(covered)) = (scope, covered) {
+            roots.extend(covered);
+        }
+    }
+}
+
+fn headless_fs_intersection(left: &Scope<String>, right: &Scope<String>) -> Scope<String> {
+    use newt_core::caveats::permits_path;
+    let (Scope::Only(left), Scope::Only(right)) = (left, right) else {
+        return if matches!(left, Scope::All) {
+            right.clone()
+        } else {
+            left.clone()
+        };
+    };
+    let mut covered = std::collections::BTreeSet::new();
+    for (candidates, allowed) in [(left, right), (right, left)] {
+        let physical = Scope::only(
+            allowed
+                .iter()
+                .filter_map(|path| resolve_headless_grant(path)),
+        );
+        covered.extend(
+            candidates
+                .iter()
+                .filter(|path| {
+                    resolve_headless_grant(path).is_some_and(|path| permits_path(&physical, &path))
+                })
+                .cloned(),
+        );
+    }
+    // Keep the exact declared spelling for Build's set-based admission check.
+    Scope::Only(covered)
+}
+
+/// Read-only admission check for an uncreated path, including canonical aliases
+/// such as macOS `/tmp`. An existing symlink must resolve; never walk past a
+/// dangling link or a permissions error. Runtime object-bound checks remain the
+/// executor's responsibility, including managed scratch's held directory leases.
+fn resolve_headless_grant(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let suffix = path.strip_prefix(ancestor).ok()?;
+                if suffix
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return None;
+                }
+                return Some(
+                    ancestor
+                        .canonicalize()
+                        .ok()?
+                        .join(suffix)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// The fence's scratch root(s), resolved at run start. Scratch is CONFIGURATION
 /// (`NEWT_SCRATCH_DIR` / `[scratch] dir`, via the one existing resolver), never a
 /// literal; see [`fence_scratch_roots`].
@@ -1595,6 +1676,7 @@ fn commits_since(
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+    use newt_core::ScopeExt as _;
 
     /// #2552 round 3: `commits_since` — the exact function `handback`'s
     /// `commits` field is built from — is reached whenever `workspace` is
@@ -2274,7 +2356,9 @@ mod tests {
         use newt_core::caveats::permits_path;
         let default =
             confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
-        let smart = newt_core::confined_exec::build_tool_caveats("/app/task".as_ref());
+        let build = newt_core::confined_exec::build_tool_caveats("/app/task".as_ref());
+        let mut smart = default.clone();
+        calibrate_headless_filesystem(&mut smart, &build, true);
         let Scope::Only(roots) = &smart.fs_write else {
             panic!("smart fs_write must be an explicit Scope::Only");
         };
@@ -2282,6 +2366,205 @@ mod tests {
             assert!(
                 permits_path(&default.fs_write, root),
                 "{root} outside default"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_build_projection_admits_only_covered_paths_in_both_modes() {
+        use newt_core::caveats::permits_path;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace").to_string_lossy().into_owned();
+        let scratch = root.join("scratch").to_string_lossy().into_owned();
+        let partition = root
+            .join("scratch/build/workspace")
+            .to_string_lossy()
+            .into_owned();
+        let build = Caveats {
+            fs_read: Scope::only([workspace.clone(), partition.clone()]),
+            fs_write: Scope::only([workspace.clone(), partition]),
+            ..Caveats::top()
+        };
+        for smart in [false, true] {
+            let default =
+                confined_bench_caveats_with_grants(&workspace, std::slice::from_ref(&scratch), &[]);
+            let mut session = default.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert!(
+                build.leq(&session),
+                "already-granted build paths need exact declarations for admission: smart={smart}"
+            );
+            let Scope::Only(roots) = &session.fs_write else {
+                panic!("writes must remain fenced");
+            };
+            assert!(roots
+                .iter()
+                .all(|root| permits_path(&default.fs_write, root)));
+            assert!(!permits_path(
+                &session.fs_write,
+                &root.join("outside").to_string_lossy()
+            ));
+        }
+    }
+
+    #[test]
+    fn headless_build_projection_admits_the_covered_managed_partition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().canonicalize().unwrap();
+        let scratch = newt_core::confined_exec::build_scratch_dir(&workspace);
+        let scratch_parent = scratch.parent().unwrap().parent().unwrap();
+        let baseline = confined_bench_caveats_with_grants(
+            &workspace.to_string_lossy(),
+            &[scratch_parent.to_string_lossy().into_owned()],
+            &[],
+        );
+        let request = newt_core::confined_exec::build_tool_request(
+            &workspace,
+            &workspace,
+            "cargo",
+            ["check"],
+            &baseline.net,
+        );
+        for smart in [false, true] {
+            let mut session = baseline.clone();
+            calibrate_headless_filesystem(&mut session, request.caveats(), smart);
+            assert!(
+                request.caveats().leq(&session),
+                "covered build: smart={smart}"
+            );
+        }
+        assert!(
+            !scratch.parent().unwrap().exists(),
+            "admission must not allocate scratch"
+        );
+    }
+
+    #[test]
+    fn headless_build_projection_preserves_narrow_reads_and_other_authority() {
+        use newt_core::caveats::CountBound;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace").to_string_lossy().into_owned();
+        let build = Caveats {
+            fs_read: Scope::only([
+                workspace.clone(),
+                root.join("toolchain").to_string_lossy().into_owned(),
+            ]),
+            fs_write: Scope::only([
+                workspace.clone(),
+                root.join("outside/scratch").to_string_lossy().into_owned(),
+            ]),
+            ..Caveats::top()
+        };
+        for smart in [false, true] {
+            let mut session = Caveats {
+                fs_read: Scope::only([workspace.clone()]),
+                fs_write: Scope::only([workspace.clone()]),
+                exec: Scope::none(),
+                net: Scope::none(),
+                max_calls: CountBound::AtMost(3),
+                valid_for_generation: Scope::only([42]),
+            };
+            let baseline = session.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert_eq!(session, baseline, "startup may not acquire authority");
+            assert!(!build.leq(&session));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_build_projection_handles_aliases_without_granting_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let granted = root.join("granted");
+        let outside = root.join("outside");
+        std::fs::create_dir(&granted).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let alias = root.join("alias");
+        symlink(&granted, &alias).unwrap();
+        symlink(&outside, granted.join("escape")).unwrap();
+        for smart in [false, true] {
+            let mut session = confined_bench_caveats_with_grants(
+                "/app/task",
+                &[alias.to_string_lossy().into_owned()],
+                &[],
+            );
+            let admitted = granted
+                .join("uncreated-build")
+                .to_string_lossy()
+                .into_owned();
+            let escaped = granted
+                .join("escape/uncreated-build")
+                .to_string_lossy()
+                .into_owned();
+            let build = Caveats {
+                fs_read: Scope::All,
+                fs_write: Scope::only([admitted.clone(), escaped.clone()]),
+                ..Caveats::top()
+            };
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert!(
+                session.fs_write.permits(&admitted),
+                "canonical alias: smart={smart}"
+            );
+            assert!(
+                !session.fs_write.permits(&escaped),
+                "symlink escape: smart={smart}"
+            );
+            assert!(!granted.join("uncreated-build").exists());
+            assert!(!outside.join("uncreated-build").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_custom_scratch_denies_build_before_effects_in_both_modes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let configured = tempfile::tempdir().unwrap();
+        let baseline = confined_bench_caveats_with_grants(
+            &workspace.to_string_lossy(),
+            &[configured
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()],
+            &[],
+        );
+        let build = newt_core::confined_exec::build_tool_caveats(&workspace);
+        let scratch = newt_core::confined_exec::build_scratch_dir(&workspace);
+        let partition = scratch.parent().unwrap();
+        assert!(
+            !partition.exists(),
+            "planning a Build must not create its scratch"
+        );
+        for smart in [false, true] {
+            let mut session = baseline.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            let marker = workspace.join(format!("unapproved-build-{smart}"));
+            let output = newt_core::execute_tool(
+                "build_exec",
+                &serde_json::json!({"argv": ["touch", marker.to_string_lossy()], "timeout_secs": 5}),
+                &workspace.to_string_lossy(),
+                false,
+                20,
+                &session,
+                &mut newt_core::NoMcp,
+                None, None, None, None, None, None, None,
+                None, None, None, None, None, None,
+            ).await;
+            assert!(
+                output.contains("requires explicit confined build authority; no command ran"),
+                "custom scratch cannot authorize the managed partition: smart={smart}: {output}"
+            );
+            assert!(!marker.exists());
+            assert!(
+                !partition.exists(),
+                "a refused Build must not allocate scratch"
             );
         }
     }

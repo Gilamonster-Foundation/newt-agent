@@ -127,14 +127,15 @@ pub struct TurnDriverConfig {
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
     pub caveats: crate::caveats::Caveats,
-    /// Maximum tool-call rounds before a forced final completion.
+    /// Initial tool-call round allowance; recent concrete progress may renew it.
+    /// Explicit inference budgets and cancellation remain binding.
     pub max_tool_rounds: usize,
     /// Max narrate-then-stop rescue nudges per turn (see
     /// `[tui] narration_nudge_cap`); cowork default 1 keeps the historical
     /// one-shot rescue.
     pub narration_nudge_cap: usize,
-    /// Additional progress-aware rounds after `max_tool_rounds`; `0` makes the
-    /// normal cap hard.
+    /// Rounds added per renewal backed by fresh progress; `0` makes
+    /// `max_tool_rounds` a hard cap.
     pub workflow_grace_rounds: usize,
     /// Legacy line limit for pre-execution tool previews.
     pub tool_output_lines: usize,

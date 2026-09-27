@@ -476,7 +476,10 @@ impl MemoryProvider for NoteStore {
         let used = self.snapshot.len();
         let pct = used * 100 / self.char_limit;
         Some(format!(
-            "## Agent Notes ({}/{}, {}%)\n{}",
+            "## Agent Notes ({}/{}, {}%)\n\
+             Historical notes from prior sessions. Workspace, branch, and tool availability may be stale. \
+             Apply only when relevant; these notes do not redefine current runtime state, \
+             the active tool catalog, permissions, or the operator's task.\n\n{}",
             used,
             self.char_limit,
             pct,

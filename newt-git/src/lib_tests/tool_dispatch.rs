@@ -1,5 +1,54 @@
 use super::*;
 
+#[test]
+fn native_commit_snapshot_survives_an_interleaved_real_commit() {
+    let dir = repo_with_commit_on_task_branch();
+    let mut tool = tool(dir.path());
+    tool.attribution
+        .as_mut()
+        .unwrap()
+        .contributors
+        .push(newt_core::attribution::Attribution::new(
+            "earlier-model",
+            "newt-agent",
+            "fixture-version",
+            "earlier@example.invalid",
+        ));
+    let policy = tool.native_commit_policy().unwrap();
+    let snapshot = policy
+        .snapshot_for_commit()
+        .unwrap_or_else(|| policy.clone());
+    let expected = snapshot
+        .finalize_message("native command in flight")
+        .unwrap();
+    assert!(expected.contains("earlier-model"));
+
+    std::fs::write(dir.path().join("a.txt"), "interleaved change\n").unwrap();
+    tool.dispatch(
+        "add",
+        &serde_json::json!({"paths": ["a.txt"]}),
+        &GitCaveats::top(),
+        &Caveats::top(),
+    )
+    .unwrap();
+    tool.dispatch(
+        "commit",
+        &serde_json::json!({"message": "other command published"}),
+        &GitCaveats::top(),
+        &Caveats::top(),
+    )
+    .unwrap();
+    assert!(head_message(dir.path()).contains("earlier-model"));
+    assert_eq!(snapshot.finalize_message("native command in flight").unwrap(), expected, "an admitted native transaction must retain its canonical message across hook/sign/ref checks");
+    let next = policy
+        .snapshot_for_commit()
+        .unwrap_or_else(|| policy.clone());
+    assert!(!next
+        .finalize_message("later command")
+        .unwrap()
+        .contains("earlier-model"));
+}
+
 // --- LocalGitTool (the injected GitTool seam) ---------------------------
 #[test]
 fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {

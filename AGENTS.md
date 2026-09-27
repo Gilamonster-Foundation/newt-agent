@@ -96,7 +96,7 @@ Codex session working in this repo is a guest and signs as itself.
 
 | Harness | Attribution email |
 |---|---|
-| `newt-agent`, `newt-agent crew` — this repo's embedded `git` tool | `309460085+newt-agent@users.noreply.github.com` (`agent_identity::DEFAULT_AGENT_EMAIL`) |
+| `newt-agent`, `newt-agent crew` — this repo's commit attribution | `309460085+newt-agent@users.noreply.github.com` (`agent_identity::DEFAULT_AGENT_EMAIL`) |
 | `Claude Code` | `noreply@anthropic.com` |
 | `Codex CLI` | `codex@openai.com` |
 | anything else | that harness's own documented trailer — if it documents none, ask rather than invent one |
@@ -173,12 +173,14 @@ Rules:
   not produce. `newt identity` prints the same preview for the configured
   identity. Read it off one of those instead of assembling a trailer from
   this section by hand.
-- **This is mechanical, not a model instruction.** The embedded `git` tool
-  stamps the ledger's accumulated trailers itself; do not hand-write
-  `Co-authored-by` lines yourself when using it — see the per-turn "Git
-  commit identity" guidance the harness already gives you. If you must shell
-  out to `git` directly (bypassing the embedded tool), you get no automatic
-  multi-contributor credit at all — prefer the embedded tool.
+- **This is mechanical, not a model instruction.** Newt's native commit
+  broker and optional embedded Git adapter stamp the accumulated trailers.
+  Use ordinary `git` commands through `run_command` for supported native
+  commits; do not hand-write their `Co-authored-by` lines. The broker preserves
+  the harness's attribution and signing policy. Git run outside Newt has no
+  automatic Newt attribution; a foreign harness uses its own byline, as below.
+  See `docs/design/agent-toolchain.md` for current native commit scope and
+  platform support.
 - **If you are not the newt harness, this section is not yours to imitate.**
   It documents what newt stamps about itself. A Claude Code, Codex, or other
   foreign session commits with the trailer ITS OWN harness prescribes and the

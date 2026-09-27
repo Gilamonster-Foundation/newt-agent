@@ -409,6 +409,12 @@ impl Respond for ReadOnlyNudgeResponder {
 
 #[tokio::test]
 async fn read_only_nudge_injected_after_three_rounds() {
+    // This fixture asserts the Measured/default thresholds. Other loop tests
+    // deliberately install a two-round no-progress stop, so reading globals
+    // without the shared guard can stop this turn before its action nudge.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(Default::default());
+    crate::initiative::set_cli_initiative(crate::initiative::Initiative::Measured);
     let server = MockServer::start().await;
     let nudge_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -517,7 +523,7 @@ async fn read_only_nudge_injected_after_three_rounds() {
 
     assert!(
         nudge_seen.load(std::sync::atomic::Ordering::SeqCst),
-        "nudge was never injected after 3 consecutive read-only rounds"
+        "nudge was never injected after 3 consecutive read-only rounds; reply: {reply}"
     );
     assert_eq!(
         reply, "nudge received, writing file now",
@@ -584,7 +590,9 @@ async fn run_brake_loop(
     let ws = tempfile::TempDir::new().unwrap();
     let ws_path = ws.path().to_string_lossy().into_owned();
     let messages = msgs();
-    let caveats = Caveats::top();
+    // The fixture authorizes its write explicitly; unrestricted writes require
+    // an operator confirmation and stdin EOF is correctly a denial.
+    let caveats = crate::confined_exec::workspace_confined_caveats(ws.path());
     let uri = server.uri();
     let mut ctx = hard_budget_ctx(
         &uri,
@@ -612,22 +620,22 @@ async fn run_brake_loop(
 /// a person who types a steer on the round that would have stopped the turn used
 /// to have it appended and then thrown away by the stop. A human steer is new
 /// information: it resets the count, so the model reads it. Without steering the
-/// same loop still stops (after three requests).
+/// same loop still stops after the first novel read and two repetitions.
 #[tokio::test]
 async fn operator_steering_on_the_round_that_would_stop_resets_the_brake() {
     const STEER: &str = "look at the failing test, not the directory";
     let (requests, end, _) = run_brake_loop(None, STEER).await;
     assert_eq!(
-        requests, 3,
-        "no steering: write, two idle rounds, then the stop"
+        requests, 4,
+        "no steering: write, new directory evidence, two idle rounds, then the stop"
     );
     assert_eq!(end, Some(crate::TurnEndReason::NoProgress));
 
-    // Typed while round 2 (the last idle round) is on the wire: it is drained at
-    // the start of round 3 — the round that would have stopped.
-    let (requests, end, last) = run_brake_loop(Some(2), STEER).await;
+    // Typed while round 3 (the last idle round) is on the wire: it is drained at
+    // the start of round 4 — the round that would have stopped.
+    let (requests, end, last) = run_brake_loop(Some(3), STEER).await;
     assert!(
-        requests > 3,
+        requests > 4,
         "the steered turn must not stop on the spot: {requests}"
     );
     assert!(
@@ -640,7 +648,7 @@ async fn operator_steering_on_the_round_that_would_stop_resets_the_brake() {
         "it still stops later"
     );
     assert_eq!(
-        requests, 5,
-        "the count restarts after the steer: rounds 3 and 4, then the stop"
+        requests, 6,
+        "the count restarts after the steer: rounds 4 and 5, then the stop"
     );
 }

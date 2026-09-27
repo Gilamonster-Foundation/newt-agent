@@ -433,6 +433,7 @@ async fn real_shell_cannot_read_or_mutate_private_frame() {
             .unwrap();
         assert!(index.status.success());
         assert_eq!(String::from_utf8(index.stdout).unwrap(), "visible.txt\n");
+        let index_before = std::fs::read(workspace.path().join(".git/index")).unwrap();
         let commit = dispatch(
             &harness,
             workspace.path(),
@@ -443,8 +444,25 @@ async fn real_shell_cannot_read_or_mutate_private_frame() {
         )
         .await;
         assert!(
-            commit.contains("harness-managed commit attribution"),
+            commit.contains("refusing Git commit publication")
+                && commit.contains("native commit attribution/signing policy is unavailable"),
             "{commit}"
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join(".git/index")).unwrap(),
+            index_before,
+            "refused commit must leave the staged index unchanged"
+        );
+        let head = crate::git_hardening::hardened_git(
+            workspace.path(),
+            &["rev-parse", "--verify", "HEAD"],
+        )
+        .unwrap()
+        .output()
+        .unwrap();
+        assert!(
+            !head.status.success(),
+            "refused commit must leave the repository without a commit"
         );
     } else {
         assert!(output.contains("frame isolation"), "{output}");

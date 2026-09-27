@@ -1,0 +1,23 @@
+[package]
+name = "agent-toolchain"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "Portable toolchain adapters and authority contracts for agent harnesses"
+repository = "https://github.com/Gilamonster-Foundation/newt-agent"
+readme = "README.md"
+
+[features]
+default = []
+embedded-git = ["dep:serde_json"]
+
+[dependencies]
+agent-mesh-protocol = "0.6"
+content-addressable = "0.1.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = { version = "1.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
