@@ -1147,6 +1147,7 @@ async fn lifecycle_run_with_escalation(
     let first = exec_confined_command(
         joined,
         effective_dir,
+        workspace,
         color,
         tool_output_lines,
         caveats,
@@ -1519,6 +1520,51 @@ fn denial_recovery_hint(capability: &str, target: &str) -> String {
     )
 }
 
+/// Facts held by the caller at the refusal boundary. A workspace is a default
+/// directory, not an authority claim. Scope details come from the caller's
+/// already-held snapshot, which need not include command-specific setup roots.
+/// Formatting must not refresh or mint a grant.
+fn denial_context(
+    workspace: &str,
+    requested_cwd: Option<&str>,
+    caveats: Option<&crate::caveats::Caveats>,
+) -> String {
+    fn scope(scope: &crate::caveats::Scope<String>) -> String {
+        match scope {
+            crate::caveats::Scope::All => "all".into(),
+            crate::caveats::Scope::Only(roots) => {
+                const DISPLAY_ROOTS: usize = 4;
+                let shown: Vec<_> = roots.iter().take(DISPLAY_ROOTS).collect();
+                let mut text = serde_json::json!(shown).to_string();
+                let omitted = roots.len().saturating_sub(shown.len());
+                if omitted > 0 {
+                    text.push_str(&format!(" ({omitted} more roots)"));
+                }
+                text
+            }
+        }
+    }
+
+    let mut text = format!(
+        "Workspace root: {}\nDefault tool directory: workspace root",
+        serde_json::json!(workspace)
+    );
+    if let Some(cwd) = requested_cwd {
+        text.push_str(&format!(
+            "\nRequested command directory: {}",
+            serde_json::json!(cwd)
+        ));
+    }
+    if let Some(caveats) = caveats {
+        text.push_str(&format!(
+            "\nKnown filesystem grants: fs_read={}, fs_write={}",
+            scope(&caveats.fs_read),
+            scope(&caveats.fs_write)
+        ));
+    }
+    text
+}
+
 /// #479 (G4): the model-facing recovery coach when `crew`/`compose_roster` is
 /// reached while the crew/team surface is OFF — the DEFAULT, since the runner is
 /// only built when the operator sets `NEWT_TEAM`. Replaces the flat
@@ -1765,6 +1811,7 @@ fn execute_request_permissions(
     gate: Option<&mut dyn PermissionGate>,
     _color: bool,
     _tool_output_lines: usize,
+    workspace: &str,
 ) -> String {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
@@ -1792,7 +1839,8 @@ fn execute_request_permissions(
         },
     };
 
-    let out = match gate {
+    let quoted_target = serde_json::json!(target);
+    let mut out = match gate {
         // The gate consults the operator and (for a session grant) remembers it,
         // exactly as a denial-driven prompt does. We do not re-execute anything
         // here — the model retries its original tool call, which rides the #263
@@ -1800,7 +1848,7 @@ fn execute_request_permissions(
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(_widened) => permission_granted_result(capability, target),
             PermissionDecision::Deny => format!(
-                "denied: the operator declined {capability} for '{target}'. \
+                "denied: the operator declined {capability} for {quoted_target}. \
                  Do not retry it — take a different approach."
             ),
         },
@@ -1814,14 +1862,22 @@ fn execute_request_permissions(
         // within the authority it already has; only report the blocker if the
         // target is genuinely essential and out of scope.
         None => format!(
-            "no operator available to grant {capability} for '{target}' — this session \
+            "no operator available to grant {capability} for {quoted_target} — this session \
              has no interactive permission gate (headless / eval / piped), so authority \
              cannot be widened mid-run and re-calling request_permissions will not help. \
              Proceed within the authority you already have and the tools available to you; \
-             if '{target}' is genuinely essential and outside your current scope, say so in \
+             if {quoted_target} is genuinely essential and outside your current scope, say so in \
              your final answer rather than retrying it."
         ),
     };
+    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
+        && out != permission_granted_result(capability, target)
+    {
+        out.push('\n');
+        // A declined question supplies no fresh authority snapshot. In
+        // particular, do not remint capabilities just to render diagnostics.
+        out.push_str(&denial_context(workspace, None, None));
+    }
     out
 }
 
@@ -3583,7 +3639,7 @@ async fn execute_authorized_tool(
         // than blocking. Consumes the gate (mutually exclusive with the
         // run_command / fs arms that also use it — only one arm runs per call).
         "request_permissions" => {
-            execute_request_permissions(args, permission_gate, color, tool_output_lines)
+            execute_request_permissions(args, permission_gate, color, tool_output_lines, workspace)
         }
 
         // #728: the GENERIC ask-the-human tool — surfaces a free-text question to
@@ -3855,6 +3911,7 @@ async fn execute_authorized_tool(
                 shell::exec_confined_command_with_broker(
                     cmd,
                     &run_cwd,
+                    workspace,
                     color,
                     tool_output_lines,
                     &git_shell_caveats,
@@ -4077,6 +4134,7 @@ async fn execute_authorized_tool(
                     exec_confined_command(
                         &display,
                         &ran_in,
+                        workspace,
                         color,
                         tool_output_lines,
                         caveats,

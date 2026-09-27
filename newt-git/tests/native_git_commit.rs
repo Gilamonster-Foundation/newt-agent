@@ -99,6 +99,7 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
         fs_write: newt_core::Scope::only([repo.to_string_lossy().into_owned()]),
         ..newt_core::Caveats::top()
     };
+    denied_parent_keeps_child_authority(&repo, &tool, &authority).await;
     let output = execute(
         &repo,
         &tool,
@@ -408,6 +409,212 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
     assert!(regressions.is_empty(), "{}", regressions.join("\n\n"));
     println!("test native_commit_preserves_default_branch_policy ... ok");
     println!("test relative_hooks_and_post_index_change_keep_native_semantics ... ok");
+}
+
+#[derive(Default)]
+struct DenyingParentGate {
+    requests: Vec<(newt_core::DenialKind, String)>,
+    refreshes: usize,
+}
+
+impl newt_core::PermissionGate for DenyingParentGate {
+    fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
+        self.refreshes += 1;
+        newt_core::PermissionDecision::Allow(baseline.clone())
+    }
+
+    fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+        self.requests.extend(
+            requests
+                .iter()
+                .map(|request| (request.kind, request.target.clone())),
+        );
+        newt_core::PermissionDecision::Deny
+    }
+
+    fn ask_question(&mut self, _: &str) -> newt_core::HumanQuestionOutcome {
+        newt_core::HumanQuestionOutcome::Unavailable
+    }
+}
+
+async fn denied_parent_keeps_child_authority(
+    repo: &std::path::Path,
+    tool: &newt_git::LocalGitTool,
+    authority: &newt_core::Caveats,
+) {
+    let parent = repo.parent().unwrap();
+    let sentinel = parent.join("parent-sentinel");
+    let marker = parent.join("denied-parent-marker");
+    std::fs::write(&sentinel, "parent remains unchanged\n").unwrap();
+    let before_head = git(repo, &["rev-parse", "HEAD"]).stdout;
+    let before_index = std::fs::read(repo.join(".git/index")).unwrap();
+    let before_authority = serde_json::to_value(authority).unwrap();
+    let mut gate = DenyingParentGate::default();
+    let denied = execute_gated(
+        repo,
+        tool,
+        authority,
+        "run_command",
+        &serde_json::json!({
+            "command": "printf unexpected > denied-parent-marker",
+            "cwd": parent,
+        }),
+        &mut gate,
+    )
+    .await;
+    assert!(!marker.exists(), "denied cwd launched a command: {denied}");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"parent remains unchanged\n"
+    );
+    assert_eq!(git(repo, &["rev-parse", "HEAD"]).stdout, before_head);
+    assert_eq!(
+        std::fs::read(repo.join(".git/index")).unwrap(),
+        before_index
+    );
+    assert!(
+        denied.contains(&format!("Workspace root: {}", serde_json::json!(repo))),
+        "{denied}"
+    );
+    assert!(
+        denied.contains(&format!(
+            "Requested command directory: {}",
+            serde_json::json!(parent)
+        )),
+        "{denied}"
+    );
+    assert!(denied.contains("fs_read="), "{denied}");
+    assert!(denied.contains("fs_write="), "{denied}");
+    assert_eq!(
+        gate.refreshes, 1,
+        "only the existing dispatch refresh is allowed"
+    );
+    assert!(
+        gate.requests.is_empty(),
+        "cwd refusal must not invent an approval"
+    );
+
+    for capability in ["fs_read", "fs_write"] {
+        let refreshes = gate.refreshes;
+        let denied = execute_gated(
+            repo, tool, authority, "request_permissions",
+            &serde_json::json!({"capability": capability, "target": parent, "reason": "fixture parent access"}),
+            &mut gate,
+        ).await;
+        assert!(denied.starts_with("denied:"), "{denied}");
+        assert!(denied.contains(capability), "{denied}");
+        assert!(
+            denied.contains(&format!("Workspace root: {}", serde_json::json!(repo))),
+            "{denied}"
+        );
+        assert!(
+            !denied.contains("fs_read="),
+            "permission decline has no current grant snapshot: {denied}"
+        );
+        assert!(
+            !denied.contains("fs_write="),
+            "permission decline has no current grant snapshot: {denied}"
+        );
+        assert_eq!(
+            gate.refreshes, refreshes,
+            "diagnostics must not remint capabilities"
+        );
+    }
+    assert_eq!(
+        gate.requests,
+        vec![
+            (
+                newt_core::DenialKind::FsRead,
+                parent.to_string_lossy().into_owned()
+            ),
+            (
+                newt_core::DenialKind::FsWrite,
+                parent.to_string_lossy().into_owned()
+            ),
+        ]
+    );
+    assert_eq!(serde_json::to_value(authority).unwrap(), before_authority);
+
+    // The test explicitly issues each authorized operation. Denial handling
+    // must not rewrite the command, retry it, or perform a recovery itself.
+    let write = execute_gated(repo, tool, authority, "write_file",
+        &serde_json::json!({"path": "authority-probe.txt", "content": "child authority retained\n"}), &mut gate).await;
+    assert_eq!(
+        std::fs::read(repo.join("authority-probe.txt")).unwrap(),
+        b"child authority retained\n",
+        "{write}"
+    );
+    let read = execute_gated(
+        repo,
+        tool,
+        authority,
+        "read_file",
+        &serde_json::json!({"path": "authority-probe.txt"}),
+        &mut gate,
+    )
+    .await;
+    assert!(read.contains("child authority retained"), "{read}");
+    let delete = execute_gated(
+        repo,
+        tool,
+        authority,
+        "delete_file",
+        &serde_json::json!({"path": "authority-probe.txt"}),
+        &mut gate,
+    )
+    .await;
+    assert!(!repo.join("authority-probe.txt").exists(), "{delete}");
+    let staged = execute_gated(repo, tool, authority, "run_command",
+        &serde_json::json!({"command": "git status --short -- .gitignore && git add .gitignore && git diff --cached --name-only"}), &mut gate).await;
+    assert_succeeded(&staged);
+    assert!(staged.contains(".gitignore"), "{staged}");
+    assert_eq!(
+        git(repo, &["diff", "--cached", "--name-only"]).stdout,
+        b".gitignore\n"
+    );
+    assert_eq!(git(repo, &["rev-parse", "HEAD"]).stdout, before_head);
+    assert_eq!(tool.drain_commit_success(), 0);
+    assert_eq!(serde_json::to_value(authority).unwrap(), before_authority);
+    assert!(!marker.exists());
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"parent remains unchanged\n"
+    );
+    println!("test denied_parent_keeps_child_authority ... ok");
+}
+
+async fn execute_gated(
+    repo: &std::path::Path,
+    tool: &newt_git::LocalGitTool,
+    authority: &newt_core::Caveats,
+    name: &str,
+    args: &serde_json::Value,
+    gate: &mut dyn newt_core::PermissionGate,
+) -> String {
+    let mut mcp = newt_core::NoMcp;
+    newt_core::execute_tool(
+        name,
+        args,
+        &repo.to_string_lossy(),
+        false,
+        200,
+        authority,
+        &mut mcp,
+        None,
+        None,
+        None,
+        None,
+        Some(gate),
+        None,
+        Some(tool),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn execute(

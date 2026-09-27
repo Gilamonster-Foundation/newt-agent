@@ -10,7 +10,7 @@ use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
-use super::{denial_recovery_hint, full_access_requested, ocap_disabled};
+use super::{denial_context, denial_recovery_hint, full_access_requested, ocap_disabled};
 use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {
@@ -957,6 +957,7 @@ pub(super) async fn exec_confined_command(
     // The directory the command runs in (#1159): the workspace root for
     // lifecycle, or a resolved workspace-confined cwd for run_command.
     cwd: &str,
+    workspace: &str,
     color: bool,
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
@@ -980,6 +981,7 @@ pub(super) async fn exec_confined_command(
     exec_confined_command_with_broker(
         cmd,
         cwd,
+        workspace,
         color,
         tool_output_lines,
         caveats,
@@ -1002,6 +1004,7 @@ pub(super) async fn exec_confined_command(
 pub(super) async fn exec_confined_command_with_broker(
     cmd: &str,
     cwd: &str,
+    workspace: &str,
     color: bool,
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
@@ -1018,7 +1021,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // BEFORE either lane below runs anything — this is the single choke
     // point both the confined dispatch and the `--yolo` host-bypass share.
     if let Some(refusal) = same_file_redirect_refusal(cmd, cwd) {
-        return (refusal, ExecOutcome::Denied);
+        return with_denial_context((refusal, ExecOutcome::Denied), workspace, cwd, None);
     }
 
     // Venv injection (#783): the confined shell carries the venv via
@@ -1088,9 +1091,14 @@ pub(super) async fn exec_confined_command_with_broker(
         Some(gate) => match gate.refresh_caveats(caveats) {
             PermissionDecision::Allow(current) => Some(current),
             PermissionDecision::Deny => {
-                return (
-                    "capability denied: current permission authority was refused".to_string(),
-                    ExecOutcome::Denied,
+                return with_denial_context(
+                    (
+                        "capability denied: current permission authority was refused".to_string(),
+                        ExecOutcome::Denied,
+                    ),
+                    workspace,
+                    cwd,
+                    None,
                 );
             }
         },
@@ -1117,10 +1125,11 @@ pub(super) async fn exec_confined_command_with_broker(
             {
                 Some(allowed)
             }
-            _ => return (
-                "capability denied: declared filesystem authority was not granted for this command"
-                    .into(),
-                ExecOutcome::Denied,
+            _ => return with_denial_context(
+                ("capability denied: declared filesystem authority was not granted for this command".into(), ExecOutcome::Denied),
+                workspace,
+                cwd,
+                Some(caveats),
             ),
         }
     };
@@ -1129,7 +1138,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let dispatch_args = confined_dispatch_args(cmd, cwd);
-    match dispatch_bridled_shell_with_floor(
+    let result = match dispatch_bridled_shell_with_floor(
         dispatch_args.clone(),
         caveats,
         live_tool_output.clone(),
@@ -1161,9 +1170,14 @@ pub(super) async fn exec_confined_command_with_broker(
                     &envelope,
                 );
                 if command_broker.is_some() {
-                    return (
-                        denied_run_command_result(&envelope, color),
-                        ExecOutcome::Denied,
+                    return with_denial_context(
+                        (
+                            denied_run_command_result(&envelope, color),
+                            ExecOutcome::Denied,
+                        ),
+                        workspace,
+                        cwd,
+                        Some(caveats),
                     );
                 }
                 // #263: an interactive gate may turn this denial into a human grant.
@@ -1194,12 +1208,14 @@ pub(super) async fn exec_confined_command_with_broker(
                                 .iter()
                                 .all(|request| permits_filesystem_request(&widened, request))
                             {
-                                return (
-                                    "capability denied: declared filesystem authority was not retained for this command".into(),
-                                    ExecOutcome::Denied,
+                                return with_denial_context(
+                                    ("capability denied: declared filesystem authority was not retained for this command".into(), ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    None,
                                 );
                             }
-                            return match dispatch_bridled_shell(
+                            let retried = match dispatch_bridled_shell(
                                 dispatch_args,
                                 &widened,
                                 live_tool_output,
@@ -1226,8 +1242,9 @@ pub(super) async fn exec_confined_command_with_broker(
                                     ),
                                     envelope_outcome(&env2),
                                 ),
-                                Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+                                Err(e) => dispatch_error_result(e),
                             };
+                            return with_denial_context(retried, workspace, cwd, Some(&widened));
                         }
                     }
                 }
@@ -1245,8 +1262,33 @@ pub(super) async fn exec_confined_command_with_broker(
         }
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
-        Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+        Err(e) => dispatch_error_result(e),
+    };
+    with_denial_context(result, workspace, cwd, Some(caveats))
+}
+
+/// Preserve the dispatch error alongside the execution class returned to the
+/// tool-event funnel. Both initial dispatch and the existing grant retry use it.
+pub(super) fn dispatch_error_result(error: agent_bridle::ToolError) -> (String, ExecOutcome) {
+    let outcome = if matches!(error, agent_bridle::ToolError::Denied { .. }) {
+        ExecOutcome::Denied
+    } else {
+        ExecOutcome::Unavailable
+    };
+    (format!("error: {error}"), outcome)
+}
+
+fn with_denial_context(
+    (mut text, outcome): (String, ExecOutcome),
+    workspace: &str,
+    cwd: &str,
+    caveats: Option<&crate::caveats::Caveats>,
+) -> (String, ExecOutcome) {
+    if outcome == ExecOutcome::Denied {
+        text.push('\n');
+        text.push_str(&denial_context(workspace, Some(cwd), caveats));
     }
+    (text, outcome)
 }
 
 /// #2315: the class of a completed envelope from its own facts — structured
