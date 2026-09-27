@@ -1679,19 +1679,9 @@ fn streamed_lifecycle_call(args_json: &str) -> String {
     .collect()
 }
 
-/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
-/// `lifecycle action=build` does headless, where `permission_gate` is
-/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
-/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
-/// fs_write fenced to the workspace/scratch) already dominate what
-/// `build_tool_request` calibrates for the build (fenced reads, a
-/// workspace-scoped write root, network denied), so `build.leq(caveats)`
-/// is true and the `permission_gate.is_some_and(...)` check — the only
-/// place a `None` gate could matter — is never reached at all. The
-/// absent-gate case this review item worried about does not occur in
-/// practice under headless's actual default caveats.
-#[tokio::test(flavor = "multi_thread")]
-async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+async fn headless_lifecycle_build_attempt(
+    scratch_field: Option<&str>,
+) -> (tempfile::TempDir, serde_json::Value) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1702,14 +1692,18 @@ async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
         .mount(&server)
         .await;
 
-    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
+    let workspace = fixture.path().join("workspace");
+    let ordinary_temp = fixture.path().join("ordinary-temp");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&ordinary_temp).expect("ordinary temp");
     // An empty `Cargo.toml` is enough for the Rust language pack's `detect`
     // marker (tooling.rs), so `phase=test` resolves to a real command
     // instead of the "no command configured" no-op.
-    std::fs::write(workspace.path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
-    let config_path = workspace.path().join("headless.toml");
-    let instruction_path = workspace.path().join("instruction.md");
-    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(workspace.as_path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
+    let config_path = workspace.as_path().join("headless.toml");
+    let instruction_path = workspace.as_path().join("instruction.md");
+    let events_path = workspace.as_path().join("events.jsonl");
     std::fs::write(
         &config_path,
         format!(
@@ -1725,16 +1719,31 @@ kind = "openai"
         ),
     )
     .expect("write headless config");
+    if let Some(field) = scratch_field {
+        let configured = fixture.path().join("configured-scratch");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let value = toml::Value::String(configured.to_string_lossy().into_owned());
+        std::fs::write(
+            &config_path,
+            format!("{config}\n[scratch]\n{field} = {value}\n"),
+        )
+        .unwrap();
+    }
     std::fs::write(&instruction_path, "Verify the change builds.\n")
         .expect("write headless instruction");
 
     let _ = Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
+        .env_remove("NEWT_SCRATCH_DIR")
+        .env_remove("NEWT_BUILD_SCRATCH_DIR")
+        .env("TMPDIR", &ordinary_temp)
+        .env("TEMP", &ordinary_temp)
+        .env("TMP", &ordinary_temp)
         .arg("--config")
         .arg(&config_path)
         .args(["headless", "--cwd"])
-        .arg(workspace.path())
+        .arg(workspace.as_path())
         .arg("--instruction-file")
         .arg(&instruction_path)
         .arg("--events")
@@ -1743,6 +1752,23 @@ kind = "openai"
         .assert();
 
     let result = solve_result_from(&events_path);
+    (fixture, result)
+}
+
+/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
+/// `lifecycle action=build` does headless, where `permission_gate` is
+/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
+/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
+/// fs_write fenced to the workspace/scratch) already dominate what
+/// `build_tool_request` calibrates for the build (fenced reads, a
+/// workspace-scoped write root, caller-authorized network), so `build.leq(caveats)`
+/// is true and the `permission_gate.is_some_and(...)` check — the only
+/// place a `None` gate could matter — is never reached at all. The
+/// absent-gate case this review item worried about does not occur in
+/// practice under headless's actual default caveats.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+    let (_fixture, result) = headless_lifecycle_build_attempt(None).await;
     let trajectory = result["trajectory"].as_array().expect("trajectory");
     assert!(
         !trajectory.is_empty(),
@@ -1756,7 +1782,7 @@ kind = "openai"
     // (`confined_bench_caveats` — fs_read/exec/net = Scope::All, only
     // fs_write fenced to the workspace/scratch), `build.leq(caveats)` is
     // already TRUE — the calibrated build caveats (fenced reads,
-    // workspace-scoped writes, denied network) are a subset of what headless
+    // workspace-scoped writes, caller-authorized network) are a subset of what headless
     // already grants. So the `!build.leq(caveats)` gate check never fires and
     // `permission_gate` is never consulted: the command actually RUNS.
     // "denied" never appears; the FIRST call's real execution classifies as
@@ -1770,6 +1796,19 @@ kind = "openai"
     assert_ne!(trajectory[0]["execution"], "denied", "{}", trajectory[0]);
     #[cfg(target_os = "linux")]
     assert_eq!(trajectory[0]["execution"], "failed", "{}", trajectory[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_scratch_overrides_do_not_authorize_external_build_partitions() {
+    for field in ["dir", "build_dir"] {
+        let (fixture, result) = headless_lifecycle_build_attempt(Some(field)).await;
+        let trajectory = result["trajectory"].as_array().expect("trajectory");
+        assert!(!trajectory.is_empty(), "{field}: {result}");
+        assert_eq!(trajectory[0]["tool"], "lifecycle", "{field}: {result}");
+        assert_eq!(trajectory[0]["execution"], "denied", "{field}: {result}");
+        assert!(!fixture.path().join("configured-scratch").exists());
+        assert!(!fixture.path().join("workspace/target").exists());
+    }
 }
 
 /// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool call

@@ -1113,6 +1113,16 @@ pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
     scratch_dir_under(workspace, Some(crate::scratch::build_scratch_base()))
 }
 
+/// The stable per-workspace scratch root used by Build requests and their run
+/// directories. This only plans a path; allocation remains after admission.
+/// An explicit operator Build scratch override is reflected in this path and
+/// still needs coverage by the caller's authority.
+#[must_use]
+pub fn build_scratch_root(workspace: &Path) -> PathBuf {
+    operator_build_scratch_root(workspace, Some(crate::scratch::build_scratch_base()))
+        .expect("the Build scratch base is always configured or managed")
+}
+
 fn scratch_dir_under(workspace: &Path, base: Option<PathBuf>) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1125,14 +1135,14 @@ fn scratch_dir_under(workspace: &Path, base: Option<PathBuf>) -> PathBuf {
         ))
 }
 
-/// `<base>/<workspace id>` for an operator-set build scratch base, else `None`.
-/// Stable per workspace, so the fence can grant it before any run exists.
+/// Stable per-workspace root, so the fence can grant it before any run exists.
+/// Managed defaults use a compact locator; explicit bases retain the full CID.
 fn operator_build_scratch_root(workspace: &Path, base: Option<PathBuf>) -> Option<PathBuf> {
     base.map(|base| {
-        base.join(
-            content_addressable::RawContentId::from_content(workspace.to_string_lossy().as_bytes())
-                .to_string(),
-        )
+        let identity =
+            content_addressable::RawContentId::from_content(workspace.to_string_lossy().as_bytes());
+        crate::scratch::managed_build_partition(&base, &identity)
+            .unwrap_or_else(|| base.join(identity.to_string()))
     })
 }
 

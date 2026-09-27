@@ -12,6 +12,36 @@ fn main() {
         std::process::exit(code);
     }
     #[cfg(unix)]
+    if std::env::args().any(|arg| arg == "--build-unix-socket-probe") {
+        use std::io::{Read, Write};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local.sock");
+        let listener = UnixListener::bind(&path).unwrap_or_else(|error| {
+            panic!(
+                "Unix socket bind failed at {} path bytes: {error}",
+                path.as_os_str().as_bytes().len()
+            )
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"ping").unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut payload = [0; 4];
+        server.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"ping");
+        std::fs::write(
+            "socket-scratch-path",
+            std::env::temp_dir().as_os_str().as_bytes(),
+        )
+        .unwrap();
+        println!(
+            "BUILD_UNIX_SOCKET_ROUNDTRIP_CONFIRMED ({} path bytes)",
+            path.as_os_str().as_bytes().len()
+        );
+        return;
+    }
+    #[cfg(unix)]
     if std::env::args().any(|arg| arg == "--build-pty-child") {
         println!("BUILD_PTY_ROUNDTRIP_CONFIRMED");
         return;
@@ -177,6 +207,9 @@ mod native {
             }
             if selected("build_tests_can_use_a_private_pty") {
                 build_tests_can_use_a_private_pty(&root).await;
+            }
+            if selected("build_tests_can_bind_a_unix_socket_in_a_tempdir") {
+                build_tests_can_bind_a_unix_socket_in_a_tempdir(&root).await;
             }
             if selected("denied_build_runs_no_pipeline_stage_or_redirection") {
                 denied_build_runs_no_pipeline_stage_or_redirection(&root).await;
@@ -486,6 +519,51 @@ mod native {
         assert!(!outside.join("write").exists());
         assert_eq!(gate.queries, 1);
         eprintln!("test build_temp_fixtures_do_not_inherit_repository_identity ... ok");
+    }
+
+    async fn build_tests_can_bind_a_unix_socket_in_a_tempdir(root: &Path) {
+        let (workspace, outside) = project(root, "socket-fixture");
+        let executable = std::env::current_exe().unwrap();
+        let short = tempfile::tempdir_in("/tmp").unwrap();
+        let control = std::process::Command::new(&executable)
+            .arg("--build-unix-socket-probe")
+            .env("TMPDIR", short.path())
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            control.status.success(),
+            "short-path host control: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        let mut gate = CachedBuildGate {
+            workspace: workspace.to_string_lossy().into_owned(),
+            allow: true,
+            queries: 0,
+        };
+        let source = format!(
+            "cargo build --lib --offline && '{}' --build-unix-socket-probe",
+            executable.display()
+        );
+        let output = command(&workspace, &source, &mut gate).await;
+        assert!(
+            output.contains("BUILD_UNIX_SOCKET_ROUNDTRIP_CONFIRMED"),
+            "{output}"
+        );
+        eprintln!(
+            "{}",
+            output
+                .lines()
+                .find(|line| line.contains("BUILD_UNIX_SOCKET_ROUNDTRIP_CONFIRMED"))
+                .unwrap()
+        );
+        let scratch =
+            PathBuf::from(std::fs::read_to_string(workspace.join("socket-scratch-path")).unwrap());
+        assert!(!scratch.starts_with(&workspace));
+        assert!(!scratch.exists(), "normal completion must remove scratch");
+        assert!(!outside.join("write").exists());
+        assert_eq!(gate.queries, 1);
+        eprintln!("test build_tests_can_bind_a_unix_socket_in_a_tempdir ... ok");
     }
 
     /// Grounds terminal-test availability in the actual Build fence: a fresh

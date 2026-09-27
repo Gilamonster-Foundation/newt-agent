@@ -24,7 +24,8 @@
 //!   Instead of full access, [`confined_bench_caveats`] seeds a workspace-fenced
 //!   authority — reads/exec/net stay open, but writes are confined to the
 //!   workspace, the configured scratch root (the platform temp dir unless
-//!   `NEWT_SCRATCH_DIR` / `[scratch] dir` names an absolute one) and explicit
+//!   `NEWT_SCRATCH_DIR` / `[scratch] dir` names an absolute one), the private
+//!   managed workspace Build partition under default scratch settings, and explicit
 //!   `NEWT_WRITE_PATHS` grants (a `Scope::Only`
 //!   fs_write, never `Scope::All`). The container's mutable system roots
 //!   (`/usr /usr/local /var /etc /opt /root /home`, the #1487 bench rationale:
@@ -558,7 +559,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         // grant).
         // The smart lane instead keeps only calibrated build paths already
         // covered by this baseline; it must not gain an external scratch grant.
-        let scratch = resolve_fence_scratch();
+        let scratch = resolve_fence_scratch(std::path::Path::new(&workspace));
         if let (false, Some(root)) = (smart_enabled, scratch.first()) {
             // Same single-threaded-at-this-point contract as the lane's other
             // env writes above.
@@ -1270,23 +1271,39 @@ fn resolve_headless_grant(path: &str) -> Option<String> {
 }
 
 /// The fence's scratch root(s), resolved at run start. Scratch is CONFIGURATION
-/// (`NEWT_SCRATCH_DIR` / `[scratch] dir`, via the one existing resolver), never a
-/// literal; see [`fence_scratch_roots`].
-fn resolve_fence_scratch() -> Vec<String> {
-    fence_scratch_roots(&newt_core::scratch::scratch_dir(), &std::env::temp_dir())
+/// (`NEWT_SCRATCH_DIR` / `[scratch] dir`, via the existing resolver). With
+/// default scratch settings the policy also names the exact managed Build
+/// partition, which can live outside the platform temp root. An operator Build
+/// override must already be covered by the configured fence or explicit grants.
+fn resolve_fence_scratch(workspace: &std::path::Path) -> Vec<String> {
+    let managed = newt_core::scratch::build_scratch_override()
+        .is_none()
+        .then(|| newt_core::confined_exec::build_scratch_root(workspace));
+    fence_scratch_roots(
+        &newt_core::scratch::scratch_dir(),
+        &std::env::temp_dir(),
+        managed.as_deref(),
+    )
 }
 
 /// The fence's scratch root(s): the configured scratch dir when it is ABSOLUTE
 /// (an operator relocated it, e.g. to `/var/tmp` or a PVC), else the platform
-/// temp dir (`temp_dir`, which honours `TMPDIR`). A relative dir — including the
-/// `.scratch` default — already lives inside the workspace, so it is "nothing
-/// configured" for this purpose. Pure. There is no way to drop the scratch root
-/// through configuration today; see RESULT-2501 for the proposed key.
-fn fence_scratch_roots(scratch_dir: &str, temp_dir: &std::path::Path) -> Vec<String> {
+/// temp dir (`temp_dir`, which honours `TMPDIR`) plus the exact managed Build
+/// partition, when no Build override is configured. The temp root stays first:
+/// ordinary commands continue to use it as their `TMPDIR`. A relative scratch
+/// dir already lives inside the workspace and uses this default temp policy.
+/// Pure; no directory is allocated and no shared Build parent is granted.
+fn fence_scratch_roots(
+    scratch_dir: &str,
+    temp_dir: &std::path::Path,
+    managed_build: Option<&std::path::Path>,
+) -> Vec<String> {
     if std::path::Path::new(scratch_dir).is_absolute() {
         vec![scratch_dir.to_string()]
     } else {
-        vec![temp_dir.to_string_lossy().into_owned()]
+        let mut roots = vec![temp_dir.to_string_lossy().into_owned()];
+        roots.extend(managed_build.map(|path| path.to_string_lossy().into_owned()));
+        roots
     }
 }
 
@@ -2441,6 +2458,65 @@ mod tests {
     }
 
     #[test]
+    fn default_scratch_policy_admits_only_its_managed_build_partition() {
+        use newt_core::caveats::permits_path;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let ordinary_temp = root.join("ordinary-temp");
+        let partition = root.join("managed-build/workspace");
+        let configured = root.join("configured-scratch");
+        let build = Caveats {
+            fs_read: Scope::only([
+                workspace.to_string_lossy().into_owned(),
+                partition.to_string_lossy().into_owned(),
+            ]),
+            fs_write: Scope::only([
+                workspace.to_string_lossy().into_owned(),
+                partition.to_string_lossy().into_owned(),
+            ]),
+            ..Caveats::top()
+        };
+        let roots = fence_scratch_roots(".scratch", &ordinary_temp, Some(&partition));
+        assert_eq!(roots[0], ordinary_temp.to_string_lossy());
+        assert_eq!(roots.len(), 2);
+        let baseline =
+            confined_bench_caveats_with_grants(&workspace.to_string_lossy(), &roots, &[]);
+        for smart in [false, true] {
+            let mut session = baseline.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert!(build.leq(&session), "default Build: smart={smart}");
+            for denied in [
+                partition.parent().unwrap().to_path_buf(),
+                partition.with_file_name("other-workspace"),
+            ] {
+                assert!(!permits_path(&session.fs_write, &denied.to_string_lossy()));
+            }
+            // An absolute general scratch setting excludes the managed default;
+            // an explicit Build override supplies no managed default at all.
+            for roots in [
+                fence_scratch_roots(
+                    &configured.to_string_lossy(),
+                    &ordinary_temp,
+                    Some(&partition),
+                ),
+                fence_scratch_roots(".scratch", &ordinary_temp, None),
+            ] {
+                let mut session =
+                    confined_bench_caveats_with_grants(&workspace.to_string_lossy(), &roots, &[]);
+                calibrate_headless_filesystem(&mut session, &build, smart);
+                assert!(
+                    !build.leq(&session),
+                    "configured scratch requires coverage: smart={smart}"
+                );
+            }
+        }
+        for planned in [&workspace, &ordinary_temp, &partition, &configured] {
+            assert!(!planned.exists(), "startup must only plan paths");
+        }
+    }
+
+    #[test]
     fn headless_build_projection_preserves_narrow_reads_and_other_authority() {
         use newt_core::caveats::CountBound;
         let fixture = tempfile::tempdir().unwrap();
@@ -2569,10 +2645,8 @@ mod tests {
         }
     }
 
-    /// Three Cs (configuration over a hardcoded constant): the fence's scratch
-    /// root is the CONFIGURED scratch dir when it is absolute (an operator moved
-    /// it), else the platform temp dir (which honours `TMPDIR`). `/tmp` is never
-    /// a literal: not every distro uses it the way we think.
+    /// The ordinary temp root follows an absolute scratch setting, otherwise
+    /// the platform temp dir. The managed Build addition is tested separately.
     #[test]
     fn fence_scratch_root_comes_from_configuration_then_temp_dir() {
         use newt_core::caveats::permits_path;
@@ -2592,15 +2666,15 @@ mod tests {
             permits_path(&cv.fs_write, &dir.join("x").to_string_lossy())
         };
         // Configured absolute dir wins, and the temp dir is NOT also granted.
-        let roots = fence_scratch_roots(&configured_s, &temp);
+        let roots = fence_scratch_roots(&configured_s, &temp, None);
         assert_eq!(roots, std::slice::from_ref(&configured_s));
         let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
         assert!(writable(&cv, &configured));
         assert!(!writable(&cv, &temp));
         assert!(!writable(&cv, &base), "the temp dir itself is not granted");
-        // Unset (the relative `.scratch` default lives in the workspace already):
-        // fall back to the platform temp dir, not a literal `/tmp`.
-        let roots = fence_scratch_roots(".scratch", &temp);
+        // A relative general scratch setting with no managed Build default
+        // supplied (an explicit Build override) retains only platform temp.
+        let roots = fence_scratch_roots(".scratch", &temp, None);
         assert_eq!(roots, [temp_s]);
         let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
         assert!(writable(&cv, &temp));

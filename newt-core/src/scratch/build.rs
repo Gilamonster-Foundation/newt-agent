@@ -1,6 +1,6 @@
 //! Private build temporary directories, acquired only after Build admission.
-//! The random name is an ephemeral locator; workspace partition identity stays
-//! the existing RawContentId in confined_exec. No durable identity is minted.
+//! Random names and compact partition ordinals are ephemeral locators; the
+//! partition map retains each full RawContentId. No durable identity is minted.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,9 @@ fn outside_git(path: &Path) -> bool {
 struct Plan {
     path: PathBuf,
     shared: Arc<LeaseState>,
+    // Keep mappings after lease cleanup: remembered session grants must still
+    // name the same partition. Full identities are never truncated or hashed again.
+    workspaces: parking_lot::Mutex<Vec<content_addressable::RawContentId>>,
 }
 
 #[derive(Default)]
@@ -34,9 +37,23 @@ struct LeaseState {
 impl Plan {
     fn new(parent: PathBuf) -> Self {
         Self {
-            path: parent.join(format!("newt-build-{}", uuid::Uuid::new_v4())),
+            path: parent.join(format!("newt-{}", uuid::Uuid::new_v4().simple())),
             shared: Arc::default(),
+            workspaces: parking_lot::Mutex::default(),
         }
+    }
+
+    fn partition(&self, identity: &content_addressable::RawContentId) -> PathBuf {
+        let mut workspaces = self.workspaces.lock();
+        let ordinal = workspaces
+            .iter()
+            .position(|known| known == identity)
+            .unwrap_or_else(|| {
+                let ordinal = workspaces.len();
+                workspaces.push(*identity);
+                ordinal
+            });
+        self.path.join(format!("w{ordinal:x}"))
     }
 
     fn acquire(&self) -> io::Result<Arc<Base>> {
@@ -96,9 +113,14 @@ fn plan() -> &'static Plan {
     static PLAN: OnceLock<Plan> = OnceLock::new();
     PLAN.get_or_init(|| {
         let temporary = std::env::temp_dir();
-        let candidates = vec![temporary.clone()];
+        // A typical macOS user temp path is already ~60 bytes; adding private
+        // parents can exhaust sockaddr_un before an ordinary TempDir socket
+        // filename. Prefer the short canonical shared parent, whose held-root,
+        // sticky-bit, outside-Git and owner-only child checks remain unchanged.
         #[cfg(unix)]
-        let candidates = candidates.into_iter().chain([PathBuf::from("/tmp")]);
+        let candidates = [PathBuf::from("/tmp"), temporary.clone()];
+        #[cfg(not(unix))]
+        let candidates = [temporary.clone()];
         let parent = candidates
             .into_iter()
             .filter_map(|path| path.canonicalize().ok())
@@ -110,6 +132,14 @@ fn plan() -> &'static Plan {
 
 pub(super) fn default_base() -> PathBuf {
     plan().path.clone()
+}
+
+pub(crate) fn managed_partition(
+    base: &Path,
+    identity: &content_addressable::RawContentId,
+) -> Option<PathBuf> {
+    let plan = plan();
+    (base == plan.path).then(|| plan.partition(identity))
 }
 
 struct Base {
@@ -369,6 +399,41 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let plan = Plan::new(temporary.path().canonicalize().unwrap());
         (temporary, plan)
+    }
+
+    #[test]
+    fn managed_partitions_preserve_full_identity_without_filesystem_effects() {
+        let (_temporary, plan) = fixture();
+        let first_id = content_addressable::RawContentId::from_content(b"first workspace");
+        let second_id = content_addressable::RawContentId::from_content(b"second workspace");
+        let first = plan.partition(&first_id);
+        let second = plan.partition(&second_id);
+        assert_ne!(first, second);
+        assert_eq!(first, plan.partition(&first_id));
+        let grant = crate::caveats::Scope::only([first.to_string_lossy().into_owned()]);
+        assert!(crate::caveats::permits_path(
+            &grant,
+            &first.join("run/file").to_string_lossy()
+        ));
+        assert!(!crate::caveats::permits_path(
+            &grant,
+            &second.to_string_lossy()
+        ));
+        assert!(!crate::caveats::permits_path(
+            &grant,
+            &plan.path.to_string_lossy()
+        ));
+        assert!(!plan.path.exists(), "planning must precede allocation");
+        let run = first.join("run");
+        drop(ManagedRun::create(&plan, &run).unwrap());
+        assert!(!plan.path.exists());
+        assert_eq!(
+            first,
+            plan.partition(&first_id),
+            "remember the granted root"
+        );
+        assert_eq!(second, plan.partition(&second_id));
+        assert_eq!(plan.workspaces.lock().as_slice(), &[first_id, second_id]);
     }
 
     #[test]

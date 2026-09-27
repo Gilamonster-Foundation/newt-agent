@@ -26,7 +26,8 @@ use std::sync::OnceLock;
 
 mod build;
 pub(crate) use build::{
-    acquire_run as acquire_build_run, validate_grant as validate_build_grant, ManagedRun,
+    acquire_run as acquire_build_run, managed_partition as managed_build_partition,
+    validate_grant as validate_build_grant, ManagedRun,
 };
 
 /// The operator override, or the stable private managed base proposed to the
