@@ -294,6 +294,11 @@ fn parse_peers(raw: &str) -> Vec<DockPeer> {
                     (host, entry.to_string())
                 }
             };
+            // `uplink:` routes name uplinked hosts by key; a configured label
+            // there would alias one, so it is refused.
+            if label.starts_with(UPLINK_ROUTE) {
+                return None;
+            }
             let kind = if let Some(rest) = target.strip_prefix("mesh:") {
                 parse_mesh(rest)?
             } else if target.is_empty() {
@@ -653,6 +658,22 @@ mod tests {
         assert_eq!(
             key_of(resolve_peer(vec![], both_named_alpha(), &b_route)),
             Some([2; 32])
+        );
+    }
+
+    #[test]
+    fn a_configured_label_cannot_take_an_uplink_route() {
+        let b_key = "02".repeat(32);
+        let configured = parse_peers(&format!(
+            "uplink:{b_key}=http://127.0.0.1:1,ok=http://127.0.0.1:2"
+        ));
+        assert_eq!(configured.len(), 1, "the reserved-prefix label is refused");
+        assert_eq!(configured[0].label, "ok");
+        let found = resolve_peer(configured, vec![uplink("b", 2)], &format!("uplink:{b_key}"));
+        assert_eq!(
+            key_of(found),
+            Some([2; 32]),
+            "the route still names only B itself"
         );
     }
 
