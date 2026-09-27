@@ -90,25 +90,49 @@ pub const DOCK_INSTANCE_FILE: &str = "dock-instance";
 /// `state_dir`, created with a random name on first use.
 ///
 /// The name is not a secret — it only keeps two installations' derived keys
-/// apart — so it may be stored. It is also the operator's to choose: write
-/// `nuc1` into the file to name the machine. Changing it changes this
-/// installation's dock identity, so existing approvals must be re-granted.
+/// apart — so it may be stored. It does select which key the operator root
+/// derives, so it is the operator's alone to choose: write `nuc1` into the
+/// file to name the machine. Changing it changes this installation's dock
+/// identity, so existing approvals must be re-granted.
+///
+/// Concurrent first starts agree on one name: each candidate is written in
+/// full to its own file and published by hard link, which fails rather than
+/// replace a name already published, and a loser reads the winner's.
 ///
 /// # Errors
-/// An unreadable file, or a state dir the name cannot be written to. An empty
-/// file is treated as absent.
+/// An unreadable file, a state dir the name cannot be published in, or an
+/// empty file — it is refused rather than regenerated, because two starts
+/// both "recovering" it could each pick a different identity.
 pub fn dock_instance(state_dir: &Path) -> std::io::Result<String> {
     let path = state_dir.join(DOCK_INSTANCE_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(name) if !name.trim().is_empty() => return Ok(name.trim().to_string()),
-        Ok(_) => {}
+    let read = || -> std::io::Result<String> {
+        let name = std::fs::read_to_string(&path)?.trim().to_string();
+        if name.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is empty: write a name into it or delete it",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(name)
+    };
+    match read() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        found => return found,
     }
     let name = newt_core::new_conversation_id();
     std::fs::create_dir_all(state_dir)?;
-    std::fs::write(&path, format!("{name}\n"))?;
-    Ok(name)
+    let candidate = state_dir.join(format!(".{DOCK_INSTANCE_FILE}.{name}"));
+    std::fs::write(&candidate, format!("{name}\n"))?;
+    let published = std::fs::hard_link(&candidate, &path);
+    let _ = std::fs::remove_file(&candidate);
+    match published {
+        Ok(()) => Ok(name),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read(),
+        Err(e) => Err(e),
+    }
 }
 
 const DOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -559,8 +583,42 @@ mod tests {
         assert_eq!(dock_instance(dir.path()).unwrap(), "nuc1");
 
         std::fs::write(dir.path().join(DOCK_INSTANCE_FILE), "  \n").unwrap();
-        let regenerated = dock_instance(dir.path()).unwrap();
-        assert!(!regenerated.trim().is_empty() && regenerated != "nuc1");
+        let empty = dock_instance(dir.path()).unwrap_err();
+        assert_eq!(
+            empty.kind(),
+            std::io::ErrorKind::InvalidData,
+            "refused, not regenerated"
+        );
+    }
+
+    /// Concurrent first starts must agree: every caller returns the one name
+    /// that ended up on disk, and no candidate file is left behind.
+    #[test]
+    fn concurrent_first_starts_agree_on_one_dock_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let names: Vec<String> = (0..16)
+            .map(|_| {
+                let (dir, barrier) = (dir.path().to_path_buf(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    dock_instance(&dir).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let persisted = std::fs::read_to_string(dir.path().join(DOCK_INSTANCE_FILE)).unwrap();
+        assert!(
+            names.iter().all(|n| n == persisted.trim()),
+            "{names:?} vs {persisted:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "candidates cleaned up"
+        );
     }
 
     /// Pure dock-request handling against a seeded store — the DETERMINISTIC
