@@ -903,8 +903,29 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
     };
     let hub = newt_mesh::dock_agent(&user, newt_mesh::DockRole::Hub, &instance);
     let hub_pubkey = hub.public_bytes();
-    match newt_mesh::DockClient::bind(&user, hub, 0).await {
+    // K8: `NEWT_WEB_DOCK_UPLINK_PORT` binds the hub on a stable UDP port and
+    // accepts uplinks there from docked hosts. Only a host promoted in this
+    // hub's registry is served; any other is staged for `newt dock approve
+    // --staged` (K8.5). Unset, the hub binds an ephemeral port and dials only.
+    let uplink_port = match std::env::var("NEWT_WEB_DOCK_UPLINK_PORT") {
+        Ok(raw) => match raw.trim().parse::<u16>() {
+            Ok(port) if port != 0 => Some(port),
+            _ => {
+                eprintln!("newt-web: NEWT_WEB_DOCK_UPLINK_PORT={raw:?} is not a port; not accepting uplinks");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    match newt_mesh::DockClient::bind(&user, hub, uplink_port.unwrap_or(0)).await {
         Ok(client) => {
+            if uplink_port.is_some() {
+                client.serve_uplinks(state.clone());
+                eprintln!(
+                    "newt-web: accepting dock uplinks on udp/{} (promote hosts with `newt dock approve --staged`)",
+                    client.local_port()
+                );
+            }
             dock::set_dock_client(std::sync::Arc::new(client));
             // Stable across restarts now (K8.4), so a host can approve it once:
             // `newt dock approve` there takes this pubkey and shows these words.

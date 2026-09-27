@@ -54,6 +54,9 @@ pub(crate) enum DockKind {
     Http { base_url: String },
     /// The agent-mesh transport: the peer agent's pubkey + a direct-dial addr.
     Mesh { pubkey: [u8; 32], addr: SocketAddr },
+    /// A promoted host holding an uplink to this hub (K8): reached over the
+    /// connection it dialed, never dialed by the hub.
+    Uplink { pubkey: [u8; 32] },
 }
 
 /// A configured dock peer: an operator label + how to reach it.
@@ -81,7 +84,7 @@ fn dock_client() -> Option<Arc<newt_mesh::DockClient>> {
 // agent is calling, but the hub already knows each peer's agent pubkey from its
 // dock config, so it resolves `BLAKE3(pubkey)` against the signed dock registry
 // before every dial. All three mesh operations funnel through
-// `approved_endpoint`, so an ungated dial cannot be written.
+// `approved_peer`, so an ungated request cannot be written.
 
 /// The operator identity paths the dock registry resolves against — set once at
 /// startup: `(config_path, identity_pem)`. The registry lives at
@@ -169,16 +172,22 @@ fn check_dock_approval(
     Ok(())
 }
 
-/// Gate a mesh dial on the approved-dock registry, then build the endpoint.
-/// The ONLY place a mesh `PeerEndpoint` is constructed, so no dial skips the
-/// gate.
-fn approved_endpoint(
-    pubkey: &[u8; 32],
-    addr: &SocketAddr,
-    op: DockOp,
-) -> Result<newt_mesh::PeerEndpoint, String> {
+/// Gate a mesh request on the approved-dock registry, then build the route.
+/// The ONLY place a mesh route (a direct `PeerEndpoint` or an uplink) is
+/// constructed, so no request skips the gate.
+fn approved_peer(kind: &DockKind, op: DockOp) -> Result<newt_mesh::DockPeer, String> {
+    let (pubkey, route) = match kind {
+        DockKind::Mesh { pubkey, addr } => {
+            (pubkey, newt_mesh::PeerEndpoint::new(*pubkey, *addr).into())
+        }
+        DockKind::Uplink { pubkey } => (
+            pubkey,
+            newt_mesh::DockPeer::Uplink(agent_mesh_core::Fingerprint::of_bytes(pubkey)),
+        ),
+        DockKind::Http { .. } => return Err("not a mesh peer".into()),
+    };
     check_dock_approval(require_dock_approval(), DOCK_IDENTITY.get(), pubkey, op)?;
-    Ok(newt_mesh::PeerEndpoint::new(*pubkey, *addr))
+    Ok(route)
 }
 
 /// Percent-encode a value for a query string (peer label / conversation id).
@@ -195,16 +204,42 @@ fn pct(s: &str) -> String {
     out
 }
 
-/// Find a configured peer by its label (fail-closed on an unknown one).
+/// Find a peer by its label: fail-closed on an unknown label, and on one that
+/// names more than one peer.
 pub(crate) fn peer_by_label(label: &str) -> Option<DockPeer> {
-    configured_peers().into_iter().find(|p| p.label == label)
+    only_peer_labelled(dock_peers(), label)
 }
 
-/// The configured dock peers, from `NEWT_WEB_DOCK_PEERS`.
-pub(crate) fn configured_peers() -> Vec<DockPeer> {
-    std::env::var("NEWT_WEB_DOCK_PEERS")
+fn only_peer_labelled(peers: Vec<DockPeer>, label: &str) -> Option<DockPeer> {
+    let mut matching = peers.into_iter().filter(|p| p.label == label);
+    let peer = matching.next()?;
+    matching.next().is_none().then_some(peer)
+}
+
+/// Every dock peer: those configured in `NEWT_WEB_DOCK_PEERS`, then each
+/// promoted host holding an uplink to this hub, labelled by its instance name.
+fn dock_peers() -> Vec<DockPeer> {
+    let mut peers: Vec<DockPeer> = std::env::var("NEWT_WEB_DOCK_PEERS")
         .map(|raw| parse_peers(&raw))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(client) = dock_client() {
+        peers.extend(uplink_peers(client.uplinked_hosts()));
+    }
+    peers
+}
+
+/// Uplinked hosts as cockpit peers, each labelled by its instance name (K8.7:
+/// its sessions are grouped under, and addressed `session@<instance>` by, it).
+fn uplink_peers(hosts: Vec<newt_mesh::uplink::Hello>) -> Vec<DockPeer> {
+    hosts
+        .into_iter()
+        .map(|host| DockPeer {
+            label: host.instance,
+            kind: DockKind::Uplink {
+                pubkey: host.pubkey,
+            },
+        })
+        .collect()
 }
 
 /// Parse a `NEWT_WEB_DOCK_PEERS` value into peers — pure (tests need no env). An
@@ -282,11 +317,11 @@ async fn peer_sessions(peer: &DockPeer) -> Result<Vec<DockedSession>, String> {
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
         }
-        DockKind::Mesh { pubkey, addr } => {
+        kind => {
             let client = dock_client().ok_or("mesh dock unavailable (no operator identity)")?;
-            let ep = approved_endpoint(pubkey, addr, DockOp::Read)?;
+            let route = approved_peer(kind, DockOp::Read)?;
             client
-                .list_sessions(ep)
+                .list_sessions(route)
                 .await
                 .map(|v| v.into_iter().map(mesh_to_docked).collect())
                 .map_err(|e| format!("mesh: {e}"))
@@ -310,11 +345,11 @@ async fn peer_transcript(peer: &DockPeer, conv: &str) -> Result<DockedTranscript
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
         }
-        DockKind::Mesh { pubkey, addr } => {
+        kind => {
             let client = dock_client().ok_or("mesh dock unavailable")?;
-            let ep = approved_endpoint(pubkey, addr, DockOp::Read)?;
+            let route = approved_peer(kind, DockOp::Read)?;
             client
-                .transcript(ep, conv)
+                .transcript(route, conv)
                 .await
                 .map(|t| DockedTranscript {
                     title: t.title,
@@ -349,11 +384,11 @@ pub(crate) async fn peer_inject(peer: &DockPeer, conv: &str, text: &str) -> Resu
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
         }
-        DockKind::Mesh { pubkey, addr } => {
+        kind => {
             let client = dock_client().ok_or("mesh dock unavailable")?;
-            let ep = approved_endpoint(pubkey, addr, DockOp::Inject)?;
+            let route = approved_peer(kind, DockOp::Inject)?;
             client
-                .inject(ep, conv, text)
+                .inject(route, conv, text)
                 .await
                 .map_err(|e| format!("mesh: {e}"))
         }
@@ -394,7 +429,7 @@ pub(crate) fn dock_panel(
     };
     format!(
         r##"<section class="agent dock-remote">
-<h2><span>{title} <small>· {label} · remote (mirror + inject, D2)</small></span></h2>
+<h2><span>{title} <small>· {address} · remote (mirror + inject, D2)</small></span></h2>
 <div class="transcript">{fragment}</div>
 <form class="prompt" method="post" action="/dock/inject?peer={plabel}&amp;conv={pconv}" hx-post="/dock/inject?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">
 {csrf_field}<label class="sr-only" for="dock-prompt">prompt the remote session</label>
@@ -403,7 +438,7 @@ pub(crate) fn dock_panel(
 <p class="hint">Injected over the dock — the remote host runs it and stays the sole writer (D2).</p>
 </section>"##,
         title = crate::shell::escape(&transcript.title),
-        label = crate::shell::escape(peer_label),
+        address = crate::shell::escape(&format!("{conv_id}@{peer_label}")),
         fragment = crate::shell::transcript_fragment(&snap),
         csrf_field = newt_web::csrf::hidden_field(csrf),
         plabel = pct(peer_label),
@@ -415,7 +450,7 @@ pub(crate) fn dock_panel(
 /// remote sessions (read-only + selectable). An unreachable peer renders a
 /// notice, not a gap. Fetched over each peer's own transport.
 pub(crate) async fn docked_section(_csrf: &str) -> String {
-    let peers = configured_peers();
+    let peers = dock_peers();
     if peers.is_empty() {
         return String::new();
     }
@@ -426,6 +461,7 @@ pub(crate) async fn docked_section(_csrf: &str) -> String {
         let transport = match peer.kind {
             DockKind::Http { .. } => "http",
             DockKind::Mesh { .. } => "mesh",
+            DockKind::Uplink { .. } => "uplink",
         };
         match peer_sessions(peer).await {
             Ok(sessions) if sessions.is_empty() => {
@@ -501,6 +537,39 @@ mod tests {
 
     #[serial_test::serial(newt_web_env)]
     #[test]
+    fn an_uplinked_host_is_a_peer_labelled_by_its_instance() {
+        let hosts = vec![newt_mesh::uplink::Hello {
+            pubkey: [4; 32],
+            instance: "nuc1".into(),
+        }];
+        let peers = uplink_peers(hosts);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].label, "nuc1");
+        assert!(matches!(
+            peers[0].kind,
+            DockKind::Uplink { pubkey: [4, ..] }
+        ));
+    }
+
+    #[test]
+    fn a_label_resolves_only_when_it_names_exactly_one_peer() {
+        let uplink = |label: &str, byte: u8| DockPeer {
+            label: label.into(),
+            kind: DockKind::Uplink { pubkey: [byte; 32] },
+        };
+        let peers = || vec![uplink("nuc1", 1), uplink("nuc2", 2), uplink("nuc2", 3)];
+        assert!(matches!(
+            only_peer_labelled(peers(), "nuc1"),
+            Some(DockPeer {
+                kind: DockKind::Uplink { pubkey: [1, ..] },
+                ..
+            })
+        ));
+        assert!(only_peer_labelled(peers(), "nuc3").is_none(), "unknown");
+        assert!(only_peer_labelled(peers(), "nuc2").is_none(), "ambiguous");
+    }
+
+    #[test]
     fn dock_approval_is_fail_closed_by_default() {
         std::env::remove_var("NEWT_INSECURE_DOCK_NO_APPROVAL");
         assert!(
@@ -558,7 +627,7 @@ mod tests {
 
     /// Belt-and-suspenders (D2): a Mirror-scope grant may be mirrored but the
     /// hub refuses to even DIAL it for an inject — the under-scoped operation is
-    /// rejected before `approved_endpoint` constructs a `PeerEndpoint`, so no
+    /// rejected before `approved_peer` constructs a mesh route, so no
     /// session is opened. The responder enforces the same rule per request; this
     /// is the hub-side half. Regression for PR #1643's deferred inject-scope
     /// hardening.
@@ -617,5 +686,9 @@ mod tests {
         assert!(html.contains("mirror + inject"));
         assert!(html.contains("STUB_REPLY ok"));
         assert!(html.contains("hx-post=\"/dock/inject?peer=laptop-b&conv=conv-123\""));
+        assert!(
+            html.contains("conv-123@laptop-b"),
+            "addressed as session@host"
+        );
     }
 }

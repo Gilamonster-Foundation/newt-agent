@@ -72,10 +72,12 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Who is polling: the host's dock key, which the hub checks against the
 /// poll's verified signer, and its instance name, which is display only. A hub
 /// stages a host it has not approved under these (K8.5).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Hello {
-    pub(crate) pubkey: [u8; 32],
-    pub(crate) instance: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    /// The host's dock agent public key.
+    pub pubkey: [u8; 32],
+    /// The host's dock instance name, as it reports it.
+    pub instance: String,
 }
 
 /// One poll from a host: who it is, and the answer to the previous job, if any.
@@ -333,14 +335,22 @@ struct HostLink {
     work: Mutex<HostWork>,
     queued: Notify,
     last_poll: Mutex<Instant>,
+    /// How the host introduced itself on its latest promoted poll.
+    hello: Mutex<Option<Hello>>,
 }
 
 impl HostLink {
+    /// Polled recently enough to take requests.
+    fn is_live(&self) -> bool {
+        self.last_poll.lock().unwrap().elapsed() < POLL_TIMEOUT
+    }
+
     fn new() -> Self {
         Self {
             work: Mutex::default(),
             queued: Notify::new(),
             last_poll: Mutex::new(Instant::now()),
+            hello: Mutex::new(None),
         }
     }
 }
@@ -418,8 +428,17 @@ impl UplinkHub {
 
     fn live_link(&self, host: Fingerprint) -> Option<Arc<HostLink>> {
         let link = self.hosts.lock().unwrap().links.get(&host).cloned()?;
-        let fresh = link.last_poll.lock().unwrap().elapsed() < POLL_TIMEOUT;
-        fresh.then_some(link)
+        link.is_live().then_some(link)
+    }
+
+    /// The promoted hosts with a live uplink, as each last introduced itself.
+    pub(crate) fn live_hosts(&self) -> Vec<Hello> {
+        let links: Vec<_> = self.hosts.lock().unwrap().links.values().cloned().collect();
+        links
+            .iter()
+            .filter(|link| link.is_live())
+            .filter_map(|link| link.hello.lock().unwrap().clone())
+            .collect()
     }
 
     /// Wait until `host` has polled recently enough to take requests.
@@ -442,6 +461,7 @@ impl UplinkHub {
             return self.stage(host).await;
         };
         *link.last_poll.lock().unwrap() = Instant::now();
+        *link.hello.lock().unwrap() = Some(poll.host);
         self.polled.notify_waiters();
         if let Some((id, reply)) = poll.answer {
             let answer = link.work.lock().unwrap().dispatched.remove(&id);
@@ -944,6 +964,28 @@ mod tests {
         assert!(hub.live_link(fp(1)).is_none(), "staging drops the link");
         let unreached = hub.request(fp(1), DockRequest::ListSessions).await;
         assert!(unreached.is_err(), "the hub cannot reach a staged host");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hub_lists_the_hosts_with_a_live_uplink_as_they_introduced_themselves() {
+        let hub = UplinkHub::default();
+        assert!(hub.live_hosts().is_empty());
+        hub.poll_now(fp(1), Poll::answering(None)).await;
+        assert_eq!(
+            hub.live_hosts()
+                .iter()
+                .map(|h| h.instance.as_str())
+                .collect::<Vec<_>>(),
+            ["test"]
+        );
+        tokio::time::advance(POLL_TIMEOUT).await;
+        assert!(
+            hub.live_hosts().is_empty(),
+            "a host that stopped polling is not live"
+        );
+        hub.poll_now(fp(1), Poll::answering(None)).await;
+        hub.stage(fp(1)).await;
+        assert!(hub.live_hosts().is_empty(), "a staged host is not listed");
     }
 
     /// Poll A reads the registry while the host is approved, then the host is
