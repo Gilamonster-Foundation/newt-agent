@@ -495,6 +495,13 @@ impl DockClient {
         self.serve_uplinks_with(|_| true);
     }
 
+    /// The promoted hosts holding a live uplink to this hub, as each last
+    /// introduced itself: its dock key, and its instance name (display only).
+    #[must_use]
+    pub fn uplinked_hosts(&self) -> Vec<crate::uplink::Hello> {
+        self.uplinks.live_hosts()
+    }
+
     /// The hub state behind [`Self::serve_uplinks`].
     #[cfg(test)]
     pub(crate) fn uplinks(&self) -> &crate::uplink::UplinkHub {
@@ -1244,6 +1251,14 @@ mod tests {
         assert!(
             sessions.iter().any(|s| s.title == "nuc1 session"),
             "{sessions:?}"
+        );
+        assert_eq!(
+            hub.uplinked_hosts(),
+            [crate::uplink::Hello {
+                pubkey: host_pubkey,
+                instance: "nuc1".into(),
+            }],
+            "the hub lists the promoted host by the name it reported"
         );
 
         host.close().await;
