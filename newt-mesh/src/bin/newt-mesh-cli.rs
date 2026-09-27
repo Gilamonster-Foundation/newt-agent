@@ -258,6 +258,11 @@ async fn dock(hub_spec: &str, inject: bool, label: &str, state_dir: PathBuf) -> 
                     uplink.close().await;
                     return Ok(());
                 }
+                if uplink.pairing().as_ref() != Some(&pairing) {
+                    // The hub no longer holds the pairing just compared.
+                    println!("the pairing changed while you compared codes; not approved");
+                    continue;
+                }
                 registry::approve_dock_with_identity(
                     &state_dir.join("config.toml"),
                     &state_dir.join("identity.pem"),

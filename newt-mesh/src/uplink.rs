@@ -105,7 +105,9 @@ struct Poll {
 }
 
 /// The hub's reply to a poll: the next job for this host, if any, or that the
-/// hub has only staged this host and will send it none until it is approved.
+/// hub has only staged this host and will send it none until it is approved;
+/// the answer to its pairing step; and the transcript id of the pairing the hub
+/// holds for it, if any.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Work {
     job: Option<(JobId, DockRequest)>,
@@ -113,13 +115,17 @@ struct Work {
     staged: bool,
     #[serde(default)]
     pairing: Option<PairMsg>,
+    #[serde(default)]
+    paired: Option<String>,
 }
 
-/// How a hub admits one poll: served, or staged with its pairing reply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Admit {
-    Promoted,
-    Staged(Option<PairingReply>),
+/// How a hub admits one poll: whether the host is served, the answer to its
+/// pairing step, and the transcript id of the pairing the hub holds for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Admit {
+    pub(crate) promoted: bool,
+    pub(crate) pairing: Option<PairingReply>,
+    pub(crate) paired: Option<String>,
 }
 
 // ── Host side ────────────────────────────────────────────────────────────────
@@ -297,15 +303,25 @@ async fn run(
                 break;
             }
         }
+        // Pair while either side has yet to approve the other, until a pairing
+        // the hub also holds is published for both operators to compare.
+        if standing != HubStanding::Approved || staged {
+            if pairing_run.is_none() && paired.lock().unwrap().is_none() {
+                pairing_run = Some(HostPairing::start(keys));
+            }
+        } else {
+            pairing_run = None;
+        }
         state.send_replace(match (staged, pairing_run.is_some()) {
-            (false, _) => UplinkState::Polling,
+            (_, true) => UplinkState::Pairing,
             (true, false) => UplinkState::Staged,
-            (true, true) => UplinkState::Pairing,
+            (false, false) => UplinkState::Polling,
         });
+        let step = pairing_run.as_ref().map(HostPairing::next);
         let poll = Poll {
             host: hello.clone(),
             answer: answer.clone(),
-            pairing: pairing_run.as_ref().map(HostPairing::next),
+            pairing: step,
         };
         let body = serde_json::to_vec(&poll).unwrap_or_default();
         let polled = tokio::select! {
@@ -317,34 +333,26 @@ async fn run(
             Ok(reply) => {
                 answer = None;
                 backoff = BACKOFF_MIN;
-                let work = serde_json::from_slice::<Work>(&reply);
-                staged = matches!(work, Ok(Work { staged: true, .. }));
-                match work {
-                    Ok(Work {
-                        job: Some((id, request)),
-                        ..
-                    }) => {
-                        // Not raced against `stopped`: a started operation
-                        // runs to completion.
-                        state.send_replace(UplinkState::Serving);
-                        let reply =
-                            serve_dock(state_dir.clone(), hub_fp.clone(), Ok(request)).await;
-                        answer = Some((id, reply));
+                let work = match serde_json::from_slice::<Work>(&reply) {
+                    Ok(work) => work,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dock uplink: unreadable work from hub");
+                        continue;
                     }
-                    Ok(Work {
-                        staged: true,
-                        pairing: reply,
-                        ..
-                    }) => {
-                        let complete = paired.lock().unwrap().is_some();
-                        if !(complete && pairing_run.is_none() && reply.is_none()) {
-                            if let Some(done) = advance(&mut pairing_run, reply, keys) {
-                                *paired.lock().unwrap() = Some(done);
-                            }
-                        }
+                };
+                staged = work.staged;
+                if step.is_some() {
+                    if let Some(done) = advance(&mut pairing_run, work.pairing, keys) {
+                        *paired.lock().unwrap() = Some(done);
                     }
-                    Ok(Work { job: None, .. }) => pairing_run = None,
-                    Err(e) => tracing::warn!(error = %e, "dock uplink: unreadable work from hub"),
+                }
+                withdraw_unheld(&paired, pairing_run.is_none(), work.paired.as_deref());
+                if let Some((id, request)) = work.job {
+                    // Not raced against `stopped`: a started operation
+                    // runs to completion.
+                    state.send_replace(UplinkState::Serving);
+                    let reply = serve_dock(state_dir.clone(), hub_fp.clone(), Ok(request)).await;
+                    answer = Some((id, reply));
                 }
             }
             Err(e) => {
@@ -395,9 +403,23 @@ impl HostPairing {
     }
 }
 
-/// Advance the host's pairing on a staged reply. Returns the pairing once the
-/// hub confirms it. Anything else a staged hub says — no pairing yet, a
-/// failure, or a reply out of order — starts over with a fresh nonce.
+/// Withdraw the host's published pairing once the hub no longer holds it —
+/// expired, replaced, or forgotten — so the operator is never shown a code the
+/// hub cannot match, and pairing starts over. Not while a run is under way.
+fn withdraw_unheld(published: &Mutex<Option<Pairing>>, idle: bool, held: Option<&str>) {
+    let mut published = published.lock().unwrap();
+    if idle
+        && published
+            .as_ref()
+            .is_some_and(|p| Some(p.transcript_id.as_str()) != held)
+    {
+        *published = None;
+    }
+}
+
+/// Advance the host's pairing on the hub's answer to its step. Returns the
+/// pairing once the hub confirms it. Any other answer — none, a failure, or a
+/// reply out of order — starts over with a fresh nonce.
 fn advance(
     run: &mut Option<HostPairing>,
     reply: Option<PairMsg>,
@@ -411,7 +433,7 @@ fn advance(
         (Some(p), Some(PairMsg::Paired)) if p.hub_nonce.is_some() => {
             let done = pairing(&keys.0, &keys.1, &p.hub_nonce?, &p.nonce);
             *run = None;
-            Some(done)
+            done
         }
         _ => {
             *run = Some(HostPairing::start(keys));
@@ -602,9 +624,10 @@ impl UplinkHub {
     }
 
     /// Answer one poll from `host`: deliver the answer it carries, then hold
-    /// until there is a live job for it or [`HOLD`] lapses. An answer is
-    /// matched only within this host's own dispatched work.
-    async fn poll(&self, host: Fingerprint, poll: Poll, admission: Admission) -> Work {
+    /// until there is a live job for it or [`HOLD`] lapses — or, with `hold`
+    /// unset, take a job only if one is ready. An answer is matched only
+    /// within this host's own dispatched work.
+    async fn poll(&self, host: Fingerprint, poll: Poll, admission: Admission, hold: bool) -> Work {
         let Some(link) = self.link(admission) else {
             return self.stage(host, None).await;
         };
@@ -617,7 +640,7 @@ impl UplinkHub {
                 let _ = answer.send(reply);
             }
         }
-        let hold = Instant::now() + HOLD;
+        let until = Instant::now() + if hold { HOLD } else { Duration::ZERO };
         loop {
             let queued = link.queued.notified();
             let (job, closed) = {
@@ -636,7 +659,7 @@ impl UplinkHub {
                     ..Work::default()
                 };
             }
-            if tokio::time::timeout_at(hold, queued).await.is_err() {
+            if tokio::time::timeout_at(until, queued).await.is_err() {
                 return Work::default();
             }
         }
@@ -670,9 +693,9 @@ impl UplinkHub {
             tokio::time::sleep(STAGED_HOLD).await;
         }
         Work {
-            job: None,
             staged: true,
             pairing,
+            ..Work::default()
         }
     }
 
@@ -760,18 +783,23 @@ pub(crate) fn serve(
             // Fail closed: a check that could not run promotes nobody.
             let admitted = tokio::task::spawn_blocking(move || admit(&hello, step))
                 .await
-                .unwrap_or(Admit::Staged(None));
-            let work = match admitted {
-                Admit::Promoted => hub.poll(host, poll, admission).await,
-                Admit::Staged(reply) => {
-                    let reply = reply.map(|r| match r {
-                        PairingReply::Nonce(n) => PairMsg::Nonce(n),
-                        PairingReply::Paired => PairMsg::Paired,
-                        PairingReply::Failed => PairMsg::Failed,
-                    });
-                    hub.stage(host, reply).await
+                .unwrap_or_default();
+            let reply = admitted.pairing.map(|r| match r {
+                PairingReply::Nonce(n) => PairMsg::Nonce(n),
+                PairingReply::Paired => PairMsg::Paired,
+                PairingReply::Failed => PairMsg::Failed,
+            });
+            let mut work = if admitted.promoted {
+                // A pairing reply goes back at once, and leaves the link open.
+                let hold = reply.is_none();
+                Work {
+                    pairing: reply,
+                    ..hub.poll(host, poll, admission, hold).await
                 }
+            } else {
+                hub.stage(host, reply).await
             };
+            work.paired = admitted.paired;
             Ok(serde_json::to_vec(&work)?)
         }
     });
@@ -788,7 +816,7 @@ mod tests {
     impl UplinkHub {
         /// Poll with an admission taken now: a promoted host.
         async fn poll_now(&self, host: Fingerprint, poll: Poll) -> Work {
-            self.poll(host, poll, self.admission(host)).await
+            self.poll(host, poll, self.admission(host), true).await
         }
 
         /// Open `host`'s link as a promoted poll would.
@@ -1155,7 +1183,7 @@ mod tests {
         assert!(advance(&mut run, Some(PairMsg::Nonce([3; 16])), keys).is_none());
         assert_eq!(run.as_ref().unwrap().next(), PairMsg::Reveal(host_nonce));
         let done = advance(&mut run, Some(PairMsg::Paired), keys);
-        assert_eq!(done, Some(pairing(&keys.0, &keys.1, &[3; 16], &host_nonce)));
+        assert_eq!(done, pairing(&keys.0, &keys.1, &[3; 16], &host_nonce));
         assert!(run.is_none());
 
         advance(&mut run, None, keys);
@@ -1170,6 +1198,24 @@ mod tests {
             advance(&mut run, Some(PairMsg::Paired), keys).is_none(),
             "paired before the hub's nonce is out of order"
         );
+    }
+
+    /// A published pairing the hub does not hold — it expired, the hub
+    /// forgot it, or the hub holds another — is withdrawn, so pairing starts
+    /// over; one the hub holds stays, and nothing is withdrawn mid-run (#2616).
+    #[test]
+    fn a_published_pairing_is_withdrawn_once_the_hub_no_longer_holds_it() {
+        let p = pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]).unwrap();
+        let published = Mutex::new(Some(p.clone()));
+        withdraw_unheld(&published, true, Some(&p.transcript_id));
+        assert_eq!(*published.lock().unwrap(), Some(p.clone()), "held: kept");
+        withdraw_unheld(&published, false, None);
+        assert_eq!(*published.lock().unwrap(), Some(p.clone()), "mid-run: kept");
+        withdraw_unheld(&published, true, Some("another"));
+        assert_eq!(*published.lock().unwrap(), None, "another held: withdrawn");
+        *published.lock().unwrap() = Some(p);
+        withdraw_unheld(&published, true, None);
+        assert_eq!(*published.lock().unwrap(), None, "none held: withdrawn");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1204,7 +1250,7 @@ mod tests {
         let a = hub.admission(fp(1));
         hub.stage(fp(1), None).await;
 
-        let work = hub.poll(fp(1), Poll::answering(None), a).await;
+        let work = hub.poll(fp(1), Poll::answering(None), a, true).await;
         assert!(work.staged && work.job.is_none(), "{work:?}");
         assert!(
             hub.live_link(fp(1)).is_none(),
@@ -1352,7 +1398,9 @@ mod tests {
         )
         .await
         .expect("the hub is holding a poll");
-        assert_eq!(uplink.state(), UplinkState::Polling);
+        // This host has not approved its hub, so its held poll is a pairing
+        // step the carrier-only hub does not answer.
+        assert_eq!(uplink.state(), UplinkState::Pairing);
         let port = uplink.local_port();
         close_within_5s(uplink, "held poll").await;
         assert!(port_released(port, RELEASE_BOUND).await, "port still bound");

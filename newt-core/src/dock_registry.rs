@@ -595,38 +595,71 @@ pub struct Pairing {
     /// The [`PAIRING_CODE_DIGITS`]-digit code both operators compare before
     /// either side approves the other.
     pub code: String,
-    /// The transcript id, hex, that each side's signed approval commits to.
+    /// What was paired: both keys, the commitment and both nonces.
+    pub transcript: PairingTranscript,
+    /// The transcript's content id — what each side's signed approval
+    /// commits to as its `transcript_id`.
     pub transcript_id: String,
+}
+
+/// The record of one Numeric Comparison pairing, content-addressed so the id
+/// both signed approvals carry is the dag-cbor CID of what was compared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingTranscript {
+    /// The pairing protocol, `newt/dock-pairing/v1`.
+    pub protocol: String,
+    /// The hub's dock key, hex.
+    pub hub_pubkey: String,
+    /// The host's dock key, hex.
+    pub host_pubkey: String,
+    /// The host's commitment to its nonce, hex.
+    pub host_commitment: String,
+    /// The hub's nonce, hex.
+    pub hub_nonce: String,
+    /// The host's nonce, hex, which opens its commitment.
+    pub host_nonce: String,
+}
+
+impl content_addressable::ContentAddressable for PairingTranscript {
+    fn canonical_form(&self) -> Result<Vec<u8>, content_addressable::ContentError> {
+        content_addressable::canonical::to_canonical_dagcbor(self)
+    }
 }
 
 /// Derive the pairing of a hub and host from both dock keys, in role order,
 /// the host's commitment and both nonces. Neither end can steer the code: the
 /// host committed to its nonce before seeing the hub's, and the hub chose its
-/// nonce before seeing the host's.
+/// nonce before seeing the host's. `None` only if the transcript cannot be
+/// encoded.
 #[must_use]
 pub fn pairing(
     hub_pubkey: &[u8; 32],
     host_pubkey: &[u8; 32],
     hub_nonce: &[u8; 16],
     host_nonce: &[u8; 16],
-) -> Pairing {
-    let mut payload = Vec::with_capacity(192);
-    payload.extend_from_slice(b"newt/dock-pairing/v1");
-    push_field(&mut payload, hub_pubkey);
-    push_field(&mut payload, host_pubkey);
-    push_field(
-        &mut payload,
-        &pairing_commitment(hub_pubkey, host_pubkey, host_nonce),
-    );
-    push_field(&mut payload, hub_nonce);
-    push_field(&mut payload, host_nonce);
+) -> Option<Pairing> {
+    use content_addressable::ContentAddressable as _;
+    let transcript = PairingTranscript {
+        protocol: "newt/dock-pairing/v1".into(),
+        hub_pubkey: hex(hub_pubkey),
+        host_pubkey: hex(host_pubkey),
+        host_commitment: hex(&pairing_commitment(hub_pubkey, host_pubkey, host_nonce)),
+        hub_nonce: hex(hub_nonce),
+        host_nonce: hex(host_nonce),
+    };
+    let id = transcript.content_id().ok()?;
+    // The code is its own derivation from the transcript, domain-separated
+    // from the id, so displaying it reveals nothing the id is used for.
+    let mut payload = b"newt/dock-pairing-code/v1".to_vec();
+    push_field(&mut payload, &transcript.canonical_form().ok()?);
     let digest = Fingerprint::of_bytes(&payload);
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest.0[..8]);
-    Pairing {
+    Some(Pairing {
         code: format!("{:06}", u64::from_be_bytes(head) % 1_000_000),
-        transcript_id: digest.hex(),
-    }
+        transcript,
+        transcript_id: id.to_string(),
+    })
 }
 
 /// The human-verifiable output of a dock approval: the 6-word mnemonic of the
@@ -734,6 +767,7 @@ impl StagedHost {
         let host_nonce = decode_hex::<16>(self.host_nonce.as_deref()?)?;
         (pairing_commitment(&hub, &host, &host_nonce) == commitment)
             .then(|| pairing(&hub, &host, &hub_nonce, &host_nonce))
+            .flatten()
     }
 }
 
@@ -1019,6 +1053,7 @@ fn signing_payload(issuer: &str, subject: &str, record: &DockRecord) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use content_addressable::ContentAddressable as _;
     use tempfile::TempDir;
 
     /// A pubkey whose every byte is `seed`, as 64 hex chars.
@@ -1656,12 +1691,24 @@ mod tests {
 
     #[test]
     fn a_pairing_code_is_six_digits_bound_to_both_keys_and_both_nonces() {
-        let p = pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]);
+        let p = pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]).unwrap();
         assert_eq!(p.code.len(), PAIRING_CODE_DIGITS);
+        let id = p.transcript.content_id().unwrap();
+        assert_eq!(
+            p.transcript_id,
+            id.to_string(),
+            "the id is the transcript's CID"
+        );
+        assert_eq!(
+            p.transcript_id
+                .parse::<content_addressable::ContentId>()
+                .unwrap(),
+            id
+        );
         assert!(p.code.bytes().all(|b| b.is_ascii_digit()), "{}", p.code);
         assert_eq!(
             p,
-            pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]),
+            pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]).unwrap(),
             "deterministic"
         );
         for other in [
@@ -1669,7 +1716,7 @@ mod tests {
             pairing(&[1; 32], &[2; 32], &[5; 16], &[4; 16]),
             pairing(&[1; 32], &[2; 32], &[3; 16], &[5; 16]),
         ] {
-            assert_ne!(other.transcript_id, p.transcript_id);
+            assert_ne!(other.unwrap().transcript_id, p.transcript_id);
         }
     }
 
@@ -1702,7 +1749,7 @@ mod tests {
 
         step(commit);
         assert_eq!(step(PairingStep::Reveal(host_nonce)), PairingReply::Paired);
-        let expected = pairing(&HUB, &host, &hub_nonce, &host_nonce);
+        let expected = pairing(&HUB, &host, &hub_nonce, &host_nonce).unwrap();
         assert_eq!(live().pairing(), Some(expected.clone()));
 
         stage_host(&config, &host, "nuc1", &HUB, at(1)).unwrap();

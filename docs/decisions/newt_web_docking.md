@@ -288,15 +288,20 @@ secure.
 direction: pairing is a second factor between the two endpoints, modelled on Bluetooth Secure
 Simple Pairing's Numeric Comparison. It supersedes the host half of K8.5's word check for a first
 dock; `pubkey_words` stays as a display of each key.
-- *Exchange, over the uplink, while the host is staged.* The host sends a commitment
+- *Exchange, over the uplink, while either side has yet to approve the other.* This includes a
+  host the hub still approves after the host revoked it. The host sends a commitment
   `C = H(hub key, host key, Nh)` to a fresh 128-bit nonce `Nh`; the hub answers at once with a
   fresh nonce `Nb`; the host reveals `Nh`; the hub checks it opens `C`. A failed or out-of-order
   step clears the pairing and the host starts again with fresh nonces. The host is committed to
   `Nh` before it sees `Nb`, so neither end can steer the result: an attacker gets one guess per
   attempt.
-- *Code.* Both ends derive the same six digits and a transcript id from one domain-tagged hash
-  over both keys (role order: hub, host), `C`, `Nb` and `Nh`
-  (`newt_core::dock_registry::pairing`).
+- *Code and transcript.* Both ends build the same `PairingTranscript`: both keys (role order:
+  hub, host), `C`, `Nb` and `Nh`. The transcript id is its dag-cbor `ContentId`. The six digits
+  are a separate, domain-tagged hash of it (`newt_core::dock_registry::pairing`).
+- *One pairing, held by the hub.* Every reply names the transcript id of the pairing the hub
+  holds for the host: its staged pairing, or else the one its approval was signed under. A host
+  withdraws a code the hub no longer holds (expired, replaced or forgotten) and pairs again.
+  Each confirmation re-checks, after "yes", that the pairing compared is still the one held.
 - *Confirmation on both ends before either side is approved.* The host (`newt-mesh dock`) shows
   the code and writes its approval of the hub only on "yes" at its terminal; the hub keeps the
   exchange with the staged host, and `newt dock approve --staged` recomputes the code, shows it,
