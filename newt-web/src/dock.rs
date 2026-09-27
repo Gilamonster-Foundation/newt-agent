@@ -59,11 +59,31 @@ pub(crate) enum DockKind {
     Uplink { pubkey: [u8; 32] },
 }
 
-/// A configured dock peer: an operator label + how to reach it.
+/// A dock peer: a display label + how to reach it.
 #[derive(Debug, Clone)]
 pub(crate) struct DockPeer {
     pub label: String,
     pub kind: DockKind,
+}
+
+/// The route prefix naming an uplinked host by its dock key.
+const UPLINK_ROUTE: &str = "uplink:";
+
+impl DockPeer {
+    /// What a link or form names this peer by, and [`peer_by_route`] resolves.
+    /// A configured peer is named by its operator-chosen label. An uplinked
+    /// host is named by its dock key, never by the instance name it reports:
+    /// that name is display only, so a host reusing another's name cannot take
+    /// over an open panel or inject form.
+    pub(crate) fn route(&self) -> String {
+        match &self.kind {
+            DockKind::Uplink { pubkey } => {
+                let hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{UPLINK_ROUTE}{hex}")
+            }
+            _ => self.label.clone(),
+        }
+    }
 }
 
 // ── the shared mesh dial client (bound once at startup) ─────────────────────
@@ -204,32 +224,45 @@ fn pct(s: &str) -> String {
     out
 }
 
-/// Find a peer by its label: fail-closed on an unknown label, and on one that
-/// names more than one peer.
-pub(crate) fn peer_by_label(label: &str) -> Option<DockPeer> {
-    only_peer_labelled(dock_peers(), label)
+/// Find a peer by its [`DockPeer::route`] (fail-closed on an unknown one).
+pub(crate) fn peer_by_route(route: &str) -> Option<DockPeer> {
+    resolve_peer(configured_peers(), uplinked_peers(), route)
 }
 
-fn only_peer_labelled(peers: Vec<DockPeer>, label: &str) -> Option<DockPeer> {
-    let mut matching = peers.into_iter().filter(|p| p.label == label);
+/// Resolve `route`: an `uplink:<key>` route names only the uplinked host
+/// holding exactly that key, and fails if it is not connected — it never falls
+/// back to another host. Any other route names a configured peer by label, and
+/// fails if the label is ambiguous. An uplinked host is never found by name.
+fn resolve_peer(
+    configured: Vec<DockPeer>,
+    uplinked: Vec<DockPeer>,
+    route: &str,
+) -> Option<DockPeer> {
+    if let Some(hex) = route.strip_prefix(UPLINK_ROUTE) {
+        let want = newt_core::dock_registry::decode_agent_pubkey(hex)?;
+        return uplinked
+            .into_iter()
+            .find(|p| matches!(p.kind, DockKind::Uplink { pubkey } if pubkey == want));
+    }
+    let mut matching = configured.into_iter().filter(|p| p.label == route);
     let peer = matching.next()?;
     matching.next().is_none().then_some(peer)
 }
 
-/// Every dock peer: those configured in `NEWT_WEB_DOCK_PEERS`, then each
-/// promoted host holding an uplink to this hub, labelled by its instance name.
-fn dock_peers() -> Vec<DockPeer> {
-    let mut peers: Vec<DockPeer> = std::env::var("NEWT_WEB_DOCK_PEERS")
+/// The peers configured in `NEWT_WEB_DOCK_PEERS`.
+fn configured_peers() -> Vec<DockPeer> {
+    std::env::var("NEWT_WEB_DOCK_PEERS")
         .map(|raw| parse_peers(&raw))
-        .unwrap_or_default();
-    if let Some(client) = dock_client() {
-        peers.extend(uplink_peers(client.uplinked_hosts()));
-    }
-    peers
+        .unwrap_or_default()
 }
 
-/// Uplinked hosts as cockpit peers, each labelled by its instance name (K8.7:
-/// its sessions are grouped under, and addressed `session@<instance>` by, it).
+/// Each promoted host holding an uplink to this hub.
+fn uplinked_peers() -> Vec<DockPeer> {
+    dock_client().map_or_else(Vec::new, |client| uplink_peers(client.uplinked_hosts()))
+}
+
+/// Uplinked hosts as cockpit peers, each displayed under its instance name
+/// (K8.7: `session@<instance>`) and routed by its key ([`DockPeer::route`]).
 fn uplink_peers(hosts: Vec<newt_mesh::uplink::Hello>) -> Vec<DockPeer> {
     hosts
         .into_iter()
@@ -408,7 +441,7 @@ pub(crate) async fn fetch_transcript(
 /// read-only, plus an **inject** form (D2 — enqueue to the remote; the remote
 /// runs it and stays sole writer).
 pub(crate) fn dock_panel(
-    peer_label: &str,
+    peer: &DockPeer,
     conv_id: &str,
     transcript: &DockedTranscript,
     csrf: &str,
@@ -438,10 +471,10 @@ pub(crate) fn dock_panel(
 <p class="hint">Injected over the dock — the remote host runs it and stays the sole writer (D2).</p>
 </section>"##,
         title = crate::shell::escape(&transcript.title),
-        address = crate::shell::escape(&format!("{conv_id}@{peer_label}")),
+        address = crate::shell::escape(&format!("{conv_id}@{}", peer.label)),
         fragment = crate::shell::transcript_fragment(&snap),
         csrf_field = newt_web::csrf::hidden_field(csrf),
-        plabel = pct(peer_label),
+        plabel = pct(&peer.route()),
         pconv = pct(conv_id),
     )
 }
@@ -450,7 +483,8 @@ pub(crate) fn dock_panel(
 /// remote sessions (read-only + selectable). An unreachable peer renders a
 /// notice, not a gap. Fetched over each peer's own transport.
 pub(crate) async fn docked_section(_csrf: &str) -> String {
-    let peers = dock_peers();
+    let mut peers = configured_peers();
+    peers.extend(uplinked_peers());
     if peers.is_empty() {
         return String::new();
     }
@@ -479,7 +513,7 @@ pub(crate) async fn docked_section(_csrf: &str) -> String {
                     let dot = if s.live { "▶" } else { "○" };
                     out.push_str(&format!(
                         r##"<li><button class="dock-open" hx-get="/dock/panel?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">{dot} {title}</button> <small>({n} turns · {label})</small></li>"##,
-                        plabel = pct(&peer.label),
+                        plabel = pct(&peer.route()),
                         pconv = pct(&s.id),
                         dot = dot,
                         title = crate::shell::escape(&s.title),
@@ -551,22 +585,98 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_label_resolves_only_when_it_names_exactly_one_peer() {
-        let uplink = |label: &str, byte: u8| DockPeer {
+    fn uplink(label: &str, byte: u8) -> DockPeer {
+        DockPeer {
             label: label.into(),
             kind: DockKind::Uplink { pubkey: [byte; 32] },
+        }
+    }
+
+    fn http(label: &str) -> DockPeer {
+        DockPeer {
+            label: label.into(),
+            kind: DockKind::Http {
+                base_url: "http://127.0.0.1:1".into(),
+            },
+        }
+    }
+
+    fn key_of(peer: Option<DockPeer>) -> Option<[u8; 32]> {
+        match peer?.kind {
+            DockKind::Uplink { pubkey } => Some(pubkey),
+            _ => None,
+        }
+    }
+
+    /// The route an inject form rendered for `peer` posts to, as the hub
+    /// handler receives it.
+    fn posted_route(peer: &DockPeer) -> String {
+        let t = DockedTranscript {
+            title: "t".into(),
+            turns: vec![],
         };
-        let peers = || vec![uplink("nuc1", 1), uplink("nuc2", 2), uplink("nuc2", 3)];
-        assert!(matches!(
-            only_peer_labelled(peers(), "nuc1"),
-            Some(DockPeer {
-                kind: DockKind::Uplink { pubkey: [1, ..] },
-                ..
-            })
-        ));
-        assert!(only_peer_labelled(peers(), "nuc3").is_none(), "unknown");
-        assert!(only_peer_labelled(peers(), "nuc2").is_none(), "ambiguous");
+        let html = dock_panel(peer, "conv-1", &t, "tok");
+        let start = html.find("hx-post=\"/dock/inject?peer=").unwrap() + 27;
+        let end = start + html[start..].find("&conv=").unwrap();
+        html[start..end].replace("%3A", ":")
+    }
+
+    /// An open panel for host A stays bound to A's key: once A is gone and B
+    /// polls under A's name, A's form resolves to nothing, never to B.
+    #[test]
+    fn an_open_inject_form_stays_bound_to_its_hosts_key() {
+        let route = posted_route(&uplink("alpha", 1));
+        assert_eq!(route, format!("uplink:{}", "01".repeat(32)));
+
+        let b_took_the_name = vec![uplink("alpha", 2)];
+        assert_eq!(
+            key_of(resolve_peer(vec![], b_took_the_name.clone(), &route)),
+            None
+        );
+        assert!(
+            resolve_peer(vec![], b_took_the_name, "alpha").is_none(),
+            "an uplinked host is never found by the name it reports"
+        );
+
+        let a_renamed = vec![uplink("beta", 1)];
+        assert_eq!(
+            key_of(resolve_peer(vec![], a_renamed, &route)),
+            Some([1; 32])
+        );
+
+        let both_named_alpha = || vec![uplink("alpha", 1), uplink("alpha", 2)];
+        assert_eq!(
+            key_of(resolve_peer(vec![], both_named_alpha(), &route)),
+            Some([1; 32])
+        );
+        let b_route = posted_route(&uplink("alpha", 2));
+        assert_eq!(
+            key_of(resolve_peer(vec![], both_named_alpha(), &b_route)),
+            Some([2; 32])
+        );
+    }
+
+    #[test]
+    fn a_label_names_only_a_configured_peer_and_only_when_unique() {
+        let configured = || vec![http("nuc1"), http("nuc2"), http("nuc2")];
+        let uplinked = || vec![uplink("nuc1", 1), uplink("nuc3", 3)];
+        let found = resolve_peer(configured(), uplinked(), "nuc1").unwrap();
+        assert!(
+            matches!(found.kind, DockKind::Http { .. }),
+            "not the uplink named nuc1"
+        );
+        assert!(
+            resolve_peer(configured(), uplinked(), "nuc2").is_none(),
+            "ambiguous"
+        );
+        assert!(
+            resolve_peer(configured(), uplinked(), "nuc3").is_none(),
+            "uplink by name"
+        );
+        assert!(
+            resolve_peer(configured(), uplinked(), "uplink:zz").is_none(),
+            "bad key"
+        );
     }
 
     #[test]
@@ -682,7 +792,7 @@ mod tests {
                 assistant: "STUB_REPLY ok".into(),
             }],
         };
-        let html = dock_panel("laptop-b", "conv-123", &t, "tok");
+        let html = dock_panel(&http("laptop-b"), "conv-123", &t, "tok");
         assert!(html.contains("mirror + inject"));
         assert!(html.contains("STUB_REPLY ok"));
         assert!(html.contains("hx-post=\"/dock/inject?peer=laptop-b&conv=conv-123\""));

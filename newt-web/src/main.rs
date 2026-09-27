@@ -683,11 +683,11 @@ async fn dock_panel_route(
     Query(q): Query<DockPanelQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let Some(peer) = dock::peer_by_label(&q.peer) else {
+    let Some(peer) = dock::peer_by_route(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
+        Ok(t) => Html(dock::dock_panel(&peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(
             r#"<p class="empty">dock unreachable: {}</p>"#,
             shell::escape(&e)
@@ -744,7 +744,7 @@ async fn dock_inject_route(
     headers: axum::http::HeaderMap,
     Form(form): Form<InjectForm>,
 ) -> impl IntoResponse {
-    let Some(peer) = dock::peer_by_label(&q.peer) else {
+    let Some(peer) = dock::peer_by_route(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
     if let Err(e) = dock::peer_inject(&peer, &q.conv, &form.text).await {
@@ -757,7 +757,7 @@ async fn dock_inject_route(
     // Re-mirror: the remote may not have consumed yet; the operator sees the ask
     // land and the transcript catches up on the next select/refresh.
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
+        Ok(t) => Html(dock::dock_panel(&peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
 }
