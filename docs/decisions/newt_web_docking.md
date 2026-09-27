@@ -313,7 +313,9 @@ secure.
 - [x] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
   serves list/transcript/inject while accepting no inbound connection. The hub half is
   `DockClient::serve_uplinks` (opt-in) plus `DockPeer::Uplink`; which hosts it serves is K8-d.
-- [ ] **K8-d** — hub side: accept uplinks, stage and promote hosts (K8.5), list sessions by host
-  (K8.7).
+- [ ] **K8-d** — hub side, in two PRs:
+  - [x] **K8-d1** — admission: a hub serves only hosts promoted in its own registry, stages the
+    rest (`docks.staged`, expiring) and promotes them with `newt dock approve --staged` (K8.5).
+  - [ ] **K8-d2** — newt-web accepts uplinks and lists sessions by host, as `session@host` (K8.7).
 - [ ] **K8-e** — TUI verbs `/dock <hub>`, `/undock`, `/dock status` (K8.6).
 - [ ] **K8-f** — swap the carrier to `session_streams` when agent-mesh ships it.
