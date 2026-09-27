@@ -736,13 +736,25 @@ pub(crate) fn maybe_dispatch() -> Option<i32> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forward_original_hook_input(mut stdin: impl std::io::Write, input: &[u8]) -> Result<(), String> {
+    // Git treats EPIPE as an early-successful hook exit and uses the hook's
+    // eventual status to decide whether the operation is refused.
+    if let Err(error) = stdin.write_all(input) {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(error.to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_helper(
     role: Option<agent_toolchain::native_git::helper::HelperRole>,
     name: &str,
     args: &[OsString],
 ) -> Result<(), String> {
     use agent_toolchain::native_git::helper::{self, HelperRole};
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     if role == Some(HelperRole::Sign) && args.get(2).is_none_or(|key| key != "newt-native-git") {
         return Err(
             "native Git signing-key override differs from the operator-configured signer".into(),
@@ -788,12 +800,8 @@ fn run_helper(
                 match command.spawn() {
                     Ok(mut child) => {
                         if reads_stdin {
-                            child
-                                .stdin
-                                .take()
-                                .ok_or("original hook stdin missing")?
-                                .write_all(&input)
-                                .map_err(|error| error.to_string())?;
+                            let stdin = child.stdin.take().ok_or("original hook stdin missing")?;
+                            forward_original_hook_input(stdin, &input)?;
                         }
                         if !child.wait().map_err(|error| error.to_string())?.success() {
                             return Err(format!("original {name} hook refused"));
@@ -827,4 +835,39 @@ fn run_helper(
     _args: &[OsString],
 ) -> Result<(), String> {
     Err("authenticated native Git helper transport is unavailable on this platform".into())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::forward_original_hook_input;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn original_hook_closing_stdin_does_not_refuse_successful_hook() {
+        let directory = tempfile::tempdir().unwrap();
+        let closed = directory.path().join("stdin-closed");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec 0<&-\nprintf ready > \"$1\"", "sh"])
+            .arg(&closed)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !closed.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "test hook did not close its stdin"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stdin = child.stdin.take().expect("test hook stdin missing");
+        forward_original_hook_input(
+            stdin,
+            b"0000000000000000000000000000000000000000 \
+1111111111111111111111111111111111111111 refs/heads/task\n",
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
 }

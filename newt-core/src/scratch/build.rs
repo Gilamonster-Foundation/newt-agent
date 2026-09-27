@@ -28,10 +28,29 @@ struct Plan {
 
 #[derive(Default)]
 struct LeaseState {
-    // The flag covers the interval between the last strong reference going
+    // `cleaning` covers the interval between the last strong reference going
     // away and Base::drop finishing cleanup; a new run waits for that cleanup.
-    live: Mutex<(Weak<Base>, bool)>,
+    // A failed cleanup may retain an already-held base. That is the only
+    // existing base that a later run may reuse: reopening a matching pathname
+    // would give an attacker-owned replacement build authority.
+    live: Mutex<Lease>,
     cleaned: Condvar,
+}
+
+#[derive(Default)]
+struct Lease {
+    base: Weak<Base>,
+    cleaning: bool,
+    retained: Option<RetainedBase>,
+    cleanup_failure: Option<String>,
+}
+
+/// An owned base which cleanup could not remove. Both identities stay held so
+/// a later build can safely reuse this exact directory without treating an
+/// arbitrary pre-existing path as ours.
+struct RetainedBase {
+    directory: Directory,
+    parent: Directory,
 }
 
 impl Plan {
@@ -62,13 +81,16 @@ impl Plan {
             .live
             .lock()
             .map_err(|_| io::Error::other("build scratch lease poisoned"))?;
+        if let Some(error) = &live.cleanup_failure {
+            return Err(io::Error::other(error.clone()));
+        }
         loop {
-            if let Some(base) = live.0.upgrade() {
+            if let Some(base) = live.base.upgrade() {
                 drop(live);
                 base.directory().check()?;
                 return Ok(base);
             }
-            if !live.1 {
+            if !live.cleaning {
                 break;
             }
             live = self
@@ -76,6 +98,31 @@ impl Plan {
                 .cleaned
                 .wait(live)
                 .map_err(|_| io::Error::other("build scratch lease poisoned"))?;
+        }
+        // A final lease cleanup can record a fail-closed error while this
+        // acquisition waits on its Condvar. Check again before considering
+        // either retained state or a fresh pathname.
+        if let Some(error) = &live.cleanup_failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        if let Some(retained) = live.retained.as_ref() {
+            // Do not take this state until both checks pass. A rejected
+            // replacement must remain rejected on every later acquisition.
+            retained.parent.check()?;
+            retained.directory.check()?;
+            let RetainedBase { directory, parent } = live
+                .retained
+                .take()
+                .expect("checked retained build scratch must remain present");
+            let base = Arc::new(Base {
+                directory: Some(directory),
+                parent: Some(parent),
+                shared: self.shared.clone(),
+                operations: Mutex::new(()),
+            });
+            live.base = Arc::downgrade(&base);
+            live.cleaning = true;
+            return Ok(base);
         }
         let parent_path = self
             .path
@@ -97,14 +144,15 @@ impl Plan {
                 ));
             }
         }
-        let directory = parent.create_child(self.path.file_name().unwrap(), false)?;
+        let directory = parent.create_owned_child(self.path.file_name().unwrap())?;
         let base = Arc::new(Base {
             directory: Some(directory),
-            parent,
+            parent: Some(parent),
             shared: self.shared.clone(),
             operations: Mutex::new(()),
         });
-        *live = (Arc::downgrade(&base), true);
+        live.base = Arc::downgrade(&base);
+        live.cleaning = true;
         Ok(base)
     }
 }
@@ -144,7 +192,7 @@ pub(crate) fn managed_partition(
 
 struct Base {
     directory: Option<Directory>,
-    parent: Directory,
+    parent: Option<Directory>,
     shared: Arc<LeaseState>,
     operations: Mutex<()>,
 }
@@ -160,28 +208,88 @@ impl Drop for Base {
         let Ok(mut live) = self.shared.live.lock() else {
             return;
         };
-        // Empty-directory removal only; never sweep unrelated or replaced data.
-        if let Some(directory) = self.directory.take() {
-            let _ = self.parent.remove_child(directory);
+        let directory = self.directory.take();
+        let parent = self.parent.take();
+        if let (Some(directory), Some(parent)) = (directory, parent) {
+            let path = directory.path.clone();
+            // Empty-directory removal only; never sweep unrelated or replaced
+            // data. If a previous run left content behind, keep the directory
+            // handle instead of later reopening a same-named path.
+            match directory.is_nonempty() {
+                Ok(false) => match parent.remove_owned_child(directory) {
+                    Ok(()) => {}
+                    Err((Some(directory), error)) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "managed build scratch cleanup could not remove its empty base; retaining its held base for safe reuse"
+                        );
+                        live.retained = Some(RetainedBase { directory, parent });
+                    }
+                    Err((None, error)) => {
+                        let message = format!(
+                                "managed build scratch cleanup could not retain its base after removal failed: {error}"
+                            );
+                        tracing::warn!(path = %path.display(), "{message}");
+                        live.cleanup_failure = Some(message);
+                    }
+                },
+                Ok(true) => {
+                    tracing::warn!(
+                        path = %directory.path.display(),
+                        "managed build scratch cleanup left owned entries; retaining its held base for safe reuse"
+                    );
+                    live.retained = Some(RetainedBase { directory, parent });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %directory.path.display(),
+                        error = %error,
+                        "managed build scratch cleanup could not inspect its base; retaining its held base for safe reuse"
+                    );
+                    live.retained = Some(RetainedBase { directory, parent });
+                }
+            }
         }
-        live.1 = false;
+        live.cleaning = false;
         self.shared.cleaned.notify_all();
     }
 }
 
 /// Held filesystem identity, using existing Bridle Unix capabilities and the
 /// already-used same-file Windows handle. Windows handles deny delete-sharing
-/// for every ancestor, preventing path relocation while creating a child.
+/// for every ancestor except the known owned base, whose own held handle
+/// retains that protection while descendants share its DELETE access.
 struct Directory {
     path: PathBuf,
     #[cfg(unix)]
     root: agent_bridle_fdguard::GrantedRoot,
     #[cfg(windows)]
     ancestors: Vec<same_file::Handle>,
+    /// Path whose held handle owns DELETE access without DELETE sharing. A
+    /// descendant must share that existing access when it traverses this
+    /// specific ancestor, while retaining no-delete sharing everywhere else.
+    #[cfg(windows)]
+    delete_owner: Option<PathBuf>,
 }
 
 impl Directory {
     fn acquire(path: &Path) -> io::Result<Self> {
+        Self::open(path, false, None)
+    }
+
+    fn inspect(path: &Path, delete_owner: Option<&Path>) -> io::Result<Self> {
+        // A held owned base requests DELETE access without sharing delete. An
+        // inspection needs to share that existing access in order to compare
+        // the path with the held identity, but it still asks only for read
+        // access itself. The held base continues to prevent a third party
+        // from obtaining DELETE access.
+        Self::open(path, false, delete_owner)
+    }
+
+    fn open(path: &Path, owns_deletion: bool, delete_owner: Option<&Path>) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        let _ = (owns_deletion, delete_owner);
         if path.canonicalize()? != path {
             return Err(refused("build scratch path is not canonical"));
         }
@@ -190,19 +298,35 @@ impl Directory {
         #[cfg(windows)]
         let ancestors = {
             use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            use windows_sys::Win32::Foundation::GENERIC_READ;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             };
             let mut paths: Vec<_> = path.ancestors().collect();
             paths.reverse();
             let mut handles = Vec::new();
             for ancestor in paths {
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                    .open(ancestor)?;
+                let mut options = std::fs::OpenOptions::new();
+                let share_mode = FILE_SHARE_READ
+                    | FILE_SHARE_WRITE
+                    | if delete_owner == Some(ancestor) {
+                        FILE_SHARE_DELETE
+                    } else {
+                        0
+                    };
+                options
+                    .share_mode(share_mode)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+                if ancestor == path && owns_deletion {
+                    // The final handle both prevents a replacement and carries
+                    // DELETE access, so empty-directory removal never reopens
+                    // this child by pathname.
+                    options.access_mode(GENERIC_READ | DELETE);
+                } else {
+                    options.read(true);
+                }
+                let file = options.open(ancestor)?;
                 let metadata = file.metadata()?;
                 if !metadata.is_dir()
                     || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -227,11 +351,24 @@ impl Directory {
             root,
             #[cfg(windows)]
             ancestors,
+            #[cfg(windows)]
+            delete_owner: if owns_deletion {
+                Some(path.to_owned())
+            } else {
+                delete_owner.map(Path::to_owned)
+            },
         })
     }
 
     fn check(&self) -> io::Result<()> {
-        let current = Self::acquire(&self.path)?;
+        // An inspection borrows read access only. A held final directory
+        // deliberately denies DELETE sharing, so a second delete-capable
+        // handle would fail before the identity comparison.
+        #[cfg(windows)]
+        let delete_owner = self.delete_owner.as_deref();
+        #[cfg(not(windows))]
+        let delete_owner = None;
+        let current = Self::inspect(&self.path, delete_owner)?;
         #[cfg(unix)]
         let unchanged = self.root.identity() == current.root.identity();
         #[cfg(windows)]
@@ -244,7 +381,33 @@ impl Directory {
         Ok(())
     }
 
+    /// Inspect only to avoid attempting an unsafe deletion of a nonempty base.
+    /// A nonempty or unreadable result retains the held identity; the empty
+    /// case still goes through `remove_child` and its identity checks.
+    fn is_nonempty(&self) -> io::Result<bool> {
+        self.check()?;
+        std::fs::read_dir(&self.path)?
+            .next()
+            .transpose()
+            .map(|entry| entry.is_some())
+    }
+
     fn create_child(&self, name: &std::ffi::OsStr, reuse: bool) -> io::Result<Self> {
+        self.create_child_with_ownership(name, reuse, false)
+    }
+
+    fn create_owned_child(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+        self.create_child_with_ownership(name, false, true)
+    }
+
+    fn create_child_with_ownership(
+        &self,
+        name: &std::ffi::OsStr,
+        reuse: bool,
+        owns_deletion: bool,
+    ) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        let _ = owns_deletion;
         self.check()?;
         let path = self.path.join(name);
         #[cfg(unix)]
@@ -280,7 +443,81 @@ impl Directory {
             Ok(child)
         }
         #[cfg(not(unix))]
-        Self::acquire(&path)
+        {
+            #[cfg(windows)]
+            let delete_owner = self.delete_owner.as_deref();
+            #[cfg(not(windows))]
+            let delete_owner = None;
+            Self::open(&path, owns_deletion, delete_owner)
+        }
+    }
+
+    #[cfg(windows)]
+    fn delete_empty_by_identity(&self) -> io::Result<()> {
+        use std::mem::size_of;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        };
+
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let handle = self
+            .ancestors
+            .last()
+            .ok_or_else(|| refused("build scratch child has no identity handle"))?;
+        // The final handle was opened with DELETE access and without
+        // FILE_SHARE_DELETE. This marks exactly that held directory for
+        // deletion; no pathname can be substituted between validation and
+        // removal.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                handle.as_file().as_raw_handle() as _,
+                FileDispositionInfo,
+                &disposition as *const FILE_DISPOSITION_INFO as *const _,
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Removes the exclusive base child. On failure, returns its held identity
+    /// so a later lease never reopens a same-named pathname.
+    fn remove_owned_child(&self, child: Self) -> Result<(), (Option<Self>, io::Error)> {
+        if let Err(error) = self.check() {
+            return Err((Some(child), error));
+        }
+        if let Err(error) = child.check() {
+            return Err((Some(child), error));
+        }
+        #[cfg(test)]
+        if take_forced_remove_child_failure() {
+            return Err((
+                Some(child),
+                io::Error::other("forced managed build scratch removal failure"),
+            ));
+        }
+        #[cfg(unix)]
+        return match rustix::fs::unlinkat(
+            self.root.as_fd(),
+            child.path.file_name().unwrap(),
+            rustix::fs::AtFlags::REMOVEDIR,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => Err((Some(child), io::Error::from(error))),
+        };
+        #[cfg(windows)]
+        return child
+            .delete_empty_by_identity()
+            .map_err(|error| (Some(child), error));
+        #[cfg(not(any(unix, windows)))]
+        return match std::fs::remove_dir(&child.path) {
+            Ok(()) => Ok(()),
+            Err(error) => Err((Some(child), error)),
+        };
     }
 
     fn remove_child(&self, child: Self) -> io::Result<()> {
@@ -300,6 +537,21 @@ impl Directory {
         #[cfg(not(unix))]
         std::fs::remove_dir(&child.path)
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FORCE_NEXT_REMOVE_CHILD_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_next_remove_child_failure() {
+    FORCE_NEXT_REMOVE_CHILD_FAILURE.with(|forced| forced.set(true));
+}
+
+#[cfg(test)]
+fn take_forced_remove_child_failure() -> bool {
+    FORCE_NEXT_REMOVE_CHILD_FAILURE.with(|forced| forced.replace(false))
 }
 
 /// Keeps all owned parents alive until the existing execution lease ends.
@@ -479,6 +731,80 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(plan.path.join("keep")).unwrap(),
             "unowned"
+        );
+    }
+
+    #[test]
+    fn managed_scratch_reuses_a_held_base_after_incomplete_cleanup() {
+        let (_temporary, plan) = fixture();
+        let orphan_path = plan.path.join("orphan");
+        let base = plan.acquire().unwrap();
+        // Model a run which could not remove one of its own directories. The
+        // base must remain attributable to this lease, not merely to its path.
+        let orphan = base
+            .directory()
+            .create_child(std::ffi::OsStr::new("orphan"), false)
+            .unwrap();
+        drop(base);
+        assert!(orphan_path.is_dir());
+
+        let next = plan.path.join("workspace/next");
+        drop(ManagedRun::create(&plan, &next).unwrap());
+        assert!(
+            orphan_path.is_dir(),
+            "recovery must not sweep the leftover owned directory"
+        );
+
+        // Once the known leftover is gone, ordinary empty-base cleanup still
+        // removes the base rather than retaining it for the whole process.
+        let base = plan.acquire().unwrap();
+        assert!(base.directory().remove_child(orphan).is_ok());
+        drop(base);
+        assert!(!plan.path.exists());
+    }
+
+    #[test]
+    fn managed_scratch_recovers_from_empty_base_cleanup_failure() {
+        let (_temporary, plan) = fixture();
+        let base = plan.acquire().unwrap();
+        force_next_remove_child_failure();
+        drop(base);
+        assert!(plan.path.is_dir());
+
+        let next = plan.path.join("workspace/next");
+        drop(ManagedRun::create(&plan, &next).unwrap());
+        assert!(
+            !plan.path.exists(),
+            "a retained empty base should be removed by its next successful cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_managed_scratch_rejects_a_replaced_base() {
+        let (_temporary, plan) = fixture();
+        let base = plan.acquire().unwrap();
+        drop(
+            base.directory()
+                .create_child(std::ffi::OsStr::new("orphan"), false)
+                .unwrap(),
+        );
+        drop(base);
+
+        // A naïve `create_child(..., true)` recovery would now adopt this
+        // replacement. The retained descriptor must continue to reject it.
+        let old = plan.path.with_extension("old");
+        std::fs::rename(&plan.path, &old).unwrap();
+        std::fs::create_dir(&plan.path).unwrap();
+        std::fs::write(plan.path.join("keep"), "replacement").unwrap();
+        assert!(plan.acquire().is_err());
+        assert!(
+            plan.acquire().is_err(),
+            "failed checks must not discard the held base"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan.path.join("keep")).unwrap(),
+            "replacement"
         );
     }
 

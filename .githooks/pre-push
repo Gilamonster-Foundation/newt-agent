@@ -145,7 +145,10 @@ import sys
 private = re.compile(sys.argv[1], re.IGNORECASE)
 allowed = re.compile(sys.argv[2], re.IGNORECASE)
 added_line = 0
-for line in sys.stdin:
+# Git diffs may contain arbitrary bytes; make scan behavior independent of
+# the locale and PYTHONIOENCODING without discarding those bytes.
+for raw_line in sys.stdin.buffer:
+    line = raw_line.decode("utf-8", errors="surrogateescape")
     if not line.startswith("+") or line.startswith("+++"):
         continue
     added_line += 1

@@ -1693,6 +1693,7 @@ fn commits_since(
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+    #[cfg(unix)]
     use newt_core::ScopeExt as _;
 
     /// #2552 round 3: `commits_since` — the exact function `handback`'s

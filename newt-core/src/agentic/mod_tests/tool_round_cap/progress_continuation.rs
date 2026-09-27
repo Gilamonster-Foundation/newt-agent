@@ -368,7 +368,13 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
                 || request_text
                     .last()
                     .unwrap()
-                    .contains("cannot find the path"),
+                    .contains("cannot find the path")
+                // Windows reports an absent process working directory as
+                // ERROR_DIRECTORY (267), whose system message is this text.
+                || request_text
+                    .last()
+                    .unwrap()
+                    .contains("directory name is invalid"),
             "{wire}: failure must come from the absent cwd: {}",
             request_text.last().unwrap()
         );

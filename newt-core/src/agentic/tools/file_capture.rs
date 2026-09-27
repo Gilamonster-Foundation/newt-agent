@@ -16,6 +16,38 @@ pub(in crate::agentic) enum TextSnapshot {
     Unavailable(&'static str),
 }
 
+/// True only when `path` is an absent leaf below an existing directory.
+///
+/// Windows reports both an absent leaf and an attempt to traverse through a
+/// regular-file parent as `NotFound` (`ERROR_PATH_NOT_FOUND`). The latter is
+/// not evidence that the requested file was absent: receipt capture must stay
+/// unavailable so a failed mutation cannot acquire an invented empty state.
+/// A dangling final symlink is likewise unavailable, because
+/// `symlink_metadata` observes the link rather than an absent leaf.
+fn is_absent_leaf(path: &Path) -> bool {
+    if !matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    ) {
+        return false;
+    }
+    matches!(
+        path.parent().and_then(|parent| std::fs::symlink_metadata(parent).ok()),
+        Some(metadata) if metadata.is_dir()
+    )
+}
+
+/// Whether a `Scope::Only` grant names this exact path after the same lexical
+/// normalization used by the tool gate.
+#[cfg(windows)]
+fn exact_scope_root(scope: &Scope<String>, path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    let normalized_path = crate::caveats::lexically_normalize(&path);
+    matches!(scope, Scope::Only(roots) if roots.iter().any(|root| {
+        crate::caveats::lexically_normalize(root) == normalized_path
+    }))
+}
+
 fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Result<File> {
     if !super::tui_permits_path(scope, &path.to_string_lossy()) {
         return Err(io::Error::new(
@@ -46,6 +78,17 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
             if !roots.iter().any(|root| {
                 super::artifact_path_is_physically_within_workspace(Path::new(root), path)
             }) {
+                // A deleted exact-file grant cannot be canonicalized, but no
+                // reopen is necessary to attest its absent postimage. Keep
+                // this exception limited to Windows, nofollow observations,
+                // an exact lexical grant, and a verified missing leaf.
+                #[cfg(windows)]
+                if nofollow && exact_scope_root(scope, path) && is_absent_leaf(path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "exact granted leaf is absent",
+                    ));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "physical path is outside the read scope",
@@ -62,7 +105,9 @@ pub(in crate::agentic) fn capture(scope: &Scope<String>, path: &Path) -> TextSna
     }
     let mut file = match open_for_scope(scope, path, true) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return TextSnapshot::Absent,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && is_absent_leaf(path) => {
+            return TextSnapshot::Absent;
+        }
         Err(_) => {
             return TextSnapshot::Unavailable(
                 "the file could not be read as an authorized regular file",
@@ -321,7 +366,7 @@ pub(super) fn failure(output: String, receipt: &str) -> String {
 }
 
 pub(super) fn absent(scope: &Scope<String>, path: &Path) -> bool {
-    matches!(open_for_scope(scope, path, true), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    matches!(open_for_scope(scope, path, true), Err(error) if error.kind() == io::ErrorKind::NotFound && is_absent_leaf(path))
 }
 
 /// Preserve final-link mutation policy, but refuse actual FIFO/device targets
