@@ -447,6 +447,12 @@ impl DockClient {
         crate::uplink::serve(&self.bus, self.user_fp, self.uplinks.clone());
     }
 
+    /// The hub state behind [`Self::serve_uplinks`].
+    #[cfg(test)]
+    pub(crate) fn uplinks(&self) -> &crate::uplink::UplinkHub {
+        &self.uplinks
+    }
+
     /// The bound UDP port hosts uplink to.
     #[must_use]
     pub fn local_port(&self) -> u16 {
@@ -1075,8 +1081,10 @@ mod tests {
 
     /// K8-c acceptance: a docked host serves list, transcript and inject to its
     /// hub over an uplink it dialed, while accepting no inbound connection. The
-    /// host still authorizes the hub against its own registry (K8.2): before
-    /// the approval the same uplinked request is refused. Real loopback QUIC.
+    /// host authorizes the hub against its own registry on every request
+    /// (K8.2), through the uplink exactly as through a direct dial: an
+    /// unapproved hub, a Mirror-only inject, a revoked hub and the kill switch
+    /// are each refused by the host with its own reason. Real loopback QUIC.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn docked_host_serves_its_hub_over_an_uplink_and_accepts_no_inbound() {
@@ -1103,27 +1111,21 @@ mod tests {
         .await
         .unwrap();
         let laptop = DockPeer::Uplink(host_fp);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hub.uplinks().wait_for_uplink(host_fp),
+        )
+        .await
+        .expect("the host uplinks within 5s");
 
-        // Wait for the first poll; until then the hub reports no uplink.
-        let mut refused = None;
-        for _ in 0..50 {
-            match hub.list_sessions(laptop).await {
-                Err(e) if e.to_string().contains("no open uplink") => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                other => {
-                    refused = Some(other);
-                    break;
-                }
-            }
-        }
-        let refused = refused.expect("the host uplinks within 5s");
+        let refusal = |r: anyhow::Result<Vec<DockSessionInfo>>| r.unwrap_err().to_string();
+        let unapproved = refusal(hub.list_sessions(laptop).await);
         assert!(
-            refused.is_err(),
-            "an unapproved hub is refused by the host, even over the host's own uplink"
+            unapproved.contains("is not an approved dock"),
+            "the host itself refuses an unapproved hub: {unapproved}"
         );
 
-        approve_caller(&user, dir.path(), &hub_pubkey, DockScope::MirrorInject);
+        approve_caller(&user, dir.path(), &hub_pubkey, DockScope::Mirror);
         let sessions = hub.list_sessions(laptop).await.unwrap();
         assert!(
             sessions.iter().any(|s| s.title == "laptop session"),
@@ -1134,6 +1136,18 @@ mod tests {
             .turns
             .iter()
             .any(|turn| turn.assistant.contains("UPLINK_REPLY")));
+        let mirror_only = hub
+            .inject(laptop, &conv, "MIRROR_ONLY_INJECT")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mirror_only.contains("does not permit this operation"),
+            "a Mirror dock may not inject: {mirror_only}"
+        );
+        assert!(store.take_injected_prompt(&conv).unwrap().is_none());
+
+        approve_caller(&user, dir.path(), &hub_pubkey, DockScope::MirrorInject);
         hub.inject(laptop, &conv, "UPLINK_INJECT run the lints")
             .await
             .unwrap();
@@ -1141,6 +1155,24 @@ mod tests {
             store.take_injected_prompt(&conv).unwrap().map(|p| p.body),
             Some("UPLINK_INJECT run the lints".to_string()),
             "the inject lands in the host's own inbox (the host stays sole writer)"
+        );
+
+        std::fs::write(dir.path().join("dock-exposure-disabled"), b"").unwrap();
+        let killed = refusal(hub.list_sessions(laptop).await);
+        assert!(killed.contains("dock exposure disabled"), "{killed}");
+        std::fs::remove_file(dir.path().join("dock-exposure-disabled")).unwrap();
+
+        let hub_fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&hub_pubkey);
+        newt_core::dock_registry::revoke_dock_with_identity(
+            &dir.path().join("config.toml"),
+            &dir.path().join("identity.pem"),
+            &hub_fp,
+        )
+        .unwrap();
+        let revoked = refusal(hub.list_sessions(laptop).await);
+        assert!(
+            revoked.contains("is not an approved dock"),
+            "a revoked hub is refused on its next request: {revoked}"
         );
 
         // The host accepts nothing: a direct dial to its port is refused by the
@@ -1157,7 +1189,7 @@ mod tests {
             "a dial to the docked host must be refused, got {direct:?}"
         );
 
-        host.close();
+        host.close().await;
         hub.close().await.unwrap();
     }
 }
