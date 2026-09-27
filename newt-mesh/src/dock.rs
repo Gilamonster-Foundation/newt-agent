@@ -300,6 +300,31 @@ fn handle_dock(state_dir: &Path, authz: Authz, req: DockRequest) -> DockReply {
     }
 }
 
+/// Answer one dock request from `caller_agent_fp` (a verified agent
+/// fingerprint): authorize the caller FIRST — refuse before any disclosure or
+/// side effect — then handle it. Shared by the direct responder
+/// ([`NewtDockService`]) and the uplink ([`crate::DockUplink`]), so both carry
+/// exactly the same authorization. SQLite is synchronous, so it runs on a
+/// blocking thread.
+pub(crate) async fn serve_dock(
+    state_dir: PathBuf,
+    caller_agent_fp: String,
+    request: Result<DockRequest, String>,
+) -> DockReply {
+    tokio::task::spawn_blocking(move || {
+        let authz = match authorize_caller(&state_dir, &caller_agent_fp) {
+            Ok(authz) => authz,
+            Err(deny) => return deny,
+        };
+        match request {
+            Ok(req) => handle_dock(&state_dir, authz, req),
+            Err(e) => DockReply::Error(format!("bad dock request: {e}")),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| DockReply::Error(format!("dock handler panicked: {e}")))
+}
+
 /// The workspace path a conversation belongs to (store `load`/`inject` are
 /// workspace-fenced, so the caller need not know it).
 fn resolve_ws(state_dir: &Path, conv: &str) -> Option<String> {
@@ -342,20 +367,8 @@ impl NewtDockService {
             let state_dir = state_dir.clone();
             let caller_agent_fp = ctx.caller_agent_fp.hex();
             async move {
-                let reply = tokio::task::spawn_blocking(move || {
-                    // Authorize the caller FIRST — refuse before any disclosure
-                    // or side effect.
-                    let authz = match authorize_caller(&state_dir, &caller_agent_fp) {
-                        Ok(authz) => authz,
-                        Err(deny) => return deny,
-                    };
-                    match serde_json::from_slice(&body) {
-                        Ok(req) => handle_dock(&state_dir, authz, req),
-                        Err(e) => DockReply::Error(format!("bad dock request: {e}")),
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| DockReply::Error(format!("dock handler panicked: {e}")));
+                let request = serde_json::from_slice(&body).map_err(|e| e.to_string());
+                let reply = serve_dock(state_dir, caller_agent_fp, request).await;
                 Ok(serde_json::to_vec(&reply).unwrap_or_default())
             }
         });
@@ -386,10 +399,27 @@ impl NewtDockService {
     }
 }
 
+/// Where a hub reaches a docked peer.
+#[derive(Debug, Clone, Copy)]
+pub enum DockPeer {
+    /// Dial the peer's [`NewtDockService`] directly (K7, LAN).
+    Direct(PeerEndpoint),
+    /// Hand the request to the host with this agent fingerprint over the
+    /// uplink it holds open to this hub (K8). The hub never dials it.
+    Uplink(Fingerprint),
+}
+
+impl From<PeerEndpoint> for DockPeer {
+    fn from(peer: PeerEndpoint) -> Self {
+        Self::Direct(peer)
+    }
+}
+
 /// The dock **dialer**: a hub-side bus that requests docks from peers.
 pub struct DockClient {
     bus: Bus,
     user_fp: Fingerprint,
+    uplinks: std::sync::Arc<crate::uplink::UplinkHub>,
 }
 
 impl DockClient {
@@ -400,24 +430,56 @@ impl DockClient {
     pub async fn bind(user: &UserKey, agent: AgentKey, port: u16) -> anyhow::Result<Self> {
         let user_fp = user.fingerprint();
         let bus = Bus::bind(user, agent, port).await?;
-        Ok(Self { bus, user_fp })
+        let uplinks = std::sync::Arc::default();
+        Ok(Self {
+            bus,
+            user_fp,
+            uplinks,
+        })
     }
 
-    async fn request(&self, peer: PeerEndpoint, req: &DockRequest) -> anyhow::Result<DockReply> {
-        let topic = Topic::new(self.user_fp, DOCK_TOPIC);
-        let body = serde_json::to_vec(req)?;
-        let reply = self
-            .bus
-            .request_direct(peer, &topic, body, DOCK_TIMEOUT)
-            .await?;
-        Ok(serde_json::from_slice(&reply)?)
+    /// Accept uplinks from docked hosts (K8): hold each host's poll and hand
+    /// it the requests addressed to [`DockPeer::Uplink`]. Opt-in, so a hub
+    /// only serves uplinks when it means to. Which hosts may uplink is not
+    /// decided here (staging and promotion are K8.5); a host still authorizes
+    /// every request against its own registry.
+    pub fn serve_uplinks(&self) {
+        crate::uplink::serve(&self.bus, self.user_fp, self.uplinks.clone());
+    }
+
+    /// The bound UDP port hosts uplink to.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.bus.local_port()
+    }
+
+    async fn request(
+        &self,
+        peer: impl Into<DockPeer>,
+        req: &DockRequest,
+    ) -> anyhow::Result<DockReply> {
+        match peer.into() {
+            DockPeer::Direct(peer) => {
+                let topic = Topic::new(self.user_fp, DOCK_TOPIC);
+                let body = serde_json::to_vec(req)?;
+                let reply = self
+                    .bus
+                    .request_direct(peer, &topic, body, DOCK_TIMEOUT)
+                    .await?;
+                Ok(serde_json::from_slice(&reply)?)
+            }
+            DockPeer::Uplink(host) => self.uplinks.request(host, req.clone()).await,
+        }
     }
 
     /// List a peer's sessions.
     ///
     /// # Errors
     /// Bus/transport failure, or a non-`Sessions` reply.
-    pub async fn list_sessions(&self, peer: PeerEndpoint) -> anyhow::Result<Vec<DockSessionInfo>> {
+    pub async fn list_sessions(
+        &self,
+        peer: impl Into<DockPeer>,
+    ) -> anyhow::Result<Vec<DockSessionInfo>> {
         match self.request(peer, &DockRequest::ListSessions).await? {
             DockReply::Sessions(s) => Ok(s),
             other => Err(anyhow::anyhow!("unexpected dock reply: {other:?}")),
@@ -430,7 +492,7 @@ impl DockClient {
     /// Bus/transport failure, `NotFound`, or an unexpected reply.
     pub async fn transcript(
         &self,
-        peer: PeerEndpoint,
+        peer: impl Into<DockPeer>,
         conv: &str,
     ) -> anyhow::Result<DockTranscript> {
         match self
@@ -447,7 +509,12 @@ impl DockClient {
     ///
     /// # Errors
     /// Bus/transport failure, `NotFound`, or an unexpected reply.
-    pub async fn inject(&self, peer: PeerEndpoint, conv: &str, text: &str) -> anyhow::Result<()> {
+    pub async fn inject(
+        &self,
+        peer: impl Into<DockPeer>,
+        conv: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
         match self
             .request(
                 peer,
@@ -1004,5 +1071,93 @@ mod tests {
         a.close().await.unwrap();
         b.close().await.unwrap();
         c.close().await.unwrap();
+    }
+
+    /// K8-c acceptance: a docked host serves list, transcript and inject to its
+    /// hub over an uplink it dialed, while accepting no inbound connection. The
+    /// host still authorizes the hub against its own registry (K8.2): before
+    /// the approval the same uplinked request is refused. Real loopback QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn docked_host_serves_its_hub_over_an_uplink_and_accepts_no_inbound() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        let conv = store.create("laptop session", None).unwrap();
+        store
+            .append_turn(&conv, "q1", "UPLINK_REPLY from the laptop")
+            .unwrap();
+
+        let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
+        let hub_pubkey = hub_agent.public_bytes();
+        let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        hub.serve_uplinks();
+        let host_agent = dock_agent(&user, DockRole::Host, "laptop");
+        let (host_fp, host_pubkey) = (host_agent.fingerprint(), host_agent.public_bytes());
+        let host = crate::DockUplink::start(
+            &user,
+            host_agent,
+            dir.path().to_path_buf(),
+            loopback(hub_pubkey, hub.local_port()),
+        )
+        .await
+        .unwrap();
+        let laptop = DockPeer::Uplink(host_fp);
+
+        // Wait for the first poll; until then the hub reports no uplink.
+        let mut refused = None;
+        for _ in 0..50 {
+            match hub.list_sessions(laptop).await {
+                Err(e) if e.to_string().contains("no open uplink") => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => {
+                    refused = Some(other);
+                    break;
+                }
+            }
+        }
+        let refused = refused.expect("the host uplinks within 5s");
+        assert!(
+            refused.is_err(),
+            "an unapproved hub is refused by the host, even over the host's own uplink"
+        );
+
+        approve_caller(&user, dir.path(), &hub_pubkey, DockScope::MirrorInject);
+        let sessions = hub.list_sessions(laptop).await.unwrap();
+        assert!(
+            sessions.iter().any(|s| s.title == "laptop session"),
+            "{sessions:?}"
+        );
+        let t = hub.transcript(laptop, &conv).await.unwrap();
+        assert!(t
+            .turns
+            .iter()
+            .any(|turn| turn.assistant.contains("UPLINK_REPLY")));
+        hub.inject(laptop, &conv, "UPLINK_INJECT run the lints")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.take_injected_prompt(&conv).unwrap().map(|p| p.body),
+            Some("UPLINK_INJECT run the lints".to_string()),
+            "the inject lands in the host's own inbox (the host stays sole writer)"
+        );
+
+        // The host accepts nothing: a direct dial to its port is refused by the
+        // transport, not merely unanswered.
+        let direct = hub
+            .list_sessions(loopback(host_pubkey, host.local_port()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                direct.downcast_ref::<agent_mesh_bus::BusError>(),
+                Some(agent_mesh_bus::BusError::Transport(_))
+            ),
+            "a dial to the docked host must be refused, got {direct:?}"
+        );
+
+        host.close();
+        hub.close().await.unwrap();
     }
 }
