@@ -72,17 +72,27 @@ impl WorkspaceProtection {
             );
         }
         let mut reads = scope_roots(&caveats.fs_read, !self.read_protected.is_empty())?;
-        let mut writes = scope_roots(&caveats.fs_write, !self.write_protected.is_empty())?;
-        let devices = policy.device_sink_paths.resolve();
-        writes.extend(devices.iter().map(PathBuf::from));
-        for roots in [
-            policy.base_read_paths.resolve(),
-            policy.bin_read_paths.resolve(),
-            policy.loader_paths.resolve(),
-            devices,
-        ] {
-            reads.extend(roots.into_iter().map(PathBuf::from));
-        }
+        let writes = scope_roots(&caveats.fs_write, !self.write_protected.is_empty())?;
+        // AppContainer emits only the explicit filesystem caveats; its launcher
+        // does not consume these Unix runtime path lists. In particular, `/dev`
+        // is not an implicit grant to the current Windows drive's `dev` folder.
+        #[cfg(windows)]
+        let _ = policy;
+        #[cfg(not(windows))]
+        let writes = {
+            let mut writes = writes;
+            let devices = policy.device_sink_paths.resolve();
+            writes.extend(devices.iter().map(PathBuf::from));
+            for roots in [
+                policy.base_read_paths.resolve(),
+                policy.bin_read_paths.resolve(),
+                policy.loader_paths.resolve(),
+                devices,
+            ] {
+                reads.extend(roots.into_iter().map(PathBuf::from));
+            }
+            writes
+        };
         // Match smart-frame isolation's conservative executable read inventory.
         if let Scope::Only(commands) = &caveats.exec {
             let path_bearing = |name: &str| {
@@ -277,6 +287,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn implicit_sandbox_read_roots_cannot_expose_private_keys() {
         let policy = crate::confined_exec::runtime_sandbox_policy();
@@ -286,6 +297,104 @@ mod tests {
         let key = Path::new(&root).join("newt-protected-key-fixture");
         let protection = WorkspaceProtection::new(&[], &[key]).unwrap();
         assert!(protection.validate_caveats(&authority(&[], &[])).is_err());
+    }
+
+    #[test]
+    fn explicit_grant_roots_reject_relative_paths_and_raw_parent_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let protection = WorkspaceProtection::new(&[root.join("operator-policy")], &[]).unwrap();
+        let mut traversal = root.as_os_str().to_owned();
+        // Do not use PathBuf::join: Windows verbatim paths normalize `..` there.
+        traversal.push(std::path::MAIN_SEPARATOR_STR);
+        traversal.push("..");
+        traversal.push(std::path::MAIN_SEPARATOR_STR);
+        traversal.push("outside");
+        let traversal = PathBuf::from(traversal);
+        assert!(traversal
+            .components()
+            .any(|part| part == std::path::Component::ParentDir));
+        for path in [Path::new("relative"), traversal.as_path()] {
+            assert!(protection
+                .validate_caveats(&authority(&[path], &[]))
+                .is_err());
+            assert!(protection
+                .validate_caveats(&authority(&[], &[path]))
+                .is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_appcontainer_ignores_unconsumed_policy_lists_but_checks_explicit_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let operator = root.join("operator");
+        std::fs::create_dir(&operator).unwrap();
+        let protection = WorkspaceProtection::new(
+            std::slice::from_ref(&operator),
+            std::slice::from_ref(&operator),
+        )
+        .unwrap();
+        let mut policy = agent_bridle::SandboxPolicy::default();
+        for roots in [
+            &mut policy.base_read_paths,
+            &mut policy.bin_read_paths,
+            &mut policy.loader_paths,
+            &mut policy.device_sink_paths,
+        ] {
+            roots.extra.push(operator.to_str().unwrap().to_owned());
+        }
+        protection
+            .validate_with_sandbox_policy(&authority(&[], &[]), &policy)
+            .unwrap();
+        for caveats in [authority(&[&operator], &[]), authority(&[], &[&operator])] {
+            assert!(protection
+                .validate_with_sandbox_policy(&caveats, &policy)
+                .is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ordinary_and_verbatim_paths_keep_the_same_protection() {
+        let temp = tempfile::tempdir().unwrap();
+        let ordinary = std::path::absolute(temp.path()).unwrap();
+        let verbatim = ordinary.canonicalize().unwrap();
+        assert!(matches!(
+            verbatim.components().next(),
+            Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ));
+        assert_eq!(
+            resolve_root(&ordinary).unwrap().1,
+            resolve_root(&verbatim).unwrap().1
+        );
+        std::fs::create_dir(ordinary.join("workspace")).unwrap();
+        std::fs::create_dir(ordinary.join("operator")).unwrap();
+        let protection =
+            WorkspaceProtection::new(&[verbatim.join("operator")], &[verbatim.join("operator")])
+                .unwrap();
+        for root in [&ordinary, &verbatim] {
+            let workspace = root.join("workspace");
+            let operator = root.join("operator");
+            protection
+                .validate_caveats(&authority(&[&workspace], &[&workspace]))
+                .unwrap();
+            assert!(protection
+                .validate_caveats(&authority(&[&operator], &[]))
+                .is_err());
+            assert!(protection
+                .validate_caveats(&authority(&[], &[&operator]))
+                .is_err());
+        }
+        for path in [Path::new(r"\workspace"), Path::new(r"C:workspace")] {
+            assert!(protection
+                .validate_caveats(&authority(&[path], &[]))
+                .is_err());
+            assert!(protection
+                .validate_caveats(&authority(&[], &[path]))
+                .is_err());
+        }
     }
 
     #[cfg(unix)]

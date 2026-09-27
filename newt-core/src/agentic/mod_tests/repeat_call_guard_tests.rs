@@ -979,14 +979,43 @@ async fn named_mutation_progress_uses_exact_file_grants_and_absent_postimage() {
     assert!(state.record_workspace_change(before, after));
     std::fs::remove_file(&file).unwrap();
     let absent = progress_workspace_state("delete_file", &args, workspace, &scope).await;
-    assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
-    assert!(state.record_workspace_change(after, absent));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
+        assert!(state.record_workspace_change(after, absent));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // The diagnostic fallback cannot canonicalize an absent exact-file
+        // grant. Unlike the descriptor-bound backends, it has no held parent
+        // capability proving absence, so it must not invent progress.
+        assert!(absent.is_none());
+        assert!(!state.record_workspace_change(after, absent));
+    }
     let sibling = serde_json::json!({"path":"not-granted.txt"});
     assert!(
         progress_workspace_state("write_file", &sibling, workspace, &scope)
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn named_mutation_progress_observes_absence_under_directory_grants() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("source.txt");
+    let workspace = root.path().to_str().unwrap();
+    let args = serde_json::json!({"path":"source.txt"});
+    let scope = crate::caveats::Scope::only([workspace.to_owned()]);
+    std::fs::write(&file, "before deletion").unwrap();
+    let before = progress_workspace_state("delete_file", &args, workspace, &scope).await;
+    assert!(matches!(before, Some(ProgressSnapshot::File(_))));
+    std::fs::remove_file(&file).unwrap();
+    // An existing directory grant supplies the fallback's physical anchor.
+    // Workspace/directory grants must observe deletion on Windows as well.
+    let absent = progress_workspace_state("delete_file", &args, workspace, &scope).await;
+    assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
+    assert!(WorkflowRuntimeState::default().record_workspace_change(before, absent));
 }
 
 #[test]

@@ -535,13 +535,17 @@ async fn unavailable_receipt_preview_preserves_mutation_outcome() {
     );
 
     // The parent is a regular file, so the actual authorized write fails.
-    // Its unavailable receipt must not acquire success wording or hide failure.
+    // Withhold reads so the optional receipt is unavailable on every platform:
+    // Windows reports this missing child as NotFound, Unix as NotADirectory.
+    // Neither an unavailable preview nor a write-only grant may imply success.
     std::fs::write(ws.path().join("blocked"), "keep these bytes").unwrap();
+    let mut write_only = caveats_rw(ws.path());
+    write_only.fs_read = Scope::none();
     let (failed, display) = model_and_display(
         "write_file",
         serde_json::json!({"path": "blocked/child.txt", "content": "not written"}),
         ws.path(),
-        &caveats_rw(ws.path()),
+        &write_only,
         ToolCollaborators::default(),
     )
     .await;

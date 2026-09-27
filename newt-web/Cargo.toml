@@ -52,3 +52,11 @@ wiremock = "0.6"
 serde_json = "1"
 tempfile = "3"
 serial_test = "3"
+
+# Cargo applies patches only from the active workspace root. Keep these aligned
+# with the repository root until the Bridle integration is published; see
+# ../vendor/agent-bridle-tool-shell/NEWT_PATCHES.md for provenance and removal.
+[patch.crates-io]
+agent-bridle-tool-shell = { path = "../vendor/agent-bridle-tool-shell" }
+agent-bridle-core = { path = "../vendor/agent-bridle-core" }
+agent-bridle-fdguard = { path = "../vendor/agent-bridle-fdguard" }

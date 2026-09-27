@@ -65,6 +65,7 @@ fn prepared_stdio_rejects_the_configured_commands_protected_read() {
     );
 }
 
+#[cfg(not(windows))]
 #[test]
 fn prepared_stdio_validates_its_actual_implicit_read_policy() {
     let f = Fixture::new();

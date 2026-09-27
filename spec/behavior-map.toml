@@ -1385,7 +1385,7 @@ path = "newt-tui/src/cockpit/presenter.rs"
 symbol = "escape_during_turn"
 
 [BHV-ROUTE-001]
-description = "A routed run_command(\"git …\") call never drops an operand: the router routes ONLY the exact shapes it can honor faithfully (bare status/log/diff, log limit, diff staged, a log/diff revision or A..B range, an optional -- pathspec, diff --stat) and gates everything else to exec instead of silently answering a different question with ok:true. An unroutable shape is refused naming the supported ops."
+description = "A run_command(\"git …\") call stays on the native exec path with its original flags, revisions, pathspecs, presentation options, and cwd. The router neither translates Git reads into embedded operations nor refuses a shape because the embedded Git interface cannot represent it. Existing exec, filesystem, and native Git authority checks still apply."
 [BHV-ROUTE-001.status]
 lean = "none"
 rust = "tested"
@@ -1394,33 +1394,31 @@ trace = "none"
 conformance = "partial"
 [[BHV-ROUTE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "tests::git_read_routes_never_drop_an_operand"
+symbol = "tests::native_git_commands_keep_flags_revisions_pathspecs_and_cwd"
 tier = "unit"
 [[BHV-ROUTE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "tests::git_read_routes_now_serve_revisions_pathspecs_and_stat"
+symbol = "tests::git_read_commands_preserve_operands"
 tier = "unit"
 [[BHV-ROUTE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "tests::git_read_routes_still_gate_unservable_shapes"
+symbol = "tests::git_reads_preserve_revisions_pathspecs_and_stat"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_presentation_options_stay_on_native_exec"
 tier = "unit"
 [[BHV-ROUTE-001.refs.rust_tests]]
 path = "newt-core/src/agentic/tools_tests/helper_shell_routing.rs"
-symbol = "git_run_command_refusal_names_the_supported_ops"
+symbol = "git_commands_are_never_redirected_to_a_special_tool"
 tier = "unit"
 [[BHV-ROUTE-001.refs.rust_tests]]
-path = "newt-git/src/lib_tests/log_diff_operands.rs"
-symbol = "log_revision_range_excludes_left_bound"
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "native_git_status_requires_exec_and_reads_the_actual_repository"
 tier = "unit"
 [[BHV-ROUTE-001.refs.production]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "git_read_route"
-[[BHV-ROUTE-001.refs.production]]
-path = "newt-git/src/lib.rs"
-symbol = "log"
-[[BHV-ROUTE-001.refs.production]]
-path = "newt-git/src/lib.rs"
-symbol = "diff"
+symbol = "classify_call"
 
 # ─────────────────────────────── OCAP durable grants ─────────────────────────
 

@@ -116,6 +116,12 @@ approvals.
   [native commit scope](../design/agent-toolchain.md#native-commit-adapter-scoped-implementation)
   for unsupported families and platform limits. Saving a profile does not add
   platform enforcement capabilities that the selected backend lacks.
+- On Windows, a read grant naming only one file cannot provide a verified
+  deleted-file snapshot after that file disappears. Progress accounting records
+  no deletion progress from that unavailable observation. Workspace and directory
+  read grants, including those supplied by profiles, can observe the absence and
+  count actual deletion progress. This limitation does not grant access to a
+  deleted file's parent or siblings.
 
 For one-run flags and trusted-config examples, see
 [full access inside a workspace](full-access.md).

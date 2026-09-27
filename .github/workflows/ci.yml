@@ -460,6 +460,14 @@ jobs:
         run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      - name: Stage trusted AppContainer launcher for ordinary tests
+        if: always()
+        # Ordinary workspace tests also execute confined native commands.
+        # Bridle accepts the shipped sibling, never an ambient PATH lookup.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target\debug\deps | Out-Null
+          Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
       - name: cargo test
         # `if: always()` so a clippy failure can't mask a test failure — both
         # surface in one run (same rationale as the Linux lint job).

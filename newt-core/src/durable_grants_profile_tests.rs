@@ -85,10 +85,23 @@ fn workspace_profile_cwd_must_stay_within_canonical_existing_workspace() {
     malformed.read_dirs.insert(root.join("missing"));
     assert!(malformed.validate(&root).is_err());
     malformed.read_dirs.clear();
-    malformed.default_cwd = root.join("nested/..");
-    assert!(malformed.validate(&root).is_err());
-    malformed.default_cwd = root.join("nested/.");
-    assert!(malformed.validate(&root).is_err());
+    // PathBuf::join normalizes dot components under a Windows verbatim
+    // prefix. Preserve the malformed stored spelling instead of accidentally
+    // passing the validator a valid canonical directory on that platform.
+    for component in ["..", "."] {
+        let mut raw = root.as_os_str().to_os_string();
+        raw.push(std::path::MAIN_SEPARATOR_STR);
+        raw.push("nested");
+        raw.push(std::path::MAIN_SEPARATOR_STR);
+        raw.push(component);
+        malformed.default_cwd = PathBuf::from(raw);
+        assert_ne!(malformed.default_cwd.as_os_str(), root.as_os_str());
+        assert_ne!(
+            malformed.default_cwd.as_os_str(),
+            root.join("nested").as_os_str()
+        );
+        assert!(malformed.validate(&root).is_err(), "component {component}");
+    }
 }
 
 #[cfg(unix)]
