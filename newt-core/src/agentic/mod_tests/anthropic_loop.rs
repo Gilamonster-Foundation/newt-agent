@@ -282,6 +282,7 @@ impl McpTools for RecordingMcp {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn stream_off_dispatches_kind_anthropic_end_to_end() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -315,6 +316,7 @@ async fn stream_off_dispatches_kind_anthropic_end_to_end() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn stream_off_valve_sends_stream_false_in_the_body() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -350,6 +352,7 @@ async fn stream_off_valve_sends_stream_false_in_the_body() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let mut env = test_env(false);
     env.push(EnvGuard::set("NEWT_ANTHROPIC_MAX_TOKENS", "5000"));
     for (output_allowance, sent) in [(None, 5_000), (Some(3_000), 3_000)] {
@@ -398,6 +401,7 @@ async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn sse_streamed_text_concatenates_and_reports_usage() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -495,6 +499,7 @@ impl Respond for RoundTripResponder {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn tool_use_round_trip_replays_blocks_verbatim() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -567,6 +572,7 @@ impl Respond for TwoRoundToolThenTextResponder {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn missing_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -616,6 +622,7 @@ async fn missing_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn denied_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -727,6 +734,7 @@ impl Respond for ParallelResultsResponder {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn parallel_tool_results_land_in_one_user_message_in_call_order() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -786,6 +794,7 @@ impl Respond for SseToolScript {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn input_json_delta_split_mid_token_executes_with_the_full_object() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -842,6 +851,7 @@ async fn input_json_delta_split_mid_token_executes_with_the_full_object() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn zero_argument_tool_use_executes_with_an_empty_object() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -931,6 +941,7 @@ impl Respond for ToolsUntilCap {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn tool_round_cap_summary_request_has_no_tools_key() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -988,6 +999,7 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn final_summary_provider_contracts() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let _retry_limit = EnvGuard::set("NEWT_HTTP_MAX_RETRIES", "1");
     for provider in ["ollama", "openai", "anthropic"] {
@@ -1154,6 +1166,7 @@ impl Respond for SystemShapeResponder {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn multiple_system_messages_coalesce_into_top_level_system() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1223,6 +1236,7 @@ impl Respond for AlternationResponder {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn narration_nudge_redispatch_keeps_strict_alternation() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1282,6 +1296,7 @@ impl Respond for OverloadedOnce {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn overloaded_529_is_retried_then_succeeds() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1310,6 +1325,7 @@ async fn overloaded_529_is_retried_then_succeeds() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn invalid_request_400_is_fatal_and_surfaces_the_message() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1343,6 +1359,7 @@ async fn invalid_request_400_is_fatal_and_surfaces_the_message() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn refusal_with_empty_content_returns_the_honest_placeholder() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1372,6 +1389,7 @@ async fn refusal_with_empty_content_returns_the_honest_placeholder() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn max_tokens_stop_returns_the_truncated_text() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1426,6 +1444,7 @@ impl Respond for UsageAcrossRounds {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn usage_across_rounds_takes_max_input_and_sums_output() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1510,6 +1529,7 @@ async fn assert_anthropic_attempts_equal_wire_requests(
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn every_non_streaming_anthropic_round_is_one_ledger_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1546,6 +1566,7 @@ async fn every_non_streaming_anthropic_round_is_one_ledger_attempt() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn a_streamed_anthropic_round_is_one_ledger_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1581,6 +1602,7 @@ async fn a_streamed_anthropic_round_is_one_ledger_attempt() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn a_retried_anthropic_round_is_one_ledger_attempt_per_try() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1611,6 +1633,7 @@ async fn a_retried_anthropic_round_is_one_ledger_attempt_per_try() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1677,6 +1700,7 @@ impl Respond for PauseThenAnswer {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn a_paused_turn_keeps_the_paused_replys_usage() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1749,6 +1773,7 @@ async fn streamed_anthropic_turn(
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn a_cut_anthropic_stream_is_a_failed_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let mut frames = anthropic_stream_head(6);
     frames.push(
@@ -1782,6 +1807,7 @@ impl Respond for StreamErrorThenAnswer {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_error_event_before_text_is_a_failed_attempt_then_a_retry() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let records = streamed_anthropic_turn(
         StreamErrorThenAnswer {
@@ -1801,6 +1827,7 @@ async fn an_anthropic_error_event_before_text_is_a_failed_attempt_then_a_retry()
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_error_event_after_partial_text_is_a_failed_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let mut frames = anthropic_stream_head(6);
     frames.push(
@@ -1819,6 +1846,7 @@ async fn an_anthropic_error_event_after_partial_text_is_a_failed_attempt() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_error_event_after_message_delta_keeps_the_complete_usage() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let mut frames = anthropic_stream_head(6);
     frames.push(
@@ -2001,6 +2029,7 @@ impl Respond for CancelWhileServing {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_stream_cancelled_mid_flight_is_never_ok() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let records = streamed_anthropic_turn(
@@ -2021,6 +2050,7 @@ async fn an_anthropic_stream_cancelled_mid_flight_is_never_ok() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn mid_stream_error_after_partial_text_keeps_the_partial_answer() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2085,6 +2115,7 @@ impl Respond for OverflowThenOk {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn context_window_400_compacts_and_retries() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2163,6 +2194,7 @@ impl Respond for ToolShapeResponder {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn advertised_tools_carry_input_schema_and_object_tool_choice() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2185,6 +2217,7 @@ async fn advertised_tools_carry_input_schema_and_object_tool_choice() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn anthropic_funnel_records_the_execution_class() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
     let _env = test_env(false);
     let _lock = env_lock().await;
@@ -2253,6 +2286,7 @@ fn oversized_task() -> String {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn a_declared_window_reserves_the_max_tokens_anthropic_sends() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     for (env_max_tokens, budget) in [(None, 24_576), (Some("12000"), 20_768)] {
         let mut env = test_env(false);
         env.push(match env_max_tokens {
@@ -2310,6 +2344,7 @@ async fn a_declared_window_reserves_the_max_tokens_anthropic_sends() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_interrupted_anthropic_send_is_a_cancelled_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     for stream in [true, false] {
         let _env = test_env(stream);
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2345,6 +2380,7 @@ async fn an_interrupted_anthropic_send_is_a_cancelled_attempt() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_no_output_reissue_storm_is_one_attempt_per_try() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(true);
     let _retries = EnvGuard::set("NEWT_HTTP_MAX_RETRIES", "2");
     let mut frames = anthropic_stream_head(6);
@@ -2404,6 +2440,7 @@ impl Respond for IdlessThenGood {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -2492,6 +2529,7 @@ impl Respond for BareThenAnswer {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn a_recovered_call_replays_as_tool_use_with_a_derived_id() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let _env = test_env(false);
     let server = MockServer::start().await;
     let bodies = Arc::new(Mutex::new(Vec::new()));

@@ -107,9 +107,11 @@ access checks bound the proposal; actual API compatibility still requires the
 confined probe.
 
 The scripts share the NUL helper's DACL preservation, exact-match no-op checks,
-readback verification and bounded mutex. NT namespace ACLs containing unexpected
-generic masks fail closed rather than borrowing the file-object mapping. All
-handles and proposed ACLs are prepared before writing. A later write failure
+readback verification and bounded mutex. NT namespace ACLs retain existing
+generic masks byte-for-byte; grant matching and readback use their exact raw
+values rather than borrowing the file-object mapping. A conflicting package
+deny still refuses preparation. All handles and proposed ACLs are prepared
+before writing. A later write failure
 can leave earlier bounded entries installed; the error reports completed DACL
 writes. No stale full-descriptor rollback is attempted. Re-running is idempotent.
 Existing broader administrator grants are preserved, not silently removed.

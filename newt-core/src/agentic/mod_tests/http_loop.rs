@@ -32,7 +32,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 /// Default-policy wire fixtures must not borrow a sibling's short progress
 /// brake. Acquire before async setup and hold across the complete scenario.
 /// Tests of explicit initiative settings keep their own guarded configuration.
-fn default_loop_settings() -> crate::test_guard::GlobalSettingsGuard {
+pub(super) fn default_loop_settings() -> crate::test_guard::GlobalSettingsGuard {
     let guard = crate::test_guard::GlobalSettingsGuard::acquire();
     crate::initiative::set_initiative_config(Default::default());
     guard

@@ -99,6 +99,9 @@ namespace Newt.WindowsHostPreparation {
         // (including SID, flags, opaque fields, and ACE order) still must match.
         // Never use this normalized copy for the write or pre-write race check.
         private static byte[] ComparisonBytes(RawAcl acl, bool fileMapping = true) {
+            // Namespace objects have a different generic mapping. Preserve and
+            // compare their raw masks; do not reinterpret existing host policy.
+            if (!fileMapping) return Bytes(acl);
             RawAcl copy = new RawAcl(Bytes(acl), 0);
             for (int i = 0; i < copy.Count; i++) {
                 KnownAce known = copy[i] as KnownAce;
@@ -108,10 +111,7 @@ namespace Newt.WindowsHostPreparation {
         }
 
         private static int ComparableMask(int mask, bool fileMapping) {
-            if (fileMapping) return NormalizeMask(mask);
-            if ((unchecked((uint)mask) & 0xF0000000) != 0)
-                throw new InvalidOperationException("Unexpected generic rights on an NT namespace ACL; refusing to guess an object-specific mapping.");
-            return mask;
+            return fileMapping ? NormalizeMask(mask) : mask;
         }
 
         // Copy every existing ACE unchanged. Do not coalesce other grants for
@@ -122,8 +122,6 @@ namespace Newt.WindowsHostPreparation {
 
         private static RawAcl Prepare(RawAcl original, int access, bool fileMapping, out bool changed) {
             if (original == null) throw new InvalidOperationException("Refusing an absent/null host object DACL; inspect host policy manually.");
-            // Check every NT ACE before making any change, including other SIDs.
-            ComparisonBytes(original, fileMapping);
             bool present = false;
             for (int i = 0; i < original.Count; i++) {
                 KnownAce known = original[i] as KnownAce;
@@ -385,11 +383,39 @@ namespace Newt.WindowsHostPreparation {
                 Require(refused, "DOS-path package deny must be retained and refused");
             }
             foreach (int access in new[] { DirectoryQueryTraverse, LinkQuery }) {
-                RawAcl unexpected = new RawSecurityDescriptor("D:(A;;GR;;;SY)").DiscretionaryAcl;
-                refused = false;
-                try { Prepare(unexpected, access, false, out changed); }
-                catch (InvalidOperationException) { refused = true; }
-                Require(refused, "NT namespace generics must fail closed, including on other SIDs");
+                RawAcl original = new RawSecurityDescriptor("D:(D;;GW;;;BU)(A;;GA;;;SY)(A;;GR;;;AC)(A;ID;GRGX;;;WD)").DiscretionaryAcl;
+                byte[] originalBytes = Bytes(original);
+                RawAcl update = Prepare(original, access, false, out changed);
+                CommonAce exact = update[3] as CommonAce;
+                Require(changed && update.Count == original.Count + 1 && exact != null &&
+                    exact.AccessMask == access && exact.AceFlags == AceFlags.None && exact.SecurityIdentifier.Equals(Packages),
+                    "namespace generic masks must not substitute for the exact added grant");
+                Require(Equal(Bytes(update), Bytes(Prepare(update, access, false, out changed))) && !changed,
+                    "namespace ACL with preserved generic masks must be idempotent");
+                Require(Equal(Bytes(update), ComparisonBytes(update, false)),
+                    "namespace readback must compare every raw byte without mapping");
+                RawAcl different = new RawAcl(Bytes(update), 0);
+                ((KnownAce)different[1]).AccessMask = 0x001F01FF;
+                Require(!Equal(ComparisonBytes(update, false), ComparisonBytes(different, false)),
+                    "namespace readback must reject even file-mapped replacements of generic masks");
+                different = new RawAcl(Bytes(update), 0);
+                GenericAce firstAce = different[0];
+                different.RemoveAce(0);
+                different.InsertAce(1, firstAce);
+                Require(!Equal(ComparisonBytes(update, false), ComparisonBytes(different, false)),
+                    "namespace readback must reject reordered ACEs");
+                update.RemoveAce(3);
+                Require(Equal(originalBytes, Bytes(update)) && Equal(originalBytes, Bytes(original)),
+                    "namespace preparation must preserve all generic ACE bytes, flags, SIDs and order");
+                foreach (string mask in new[] { "GR", "GW", "GX", "GA" }) {
+                    RawAcl denied = new RawSecurityDescriptor("D:(D;;" + mask + ";;;AC)").DiscretionaryAcl;
+                    byte[] deniedBytes = Bytes(denied);
+                    refused = false;
+                    try { Prepare(denied, access, false, out changed); }
+                    catch (InvalidOperationException) { refused = true; }
+                    Require(refused && Equal(deniedBytes, Bytes(denied)),
+                        "namespace package generic deny must remain unchanged and refuse preparation");
+                }
             }
             RawAcl genericRead = new RawSecurityDescriptor("D:(A;;GR;;;AC)").DiscretionaryAcl;
             RawAcl metadata = Prepare(genericRead, MountMetadata, true, out changed);
