@@ -900,6 +900,12 @@ mod tests {
         path
     }
 
+    /// A private workspace below `home`, so identity discovery cannot walk
+    /// past the fixture boundary into the real operator profile.
+    fn workspace_under(home: &TempDir) -> TempDir {
+        tempfile::tempdir_in(home.path()).unwrap()
+    }
+
     #[test]
     fn to_toml_string_wraps_agent_identity_table() {
         let id = AgentIdentity {
@@ -923,7 +929,7 @@ mod tests {
     #[test]
     fn save_writes_file_that_resolve_from_home_picks_up() {
         let home = TempDir::new().unwrap();
-        let elsewhere = TempDir::new().unwrap();
+        let elsewhere = workspace_under(&home);
         let path = home.path().join(".newt").join(AGENT_IDENTITY_FILENAME);
         let id = AgentIdentity {
             name: "saved-agent".into(),
@@ -966,10 +972,10 @@ mod tests {
 
     #[test]
     fn resolve_with_no_files_yields_compiled_default() {
-        // cwd is an empty temp dir, home a different empty temp dir: nothing on
-        // disk → the compiled-in GitHub User `newt-agent` default, cleanly.
-        let cwd = TempDir::new().unwrap();
+        // cwd is an empty child of an empty home: nothing on disk → the
+        // compiled-in GitHub User `newt-agent` default, cleanly.
         let home = TempDir::new().unwrap();
+        let cwd = workspace_under(&home);
         let (id, src) = AgentIdentity::resolve_from(Some(cwd.path()), Some(home.path())).unwrap();
         assert_eq!(id, AgentIdentity::default());
         assert_eq!(src, IdentitySource::Default);
@@ -988,14 +994,14 @@ email = "home@users.noreply.github.com"
         );
 
         // With only home set, home wins over the default.
-        let elsewhere = TempDir::new().unwrap();
+        let elsewhere = workspace_under(&home);
         let (id, src) =
             AgentIdentity::resolve_from(Some(elsewhere.path()), Some(home.path())).unwrap();
         assert_eq!(id.name, "home-agent[bot]");
         assert!(matches!(src, IdentitySource::Home(_)));
 
         // Now add a workspace file: workspace wins over home.
-        let ws = TempDir::new().unwrap();
+        let ws = workspace_under(&home);
         write_identity(
             ws.path(),
             r#"
@@ -1274,7 +1280,7 @@ svc = {{ file = '{}' }}
         // A workspace that ships ONLY agent-identity.toml (no config.toml)
         // still resolves via the standalone walk-up.
         let home = TempDir::new().unwrap();
-        let ws = TempDir::new().unwrap();
+        let ws = workspace_under(&home);
         write_identity(
             ws.path(),
             r#"
@@ -1305,7 +1311,7 @@ author = "operator"
     #[test]
     fn workspace_identity_cannot_set_sandbox_author_to_operator() {
         let home = TempDir::new().unwrap();
-        let ws = TempDir::new().unwrap();
+        let ws = workspace_under(&home);
         write_identity(ws.path(), OPERATOR_AUTHOR_TOML);
         let (id, src) = AgentIdentity::resolve_from(Some(ws.path()), Some(home.path())).unwrap();
         assert!(matches!(src, IdentitySource::Workspace(_)));
@@ -1319,7 +1325,7 @@ author = "operator"
     #[test]
     fn operator_config_may_set_sandbox_author_to_operator() {
         let home = TempDir::new().unwrap();
-        let elsewhere = TempDir::new().unwrap();
+        let elsewhere = workspace_under(&home);
         write_identity(home.path(), OPERATOR_AUTHOR_TOML);
         let (id, src) =
             AgentIdentity::resolve_from(Some(elsewhere.path()), Some(home.path())).unwrap();
@@ -1345,7 +1351,7 @@ author = "operator"
     #[test]
     fn workspace_identity_cannot_select_a_signer_or_key() {
         let home = TempDir::new().unwrap();
-        let ws = TempDir::new().unwrap();
+        let ws = workspace_under(&home);
         let key = ws.path().join("repo-key.pem");
         crate::commit_signing::generate_harness_key(&key).unwrap();
         for mode in ["harness", "operator"] {
@@ -1366,7 +1372,7 @@ author = "operator"
     #[test]
     fn operator_home_identity_may_select_the_harness_signer() {
         let home = TempDir::new().unwrap();
-        let elsewhere = TempDir::new().unwrap();
+        let elsewhere = workspace_under(&home);
         let key = home.path().join("harness.pem");
         crate::commit_signing::generate_harness_key(&key).unwrap();
         write_identity(home.path(), &signing_toml("harness", &key));
