@@ -321,6 +321,7 @@ fn map_tenacity_value(item: &mut toml_edit::Item, key: &str, changes: &mut Vec<S
 pub fn read_persona_file(path: &Path) -> std::io::Result<String> {
     read_migrating(
         path,
+        path,
         "persona",
         migrate_persona_text,
         true,
@@ -358,6 +359,7 @@ pub fn read_config_file(path: &Path, rewrite: bool) -> std::io::Result<String> {
     };
     let destination = locked.as_ref().map(|(destination, _)| destination);
     read_migrating(
+        path,
         destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path),
         "config",
         migrate_config_text,
@@ -373,7 +375,14 @@ pub fn read_config_file(path: &Path, rewrite: bool) -> std::io::Result<String> {
 
 /// The shared read-then-migrate step, with the filesystem injected so the
 /// unit tier is fs-free.
+///
+/// `shown` is the path the user typed or configured; `path` is what actually
+/// gets read/written, which on the config side is `ResolvedPath::as_path` —
+/// `std::fs::canonicalize`'s output. On Windows that canonical form carries
+/// the `\\?\` extended-length prefix, so printing it in a migration notice
+/// instead of the operator's own path is confusing, not more precise.
 fn read_migrating(
+    shown: &Path,
     path: &Path,
     kind: &str,
     migrate: fn(&str) -> Option<Migration>,
@@ -386,7 +395,7 @@ fn read_migrating(
         return Ok(raw);
     };
     let changes = migration.changes.join(", ");
-    let shown = path.display();
+    let shown = shown.display();
     if !rewrite {
         eprintln!(
             "newt: warning: {kind} {shown} uses old psyche labels ({changes}); \
@@ -566,6 +575,7 @@ Body keeps cognition = \"contemplating\" and tenacity = \"relaxed\" as prose.
         write: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
     ) -> std::io::Result<String> {
         read_migrating(
+            path,
             path,
             "persona",
             migrate_persona_text,
@@ -782,6 +792,7 @@ kimi = \"insistent\"
     fn a_file_that_must_not_be_rewritten_migrates_in_memory_only() {
         let got = read_migrating(
             Path::new("/repo/.newt/config.toml"),
+            Path::new("/repo/.newt/config.toml"),
             "config",
             migrate_config_text,
             false,
@@ -804,6 +815,7 @@ kimi = \"insistent\"
     #[test]
     fn a_read_error_propagates_without_a_write() {
         let err = read_migrating(
+            Path::new("/missing.md"),
             Path::new("/missing.md"),
             "persona",
             migrate_persona_text,
