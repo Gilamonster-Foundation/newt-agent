@@ -213,6 +213,41 @@ fn full_access_is_top() {
 }
 
 #[test]
+fn workspace_full_access_keeps_directory_and_network_authority_separate() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let mut permissions: ToolPermissions =
+        toml::from_str("preset = 'workspace_full_access'").unwrap();
+    let confined = crate::confined_exec::workspace_confined_caveats(&workspace);
+    let baseline = permissions.to_caveats(workspace.to_str().unwrap());
+    assert_eq!(baseline, confined);
+    assert!(baseline.permits_exec("rm"));
+    assert!(baseline.permits_exec("any-program"));
+    assert!(crate::caveats::permits_path(
+        &baseline.fs_write,
+        workspace.join("new/nested/file").to_str().unwrap()
+    ));
+    assert!(!crate::caveats::permits_path(
+        &baseline.fs_write,
+        workspace.join("../outside").to_str().unwrap()
+    ));
+    permissions.net = vec!["docs.rs".into()];
+    let with_network = permissions.to_caveats(workspace.to_str().unwrap());
+    assert_eq!(with_network.fs_read, baseline.fs_read);
+    assert_eq!(with_network.fs_write, baseline.fs_write);
+    assert_eq!(with_network.exec, baseline.exec);
+    assert_eq!(
+        with_network.net,
+        crate::caveats::Scope::only(["docs.rs".into()])
+    );
+    let serialized = toml::to_string(&permissions).unwrap();
+    assert_eq!(
+        toml::from_str::<ToolPermissions>(&serialized).unwrap(),
+        permissions
+    );
+}
+
+#[test]
 fn net_allowlist_controls_the_net_axis() {
     use crate::caveats::Scope;
 
@@ -302,6 +337,10 @@ fn preset_toggle_cycles() {
     );
     assert_eq!(
         PermissionPreset::WorkspaceDev.toggle(),
+        PermissionPreset::WorkspaceFullAccess
+    );
+    assert_eq!(
+        PermissionPreset::WorkspaceFullAccess.toggle(),
         PermissionPreset::FullAccess
     );
     assert_eq!(

@@ -211,14 +211,10 @@ async fn confined_lane_refuses_tee_writing_over_a_file_it_reads() {
 /// this fix all three refused on a coincidental name match, costing the
 /// model's harmless first instinct (#2558 test 1) for no safety benefit.
 ///
-/// Calls [`same_file_redirect_refusal`] directly rather than through real
-/// dispatch: `git diff`/`cargo build` are ROUTED (read-only git → the
-/// embedded git tool; build commands → the confined build lane), a
-/// pre-existing behavior orthogonal to this guard, and driving them through
-/// `execute_tool` in a test was observed to run against the actual process
-/// cwd rather than the tempdir passed as `workspace` — a real but separate
-/// routing quirk, not something to depend on (or risk polluting the repo
-/// with) here. The guard's own decision is what this test is about.
+/// Calls [`same_file_redirect_refusal`] directly: this test covers the
+/// redirect guard's classification, independently of executing native Git
+/// or dispatching a build. The tests above prove refused calls leave the
+/// real input file unchanged through both execution lanes.
 #[test]
 fn the_guard_no_longer_false_refuses_subcommand_and_non_reading_forms() {
     for command in ["cargo build > build", "git diff > diff", "echo f > f"] {
@@ -227,4 +223,19 @@ fn the_guard_no_longer_false_refuses_subcommand_and_non_reading_forms() {
             "{command:?} must not be refused by the redirect guard"
         );
     }
+}
+
+#[test]
+fn descriptor_duplication_does_not_become_an_empty_file_path() {
+    for command in [
+        "git rev-parse --show-toplevel 2>&1; echo '==='; git -C . rev-parse --show-toplevel 2>&1",
+        "git -C . status 2>&1",
+        "cat '' > ''",
+    ] {
+        assert!(
+            same_file_redirect_refusal(command, "/workspace").is_none(),
+            "an empty token cannot identify a file being truncated: {command:?}"
+        );
+    }
+    assert!(same_file_redirect_refusal("cat ./f > f 2>&1", "/workspace").is_some());
 }

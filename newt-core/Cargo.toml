@@ -23,7 +23,13 @@ description = "Newt-Agent core types, errors, and the NeMoCode-style tier router
 keywords = ["newt", "agent", "router", "llm", "nemo"]
 categories = ["api-bindings", "text-processing"]
 
+[[test]]
+name = "brush_build_pipeline"
+path = "tests/brush_build_pipeline.rs"
+harness = false
+
 [dependencies]
+agent-toolchain = { workspace = true, features = ["embedded-git"] }
 agent-harness.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -34,6 +40,7 @@ newtui.workspace = true
 # OCAP disclosure filter (ocap.rs): catch a known secret value in its common
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true
+sha2.workspace = true
 # Encrypted token store (`newt_core::secrets`) — see the workspace-level
 # justification comment on this dependency.
 age.workspace = true
@@ -104,7 +111,10 @@ tokio.workspace = true
 # spawned children (before it a confined child's whole environment was
 # PWD/SHLVL/_, so a build could not find `cc`, and the seam — HOME, TMPDIR, the
 # passthrough list — never arrived). No `[patch]`: this is the published crate.
-agent-bridle = { version = "0.7.17", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
+agent-bridle = { version = "0.8.0-rc.5", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
+agent-bridle-tool-shell = { version = "0.8.0-rc.5", features = ["brush"] }
+agent-bridle-fdguard = "0.8.0-rc.5"
+tempfile = "3"
 
 # Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,
 # behind the default `markdown` feature. Stripped under --no-default-features
@@ -158,6 +168,8 @@ rusqlite.workspace = true
 pyo3 = { workspace = true, optional = true }
 
 [target."cfg(windows)".dependencies]
+# Held directory identity for managed build scratch; already used by ignore.
+same-file = "1"
 # #1030 collision fix, Windows side: `pid_is_alive`'s `OpenProcess`-based
 # process probe (store.rs) — the Windows analogue of the Unix `libc::kill(pid,
 # 0)` check above. windows-sys is the official zero-cost sys-binding crate;

@@ -336,13 +336,13 @@ async fn run_command_windows_appcontainer_denies_direct_tcp() {
     );
 }
 
-/// Windows route proof for #8 on the `run_command` shell path: current
-/// agent-bridle `ShellTool` Windows children still inherit ambient parent
-/// environment. This pins the ACTIVE shared dependency defect instead of
-/// adding a Newt-only shim around the bridle spawn path.
+/// Windows route proof for #8 on the `run_command` shell path: an agent-bridle
+/// 0.8 `ShellTool` Windows child starts without the parent's ambient
+/// environment, so a parent-only provider credential never reaches it. This
+/// closed `windows-shelltool-env-inheritance` (agent-bridle#323).
 #[cfg(all(windows, feature = "windows-appcontainer"))]
 #[tokio::test]
-async fn run_command_windows_provider_env_inheritance_is_active() {
+async fn run_command_windows_provider_env_is_not_inherited() {
     let _lock = disable_ocap_tests::env_lock().await;
     let _engine = disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let _key = EnvGuard::set("OPENAI_API_KEY", "sk-run-command-windows-secret");
@@ -384,9 +384,9 @@ async fn run_command_windows_provider_env_inheritance_is_active() {
     );
     let text = envelope["stdout"].as_str().unwrap_or_default();
     assert!(
-            text.contains("sk-run-command-windows-secret"),
-            "expected to prove the ACTIVE shared bridle Windows env-inheritance residual; stdout was {text:?}. Flip this test to denial when agent-bridle grows Windows env_clear parity."
-        );
+        text.contains("EMPTY") && !text.contains("sk-run-command-windows-secret"),
+        "a parent-only OPENAI_API_KEY must not reach the AppContainer child; stdout was {text:?}"
+    );
 }
 
 /// Windows missing-backend truth for `run_command`: with AppContainer support

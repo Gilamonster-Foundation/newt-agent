@@ -619,6 +619,165 @@ pub fn dock_ceremony(
     }
 }
 
+/// How long an unapproved host stays staged after its last uplink poll.
+pub const STAGED_HOST_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Most hosts staged at once. Staging a new host past this is refused, so
+/// distinct proposals cannot grow the store without bound.
+pub const MAX_STAGED_HOSTS: usize = 64;
+
+/// A host that uplinked to this hub without an approval (K8.5): a proposal,
+/// never an authority. It is unsigned, and nothing reads it but
+/// `newt dock approve --staged`, which turns it into a signed [`DockRecord`]
+/// only after the operator confirms its key words at this terminal (the K4
+/// stage-then-promote rule). It expires [`STAGED_HOST_TTL`] after the host's
+/// last poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedHost {
+    /// `BLAKE3(peer_pubkey)`, as the hub verified it against the poll's signer.
+    pub peer_agent_fingerprint: String,
+    /// The host's dock agent public key, hex.
+    pub peer_pubkey: String,
+    /// The host's dock instance name, as the host reported it. Unverified: the
+    /// operator confirms the key, not the name.
+    pub peer_label: String,
+    /// When the host last polled, in seconds since the Unix epoch.
+    pub last_seen_unix: u64,
+}
+
+impl content_addressable::ContentAddressable for StagedHost {
+    fn canonical_form(&self) -> Result<Vec<u8>, content_addressable::ContentError> {
+        content_addressable::canonical::to_canonical_dagcbor(self)
+    }
+}
+
+/// A staged host as stored: the proposal and its content id, so a reader can
+/// recompute the id and detect an edited proposal. The file is named for the
+/// host's fingerprint, which only locates it.
+#[derive(Debug, Serialize, Deserialize)]
+struct StagedFile {
+    id: content_addressable::ContentId,
+    host: StagedHost,
+}
+
+/// Stage (or refresh) an unapproved host that polled this hub. Only the
+/// fingerprint of `pubkey` names the file, so a host cannot write another's.
+///
+/// # Errors
+/// A label that is not a plain instance name (1–80 of `[A-Za-z0-9._-]`), or
+/// the staging file could not be written.
+pub fn stage_host(
+    config_path: &Path,
+    pubkey: &[u8; 32],
+    label: &str,
+    now: std::time::SystemTime,
+) -> anyhow::Result<()> {
+    if !is_host_label(label) {
+        anyhow::bail!("host label {label:?} is not a plain instance name");
+    }
+    let peer_agent_fingerprint = agent_fingerprint_of_pubkey(pubkey);
+    let staged = StagedHost {
+        peer_pubkey: pubkey.iter().map(|b| format!("{b:02x}")).collect(),
+        peer_label: label.to_owned(),
+        last_seen_unix: unix_secs(now),
+        peer_agent_fingerprint,
+    };
+    let dir = staged_dir(config_path);
+    std::fs::create_dir_all(&dir)?;
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    let live = read_staged(&dir, now, true);
+    let known = live
+        .iter()
+        .any(|held| held.peer_agent_fingerprint == staged.peer_agent_fingerprint);
+    if !known && live.len() >= MAX_STAGED_HOSTS {
+        anyhow::bail!("{MAX_STAGED_HOSTS} hosts are already staged; approve or wait them out");
+    }
+    use content_addressable::ContentAddressable as _;
+    let file = StagedFile {
+        id: staged.content_id()?,
+        host: staged,
+    };
+    let path = dir.join(format!("{}.toml", file.host.peer_agent_fingerprint));
+    crate::atomic_fs::atomic_write(&path, toml::to_string(&file)?.as_bytes())?;
+    Ok(())
+}
+
+/// The hosts staged and live at `now`, by label: observed no later than `now`
+/// and less than [`STAGED_HOST_TTL`] before it. A file that does not parse,
+/// whose content id does not match its proposal, that is not named for its own
+/// key's fingerprint, or whose label [`stage_host`] would refuse is skipped.
+#[must_use]
+pub fn staged_hosts(config_path: &Path, now: std::time::SystemTime) -> Vec<StagedHost> {
+    read_staged(&staged_dir(config_path), now, false)
+}
+
+/// Read the live staged hosts in `dir`; with `reap`, delete every other file
+/// there (expired, from the future, or failing verification).
+fn read_staged(dir: &Path, now: std::time::SystemTime, reap: bool) -> Vec<StagedHost> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let now = unix_secs(now);
+    let oldest = now.saturating_sub(STAGED_HOST_TTL.as_secs());
+    let mut hosts: Vec<StagedHost> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "toml" {
+                return None;
+            }
+            let host = verified_staged(&path)
+                .filter(|host| host.last_seen_unix > oldest && host.last_seen_unix <= now);
+            if host.is_none() && reap {
+                let _ = std::fs::remove_file(&path);
+            }
+            host
+        })
+        .collect();
+    hosts.sort_by(|a, b| a.peer_label.cmp(&b.peer_label));
+    hosts
+}
+
+fn verified_staged(path: &Path) -> Option<StagedHost> {
+    use content_addressable::ContentAddressable as _;
+    let file: StagedFile = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let host = file.host;
+    let addressed = host.content_id().ok()? == file.id;
+    let named_for_key = path.file_stem()?.to_str()? == host.peer_agent_fingerprint;
+    (addressed
+        && named_for_key
+        && fingerprint_binds_pubkey(&host.peer_agent_fingerprint, &host.peer_pubkey)
+        && is_host_label(&host.peer_label))
+    .then_some(host)
+}
+
+/// Forget a staged host, once it is approved. Already gone is not an error.
+///
+/// # Errors
+/// The staging file exists but could not be removed.
+pub fn unstage_host(config_path: &Path, peer_agent_fingerprint: &str) -> anyhow::Result<()> {
+    let path = staged_dir(config_path).join(format!("{peer_agent_fingerprint}.toml"));
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn is_host_label(label: &str) -> bool {
+    (1..=80).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn unix_secs(at: std::time::SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn staged_dir(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("ocap").join("docks.staged")
+}
+
 fn docks_dir(config_path: &Path) -> PathBuf {
     config_path.with_file_name("ocap").join("docks.d")
 }
@@ -1299,5 +1458,112 @@ mod tests {
             reg_c_with_key.approved(&fp(0)).is_some(),
             "with the co-located operator root key the bearer grant resolves"
         );
+    }
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_staged_host_is_listed_until_it_expires_and_gone_once_unstaged() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let pubkey = [7u8; 32];
+        stage_host(&config, &pubkey, "nuc1", at(1_000)).unwrap();
+
+        let staged = staged_hosts(&config, at(1_000));
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].peer_label, "nuc1");
+        assert_eq!(
+            staged[0].peer_agent_fingerprint,
+            agent_fingerprint_of_pubkey(&pubkey)
+        );
+        assert_eq!(decode_agent_pubkey(&staged[0].peer_pubkey), Some(pubkey));
+
+        let ttl = STAGED_HOST_TTL.as_secs();
+        assert_eq!(staged_hosts(&config, at(1_000 + ttl - 1)).len(), 1);
+        assert!(staged_hosts(&config, at(1_000 + ttl)).is_empty(), "expired");
+
+        stage_host(&config, &pubkey, "nuc1", at(1_000 + ttl)).unwrap();
+        assert_eq!(staged_hosts(&config, at(1_000 + ttl)).len(), 1, "refreshed");
+
+        unstage_host(&config, &staged[0].peer_agent_fingerprint).unwrap();
+        assert!(staged_hosts(&config, at(1_000 + ttl)).is_empty());
+        unstage_host(&config, &staged[0].peer_agent_fingerprint).unwrap();
+    }
+
+    #[test]
+    fn a_label_that_is_not_an_instance_name_is_not_staged() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        for label in ["", "nuc 1", "nuc\n1", "../x", &"a".repeat(81)] {
+            assert!(
+                stage_host(&config, &[7u8; 32], label, at(1)).is_err(),
+                "{label:?}"
+            );
+        }
+        assert!(staged_hosts(&config, at(1)).is_empty());
+    }
+
+    #[test]
+    fn a_staged_file_not_named_for_its_own_key_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        stage_host(&config, &[7u8; 32], "nuc1", at(1)).unwrap();
+        let staged_dir = staged_dir(&config);
+        let genuine = staged_dir.join(format!("{}.toml", agent_fingerprint_of_pubkey(&[7u8; 32])));
+        let other = agent_fingerprint_of_pubkey(&[8u8; 32]);
+        std::fs::rename(genuine, staged_dir.join(format!("{other}.toml"))).unwrap();
+        assert!(staged_hosts(&config, at(1)).is_empty());
+    }
+
+    #[test]
+    fn an_edited_proposal_no_longer_matches_its_content_id() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        stage_host(&config, &[7u8; 32], "nuc1", at(1)).unwrap();
+        let path =
+            staged_dir(&config).join(format!("{}.toml", agent_fingerprint_of_pubkey(&[7u8; 32])));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"nuc1\""), "{text}");
+        std::fs::write(&path, text.replace("\"nuc1\"", "\"nuc9\"")).unwrap();
+        assert!(
+            staged_hosts(&config, at(1)).is_empty(),
+            "an edited label is not trusted"
+        );
+    }
+
+    #[test]
+    fn a_proposal_observed_in_the_future_is_not_live() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        stage_host(&config, &[7u8; 32], "nuc1", at(1_000)).unwrap();
+        assert!(staged_hosts(&config, at(999)).is_empty());
+        assert_eq!(staged_hosts(&config, at(1_000)).len(), 1);
+    }
+
+    #[test]
+    fn staging_reaps_dead_entries_and_caps_the_store() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let key = |i: usize| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            k
+        };
+        for i in 0..MAX_STAGED_HOSTS {
+            stage_host(&config, &key(i), &format!("h{i}"), at(1)).unwrap();
+        }
+        assert!(
+            stage_host(&config, &key(MAX_STAGED_HOSTS), "late", at(1)).is_err(),
+            "a new host past the cap is refused"
+        );
+        stage_host(&config, &key(0), "h0", at(1)).unwrap();
+
+        let files = || std::fs::read_dir(staged_dir(&config)).unwrap().count();
+        assert_eq!(files(), MAX_STAGED_HOSTS);
+        let later = at(1 + STAGED_HOST_TTL.as_secs());
+        stage_host(&config, &key(MAX_STAGED_HOSTS), "late", later).unwrap();
+        assert_eq!(files(), 1, "expired entries are reaped when staging");
     }
 }

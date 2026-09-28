@@ -1,8 +1,6 @@
 use super::*;
 
-/// #898/#1022: `run_command_redirect` bounces embedded-tool-served LOCAL git
-/// ops (and other direct tools), but lets git passthrough ops fall through
-/// to the shell — otherwise a model can never `git push` or `git rm`.
+/// Working directories are resolved before the confined command executes.
 #[test]
 fn resolve_exec_cwd_confines_to_workspace() {
     // #1159: relative cwd joins under the workspace; absolute passes through
@@ -96,8 +94,8 @@ fn run_command_redirect_lets_git_network_ops_through() {
     ] {
         assert_eq!(
             run_command_redirect(cmd),
-            Some("git"),
-            "{cmd} must redirect"
+            None,
+            "{cmd} must retain native command semantics"
         );
     }
     // Other direct tools still redirect; plain shell commands run as-is.
@@ -131,27 +129,21 @@ fn run_command_redirect_passes_composed_commands_through() {
     // Bare servable forms still redirect (the true positives hold).
     assert_eq!(run_command_redirect("find . -name \"*.rs\""), Some("find"));
     assert_eq!(run_command_redirect("list_dir src"), Some("list_dir"));
-    assert_eq!(run_command_redirect("git status"), Some("git"));
+    assert_eq!(run_command_redirect("git status"), None);
 }
 
-/// Item 2 of the routing-honesty job (#2485-recon): a `git` subcommand that
-/// `run_command_redirect` bounces but the router did NOT silently route (an
-/// unimplemented op, or a supported op with an unhonored operand) must get an
-/// honest refusal — naming the ops the embedded tool actually supports —
-/// instead of the old dead-end "'git' is a tool, not a shell command" with no
-/// hint of what to do about it.
+/// The old refusal forced a smaller Git dialect on the model. The native
+/// command keeps revisions, output flags, and pathspecs unchanged.
 #[test]
-fn git_run_command_refusal_names_the_supported_ops() {
-    let msg = git_run_command_refusal("git log A..B");
-    assert!(msg.contains("git log A..B"), "{msg}");
-    assert!(msg.contains("status"), "{msg}");
-    assert!(msg.contains("log"), "{msg}");
-    assert!(msg.contains("diff"), "{msg}");
-    // Not the old dead-end text with no supported-ops list.
-    assert!(
-        !msg.contains("do not pass 'git' as a command argument"),
-        "{msg}"
-    );
+fn git_commands_are_never_redirected_to_a_special_tool() {
+    for command in [
+        "git log A..B",
+        "git diff --stat -- src",
+        "git show HEAD",
+        "git status --porcelain=v1",
+    ] {
+        assert_eq!(run_command_redirect(command), None, "{command}");
+    }
 }
 
 /// #1709 family: a COMPOSED `run_command` that creates a git commit bypasses
@@ -323,15 +315,12 @@ fn run_command_creates_shell_git_commit_blocks_model_forged_attribution() {
     ));
 }
 
-/// #1709 family: a bare `git commit` is already caught by
-/// `run_command_redirect` (the existing bounce to the `git` tool); the new
-/// guard is the composed-shell fallback, not a duplicate of the bare case.
+/// Attribution integration remains a migration prerequisite for native
+/// commits. The guard, not an embedded-tool redirect, owns this restriction.
 #[test]
-fn bare_git_commit_is_caught_by_redirect_not_the_shell_guard() {
-    assert_eq!(run_command_redirect("git commit"), Some("git"));
-    assert_eq!(run_command_redirect("git commit --amend -m x"), Some("git"));
-    // The shell guard also reports it (defense in depth), but the redirect
-    // fires first in the run_command arm.
+fn bare_git_commit_uses_the_attribution_guard_without_a_redirect() {
+    assert_eq!(run_command_redirect("git commit"), None);
+    assert_eq!(run_command_redirect("git commit --amend -m x"), None);
     assert!(run_command_creates_shell_git_commit("git commit"));
 }
 
@@ -358,7 +347,7 @@ fn pipeline_is_never_counted_as_a_hallucination() {
 }
 
 /// #898 regression: a real `git push` at run_command must NOT be counted as
-/// a hallucination (it now runs), while a local `git status` still is.
+/// a hallucination. Local Git commands are equally ordinary shell invocations.
 #[test]
 fn is_hallucination_allows_git_network_ops() {
     assert!(!is_hallucination(
@@ -373,7 +362,7 @@ fn is_hallucination_allows_git_network_ops() {
         "run_command",
         &serde_json::json!({"command": "git rm src/cockpit.rs"})
     ));
-    assert!(is_hallucination(
+    assert!(!is_hallucination(
         "run_command",
         &serde_json::json!({"command": "git status"})
     ));

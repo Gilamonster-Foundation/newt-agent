@@ -327,6 +327,9 @@ fn doctor_connects_lists_and_skips_mcp_servers() {
     // `newt mcp` itself is the stdio server under test — doctor must connect,
     // initialize, and list its tools end-to-end. A broken stdio entry must
     // surface as ERROR; an http entry must be reported as skipped.
+    // This controlled transport fixture explicitly grants authority; it does
+    // not assert confinement. The restricted-spawn test below pins macOS's
+    // fail-closed default separately, including its diagnostic cause.
     let newt_bin = assert_cmd::cargo::cargo_bin("newt");
     let config = write_config(&format!(
         r#"
@@ -337,6 +340,9 @@ model = "m"
 tiers = ["FAST"]
 
 default_tier_order = ["FAST"]
+
+[tui.permissions]
+preset = "full_access"
 
 [[mcp_servers]]
 name = "self"
@@ -367,4 +373,37 @@ url = "http://127.0.0.1:1/mcp"
         .stdout(predicate::str::contains(
             "remote [http] — http://127.0.0.1:1/mcp (skipped: only stdio is supported in this build)",
         ));
+}
+
+/// Grounds doctor's error rendering in a real confined spawn: current macOS
+/// backends cannot establish the default restricted network grant, so admission
+/// must refuse and the diagnostic must expose the cause, not just spawn context.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_reports_the_cause_of_a_confined_mcp_spawn_failure() {
+    let newt_bin = assert_cmd::cargo::cargo_bin("newt");
+    let config = write_config(&format!(
+        r#"
+[[backends]]
+name = "x"
+endpoint = "http://127.0.0.1:1"
+model = "m"
+tiers = ["FAST"]
+
+[[mcp_servers]]
+name = "restricted"
+command = '{newt}'
+args = ["mcp"]
+"#,
+        newt = newt_bin.display(),
+    ));
+    let home = tempfile::tempdir().unwrap();
+
+    doctor(&config, &home)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("restricted [stdio] — ERROR:"))
+        .stdout(predicate::str::contains("refusing to spawn:"))
+        .stdout(predicate::str::contains("L3 BOUND"))
+        .stdout(predicate::str::contains("restricted [stdio] — OK").not());
 }

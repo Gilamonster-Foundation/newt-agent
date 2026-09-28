@@ -10,10 +10,42 @@ use std::path::Path;
 use crate::caveats::Scope;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum TextSnapshot {
+pub(in crate::agentic) enum TextSnapshot {
     Absent,
     Present(String),
     Unavailable(&'static str),
+}
+
+/// True only when `path` is an absent leaf below an existing directory.
+///
+/// Windows reports both an absent leaf and an attempt to traverse through a
+/// regular-file parent as `NotFound` (`ERROR_PATH_NOT_FOUND`). The latter is
+/// not evidence that the requested file was absent: receipt capture must stay
+/// unavailable so a failed mutation cannot acquire an invented empty state.
+/// A dangling final symlink is likewise unavailable, because
+/// `symlink_metadata` observes the link rather than an absent leaf.
+fn is_absent_leaf(path: &Path) -> bool {
+    if !matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    ) {
+        return false;
+    }
+    matches!(
+        path.parent().and_then(|parent| std::fs::symlink_metadata(parent).ok()),
+        Some(metadata) if metadata.is_dir()
+    )
+}
+
+/// Whether a `Scope::Only` grant names this exact path after the same lexical
+/// normalization used by the tool gate.
+#[cfg(windows)]
+fn exact_scope_root(scope: &Scope<String>, path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    let normalized_path = crate::caveats::lexically_normalize(&path);
+    matches!(scope, Scope::Only(roots) if roots.iter().any(|root| {
+        crate::caveats::lexically_normalize(root) == normalized_path
+    }))
 }
 
 fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Result<File> {
@@ -46,6 +78,17 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
             if !roots.iter().any(|root| {
                 super::artifact_path_is_physically_within_workspace(Path::new(root), path)
             }) {
+                // A deleted exact-file grant cannot be canonicalized, but no
+                // reopen is necessary to attest its absent postimage. Keep
+                // this exception limited to Windows, nofollow observations,
+                // an exact lexical grant, and a verified missing leaf.
+                #[cfg(windows)]
+                if nofollow && exact_scope_root(scope, path) && is_absent_leaf(path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "exact granted leaf is absent",
+                    ));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "physical path is outside the read scope",
@@ -56,13 +99,15 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
     }
 }
 
-pub(super) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
+pub(in crate::agentic) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
     if !super::tui_permits_path(scope, &path.to_string_lossy()) {
         return TextSnapshot::Unavailable("fs_read was not granted");
     }
     let mut file = match open_for_scope(scope, path, true) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return TextSnapshot::Absent,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && is_absent_leaf(path) => {
+            return TextSnapshot::Absent;
+        }
         Err(_) => {
             return TextSnapshot::Unavailable(
                 "the file could not be read as an authorized regular file",
@@ -108,7 +153,7 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
     use TextSnapshot::{Absent, Present, Unavailable};
     let (old, new) = match (before, after) {
         (Unavailable(reason), _) | (_, Unavailable(reason)) => {
-            return Receipt::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
+            return Receipt::unavailable(reason);
         }
         (Absent, Absent) => {
             return Receipt::plain("\n\nNo file was present before or after the operation.".into())
@@ -140,7 +185,7 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
                 captured,
             }
         }
-        Err(error) => Receipt::plain(format!("\n\nfile-change receipt unavailable: {error}")),
+        Err(error) => Receipt::unavailable(error),
     }
 }
 
@@ -153,12 +198,20 @@ struct CapturedChange {
 
 pub(super) struct Receipt {
     text: String,
-    /// The model-facing first line of `text` (`\n\nModified (+1 -1)`).
+    /// The model-facing summary used only after a successful operation.
     headline: String,
     captured: Option<CapturedChange>,
 }
 
 impl Receipt {
+    fn unavailable(reason: impl std::fmt::Display) -> Self {
+        let mut receipt = Self::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
+        // Failed operations use `text`; only `present_success` uses this summary.
+        receipt.headline =
+            "\n\nFile operation succeeded; optional change preview unavailable".into();
+        receipt
+    }
+
     fn plain(text: String) -> Self {
         Self {
             headline: text.clone(),
@@ -313,7 +366,7 @@ pub(super) fn failure(output: String, receipt: &str) -> String {
 }
 
 pub(super) fn absent(scope: &Scope<String>, path: &Path) -> bool {
-    matches!(open_for_scope(scope, path, true), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    matches!(open_for_scope(scope, path, true), Err(error) if error.kind() == io::ErrorKind::NotFound && is_absent_leaf(path))
 }
 
 /// Preserve final-link mutation policy, but refuse actual FIFO/device targets

@@ -36,11 +36,13 @@ pub use output_budget::{
     set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens,
 };
 
+mod build_shell;
 mod catalog;
 mod dependency_fetch;
 mod dispatch;
-mod file_capture;
+pub(super) mod file_capture;
 mod file_change;
+mod navigation;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
@@ -49,6 +51,7 @@ pub use dispatch::{
 pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
 mod live_output;
+mod native_git;
 mod output_budget;
 mod shell;
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
@@ -85,8 +88,8 @@ pub(crate) use catalog::{
     known_builtin_tool_name, merged_tool_definitions, resolve_tool_alias, AliasOutcome,
 };
 use catalog::{
-    disposition_tool_denied_message, git_run_command_refusal, is_mcp_tool_name,
-    run_command_creates_shell_git_commit, run_command_redirect, unknown_tool_message,
+    disposition_tool_denied_message, is_mcp_tool_name, run_command_creates_shell_git_commit,
+    run_command_redirect, unknown_tool_message,
 };
 pub use catalog::{
     filter_advertised_tools, filter_tools_for_disposition, persona_tool_allowed, tool_allowed,
@@ -940,15 +943,19 @@ fn mutation_confirm_definition(question: &str) -> newt_interaction::InteractionD
 /// hostile repo controls the shell string. It is therefore attacker-influenced
 /// execution and runs **confined** through [`ConstrainedExecutor`] (P4): the
 /// child starts env-empty with explicit toolchain/support variables only. Its
-/// writes stay within the workspace and its network is denied by the calibrated
-/// [`crate::confined_exec::build_tool_caveats`] fence. Where that fence cannot be established
+/// writes stay within the workspace and its network uses only the caller's
+/// existing operator grant, with deny-all as the default. Where that fence cannot be established
 /// the spawn is **refused** rather than run unconfined (#10). It is no longer a
 /// raw `sh -c` on the host.
-pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
+pub(crate) fn run_build_check(
+    cmd: &str,
+    workspace: &str,
+    network: &crate::Scope<String>,
+) -> String {
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
     let (program, args) = build_check_argv(cmd);
     let workspace = std::path::Path::new(workspace);
-    let req = build_tool_request(workspace, workspace, program, args);
+    let req = build_tool_request(workspace, workspace, program, args, network);
 
     match ConstrainedExecutor::run(&req) {
         Ok(out) if out.success => "  ✓ build check passed".to_string(),
@@ -989,7 +996,7 @@ fn lifecycle_run_result(
             result.0.push_str(&format!(
                 "\nThis was lifecycle action=run. For compiler/test validation, action=build \
                  requests explicit approval for toolchain/cache reads and workspace writes, \
-                 with network denied. Existing permission requirements and denials remain binding; \
+                 with network denied unless covered by an existing operator grant. Existing permission requirements and denials remain binding; \
                  do not retry a declined grant.\nSuggested lifecycle call: {suggestion}"
             ));
         }
@@ -1025,7 +1032,7 @@ fn escalated_after_timeout(
 ) -> (String, crate::ExecOutcome) {
     result.0 = format!(
         "This was lifecycle action=run; it hit the {}s wall, so it was re-run once in the \
-         action=build lane (same permission-gate re-check, network denied).\n{}",
+         action=build lane (same permission-gate re-check, existing network grants only).\n{}",
         wall.as_secs(),
         result.0
     );
@@ -1140,6 +1147,7 @@ async fn lifecycle_run_with_escalation(
     let first = exec_confined_command(
         joined,
         effective_dir,
+        workspace,
         color,
         tool_output_lines,
         caveats,
@@ -1236,11 +1244,20 @@ fn lifecycle_build_request(
     let escalation = escalation_note
         .map(|note| format!("\nThis is an escalation: {note}."))
         .unwrap_or_default();
+    let network = build_network_description(&build.net);
     PermissionRequest {
         tool: "lifecycle".into(),
         kind: DenialKind::Build,
         target: workspace.into(),
-        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites and scratch within the workspace; network denied. Compiler, build-script and test subprocesses inherit the same kernel fence.{escalation}"),
+        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites within the workspace and its build scratch directory; {network}. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
+    }
+}
+
+fn build_network_description(network: &crate::Scope<String>) -> &'static str {
+    match network {
+        crate::Scope::All => "network allowed by the existing operator grant",
+        crate::Scope::Only(hosts) if hosts.is_empty() => "network denied",
+        crate::Scope::Only(_) => "network limited to the existing operator grant",
     }
 }
 
@@ -1366,7 +1383,7 @@ async fn run_confined_build_lane(
             )
         }
     };
-    let request = build_tool_request(&root, &cwd, program, argv).timeout(wall);
+    let request = build_tool_request(&root, &cwd, program, argv, &caveats.net).timeout(wall);
     let build = request.caveats();
     if let Some(harness) = smart_harness {
         if let Err(error) = harness.validate_tool_authority(build, &root) {
@@ -1417,19 +1434,9 @@ async fn run_confined_build_lane(
             // only the rendered stdout/stderr text is cut, never inside a
             // shell pipe that could mask it (the exact hazard this route
             // exists to avoid).
-            let (stdout, stderr) = match trim {
-                Some(trim) => (
-                    trim.apply(
-                        &String::from_utf8_lossy(&out.stdout),
-                        &String::from_utf8_lossy(&out.stderr),
-                    ),
-                    String::new(),
-                ),
-                None => (
-                    String::from_utf8_lossy(&out.stdout).into_owned(),
-                    String::from_utf8_lossy(&out.stderr).into_owned(),
-                ),
-            };
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let view = trim.map(|trim| trim.apply(&stdout, &stderr));
             let envelope = serde_json::json!({
                 "exit_code": out.code,
                 "stdout": stdout,
@@ -1437,8 +1444,9 @@ async fn run_confined_build_lane(
                 "timed_out": out.timed_out,
             });
             (
-                shell::shell_envelope_output(
+                shell::shell_envelope_output_with_view(
                     &envelope,
+                    view.as_deref(),
                     tool_output_lines,
                     color,
                     tool_offload,
@@ -1510,6 +1518,51 @@ fn denial_recovery_hint(capability: &str, target: &str) -> String {
          reason=\"<why you need it>\"), or take a different approach that stays \
          within your current authority."
     )
+}
+
+/// Facts held by the caller at the refusal boundary. A workspace is a default
+/// directory, not an authority claim. Scope details come from the caller's
+/// already-held snapshot, which need not include command-specific setup roots.
+/// Formatting must not refresh or mint a grant.
+fn denial_context(
+    workspace: &str,
+    requested_cwd: Option<&str>,
+    caveats: Option<&crate::caveats::Caveats>,
+) -> String {
+    fn scope(scope: &crate::caveats::Scope<String>) -> String {
+        match scope {
+            crate::caveats::Scope::All => "all".into(),
+            crate::caveats::Scope::Only(roots) => {
+                const DISPLAY_ROOTS: usize = 4;
+                let shown: Vec<_> = roots.iter().take(DISPLAY_ROOTS).collect();
+                let mut text = serde_json::json!(shown).to_string();
+                let omitted = roots.len().saturating_sub(shown.len());
+                if omitted > 0 {
+                    text.push_str(&format!(" ({omitted} more roots)"));
+                }
+                text
+            }
+        }
+    }
+
+    let mut text = format!(
+        "Workspace root: {}\nDefault tool directory: workspace root",
+        serde_json::json!(workspace)
+    );
+    if let Some(cwd) = requested_cwd {
+        text.push_str(&format!(
+            "\nRequested command directory: {}",
+            serde_json::json!(cwd)
+        ));
+    }
+    if let Some(caveats) = caveats {
+        text.push_str(&format!(
+            "\nKnown filesystem grants: fs_read={}, fs_write={}",
+            scope(&caveats.fs_read),
+            scope(&caveats.fs_write)
+        ));
+    }
+    text
 }
 
 /// #479 (G4): the model-facing recovery coach when `crew`/`compose_roster` is
@@ -1758,6 +1811,7 @@ fn execute_request_permissions(
     gate: Option<&mut dyn PermissionGate>,
     _color: bool,
     _tool_output_lines: usize,
+    workspace: &str,
 ) -> String {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
@@ -1785,7 +1839,8 @@ fn execute_request_permissions(
         },
     };
 
-    let out = match gate {
+    let quoted_target = serde_json::json!(target);
+    let mut out = match gate {
         // The gate consults the operator and (for a session grant) remembers it,
         // exactly as a denial-driven prompt does. We do not re-execute anything
         // here — the model retries its original tool call, which rides the #263
@@ -1793,7 +1848,7 @@ fn execute_request_permissions(
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(_widened) => permission_granted_result(capability, target),
             PermissionDecision::Deny => format!(
-                "denied: the operator declined {capability} for '{target}'. \
+                "denied: the operator declined {capability} for {quoted_target}. \
                  Do not retry it — take a different approach."
             ),
         },
@@ -1807,14 +1862,22 @@ fn execute_request_permissions(
         // within the authority it already has; only report the blocker if the
         // target is genuinely essential and out of scope.
         None => format!(
-            "no operator available to grant {capability} for '{target}' — this session \
+            "no operator available to grant {capability} for {quoted_target} — this session \
              has no interactive permission gate (headless / eval / piped), so authority \
              cannot be widened mid-run and re-calling request_permissions will not help. \
              Proceed within the authority you already have and the tools available to you; \
-             if '{target}' is genuinely essential and outside your current scope, say so in \
+             if {quoted_target} is genuinely essential and outside your current scope, say so in \
              your final answer rather than retrying it."
         ),
     };
+    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
+        && out != permission_granted_result(capability, target)
+    {
+        out.push('\n');
+        // A declined question supplies no fresh authority snapshot. In
+        // particular, do not remint capabilities just to render diagnostics.
+        out.push_str(&denial_context(workspace, None, None));
+    }
     out
 }
 
@@ -3196,44 +3259,14 @@ async fn execute_authorized_tool(
     // into Plan caveats on the next turn; this local clamp closes the
     // enter-then-write gap before that boundary is rebuilt.
     let disposition = if plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode)
-        && disposition == PromptDisposition::Act
+        && disposition != PromptDisposition::Ask
     {
         PromptDisposition::Plan
     } else {
         disposition
     };
 
-    // Preserve the raw call for the absolute deny-list below. A narrowly
-    // understood branch-list shell reach may use the embedded read capability
-    // without advertising or granting shell execution. Do not discard cwd or
-    // unknown argument semantics during this rewrite.
     let (raw_name, raw_args) = (name, args);
-    let routed_read = if smart_harness.is_none()
-        && disposition != PromptDisposition::Act
-        && name == "run_command"
-        && !routing_disabled()
-    {
-        match super::routing::RouteTable::builtin().classify_call(
-            args,
-            std::path::Path::new(workspace),
-            &caveats.fs_read,
-        ) {
-            super::routing::RouteDecision::Route { tool: "git", args }
-                if args
-                    .get("op")
-                    .and_then(|op| op.as_str())
-                    .is_some_and(super::git_tool::is_scoped_read_op) =>
-            {
-                Some(args)
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let (name, args) = routed_read
-        .as_ref()
-        .map_or((name, args), |args| ("git", args));
 
     // Persona preferences affect discovery only. Evidence turns can request a
     // remote operation, but only a connected bridge and the human permission
@@ -3246,25 +3279,28 @@ async fn execute_authorized_tool(
     if !tool_allowed(disposition, name)
         || (evidence_turn && is_mcp_tool_name(name) && !remote_call)
         || (name == "git"
-            && disposition != PromptDisposition::Act
+            && disposition == PromptDisposition::Plan
             && !args
                 .get("op")
                 .and_then(|op| op.as_str())
                 .is_some_and(super::git_tool::is_scoped_read_op))
     {
-        return host_return(disposition_tool_denied_message(disposition, name));
+        return host_return(executed((
+            disposition_tool_denied_message(disposition, name),
+            crate::ExecOutcome::Denied,
+        )));
     }
 
-    // Keep the existing read-only boundary for built-ins. A remote call is an
-    // explicit human decision, not authority inferred from a research prompt.
-    if disposition != PromptDisposition::Act && name != "request_user_input" && !remote_call {
+    // Explicit Plan retains its no-grant boundary. Inferred response style
+    // cannot disable an operator's permission decision.
+    if disposition == PromptDisposition::Plan && name != "request_user_input" && !remote_call {
         permission_gate = None;
     }
 
     // FR-3 (#998): the absolute deny-list — a grant-independent veto checked
     // immediately after the prompt-disposition boundary, above every other
     // leash (persona, MCP, alias, routing). It refuses
-    // catastrophic exec (ssh / rm / systemctl restart …) by STRUCTURAL target,
+    // catastrophic exec (ssh / raw disk / systemctl restart …) by STRUCTURAL target,
     // so no capability, mode, or persona grant can unlock it. Runs on the RAW
     // name + args (pre-rewrite) so a shell alias or a routed command can't slip
     // past — and only the exec TARGET is matched, so the same words quoted in a
@@ -3321,25 +3357,15 @@ async fn execute_authorized_tool(
         None => name,
     };
 
-    // facade P4 (#780): hidden tool-call routing. After alias normalization, a
-    // `run_command` (or a shell alias rewritten to one) whose command is a
-    // read-only reach (`cat`/`ls`/`find` + read-only `git`) is SILENTLY
-    // rewritten to the governed built-in, so the model's instinctive shell
-    // calls go through the SAME fs / git caveat checks they would by calling
-    // the built-in directly — routing is NOT a bypass (§4.4). The route/gate
-    // split is pure DATA ([`super::routing::RouteTable`]). State-modifying git
-    // and everything else stay on the exec path (`RouteDecision::Exec`).
+    // Eligible file reads and lifecycle commands use the governed built-ins.
+    // Git commands keep their original arguments and use the confined exec
+    // path. The route/gate split is data in `routing::RouteTable`.
     //
     // `--no-route` / `NEWT_NO_ROUTE` ([`routing_disabled`]) turns this L2
     // convenience OFF — the command runs the normal exec path as-is — while the
     // L3 boundary (the confined shell below, the fs fence) STAYS. It is a switch
     // DISTINCT from `--disable-ocap` (§7-F5): the routing escape never disables
     // confinement.
-    // Item 3 of the routing-honesty job (#2485-recon): the audit line above is
-    // a `tracing::debug!` only — invisible to the model and to a transcript
-    // reader. Keep the original `run_command("git …")` text so a routed git
-    // call's own result can say what it was rewritten to, not just the log.
-    let mut routed_git_command: Option<String> = None;
     let routed: Option<(&'static str, serde_json::Value)> =
         if name == "run_command" && !routing_disabled() {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -3349,10 +3375,11 @@ async fn execute_authorized_tool(
                 &caveats.fs_read,
             );
             let decision = match decision {
-                super::routing::RouteDecision::Route {
-                    tool: "git" | "find",
-                    ..
-                } if smart_harness.is_some() => super::routing::RouteDecision::Exec,
+                super::routing::RouteDecision::Route { tool: "find", .. }
+                    if smart_harness.is_some() =>
+                {
+                    super::routing::RouteDecision::Exec
+                }
                 decision => decision,
             };
             // §4.4: log every silent rewrite (the original command + the
@@ -3361,10 +3388,6 @@ async fn execute_authorized_tool(
                 tracing::debug!(target: "newt::routing", "{line}");
             }
             match decision {
-                super::routing::RouteDecision::Route { tool: "git", args } => {
-                    routed_git_command = Some(command.to_string());
-                    Some(("git", args))
-                }
                 super::routing::RouteDecision::Route { tool, args } => Some((tool, args)),
                 super::routing::RouteDecision::Exec => None,
             }
@@ -3496,8 +3519,7 @@ async fn execute_authorized_tool(
                 files: None,
                 status: None,
             });
-            crate::navigator::execute_nav_tool(name, args, &ctx)
-                .unwrap_or_else(|| format!("unknown tool: {name}"))
+            navigation::execute(name, args, workspace, caveats, &ctx)
         }
 
         // Step 26.6a (#585): experiential record/recall — presence-gated on the
@@ -3617,7 +3639,7 @@ async fn execute_authorized_tool(
         // than blocking. Consumes the gate (mutually exclusive with the
         // run_command / fs arms that also use it — only one arm runs per call).
         "request_permissions" => {
-            execute_request_permissions(args, permission_gate, color, tool_output_lines)
+            execute_request_permissions(args, permission_gate, color, tool_output_lines, workspace)
         }
 
         // #728: the GENERIC ask-the-human tool — surfaces a free-text question to
@@ -3659,7 +3681,7 @@ async fn execute_authorized_tool(
                     note_sink.is_some(),
                     recall_source.is_some(),
                     memory_source.is_some(),
-                    git_tool.map(|_| &caveats.fs_read),
+                    None, // Native Git is the default; the legacy adapter is internal.
                     crew_runner.is_some(),
                     scratchpad_store.is_some(),
                     code_search.is_some(),
@@ -3721,20 +3743,6 @@ async fn execute_authorized_tool(
                     // sees WHY (e.g. "denied: commit" on a read-only session).
                     Err(e) => format!("error: {e}"),
                 };
-                // Item 3 (#2485-recon): a `run_command("git …")` routed here
-                // says so in its OWN result, not only in the debug log — a
-                // reader of the transcript (or the model) can otherwise not
-                // tell the tool ran a translated op instead of the literal
-                // shell command it typed.
-                //
-                // The note is APPENDED, never prepended.
-                // `tool_result_ok` classifies by PREFIX (`error:`, `capability
-                // denied:`, …) — prepending the note would shift an errored
-                // dispatch's `error:` prefix off the front of the string and
-                // make an errored routed call read as ok:true.
-                if let Some(original) = &routed_git_command {
-                    out = append_routed_note(out, format!("[routed: `{original}` → git {op} {args}]"));
-                }
                 // #1056: a LOCAL git WRITE denied by the projected authority is
                 // NOT a dead end (the trap that stranded the model between the git
                 // tool and `run_command git`). Route it through the gate like
@@ -3812,15 +3820,9 @@ async fn execute_authorized_tool(
 
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
-            // #898: git NETWORK ops (push/fetch/pull/clone) are NOT bounced — the
-            // embedded git tool can't do them, so they fall through to the shell
-            // (net-gated), letting the model push a branch and open a PR.
             if let Some(tool) = run_command_redirect(cmd)
-                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "git" | "find"))
+                .filter(|tool| smart_harness.is_none() || *tool != "find")
             {
-                if tool == "git" {
-                    return host_return(git_run_command_refusal(cmd));
-                }
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
@@ -3828,32 +3830,34 @@ async fn execute_authorized_tool(
                 ));
             }
 
-            // Attribution invariant (#1709 family): a COMPOSED shell command that
-            // creates a git commit (`git add . && git commit -m x`,
-            // `echo msg | git commit -F -`, `git -c user.email=… commit`,
-            // `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`)
-            // bypasses `LocalGitTool::finalize_commit_message` and would land an
-            // unattributed Newt commit. Routing the composed command through the
-            // embedded `git` tool is impossible (it cannot serve `&&`/pipes/
-            // redirects), and reusing the finalizer would require parsing an
-            // arbitrary shell command's commit message — fragile and out of
-            // scope. So FAIL PREDICTABLY: refuse the commit and direct the model
-            // to the first-class `git` tool, which stamps attribution itself.
-            // Read-only git (status/log/diff) and network ops (push/fetch/…)
-            // are unaffected; this never reaches the confined shell.
-            if run_command_creates_shell_git_commit(cmd) {
-                return host_return("error: refusing to create a git commit via the shell — that \
-                     bypasses harness-managed commit attribution (the `git` tool \
-                     stamps the Co-authored-by trailer + provenance itself; a \
-                     shell `git commit`/`merge`/`cherry-pick`/`revert`/`rebase` \
-                     would let the model forge or omit it). \
-                     Use the `git` tool with op \"commit\" (or \"amend\", \"rebase\") \
-                     for the routable forms. `git merge`/`cherry-pick`/`revert` \
-                     have no first-class Newt route — the operator must run them \
-                     directly, not via run_command. \
-                     Read-only git (status/log/diff) and `git push`/`fetch` are \
-                     unaffected; abort forms (`--abort`/`--quit`) pass through."
-                    .to_string());
+            // Native commit runs the original shell source once, with Git's
+            // expanded command bound to host-held attribution/signing policy.
+            // Other commit-producing verbs still need multi-commit lifecycle
+            // support; they keep the explicit guard below.
+            let commit_requested = native_git::needs_commit_broker(cmd);
+            let commit_broker = if commit_requested {
+                match git_tool.and_then(|tool| tool.native_commit_policy()) {
+                    Some(policy) => match crate::native_git_broker::NativeGitBroker::new(policy) {
+                        Ok(broker) => Some(broker as std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>),
+                        Err(error) => return host_return(format!("error: native Git commit broker: {error}")),
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if run_command_creates_shell_git_commit(cmd) && commit_broker.is_none() {
+                let reason = match agent_bridle::inspect_shell(cmd) {
+                    Err(error) => format!("shell inspection failed: {error}"),
+                    Ok(_) if commit_requested => "native commit attribution/signing policy is unavailable in this session".to_owned(),
+                    Ok(_) => "this commit-producing Git operation is not supported by the native broker".to_owned(),
+                };
+                return host_return(format!(
+                    "error: refusing Git commit publication for this invocation: {reason}. \
+                     Supported `git commit` commands use harness-managed attribution and signing; \
+                     other commit-producing operations (`merge`, `cherry-pick`, `revert`, `rebase`) \
+                     still require native lifecycle support. No command ran."
+                ));
             }
 
             // Route the WHOLE command through agent-bridle's confined shell
@@ -3866,19 +3870,48 @@ async fn execute_authorized_tool(
                 workspace,
                 cd_path.as_deref().or_else(|| args["cwd"].as_str()),
             );
+            if let Err(reason) = native_git::preflight(
+                cmd,
+                std::path::Path::new(&run_cwd),
+                caveats,
+                &mut permission_gate,
+                commit_broker.is_some(),
+            ) {
+                return host_return(reason);
+            }
             let filesystem_requests = match declared_filesystem_requests(args, cmd, &run_cwd) {
                 Ok(requests) => requests,
                 Err(error) => return host_return(error),
             };
+            if let Some(program) = build_shell::build_program(cmd) {
+                return executed(build_shell::execute(
+                    cmd,
+                    &program,
+                    &run_cwd,
+                    workspace,
+                    caveats,
+                    &filesystem_requests,
+                    &mut permission_gate,
+                    smart_harness,
+                    tool_output_lines,
+                    color,
+                    tool_offload,
+                    spill_store,
+                    live_tool_output.clone(),
+                    presentation,
+                    commit_broker,
+                ).await);
+            }
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
             // `objects/` for THIS dispatch only — see
             // `dispatch_caveats_for_git_shell`'s doc comment.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             executed(
-                exec_confined_command(
+                shell::exec_confined_command_with_broker(
                     cmd,
                     &run_cwd,
+                    workspace,
                     color,
                     tool_output_lines,
                     &git_shell_caveats,
@@ -3889,6 +3922,7 @@ async fn execute_authorized_tool(
                     spill_store,
                     live_tool_output.clone(),
                     presentation,
+                    commit_broker,
                 )
                 .await,
             )
@@ -4100,6 +4134,7 @@ async fn execute_authorized_tool(
                     exec_confined_command(
                         &display,
                         &ran_in,
+                        workspace,
                         color,
                         tool_output_lines,
                         caveats,
@@ -4196,15 +4231,16 @@ async fn execute_authorized_tool(
                 }
             };
             let wall_desc = format_wall(wall);
+            let network = build_network_description(&caveats.net);
             let note = match trim {
                 Some(trim) => format!(
                     "[routed `{display}` to the confined build lane — {wall_desc} limit, \
-                     network denied/offline; {}{cd_clause}{echo_clause}{timeout_clause}]",
+                     {network}; Cargo offline; {}{cd_clause}{echo_clause}{timeout_clause}]",
                     trim.note_clause()
                 ),
                 None => format!(
                     "[routed `{display}` to the confined build lane — {wall_desc} limit, \
-                     network denied/offline{cd_clause}{echo_clause}{timeout_clause}]"
+                     {network}; Cargo offline{cd_clause}{echo_clause}{timeout_clause}]"
                 ),
             };
             executed((append_routed_note(text, note), outcome))
@@ -4468,7 +4504,7 @@ async fn execute_authorized_tool(
                             }
                         };
                         let check = build_check_cmd
-                            .map(|cmd| run_build_check(cmd, workspace))
+                            .map(|cmd| run_build_check(cmd, workspace, &caveats.net))
                             .unwrap_or_default();
                         receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
@@ -4593,7 +4629,7 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, workspace))
+                        .map(|cmd| run_build_check(cmd, workspace, &caveats.net))
                         .unwrap_or_default();
                     receipt.present_success(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
@@ -4803,7 +4839,7 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, workspace))
+                        .map(|cmd| run_build_check(cmd, workspace, &caveats.net))
                         .unwrap_or_default();
                     let escape_warning = literal_newline_escape_warning(old_string, new_string)
                         .map(|w| format!("\n{w}"))
@@ -5013,10 +5049,9 @@ async fn execute_authorized_tool(
                     );
                 }
             }
-            match agent_bridle::registry()
-                .dispatch("web_fetch", fetch_args, effective_caveats)
-                .await
-            {
+            let registry = agent_bridle::registry();
+            let grant = registry.mint_grant(effective_caveats.clone());
+            match registry.dispatch("web_fetch", fetch_args, &grant).await {
                 Ok(result) =>
                     render_web_fetch_result(url, &result, &*mcp, persona_tools, disposition),
                 // A `net`-axis leash denial, or a fetch error (SSRF screen,

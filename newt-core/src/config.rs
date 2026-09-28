@@ -105,6 +105,12 @@ pub struct ScratchConfig {
     /// (`/tmp`, a PVC mount) for a read-only checkout. `NEWT_SCRATCH_DIR` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// The build lane's scratch base (#2604): an absolute dir under which each
+    /// workspace gets its build `TMPDIR`. Unset uses a private managed base
+    /// outside Git worktrees. `NEWT_BUILD_SCRATCH_DIR` wins. The Build grant
+    /// covers scratch; see [`crate::scratch::build_scratch_override`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_dir: Option<String>,
 }
 
 /// Top-level Newt-Agent configuration.
@@ -595,23 +601,19 @@ pub struct TuiConfig {
     #[serde(default = "default_time_marker_secs")]
     pub time_marker_secs: u64,
 
-    /// Maximum number of tool-call rounds the model may take within a single
-    /// turn before the agent forces a final, tools-disabled completion. Each
-    /// round is one model response that may emit tool calls; once this many
-    /// rounds have run without a tool-free answer, newt asks the model once
-    /// more with tools disabled so the user still gets a real (partial)
-    /// answer instead of a placeholder. Default: 40 (raised from 25 — a
-    /// modest safety margin alongside `workflow_grace_rounds` and the
-    /// workflow-classifier delegate hint; genuinely open-ended diagnostic work
-    /// should reach for `crew`/`team` delegation rather than depend on an
-    /// unbounded cap here).
+    /// Initial tool-call round allowance per turn. Default: 40. With nonzero
+    /// `workflow_grace_rounds`, fresh evidence or actual workspace changes
+    /// renew this allowance automatically. Explicit call/cost budgets and
+    /// cancellation still apply. Without recent progress, Newt requests one
+    /// final tools-disabled answer; set grace to zero for a hard round cap.
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
 
-    /// Additional progress-aware rounds available after `max_tool_rounds` when
-    /// an active workflow still has incomplete steps and the recent rounds show
-    /// repair progress or actionable evidence. Default: 5. Set to 0 to make the
-    /// normal round cap hard again.
+    /// Rounds granted at each progress-backed renewal of `max_tool_rounds`.
+    /// Default: 5. Each renewal requires fresh evidence since the last; repeated
+    /// reads, passing checks on unchanged work, and plan updates do not renew.
+    /// Set to 0 for a hard round cap. Applies equally to every provider and to
+    /// Smart Harness, without model-facing continuation prompts.
     #[serde(default = "default_workflow_grace_rounds")]
     pub workflow_grace_rounds: usize,
 
@@ -1734,6 +1736,10 @@ impl Config {
         // session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
         if let Some(dir) = self.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
             crate::scratch::set_scratch_dir(dir);
+        }
+        // #2604: the build lane's scratch base; `NEWT_BUILD_SCRATCH_DIR` wins.
+        if let Some(dir) = self.scratch.as_ref().and_then(|s| s.build_dir.as_deref()) {
+            crate::scratch::set_build_scratch_dir(dir);
         }
         // #1789: publish `[network] owned_suffixes` so retry policy can treat
         // operator-owned inference hosts as patiently as loopback ones.

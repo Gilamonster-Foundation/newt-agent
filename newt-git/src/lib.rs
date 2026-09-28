@@ -214,6 +214,9 @@ pub enum DiffSpec {
 /// An embedded git engine bound to one repository.
 pub struct GitEngine {
     repo: Repository,
+    /// Signs every commit, amend and rebase commit this engine writes
+    /// ([`GitEngine::write_commit`]); `None` writes them unsigned.
+    signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
 }
 
 /// Refuse a ref-move onto the repository's default branch (F32/#2537: newt may
@@ -251,28 +254,17 @@ fn refuse_if_default_branch(
     branch_ref: &str,
     ref_already_exists: bool,
 ) -> Result<(), GitError> {
+    use agent_toolchain::git_caveats::check_default_branch_move;
+    check_default_branch_move(branch_ref, ref_already_exists, None).map_err(GitError::Refused)?;
     if !ref_already_exists {
         return Ok(());
     }
-    let Some(name) = branch_ref.strip_prefix("refs/heads/") else {
-        return Ok(());
-    };
-    if name == "main" || name == "master" {
-        return Err(GitError::Refused(format!(
-            "refusing to move the default branch '{name}' (F32/#2537) — commit on a feature branch instead"
-        )));
-    }
     let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
-    if let Ok(raw) = std::fs::read_to_string(common.join("refs/remotes/origin/HEAD")) {
-        if let Some(default) = raw.trim().strip_prefix("ref: refs/remotes/origin/") {
-            if default == name {
-                return Err(GitError::Refused(format!(
-                    "refusing to move the default branch '{name}' (F32/#2537) — commit on a feature branch instead"
-                )));
-            }
-        }
-    }
-    Ok(())
+    let raw = std::fs::read_to_string(common.join("refs/remotes/origin/HEAD")).ok();
+    let default = raw
+        .as_deref()
+        .and_then(|raw| raw.trim().strip_prefix("ref: refs/remotes/origin/"));
+    check_default_branch_move(branch_ref, ref_already_exists, default).map_err(GitError::Refused)
 }
 
 /// Does this repository have NO refs anywhere — no loose ref under
@@ -318,7 +310,7 @@ impl GitEngine {
         newt_core::agentic::check_git_read_scope("open", read_scope)
             .map_err(GitError::Unsupported)?;
         let repo = Repository::discover(Some(root))?;
-        Ok(Self { repo })
+        Ok(Self { repo, signer: None })
     }
 
     fn head_oid(&self) -> Result<Option<ObjectId>, GitError> {
@@ -681,10 +673,7 @@ impl GitEngine {
             message: message.to_string(),
             raw_message: None,
         };
-        let oid = self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
+        let oid = self.write_commit(&commit)?;
         match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot commit on a detached HEAD")),
@@ -736,10 +725,7 @@ impl GitEngine {
             message: message.map(str::to_string).unwrap_or(head_commit.message),
             raw_message: None,
         };
-        let oid = self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
+        let oid = self.write_commit(&commit)?;
         match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
@@ -785,6 +771,21 @@ impl GitEngine {
         Ok(parse_commit(&self.repo.odb.read(oid)?.data)?.tree)
     }
 
+    /// Write `commit` to the object database, signed when this engine has a
+    /// signer. The one write path for `commit`, `amend` and rebase, so no
+    /// commit from them can go out unsigned once the operator asked for
+    /// signatures. A signing failure writes nothing.
+    fn write_commit(&self, commit: &CommitData) -> Result<ObjectId, GitError> {
+        let mut bytes = serialize_commit(commit);
+        if let Some(signer) = &self.signer {
+            let signature = signer
+                .sign(&bytes)
+                .map_err(|e| GitError::Refused(format!("commit signing failed: {e}")))?;
+            bytes = newt_core::commit_signing::with_signature(&bytes, &signature);
+        }
+        Ok(self.repo.odb.write(ObjectKind::Commit, &bytes)?)
+    }
+
     /// Write a single-parent commit with the agent's identity; returns its oid.
     fn write_commit_on(
         &self,
@@ -805,10 +806,7 @@ impl GitEngine {
             message: message.to_string(),
             raw_message: None,
         };
-        Ok(self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?)
+        self.write_commit(&commit)
     }
 
     /// Structured-plan rebase: replay `steps` (in order) onto `onto`, applying
@@ -1424,16 +1422,12 @@ pub struct LocalGitTool {
     /// the commit arms then leave the message unchanged.
     pub attribution: Option<newt_core::attribution::CommitAttribution>,
     /// #1709 family — the EXPLICIT commit-success signal. Incremented in the
-    /// `commit` / `amend` / `rebase` arms ONLY on a confirmed successful
-    /// `eng.*` call (the actual commit creation), never on a `HEAD` change.
-    /// The session loop drains this ([`LocalGitTool::drain_commit_success`])
-    /// after a turn and clears the contributor ledger ONLY when a real Newt
-    /// commit landed — so a `HEAD` move from an external/manual action (a
-    /// user `git reset`, a fetch advancing the branch, …) does NOT discard
-    /// pending contributors, and a commit whose `HEAD`-diff proxy was
-    /// unreliable still clears. Atomic for cross-thread visibility (the
-    /// session runs on its own thread; the drain runs on the loop thread).
-    pub commit_succeeded: std::sync::atomic::AtomicUsize,
+    /// embedded commit-producing arms on actual creation, or by the native
+    /// broker after verifying publication. The per-call session guard observes
+    /// this without draining to update attribution, including failed compound
+    /// tails and cancellation. TUI telemetry drains only after the session
+    /// turn has completed. A manual `HEAD` move is never a success signal.
+    pub commit_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// #1709 family — the per-lifecycle contributor-consumption cursor. The
     /// envelope's `contributors` snapshot is FROZEN for the turn (the field
     /// is owned, and [`GitTool::dispatch`] takes `&self`, so it cannot be
@@ -1448,7 +1442,10 @@ pub struct LocalGitTool {
     /// the end-of-turn drain. Reset to 0 by the session loop when it
     /// refreshes the envelope at the top of each iteration. Atomic for the
     /// same cross-thread reason as `commit_succeeded`.
-    pub contributors_consumed: std::sync::atomic::AtomicUsize,
+    pub contributors_consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Signs the commits this tool writes, per the operator's
+    /// `[agent-identity.git] signing` (`newt_core::commit_signing::signer_for`).
+    pub signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
 }
 
 impl LocalGitTool {
@@ -1473,30 +1470,7 @@ impl LocalGitTool {
     ///
     /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     fn finalize_commit_message(&self, message: &str) -> String {
-        match &self.attribution {
-            // Semantic B: the envelope's `contributors` snapshot (the
-            // accumulated ledger, captured at the latest refresh) is merged
-            // with the active model by `finalize_message` →
-            // `finalize_message_with`, so every contributing model is
-            // credited. An empty snapshot yields the single active-model
-            // floor (semantic A).
-            //
-            // #1709 family: the snapshot is CONSUMED at the commit boundary,
-            // not the end-of-turn boundary. `contributors_consumed` is a
-            // cursor into the frozen `contributors` Vec — render only the
-            // UNCONSUMED tail `contributors[cursor..]`. A prior successful
-            // commit in this same lifecycle advanced the cursor past the
-            // contributors it already credited, so this commit re-credits
-            // none of them (C1 → more work → C2: C2's slice is empty).
-            Some(a) => {
-                let cursor = self
-                    .contributors_consumed
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let start = cursor.min(a.contributors.len());
-                a.finalize_message_with(message, &a.contributors[start..])
-            }
-            None => message.to_string(),
-        }
+        finalize_commit_message(&self.attribution, &self.contributors_consumed, message)
     }
 
     /// Consume the contributor snapshot at the confirmed-successful commit
@@ -1512,14 +1486,98 @@ impl LocalGitTool {
 
     /// Drain the explicit commit-success counter — returns the number of
     /// Newt commits that ACTUALLY landed since the last drain, and resets it
-    /// to zero. The session loop calls this after a turn and clears the
-    /// contributor ledger ONLY when it is non-zero (a confirmed successful
-    /// commit), never merely because `HEAD` moved (the historical
-    /// stale-attribution class). See [`LocalGitTool::commit_succeeded`].
+    /// to zero for telemetry after the turn. Per-call attribution uses the
+    /// nondraining [`GitTool::confirmed_commit_count`] observer.
     #[must_use]
     pub fn drain_commit_success(&self) -> usize {
         self.commit_succeeded
             .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn finalize_commit_message(
+    attribution: &Option<newt_core::attribution::CommitAttribution>,
+    consumed: &std::sync::atomic::AtomicUsize,
+    message: &str,
+) -> String {
+    match attribution {
+        // Semantic B: the envelope's `contributors` snapshot (the
+        // accumulated ledger, captured at the latest refresh) is merged
+        // with the active model by `finalize_message` →
+        // `finalize_message_with`, so every contributing model is
+        // credited. An empty snapshot yields the single active-model
+        // floor (semantic A).
+        //
+        // #1709 family: the snapshot is CONSUMED at the commit boundary,
+        // not the end-of-turn boundary. `contributors_consumed` is a
+        // cursor into the frozen `contributors` Vec — render only the
+        // UNCONSUMED tail `contributors[cursor..]`. A prior successful
+        // commit in this same lifecycle advanced the cursor past the
+        // contributors it already credited, so this commit re-credits
+        // none of them (C1 → more work → C2: C2's slice is empty).
+        Some(a) => {
+            let cursor = consumed.load(std::sync::atomic::Ordering::Relaxed);
+            let start = cursor.min(a.contributors.len());
+            a.finalize_message_with(message, &a.contributors[start..])
+        }
+        None => message.to_string(),
+    }
+}
+
+/// An owned snapshot remains in the host supervisor while native Git runs.
+/// Shared counters retain the existing explicit-success ledger lifecycle.
+struct NativeCommitPolicy {
+    attribution: Option<newt_core::attribution::CommitAttribution>,
+    signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
+    commit_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    contributors_consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    frozen_cursor: Option<usize>,
+}
+
+impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
+    fn snapshot_for_commit(
+        &self,
+    ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
+        Some(std::sync::Arc::new(Self {
+            attribution: self.attribution.clone(),
+            signer: self.signer.clone(),
+            commit_succeeded: self.commit_succeeded.clone(),
+            contributors_consumed: self.contributors_consumed.clone(),
+            frozen_cursor: Some(
+                self.contributors_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }))
+    }
+
+    fn finalize_message(&self, message: &str) -> Result<String, String> {
+        let cursor = std::sync::atomic::AtomicUsize::new(self.frozen_cursor.unwrap_or_else(|| {
+            self.contributors_consumed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }));
+        Ok(finalize_commit_message(&self.attribution, &cursor, message))
+    }
+
+    fn signing_required(&self) -> bool {
+        self.signer.is_some()
+    }
+
+    fn sign_commit(&self, payload: &[u8]) -> Result<String, String> {
+        self.signer
+            .as_ref()
+            .ok_or("native commit signing is not configured")?
+            .sign(payload)
+    }
+
+    fn committed(&self) {
+        if let Some(attribution) = &self.attribution {
+            self.contributors_consumed.fetch_max(
+                attribution.contributors.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        self.commit_succeeded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1534,6 +1592,23 @@ impl LocalGitTool {
 // [`CommitAttribution`]: newt_core::attribution::CommitAttribution
 
 impl newt_core::agentic::GitTool for LocalGitTool {
+    fn confirmed_commit_count(&self) -> usize {
+        self.commit_succeeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn native_commit_policy(
+        &self,
+    ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
+        Some(std::sync::Arc::new(NativeCommitPolicy {
+            attribution: self.attribution.clone(),
+            signer: self.signer.clone(),
+            commit_succeeded: self.commit_succeeded.clone(),
+            contributors_consumed: self.contributors_consumed.clone(),
+            frozen_cursor: None,
+        }))
+    }
+
     fn dispatch(
         &self,
         op: &str,
@@ -1634,6 +1709,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         // ambient GIT_DIR / GIT_WORK_TREE after the filesystem scope check.
         let eng = GitEngine {
             repo: Repository::open(&git_dir, worktree.as_deref()).map_err(|e| e.to_string())?,
+            signer: self.signer.clone(),
         };
         let s = |e: GitError| e.to_string();
         match op {

@@ -434,11 +434,17 @@ async fn sequential_file_tools_show_the_immediate_change_without_an_artifact_sin
 async fn a_failed_build_check_keeps_the_verified_tool_change() {
     let ws = tempfile::TempDir::new().unwrap();
     std::fs::write(ws.path().join("state.txt"), "old\n").unwrap();
+    let caveats = Caveats {
+        // This tests the write receipt; macOS cannot admit restricted networking.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
     let (output, seen) = model_and_display(
         "write_file",
         serde_json::json!({"path": "state.txt", "content": "tool bytes\n"}),
         ws.path(),
-        &caveats_rw(ws.path()),
+        &caveats,
         ToolCollaborators {
             build_check_cmd: Some("printf 'build bytes\\n' > state.txt; exit 1"),
             ..ToolCollaborators::default()
@@ -476,7 +482,7 @@ async fn unavailable_preimages_do_not_become_added_file_receipts() {
     .await;
     assert!(output.starts_with("wrote state.txt"), "{output}");
     assert!(
-        output.contains("file-change receipt unavailable"),
+        output.contains("File operation succeeded; optional change preview unavailable"),
         "{output}"
     );
     assert!(!output.contains("private old bytes"), "{output}");
@@ -492,10 +498,141 @@ async fn unavailable_preimages_do_not_become_added_file_receipts() {
     )
     .await;
     assert!(
-        binary.contains("file-change receipt unavailable"),
+        binary.contains("File operation succeeded; optional change preview unavailable"),
         "{binary}"
     );
     assert!(!binary.contains("Added (+"), "{binary}");
+}
+
+#[tokio::test]
+async fn unavailable_receipt_preview_preserves_mutation_outcome() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let content = "x".repeat(crate::agentic::tools::file_change::MAX_VERSION_BYTES + 1);
+    let (model, display) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "large.txt", "content": content}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("large.txt")).unwrap(),
+        content
+    );
+    assert!(tool_result_ok(&model), "{model}");
+    assert!(model.starts_with("wrote large.txt"), "{model}");
+    assert!(
+        model.contains("File operation succeeded; optional change preview unavailable"),
+        "{model}"
+    );
+    assert!(!model.contains("receipt capture limit"), "{model}");
+    assert!(
+        display.contains(
+            "file-change receipt unavailable: receipt capture limit exceeded (256 KiB per version)"
+        ),
+        "{display}"
+    );
+
+    // The parent is a regular file, so the actual authorized write fails.
+    // Its unavailable receipt must not acquire success wording or hide failure.
+    std::fs::write(ws.path().join("blocked"), "keep these bytes").unwrap();
+    let (failed, display) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "blocked/child.txt", "content": "not written"}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(!tool_result_ok(&failed), "{failed}");
+    assert!(!failed.contains("File operation succeeded"), "{failed}");
+    assert!(
+        failed.contains("file-change receipt unavailable"),
+        "{failed}"
+    );
+    assert!(
+        display.contains("file-change receipt unavailable"),
+        "{display}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("blocked")).unwrap(),
+        "keep these bytes"
+    );
+}
+
+/// A precise file grant remains sufficient to verify its own deletion after
+/// the path cannot be canonicalized any more. This is a Windows-only witness:
+/// the fallback physical-containment probe must not turn a successful,
+/// authorized delete into an unverified mutation merely because its exact
+/// scope root has disappeared.
+#[cfg(windows)]
+#[tokio::test]
+async fn exact_file_grant_verifies_its_deleted_leaf() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let file = ws.path().join("state.txt");
+    std::fs::write(&file, "before\n").unwrap();
+    let granted = file.to_string_lossy().into_owned();
+    let caveats = Caveats {
+        fs_read: Scope::only([granted.clone()]),
+        fs_write: Scope::only([granted]),
+        ..Caveats::top()
+    };
+
+    let output = run_tool(
+        "delete_file",
+        serde_json::json!({"path": "state.txt"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(output.starts_with("deleted state.txt"), "{output}");
+    assert!(output.contains("Deleted (+0 -1)"), "{output}");
+    assert!(!file.exists());
+}
+
+/// Windows maps both a missing leaf and a regular-file-parent traversal to
+/// `NotFound`; only the former may prove an absent postimage. An existing
+/// directory is likewise unreadable as a regular file, not absent.
+#[cfg(windows)]
+#[test]
+fn windows_not_found_receipts_require_a_missing_leaf_below_a_directory() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let blocked = ws.path().join("blocked");
+    std::fs::write(&blocked, "regular file").unwrap();
+    let workspace_scope = Scope::only([ws.path().to_string_lossy().into_owned()]);
+    let through_regular_file = blocked.join("child.txt");
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&workspace_scope, &through_regular_file),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &workspace_scope,
+        &through_regular_file
+    ));
+
+    let through_missing_parent = ws.path().join("missing-parent/child.txt");
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&workspace_scope, &through_missing_parent),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &workspace_scope,
+        &through_missing_parent
+    ));
+
+    let directory = ws.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let exact_directory_scope = Scope::only([directory.to_string_lossy().into_owned()]);
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&exact_directory_scope, &directory),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &exact_directory_scope,
+        &directory
+    ));
 }
 
 #[cfg(unix)]
@@ -514,7 +651,7 @@ async fn deleting_a_final_symlink_does_not_report_its_target_contents_as_deleted
     .await;
     assert!(output.starts_with("deleted link.txt"), "{output}");
     assert!(
-        output.contains("file-change receipt unavailable"),
+        output.contains("File operation succeeded; optional change preview unavailable"),
         "{output}"
     );
     assert!(!output.contains("-target remains"), "{output}");

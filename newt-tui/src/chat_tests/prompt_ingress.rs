@@ -53,8 +53,9 @@ fn git_head_snapshot_requires_effective_workspace_read_authority() {
             email: "test@example.com".into(),
         },
         attribution: None,
-        commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
-        contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+        commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        signer: None,
     };
     let mut denied = newt_core::Caveats::top();
     denied.fs_read = newt_core::Scope::none();

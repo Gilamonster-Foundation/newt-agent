@@ -683,11 +683,11 @@ async fn dock_panel_route(
     Query(q): Query<DockPanelQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let Some(peer) = dock::peer_by_label(&q.peer) else {
+    let Some(peer) = dock::peer_by_route(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
+        Ok(t) => Html(dock::dock_panel(&peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(
             r#"<p class="empty">dock unreachable: {}</p>"#,
             shell::escape(&e)
@@ -744,7 +744,7 @@ async fn dock_inject_route(
     headers: axum::http::HeaderMap,
     Form(form): Form<InjectForm>,
 ) -> impl IntoResponse {
-    let Some(peer) = dock::peer_by_label(&q.peer) else {
+    let Some(peer) = dock::peer_by_route(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
     if let Err(e) = dock::peer_inject(&peer, &q.conv, &form.text).await {
@@ -757,7 +757,7 @@ async fn dock_inject_route(
     // Re-mirror: the remote may not have consumed yet; the operator sees the ask
     // land and the transcript catches up on the next select/refresh.
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
+        Ok(t) => Html(dock::dock_panel(&peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
 }
@@ -800,7 +800,7 @@ pub(crate) async fn sessions_section(csrf: &str) -> String {
     );
     if list.is_empty() {
         out.push_str(
-            r#"<p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section>"#,
+            r#"<p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent above.</p></section>"#,
         );
         return out;
     }
@@ -868,25 +868,6 @@ async fn follow_session(
     Html(format!("{panel}\n{strip}")).into_response()
 }
 
-/// Mint a short-lived agent key for a mesh role under the operator's `UserKey`.
-fn mint_agent(
-    user: &agent_mesh_core::UserKey,
-    role: &str,
-    caps: Vec<String>,
-) -> agent_mesh_core::AgentKey {
-    agent_mesh_core::AgentKey::issue(
-        user,
-        agent_mesh_core::AgentMetadata {
-            role: role.into(),
-            host: "newt-web".into(),
-            capabilities: caps,
-            issued_at: "2026-01-01T00:00:00Z".into(), // a claim; expiry is generation-based
-            expires_at: None,
-            caveats: agent_mesh_core::Caveats::top(),
-        },
-    )
-}
-
 /// Bring up the agent-mesh dock (Phase 2). Loads the operator `UserKey` from the
 /// state dir (the SAME identity the TUI signs under, so a same-operator peer
 /// auto-teams); binds a dial `DockClient` so `/dock` can reach mesh peers; and,
@@ -911,12 +892,48 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
     // mesh dial. The gate is fail-closed by default; NEWT_INSECURE_DOCK_NO_APPROVAL
     // is the only (named, unsafe) way off.
     dock::set_dock_identity(state.join("config.toml"), id_path.clone());
-    match newt_mesh::DockClient::bind(&user, mint_agent(&user, "newt-web-dock-client", vec![]), 0)
-        .await
-    {
+    // K8.4: both dock keys are DERIVED from the operator root and this
+    // installation's name, so an approval that pins either survives a restart.
+    let instance = match newt_mesh::dock_instance(&state) {
+        Ok(name) => name,
+        Err(why) => {
+            eprintln!("newt-web: mesh dock DISABLED — no dock instance name ({why})");
+            return None;
+        }
+    };
+    let hub = newt_mesh::dock_agent(&user, newt_mesh::DockRole::Hub, &instance);
+    let hub_pubkey = hub.public_bytes();
+    // K8: `NEWT_WEB_DOCK_UPLINK_PORT` binds the hub on a stable UDP port and
+    // accepts uplinks there from docked hosts. Only a host promoted in this
+    // hub's registry is served; any other is staged for `newt dock approve
+    // --staged` (K8.5). Unset, the hub binds an ephemeral port and dials only.
+    let uplink_port = match std::env::var("NEWT_WEB_DOCK_UPLINK_PORT") {
+        Ok(raw) => match raw.trim().parse::<u16>() {
+            Ok(port) if port != 0 => Some(port),
+            _ => {
+                eprintln!("newt-web: NEWT_WEB_DOCK_UPLINK_PORT={raw:?} is not a port; not accepting uplinks");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    match newt_mesh::DockClient::bind(&user, hub, uplink_port.unwrap_or(0)).await {
         Ok(client) => {
+            if uplink_port.is_some() {
+                client.serve_uplinks(state.clone());
+                eprintln!(
+                    "newt-web: accepting dock uplinks on udp/{} (promote hosts with `newt dock approve --staged`)",
+                    client.local_port()
+                );
+            }
             dock::set_dock_client(std::sync::Arc::new(client));
-            eprintln!("newt-web: mesh dock dial client bound");
+            // Stable across restarts now (K8.4), so a host can approve it once:
+            // `newt dock approve` there takes this pubkey and shows these words.
+            eprintln!(
+                "newt-web: mesh dock dial client bound (instance {instance}, hub pubkey {}, words: {})",
+                hex_lower(&hub_pubkey),
+                newt_core::dock_registry::pubkey_words(&hub_pubkey).join(" ")
+            );
         }
         Err(why) => eprintln!("newt-web: mesh dock client bind failed: {why}"),
     }
@@ -924,11 +941,7 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
         return None; // not opted in to being dockable over the mesh
     };
     let port: u16 = port_str.trim().parse().unwrap_or(0);
-    let agent = mint_agent(
-        &user,
-        "newt-web-dock",
-        vec![newt_mesh::DOCK_CAPABILITY_TAG.to_string()],
-    );
+    let agent = newt_mesh::dock_agent(&user, newt_mesh::DockRole::Host, &instance);
     match newt_mesh::NewtDockService::bind(&user, agent, state.clone(), port).await {
         Ok(svc) => {
             eprintln!(

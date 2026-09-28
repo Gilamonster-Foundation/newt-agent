@@ -1,8 +1,20 @@
 # Plan mode: draft in scratch, present once, approve, then implement
 
-**Status:** design note (pre-build) · **Amends:** [`plan_editor_ephemeral_tui.md`](../decisions/plan_editor_ephemeral_tui.md) · **Builds on:** `PlanModeControl` ([`plan_mode.rs`](../../newt-core/src/agentic/plan_mode.rs)), `render_report` ([`report.rs`](../../newt-core/src/agentic/report.rs)), the permission gate ([`permissions.rs`](../../newt-core/src/agentic/permissions.rs)), per-session `plan.md` (`session_plan_path`, #220) · **Prior art:** [`weak-model-plan-mode-findings.md`](../research/weak-model-plan-mode-findings.md), [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md)
+**Status:** design note with implemented handoff update · **Amends:** [`plan_editor_ephemeral_tui.md`](../decisions/plan_editor_ephemeral_tui.md) · **Builds on:** `PlanModeControl` ([`plan_mode.rs`](../../newt-core/src/agentic/plan_mode.rs)), `render_report` ([`report.rs`](../../newt-core/src/agentic/report.rs)), the permission gate ([`permissions.rs`](../../newt-core/src/agentic/permissions.rs)), per-session `plan.md` (`session_plan_path`, #220) · **Prior art:** [`weak-model-plan-mode-findings.md`](../research/weak-model-plan-mode-findings.md), [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md)
 
 ## The failure this answers
+
+### Implemented approval handoff
+
+The draft slot and turn-end approval routine are implemented. A successful
+`exit_plan_mode` now ends the provider loop after the current tool batch has
+been recorded, returning `AwaitingOperator`. It does not spend another model
+round or wait for the round limit. Calls later in that same batch remain
+read-only, and the pending request is left for the TUI to consume exactly once.
+Approval starts the existing implementation turn seeded from the presented
+draft; denial or an unavailable gate leaves the Plan clamp in place.
+
+The rest of this note records the original design and its proposed slices.
 
 Observed in an interactive session with a 30B local coder model, on a request to
 plan a refactor. The turn ran under the read-only Plan disposition.

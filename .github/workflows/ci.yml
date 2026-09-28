@@ -489,6 +489,15 @@ jobs:
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
           BRIDLE_REQUIRE_UNC_CONTROL: "1"
+        # agent-bridle 0.8 trusts only a configured absolute launcher path or the
+        # `agent-bridle-aclaunch.exe` shipped next to the running executable;
+        # PATH is not a provenance source. The test executables live in
+        # target\debug\deps, so the launcher is placed there: the install
+        # layout, not a PATH lookup.
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p newt-core --features windows-appcontainer --lib --test windows_appcontainer_adversarial --no-run
+          Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
           cargo test -p newt-core --features windows-appcontainer --lib run_command_windows_ -- --test-threads=1
           cargo test -p newt-core --features windows-appcontainer --test windows_appcontainer_adversarial -- --ignored --test-threads=1

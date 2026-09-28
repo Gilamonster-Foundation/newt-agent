@@ -15,6 +15,10 @@
 //! This is the load-bearing proof that the host-side wire glue carries
 //! an attenuated cert chain across the process boundary.
 
+// This E2E creates and executes a POSIX shell fixture, including its Unix
+// executable mode, so Windows must not try to compile it as a portable test.
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 

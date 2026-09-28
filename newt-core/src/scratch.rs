@@ -24,6 +24,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod build;
+pub(crate) use build::{
+    acquire_run as acquire_build_run, managed_partition as managed_build_partition,
+    validate_grant as validate_build_grant, ManagedRun,
+};
+
+/// The operator override, or the stable private managed base proposed to the
+/// Build permission gate. Resolving it creates no filesystem entries.
+pub(crate) fn build_scratch_base() -> PathBuf {
+    build_scratch_override().unwrap_or_else(build::default_base)
+}
+
 /// The default ephemeral dir, relative to the repo root. A convention, not a
 /// lock-in — override it via the `[scratch] dir` config key or `NEWT_SCRATCH_DIR`.
 pub const DEFAULT_SCRATCH_DIR: &str = ".scratch";
@@ -43,6 +55,27 @@ pub fn set_scratch_dir(dir: impl Into<String>) {
     }
 }
 
+/// The `[scratch] build_dir` config value (#2604), published like
+/// [`CONFIGURED_SCRATCH_DIR`]. `NEWT_BUILD_SCRATCH_DIR` wins over it.
+static CONFIGURED_BUILD_SCRATCH_DIR: OnceLock<String> = OnceLock::new();
+
+/// Publish the config-file build scratch base (`[scratch] build_dir`), once,
+/// with [`set_scratch_dir`]'s rules.
+pub fn set_build_scratch_dir(dir: impl Into<String>) {
+    let dir = dir.into();
+    if !dir.trim().is_empty() {
+        let _ = CONFIGURED_BUILD_SCRATCH_DIR.set(dir);
+    }
+}
+
+/// A non-empty `env` value, else the published config value.
+fn env_then_config(env: &str, configured: &OnceLock<String>) -> Option<String> {
+    std::env::var(env)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| configured.get().cloned())
+}
+
 /// The configured scratch dir, by precedence:
 /// `NEWT_SCRATCH_DIR` env → `[scratch] dir` config → `.scratch` default. The
 /// result may be relative (joined under the repo) or **absolute** (used as-is),
@@ -50,15 +83,31 @@ pub fn set_scratch_dir(dir: impl Into<String>) {
 /// mount, or anywhere writable.
 #[must_use]
 pub fn scratch_dir() -> String {
-    if let Ok(v) = std::env::var("NEWT_SCRATCH_DIR") {
-        if !v.trim().is_empty() {
-            return v;
-        }
-    }
-    CONFIGURED_SCRATCH_DIR
-        .get()
-        .cloned()
+    env_then_config("NEWT_SCRATCH_DIR", &CONFIGURED_SCRATCH_DIR)
         .unwrap_or_else(|| DEFAULT_SCRATCH_DIR.to_string())
+}
+
+/// The operator's escape hatch for the build lane's scratch base (#2604):
+/// `NEWT_BUILD_SCRATCH_DIR` env → `[scratch] build_dir` config. `None` uses
+/// a private managed temporary base outside Git worktrees.
+/// When set, a run's `TMPDIR` is `<base>/<workspace id>/<run>` (see
+/// `confined_exec::build_scratch_dir`): outside the repo, so a test fixture
+/// that must not sit in a git repo works, but outside the session's write grant
+/// too, so the Build permission covers it. Point it somewhere no other confined
+/// lane can write: a directory another lane can pre-create or symlink could
+/// redirect the build lane's writes.
+#[must_use]
+pub fn build_scratch_override() -> Option<PathBuf> {
+    absolute_dir(env_then_config(
+        "NEWT_BUILD_SCRATCH_DIR",
+        &CONFIGURED_BUILD_SCRATCH_DIR,
+    ))
+}
+
+/// Only an **absolute** setting counts: the base must sit outside any
+/// workspace, and a relative one would resolve under the build's cwd.
+fn absolute_dir(dir: Option<String>) -> Option<PathBuf> {
+    dir.map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
 /// Resolve a scratch dir setting against a repo `base`: an **absolute** setting
@@ -150,6 +199,15 @@ mod tests {
         // keeps session plans on the relative default.
         // (scratch_dir() with no env/config set → the default, which is relative.)
         assert_eq!(scratch_workspace_subdir(), DEFAULT_SCRATCH_DIR);
+    }
+
+    #[test]
+    fn build_scratch_override_takes_only_an_absolute_dir() {
+        let abs = std::env::temp_dir().join("operator-build-scratch");
+        let abs_str = abs.to_string_lossy().into_owned();
+        assert_eq!(absolute_dir(Some(abs_str)), Some(abs));
+        assert_eq!(absolute_dir(Some("relative/scratch".into())), None);
+        assert_eq!(absolute_dir(None), None);
     }
 
     #[test]

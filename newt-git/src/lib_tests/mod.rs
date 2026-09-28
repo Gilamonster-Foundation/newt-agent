@@ -137,8 +137,9 @@ fn tool(dir: &Path) -> LocalGitTool {
             None,
             "noreply@newt-agent.com",
         )),
-        commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
-        contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+        commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        signer: None,
     }
 }
 
@@ -298,6 +299,9 @@ mod checkout_branch;
 #[path = "engine_read.rs"]
 mod engine_read;
 #[cfg(test)]
+#[path = "signing.rs"]
+mod signing;
+
 #[path = "engine_write.rs"]
 mod engine_write;
 #[cfg(test)]

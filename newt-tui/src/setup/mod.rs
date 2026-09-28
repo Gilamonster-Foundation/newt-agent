@@ -716,11 +716,13 @@ async fn run_with_flow(
 fn offer_sandbox_git(op: &Operator<'_>) {
     op.say(
         "Sandbox git: git the model runs never reads your ~/.gitconfig. \
-         Choose what it uses instead (/settings changes it later).",
+         Choose what it uses instead, and how newt signs its own commits \
+         (/settings changes these later).",
     );
     for field in [
         crate::settings_form::Field::GitAuthor,
         crate::settings_form::Field::GitConfig,
+        crate::settings_form::Field::GitSigning,
     ] {
         for line in crate::settings_form::ask_and_apply(op.ask_seam(), field, "/setup") {
             op.say(&format!("  {line}"));

@@ -1064,7 +1064,11 @@ async fn the_no_progress_stop_ends_a_smart_harness_turn_typed_and_incomplete() {
     let (text, _) = result.expect("the stop is a typed end, not an error");
     assert_eq!(reason, Some(crate::TurnEndReason::NoProgress));
     assert!(text.starts_with("Stopped:"), "harness notice: {text}");
-    assert_eq!(requests.len(), 3, "write, two idle rounds, then the stop");
+    assert_eq!(
+        requests.len(),
+        4,
+        "write, new directory evidence, two idle rounds, then the stop"
+    );
     assert!(
         requests.iter().all(|r| r.get("tools").is_some()),
         "no tools-disabled summary request"

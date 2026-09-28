@@ -27,26 +27,7 @@
 
 pub use agent_mesh_protocol::caveats::{Caveats, CountBound, Scope};
 
-/// Per-axis "permits this concrete item?" check.
-///
-/// `All` permits everything; `Only(s)` permits exactly the members of `s`.
-/// Defined as a trait because the upstream `agent-mesh-protocol::Scope` ships
-/// only the lattice algebra; this is the dispatch-site adaptor. Constructors
-/// (`Scope::only`, `Scope::none`) are inherent on the upstream type — no
-/// re-definition needed.
-pub trait ScopeExt<T: Ord + Clone> {
-    /// Does this scope authorize `item`?
-    fn permits(&self, item: &T) -> bool;
-}
-
-impl<T: Ord + Clone> ScopeExt<T> for Scope<T> {
-    fn permits(&self, item: &T) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(set) => set.contains(item),
-        }
-    }
-}
+pub use agent_toolchain::caveats::ScopeExt;
 
 /// "Does this bound permit one more call?" — the dispatch-site form of the
 /// `max_calls` axis. Defined as an extension trait because the upstream
@@ -408,7 +389,9 @@ mod tests {
     #[test]
     fn own_gitdir_grants_are_read_only_in_session_caveats() {
         let root = tempfile::tempdir().unwrap();
-        let main = root.path().join("main");
+        // Git resolves macOS's /var alias; compare the same physical paths.
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
         std::fs::create_dir(&main).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| {
             assert!(std::process::Command::new("git")
@@ -426,7 +409,7 @@ mod tests {
         std::fs::write(main.join("seed"), "x").unwrap();
         git(&main, &["add", "seed"]);
         git(&main, &["commit", "-q", "-m", "init"]);
-        let wt = root.path().join("wt");
+        let wt = root_path.join("wt");
         git(
             &main,
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],

@@ -183,6 +183,12 @@ async fn build_check_mutation_is_not_recorded_as_the_governed_write_postimage() 
     let governed = b"governed bytes\n";
     let build_hook = b"build-hook bytes\n";
     let sink = RecordingArtifactSink::default();
+    let caveats = Caveats {
+        // This tests the write receipt; macOS cannot admit restricted networking.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
 
     let out = run_artifact_tool(
         "write_file",
@@ -191,7 +197,7 @@ async fn build_check_mutation_is_not_recorded_as_the_governed_write_postimage() 
             "content": std::str::from_utf8(governed).unwrap(),
         }),
         ws.path(),
-        &caveats_rw(ws.path()),
+        &caveats,
         Some("printf 'build-hook bytes\\n' > target.txt"),
         &sink,
     )

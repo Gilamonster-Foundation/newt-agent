@@ -275,6 +275,10 @@ mod git_scope;
 mod plan_disposition;
 
 #[cfg(test)]
+#[path = "execute_navigation.rs"]
+mod navigation_authority;
+
+#[cfg(test)]
 #[path = "execute_crew.rs"]
 mod crew;
 

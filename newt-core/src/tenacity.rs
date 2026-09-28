@@ -1,8 +1,9 @@
 //! Tenacity — how long and hard the agent pursues the task.
 //!
 //! Two levels today: [`Tenacity::Normal`] stops at the first plausible finish
-//! within the configured tool-round limit, and [`Tenacity::Relentless`] also
-//! lifts that limit. `grit` and `resolute` arrive in later slices of
+//! with the configured initial tool-round allowance, and [`Tenacity::Relentless`]
+//! lifts that allowance. Progress-backed renewal is controlled separately by
+//! `workflow_grace_rounds` (zero keeps the allowance a hard cap). `grit` and `resolute` arrive in later slices of
 //! `docs/design/psyche-effort-dials.md`.
 //!
 //! Until the initiative split (slice 1b) this dial also carried the
@@ -25,10 +26,10 @@ pub const RELENTLESS_TOOL_ROUND_TARGET: usize = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Tenacity {
-    /// Stop at the first plausible finish, within the configured round limit.
+    /// Stop at the first plausible finish, using the configured initial allowance.
     #[default]
     Normal,
-    /// Also lift the tool-round limit, when chosen explicitly.
+    /// Also lift the initial tool-round allowance, when chosen explicitly.
     Relentless,
 }
 
@@ -61,11 +62,11 @@ impl Tenacity {
     pub fn describe(self) -> String {
         match self {
             Self::Normal => {
-                "stop at the first plausible finish, within the configured round limit".to_string()
+                "stop at the first plausible finish; fresh progress may renew the initial allowance".to_string()
             }
             Self::Relentless => format!(
-                "lift the tool-round limit to at least {RELENTLESS_TOOL_ROUND_TARGET} \
-                 (an explicit round limit still wins)"
+                "lift the initial tool-round allowance to at least {RELENTLESS_TOOL_ROUND_TARGET} \
+                 (an explicit initial allowance still wins; configured progress renewal remains active)"
             ),
         }
     }
@@ -157,7 +158,7 @@ impl ToolRoundLimitSource {
 /// impossible to write rather than remember to write it correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRoundLimit {
-    /// The limit actually enforced this turn.
+    /// The initial allowance; the tool loop separately applies progress renewal.
     pub rounds: usize,
     /// Which input won.
     pub source: ToolRoundLimitSource,
@@ -181,7 +182,8 @@ impl ToolRoundLimit {
 /// Compose the tool-round safety valve without losing provenance. Callers pass
 /// only a direct operator choice ([`cli_tenacity`]), never a resolved default,
 /// so no automatic layer can silently grant 10,000 rounds. An explicit
-/// `/rounds`/`--max-rounds` value remains the outermost override.
+/// `/rounds`/`--max-rounds` value remains the outermost initial-allowance override.
+/// Set `workflow_grace_rounds = 0` when this value must be a hard round cap.
 ///
 /// Returns a [`ToolRoundLimit`] rather than a number, so the derivation cannot
 /// be dropped on the way to a durable record — see that type's docs (#1965).

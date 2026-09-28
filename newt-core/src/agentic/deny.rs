@@ -17,6 +17,8 @@
 //! Fail-closed within the axis it checks: a shell command whose leader hits the
 //! list is refused regardless of caveats; anything we cannot parse to a target
 //! simply is not an exec surface and falls through to the normal leashes.
+//! File and directory deletion uses those normal exec/filesystem grants; it is
+//! not an absolute prohibition, including recursive and multi-target cleanup.
 
 use serde_json::Value;
 
@@ -60,7 +62,6 @@ const DENY_EXEC_LEADERS: &[&str] = &[
     "rlogin",
     "telnet",
     // destructive / raw-disk
-    "rmdir",
     "shred",
     "dd",
     "mkfs",
@@ -139,16 +140,6 @@ fn deny_exec(command: &str) -> Option<Denied> {
     // `/usr/bin/ssh` → `ssh`; `./rm` → `rm`.
     let leader = raw_leader.rsplit(['/', '\\']).next().unwrap_or(raw_leader);
 
-    if leader == "rm" || leader == "unlink" {
-        let rest: Vec<&str> = tokens.collect();
-        if simple_one_file_delete(leader, &rest) {
-            return None;
-        }
-        return Some(Denied {
-            reason: deny_message(leader, "an absolutely forbidden command"),
-        });
-    }
-
     if DENY_EXEC_LEADERS.contains(&leader) {
         return Some(Denied {
             reason: deny_message(leader, "an absolutely forbidden command"),
@@ -162,31 +153,6 @@ fn deny_exec(command: &str) -> Option<Denied> {
     }
 
     None
-}
-
-fn simple_one_file_delete(leader: &str, rest: &[&str]) -> bool {
-    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
-    let mut operands = Vec::new();
-    let mut end_of_flags = false;
-    for token in rest {
-        if token.contains(SHELL_META) {
-            return false;
-        }
-        if !end_of_flags && *token == "--" {
-            end_of_flags = true;
-            continue;
-        }
-        if !end_of_flags && token.starts_with('-') {
-            match leader {
-                // `rm -f file` is still a one-file delete; recursive / dir /
-                // forceful tree forms stay absolutely denied.
-                "rm" if token.chars().skip(1).all(|c| c == 'f') => continue,
-                _ => return false,
-            }
-        }
-        operands.push(*token);
-    }
-    operands.len() == 1
 }
 
 fn deny_message(target: &str, what: &str) -> String {
@@ -210,10 +176,6 @@ mod tests {
     #[test]
     fn denies_lateral_movement_destruction_and_service_changes() {
         assert!(cmd("ssh host 'uptime'").is_some(), "ssh denied");
-        assert!(cmd("rm -rf build/").is_some(), "recursive rm denied");
-        assert!(cmd("rm -r build/").is_some(), "recursive rm denied");
-        assert!(cmd("rm a b").is_some(), "multi-target rm denied");
-        assert!(cmd("sudo rm -rf /").is_some(), "sudo recursive rm denied");
         assert!(
             cmd("/usr/bin/scp a b:").is_some(),
             "path-qualified scp denied"
@@ -232,6 +194,27 @@ mod tests {
         );
         assert!(cmd("shutdown -h now").is_some(), "shutdown denied");
         assert!(cmd("dd if=/dev/zero of=/dev/sda").is_some(), "dd denied");
+    }
+
+    #[test]
+    fn native_cleanup_reaches_the_existing_authority_boundary() {
+        for command in [
+            "rm -rf build/",
+            "rm -r build/",
+            "rm one two",
+            "rm --recursive --force -- 'directory with spaces'",
+            "rmdir empty/",
+            "unlink file",
+            "/bin/rm -rf /outside/workspace",
+            "env FLAG=1 rm -rf build/",
+        ] {
+            for alias in EXEC_TOOL_NAMES {
+                assert!(
+                    deny_check(alias, &json!({ "command": command })).is_none(),
+                    "{alias} must leave {command:?} to exec/filesystem authority"
+                );
+            }
+        }
     }
 
     #[test]

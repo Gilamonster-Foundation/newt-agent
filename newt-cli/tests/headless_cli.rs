@@ -3,7 +3,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use assert_cmd::Command;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -269,8 +268,7 @@ nemotron = "relentless"
     std::fs::write(workspace.path().join("tool-ground-truth.txt"), "present\n")
         .expect("write list_dir ground-truth marker");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -384,8 +382,7 @@ nemotron = "eager"
     .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Complete the task.\n").expect("write instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -476,7 +473,7 @@ bounded_reasoning_continuation = true
         let workspace = fixture.path().join(format!("ws-{name}"));
         std::fs::create_dir(&workspace).expect("create headless workspace");
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command.env_remove("NEWT_TEAM");
         if obsessive {
             command.arg("--obsessive");
@@ -570,8 +567,7 @@ async fn headless_refuses_an_invalid_output_allowance_before_inference() {
             "output_allowance 40000 leaves no input room in the declared 32768-token context window",
         ),
     ] {
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
@@ -654,7 +650,7 @@ output_allowance = 12000
         let config_path = fixture.path().join(format!("{name}.toml"));
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
         std::fs::write(&config_path, config).expect("write headless config");
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command
             .env_remove("NEWT_TEAM")
             .arg("--config")
@@ -709,8 +705,7 @@ async fn headless_with_an_exhausted_run_allowance_refuses_dispatch_before_any_re
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
@@ -780,8 +775,7 @@ async fn headless_run_allowance_is_reported_when_set_and_absent_when_not() {
         ("unconfigured", vec![], false),
     ] {
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
@@ -843,7 +837,7 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
         .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
     let headless = |extra: &[&std::ffi::OsStr]| {
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
@@ -921,8 +915,7 @@ async fn headless_scratchpad_state_reaches_wire_and_receipt() {
         .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
@@ -1011,8 +1004,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
     for kind in ["openai", "anthropic"] {
-        let output = Command::cargo_bin("newt")
-            .expect("newt binary")
+        let output = common::newt()
             .env_remove("NEWT_TEAM")
             .env_remove("NEWT_ANTHROPIC_STREAM")
             .args(["--backend-endpoint", &server.uri()])
@@ -1036,8 +1028,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
 
     // The answer is shown before anything that can fail: an unwritable
     // --events path (a directory) fails the run, and the claim is still there.
-    let output = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let output = common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
@@ -1087,8 +1078,7 @@ async fn headless_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
-    let output = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let output = common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
@@ -1158,8 +1148,7 @@ kind = "openai"
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "operator-model"])
@@ -1237,8 +1226,7 @@ api = "chat_completions"
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--cognition", "meticulous"])
         .arg("--config")
@@ -1302,7 +1290,10 @@ api = "chat_completions"
 // read-only round a DISTINCT path, so the rounds are burned the way the
 // captured run burned them — by legitimate, succeeding, redundant work — and
 // not by a mechanism that already has its own guard.
-const CAP_ROUNDS: usize = 8;
+// Three writes + one fresh read + seven duplicate observations exceed the
+// bundled workflows' six-round recent-progress horizon without hitting the
+// twelve-round no-progress brake. This tests the renewable allowance expiring.
+const CAP_ROUNDS: usize = 11;
 const EARLY_WRITES: usize = 3;
 
 /// Reads the ONE `solve_result` line. Sibling of [`contract_from`], which
@@ -1386,6 +1377,16 @@ impl Respond for WritesEarlyThenGrindsReadOnly {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn round_cap_exit_is_not_reported_as_a_completed_run() {
+    assert_round_cap_exit(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_zero_grace_stops_fresh_evidence_at_the_round_cap() {
+    assert_round_cap_exit(true).await;
+}
+
+async fn assert_round_cap_exit(hard_cap: bool) {
+    let cap_rounds = if hard_cap { 8 } else { CAP_ROUNDS };
     let server = MockServer::start().await;
     let rounds_served = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -1400,17 +1401,27 @@ async fn round_cap_exit_is_not_reported_as_a_completed_run() {
     let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let src = workspace.path().join("src");
     std::fs::create_dir_all(&src).expect("workspace src dir");
-    // One readable seed per grinding round, so every read SUCCEEDS. A grind
-    // made of failures would be a different defect (thrash), already covered by
-    // `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit`.
-    for n in 0..(CAP_ROUNDS + 4) {
+    // Distinct paths ensure every read executes. Identical bytes provide no new
+    // evidence after the first read, giving the default cap a controlled stall.
+    // The explicit hard-cap case instead supplies fresh evidence every round:
+    // zero grace must stop even useful work at the operator's chosen bound.
+    for n in 0..(cap_rounds + 4) {
         std::fs::write(
             src.join(format!("seed_{n}.rs")),
-            format!("pub const SEED_{n}: u32 = {n};\n"),
+            if hard_cap {
+                format!("pub const SEED_{n}: u32 = {n};\n")
+            } else {
+                "pub const OBSERVED: u32 = 0;\n".to_string()
+            },
         )
         .expect("write seed file");
     }
 
+    let round_policy = if hard_cap {
+        "\n[tui]\nworkflow_grace_rounds = 0\n"
+    } else {
+        ""
+    };
     let config_path = workspace.path().join("headless.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
@@ -1424,6 +1435,7 @@ name = "capped"
 endpoint = "{}"
 model = "{NEMOTRON_MODEL}"
 kind = "openai"
+{round_policy}
 "#,
             server.uri()
         ),
@@ -1435,8 +1447,7 @@ kind = "openai"
     )
     .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -1446,7 +1457,7 @@ kind = "openai"
         .arg(&instruction_path)
         .arg("--events")
         .arg(&events_path)
-        .args(["--max-rounds", &CAP_ROUNDS.to_string()])
+        .args(["--max-rounds", &cap_rounds.to_string()])
         .assert()
         .success();
 
@@ -1459,12 +1470,12 @@ kind = "openai"
     // rather than any capped run.
     let served = rounds_served.load(Ordering::SeqCst);
     assert_eq!(
-        served, CAP_ROUNDS,
-        "the scripted model must have served exactly {CAP_ROUNDS} tool rounds; \
+        served, cap_rounds,
+        "the scripted model must have served exactly {cap_rounds} tool rounds; \
          served {served} — the replay did not run the trajectory it claims to"
     );
     assert_eq!(
-        result["tool_calls"], CAP_ROUNDS as u64,
+        result["tool_calls"], cap_rounds as u64,
         "the harness must have dispatched every scripted round: {result}"
     );
     assert_eq!(
@@ -1486,6 +1497,17 @@ kind = "openai"
         writes_ok, EARLY_WRITES,
         "the early writes must have SUCCEEDED, not merely been attempted: {result}"
     );
+    let reads_ok = result["trajectory"]
+        .as_array()
+        .expect("trajectory is an array")
+        .iter()
+        .filter(|e| e["tool"] == "read_file" && e["ok"] == true)
+        .count();
+    assert_eq!(
+        reads_ok,
+        cap_rounds - EARLY_WRITES,
+        "every distinct-path tail read must execute successfully: {result}"
+    );
 
     // ── the typed grind measurement (#2214) ───────────────────────────────
     // RED against e3f42a36: the record has no such key, so this reads `null`.
@@ -1495,14 +1517,14 @@ kind = "openai"
     // from a genuinely-too-small cap, all three of which say `RoundCap` today.
     //
     // The expected value is in CALLS, not rounds. It equals
-    // `CAP_ROUNDS - EARLY_WRITES` only because this scripted model issues
+    // `cap_rounds - EARLY_WRITES` only because this scripted model issues
     // exactly one call per round; a fixture that ever batches two calls into a
     // round must recompute it from the trajectory rather than from the round
-    // counts. 5 is neither 0 nor `tool_calls` (8), so neither a constant-zero
-    // implementation nor an off-by-the-whole-length one passes.
+    // counts. The tail is neither zero nor the whole trajectory, so neither
+    // a constant-zero implementation nor an off-by-the-whole-length one passes.
     assert_eq!(
         result["calls_after_last_write"],
-        (CAP_ROUNDS - EARLY_WRITES) as u64,
+        (cap_rounds - EARLY_WRITES) as u64,
         "the run spent its whole tail after the work was done; that must be a \
          value a gate can assert, not prose in the reply: {result}"
     );
@@ -1587,8 +1609,7 @@ kind = "openai"
     .expect("write headless config");
     std::fs::write(&instruction_path, "Read the seed file.\n").expect("write headless instruction");
 
-    let _ = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let _ = common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -1644,19 +1665,9 @@ fn streamed_lifecycle_call(args_json: &str) -> String {
     .collect()
 }
 
-/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
-/// `lifecycle action=build` does headless, where `permission_gate` is
-/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
-/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
-/// fs_write fenced to the workspace/scratch) already dominate what
-/// `build_tool_request` calibrates for the build (fenced reads, a
-/// workspace-scoped write root, network denied), so `build.leq(caveats)`
-/// is true and the `permission_gate.is_some_and(...)` check — the only
-/// place a `None` gate could matter — is never reached at all. The
-/// absent-gate case this review item worried about does not occur in
-/// practice under headless's actual default caveats.
-#[tokio::test(flavor = "multi_thread")]
-async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+async fn headless_lifecycle_build_attempt(
+    scratch_field: Option<&str>,
+) -> (tempfile::TempDir, serde_json::Value) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1667,14 +1678,18 @@ async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
         .mount(&server)
         .await;
 
-    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
+    let workspace = fixture.path().join("workspace");
+    let ordinary_temp = fixture.path().join("ordinary-temp");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&ordinary_temp).expect("ordinary temp");
     // An empty `Cargo.toml` is enough for the Rust language pack's `detect`
     // marker (tooling.rs), so `phase=test` resolves to a real command
     // instead of the "no command configured" no-op.
-    std::fs::write(workspace.path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
-    let config_path = workspace.path().join("headless.toml");
-    let instruction_path = workspace.path().join("instruction.md");
-    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(workspace.as_path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
+    let config_path = workspace.as_path().join("headless.toml");
+    let instruction_path = workspace.as_path().join("instruction.md");
+    let events_path = workspace.as_path().join("events.jsonl");
     std::fs::write(
         &config_path,
         format!(
@@ -1690,16 +1705,30 @@ kind = "openai"
         ),
     )
     .expect("write headless config");
+    if let Some(field) = scratch_field {
+        let configured = fixture.path().join("configured-scratch");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let value = toml::Value::String(configured.to_string_lossy().into_owned());
+        std::fs::write(
+            &config_path,
+            format!("{config}\n[scratch]\n{field} = {value}\n"),
+        )
+        .unwrap();
+    }
     std::fs::write(&instruction_path, "Verify the change builds.\n")
         .expect("write headless instruction");
 
-    let _ = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let _ = common::newt()
         .env_remove("NEWT_TEAM")
+        .env_remove("NEWT_SCRATCH_DIR")
+        .env_remove("NEWT_BUILD_SCRATCH_DIR")
+        .env("TMPDIR", &ordinary_temp)
+        .env("TEMP", &ordinary_temp)
+        .env("TMP", &ordinary_temp)
         .arg("--config")
         .arg(&config_path)
         .args(["headless", "--cwd"])
-        .arg(workspace.path())
+        .arg(workspace.as_path())
         .arg("--instruction-file")
         .arg(&instruction_path)
         .arg("--events")
@@ -1708,6 +1737,23 @@ kind = "openai"
         .assert();
 
     let result = solve_result_from(&events_path);
+    (fixture, result)
+}
+
+/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
+/// `lifecycle action=build` does headless, where `permission_gate` is
+/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
+/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
+/// fs_write fenced to the workspace/scratch) already dominate what
+/// `build_tool_request` calibrates for the build (fenced reads, a
+/// workspace-scoped write root, caller-authorized network), so `build.leq(caveats)`
+/// is true and the `permission_gate.is_some_and(...)` check — the only
+/// place a `None` gate could matter — is never reached at all. The
+/// absent-gate case this review item worried about does not occur in
+/// practice under headless's actual default caveats.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+    let (_fixture, result) = headless_lifecycle_build_attempt(None).await;
     let trajectory = result["trajectory"].as_array().expect("trajectory");
     assert!(
         !trajectory.is_empty(),
@@ -1721,7 +1767,7 @@ kind = "openai"
     // (`confined_bench_caveats` — fs_read/exec/net = Scope::All, only
     // fs_write fenced to the workspace/scratch), `build.leq(caveats)` is
     // already TRUE — the calibrated build caveats (fenced reads,
-    // workspace-scoped writes, denied network) are a subset of what headless
+    // workspace-scoped writes, caller-authorized network) are a subset of what headless
     // already grants. So the `!build.leq(caveats)` gate check never fires and
     // `permission_gate` is never consulted: the command actually RUNS.
     // "denied" never appears; the FIRST call's real execution classifies as
@@ -1735,6 +1781,19 @@ kind = "openai"
     assert_ne!(trajectory[0]["execution"], "denied", "{}", trajectory[0]);
     #[cfg(target_os = "linux")]
     assert_eq!(trajectory[0]["execution"], "failed", "{}", trajectory[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_scratch_overrides_do_not_authorize_external_build_partitions() {
+    for field in ["dir", "build_dir"] {
+        let (fixture, result) = headless_lifecycle_build_attempt(Some(field)).await;
+        let trajectory = result["trajectory"].as_array().expect("trajectory");
+        assert!(!trajectory.is_empty(), "{field}: {result}");
+        assert_eq!(trajectory[0]["tool"], "lifecycle", "{field}: {result}");
+        assert_eq!(trajectory[0]["execution"], "denied", "{field}: {result}");
+        assert!(!fixture.path().join("configured-scratch").exists());
+        assert!(!fixture.path().join("workspace/target").exists());
+    }
 }
 
 /// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool call
@@ -1802,8 +1861,7 @@ async fn headless_reports_verification_off_where_the_loop_has_no_gate() {
         let events_path = fixture.path().join("events.jsonl");
         std::fs::write(&instruction_path, "Finish without calling a tool.\n")
             .expect("write headless instruction");
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .env("NEWT_SELF_VERIFY", "1")
             .env("NEWT_VERIFY_OUTCOMES", "1")
@@ -1874,7 +1932,7 @@ kind = "openai"
     }
     std::fs::write(&config_path, config).expect("write headless config");
     std::fs::write(&instruction_path, "Say done.\n").expect("write headless instruction");
-    let mut command = Command::cargo_bin("newt").expect("newt binary");
+    let mut command = common::newt();
     command
         .env_remove("NEWT_TEAM")
         .arg("--config")
@@ -2068,8 +2126,7 @@ async fn a_run_that_fails_after_a_write_hands_back_what_it_changed() {
     std::fs::write(&instruction, "Write out.txt.\n").expect("write instruction");
     let events_path = control.path().join("events.jsonl");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .env("NEWT_HTTP_MAX_RETRIES", "0")
         .arg("--config")
@@ -2141,8 +2198,7 @@ async fn handback_from_a_no_op_run(
     std::fs::write(&instruction, "Just answer, don't touch anything.\n")
         .expect("write instruction");
     let events_path = control.join("events.jsonl");
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -2667,8 +2723,7 @@ async fn assert_write_then_no_progress_stops(api: &str) {
     std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
     let events_path = control.path().join("events.jsonl");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -2707,21 +2762,21 @@ async fn assert_write_then_no_progress_stops(api: &str) {
     let requests = requests.lock().expect("capture");
     assert_eq!(
         requests.len(),
-        4,
-        "write, then three grinding rounds; no summary call"
+        5,
+        "write, new directory evidence, then three grinding rounds; no summary call"
     );
     assert!(
         requests.iter().all(|r| r.get("tools").is_some()),
         "no tools-disabled summary"
     );
     // Chat bodies carry `messages`; Responses bodies carry `input`.
-    let last_messages = requests[3]
+    let last_messages = requests[4]
         .get("messages")
-        .or_else(|| requests[3].get("input"))
+        .or_else(|| requests[4].get("input"))
         .expect("messages or input")
         .to_string();
     assert!(
-        last_messages.contains("rounds have passed since your last successful change"),
+        last_messages.contains("rounds produced no new evidence"),
         "the steer must precede the final round: {last_messages}"
     );
 }
@@ -2799,8 +2854,7 @@ async fn an_idless_reask_round_is_counted_by_the_brake_and_does_not_reset_it() {
     std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
     let events_path = control.path().join("events.jsonl");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)

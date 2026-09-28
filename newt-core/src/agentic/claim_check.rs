@@ -211,15 +211,10 @@ impl ObservedPaths {
     }
 }
 
-/// #1214: ground truth about the workspace's git state across THIS turn —
-/// captured by the caller (HEAD at turn start vs. cap-exit) and handed to
-/// [`annotate_action_claims`] as pure data, so the analysis stays in the
-/// mocked unit tier. Collected at runtime by [`collect_git_evidence`].
+/// #1214: the observed local branch inventory, handed to
+/// [`annotate_action_claims`] as pure data. This is not execution evidence
+/// for commits, pushes, pull requests, or tests.
 pub(crate) struct TurnGitEvidence {
-    /// HEAD moved during the turn — a commit was actually created.
-    pub head_moved: bool,
-    /// The working tree / index has uncommitted changes right now.
-    pub tree_dirty: bool,
     /// Local branch names that exist right now.
     pub branches: Vec<String>,
 }
@@ -256,10 +251,6 @@ pub fn files_changed_between(before: &StatusSnapshot, after: &StatusSnapshot) ->
         .map(|(path, _)| path.clone())
         .collect()
 }
-
-/// The plain probe `collect_git_evidence` runs at every turn finalisation: it only
-/// needs emptiness, so untracked directories stay collapsed (cheap on a big tree).
-const EVIDENCE_STATUS_ARGS: [&str; 2] = ["status", "--porcelain"];
 
 /// The hand-back snapshot: raw paths (`-z`) and every untracked FILE, so a stray
 /// script inside a new directory is named, not hidden behind `dir/`.
@@ -519,55 +510,6 @@ pub fn snapshot_workspace_subtree(
     )
 }
 
-/// `phrase` appears in `text` (already lowercased) with non-alphanumeric
-/// boundaries on both sides — `contains` with word edges, no regex dep.
-fn has_phrase(lower: &str, phrase: &str) -> bool {
-    let mut from = 0;
-    while let Some(i) = lower[from..].find(phrase) {
-        let start = from + i;
-        let end = start + phrase.len();
-        let left_ok = start == 0
-            || !lower[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphanumeric());
-        let right_ok = end == lower.len()
-            || !lower[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric());
-        if left_ok && right_ok {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-/// Completed-work phrases (#1214, from the live transcripts): claims of a
-/// commit, push, opened PR, or passing tests/build. Conservative on purpose —
-/// precision over recall, like the path check. Pure data.
-const WORK_CLAIM_PHRASES: [&str; 12] = [
-    "committed",
-    "created a commit",
-    "commit ahead",
-    "commits ahead",
-    "single commit",
-    "pushed",
-    "opened a pull request",
-    "pull request created",
-    "tests pass",
-    "test passes",
-    "tests passed",
-    "check is green",
-];
-
-/// `true` when the summary claims a completed work product.
-pub(crate) fn claims_completed_work(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    WORK_CLAIM_PHRASES.iter().any(|p| has_phrase(&lower, p))
-}
-
 /// Branch names the summary claims: the first ref-looking token within a few
 /// words of a `branch`/`branches` mention — the live transcripts say both
 /// "branch `X`" and "Branch is clean on X". Ref-looking is strict (must
@@ -606,16 +548,11 @@ pub(crate) fn claimed_branches(text: &str) -> Vec<String> {
     out
 }
 
-/// #1214: append refutations for claimed ACTIONS the workspace's git state
-/// contradicts — the sibling of [`annotate_path_claims`] for work products
-/// instead of paths. Same posture: append-only, prose preserved as an exact
-/// prefix, no annotation when everything checks out (or no evidence exists —
-/// a non-git workspace refutes nothing). Two checks:
-/// - a claimed branch name that does not exist;
-/// - a completed-work claim (commit / push / PR / tests pass) when HEAD did
-///   not move this turn — with the working tree state deciding the wording
-///   (clean tree = no work product exists at all; dirty = work exists but is
-///   uncommitted, so commit-level claims are still false).
+/// #1214: append a refutation for a claimed local branch absent from the
+/// observed inventory, preserving the model's prose as an exact prefix.
+/// Git state cannot establish whether tests passed, an existing commit was
+/// pushed, or a pull request was opened. Do not turn a keyword in prose or
+/// an unchanged HEAD into an accusation about those actions.
 pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvidence>) -> String {
     let Some(ev) = evidence else { return text };
     let mut notes: Vec<String> = Vec::new();
@@ -623,17 +560,6 @@ pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvid
         if !ev.branches.iter().any(|have| have == &b) {
             notes.push(format!("claimed branch `{b}` does not exist"));
         }
-    }
-    if claims_completed_work(&text) && !ev.head_moved {
-        notes.push(if ev.tree_dirty {
-            "no commit was created this turn (HEAD unchanged) — changes exist but are \
-             uncommitted, so commit/push/PR claims above are not true yet"
-                .to_string()
-        } else {
-            "no commit was created this turn and the working tree is clean — the claimed \
-             work product does not exist in this workspace"
-                .to_string()
-        });
     }
     if notes.is_empty() {
         return text;
@@ -645,18 +571,14 @@ pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvid
     )
 }
 
-/// Runtime evidence collector (the thin real-git wrapper around the pure
-/// analysis; the two cap-exit sites call it). `head_at_turn_start` is the
-/// [`git_head`] capture from the top of the turn. Any git failure (not a
-/// repo, no git binary) yields `None` — no evidence, no refutation,
-/// fail-quiet: this check must never break a summary.
+/// Observe the branch inventory used by final-answer annotations. Preserve
+/// the existing no-evidence behavior for unborn HEADs and failed Git reads;
+/// no evidence means no refutation.
 pub(crate) fn collect_git_evidence(
     workspace: &str,
     read_scope: &crate::Scope<String>,
-    head_at_turn_start: Option<&str>,
 ) -> Option<TurnGitEvidence> {
-    let head_now = git_head(workspace, read_scope)?;
-    let status = git_in(workspace, &EVIDENCE_STATUS_ARGS, read_scope)?;
+    git_head(workspace, read_scope)?;
     let branches = git_in(
         workspace,
         &["branch", "--format=%(refname:short)"],
@@ -666,11 +588,7 @@ pub(crate) fn collect_git_evidence(
     .map(|l| l.trim().to_string())
     .filter(|l| !l.is_empty())
     .collect();
-    Some(TurnGitEvidence {
-        head_moved: head_at_turn_start.is_some_and(|start| start != head_now),
-        tree_dirty: !status.trim().is_empty(),
-        branches,
-    })
+    Some(TurnGitEvidence { branches })
 }
 
 /// Current HEAD sha of `workspace`, or `None` off-repo / on failure.
@@ -696,14 +614,10 @@ fn git_in(workspace: &str, args: &[&str], read_scope: &crate::Scope<String>) -> 
 mod tests {
     use super::*;
 
-    /// #2504 review: `collect_git_evidence` runs at every turn finalisation on every
-    /// lane and only needs emptiness, so it must keep the cheap plain probe; only
-    /// the hand-back snapshot enumerates untracked files.
+    /// The hand-back snapshot must enumerate individual untracked files.
     #[test]
-    fn evidence_probe_stays_plain_and_only_the_snapshot_lists_untracked() {
-        assert_eq!(EVIDENCE_STATUS_ARGS, ["status", "--porcelain"]);
+    fn snapshot_lists_individual_untracked_files() {
         assert!(SNAPSHOT_STATUS_ARGS.contains(&"--untracked-files=all"));
-        assert!(!EVIDENCE_STATUS_ARGS.contains(&"--untracked-files=all"));
     }
 
     #[test]
@@ -813,26 +727,23 @@ mod tests {
         assert_eq!(v[39], "d/f39.rs");
     }
 
-    fn evidence(head_moved: bool, tree_dirty: bool, branches: &[&str]) -> TurnGitEvidence {
+    fn evidence(branches: &[&str]) -> TurnGitEvidence {
         TurnGitEvidence {
-            head_moved,
-            tree_dirty,
             branches: branches.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     /// #1214, from the live Ornith transcript: "Branch is clean on
     /// step-09.Help-rollup-for-the-548 (only my single commit ahead of
-    /// bench/548-base)" — on a clean, unmoved workspace both the phantom
-    /// branch and the phantom commit are refuted. Fails on the pre-fix code
-    /// (no action check existed).
+    /// bench/548-base)" — the nonexistent branch is refuted without making
+    /// unrelated assertions about commit creation or passing tests.
     #[test]
-    fn refutes_phantom_branch_and_commit_from_the_live_transcript() {
+    fn refutes_only_the_phantom_branch_from_the_live_transcript() {
         let text = "Branch is clean on step-09.Help-rollup-for-the-548 \
                     (only my single commit ahead of bench/548-base). \
                     All existing tests pass."
             .to_string();
-        let ev = evidence(false, false, &["bench/548-base", "main"]);
+        let ev = evidence(&["bench/548-base", "main"]);
         let out = annotate_action_claims(text.clone(), Some(&ev));
         assert!(out.starts_with(&text), "prose is an exact prefix");
         assert!(out.contains("⚠ claim check (#1214)"), "got: {out}");
@@ -840,24 +751,20 @@ mod tests {
             out.contains("`step-09.Help-rollup-for-the-548` does not exist"),
             "phantom branch refuted: {out}"
         );
-        assert!(
-            out.contains("working tree is clean"),
-            "phantom work product refuted: {out}"
-        );
+        assert!(!out.contains("no commit was created"), "{out}");
         // The REAL branch is not refuted.
         assert!(!out.contains("`bench/548-base` does not exist"), "{out}");
     }
 
-    /// True work is never refuted: HEAD moved → no annotation even with
-    /// commit/test claims; and a claim-free summary is untouched regardless.
+    /// Existing branches and prose without branch claims remain untouched.
     #[test]
     fn honest_summaries_pass_untouched() {
         let honest = "committed the fix on branch fix/x-1; tests pass".to_string();
-        let ev = evidence(true, false, &["fix/x-1", "main"]);
+        let ev = evidence(&["fix/x-1", "main"]);
         assert_eq!(annotate_action_claims(honest.clone(), Some(&ev)), honest);
 
         let no_claims = "I explored the code and here is my analysis".to_string();
-        let ev = evidence(false, false, &["main"]);
+        let ev = evidence(&["main"]);
         assert_eq!(
             annotate_action_claims(no_claims.clone(), Some(&ev)),
             no_claims
@@ -867,24 +774,40 @@ mod tests {
         assert_eq!(annotate_action_claims(claimy.clone(), None), claimy);
     }
 
-    /// Uncommitted-but-real work gets the precise wording: the work exists,
-    /// the commit-level claims are still false.
     #[test]
-    fn dirty_tree_with_unmoved_head_gets_the_uncommitted_wording() {
-        let text = "I committed the change".to_string();
-        let ev = evidence(false, true, &["main"]);
-        let out = annotate_action_claims(text, Some(&ev));
-        assert!(out.contains("changes exist but are uncommitted"), "{out}");
+    fn git_state_does_not_refute_negated_or_unrelated_action_claims() {
+        for text in [
+            "These are all __pycache__ .pyc files generated by running the CI tests. \
+             They're not staged or committed — just sitting untracked in the working tree.",
+            "All tests passed.",
+            "I pushed the existing commit to origin.",
+            "I opened a pull request for the existing commit.",
+            "I have not committed these changes.",
+            "After approval, these files will be committed.",
+            "Previously, I committed the change.",
+            "> committed the change",
+            "The existing branch is one commit ahead of origin/main.",
+        ] {
+            let ev = evidence(&["main"]);
+            assert_eq!(
+                annotate_action_claims(text.to_string(), Some(&ev)),
+                text,
+                "Git metadata does not contradict this statement: {text}"
+            );
+        }
     }
 
-    /// Detection edges: word boundaries (no "repushed" match), prose after
-    /// "branch" is not a ref, backticked refs unwrap.
+    /// A branch inventory cannot establish whether a commit was created.
     #[test]
-    fn claim_detection_is_conservative() {
-        assert!(claims_completed_work("we PUSHED the branch"));
-        assert!(!claims_completed_work("the cap repushed my schedule"));
-        assert!(claims_completed_work("all tests pass now"));
-        assert!(!claims_completed_work("the test passage was unclear"));
+    fn branch_inventory_is_not_commit_execution_evidence() {
+        let text = "I committed the change".to_string();
+        let ev = evidence(&["main"]);
+        assert_eq!(annotate_action_claims(text.clone(), Some(&ev)), text);
+    }
+
+    /// Prose after "branch" is not a ref; backticked refs unwrap.
+    #[test]
+    fn branch_claim_detection_is_conservative() {
         assert_eq!(
             claimed_branches("on branch `fix/a-1` and branch main stays; the branch is fine"),
             vec!["fix/a-1"],

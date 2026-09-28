@@ -56,6 +56,12 @@ this closure before returning. It never reruns a call. Requests and ordinary
 transcript replacement refuse an incomplete batch. A same-process host must
 close abandoned work before starting another turn.
 
+After every call in a batch has a recorded delivery, a host may record an
+`await_operator` outcome for that batch's reply. This records a host approval
+handoff without inventing a model question verdict or granting authority.
+Ordinary model replies still require a question verdict; terminal outcomes
+cannot be replaced.
+
 Hosts can explicitly admit quoted legacy context with
 `record_historical_message`. It uses the existing observation journal with
 `Historical` origin and a fixed textual wire envelope. Historical material

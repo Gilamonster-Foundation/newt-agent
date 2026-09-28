@@ -302,6 +302,17 @@ pub fn impact_analysis(
     files: &[(String, String)],
     workspace: &Path,
 ) -> ImpactReport {
+    let coverage = std::fs::read_to_string(workspace.join("lcov.info")).ok();
+    impact_from_admitted(unit_or_symbol, model, files, coverage.as_deref())
+}
+
+/// Compute the report from previously admitted inputs; performs no filesystem IO.
+pub(crate) fn impact_from_admitted(
+    unit_or_symbol: &str,
+    model: &ProjectModel,
+    files: &[(String, String)],
+    coverage: Option<&str>,
+) -> ImpactReport {
     let name = unit_or_symbol.trim();
     let mut warnings = vec![
         "impact uses ProjectModel deps + regex import extraction — not a full call graph".into(),
@@ -349,10 +360,9 @@ pub fn impact_analysis(
     importers.sort();
     importers.dedup();
 
-    let lcov_path = workspace.join("lcov.info");
-    let lcov_lines = if lcov_path.is_file() {
+    let lcov_lines = if let Some(coverage) = coverage {
         Some(parse_lcov_summary(
-            &lcov_path,
+            coverage,
             unit.as_ref().map(|u| u.dir.as_str()),
         ))
     } else {
@@ -373,10 +383,7 @@ pub fn impact_analysis(
 }
 
 /// Minimal lcov summary: per-file LH/LF for paths under `dir_filter`.
-fn parse_lcov_summary(path: &Path, dir_filter: Option<&str>) -> Vec<(String, u32, u32)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
+fn parse_lcov_summary(text: &str, dir_filter: Option<&str>) -> Vec<(String, u32, u32)> {
     let mut out = Vec::new();
     let mut cur_file = String::new();
     let mut lh = 0u32;

@@ -36,7 +36,8 @@ fn the_greeting_reaches_explain_through_the_question_mark_fallback() {
     );
     // Not the `?`: the same greeting without one matches nothing at all and
     // falls through to the terminal `Act` arm. Pinned so a later attempt to
-    // "fix the `?` cliff" cannot silently hand a greeting execution authority.
+    // "fix the `?` cliff" does not silently change conversational style.
+    // Neither classification supplies execution authority.
     assert_eq!(
         PromptIntake::analyze("hello").disposition(),
         PromptDisposition::Act,
@@ -91,8 +92,8 @@ async fn the_greeting_turn_never_ships_a_sentence_to_read_aloud() {
     );
 }
 
-/// The turn the greeting BAT above cannot exercise: a request the lexicon
-/// misfiles as Explain, on which the model reaches for a write, is refused,
+/// The turn the greeting BAT above cannot exercise: a request classified as
+/// Explain in a session without write authority reaches for a write, is refused,
 /// then goes looking for an execution tool. Both of those results land on the
 /// model wire as tool results, which is the only place the refusal and the
 /// discovery note exist — a script that answers in one round never puts either
@@ -105,12 +106,13 @@ async fn the_greeting_turn_never_ships_a_sentence_to_read_aloud() {
 /// mechanism and that separates what may not be quoted from what must still
 /// be said.
 #[tokio::test]
-async fn a_refused_write_and_a_discovery_reach_the_wire_without_naming_the_mechanism() {
+async fn a_capability_refused_write_and_discovery_keep_style_out_of_authority() {
     let ws = tempfile::tempdir().expect("tempdir");
     let (_reply, _hallucinations, _end_reason, wire) = run_scenario_for(
         // Recorded as "could you add a line saying hello to README.md?", which
         // #2332 now routes to Act like its imperative. This phrasing still
-        // misfiles as Explain, which is the turn this BAT needs.
+        // classifies as Explain, which is the style this BAT needs. The shared
+        // fixture explicitly grants workspace reads but no writes or exec.
         "README.md could use a line saying hello?",
         PromptDisposition::Explain,
         ws.path(),
@@ -137,20 +139,19 @@ async fn a_refused_write_and_a_discovery_reach_the_wire_without_naming_the_mecha
     )
     .await;
 
-    // The refusal reached the model, names the tool, and says what to do
-    // with the gap: not quote the notice, and not pretend the write happened.
+    // The actual authority refusal reaches the model. Explain style neither
+    // denies the call nor hides another command interface from discovery.
     assert!(
-        wire.contains("Tool `write_file` is not available for this request."),
-        "the refusal must reach the model as a tool result: {wire}"
+        wire.contains("capability denied: fs_write"),
+        "the filesystem grant denial must reach the model as a tool result: {wire}"
     );
     assert!(
-        wire.contains("say plainly what remains undone; never claim it was done"),
-        "the refusal must require the honest answer, not silence"
+        !wire.contains("Tool `write_file` is not available for this request."),
+        "a question-shaped prompt must not act as a filesystem capability"
     );
-    // The discovery note reached the model and still coaches the handoff.
     assert!(
-        wire.contains("Catalog scope:") && wire.contains("direct action request"),
-        "the discovery scope note must reach the model as a tool result"
+        wire.contains("run_command") && !wire.contains("Catalog scope:"),
+        "command discovery stays available under the same session grants"
     );
     // None of the sentences that named the mechanism, or told the model it
     // had no move, or gagged it, are on the wire in either result.

@@ -224,7 +224,6 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
         "Updated src/definitely_not_present.rs and verified it.".to_string(),
         &workspace.path().to_string_lossy(),
         &crate::Scope::All,
-        None,
         &capability_check::Evidence::default(),
         None,
     );
@@ -394,7 +393,7 @@ fn read_only_call_classifies_simple_shell_probes() {
 
 #[test]
 fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
-    let nudge = read_only_action_nudge(3, 4, None, None);
+    let nudge = read_only_action_nudge(3, Some(4), None, None);
     assert!(nudge.contains("read-only rounds so far"), "{nudge}");
     assert!(nudge.contains("edit_file"), "{nudge}");
     assert!(nudge.contains("write_file"), "{nudge}");
@@ -404,21 +403,31 @@ fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
 }
 
 #[test]
+fn read_only_action_nudge_counts_only_fixed_rounds_after_the_current_round() {
+    for remaining in [0, 4] {
+        let nudge = read_only_action_nudge(3, Some(remaining), None, None);
+        assert!(nudge.contains(&format!(
+            "After this round, at most {remaining} further tool rounds remain under the configured hard limit."
+        )), "{nudge}");
+        assert!(!nudge.contains("round(s) left"), "{nudge}");
+    }
+    let renewable = read_only_action_nudge(3, None, None, None);
+    assert!(renewable.contains("read-only rounds so far"), "{renewable}");
+    assert!(renewable.contains("edit_file or write_file"), "{renewable}");
+    assert!(!renewable.contains("configured hard limit"), "{renewable}");
+    assert!(!renewable.contains("round(s) left"), "{renewable}");
+}
+
+#[test]
 fn workflow_action_nudges_honor_operator_stop_and_report_only_requests() {
     let ledger = SessionStepLedger::default();
     ledger.set_plan(&["finish the original task".into(), "verify it".into()]);
-    let step = Some("finish the original task");
     for nudge in [
         narration_action_nudge(),
         escalated_narration_action_nudge(2, 2, Some(&ledger)),
-        read_only_action_nudge(3, 2, None, None),
+        read_only_action_nudge(3, Some(2), None, None),
         pending_plan_completion_nudge(Some(&ledger), false, None).unwrap(),
         pending_plan_completion_nudge(Some(&ledger), true, None).unwrap(),
-        workflow_step_lock_nudge("error", 1, step),
-        workflow_rediscovery_nudge("error", step),
-        workflow_cap_grace_nudge("error", step, 4, 2),
-        workflow_post_write_grace_nudge("error", step, 4, 2),
-        workflow_progress_grace_nudge(step, 4, 2),
     ] {
         assert!(nudge.contains("latest operator instruction"), "{nudge}");
         assert!(nudge.contains("newer steering"), "{nudge}");
@@ -443,7 +452,7 @@ fn read_only_action_nudge_mentions_active_plan_when_present() {
             },
         ],
     });
-    let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger), None);
+    let nudge = read_only_action_nudge(3, Some(2), Some(&ledger as &dyn StepLedger), None);
     assert!(nudge.contains("active multi-step plan"), "{nudge}");
     assert!(nudge.contains("ACTIVE step"), "{nudge}");
     assert!(nudge.contains("latest operator instruction"), "{nudge}");
@@ -461,7 +470,7 @@ fn read_only_action_nudge_mentions_active_plan_when_present() {
 /// for, not just "stop reading, edit it yourself".
 #[test]
 fn read_only_action_nudge_includes_a_delegate_hint_when_offered() {
-    let nudge = read_only_action_nudge(3, 4, None, Some("consider calling crew or team"));
+    let nudge = read_only_action_nudge(3, Some(4), None, Some("consider calling crew or team"));
     assert!(nudge.contains("consider calling crew or team"), "{nudge}");
     // Still carries the original inline-action guidance too — delegation
     // is offered ALONGSIDE continuing directly, never in place of it.
@@ -470,7 +479,7 @@ fn read_only_action_nudge_includes_a_delegate_hint_when_offered() {
 
 #[test]
 fn read_only_action_nudge_omits_delegate_clause_when_none_offered() {
-    let nudge = read_only_action_nudge(3, 4, None, None);
+    let nudge = read_only_action_nudge(3, Some(4), None, None);
     assert!(!nudge.contains("crew"), "{nudge}");
     assert!(!nudge.contains("team"), "{nudge}");
 }

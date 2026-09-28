@@ -696,6 +696,7 @@ fn seatbelt_build_request_runs_cargo_and_denies_sibling_secret() {
         ws.path(),
         "/bin/sh",
         ["-c", "cargo --version && cargo test"],
+        &Scope::none(),
     )
     .timeout(std::time::Duration::from_secs(60));
     let out = ConstrainedExecutor::run(&request).unwrap();
@@ -708,6 +709,102 @@ fn seatbelt_build_request_runs_cargo_and_denies_sibling_secret() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
     assert!(!outside.path().join("write").exists());
+}
+
+/// Grounds `build_network_authority_preserves_granted_scope_and_filesystem_fence`
+/// with an actual compiler/build-script/test process tree. Positive controls
+/// prove the child runs, can write inside its workspace and can use the explicit
+/// network grant; sibling reads/writes must fail with a permission error.
+#[test]
+#[ignore = "real installed Rust toolchain, loopback socket and Seatbelt"]
+#[serial]
+fn seatbelt_operator_network_grant_keeps_build_filesystem_confined() {
+    use std::io::Read as _;
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let secret = outside.path().join("secret");
+    let forbidden = outside.path().join("write");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(&secret, "sentinel").unwrap();
+    std::fs::create_dir(ws.path().join("src")).unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"network-grant-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ws.path().join("src/lib.rs"),
+        "#[test] fn built_test_runs() { std::net::UdpSocket::bind(\"127.0.0.1:0\").unwrap(); }",
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("build.rs"), format!(r#"
+        fn main() {{
+            use std::io::{{ErrorKind, Write}};
+            assert_eq!(std::fs::read({secret:?}).unwrap_err().kind(), ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::write({forbidden:?}, b"poison").unwrap_err().kind(), ErrorKind::PermissionDenied);
+            std::fs::write("positive-control", b"workspace write allowed").unwrap();
+            std::net::TcpStream::connect({address:?}).unwrap().write_all(b"operator-granted").unwrap();
+        }}
+    "#, address = listener.local_addr().unwrap().to_string())).unwrap();
+    let request = newt_core::confined_exec::build_tool_request(
+        ws.path(),
+        ws.path(),
+        "cargo",
+        ["test", "--offline"],
+        &Scope::All,
+    )
+    .timeout(std::time::Duration::from_secs(90));
+    let out = ConstrainedExecutor::run(&request).expect("explicit network grant must be admitted");
+    assert_seatbelt(&out);
+    assert!(
+        out.success,
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("positive-control")).unwrap(),
+        "workspace write allowed"
+    );
+    assert!(!forbidden.exists());
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "sentinel");
+    listener.set_nonblocking(true).unwrap();
+    let (mut stream, _) = listener
+        .accept()
+        .expect("build script reached granted destination");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut received = String::new();
+    stream.read_to_string(&mut received).unwrap();
+    assert_eq!(received, "operator-granted");
+}
+
+/// Grounds the restricted cases of the build-network unit test against L3:
+/// unsupported network authority must never be promoted to an unrestricted
+/// grant to make a command run. The positive counterpart is the build test above.
+#[test]
+#[ignore = "real Seatbelt admission"]
+#[serial]
+fn seatbelt_build_without_unrestricted_network_grant_refuses_before_spawn() {
+    let ws = tempdir().unwrap();
+    for network in [Scope::none(), Scope::only(["example.test".into()])] {
+        let request = newt_core::confined_exec::build_tool_request(
+            ws.path(),
+            ws.path(),
+            "/bin/sh",
+            ["-c", "echo ran > forbidden-marker"],
+            &network,
+        );
+        let error = ConstrainedExecutor::run(&request).unwrap_err();
+        assert!(
+            matches!(&error, ExecRefused::ConfinementUnenforceable(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Net axis"), "{error}");
+        assert!(!ws.path().join("forbidden-marker").exists());
+    }
 }
 
 /// Grounds cancellation's pre-spawn unit check in a real started subprocess:
@@ -724,6 +821,7 @@ async fn seatbelt_async_build_cancellation_reaps_child() {
         ws.path(),
         "/bin/sh",
         ["-c", "echo $$ > pid; /bin/sleep 60"],
+        &Scope::none(),
     )
     .timeout(Duration::from_secs(10));
     let child = tokio::spawn(ConstrainedExecutor::run_async(request));

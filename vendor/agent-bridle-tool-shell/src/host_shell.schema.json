@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "cmd": {
+      "type": "string",
+      "description": "A command line run by the OS shell (`/bin/sh -c`) with the whole process tree inside the kernel filesystem jail. Full shell semantics — pipes, `$(...)`, loops — are allowed because the kernel, not a parser, bounds their filesystem reach. Requires exec+net to be unrestricted (else refused)."
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Environment for the child (no ambient inheritance)."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory (within fs_read)."
+    }
+  },
+  "required": ["cmd"]
+}

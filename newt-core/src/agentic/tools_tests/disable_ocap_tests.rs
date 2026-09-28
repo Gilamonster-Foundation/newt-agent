@@ -1136,11 +1136,10 @@ async fn yolo_keeps_the_tool_name_corrective_guard() {
 
 // --- facade P4 (#780): hidden tool-call routing dispatch ---------------
 
-/// A git stub that proves *which path served the call*: a routed
-/// `git status` lands here as op `status`; a routed write op would surface
-/// the unexpected-op error (so a test can assert it was NOT routed).
-struct RoutingStubGit;
-impl crate::agentic::GitTool for RoutingStubGit {
+/// Even when a legacy Git collaborator is installed, native shell commands
+/// must not dispatch through its narrower operation interface.
+struct UnexpectedEmbeddedGit;
+impl crate::agentic::GitTool for UnexpectedEmbeddedGit {
     fn dispatch(
         &self,
         op: &str,
@@ -1148,14 +1147,15 @@ impl crate::agentic::GitTool for RoutingStubGit {
         _caps: &crate::git_caveats::GitCaveats,
         _session: &Caveats,
     ) -> Result<String, String> {
-        match op {
-            "status" => Ok("on branch main (routed via git built-in)".to_string()),
-            other => Err(format!("unexpected routed git op '{other}'")),
-        }
+        panic!("native command reached the embedded Git operation {op}");
     }
 }
 
-async fn run_routed_with_git(command: &str, ws: &std::path::Path, caveats: &Caveats) -> String {
+async fn run_command_with_legacy_git(
+    command: &str,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+) -> String {
     execute_tool(
         "run_command",
         &serde_json::json!({ "command": command }),
@@ -1170,7 +1170,39 @@ async fn run_routed_with_git(command: &str, ws: &std::path::Path, caveats: &Cave
         None, // memory_source
         None, // permission_gate
         None, // exec_floor
-        Some(&RoutingStubGit as &dyn crate::agentic::GitTool),
+        Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await
+}
+
+#[cfg(target_os = "windows")]
+async fn run_command_with_legacy_git_and_gate(
+    command: &str,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+    permission_gate: &mut dyn super::PermissionGate,
+) -> String {
+    execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": command }),
+        &ws.to_string_lossy(),
+        false,
+        20,
+        caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        Some(permission_gate),
+        None, // exec_floor
+        Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
         None, // crew_runner
         None, // scratchpad_store
         None, // code_search
@@ -1317,24 +1349,79 @@ async fn routed_cat_goes_through_the_fs_floor_not_a_bypass() {
     );
 }
 
-/// Routing does not authorize the legacy engine's unbounded transitive reads.
-/// With unrestricted read authority it still needs no shell exec grant.
+/// Grounds the routing table's native-Git decision with a real repository:
+/// status observes an untracked file through the exec gate with scoped reads,
+/// no write grant, and explicitly granted network/exec authority.
 #[tokio::test]
-async fn routed_git_status_dispatches_through_the_git_builtin() {
+async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("native-only.txt"), "native evidence\n").unwrap();
     let mut caveats = caveats_no_exec(ws.path());
-    let denied = run_routed_with_git("git status", ws.path(), &caveats).await;
-    assert!(denied.contains("Git operation unavailable with scoped fs_read"));
-    caveats.fs_read = Scope::All;
-    assert_eq!(caveats.exec, Scope::none());
-    let out = run_routed_with_git("git status", ws.path(), &caveats).await;
+    caveats.fs_write = Scope::none();
+    caveats.net = Scope::All;
+    let denied = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
+    assert!(denied.contains("capability denied"), "{denied}");
     assert!(
-        out.contains("routed via git built-in"),
-        "git status must route to the governed git built-in; got: {out}"
+        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
     );
+    caveats.exec = Scope::All;
+    let out = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
+    #[cfg(target_os = "windows")]
+    {
+        assert!(
+            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+            "restricted AppContainer must refuse before native Git runs: {out}"
+        );
+        assert!(!out.contains("routed:"), "{out}");
+        assert!(!ws.path().join(".git/index").exists());
+    }
+    #[cfg(not(target_os = "windows"))]
+    assert!(
+        out.contains("native-only.txt"),
+        "native Git must report the actual untracked file: {out}"
+    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert!(!out.contains("routed:"), "{out}");
+        assert!(!ws.path().join(".git/index").exists());
+    }
+}
+
+/// The documented operator-controlled host route is intentionally distinct
+/// from the restricted AppContainer path: it preserves ordinary native Git
+/// behavior rather than silently widening a confined invocation.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn windows_disable_ocap_keeps_native_git_available() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("native-only.txt"), "host route evidence\n").unwrap();
+    let out =
+        run_command_with_legacy_git("git status", ws.path(), &caveats_no_exec(ws.path())).await;
+    assert!(out.contains("native-only.txt"), "{out}");
+    assert!(
+        !out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the explicit host route must not take the AppContainer refusal: {out}"
+    );
+    assert!(!out.contains("routed:"), "{out}");
 }
 
 /// #1022: `run_command("rm file")` routes to the governed delete_file arm,
@@ -1361,24 +1448,121 @@ async fn routed_rm_dispatches_through_delete_file() {
     );
 }
 
-/// TDD: state-modifying `git add` is GATED as exec — NOT silently routed
-/// (owner decision 2). It never reaches the git built-in (no unexpected-op
-/// error from the stub); it falls through to the normal run_command path.
+/// The same exec boundary governs mutations: denial creates no index. On
+/// Windows, restricted AppContainer reports the documented pre-spawn native
+/// Git incompatibility; other platforms stage the real file.
 #[tokio::test]
 async fn state_modifying_git_add_is_not_routed() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = caveats_no_exec(ws.path());
-    let out = run_routed_with_git("git add a.txt", ws.path(), &caveats).await;
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("stage-me.txt"), "stage this file\n").unwrap();
+    let mut caveats = caveats_no_exec(ws.path());
+    caveats.net = Scope::All;
+    let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
+    assert!(denied.contains("capability denied"), "{denied}");
+    assert!(
+        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
+    );
+    assert!(!ws.path().join(".git/index").exists());
+    caveats.exec = Scope::All;
+    let out = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
     assert!(
         !out.contains("routed"),
         "git add must NOT route to the git built-in; got: {out}"
     );
-    // It falls through to the run_command path (git ∈ DIRECT_TOOL_NAMES ⇒
-    // the existing corrective guard), never silently routed.
-    assert!(out.contains("is a tool, not a shell command"), "got: {out}");
+    let staged =
+        crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .output()
+            .unwrap();
+    assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
+    #[cfg(target_os = "windows")]
+    {
+        assert!(
+            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+            "restricted AppContainer must refuse before native Git runs: {out}"
+        );
+        assert!(!ws.path().join(".git/index").exists());
+        assert_eq!(
+            String::from_utf8(staged.stdout).unwrap().trim(),
+            "",
+            "the unavailable command must not stage the file: {out}"
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    assert_eq!(
+        String::from_utf8(staged.stdout).unwrap().trim(),
+        "stage-me.txt",
+        "native dispatch must actually stage the file: {out}"
+    );
+}
+
+/// An interactive exec grant retries once with the freshly minted caveats. On
+/// Windows that retry must still fail before native Git reaches AppContainer.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn native_git_exec_grant_retry_is_refused_before_spawn() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("retry-me.txt"), "retry evidence\n").unwrap();
+
+    struct GrantExecGate {
+        requests: Vec<super::PermissionRequest>,
+        granted: Caveats,
+    }
+    impl super::PermissionGate for GrantExecGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.requests.extend_from_slice(requests);
+            super::PermissionDecision::Allow(self.granted.clone())
+        }
+        fn ask_question(&mut self, _: &str) -> super::HumanQuestionOutcome {
+            super::HumanQuestionOutcome::Unavailable
+        }
+    }
+
+    let mut caveats = caveats_no_exec(ws.path());
+    caveats.net = Scope::All;
+    let mut granted = caveats.clone();
+    granted.exec = Scope::All;
+    let mut gate = GrantExecGate {
+        requests: vec![],
+        granted,
+    };
+    let out = run_command_with_legacy_git_and_gate(
+        "git add retry-me.txt",
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert!(
+        out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the post-grant retry must be refused before native Git runs: {out}"
+    );
+    assert_eq!(gate.requests.len(), 1, "{out}");
+    assert_eq!(gate.requests[0].kind, super::DenialKind::Exec, "{out}");
+    assert_eq!(gate.requests[0].target, "git", "{out}");
+    assert!(
+        !ws.path().join(".git/index").exists(),
+        "the refused retry must not stage a file: {out}"
+    );
 }
 
 /// F5 (§7-F5): `--no-route` bypasses routing but NEVER disables L3. With
@@ -1785,6 +1969,75 @@ async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
         !out.contains("UNDEFINED_VAR_1`"),
         "only the last 10 lines should remain: {out}"
     );
+}
+
+/// A requested tail is a view of the captured build, not permission to discard
+/// earlier diagnostics. Recover an omitted error through the normal spill API.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_trimmed_build_retains_full_diagnostics_for_retrieval() {
+    use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
+    use crate::agentic::memory_fetch::{execute_memory_fetch, StoreMemorySource};
+
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_failing_scratch_crate(root.path());
+    let spill = SessionSpillStore::new([19u8; 16]);
+    let out = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "cargo check 2>&1 | tail -10; echo \"EXIT: $?\""}),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut NoMcp,
+        ToolCollaborators {
+            spill_store: Some(&spill),
+            ..Default::default()
+        },
+        true,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(out.contains("error: command exited 1"), "{out}");
+    assert!(out.contains("output trimmed to the last 10 lines"), "{out}");
+    assert!(out.contains("UNDEFINED_VAR_20"), "{out}");
+    assert!(
+        !out.contains("UNDEFINED_VAR_1`"),
+        "tail must stay selected: {out}"
+    );
+    let handle = out
+        .split("spill:")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("trimmed build must expose the existing full-output retrieval handle");
+    let cid = SpillCid::parse(handle).unwrap();
+    let full = spill
+        .fetch(&cid)
+        .expect("retained build output")
+        .redacted_text;
+    assert!(
+        full.contains("UNDEFINED_VAR_1`"),
+        "first error was lost: {full}"
+    );
+    assert!(
+        full.contains("UNDEFINED_VAR_20"),
+        "last error was lost: {full}"
+    );
+
+    let source = StoreMemorySource::from_stores(None, None).with_spill_store(&spill);
+    let recovered = execute_memory_fetch(
+        &serde_json::json!({"address": format!("spill:{handle}"), "grep": "UNDEFINED_VAR_1`"}),
+        &source,
+        false,
+        20,
+    );
+    assert!(recovered.contains("UNDEFINED_VAR_1`"), "{recovered}");
 }
 
 /// F27 (r14a evidence): the twin hazard to the `| tail` case above — a
@@ -2246,6 +2499,8 @@ async fn confined_python3_runs_on_macos() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats {
         exec: Scope::only(["python3".to_string()]),
+        // Exercise the executable fence; macOS cannot admit restricted networking.
+        net: Scope::All,
         ..caveats_no_exec(ws.path())
     };
     let out = run_tool(
@@ -2272,6 +2527,9 @@ async fn confined_git_ignores_ambient_config_and_carries_the_agent_identity() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats {
         exec: Scope::only(["git".to_string()]),
+        // Exercise Git identity/config isolation without an unsupported net floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
         ..caveats_no_exec(ws.path())
     };
     let out = run_tool(

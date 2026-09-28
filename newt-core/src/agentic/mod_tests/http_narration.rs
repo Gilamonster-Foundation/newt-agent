@@ -347,9 +347,10 @@ async fn completed_check_report_after_tool_reads_keeps_completed_end_reason() {
 }
 
 #[tokio::test]
-async fn readonly_completion_retries_an_unfinished_promise_without_action_authority() {
+async fn explanation_completion_retries_a_promise_without_restricting_session_authority() {
     // The branch-count incident ended after eighteen reads with only "Let me
-    // check...". A read-only boundary must not turn that promise into an answer.
+    // check...". A response style must not turn that promise into an answer or
+    // remove the operator's existing tool authority.
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -405,7 +406,7 @@ async fn readonly_completion_retries_an_unfinished_promise_without_action_author
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
         assert!(
-            !names.contains(&"write_file") && !names.contains(&"run_command"),
+            names.contains(&"write_file") && names.contains(&"run_command"),
             "{names:?}"
         );
     }
@@ -515,7 +516,6 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
         false,
         workspace.path().to_str().unwrap(),
         &crate::Scope::All,
-        None,
         &capability_check::Evidence::default(),
         Some(&filter),
     );

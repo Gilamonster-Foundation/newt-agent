@@ -20,7 +20,6 @@ async fn scoped_act_git_discovery_does_not_advertise_legacy_operations() {
         Scope::All,
         Scope::only([ws.path().to_string_lossy().into_owned()]),
     ] {
-        let scoped = fs_read != Scope::All;
         let caveats = Caveats {
             fs_read,
             ..Caveats::top()
@@ -44,8 +43,8 @@ async fn scoped_act_git_discovery_does_not_advertise_legacy_operations() {
         .await
         .expect("legacy fixture has no durable writer")
         .unwrap();
-        assert_eq!(out.contains("git — List and count"), scoped, "{out}");
-        assert_eq!(out.contains("git — Run a git operation"), !scoped, "{out}");
+        assert!(out.contains("- run_command —"), "{out}");
+        assert!(!out.contains("- git —"), "legacy Git stays internal: {out}");
     }
 }
 
@@ -84,7 +83,7 @@ fn git_catalog_intersects_read_scope_with_prompt_disposition() {
                 assert!(git.is_none());
             } else {
                 let ops = &git.unwrap()["function"]["parameters"]["properties"]["op"]["enum"];
-                if scope != Scope::All || disposition != PromptDisposition::Act {
+                if scope != Scope::All || disposition == PromptDisposition::Plan {
                     assert_eq!(ops, &serde_json::json!(["branch-list"]));
                 } else {
                     assert!(ops

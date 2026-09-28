@@ -158,14 +158,11 @@ impl InitiativeRounds {
     }
 }
 
-/// `[initiative.no_progress]`: the no-progress brake (U4b). After a turn's first
-/// successful workspace write, `steer_after` consecutive completed rounds that
-/// change nothing and run no passing `lifecycle` test/check inject one steer, and
-/// `stop_after` end the turn (`TurnEndReason::NoProgress`). `0` disables that
-/// half. Data, not constants: a task that legitimately polls long builds retunes
-/// it in config. The defaults, 8 / 12, are sized to the dispatcher's
-/// `--max-rounds 15-20` (a larger `stop_after` could never fire inside such a
-/// run); a run with a bigger cap can raise them.
+/// `[initiative.no_progress]`: consecutive completed rounds without fresh
+/// evidence, an observed workspace change, or a newly verified check. Applies
+/// before and after writes. `steer_after` injects one optional steer and
+/// `stop_after` ends the turn (`TurnEndReason::NoProgress`), even when action
+/// nudges are disabled. `0` disables the corresponding half. Defaults: 8 / 12.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NoProgressRounds {

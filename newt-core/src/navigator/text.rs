@@ -11,7 +11,7 @@ use crate::agentic::semantic::EvidenceKind;
 
 use super::{NavHit, NavResult};
 
-const MAX_HITS: usize = 200;
+pub(crate) const MAX_HITS: usize = 200;
 
 /// One lexical line hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +105,16 @@ pub fn text_search_scoped(
         result.complete = false;
         result.warnings.push(format!("search error: {e}"));
     }
+    finish_text_search(q, &re, hits, result)
+}
+
+/// Render lexical evidence collected through either an operator or admitted reader.
+pub(crate) fn finish_text_search(
+    q: &str,
+    re: &Regex,
+    hits: Vec<TextHit>,
+    mut result: NavResult,
+) -> NavResult {
     result.candidates = hits.len();
     if hits.len() >= MAX_HITS {
         result.complete = false;
@@ -121,7 +131,7 @@ pub fn text_search_scoped(
     let mut quoted_only_hits = 0usize;
     let total_hits = hits.len();
     for h in hits {
-        let quoted = matches_only_inside_string_literals(&re, &h.line);
+        let quoted = matches_only_inside_string_literals(re, &h.line);
         if quoted {
             quoted_only_hits += 1;
         }
@@ -229,19 +239,24 @@ fn search_file(
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/");
+    search_contents(&rel, &content, re, hits);
+    Ok(())
+}
+
+/// Match already admitted bytes without opening another path.
+pub(crate) fn search_contents(relative: &str, content: &str, re: &Regex, hits: &mut Vec<TextHit>) {
     for (i, line) in content.lines().enumerate() {
         if hits.len() >= MAX_HITS {
             break;
         }
         if re.is_match(line) {
             hits.push(TextHit {
-                path: rel.clone(),
+                path: relative.to_owned(),
                 line_number: i + 1,
                 line: line.to_string(),
             });
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
