@@ -981,8 +981,47 @@ fn verified_staged(path: &Path) -> Option<StagedHost> {
 /// # Errors
 /// The staging file exists but could not be removed.
 pub fn unstage_host(config_path: &Path, peer_agent_fingerprint: &str) -> anyhow::Result<()> {
-    let path = staged_dir(config_path).join(format!("{peer_agent_fingerprint}.toml"));
-    match std::fs::remove_file(path) {
+    let dir = staged_dir(config_path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    remove_staged(&dir, peer_agent_fingerprint)
+}
+
+/// Promote the staged host `peer_agent_fingerprint` under the pairing its
+/// operator compared, `transcript_id`: `approve` signs the approval, and the
+/// staged record is consumed. All of it holds the staging lock the pairing
+/// steps take, so the host cannot pair again between the check and the
+/// signature, and a newer pairing is never consumed in the old one's place.
+/// Lock order: staging, then (inside `approve`) the registry.
+///
+/// # Errors
+/// The host is no longer staged or no longer holds that pairing — nothing is
+/// signed and the record is left as it is — or `approve` fails, or the staged
+/// record cannot be removed.
+pub fn promote_staged_host<T>(
+    config_path: &Path,
+    peer_agent_fingerprint: &str,
+    transcript_id: &str,
+    approve: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let dir = staged_dir(config_path);
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    let held = read_staged(&dir, std::time::SystemTime::now(), false)
+        .into_iter()
+        .find(|host| host.peer_agent_fingerprint == peer_agent_fingerprint)
+        .and_then(|host| host.pairing());
+    if held.is_none_or(|p| p.transcript_id != transcript_id) {
+        anyhow::bail!("the host no longer holds the pairing compared; nothing was approved");
+    }
+    let approved = approve()?;
+    remove_staged(&dir, peer_agent_fingerprint)?;
+    Ok(approved)
+}
+
+fn remove_staged(dir: &Path, peer_agent_fingerprint: &str) -> anyhow::Result<()> {
+    match std::fs::remove_file(dir.join(format!("{peer_agent_fingerprint}.toml"))) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
     }
@@ -1760,6 +1799,52 @@ mod tests {
         );
         stage_host(&config, &host, "nuc1", &[8; 32], at(1)).unwrap();
         assert_eq!(live().pairing(), None, "another hub's staging starts over");
+    }
+
+    /// A staged host is promoted only under the pairing its operator compared,
+    /// and atomically: a pairing step that races the promotion waits for it,
+    /// then finds the record consumed rather than re-pairing a host whose old
+    /// pairing is being signed (#2616).
+    #[test]
+    fn a_staged_host_is_promoted_only_under_the_pairing_compared_and_atomically() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let (host, now) = ([7u8; 32], std::time::SystemTime::now());
+        let fp = agent_fingerprint_of_pubkey(&host);
+        let step = |s| pair_staged_host(&config, &host, &HUB, s, [6; 16], now);
+        stage_host(&config, &host, "nuc1", &HUB, now).unwrap();
+        step(PairingStep::Commit(pairing_commitment(
+            &HUB, &host, &[5; 16],
+        )))
+        .unwrap();
+        step(PairingStep::Reveal([5; 16])).unwrap();
+        let compared = staged_hosts(&config, now)[0].pairing().unwrap();
+
+        let refused = promote_staged_host(&config, &fp, "another", || -> anyhow::Result<()> {
+            panic!("nothing is signed under a pairing the host does not hold")
+        });
+        assert!(refused.is_err());
+        assert_eq!(staged_hosts(&config, now).len(), 1, "the record is left");
+
+        let (started, racing) = std::sync::mpsc::channel();
+        let promoted = promote_staged_host(&config, &fp, &compared.transcript_id, || {
+            let config = config.clone();
+            let race = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let commit = PairingStep::Commit(pairing_commitment(&HUB, &host, &[8; 16]));
+                pair_staged_host(&config, &host, &HUB, commit, [6; 16], now)
+            });
+            racing.recv().unwrap();
+            // Long enough for an unlocked step to land before the signature.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(race)
+        })
+        .unwrap();
+        assert!(
+            promoted.join().unwrap().is_err(),
+            "the racing step waited, then found the host promoted"
+        );
+        assert!(staged_hosts(&config, now).is_empty(), "consumed");
     }
 
     fn at(secs: u64) -> std::time::SystemTime {

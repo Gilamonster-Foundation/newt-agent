@@ -301,7 +301,11 @@ dock; `pubkey_words` stays as a display of each key.
 - *One pairing, held by the hub.* Every reply names the transcript id of the pairing the hub
   holds for the host: its staged pairing, or else the one its approval was signed under. A host
   withdraws a code the hub no longer holds (expired, replaced or forgotten) and pairs again.
-  Each confirmation re-checks, after "yes", that the pairing compared is still the one held.
+  Each confirmation re-checks, after "yes", that the pairing compared is still the one held. On
+  the hub the check, the signature and consuming the staged record hold the staging lock the
+  pairing steps take (`promote_staged_host`), so a racing step cannot slip between them.
+- *Restart.* Re-docking restarts the host under the same key against a hub that kept running.
+  That relies on agent-mesh sequencing each sender above its predecessor (agent-mesh#100).
 - *Confirmation on both ends before either side is approved.* The host (`newt-mesh dock`) shows
   the code and writes its approval of the hub only on "yes" at its terminal; the hub keeps the
   exchange with the staged host, and `newt dock approve --staged` recomputes the code, shows it,

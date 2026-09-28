@@ -136,13 +136,6 @@ fn staged_host(config_path: &Path, prefix: &str) -> anyhow::Result<dock_registry
     }
 }
 
-/// Whether the staged host `peer_fp` still holds `pairing`: the host may pair
-/// afresh while the operator compares codes, and only the code compared may
-/// be approved.
-fn pairing_still_held(config_path: &Path, peer_fp: &str, pairing: &dock_registry::Pairing) -> bool {
-    staged_host(config_path, peer_fp).is_ok_and(|host| host.pairing().as_ref() == Some(pairing))
-}
-
 fn config_path(config: Option<&Path>) -> anyhow::Result<PathBuf> {
     config
         .map(Path::to_path_buf)
@@ -234,30 +227,38 @@ fn run_approve(
         window.notice("dock approval declined; nothing changed")?;
         return Ok(1);
     }
-    if pairing.is_some_and(|p| !pairing_still_held(&config_path, &peer_fp, p)) {
-        window.notice("the host paired again while you compared codes; nothing changed")?;
-        return Ok(1);
-    }
 
-    match dock_registry::approve_dock(
-        &config_path,
-        &peer_fp,
-        label,
-        pubkey_hex.trim(),
-        scope,
-        // A paired host's approval commits to the pairing transcript.
-        pairing.map_or(&ceremony.transcript_id, |p| &p.transcript_id),
-        &root_key,
-    ) {
+    // A paired host's approval commits to the pairing transcript, and is
+    // signed only while the host still holds the pairing compared.
+    let approve = |transcript_id: &str| {
+        dock_registry::approve_dock(
+            &config_path,
+            &peer_fp,
+            label,
+            pubkey_hex.trim(),
+            scope,
+            transcript_id,
+            &root_key,
+        )
+    };
+    let approved = match pairing {
+        Some(p) => {
+            dock_registry::promote_staged_host(&config_path, &peer_fp, &p.transcript_id, || {
+                approve(&p.transcript_id)
+            })
+        }
+        None => approve(&ceremony.transcript_id).inspect(|_| {
+            // A host approved by key needs no staged entry either.
+            let _ = dock_registry::unstage_host(&config_path, &peer_fp);
+        }),
+    };
+    match approved {
         Ok(path) => {
             window.notice(&format!(
                 "approved `{label}` ({}) → {}",
                 &peer_fp[..16.min(peer_fp.len())],
                 path.display()
             ))?;
-            if let Err(error) = dock_registry::unstage_host(&config_path, &peer_fp) {
-                window.notice(&format!("(could not clear its staged entry: {error})"))?;
-            }
             Ok(0)
         }
         Err(error) => {
@@ -429,38 +430,6 @@ mod tests {
         assert_eq!(parse_pubkey(&hex).unwrap(), [0xaau8; 32]);
         assert!(parse_pubkey("short").is_err());
         assert!(parse_pubkey(&"zz".repeat(32)).is_err());
-    }
-
-    /// Only the pairing the operator compared may be approved: once the host
-    /// pairs afresh, or its staging lapses, the compared one is not held (#2616).
-    #[test]
-    fn only_the_pairing_still_held_may_be_approved() {
-        use dock_registry::{pair_staged_host, pairing_commitment, PairingStep};
-        let dir = tempfile::TempDir::new().unwrap();
-        let config = dir.path().join("config.toml");
-        let (host, hub, now) = ([1; 32], [9; 32], std::time::SystemTime::now());
-        let fp = dock_registry::agent_fingerprint_of_pubkey(&host);
-        let pair = |nonce: [u8; 16]| {
-            let commit = PairingStep::Commit(pairing_commitment(&hub, &host, &nonce));
-            pair_staged_host(&config, &host, &hub, commit, [7; 16], now).unwrap();
-            pair_staged_host(
-                &config,
-                &host,
-                &hub,
-                PairingStep::Reveal(nonce),
-                [7; 16],
-                now,
-            )
-            .unwrap();
-            staged_host(&config, &fp).unwrap().pairing().unwrap()
-        };
-        dock_registry::stage_host(&config, &host, "nuc1", &hub, now).unwrap();
-        let compared = pair([5; 16]);
-        assert!(pairing_still_held(&config, &fp, &compared));
-        pair([6; 16]);
-        assert!(!pairing_still_held(&config, &fp, &compared), "re-paired");
-        dock_registry::unstage_host(&config, &fp).unwrap();
-        assert!(!pairing_still_held(&config, &fp, &compared), "unstaged");
     }
 
     #[test]

@@ -1547,50 +1547,54 @@ mod tests {
             "the hub's approval commits to the same pairing"
         );
 
-        // A host the hub approves but that does not approve the hub — revoked
-        // on the host only — still pairs, to re-approve it; approved by the
-        // hub only, it refuses the hub (#2616).
-        let spare_dir = tempfile::tempdir().unwrap();
-        user.save(&spare_dir.path().join("identity.pem")).unwrap();
-        let spare_agent = dock_agent(&user, DockRole::Host, "nuc3");
-        let (spare_fp, spare_pubkey) = (spare_agent.fingerprint(), spare_agent.public_bytes());
-        approve_caller_under(
+        // Revoked on the host only, the host undocks. Restarted under the same
+        // key against the hub that kept running, it pairs afresh although the
+        // hub still approves it — and, approved by the hub only, it refuses the
+        // hub (#2616; the restart needs agent-mesh#100's sequence floor).
+        registry::revoke_dock_with_identity(&host_config, &host_identity, &hub_fp).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            host.reached(crate::uplink::UplinkState::Undocked),
+        )
+        .await
+        .expect("a host undocks itself once its hub is revoked");
+        host.close().await;
+        let mut host = crate::DockUplink::start(
             &user,
-            hub_dir.path(),
-            &spare_pubkey,
-            DockScope::Mirror,
-            "an-earlier-pairing",
-        );
-        let mut spare = crate::DockUplink::start(
-            &user,
-            "nuc3",
-            spare_dir.path().to_path_buf(),
+            "nuc2",
+            host_dir.path().to_path_buf(),
             loopback(hub_pubkey, hub.local_port()),
         )
         .await
         .unwrap();
         let repaired = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Some(p) = spare.pairing() {
+                if let Some(p) = host.pairing() {
                     return p;
                 }
-                spare.changed().await;
+                host.changed().await;
             }
         })
         .await
-        .expect("a host pairs with a hub that already approves it");
+        .expect("the restarted host pairs again with a hub that still approves it");
+        assert_ne!(repaired.transcript_id, pairing.transcript_id);
         let restaged = registry::staged_hosts(&hub_config, std::time::SystemTime::now());
         assert_eq!(
             restaged[0].pairing(),
             Some(repaired.clone()),
-            "the hub shows the same code"
+            "the hub shows the same new code"
         );
-        let refused = hub.list_sessions(DockPeer::Uplink(spare_fp)).await;
+        wait_served().await;
+        let refused = hub.list_sessions(DockPeer::Uplink(host_fp)).await;
         assert!(
             format!("{refused:?}").contains("not an approved dock"),
             "approved by the hub only, the host refuses it: {refused:?}"
         );
-        spare.close().await;
+        approve_hub(&repaired.transcript_id);
+        assert!(
+            hub.list_sessions(DockPeer::Uplink(host_fp)).await.is_ok(),
+            "re-approved under the new pairing, the host serves the hub again"
+        );
 
         // The kill switch closes every uplink: the host undocks itself.
         std::fs::write(host_dir.path().join(DOCK_DISABLED_MARKER), b"").unwrap();
