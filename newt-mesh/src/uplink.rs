@@ -192,7 +192,12 @@ impl DockUplink {
             pubkey: agent.public_bytes(),
             instance: instance.to_owned(),
         };
-        let bus = Bus::bind_outbound_only(user, agent).await?;
+        // Reserved in the host's store, so a hub that outlives this uplink
+        // still admits the next one under this key (agent-mesh#100).
+        let reservations = agent_mesh_bus::FileSequenceReservations::new(
+            state_dir.join(format!("dock-sequence-{}", agent.fingerprint().hex())),
+        );
+        let bus = Bus::bind_outbound_only_reserving(user, agent, Arc::new(reservations)).await?;
         let local_port = bus.local_port();
         let (stop, stopped) = oneshot::channel();
         let (state_tx, state) = watch::channel(UplinkState::Polling);

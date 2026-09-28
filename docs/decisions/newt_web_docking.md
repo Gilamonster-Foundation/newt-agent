@@ -305,7 +305,9 @@ dock; `pubkey_words` stays as a display of each key.
   the hub the check, the signature and consuming the staged record hold the staging lock the
   pairing steps take (`promote_staged_host`), so a racing step cannot slip between them.
 - *Restart.* Re-docking restarts the host under the same key against a hub that kept running.
-  That relies on agent-mesh sequencing each sender above its predecessor (agent-mesh#100).
+  The host's uplink reserves its envelope sequences durably in its state dir (agent-mesh
+  `bind_outbound_only_reserving`, agent-mesh#100), so its successor starts above them. A hub
+  that restarts while its hosts keep running needs the same treatment; that is a follow-up.
 - *Confirmation on both ends before either side is approved.* The host (`newt-mesh dock`) shows
   the code and writes its approval of the hub only on "yes" at its terminal; the hub keeps the
   exchange with the staged host, and `newt dock approve --staged` recomputes the code, shows it,
