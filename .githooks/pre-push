@@ -16,6 +16,15 @@
 #     tag-only artifact assembly/publication, which this hook does not perform.
 #   - .github/workflows/harness-python.yml is a declared real-resource lane (uv + CPython), deliberately outside hook parity; `just harness-python` mirrors it.
 #   - .github/workflows/newt-tui-pty.yml is a declared real-resource lane (real PTYs and subprocesses; its cockpit steps run the `#[ignore]`d PTY tests with `--include-ignored`), deliberately outside hook parity; nothing here mirrors it.
+#   - .github/workflows/mcp-import-real.yml is a declared real-resource lane
+#     (weekly + release-gate + workflow_dispatch, not per-push), deliberately
+#     outside hook parity. Its two #2596 net-scope steps
+#     (`stdio_spawn_under_net_none_does_not_l3_bound_refuse` and
+#     `stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused`,
+#     both `newt-mcp-client --lib`, Linux-only, real confined stdio subprocess)
+#     ground the `caveats::spawn_net_scope` mock-free — run them locally with
+#     `cargo test -p newt-mcp-client --lib stdio_spawn_under -- --ignored
+#     --test-threads=1` before relying on this hook alone for that change.
 #   - The feature list passed to clippy and to cargo test must MATCH:
 #     `--features newt-data/kernel,newt-interaction/schema`. Linting without
 #     a feature the tests enable hides feature-gated lint regressions, which

@@ -769,9 +769,15 @@ fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
 /// declared it in their config, so *spawning it* must not require its command in
 /// the session's exec allow-list (the agent never chose to run it). Only the
 /// command itself is granted — the child's RUNTIME authority stays exactly the
-/// session leash: `fs_write` remains Landlock-enforced, and `net` / the exec of
-/// anything the server itself spawns are unchanged. An `exec: All` leash is
+/// session leash: `fs_write` remains Landlock-enforced, and the exec of
+/// anything the server itself spawns is unchanged. An `exec: All` leash is
 /// already unrestricted, so it is left untouched.
+///
+/// `net` is the one axis narrowed, not left as-is: a host-scoped session
+/// `net` grant is `Unknown` to agent-bridle 0.8's Linux admission and refuses
+/// the WHOLE spawn (L3 BOUND), and a stdio child can't bind a host
+/// allow-list either way (see `caveats::spawn_net_scope`). `Scope::All` and
+/// `Scope::none()` still pass through unchanged.
 #[cfg(unix)]
 fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     use newt_core::caveats::Scope;
@@ -779,6 +785,12 @@ fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     if let Scope::Only(ref mut set) = caveats.exec {
         set.extend([command.to_string()]);
     }
+    // #2596 round 3: same narrowing as the shell dispatch site
+    // (`newt_core::agentic::tools::shell::dispatch_caveats_for_command`) — a
+    // host-scoped session `net` grant is `Unknown` to agent-bridle 0.8's
+    // admission on Linux and refuses the whole spawn (L3 BOUND). Narrow to
+    // `net: none`, which the `DenyDirect` sandbox policy below can bind.
+    caveats.net = newt_core::caveats::spawn_net_scope(&caveats.net);
     caveats
 }
 
