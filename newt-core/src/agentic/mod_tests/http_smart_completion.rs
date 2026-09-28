@@ -1097,3 +1097,196 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
         "the re-ask's continue, then the stop's incomplete: {outcomes:?}"
     );
 }
+
+/// The arming `write_file` targets a scope-permitted absolute path, but this
+/// suite's `ctx()` sets no `permission_gate`, and a write with no gate to
+/// consult is refused. Grant every request unconditionally under the caller's
+/// own `Caveats::top()` so the arming write actually lands, in addition to
+/// asserting the workspace-change/turn-completion behavior these fixtures
+/// exist to pin.
+struct AllowEverything(Caveats);
+
+impl crate::PermissionGate for AllowEverything {
+    fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
+        crate::HumanQuestionOutcome::Answer("y".to_string())
+    }
+
+    fn ask(&mut self, _requests: &[crate::PermissionRequest]) -> crate::PermissionDecision {
+        crate::PermissionDecision::Allow(self.0.clone())
+    }
+}
+
+// ---- #2618/F46: run_command shell writes must count toward the brake -------
+
+/// Round 0 is a `write_file` (arms the brake); every round after that is a
+/// `run_command` writing via `>` shell redirection (never `write_file`/
+/// `edit_file`), for `rounds` rounds; then a final plain-text reply. Every
+/// generated path is absolute, inside the caller's owned `workspace`
+/// TempDir, and shell-quoted through the existing [`crate::mcp::shell_quote_arg`]
+/// helper — under `Caveats::top()` the confined shell dispatch does not chdir
+/// into the resolved workspace cwd for a plain `>` redirect (#2618 review),
+/// so a bare relative filename lands in the test binary's actual process cwd
+/// (the crate root) instead of the tempdir.
+struct RunCommandWrites {
+    n: std::sync::atomic::AtomicUsize,
+    rounds: usize,
+    workspace: std::path::PathBuf,
+}
+
+impl wiremock::Respond for RunCommandWrites {
+    fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+        let n = self.n.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            let arm_path = self.workspace.join("arm.txt");
+            let call = serde_json::json!({
+                "id": "c0", "type": "function",
+                "function": {"name": "write_file",
+                    "arguments": serde_json::json!({
+                        "path": arm_path.to_string_lossy(),
+                        "content": "x\n",
+                    }).to_string()}
+            });
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                    "finish_reason": "tool_calls"}]
+            }));
+        }
+        if n > self.rounds {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop"}]
+            }));
+        }
+        let target = self.workspace.join(format!("out_{n}.txt"));
+        let quoted = crate::mcp::shell_quote_arg(&target.to_string_lossy());
+        let call = serde_json::json!({
+            "id": format!("c{n}"),
+            "type": "function",
+            "function": {"name": "run_command",
+                "arguments": serde_json::json!({
+                    "command": format!("echo {n} > {quoted}"),
+                }).to_string()}
+        });
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                "finish_reason": "tool_calls"}]
+        }))
+    }
+}
+
+/// #2620 round 1 review finding 1: the real-loop smoke test below proves the
+/// turn completes, but a second, independent progress channel
+/// (`WorkflowRuntimeState::record_observation`, which credits each
+/// `run_command`'s distinct result bytes) can mask a broken workspace-change
+/// channel on its own — the brake never trips even if `progress_workspace_state`
+/// stops recognising `run_command` entirely. This test isolates that one
+/// channel directly: call the real production `progress_workspace_state`
+/// before and after an actual shell redirect into an owned TempDir, and
+/// assert `WorkflowRuntimeState::record_workspace_change` reports the change.
+/// Removing `"run_command"` from `progress_workspace_state`'s own match arm
+/// (not the `RunCommandWrites` fixture, not `record_observation`) must turn
+/// this red on its own.
+#[tokio::test]
+async fn progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change() {
+    let workspace = tempfile::tempdir().unwrap();
+    let caveats = Caveats::top();
+    let target = workspace.path().join("out.txt");
+    let args = serde_json::json!({
+        "command": format!("echo hi > {}", crate::mcp::shell_quote_arg(&target.to_string_lossy())),
+    });
+    let workspace_str = workspace.path().to_str().unwrap();
+
+    // Unchanged: two snapshots with no write between them agree.
+    let unchanged_before =
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+    let unchanged_after =
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+    let mut unchanged_runtime = WorkflowRuntimeState::default();
+    assert!(
+        !unchanged_runtime.record_workspace_change(unchanged_before, unchanged_after),
+        "an unchanged workspace must not be reported as progress"
+    );
+
+    // Changed: a real shell redirect runs between the two snapshots.
+    let before =
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(args["command"].as_str().unwrap())
+        .status()
+        .expect("the real shell redirect must run");
+    assert!(status.success(), "the fixture redirect must succeed");
+    let after =
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+    let mut runtime = WorkflowRuntimeState::default();
+    assert!(
+        runtime.record_workspace_change(before, after),
+        "a real shell redirect must be recognised as a workspace change by the \
+         production snapshot function, independent of any observation credit"
+    );
+}
+
+/// Regression for #2618: an arming `write_file`, then 12 rounds of
+/// `run_command` shell writes (never another `write_file`/`edit_file`), must
+/// NOT trip the no-progress brake. Before the fix, the brake sites judged the
+/// tool by NAME only (`is_workspace_write_call`, which deliberately excludes
+/// `run_command`), so none of these rounds counted as workspace-modifying and
+/// the 12th tripped `stop_after: 12` even though every round wrote a new file.
+#[tokio::test]
+#[serial_test::serial]
+async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
+    let _launch = ConfinedLaunch::new();
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 12,
+        },
+        ..Default::default()
+    });
+    let server = MockServer::start().await;
+    let rounds = 12;
+    let workspace = tempfile::tempdir().unwrap();
+    Mock::given(method("POST"))
+        .respond_with(RunCommandWrites {
+            n: std::sync::atomic::AtomicUsize::new(0),
+            rounds,
+            workspace: workspace.path().to_path_buf(),
+        })
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let current = msgs();
+    let caveats = Caveats::top();
+    let mut permission = AllowEverything(caveats.clone());
+    let mut reason = None;
+    let mut context = ctx(&uri, &current, &caveats);
+    context.workspace = workspace.path().to_str().unwrap();
+    context.permission_gate = Some(&mut permission);
+    context.end_reason = Some(&mut reason);
+    context.kind = BackendKind::Openai;
+    context.max_tool_rounds = rounds + 3;
+    let result = chat_complete(context, &mut NoMcp)
+        .await
+        .map(|(text, streamed, _, _)| (text, streamed));
+    let (text, _) = result.expect("run_command writes must not end the turn as an error");
+    assert_eq!(
+        text, "done",
+        "the turn must run to its normal end, not be cut short by the brake"
+    );
+    assert_ne!(
+        reason,
+        Some(crate::TurnEndReason::NoProgress),
+        "12 rounds that each wrote via run_command must not trip the brake"
+    );
+    let arm_path = workspace.path().join("arm.txt");
+    let arm_content = std::fs::read_to_string(&arm_path)
+        .unwrap_or_else(|e| panic!("{} must exist in the workspace: {e}", arm_path.display()));
+    assert_eq!(arm_content, "x\n", "{} content", arm_path.display());
+    for n in 1..=rounds {
+        let path = workspace.path().join(format!("out_{n}.txt"));
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must exist in the workspace: {e}", path.display()));
+        assert_eq!(content, format!("{n}\n"), "{} content", path.display());
+    }
+}
