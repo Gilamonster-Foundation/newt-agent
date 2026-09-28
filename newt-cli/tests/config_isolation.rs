@@ -129,6 +129,9 @@ fn the_isolated_root_starts_empty_and_is_unique_per_command() {
 /// - `cli_tests.rs` is pinned at **0** — every command there is
 ///   `common::newt()`, and `assert_cmd::Command` is not even imported, so a
 ///   raw construction fails to compile before it reaches this test.
+/// - `identity_cli.rs` is pinned at **0** — its caller-owned home and nested
+///   workspace use `common::newt_at`, so its construction cannot skip the
+///   shared policy.
 /// - `worker_cli.rs` and `stdout_purity.rs` keep small counts because they own
 ///   their spawns (a raw `std::process::Command`, a `tokio` one) and hand them
 ///   to `common::isolate`. The number is pinned so a NEW spawn site has to be
@@ -151,6 +154,7 @@ fn newt_is_only_constructed_through_the_isolation_helper() {
             include_str!("headless_cli/cognition.rs"),
             0,
         ),
+        ("identity_cli.rs", include_str!("identity_cli.rs"), 0),
         ("worker_cli.rs", include_str!("worker_cli.rs"), 2),
         ("stdout_purity.rs", include_str!("stdout_purity.rs"), 0),
     ] {

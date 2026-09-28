@@ -3035,7 +3035,7 @@ async fn custom_host_requires_a_host() {
 /// Setup asks the sandbox git profile through `/settings`' own fields and
 /// writes it through their one path, into the operator's identity file.
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(real_fs)]
 fn setup_writes_the_sandbox_git_profile_through_settings() {
     let dir = tempfile::tempdir().unwrap();
     let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());

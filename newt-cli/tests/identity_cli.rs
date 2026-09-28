@@ -1,27 +1,42 @@
 //! Integration tests for `newt identity`.
 //!
-//! Each test runs `newt` in a private working directory with `HOME` pointed at
-//! a separate empty tempdir, so resolution never reads the developer's real
-//! `~/.newt`. Because the working directory and `$HOME` are distinct empty
-//! trees, the default case resolves cleanly to the compiled-in
-//! `newt-agent` identity.
+//! Each test runs `newt` in a private workspace nested below a private home,
+//! so identity discovery stops at that fake home before it could reach the
+//! developer's real `~/.newt`. The default case therefore resolves cleanly to
+//! the compiled-in `newt-agent` identity.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-/// A `newt identity` command with `HOME` and cwd isolated to fresh tempdirs.
-/// Returns the command plus the two tempdirs (kept alive for the test).
+mod common;
+
+/// A fake home plus a workspace below it, keeping both directories alive.
+fn identity_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir_in(home.path()).unwrap();
+    (home, workspace)
+}
+
+/// A `newt` command with all config discovery axes isolated, running in the
+/// fixture workspace. The workspace must live below `home`: changing HOME
+/// alone would let the project walk continue into the real profile.
+fn newt_in(workspace: &std::path::Path, home: &std::path::Path) -> Command {
+    let mut cmd = common::newt_at(home);
+    cmd.current_dir(workspace);
+    cmd
+}
+
+/// A `newt identity` command in the isolated fixture.
 fn newt_identity_in(workspace: &std::path::Path, home: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("newt").unwrap();
-    cmd.current_dir(workspace).env("HOME", home).arg("identity");
+    let mut cmd = newt_in(workspace, home);
+    cmd.arg("identity");
     cmd
 }
 
 #[test]
 fn identity_default_resolves_to_newt_agent_user() {
     // Empty workspace, empty home: nothing on disk → the compiled-in default.
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
 
     newt_identity_in(workspace.path(), home.path())
         .assert()
@@ -39,24 +54,21 @@ fn identity_default_resolves_to_newt_agent_user() {
 
 #[test]
 fn identity_set_writes_home_override_and_show_picks_it_up() {
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
 
-    let mut set = Command::cargo_bin("newt").unwrap();
-    set.current_dir(workspace.path())
-        .env("HOME", home.path())
-        .args([
-            "identity",
-            "set",
-            "--name",
-            "my-harness",
-            "--email",
-            "my-harness@example.com",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Wrote agent identity"))
-        .stdout(predicate::str::contains("my-harness@example.com"));
+    let mut set = newt_in(workspace.path(), home.path());
+    set.args([
+        "identity",
+        "set",
+        "--name",
+        "my-harness",
+        "--email",
+        "my-harness@example.com",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Wrote agent identity"))
+    .stdout(predicate::str::contains("my-harness@example.com"));
 
     let written = home.path().join(".newt").join("agent-identity.toml");
     assert!(
@@ -78,23 +90,20 @@ fn identity_set_writes_home_override_and_show_picks_it_up() {
 
 #[test]
 fn identity_set_workspace_writes_local_override() {
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
 
-    let mut set = Command::cargo_bin("newt").unwrap();
-    set.current_dir(workspace.path())
-        .env("HOME", home.path())
-        .args([
-            "identity",
-            "set",
-            "--name",
-            "ws-agent",
-            "--email",
-            "ws@example.com",
-            "--workspace",
-        ])
-        .assert()
-        .success();
+    let mut set = newt_in(workspace.path(), home.path());
+    set.args([
+        "identity",
+        "set",
+        "--name",
+        "ws-agent",
+        "--email",
+        "ws@example.com",
+        "--workspace",
+    ])
+    .assert()
+    .success();
 
     let written = workspace.path().join(".newt").join("agent-identity.toml");
     assert!(written.is_file());
@@ -132,8 +141,7 @@ fn identity_workspace_file_overrides_name_but_not_credentials() {
     // A workspace file is untrusted (a repo can ship it): it may set the
     // agent's public name/email, but its GitHub App and token references are
     // ignored, and no token value ever reaches stdout.
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
     write_identity(workspace.path(), APP_AND_TOKEN_TOML);
 
     newt_identity_in(workspace.path(), home.path())
@@ -156,8 +164,7 @@ fn identity_workspace_file_overrides_name_but_not_credentials() {
 fn identity_operator_file_shows_app_and_hides_secret() {
     // The operator's own (home) file is trusted: the App coordinates and token
     // NAMES show, but the resolved token VALUE never does.
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
     write_identity(home.path(), APP_AND_TOKEN_TOML);
 
     newt_identity_in(workspace.path(), home.path())
@@ -178,8 +185,7 @@ fn identity_missing_signing_key_is_clean_not_panic() {
     // A configured signing-key path that doesn't exist must render an
     // "<unavailable>" note and still exit 0 — never panic, never mint. The
     // key path is operator-owned config, so it lives in the home file.
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
     write_identity(
         home.path(),
         r#"
@@ -201,8 +207,7 @@ signing_key = "/nonexistent/vault/path/identity.pem"
 #[test]
 fn identity_workspace_signing_key_is_ignored() {
     // A repo-shipped signing_key must not select the key.
-    let workspace = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let (home, workspace) = identity_fixture();
     write_identity(
         workspace.path(),
         r#"
