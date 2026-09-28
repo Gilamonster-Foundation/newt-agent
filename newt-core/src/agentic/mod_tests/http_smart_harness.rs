@@ -146,6 +146,13 @@ async fn all_four_wires_deliver_a_real_answer_after_a_nudge_without_regeneration
 
 #[tokio::test]
 async fn all_four_wires_preserve_questions_and_honestly_stop_exhausted_narration() {
+    // The two-round narration exhaustion below races the process-global
+    // `no_progress` brake (`crate::initiative::installed_no_progress()`):
+    // unguarded, this test can observe a `stop_after` a sibling test (e.g.
+    // `loop_controls::run_brake_loop`) installed under `GlobalSettingsGuard`
+    // for its own duration, stopping this turn after 2 idle rounds instead
+    // of the default 12. Holding the guard serializes against every writer.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) =
             run(wire, &["Which repository?"], &["\"question\""], 4).await;

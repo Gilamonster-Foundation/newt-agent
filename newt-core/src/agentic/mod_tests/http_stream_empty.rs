@@ -482,6 +482,12 @@ impl Respond for SuspiciousEmptyTwiceThenRecover {
 
 #[tokio::test]
 async fn repeated_thinking_only_gets_stronger_second_nudge() {
+    // Two hidden-only probe rounds race the process-global `no_progress` brake
+    // (`crate::initiative::installed_no_progress()`): unguarded, this test can
+    // observe a `stop_after` a sibling test (e.g. `loop_controls::run_brake_loop`)
+    // installed under `GlobalSettingsGuard` for its own duration, stopping the
+    // turn after 2 idle rounds before the third (recovering) probe runs.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     let saw_strong_nudge = Arc::new(AtomicBool::new(false));
@@ -532,6 +538,13 @@ impl Respond for SuspiciousEmptyStaysEmpty {
 
 #[tokio::test]
 async fn suspicious_empty_generated_output_reports_targeted_diagnostic() {
+    // Two suspicious-empty retry rounds race the process-global `no_progress`
+    // brake (`crate::initiative::installed_no_progress()`): unguarded, this
+    // test can observe a `stop_after` a sibling test (e.g.
+    // `loop_controls::run_brake_loop`) installed under `GlobalSettingsGuard`
+    // for its own duration, stopping the turn after 2 idle rounds before the
+    // retry cap is reached and the targeted diagnostic is produced.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
