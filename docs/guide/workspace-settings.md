@@ -122,6 +122,9 @@ approvals.
   read grants, including those supplied by profiles, can observe the absence and
   count actual deletion progress. This limitation does not grant access to a
   deleted file's parent or siblings.
+- Windows confined native tools also need the explicit administrator
+  [NUL host prerequisite](windows-prerequisites.md) after each boot. Saving a
+  workspace profile does not perform this host-wide setup or elevate Newt.
 
 For one-run flags and trusted-config examples, see
 [full access inside a workspace](full-access.md).

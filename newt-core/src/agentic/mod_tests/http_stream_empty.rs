@@ -25,6 +25,7 @@ impl Respond for StreamHappyResponder {
 
 #[tokio::test]
 async fn ollama_returns_the_accepted_probe_answer_without_a_reissue() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -91,7 +92,7 @@ async fn ollama_answer(
 }
 
 fn thinking_folded() -> crate::test_guard::GlobalSettingsGuard {
-    let guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    let guard = default_loop_settings();
     crate::process_env::set_var("NEWT_THINKING", "fold");
     guard
 }
@@ -217,6 +218,7 @@ impl Respond for EmptyStreamResponder {
 
 #[tokio::test]
 async fn empty_stream_falls_back_to_probe_content() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -269,6 +271,7 @@ impl Respond for EmptyStreamPendingActionResponder {
 
 #[tokio::test]
 async fn empty_stream_probe_fallback_pending_action_nudges_and_continues() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -315,6 +318,7 @@ impl Respond for AllEmptyResponder {
 
 #[tokio::test]
 async fn fully_empty_response_yields_diagnostic_message() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -395,6 +399,7 @@ impl Respond for SuspiciousEmptyThenRecover {
 
 #[tokio::test]
 async fn suspicious_empty_generated_output_retries_with_nudge() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     let saw_nudge = Arc::new(AtomicBool::new(false));
@@ -482,6 +487,16 @@ impl Respond for SuspiciousEmptyTwiceThenRecover {
 
 #[tokio::test]
 async fn repeated_thinking_only_gets_stronger_second_nudge() {
+    let _caller = crate::test_guard::GlobalSettingsGuard::acquire();
+    let foreign = crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 2,
+        },
+        ..Default::default()
+    };
+    crate::initiative::set_initiative_config(foreign.clone());
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     let saw_strong_nudge = Arc::new(AtomicBool::new(false));
@@ -505,6 +520,8 @@ async fn repeated_thinking_only_gets_stronger_second_nudge() {
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 3);
     assert!(saw_strong_nudge.load(Ordering::SeqCst));
+    drop(_settings);
+    assert_eq!(crate::initiative::initiative_config(), Some(foreign));
 }
 
 struct SuspiciousEmptyStaysEmpty;
@@ -532,6 +549,16 @@ impl Respond for SuspiciousEmptyStaysEmpty {
 
 #[tokio::test]
 async fn suspicious_empty_generated_output_reports_targeted_diagnostic() {
+    let _caller = crate::test_guard::GlobalSettingsGuard::acquire();
+    let foreign = crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 2,
+        },
+        ..Default::default()
+    };
+    crate::initiative::set_initiative_config(foreign.clone());
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -555,10 +582,13 @@ async fn suspicious_empty_generated_output_reports_targeted_diagnostic() {
     );
     assert!(reply.contains("--trace"), "points at trace diagnostics");
     assert!(!streamed);
+    drop(_settings);
+    assert_eq!(crate::initiative::initiative_config(), Some(foreign));
 }
 
 #[tokio::test]
 async fn openai_empty_content_yields_diagnostic_message() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))

@@ -155,8 +155,7 @@ async fn run_turn(turn: Turn<'_>) -> Run {
     // Verification scenarios use the default progress budget, independently
     // of sibling tests that intentionally install a much shorter brake.
     // Match other loop fixtures: settings ownership precedes async setup.
-    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
-    crate::initiative::set_initiative_config(Default::default());
+    let _settings = default_loop_settings();
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
     let _confined = EnvVar::unset("NEWT_DISABLE_OCAP");

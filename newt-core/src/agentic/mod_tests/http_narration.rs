@@ -62,6 +62,7 @@ async fn run_openai_script_with_cap(
     script: Vec<serde_json::Value>,
     narration_nudge_cap: usize,
 ) -> (String, usize) {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -718,6 +719,7 @@ async fn narration_nudge_reaches_the_wire_tagged_as_loop_guidance() {
 
 #[tokio::test]
 async fn ollama_loop_honors_cap_two_and_escalates_the_second_nudge() {
+    let _settings = default_loop_settings();
     // Ollama-path parity for lever L3 (the macro chain is separate code
     // from the OpenAI inline chain): with narration_nudge_cap = 2 the
     // first rescue carries the [loop-guidance]-tagged generic corrective

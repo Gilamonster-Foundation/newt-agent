@@ -368,7 +368,11 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
                 || request_text
                     .last()
                     .unwrap()
-                    .contains("cannot find the path"),
+                    .contains("cannot find the path")
+                // CreateProcess reports ERROR_DIRECTORY for a missing cwd.
+                // Match its stable code, not locale-dependent Windows wording.
+                || (cfg!(windows)
+                    && request_text.last().unwrap().contains("(os error 267)")),
             "{wire}: failure must come from the absent cwd: {}",
             request_text.last().unwrap()
         );

@@ -29,6 +29,15 @@ fn msgs() -> Vec<MemMessage> {
 /// `an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check`.
 const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist";
 
+/// Default-policy wire fixtures must not borrow a sibling's short progress
+/// brake. Acquire before async setup and hold across the complete scenario.
+/// Tests of explicit initiative settings keep their own guarded configuration.
+fn default_loop_settings() -> crate::test_guard::GlobalSettingsGuard {
+    let guard = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(Default::default());
+    guard
+}
+
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
         overflow_retry: Default::default(),
@@ -324,6 +333,7 @@ async fn run_openai_script_with_ledger(
     script: Vec<serde_json::Value>,
     step_ledger: Option<&dyn StepLedger>,
 ) -> (String, usize) {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))

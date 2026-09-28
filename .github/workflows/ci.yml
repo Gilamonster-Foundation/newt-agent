@@ -468,6 +468,20 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force target\debug\deps | Out-Null
           Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
+      - name: Prepare NUL device for AppContainer tools (elevated host prerequisite)
+        if: always()
+        shell: pwsh
+        # Explicit host setup, not a launcher/runtime privilege escalation.
+        # Native Git tests below must still execute and assert real effects.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows/Enable-AppContainerNull.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerNull.ps1
+          $repeated = ./scripts/windows/Enable-AppContainerNull.ps1
+          Write-Output $repeated
+          if ($repeated -notmatch 'already present; no change') {
+            throw 'NUL preparation was not idempotent after kernel readback.'
+          }
       - name: cargo test
         # `if: always()` so a clippy failure can't mask a test failure — both
         # surface in one run (same rationale as the Linux lint job).
