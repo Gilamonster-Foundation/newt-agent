@@ -907,23 +907,24 @@ impl StdioTransport {
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
         let grants = resolve_env_grants(entry)?;
         // Admit exec of the configured server command; keep its runtime authority
-        // (fs/net) the session leash.
+        // (fs) from the session leash; `net` is narrowed to `none` by
+        // `spawn_caveats` (`spawn_net_scope`) — a host list cannot be enforced
+        // by any spawn backend, so narrowing loses nothing a child could honor.
         let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
             format!("authorizing confined spawn of MCP server `{}`", entry.name)
         })?;
 
         // agent-bridle 0.8's L3 admission bound only resolves a RESTRICTED
         // `net` axis when `child_network == DenyDirect`; under the default
-        // `LandlockOnly` a `net: none` server (the common case — no server
-        // config declares an allowlist by default) is `Unknown` and every
-        // confined spawn fails closed with "not decidable ... (L3 BOUND)".
-        // Safe to apply unconditionally: `DenyDirect` is a no-op unless the
-        // `net` caveat is ALREADY deny-all, so a server with a net grant
-        // (the egress-proxy path, `agent_bridle::net_egress_proxy_hosts`) is
-        // untouched — the proxy's own engagement test
-        // (`loopback_net_enforceable`) never inspects `child_network` at
-        // all. Same floor `confined_exec::runtime_sandbox_policy` already
-        // applies to `run_command`.
+        // `LandlockOnly` a `net: none` server is `Unknown` and every confined
+        // spawn fails closed with "not decidable ... (L3 BOUND)".
+        // `spawn_caveats` above has already narrowed any host-scoped session
+        // grant to `none`, so the child's net is always `All` or `none` here.
+        // `DenyDirect` is then a no-op on `All`, and resolves `none` to
+        // `Kernel`-decidable on Linux. Non-Unix MCP takes the raw Tokio path
+        // (`#[cfg(not(unix))]` below) — env-scrubbed but unconfined.
+        // Same floor `confined_exec::runtime_sandbox_policy` already applies
+        // to `run_command`.
         let sandbox_policy = std::sync::Arc::new(SandboxPolicy {
             child_network: ChildNetworkPolicy::DenyDirect,
             ..SandboxPolicy::default()

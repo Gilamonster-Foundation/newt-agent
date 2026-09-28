@@ -247,11 +247,11 @@ pub fn permits_path(scope: &Scope<String>, full_path: &str) -> bool {
 /// makes admission decidable on Linux (`none` + `ChildNetworkPolicy::DenyDirect`
 /// ⇒ `Kernel`).
 ///
-/// This does **not** repair macOS/Seatbelt or Windows/AppContainer admission:
-/// both backends resolve every restricted `net` scope — including
-/// `Scope::none()` — to `Unknown` and refuse independently of this
-/// narrowing. Fail-closed behavior on those backends is preserved, not
-/// fixed, by this helper.
+/// **Measured on Linux** (Landlock + `DenyDirect` → `Kernel`-decidable after
+/// this narrowing). On macOS, Seatbelt still refuses a restricted `net` scope
+/// — including `none` — independently; a separate agent-bridle fix is under
+/// way. On Windows, AppContainer can bind `net:none`, but other axes (e.g.
+/// restricted exec) can still refuse; behaviour is unvalidated here.
 ///
 /// `Scope::All` and `Scope::none()` pass through unchanged: `All` is already
 /// unrestricted (nothing to narrow), and `none()` is already the bindable

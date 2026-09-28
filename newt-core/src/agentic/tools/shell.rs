@@ -2279,10 +2279,11 @@ fn dispatch_caveats_for_command(
     // 0.8's admission on every backend and refuses the WHOLE spawn (L3
     // BOUND) — not just the network. Narrow it to `net: none`, which the
     // shell's `DenyDirect` sandbox policy (`confined_exec::runtime_sandbox_policy`)
-    // can bind on Linux. macOS/Seatbelt and Windows/AppContainer still refuse
-    // this admission for other reasons (every restricted host-net scope
-    // resolves `Unknown` there too, independent of this narrowing) — that
-    // fail-closed behavior is preserved, not fixed, by this change. See
+    // can bind on Linux (measured). On macOS, Seatbelt still refuses a
+    // restricted `net` scope; a separate agent-bridle fix is under way. On
+    // Windows, AppContainer can bind `net:none` but restricted exec can still
+    // refuse; unvalidated here. Fail-closed posture on non-Linux backends is
+    // preserved. See
     // `caveats::spawn_net_scope` doc comment for why narrowing loses nothing
     // a spawned shell child could enforce anyway.
     widened.net = crate::caveats::spawn_net_scope(&widened.net);
@@ -2709,6 +2710,20 @@ mod dispatch_caveats_tests {
             crate::caveats::Scope::none(),
             "a host-scoped net grant cannot be bound by a spawn backend and \
              must be narrowed, not passed through as an Unknown scope"
+        );
+    }
+
+    /// `dispatch_caveats_for_command` clones the session — the caller's
+    /// original `Caveats` must never be mutated by the dispatch.
+    #[test]
+    fn dispatch_caveats_for_command_does_not_mutate_session() {
+        let mut original = base("/ws");
+        original.net = crate::caveats::Scope::only(["api.example.com".to_string()]);
+        let original_net = original.net.clone();
+        let _ = dispatch_caveats_for_command("cargo --version", &original);
+        assert_eq!(
+            original.net, original_net,
+            "session caveats must not be mutated by dispatch"
         );
     }
 
