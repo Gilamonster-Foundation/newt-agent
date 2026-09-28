@@ -1102,20 +1102,31 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
 
 /// Round 0 is a `write_file` (arms the brake); every round after that is a
 /// `run_command` writing via `>` shell redirection (never `write_file`/
-/// `edit_file`), for `rounds` rounds; then a final plain-text reply.
+/// `edit_file`), for `rounds` rounds; then a final plain-text reply. Every
+/// generated path is absolute, inside the caller's owned `workspace`
+/// TempDir, and shell-quoted through the existing [`crate::mcp::shell_quote_arg`]
+/// helper — under `Caveats::top()` the confined shell dispatch does not chdir
+/// into the resolved workspace cwd for a plain `>` redirect (#2618 review),
+/// so a bare relative filename lands in the test binary's actual process cwd
+/// (the crate root) instead of the tempdir.
 struct RunCommandWrites {
     n: std::sync::atomic::AtomicUsize,
     rounds: usize,
+    workspace: std::path::PathBuf,
 }
 
 impl wiremock::Respond for RunCommandWrites {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
         let n = self.n.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
+            let arm_path = self.workspace.join("arm.txt");
             let call = serde_json::json!({
                 "id": "c0", "type": "function",
                 "function": {"name": "write_file",
-                    "arguments": r#"{"path":"arm.txt","content":"x\n"}"#}
+                    "arguments": serde_json::json!({
+                        "path": arm_path.to_string_lossy(),
+                        "content": "x\n",
+                    }).to_string()}
             });
             return ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
@@ -1128,11 +1139,15 @@ impl wiremock::Respond for RunCommandWrites {
                     "finish_reason": "stop"}]
             }));
         }
+        let target = self.workspace.join(format!("out_{n}.txt"));
+        let quoted = crate::mcp::shell_quote_arg(&target.to_string_lossy());
         let call = serde_json::json!({
             "id": format!("c{n}"),
             "type": "function",
             "function": {"name": "run_command",
-                "arguments": format!("{{\"command\":\"echo {n} > out_{n}.txt\"}}")}
+                "arguments": serde_json::json!({
+                    "command": format!("echo {n} > {quoted}"),
+                }).to_string()}
         });
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
@@ -1161,14 +1176,15 @@ async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
     });
     let server = MockServer::start().await;
     let rounds = 12;
+    let workspace = tempfile::tempdir().unwrap();
     Mock::given(method("POST"))
         .respond_with(RunCommandWrites {
             n: std::sync::atomic::AtomicUsize::new(0),
             rounds,
+            workspace: workspace.path().to_path_buf(),
         })
         .mount(&server)
         .await;
-    let workspace = tempfile::tempdir().unwrap();
     let uri = server.uri();
     let current = msgs();
     let caveats = Caveats::top();
@@ -1191,4 +1207,10 @@ async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
         Some(crate::TurnEndReason::NoProgress),
         "12 rounds that each wrote via run_command must not trip the brake"
     );
+    for n in 1..=rounds {
+        let path = workspace.path().join(format!("out_{n}.txt"));
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must exist in the workspace: {e}", path.display()));
+        assert_eq!(content.trim(), n.to_string(), "{} content", path.display());
+    }
 }
