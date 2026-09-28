@@ -296,6 +296,11 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
     crate::initiative::set_initiative_config(Default::default());
     crate::initiative::set_cli_initiative(crate::initiative::Initiative::Measured);
     let _env = crate::agentic::anthropic_loop_tests::test_env(false);
+    let command = if cfg!(windows) {
+        "cmd.exe /d /c cd"
+    } else {
+        "pwd"
+    };
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -308,7 +313,7 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
                 tools: vec![
                     (
                         "run_command",
-                        serde_json::json!({"command":"pwd", "cwd":"missing-subdirectory"}),
+                        serde_json::json!({"command":command, "cwd":"missing-subdirectory"}),
                     ),
                     ("read_file", serde_json::json!({"path":"evidence.txt"})),
                 ],
@@ -324,10 +329,10 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         .unwrap();
         let task = "Inspect the workspace and report the findings.";
         let messages = vec![MemMessage::user(task)];
-        let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-        // Exercise the invalid cwd, not this host's restricted-network support.
-        // The command itself is a local pwd and makes no network request.
-        caveats.net = crate::caveats::Scope::All;
+        // This is a recovery-transcript fixture, not an AppContainer proof.
+        // Unrestricted axes let the invalid cwd reach the operating system;
+        // AppContainer evidence lives in the dedicated Windows evidence lane.
+        let caveats = crate::caveats::Caveats::top();
         let uri = server.uri();
         let kind = match wire {
             "ollama" => BackendKind::Ollama,
