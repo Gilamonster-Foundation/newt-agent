@@ -153,25 +153,25 @@ async fn stdio_spawn_under_net_none_does_not_l3_bound_refuse() {
         .expect("a net:none stdio MCP server must spawn (not L3-BOUND-refused)");
 }
 
-/// **KNOWN LIMITATION, not fixed by this PR** — a bridle-side gap, tracked for
-/// the maintainer, not a newt-mcp-client defect: on Linux, a stdio MCP server
-/// under a HOST-SCOPED `net` allowlist (the egress-proxy-eligible shape) is
-/// now refused outright, where pre-0.8 it ran (net axis advisory/unconfined —
-/// Landlock's net rule is port-based, not hostname-based, so it never could
-/// bound a host allow-list; ADR 0015). `ChildNetworkPolicy::DenyDirect` does
-/// NOT help here — by its own doc contract it only engages when `net` is
-/// ALREADY deny-all (a granted scope leaves it inert), confirmed structurally
-/// in `LandlockSandbox::resolved_authority`
-/// (agent-bridle-core-0.8.0-rc.4/src/sandbox.rs:1429): every restricted `net`
-/// axis OTHER than `net: none` under `DenyDirect` resolves `Unknown` and the
-/// L3 admission bound fails closed. The Linux enabler (a netns egress fence)
-/// is deferred, separately tracked. This test PINS today's honest, if worse,
-/// behavior so a future bridle release that closes the gap is a visible test
-/// flip, not a silent regression.
+/// #2596 round 3: a HOST-SCOPED `net` allowlist (e.g. a session net grant
+/// widened from a `web_fetch` prompt) must not L3-BOUND-refuse a stdio MCP
+/// spawn on Linux either. Fixed by `spawn_caveats` narrowing the spawn's
+/// `net` caveat to `none` before admission (`spawn_caveats` calls
+/// `caveats::spawn_net_scope`, exercised here through the real
+/// `StdioTransport::spawn` call path — `Scope::Only(_)` is `Unknown` to
+/// Landlock and refuses fail-closed; `none` under `DenyDirect` is
+/// `Kernel`-decidable). A stdio child was never able to enforce a host
+/// allow-list anyway (Landlock's net rule is port-based, not
+/// hostname-based; ADR 0015), so this loses nothing a spawn could actually
+/// honor — it only fixes admission for a shape that previously ran
+/// advisory pre-0.8 and started refusing outright under 0.8 (previously
+/// pinned by this same test as a "known limitation"; fixed here in newt
+/// rather than in bridle, since bridle correctly has no way to know a
+/// spawned child can't bind a hostname allow-list).
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "real confined stdio subprocess; integration tier"]
-async fn stdio_spawn_under_a_host_scoped_net_grant_is_l3_bound_refused_on_linux() {
+async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused() {
     let entry = McpServerEntry {
         name: "net-grant-probe".into(),
         enabled: true,
@@ -191,14 +191,8 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_l3_bound_refused_on_linux(
         net: newt_core::caveats::Scope::only(["api.github.com".to_string()]),
         ..Caveats::top()
     };
-    let err = match StdioTransport::spawn(&admitted, &caveats) {
-        Ok(_) => {
-            panic!("expected a host-scoped net grant to be L3-BOUND-refused on Linux (bridle gap)")
-        }
-        Err(e) => e,
-    };
-    assert!(
-        format!("{err:#}").contains("L3 BOUND"),
-        "expected the L3 admission bound's refusal, got: {err:#}"
+    StdioTransport::spawn(&admitted, &caveats).expect(
+        "a host-scoped net grant must be narrowed to net:none for the spawn, \
+         not L3-BOUND-refused",
     );
 }

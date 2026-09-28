@@ -769,9 +769,15 @@ fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
 /// declared it in their config, so *spawning it* must not require its command in
 /// the session's exec allow-list (the agent never chose to run it). Only the
 /// command itself is granted — the child's RUNTIME authority stays exactly the
-/// session leash: `fs_write` remains Landlock-enforced, and `net` / the exec of
-/// anything the server itself spawns are unchanged. An `exec: All` leash is
+/// session leash: `fs_write` remains Landlock-enforced, and the exec of
+/// anything the server itself spawns is unchanged. An `exec: All` leash is
 /// already unrestricted, so it is left untouched.
+///
+/// `net` is the one axis narrowed, not left as-is: a host-scoped session
+/// `net` grant is `Unknown` to agent-bridle 0.8's Linux admission and refuses
+/// the WHOLE spawn (L3 BOUND), and a stdio child can't bind a host
+/// allow-list either way (see `caveats::spawn_net_scope`). `Scope::All` and
+/// `Scope::none()` still pass through unchanged.
 #[cfg(unix)]
 fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     use newt_core::caveats::Scope;
@@ -779,6 +785,12 @@ fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     if let Scope::Only(ref mut set) = caveats.exec {
         set.extend([command.to_string()]);
     }
+    // #2596 round 3: same narrowing as the shell dispatch site
+    // (`newt_core::agentic::tools::shell::dispatch_caveats_for_command`) — a
+    // host-scoped session `net` grant is `Unknown` to agent-bridle 0.8's
+    // admission on Linux and refuses the whole spawn (L3 BOUND). Narrow to
+    // `net: none`, which the `DenyDirect` sandbox policy below can bind.
+    caveats.net = newt_core::caveats::spawn_net_scope(&caveats.net);
     caveats
 }
 
@@ -895,23 +907,24 @@ impl StdioTransport {
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
         let grants = resolve_env_grants(entry)?;
         // Admit exec of the configured server command; keep its runtime authority
-        // (fs/net) the session leash.
+        // (fs) from the session leash; `net` is narrowed to `none` by
+        // `spawn_caveats` (`spawn_net_scope`) — a host list cannot be enforced
+        // by any spawn backend, so narrowing loses nothing a child could honor.
         let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
             format!("authorizing confined spawn of MCP server `{}`", entry.name)
         })?;
 
         // agent-bridle 0.8's L3 admission bound only resolves a RESTRICTED
         // `net` axis when `child_network == DenyDirect`; under the default
-        // `LandlockOnly` a `net: none` server (the common case — no server
-        // config declares an allowlist by default) is `Unknown` and every
-        // confined spawn fails closed with "not decidable ... (L3 BOUND)".
-        // Safe to apply unconditionally: `DenyDirect` is a no-op unless the
-        // `net` caveat is ALREADY deny-all, so a server with a net grant
-        // (the egress-proxy path, `agent_bridle::net_egress_proxy_hosts`) is
-        // untouched — the proxy's own engagement test
-        // (`loopback_net_enforceable`) never inspects `child_network` at
-        // all. Same floor `confined_exec::runtime_sandbox_policy` already
-        // applies to `run_command`.
+        // `LandlockOnly` a `net: none` server is `Unknown` and every confined
+        // spawn fails closed with "not decidable ... (L3 BOUND)".
+        // `spawn_caveats` above has already narrowed any host-scoped session
+        // grant to `none`, so the child's net is always `All` or `none` here.
+        // `DenyDirect` is then a no-op on `All`, and resolves `none` to
+        // `Kernel`-decidable on Linux. Non-Unix MCP takes the raw Tokio path
+        // (`#[cfg(not(unix))]` below) — env-scrubbed but unconfined.
+        // Same floor `confined_exec::runtime_sandbox_policy` already applies
+        // to `run_command`.
         let sandbox_policy = std::sync::Arc::new(SandboxPolicy {
             child_network: ChildNetworkPolicy::DenyDirect,
             ..SandboxPolicy::default()

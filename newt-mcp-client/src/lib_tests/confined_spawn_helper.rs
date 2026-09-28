@@ -54,6 +54,63 @@ fn spawn_caveats_admits_command_but_keeps_runtime_leash() {
     ));
 }
 
+/// #2619 / #2596 round 3: `spawn_caveats` must narrow a non-empty host list to
+/// `Scope::none()` in the child caveats — the reviewer's P2 discriminating
+/// assertion. The original session must be unchanged (clone, never mutate).
+/// `All` and `none` must pass through unchanged.
+///
+/// Discriminating proof recorded in RESULT.md:
+/// (a) delete `caveats.net = spawn_net_scope(…)` → this test fails:
+///     child net was `Only({…})`, expected `Only({})` (Scope::none())
+/// (b) replace with `caveats.net = Scope::All` → this test fails:
+///     child net was `All`, expected `Only({})`
+#[test]
+fn spawn_caveats_narrows_host_net_to_none_and_preserves_session() {
+    use newt_core::caveats::Scope;
+
+    let session = Caveats {
+        net: Scope::only([
+            "api.github.com".to_string(),
+            "registry.npmjs.org".to_string(),
+        ]),
+        ..Caveats::top()
+    };
+    let child = spawn_caveats(&session, "node");
+
+    // Child's net must be exactly Scope::none() — the only bindable shape.
+    assert_eq!(
+        child.net,
+        Scope::none(),
+        "a host-scoped session net grant must be narrowed to none for the child"
+    );
+
+    // The original session is cloned, never mutated.
+    match &session.net {
+        Scope::Only(hosts) => {
+            assert!(hosts.contains("api.github.com"), "session net unchanged");
+            assert!(
+                hosts.contains("registry.npmjs.org"),
+                "session net unchanged"
+            );
+        }
+        other => panic!("expected Only, got {other:?}"),
+    }
+
+    // Scope::All passes through unchanged (unrestricted; nothing to narrow).
+    let all_session = Caveats {
+        net: Scope::All,
+        ..Caveats::top()
+    };
+    assert_eq!(spawn_caveats(&all_session, "node").net, Scope::All);
+
+    // Scope::none() passes through unchanged (already the bindable shape).
+    let none_session = Caveats {
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    assert_eq!(spawn_caveats(&none_session, "node").net, Scope::none());
+}
+
 #[test]
 fn log_confinement_covers_advisory_and_confined() {
     // Both branches — smoke (no panic); the honest posture the surface reads.
