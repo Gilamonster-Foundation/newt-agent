@@ -478,19 +478,26 @@ fn workspace_write_classifier_is_narrow() {
     assert!(!is_workspace_write_call("read_file"));
 }
 
-/// #2618/F46: the brake's own predicate must count a `run_command` that
-/// wrote via shell redirection — `is_workspace_write_call` (the narrow,
-/// name-only classifier used for the headless write-trajectory) never will,
-/// by design, which was the bug: the brake sites used that predicate instead
-/// of `may_change_workspace`.
+/// #2618/F46: `may_change_workspace` gates ELIGIBILITY for a
+/// `progress_workspace_state` before/after snapshot, not progress itself — a
+/// `run_command` that wrote via shell redirection must be ELIGIBLE for that
+/// snapshot; `is_workspace_write_call` (the narrow, name-only classifier used
+/// for the headless write-trajectory) never would, by design, which was the
+/// bug: the brake's snapshot selector used to gate eligibility on that
+/// predicate instead of `may_change_workspace`. Whether the round actually
+/// AWARDS progress is a separate question, answered by comparing the
+/// before/after `ProgressSnapshot`s in `WorkflowRuntimeState::record_workspace_change`
+/// (pinned directly, on the real production snapshot function, by
+/// `progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change` in
+/// `http_smart_completion.rs`) — not by this predicate alone.
 #[test]
 fn may_change_workspace_counts_a_run_command_redirect_write() {
     let args = serde_json::json!({"command": "head -n 9309 x | tail -n 2183 > out.rs"});
     assert!(may_change_workspace("run_command", &args));
 }
 
-/// A pure read command must still count as no-change under the same predicate
-/// the brake now uses.
+/// A pure read command must still be INELIGIBLE for a workspace snapshot
+/// under the same predicate the brake's snapshot selector now gates on.
 #[test]
 fn may_change_workspace_excludes_a_pure_read_command() {
     let args = serde_json::json!({"command": "grep -n x f"});
