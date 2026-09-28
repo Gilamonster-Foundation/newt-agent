@@ -427,14 +427,14 @@ mod tests {
     /// session but not callable for an Explain request; the search used to run
     /// over the already-filtered catalog and so reported it absent. It is now
     /// named as present-but-not-callable, with the handoff, and is never listed
-    /// as a callable match. Run under Explain: Act sees everything, so an Act
-    /// search proves nothing here.
+    /// as a callable match. Explicit Plan narrows the catalog; inferred
+    /// response style preserves the session's tool surface.
     #[test]
-    fn explain_search_reports_a_hidden_tool_as_present_not_absent() {
+    fn explicit_plan_search_reports_a_hidden_tool_as_present_not_absent() {
         let out = execute_tool_search_for_disposition(
             "run_command",
             &full_catalog(),
-            super::super::PromptDisposition::Explain,
+            super::super::PromptDisposition::Plan,
             None,
         );
         let voices = super::super::DispositionVoices::default();

@@ -481,6 +481,10 @@ mod narration;
 mod plan_handoff;
 
 #[cfg(test)]
+#[path = "http_plan_exit.rs"]
+mod plan_exit;
+
+#[cfg(test)]
 #[path = "http_verification.rs"]
 mod verification;
 

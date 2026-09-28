@@ -120,6 +120,22 @@ fn gauntlet_workspace() -> tempfile::TempDir {
     ws
 }
 
+/// Completed history is eligible for summarization; the current task and its
+/// fresh read results remain protected. Do not rely on an action reminder
+/// being mistaken for a newer operator turn to create that boundary.
+fn gauntlet_messages_with_history(workspace: &std::path::Path, copies: usize) -> Vec<MemMessage> {
+    let earlier_read = std::fs::read_to_string(workspace.join("big.txt")).unwrap();
+    vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("Read the earlier fixtures and report their contents."),
+        MemMessage::assistant(format!(
+            "Completed earlier file review:\n{}",
+            earlier_read.repeat(copies)
+        )),
+        MemMessage::user(TASK),
+    ]
+}
+
 fn body_json(req: &Request) -> serde_json::Value {
     serde_json::from_slice(&req.body).unwrap_or_default()
 }
@@ -239,6 +255,8 @@ impl Respond for GauntletResponder {
 /// request — summarized, not discarded.
 #[tokio::test]
 async fn active_task_survives_compression() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(Default::default());
     let server = MockServer::start().await;
     let log = Arc::new(Mutex::new(Vec::new()));
     let task_in_marker = Arc::new(AtomicBool::new(false));
@@ -259,24 +277,33 @@ async fn active_task_survives_compression() {
 
     let ws = gauntlet_workspace();
     let workspace = ws.path().to_string_lossy().to_string();
-    let messages = msgs();
+    let messages = gauntlet_messages_with_history(ws.path(), 4);
     let caveats = Caveats::top();
     let uri = server.uri();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let summarizer = canned_summarizer(prompts.clone());
     let mut compress_state = CompressState::new();
     let mut c = ctx(&uri, &messages, &caveats, &workspace);
+    // Repeated reads supply compression pressure here; action reminders are
+    // a separate policy with their own wire tests. Their wording/initiative
+    // must not determine this fixture's reclaim ratio or compression boundary.
+    c.action_nudges = false;
     // The trigger is a complete-request ceiling, including the expanded
     // builtin tool catalog. Derive it as the live catalog weight plus ~5k
-    // message tokens of headroom (a catalog-INDEPENDENT offset) so the
-    // first zero-cost prune remains observable on wire before the
-    // summarizing pass; catalog growth shifts the threshold with it. The
+    // message tokens of headroom (a catalog-INDEPENDENT offset), so completed
+    // history fits before fresh reads trigger the summarizing pass; catalog
+    // growth shifts the threshold with it. The
     // >40% reclaim assertion below still measures actual dispatched
     // requests.
     c.mid_loop_trim_tokens = Some(
         builtin_catalog_tokens(PromptDisposition::Act)
             + prompt_read::response_repository_policy_tokens()
             + 5_600,
+    );
+    assert!(
+        initial_request_budget(&messages, TASK).saturating_sub(1)
+            <= c.mid_loop_trim_tokens.unwrap(),
+        "completed history must fit initially; fresh reads trigger the compression"
     );
     c.summarizer = Some(&*summarizer);
     c.compress_state = Some(&mut compress_state);
@@ -454,6 +481,8 @@ async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
 /// instead and the turn still completes (never aborts).
 #[tokio::test]
 async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(Default::default());
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/summarize"))
@@ -500,11 +529,14 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
 
     let ws = gauntlet_workspace();
     let workspace = ws.path().to_string_lossy().to_string();
-    let messages = msgs();
+    let messages = gauntlet_messages_with_history(ws.path(), 1);
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut compress_state = CompressState::new();
     let mut c = ctx(&uri, &messages, &caveats, &workspace);
+    // Isolate outage recovery from read-only reminders and the separately
+    // tested post-compaction action directive. Keep the exact hard ceiling.
+    c.action_nudges = false;
     // The complete-request gate now honestly includes the advertised
     // schemas. Derive the threshold as the live catalog weight plus a
     // ~1.8k-token sliver (a catalog-INDEPENDENT offset) that holds the task
@@ -516,6 +548,11 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
         builtin_catalog_tokens(PromptDisposition::Act)
             + prompt_read::response_repository_policy_tokens()
             + 1_815,
+    );
+    assert!(
+        initial_request_budget(&messages, TASK).saturating_sub(1)
+            <= c.mid_loop_trim_tokens.unwrap(),
+        "completed history must fit initially; a fresh read triggers outage recovery"
     );
     c.summarizer = Some(&*summarizer);
     c.compress_state = Some(&mut compress_state);
@@ -562,6 +599,72 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
     );
     assert!(task_in_marker.load(Ordering::SeqCst), "task still anchored");
     assert!(!old_placeholder.load(Ordering::SeqCst));
+}
+
+/// A fitting static fallback must not become an impossible request merely
+/// because the optional action continuation is appended afterward.
+#[tokio::test]
+async fn optional_continuation_cannot_abort_a_fitting_static_fallback() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(Default::default());
+    let _initiative = crate::initiative::scoped_effective_initiative(crate::Initiative::Measured);
+    let server = MockServer::start().await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let task_in_marker = Arc::new(AtomicBool::new(false));
+    let static_in_marker = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(GauntletResponder {
+            final_answer: "completed with action nudges enabled".into(),
+            log: log.clone(),
+            task_in_marker_request: task_in_marker.clone(),
+            summary_in_marker_request: static_in_marker.clone(),
+            old_placeholder_seen: Arc::new(AtomicBool::new(false)),
+            static_marker_instead: true,
+        })
+        .mount(&server)
+        .await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_in = attempts.clone();
+    let summarizer: Summarizer = Box::new(move |_| {
+        attempts_in.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { anyhow::bail!("fixture summarizer unavailable") })
+    });
+    let ws = gauntlet_workspace();
+    let workspace = ws.path().to_string_lossy().to_string();
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut state = CompressState::new();
+    let mut c = ctx(&uri, &messages, &caveats, &workspace);
+    assert!(
+        c.action_nudges,
+        "this regression must exercise the live continuation"
+    );
+    // Preserve the observed tight ceiling, derived from the current catalog.
+    let ceiling = builtin_catalog_tokens(PromptDisposition::Act)
+        + prompt_read::response_repository_policy_tokens()
+        + 1_815;
+    c.mid_loop_trim_tokens = Some(ceiling);
+    c.summarizer = Some(&*summarizer);
+    c.compress_state = Some(&mut state);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("optional harness guidance must not abort a fitting fallback");
+    assert_eq!(reply, "completed with action nudges enabled");
+    assert!(attempts.load(Ordering::SeqCst) > 0);
+    assert!(task_in_marker.load(Ordering::SeqCst));
+    assert!(static_in_marker.load(Ordering::SeqCst));
+    let requests = server.received_requests().await.unwrap();
+    let fallback = requests
+        .iter()
+        .map(body_json)
+        .find(|body| messages_contain(body, SUMMARY_PREFIX))
+        .expect("the real provider request must receive the static fallback");
+    assert!(!messages_contain(&fallback, compress::CONTINUATION_PREFIX));
+    assert!(requests
+        .iter()
+        .all(|request| body_request_tokens(&body_json(request)) <= ceiling));
 }
 
 /// OpenAI-path mirror: the same pipeline serves the second loop — the
@@ -767,6 +870,17 @@ async fn run_long_haul(
     file: &'static str,
     content: &str,
 ) -> (Vec<(usize, Option<usize>)>, usize, String, bool) {
+    // Repeated identical reads are intentional compression pressure here.
+    // Exercise the configured round cap, independently of the stagnation
+    // policy (covered by the progress and no-progress loop fixtures).
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 0,
+        },
+        ..Default::default()
+    });
     let server = MockServer::start().await;
     let log = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))

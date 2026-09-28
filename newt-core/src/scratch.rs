@@ -24,6 +24,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod build;
+pub(crate) use build::{
+    acquire_run as acquire_build_run, managed_partition as managed_build_partition,
+    validate_grant as validate_build_grant, ManagedRun,
+};
+
+/// The operator override, or the stable private managed base proposed to the
+/// Build permission gate. Resolving it creates no filesystem entries.
+pub(crate) fn build_scratch_base() -> PathBuf {
+    build_scratch_override().unwrap_or_else(build::default_base)
+}
+
 /// The default ephemeral dir, relative to the repo root. A convention, not a
 /// lock-in — override it via the `[scratch] dir` config key or `NEWT_SCRATCH_DIR`.
 pub const DEFAULT_SCRATCH_DIR: &str = ".scratch";
@@ -76,12 +88,12 @@ pub fn scratch_dir() -> String {
 }
 
 /// The operator's escape hatch for the build lane's scratch base (#2604):
-/// `NEWT_BUILD_SCRATCH_DIR` env → `[scratch] build_dir` config. `None` keeps
-/// the default, `<workspace>/target/tmp`, which stays inside the build fence.
+/// `NEWT_BUILD_SCRATCH_DIR` env → `[scratch] build_dir` config. `None` uses
+/// a private managed temporary base outside Git worktrees.
 /// When set, a run's `TMPDIR` is `<base>/<workspace id>/<run>` (see
 /// `confined_exec::build_scratch_dir`): outside the repo, so a test fixture
 /// that must not sit in a git repo works, but outside the session's write grant
-/// too, so each build asks for permission. Point it somewhere no other confined
+/// too, so the Build permission covers it. Point it somewhere no other confined
 /// lane can write: a directory another lane can pre-create or symlink could
 /// redirect the build lane's writes.
 #[must_use]

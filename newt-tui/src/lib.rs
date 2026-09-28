@@ -1146,7 +1146,6 @@ fn runtime_context_block(
     };
     let author_email = identity.email.as_str();
     let author_name = identity.name.as_str();
-    let harness = newt_core::build_info::harness_name();
     let runtime_authority = runtime_authority_note(disposition)
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
@@ -1163,21 +1162,11 @@ fn runtime_context_block(
          never invent or guess an identity.\n\
          {runtime_authority}\
          # Git commit identity\n\
-         Prefer the `git` tool: it commits as `{author_name} <{author_email}>` and \
-         auto-signs `Co-authored-by: {model} ({harness} v<version> <build>) <{author_email}>` for \
-         every model/harness that materially contributed since the last commit \
-         (not just this one) — do NOT add that trailer yourself, just write the \
-         plain message; for the last commit use op=amend (don't claim to amend \
-         without calling it).\n\
-         If you instead commit with the SHELL `git` command (run_command), you \
-         MUST set the same identity explicitly — the email is what attributes the \
-         commit to the harness account on GitHub. Use:\n\
-         `git -c user.name='{author_name}' -c user.email='{author_email}' commit -m \"…\"`\n\
-         (the author name may be `{author_name}` or this model's name, but the \
-         email must always be `{author_email}`). Never commit with a guessed or \
-         personal email. The shell path bypasses the harness entirely, so it \
-         gets NO automatic Co-authored-by credit — prefer the `git` tool \
-         whenever multi-contributor attribution matters.\n\
+         Configured Git identity: `{author_name} <{author_email}>`. \
+         Use ordinary Git commands for repository work. Harness-managed commits \
+         record every contributing model/harness pair from the attribution ledger. \
+         Never invent an author identity or claim a commit or signature without \
+         a successful tool result.\n\
          {filesystem_authority}"
     )
 }
@@ -1212,6 +1201,14 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
 /// `--read <path>` adds a read path; `--write <path>` adds a read+write path
 /// (write implies read) and is also widened into the already-fenced `fs_write`.
 fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
+    policy_for_launch(tui, workspace, newt_core::launch_authority::current())
+}
+
+fn policy_for_launch(
+    tui: Option<newt_core::TuiConfig>,
+    workspace: &str,
+    authority: newt_core::launch_authority::LaunchAuthority,
+) -> newt_core::caveats::Caveats {
     use newt_core::caveats::Scope;
     // --full-access / NEWT_FULL_ACCESS=1: per-invocation preset override —
     // build the policy from `full_access` (`Caveats::top()`, the exact value
@@ -1220,8 +1217,12 @@ fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::
     // + no mode ⇒ `exec_floor_from` → None), so combined with --yolo the
     // host-shell bypass covers every command. Surfaced loudly at session
     // start by `full_access_banner`.
-    let mut caveats = if newt_core::agentic::full_access_requested() {
+    let mut caveats = if authority.full_access() {
         newt_core::caveats::Caveats::top()
+    } else if authority.workspace_access() {
+        let mut permissions = tui.map(|t| t.permissions).unwrap_or_default();
+        permissions.preset = newt_core::PermissionPreset::WorkspaceFullAccess;
+        permissions.to_caveats(workspace)
     } else {
         tui.map(|t| t.permissions.to_caveats(workspace))
             .unwrap_or_else(|| read_only_caveats(workspace))
@@ -1379,6 +1380,11 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
     fn take_exit_requested(&self) -> bool {
         self.exit_requested
             .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn exit_requested(&self) -> bool {
+        self.exit_requested
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1755,14 +1761,39 @@ fn apply_operating_mode_to_intake(
     }
 }
 
-/// Defense in depth for modes that promise no mutation. This is a meet with
-/// the existing plan-phase clamp, so it can only attenuate ambient authority.
-fn operating_mode_caveats(mode: OperatingMode, caveats: newt_core::Caveats) -> newt_core::Caveats {
+/// Only an operator-selected mode or an active model Plan phase may clamp
+/// authority. Inferred working styles guide the response; they cannot remove
+/// existing grants. Every clamp is a meet, so it cannot add authority either.
+fn operating_mode_caveats(
+    configured: OperatingMode,
+    model_plan_phase: bool,
+    caveats: newt_core::Caveats,
+) -> newt_core::Caveats {
+    let mode = if model_plan_phase {
+        OperatingMode::Plan
+    } else {
+        configured
+    };
     match mode {
         OperatingMode::Plan => caveats.meet(&newt_core::agentic::plan_phase_clamp()),
         OperatingMode::Diagnose => caveats.meet(&diagnose_mode_clamp()),
         _ => caveats,
     }
+}
+
+/// The ceiling re-applied by the permission gate after recalled or new grants.
+fn operating_mode_permission_clamp(
+    configured: OperatingMode,
+    model_plan_phase: bool,
+    posture_clamp: Option<newt_core::Caveats>,
+) -> Option<newt_core::Caveats> {
+    let has_posture_clamp = posture_clamp.is_some();
+    let ceiling = operating_mode_caveats(
+        configured,
+        model_plan_phase,
+        posture_clamp.unwrap_or_else(newt_core::Caveats::top),
+    );
+    (has_posture_clamp || ceiling != newt_core::Caveats::top()).then_some(ceiling)
 }
 
 /// Diagnose may gather remote read-only evidence, while still denying every
@@ -1781,18 +1812,29 @@ fn diagnose_mode_clamp() -> newt_core::Caveats {
 }
 
 fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) -> String {
+    let (description, instructions) = match (configured != effective, effective) {
+        (true, OperatingMode::Diagnose) => (
+            "Gather evidence and identify the cause.",
+            "Gather evidence using the tools needed for the assignment under the session grants. \
+             Report supported findings and continue any already requested follow-through. Ask \
+             when a consequential decision or required permission remains unresolved.",
+        ),
+        (true, OperatingMode::Plan) => (
+            "Organize the requested work into a concrete, sequenced plan.",
+            "Build a concrete plan using necessary evidence and tools under the session grants. \
+             Follow the requested scope and any active Plan-phase restrictions. Ask about \
+             unresolved decisions or required permissions.",
+        ),
+        _ => (effective.description(), effective.instructions()),
+    };
     let identity = if configured == effective {
-        format!(
-            "Operating mode: {} — {}",
-            effective.as_str(),
-            effective.description()
-        )
+        format!("Operating mode: {} — {}", effective.as_str(), description)
     } else {
         format!(
             "Configured session mode: {}. Effective working style for this turn: {} — {}.",
             configured.as_str(),
             effective.as_str(),
-            effective.description(),
+            description,
         )
     };
     let auto_control = if configured == OperatingMode::Auto {
@@ -1811,13 +1853,14 @@ fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) ->
     format!(
         "<operating_mode configured=\"{}\" effective=\"{}\">\n{}\n\
          Effective instructions:\n{}{}{}\n\
-         This mode controls working style only. It grants no authority, bypasses no \
-         permission or safety boundary, and cannot turn a read-only prompt into an \
-         action prompt.\n</operating_mode>",
+         Inferred styles guide the response; they do not change session grants or \
+         bypass permission gates. Explicit operator Plan or Diagnose modes and an \
+         active model Plan phase retain their permission ceilings. Stay within the \
+         requested task.\n</operating_mode>",
         configured.as_str(),
         effective.as_str(),
         identity,
-        effective.instructions(),
+        instructions,
         auto_control,
         configured_invariants,
     )
@@ -5420,7 +5463,13 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
     };
-    let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
+    let mut ctx = format!(
+        "{identity}\n\nWorkspace: {workspace}\n\
+         This is the current runtime root. Relative tool paths resolve here; \
+         run_command starts here unless its cwd or command selects another directory. \
+         Other requested paths remain governed by the session's permissions. \
+         Historical notes do not redefine this root.\n"
+    );
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -7878,7 +7927,7 @@ fn mouse_capable_for(
         )
 }
 
-/// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
+/// Initial allowance of tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Uses the canonical core default when there's no `[tui]` table or config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui
@@ -7887,7 +7936,7 @@ fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
         .unwrap_or_else(|| newt_core::TuiConfig::default().max_tool_rounds)
 }
 
-/// Additional progress-aware tool-call rounds after `[tui].max_tool_rounds`.
+/// Renewable progress-aware round increments after `[tui].max_tool_rounds`.
 /// Defaults to 5; set to 0 to keep the normal round cap hard.
 fn workflow_grace_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui
@@ -8067,21 +8116,22 @@ fn tool_round_limit_status(
     let explicit_relentless = explicit_tenacity == Some(newt_core::Tenacity::Relentless);
     match session_override {
         Some(rounds) if explicit_relentless => format!(
-            "tool-call round limit: {} this session (explicit relentless tenacity default {}; config/model default {})",
+            "initial tool-call round allowance: {} this session (explicit relentless tenacity default {}; config/model default {})",
             describe_tool_round_limit(rounds),
             describe_tool_round_limit(posture_default),
             describe_tool_round_limit(configured),
         ),
         Some(rounds) => format!(
-            "tool-call round limit: {} this session (config/model default {})",
-            describe_tool_round_limit(rounds), describe_tool_round_limit(configured),
+            "initial tool-call round allowance: {} this session (config/model default {})",
+            describe_tool_round_limit(rounds),
+            describe_tool_round_limit(configured),
         ),
         None if explicit_relentless => format!(
-            "tool-call round limit: {posture_default} (effectively unlimited; explicit relentless tenacity; config/model default {})",
+            "initial tool-call round allowance: {posture_default} (effectively unlimited; explicit relentless tenacity; config/model default {})",
             describe_tool_round_limit(configured),
         ),
         None => format!(
-            "tool-call round limit: {} (config/model default)",
+            "initial tool-call round allowance: {} (config/model default)",
             describe_tool_round_limit(configured)
         ),
     }

@@ -132,16 +132,21 @@ pub(super) fn cap_model_output_with_handle(
     head_tokens: usize,
     spill_id: Option<&str>,
 ) -> String {
-    if max_tokens == 0 {
-        return text.to_string();
-    }
     // Size the cap with the CONSERVATIVE ratio, not the 4 c/t context estimate:
     // dense output tokenizes denser, so a cap sized at 4 c/t admits more real
     // tokens than its budget. Using the conservative ratio for BOTH the
     // over-budget test and the char budget caps dense content sooner and tighter.
     let est = cap_estimator();
-    if est.tokens_for_chars(text.len()) <= max_tokens {
-        return text.to_string();
+    if max_tokens == 0 || est.tokens_for_chars(text.len()) <= max_tokens {
+        // A caller-selected view can be small while its retained source is
+        // larger. An existing handle must remain discoverable in either case.
+        return match spill_id {
+            Some(id) => format!(
+                "{text}\n\n{}",
+                crate::agentic::content_spill::tool_output_retrieval_hint(id)
+            ),
+            None => text.to_string(),
+        };
     }
     let max_chars = est.chars_for_tokens(max_tokens);
     let head_tokens = head_tokens.min(max_tokens);

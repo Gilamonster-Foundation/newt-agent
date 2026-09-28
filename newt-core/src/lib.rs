@@ -36,6 +36,7 @@ pub mod event_journal;
 pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;
+mod native_git_broker;
 pub mod netguard;
 pub mod owned_hosts;
 pub mod permission_journal;
@@ -169,7 +170,9 @@ pub mod pyo3_module;
 /// Carried-coreutils dispatch (agent-bridle #206): a newt binary calls this at
 /// the top of `main` to become dispatch-capable, so the brush engine's carried
 /// `ls`/`cat` shims re-exec against the newt binary itself.
-pub use agent_bridle::maybe_dispatch;
+pub fn maybe_dispatch() -> Option<i32> {
+    native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
+}
 pub use agent_identity::{
     default_operator, AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef,
     AGENT_IDENTITY_FILENAME, DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_NAME, GITHUB_APP_BOT_EMAIL,

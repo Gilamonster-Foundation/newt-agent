@@ -253,6 +253,14 @@ impl NavigatorSession {
     }
 }
 
+// Internal admitted adapters share the pure matching and report format.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use impact::impact_from_admitted;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use text::{finish_text_search, search_contents, MAX_HITS};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use tools::{index_id, TEXT_SEARCH_PAGE_SIZE};
+
 #[cfg(test)]
 mod tests {
     use super::*;

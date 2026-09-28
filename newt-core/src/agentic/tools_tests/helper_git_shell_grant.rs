@@ -97,13 +97,15 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
 #[test]
 fn session_fs_write_still_excludes_the_common_objects_directory() {
     let root = tempfile::tempdir().unwrap();
-    let main = root.path().join("main");
+    // Git resolves macOS's /var alias; compare the same physical paths.
+    let root_path = root.path().canonicalize().unwrap();
+    let main = root_path.join("main");
     std::fs::create_dir(&main).unwrap();
     real_git(&main, &["init", "-q"]);
     std::fs::write(main.join("seed"), "x").unwrap();
     real_git(&main, &["add", "seed"]);
     real_git(&main, &["commit", "-q", "-m", "init"]);
-    let wt = root.path().join("wt");
+    let wt = root_path.join("wt");
     real_git(
         &main,
         &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
@@ -140,6 +142,78 @@ fn session_fs_write_still_excludes_the_common_objects_directory() {
     let unwidened =
         super::shell::dispatch_caveats_for_git_shell("rm f.txt", &wt.to_string_lossy(), &session);
     assert_eq!(unwidened.fs_write, session.fs_write);
+}
+
+/// A cached repository identity is not a write grant. In particular, a
+/// read-only session or a grant for an unrelated path must not gain .git writes
+/// merely by running a native Git command.
+#[test]
+fn git_shell_widening_requires_write_authority_over_the_workspace() {
+    use crate::caveats::{Caveats, Scope};
+
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    real_git(&main, &["init", "-q", "-b", "main"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    let repo = root.path().join("repo");
+    real_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            repo.to_str().unwrap(),
+            "-b",
+            "task",
+        ],
+    );
+    let own_git = crate::git_hardening::own_gitdir_grants(&repo);
+    assert!(
+        !own_git.write.is_empty(),
+        "prime a real writable Git identity"
+    );
+    let workspace = repo.to_string_lossy();
+
+    for write_scope in [
+        Scope::none(),
+        Scope::only([root.path().join("unrelated").to_string_lossy().into_owned()]),
+        Scope::only([repo.join("seed").to_string_lossy().into_owned()]),
+    ] {
+        let session = Caveats {
+            fs_read: Scope::only([workspace.to_string()]),
+            fs_write: write_scope,
+            ..Caveats::top()
+        };
+        let dispatched = super::shell::dispatch_caveats_for_git_shell(
+            "git config --local test.key value",
+            &workspace,
+            &session,
+        );
+        assert_eq!(
+            dispatched, session,
+            "cached Git metadata must not add authority without a workspace write grant"
+        );
+    }
+
+    let session = Caveats {
+        fs_write: Scope::only([workspace.to_string()]),
+        ..Caveats::top()
+    };
+    assert!(own_git
+        .write
+        .iter()
+        .all(|path| !crate::caveats::permits_path(&session.fs_write, path)));
+    let dispatched =
+        super::shell::dispatch_caveats_for_git_shell("git add seed", &workspace, &session);
+    for path in own_git.write {
+        assert!(
+            crate::caveats::permits_path(&dispatched.fs_write, &path),
+            "a genuine workspace write grant retains access to its Git metadata: {path}"
+        );
+    }
 }
 
 /// Item 2(c): on the default branch, no shell write widening — matches

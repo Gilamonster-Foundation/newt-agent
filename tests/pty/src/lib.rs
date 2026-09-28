@@ -98,7 +98,11 @@ impl Pty {
     fn open_with_reply(cursor_reply: Option<String>) -> Self {
         unsafe {
             let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(master >= 0, "posix_openpt failed");
+            assert!(
+                master >= 0,
+                "posix_openpt failed: {}",
+                std::io::Error::last_os_error()
+            );
             // CLOSE-ON-EXEC, and it is load-bearing (#2086). Tests in one
             // binary run in PARALLEL, and `libc` does not set this for us, so
             // without it every child ANY test spawns inherits every other live
@@ -118,12 +122,26 @@ impl Pty {
                 0,
                 "FD_CLOEXEC on the pty master failed"
             );
-            assert_eq!(libc::grantpt(master), 0, "grantpt failed");
-            assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+            assert_eq!(
+                libc::grantpt(master),
+                0,
+                "grantpt failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                libc::unlockpt(master),
+                0,
+                "unlockpt failed: {}",
+                std::io::Error::last_os_error()
+            );
             let name = libc::ptsname(master);
             assert!(!name.is_null(), "ptsname failed");
             let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
-            assert!(slave >= 0, "opening the pty slave failed");
+            assert!(
+                slave >= 0,
+                "opening the pty slave failed: {}",
+                std::io::Error::last_os_error()
+            );
 
             let ws = libc::winsize {
                 ws_row: 50,

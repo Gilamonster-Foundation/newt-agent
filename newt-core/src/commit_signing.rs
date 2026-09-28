@@ -35,16 +35,7 @@ pub trait CommitSigner: Send + Sync {
 /// the last header, continuation lines indented by one space.
 #[must_use]
 pub fn with_signature(commit: &[u8], armored: &str) -> Vec<u8> {
-    let split = commit
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map_or(commit.len(), |at| at + 1);
-    let header = format!("gpgsig {}\n", armored.trim_end().replace('\n', "\n "));
-    let mut out = Vec::with_capacity(commit.len() + header.len());
-    out.extend_from_slice(&commit[..split]);
-    out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(&commit[split..]);
-    out
+    agent_toolchain::native_git::with_signature(commit, armored)
 }
 
 /// The signer the identity's git profile asks for, or `None` when signing is

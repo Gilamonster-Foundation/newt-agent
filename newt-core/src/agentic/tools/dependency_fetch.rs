@@ -1,7 +1,7 @@
 //! Missing-dependency recovery for the confined build lane.
 //!
-//! The build lane is offline by design (`build_tool_request`: kernel deny-all
-//! network, `CARGO_NET_OFFLINE`), so a `Cargo.lock` that pins a crate the
+//! Cargo dependency resolution in the build lane is offline by design
+//! (`CARGO_NET_OFFLINE`), so a `Cargo.lock` that pins a crate the
 //! operator's cache lacks fails with cargo's `--offline was specified` error.
 //! Nothing a model does inside the fence can fix that, and a live ornith-35b
 //! refactor run spent its last 12 rounds trying until the no-progress stop
@@ -99,11 +99,35 @@ pub(super) async fn fetch_locked_dependencies(
     if let Some(refusal) = fetch_refusal(root, cwd, read) {
         return Err(refusal.to_owned());
     }
+    let network = fetch_network_scope(cwd, caveats, permission_gate)?;
+    match ConstrainedExecutor::run_async(
+        dependency_fetch_request(root, cwd, &network).timeout(FETCH_TIMEOUT),
+    )
+    .await
+    {
+        Ok(out) if out.success => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let lines: Vec<&str> = stderr.lines().collect();
+            let tail = lines[lines.len().saturating_sub(6)..].join("\n");
+            Err(format!("`cargo fetch --locked` failed:\n{tail}"))
+        }
+        Err(error) => Err(format!("`cargo fetch --locked` could not run: {error}")),
+    }
+}
+
+/// Resolve the authority carried by the fetch request before spawning cargo.
+fn fetch_network_scope(
+    cwd: &Path,
+    caveats: &Caveats,
+    permission_gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<crate::Scope<String>, String> {
     let ungranted: Vec<&str> = CRATES_IO_FETCH_HOSTS
         .iter()
         .copied()
         .filter(|host| !caveats.permits_net(host))
         .collect();
+    let mut network = caveats.net.clone();
     if !ungranted.is_empty() {
         let requests: Vec<PermissionRequest> = ungranted
             .iter()
@@ -124,36 +148,37 @@ pub(super) async fn fetch_locked_dependencies(
             None => {
                 return Err("no operator is present to approve network access to crates.io".into())
             }
-            Some(gate) => gate.ask(&requests),
+            Some(gate) => gate.ask_with_caveats(caveats, &requests),
         };
-        if !matches!(approved, PermissionDecision::Allow(granted) if ungranted.iter().all(|host| granted.permits_net(host)))
-        {
-            return Err("the operator declined network access to crates.io".into());
+        match approved {
+            PermissionDecision::Allow(granted)
+                if CRATES_IO_FETCH_HOSTS
+                    .iter()
+                    .all(|host| granted.permits_net(host)) =>
+            {
+                network = granted.net;
+            }
+            _ => return Err("the operator declined network access to crates.io".into()),
         }
     }
-    match ConstrainedExecutor::run_async(dependency_fetch_request(root, cwd).timeout(FETCH_TIMEOUT))
-        .await
-    {
-        Ok(out) if out.success => Ok(()),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let lines: Vec<&str> = stderr.lines().collect();
-            let tail = lines[lines.len().saturating_sub(6)..].join("\n");
-            Err(format!("`cargo fetch --locked` failed:\n{tail}"))
-        }
-        Err(error) => Err(format!("`cargo fetch --locked` could not run: {error}")),
+    // Keep the existing least-authority fetch for a restricted operator grant.
+    // An explicit All grant must remain All: on macOS, narrowing it to a host
+    // list requests a boundary Seatbelt cannot establish and L3 refuses it.
+    if network != crate::Scope::All {
+        network = crate::Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
     }
+    Ok(network)
 }
 
 /// Appended to the re-run build's output, so the model knows what happened.
 pub(super) const FETCHED_NOTE: &str =
     "note: the local Cargo cache was missing crates this Cargo.lock pins; newt fetched them (`cargo fetch --locked`) and re-ran the build above.";
 
-/// Appended when the harness could not fetch. Names the operator as the only
-/// remedy, because the model's own attempts cannot reach the network.
+/// Appended when the harness could not fetch. Report the actual failure while
+/// retaining the normal permission/setup recovery path; do not retry here.
 pub(super) fn blocked_note(reason: &str, cwd: &Path) -> String {
     format!(
-        "note: this build needs crates missing from the local Cargo cache, and the build lane is offline by design. newt could not fetch them: {reason}.\nNothing run from inside the sandbox can fix this. Stop and tell the operator to run `cargo fetch --locked` in {}.",
+        "note: this build needs locked dependencies missing from the local Cargo cache. Automatic `cargo fetch --locked` failed in {}: {reason}. Request the needed permission or report the setup failure.",
         cwd.display()
     )
 }
@@ -275,6 +300,41 @@ checksum = "00"
         crate::confined_exec::build_tool_caveats(Path::new("/ws"))
     }
 
+    #[test]
+    fn dependency_fetch_does_not_restore_a_broader_gate_network_baseline() {
+        // A legacy gate can return its broader session baseline on approval.
+        // This invocation holds one crates.io host and an unrelated host; the
+        // pending permission adds only the missing crates.io host, never All.
+        let mut invocation = no_net();
+        invocation.net = crate::Scope::only([
+            CRATES_IO_FETCH_HOSTS[0].to_owned(),
+            "existing.example.test".to_owned(),
+        ]);
+        let mut gate = Answer(true, 0);
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let network = fetch_network_scope(Path::new("/ws"), &invocation, &mut slot).unwrap();
+        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws"), &network);
+        assert_eq!(
+            request.caveats().net,
+            crate::Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned())),
+            "approving the missing fetch host must not restore the gate's All scope"
+        );
+        assert!(!request.caveats().permits_net("unrequested.example.test"));
+        assert_eq!(gate.1, 1);
+    }
+
+    #[test]
+    fn dependency_fetch_keeps_an_existing_unrestricted_grant_without_prompting() {
+        let mut invocation = no_net();
+        invocation.net = crate::Scope::All;
+        let mut gate = Answer(false, 0);
+        let mut slot: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let network = fetch_network_scope(Path::new("/ws"), &invocation, &mut slot).unwrap();
+        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws"), &network);
+        assert_eq!(request.caveats().net, crate::Scope::All);
+        assert_eq!(gate.1, 0);
+    }
+
     #[tokio::test]
     async fn operator_denial_fails_closed_before_any_fetch() {
         let mut gate = Answer(false, 0);
@@ -327,12 +387,16 @@ checksum = "00"
     }
 
     #[test]
-    fn blocked_note_names_the_operator_remedy() {
+    fn blocked_note_reports_the_failure_and_keeps_permission_recovery_available() {
         let note = blocked_note(
             "the operator declined network access to crates.io",
             Path::new("/ws/newt-core"),
         );
         assert!(note.contains("cargo fetch --locked"));
         assert!(note.contains("/ws/newt-core"));
+        assert!(note.contains("the operator declined network access to crates.io"));
+        assert!(note.contains("Request the needed permission or report the setup failure"));
+        assert!(!note.contains("Nothing run from inside the sandbox can fix this"));
+        assert!(!note.contains("Stop and tell the operator"));
     }
 }

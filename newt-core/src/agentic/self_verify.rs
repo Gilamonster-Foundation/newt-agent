@@ -13,7 +13,10 @@
 //! detects the verifications on offer and returns a nudge naming the ones NOT run — so the
 //! loop can hand the model one more round to verify instead of accepting a
 //! finish. It renders no output and touches no filesystem; the loop supplies the
-//! entries (one cheap scan) and the accumulated commands.
+//! entries (one cheap scan) and the accumulated commands. Discovery offers
+//! candidates; only checks explicitly named by the task or actually requested
+//! or attempted this turn enter the conclusion gate. Finding another package's
+//! runner does not make it mandatory after an unrelated workspace edit.
 //!
 //! Complements — does not duplicate — [`crate::verify_gate`] (#73), which is a
 //! STATIC control: it resolves a coding turn's Python imports against the
@@ -274,8 +277,8 @@ fn non_runs_for(runner: &str) -> &'static [&'static str] {
 /// (file/dir names, not full paths) plus the task `instruction`. Pure.
 ///
 /// High-confidence signals only:
-/// - a top-level `test_*.py` / `*_test.py` (and `tests/`, `conftest.py`,
-///   `pytest.ini`) ⇒ run the tests with pytest,
+/// - a Python `test_*.py` / `*_test.py`, `conftest.py`, or `pytest.ini`
+///   offers a Python test runner; a directory named `tests` identifies no language,
 /// - a build-tool entrypoint that conventionally carries a `test` target
 ///   (`Makefile`, `justfile`, `package.json`, `Cargo.toml`, `go.mod`),
 /// - the instruction naming a verify/run command in backticks.
@@ -287,7 +290,6 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
         let el = e.to_ascii_lowercase();
         let is_py_test = (el.starts_with("test_") && el.ends_with(".py"))
             || el.ends_with("_test.py")
-            || el == "tests"
             || el == "conftest.py"
             || el == "pytest.ini";
         if is_py_test && !seen_pytest {
@@ -599,8 +601,8 @@ fn collect_entry_names(
                 if !skip && depth < max_depth {
                     queue.push_back((dir.join(&name), depth + 1));
                 }
-                // A directory name is itself a signal (`tests`), so it is
-                // collected whether or not it is descended into.
+                // Preserve entry names uniformly; a generic directory name
+                // alone does not identify a language-specific test runner.
             }
             seen.entry(name.to_ascii_lowercase()).or_insert(name);
         }
@@ -729,9 +731,6 @@ enum Observed {
 #[derive(Debug, Default, Clone)]
 pub struct VerificationLedger {
     entries: Vec<Observed>,
-    /// Bounded workspace state before the turn. Unknown keeps inferred checks
-    /// eligible; an unchanged workspace only needs explicit or attempted checks.
-    initial_tree: Option<ContentId>,
     /// The instruction checks are detected against, so only a check's own pass
     /// pays for a tree hash.
     task: String,
@@ -751,30 +750,15 @@ impl VerificationLedger {
     pub(crate) fn for_turn(task: &str, result_aware: bool) -> Self {
         Self {
             entries: Vec::new(),
-            initial_tree: None,
             task: task.to_string(),
             result_aware,
             checks: None,
         }
     }
 
-    pub(crate) async fn for_workspace(
-        task: &str,
-        result_aware: bool,
-        workspace: &str,
-        gate_on: bool,
-    ) -> Self {
-        let mut ledger = Self::for_turn(task, result_aware);
-        if gate_on && enabled() {
-            ledger.initial_tree = tree_state_off_worker(workspace).await;
-        }
-        ledger
-    }
-
-    /// Workspace manifests alone do not make a permission, read, or external
-    /// report turn a coding task. Retain explicitly named and attempted checks
-    /// even without a mutation, including their failures and denials. Unknown
-    /// snapshots keep the existing conservative behavior and resource bounds.
+    /// Discovery alone does not make a runner mandatory. Both conclusion
+    /// modes retain only task-explicit, requested, or observed checks, including
+    /// their failures and denials, regardless of unrelated workspace changes.
     pub(crate) async fn applicable_checks(
         &self,
         workspace: &str,
@@ -782,22 +766,17 @@ impl VerificationLedger {
         requested: &[String],
     ) -> Option<Vec<VerifyCheck>> {
         let mut checks = detect_off_worker(workspace, task).await?;
-        if !checks.is_empty()
-            && self.initial_tree.is_some()
-            && tree_state_off_worker(workspace).await == self.initial_tree
-        {
-            let explicit = detect_checks(&[], task);
-            checks.retain(|check| {
-                explicit.contains(check)
-                    || requested
-                        .iter()
-                        .any(|command| check.invocation(command).is_some())
-                    || self.entries.iter().any(|entry| {
-                        matches!(entry,
-                        Observed::Exec { command, .. } if check.invocation(command).is_some())
-                    })
-            });
-        }
+        let explicit = detect_checks(&[], task);
+        checks.retain(|check| {
+            explicit.contains(check)
+                || requested
+                    .iter()
+                    .any(|command| check.invocation(command).is_some())
+                || self.entries.iter().any(|entry| {
+                    matches!(entry,
+                    Observed::Exec { command, .. } if check.invocation(command).is_some())
+                })
+        });
         Some(checks)
     }
 
@@ -1398,20 +1377,29 @@ pub(crate) fn tree_state(
 /// a regular file or a symlink (a FIFO, a socket) is refused rather than read,
 /// so the turn falls back to the mutation chain instead of blocking.
 pub fn workspace_tree_state(root: &std::path::Path) -> Option<ContentId> {
-    tree_state(
+    let complete = std::cell::Cell::new(true);
+    let state = tree_state(
         root,
         &|dir| {
             std::fs::read_dir(dir)
                 .map(|rd| {
-                    rd.filter_map(Result::ok)
-                        .filter_map(|e| {
+                    rd.filter_map(|entry| {
+                        let value = entry.ok().and_then(|e| {
                             let name = e.file_name().into_string().ok()?;
                             let ft = e.file_type().ok()?;
                             Some((name, ft.is_dir() && !ft.is_symlink()))
-                        })
-                        .collect()
+                        });
+                        if value.is_none() {
+                            complete.set(false);
+                        }
+                        value
+                    })
+                    .collect()
                 })
-                .unwrap_or_default()
+                .unwrap_or_else(|_| {
+                    complete.set(false);
+                    Vec::new()
+                })
         },
         &|path| {
             let meta = std::fs::symlink_metadata(path).ok()?;
@@ -1431,7 +1419,8 @@ pub fn workspace_tree_state(root: &std::path::Path) -> Option<ContentId> {
         },
         MAX_TREE_ENTRIES,
         MAX_TREE_BYTES,
-    )
+    );
+    complete.get().then_some(state).flatten()
 }
 
 #[cfg(test)]
@@ -1444,6 +1433,13 @@ mod tests {
 
     fn entries(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_tests_directory_does_not_identify_python() {
+        let checks = detect_checks(&entries(&["Cargo.toml", "tests"]), "");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].label, "`cargo test`");
     }
 
     #[test]

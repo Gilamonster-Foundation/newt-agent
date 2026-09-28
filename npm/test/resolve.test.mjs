@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, cpSync, copyFileSync, chmodSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, cpSync, copyFileSync, symlinkSync, chmodSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -29,9 +29,16 @@ function installedShim(t, shim, script) {
   mkdirSync(platDir, { recursive: true });
   writeFileSync(join(platDir, 'package.json'), JSON.stringify({ name: `@gilamonster/${binaryShim}-${currentPlatform.key}` }));
   const fakeBin = join(platDir, `${binaryShim}${process.platform === 'win32' ? '.exe' : ''}`);
-  if (script === undefined) copyFileSync(process.execPath, fakeBin);
-  else writeFileSync(fakeBin, script);
-  chmodSync(fakeBin, 0o755);
+  if (script === undefined && process.platform !== 'win32') {
+    // Preserve the executable's loader-relative libraries (e.g. Homebrew Node).
+    // Do not chmod this link: that would modify the installed Node executable.
+    symlinkSync(process.execPath, fakeBin);
+  } else {
+    // Windows keeps a real .exe without requiring symlink privileges.
+    if (script === undefined) copyFileSync(process.execPath, fakeBin);
+    else writeFileSync(fakeBin, script);
+    chmodSync(fakeBin, 0o755);
+  }
   if (shim === 'newt-agent') {
     const umbrellaDir = join(tmp, 'node_modules', shim);
     cpSync(join(root, shim), umbrellaDir, { recursive: true });
@@ -217,7 +224,7 @@ for (const shim of SHIMS) {
 }
 
 for (const shim of [...SHIMS, 'newt-agent']) {
-  // A copied native executable grounds package/bin metadata and stdio forwarding
+  // A real native executable grounds package/bin metadata and stdio forwarding
   // on Windows as well as POSIX; only the separate signal test needs a script.
   test(`${shim}: native executable receives argv and stdio and preserves exit status`, { skip: !currentPlatform }, (t) => {
     const launcher = installedShim(t, shim);

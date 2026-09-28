@@ -23,7 +23,7 @@ async fn assert_semantic_chat(allowance: Option<u32>, capable: bool) {
         "default_backend = \"strict\"\n[[backends]]\nname = \"strict\"\nendpoint = \"{}\"\nmodel = \"arbitrary-served-model\"\nkind = \"openai\"\napi = \"chat_completions\"\n{declaration}", server.uri()
     )).unwrap();
     std::fs::write(&instruction, "Finish without calling a tool.\n").unwrap();
-    let mut command = Command::cargo_bin("newt").unwrap();
+    let mut command = common::newt();
     command
         .env_remove("NEWT_TEAM")
         .args(["--cognition", "meticulous", "--config"])

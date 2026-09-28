@@ -1,38 +1,19 @@
 //! Hidden tool-call routing — facade **P4** (§4 of
 //! `docs/ocap/permissions-facade-design.md`).
 //!
-//! Capable models emit tool calls learned from *other* harnesses —
-//! `run_command("cat X")`, `run_command("ls")`, `run_command("find … ")`,
-//! `run_command("rm X")`, `run_command("git status")` — instead of newt's
-//! governed built-ins (`read_file` / `list_dir` / `find` / `delete_file` / the
-//! embedded `git` tool). Each such reach lands as a wasted round, and worse, an
-//! operation the model could have done *within authority* can trip an **exec**
-//! denial when it arrives as a shell command (§4.1).
+//! Faithful single-tool shell calls can use the governed built-in directly:
+//! `cat X` → `read_file`, `ls` → `list_dir`, and supported build commands →
+//! `build_exec`. Each route retains the destination tool's authority checks.
+//! Other calls use ordinary exec under the existing OCAP boundary.
 //!
-//! P4 **promotes faithful one-tool reaches to a silent rewrite**: the call is
-//! transparently re-dispatched to the OCAP-governed built-in (no model
-//! retraining), and **everything else is gated** as ordinary exec.
+//! Native Git commands always use exec. Translating them into a smaller Git
+//! interface changes the requested flags, revisions, or output shape; the
+//! installed Git executable is responsible for its own command semantics.
 //!
-//! ## Routing is NOT a bypass (§4.4)
-//!
-//! A routed call goes through the **same** fs / git caveat checks the built-in
-//! always runs — [`RouteDecision::Route`] only changes *which built-in serves
-//! the call*, never *whether it is within authority*. An out-of-scope
-//! `cat /etc/shadow` routes to `read_file{path:"/etc/shadow"}` and is denied by
-//! the fs floor exactly as a direct `read_file` would be. Routing is the L2
-//! convenience engine; the L3 boundary (the confined shell, the fs fence) is
-//! untouched, and is **never** disabled by the routing escape (§7-F5 — see
-//! `tools::routing_disabled`, a switch distinct from `--disable-ocap`).
-//!
-//! ## The route/gate split is DATA, not `match` arms (three-Cs)
-//!
-//! Per the repo's language-pack / lexicon convention (`CLAUDE.md` → "the three
-//! Cs"), the knowledge of *which* shell reaches route, and *which git
-//! subcommands are read-only*, lives in pure data — the [`SHELL_ROUTES`] slice
-//! and the [`GIT_READ_ONLY_SUBCOMMANDS`] set — read by [`RouteTable::classify`],
-//! a pure function (no fs, no env, no I/O). A new read reach, or a newly
-//! read-only git subcommand, is a **data edit** (and a future drop-in
-//! `[tui.permissions]` override), never a logic change.
+//! [`SHELL_ROUTES`] records which shell programs route. Classification also
+//! checks argument semantics and resolves any leading `cd` against the
+//! caller's workspace and read scope. A command that cannot be translated
+//! faithfully stays on the normal exec path.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -41,7 +22,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteDecision {
     /// Silently route to this governed built-in with these translated args. The
-    /// built-in applies the SAME fs / git caveat checks — routing is not a
+    /// built-in applies the same authority checks — routing is not a
     /// bypass.
     Route { tool: &'static str, args: Value },
     /// Leave the command on the normal exec path (the confined shell / #263
@@ -104,17 +85,6 @@ pub(crate) fn is_build_tool_program(program: &str) -> bool {
     program == "cargo" || program == "just"
 }
 
-/// The git subcommands that are **read-only** and route to the embedded `git`
-/// tool's read path — pure DATA.
-///
-/// These map one-to-one onto the embedded git tool's read ops
-/// (`status`/`log`/`diff`). State-modifying subcommands (`add`, `stash`,
-/// `checkout`, `reset`, `commit`, `push`, `amend`, `rebase`, `branch-delete`,
-/// …) are **NOT** here: they GATE as exec (owner decision 2). `show` has no
-/// embedded read op yet. `branch` mixes reads and mutations, so it uses the
-/// exact argument translation in [`branch_list_route`] instead of this set.
-const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &["status", "log", "diff"];
-
 /// Shell control / redirection / substitution metacharacters. A command
 /// containing any of these is **compound** (`cat f | grep x`, `cat a && cat b`,
 /// `cat $(…)`, a redirect) — its semantics cannot be reproduced by a single
@@ -144,24 +114,19 @@ const BUILD_UNSAFE: &[char] = &['"', '\'', '\\', '~', '*', '?', '[', ']'];
 #[derive(Debug, Clone)]
 pub(crate) struct RouteTable {
     shell_routes: &'static [ShellRoute],
-    git_read_only: &'static [&'static str],
 }
 
 impl RouteTable {
-    /// The built-in table: the [`SHELL_ROUTES`] reaches plus the
-    /// [`GIT_READ_ONLY_SUBCOMMANDS`] set. Composed from data (three-Cs) so a
-    /// future `[tui.permissions]` override layers on the same shape.
+    /// The built-in table of shell calls that have faithful translations.
     #[must_use]
     pub(crate) fn builtin() -> Self {
         Self {
             shell_routes: SHELL_ROUTES,
-            git_read_only: GIT_READ_ONLY_SUBCOMMANDS,
         }
     }
 
-    /// Classify a complete call without discarding argument semantics on the
-    /// newly scoped Git read route. Other routes retain their existing
-    /// policy. `workspace` is the session's workspace root; `read_scope` is
+    /// Classify a complete call without discarding argument semantics.
+    /// `workspace` is the session's workspace root; `read_scope` is
     /// the call's fs-read fence (F24/PR1's `cd`/`cwd` fold, below, needs
     /// both — the caller's own values, never read from the process).
     #[must_use]
@@ -184,11 +149,9 @@ impl RouteTable {
         // round 2 (the BLOCKER's "same rule" for the `cwd`-field path, and
         // its pre-existing sibling: `{command:"cat f", cwd:"sub"}` used to
         // route and silently drop `cwd`): a `cwd` field is allowed
-        // alongside `command` ONLY for `build_exec`/`git` — the two routes
-        // that actually read it ([`attach_cwd`]) — every other route
-        // refuses a call carrying anything beyond bare `command`, exactly
-        // as `build_exec`/the scoped git read always required.
-        let extra_keys_allowed: &[&str] = if matches!(*tool, "build_exec" | "git") {
+        // alongside `command` only for `build_exec`, which actually reads
+        // it ([`attach_cwd`]). Other routes require bare `command`.
+        let extra_keys_allowed: &[&str] = if *tool == "build_exec" {
             &["command", "cwd"]
         } else {
             &["command"]
@@ -221,7 +184,7 @@ impl RouteTable {
         }
         // PR1: a model-supplied `cwd` FIELD on an otherwise-bare call is the
         // SAME question a leading `cd` asks — resolved the SAME way
-        // ([`attach_cwd`]'s own build_exec/git-only rule applies here too).
+        // ([`attach_cwd`]'s build-only rule applies here too).
         // A call with no `cwd` field at all (the original bare shape) is
         // unaffected: `decision` returned as-is.
         let Some(cwd_field) = call.get("cwd").and_then(Value::as_str) else {
@@ -340,22 +303,6 @@ impl RouteTable {
         let Some(program) = tokens.next() else {
             return RouteDecision::Exec;
         };
-
-        // Read-only VCS reaches route BY SUBCOMMAND (the route/gate split is
-        // DATA). A read-only subcommand routes to the embedded git tool's read
-        // path; a state-modifying / unknown / absent subcommand GATES as exec.
-        if program == "git" {
-            let sub = tokens.next();
-            if sub == Some("branch") {
-                return branch_list_route(&tokens.collect::<Vec<_>>());
-            }
-            return match sub {
-                Some(sub) if self.git_read_only.contains(&sub) => {
-                    git_read_route(sub, &tokens.collect::<Vec<_>>())
-                }
-                _ => RouteDecision::Exec,
-            };
-        }
 
         // A recognised build/test invocation routes to the confined build
         // lane — the model's literal argv runs verbatim (see
@@ -482,8 +429,8 @@ fn canonicalize_scope(scope: &crate::caveats::Scope<String>) -> crate::caveats::
 /// classify_call`]'s `cwd`-field fold use, so a routed call's `cwd` is
 /// attached identically regardless of which shape asked for it.
 ///
-/// #2551 round 2 BLOCKER: `cwd` is honoured ONLY by `build_exec`
-/// (`run_confined_build_lane`) and `git` (`newt-git` reads it directly) —
+/// #2551 round 2 BLOCKER: `cwd` is honoured only by `build_exec`
+/// (`run_confined_build_lane`) —
 /// `read_file`/`list_dir`/`find`/`delete_file` all join `workspace + path`
 /// and never look at `args["cwd"]`. Attaching it to any OTHER route would
 /// leave the built-in silently acting on `workspace` while the routed note
@@ -496,7 +443,7 @@ fn attach_cwd(decision: RouteDecision, cwd: String) -> RouteDecision {
     let RouteDecision::Route { tool, mut args } = decision else {
         return decision;
     };
-    if !matches!(tool, "build_exec" | "git") {
+    if tool != "build_exec" {
         return if cwd == "." {
             RouteDecision::Route { tool, args }
         } else {
@@ -835,173 +782,6 @@ fn mark_timeout_secs(decision: RouteDecision, timeout_secs: u64) -> RouteDecisio
     }
 }
 
-/// Translate `status` / `log` / `diff` operands into the embedded git tool's
-/// args — same rule as [`branch_list_route`]: only list shapes whose
-/// namespace the embedded op can preserve; an unmodeled flag GATES as exec
-/// rather than silently running the bare op on a request that asked for
-/// something narrower (item 1 of the routing-honesty job: `git log A..B`
-/// used to answer with the last 20 commits from HEAD, and `git diff --cached`
-/// used to answer with the unstaged diff instead).
-///
-/// A revision/pathspec/`--stat` shape now routes too (the engine serves
-/// them); a near-miss that changes the *presentation* the engine cannot
-/// reproduce (`--word-diff`, `-p` with a range, `--oneline`, …) still gates.
-fn git_read_route(sub: &str, rest: &[&str]) -> RouteDecision {
-    match sub {
-        "status" if rest.is_empty() => RouteDecision::Route {
-            tool: "git",
-            args: json!({ "op": "status" }),
-        },
-        "log" => log_route(rest),
-        "diff" => diff_route(rest),
-        _ => RouteDecision::Exec,
-    }
-}
-
-/// `git log`'s routable shapes: bare, `-N`/`-n N` limit, a single revision or
-/// `A..B` range, and an optional `-- <paths>` pathspec tail, any of which may
-/// combine. Any other flag (`--oneline`, `-p`, `--author=…`, …) gates.
-fn log_route(rest: &[&str]) -> RouteDecision {
-    let mut limit = None;
-    let mut i = 0;
-    if let Some(&"-n") = rest.first() {
-        let Some(n) = rest.get(1).and_then(|n| n.parse::<u64>().ok()) else {
-            return RouteDecision::Exec;
-        };
-        limit = Some(n);
-        i = 2;
-    } else if let Some(flag) = rest.first() {
-        if let Some(n) = parse_log_limit(flag) {
-            limit = Some(n);
-            i = 1;
-        }
-    }
-    let revision = match rest.get(i) {
-        Some(tok) if *tok != "--" && !tok.starts_with('-') => {
-            i += 1;
-            Some(*tok)
-        }
-        _ => None,
-    };
-    let paths = match rest.get(i) {
-        Some(&"--") => &rest[i + 1..],
-        None => &[][..],
-        Some(_) => return RouteDecision::Exec,
-    };
-    if paths.iter().any(|p| p.is_empty()) {
-        return RouteDecision::Exec;
-    }
-    let mut args = serde_json::Map::new();
-    args.insert("op".into(), json!("log"));
-    if let Some(limit) = limit {
-        args.insert("limit".into(), json!(limit));
-    }
-    if let Some(rev) = revision {
-        args.insert("revision".into(), json!(rev));
-    }
-    if !paths.is_empty() {
-        args.insert("paths".into(), json!(paths));
-    }
-    RouteDecision::Route {
-        tool: "git",
-        args: Value::Object(args),
-    }
-}
-
-/// `git diff`'s routable shapes: bare, `--cached`/`--staged`, zero/one/two
-/// revisions, an optional `--stat`, and an optional `-- <paths>` pathspec
-/// tail, any of which may combine. Any other flag (`--word-diff`, `-p`,
-/// `--name-only`, …) gates.
-fn diff_route(rest: &[&str]) -> RouteDecision {
-    let stat = rest.contains(&"--stat");
-    let rest: Vec<&str> = rest.iter().copied().filter(|t| *t != "--stat").collect();
-    let rest = rest.as_slice();
-    if let [flag] = rest {
-        if *flag == "--cached" || *flag == "--staged" {
-            let mut args = serde_json::Map::new();
-            args.insert("op".into(), json!("diff"));
-            args.insert("spec".into(), json!("staged"));
-            if stat {
-                args.insert("stat".into(), json!(true));
-            }
-            return RouteDecision::Route {
-                tool: "git",
-                args: Value::Object(args),
-            };
-        }
-    }
-    let mut i = 0;
-    let mut revs: Vec<&str> = Vec::new();
-    while revs.len() < 2 {
-        match rest.get(i) {
-            Some(tok) if *tok != "--" && !tok.starts_with('-') => {
-                revs.push(tok);
-                i += 1;
-            }
-            _ => break,
-        }
-    }
-    let paths = match rest.get(i) {
-        Some(&"--") => &rest[i + 1..],
-        None => &[][..],
-        Some(_) => return RouteDecision::Exec,
-    };
-    if paths.iter().any(|p| p.is_empty()) {
-        return RouteDecision::Exec;
-    }
-    let mut args = serde_json::Map::new();
-    args.insert("op".into(), json!("diff"));
-    match revs.as_slice() {
-        [] => {}
-        [a] => {
-            args.insert("rev".into(), json!(a));
-        }
-        [a, b] => {
-            args.insert("rev".into(), json!(a));
-            args.insert("rev2".into(), json!(b));
-        }
-        _ => unreachable!("capped at 2 by the while loop"),
-    }
-    if stat {
-        args.insert("stat".into(), json!(true));
-    }
-    if !paths.is_empty() {
-        args.insert("paths".into(), json!(paths));
-    }
-    RouteDecision::Route {
-        tool: "git",
-        args: Value::Object(args),
-    }
-}
-
-/// Parse `git log`'s count shorthand: `-n N` is two tokens, `-N` is one. Only
-/// a bare non-negative integer count is modeled; anything else (a range, a
-/// path, `--oneline`, …) is not representable by `limit` alone, so it gates.
-fn parse_log_limit(flag: &str) -> Option<u64> {
-    flag.strip_prefix("-n")
-        .or_else(|| flag.strip_prefix('-'))
-        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|s| s.parse().ok())
-}
-
-/// Only list shapes whose namespace the embedded operation can preserve.
-/// Never drop a branch operand, mutation flag, or unsupported result filter.
-fn branch_list_route(rest: &[&str]) -> RouteDecision {
-    let scope = match rest {
-        [] | ["--list"] => "local",
-        [flag] | ["--list", flag] | [flag, "--list"] => match *flag {
-            "-a" | "--all" => "all",
-            "-r" | "--remotes" => "remote",
-            _ => return RouteDecision::Exec,
-        },
-        _ => return RouteDecision::Exec,
-    };
-    RouteDecision::Route {
-        tool: "git",
-        args: json!({ "op": "branch-list", "scope": scope }),
-    }
-}
-
 /// Recognise EXACTLY `<clean build argv> [2>&1] | tail -N` (or `tail -n N` /
 /// `head -N` / `head -n N`) and nothing wider (F23 / #2524
 /// "tail-pipe-routes"). Measured (2488-r9): the model's own natural call to
@@ -1142,8 +922,7 @@ fn build_lane_route(program: &str, rest: &[&str]) -> RouteDecision {
 
 /// `cargo build|check|test|clippy [args…]`. `--config`/`-Z…` change what
 /// cargo does (config override / unstable flags outside the calibrated
-/// fence) and never route — same "never widen, never drop" posture as the
-/// git read routes.
+/// fence) and never route; translation must not widen or drop arguments.
 fn cargo_build_route(rest: &[&str]) -> RouteDecision {
     // #2524 follow-up (F23 evidence): 2488-r9's own command was `cargo
     // +stable test …` — cargo's leading `+toolchain` selector, ONE token,
@@ -1266,7 +1045,7 @@ fn operands<'a>(rest: &[&'a str]) -> Vec<&'a str> {
 
 /// Translate `rm [-f] <path>` / `unlink <path>` into `delete_file`.
 /// Recursive/tree deletes, multiple operands, globs, and unknown flags stay on
-/// the exec path, where the absolute deny-list refuses them before the shell.
+/// the exec path under its command grants and native filesystem confinement.
 fn build_delete_route(rest: &[&str]) -> RouteDecision {
     let mut operands = Vec::new();
     let mut end_of_flags = false;
@@ -1461,180 +1240,82 @@ mod tests {
         );
     }
 
-    /// TDD: read-only `git status` is a silent Rewrite to the governed `git`
-    /// built-in read path.
     #[test]
-    fn read_only_git_routes_to_the_git_builtin() {
-        for (cmd, op) in [
-            ("git status", "status"),
-            ("git log", "log"),
-            ("git diff", "diff"),
+    fn native_git_commands_keep_flags_revisions_pathspecs_and_cwd() {
+        let fx = CdFixture::new();
+        let table = RouteTable::builtin();
+        for command in [
+            "git status",
+            "git status --porcelain=v1 --untracked-files=all",
+            "git log -5 A..B -- src/lib.rs docs/",
+            "git log HEAD~1...HEAD -- 'src/a b.rs'",
+            "git diff --cached --stat HEAD~1 -- src/lib.rs",
+            "git diff --word-diff A B -- '*.rs'",
+            "git branch",
+            "git branch --all",
+            "git branch --remotes",
+            "git -C sub status",
+            "git --git-dir=sub/.git status",
+            "cd sub && git status",
+            "cd sub; git log -n 5 -- src/lib.rs",
         ] {
-            assert_eq!(
-                classify(cmd),
-                RouteDecision::Route {
-                    tool: "git",
-                    args: json!({ "op": op }),
-                },
-                "{cmd}"
-            );
+            for extra in [json!({}), json!({"cwd": "sub"}), json!({"timeout": 5})] {
+                let mut call = extra;
+                call["command"] = json!(command);
+                assert_eq!(
+                    table.classify_call(&call, &fx.root, &fx.read_scope()),
+                    RouteDecision::Exec,
+                    "preserve the original shell request: {call}"
+                );
+            }
         }
     }
 
-    /// Item 1 of the routing-honesty job: a routed call must never drop an
-    /// operand. `git status -s` gates (no embedded way to honor `-s`'s short
-    /// format). `git log`/`git diff` get an EXACT translation table for the
-    /// shapes the embedded tool can honour; every other operand gates to
-    /// exec instead of silently answering a different question with
-    /// `ok: true`.
     #[test]
-    fn git_read_routes_never_drop_an_operand() {
-        assert_eq!(classify("git status -s"), RouteDecision::Exec);
-        assert_eq!(classify("git status --porcelain"), RouteDecision::Exec);
-        assert_eq!(
-            classify("git diff --cached"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "spec": "staged" }),
-            }
-        );
-        assert_eq!(
-            classify("git diff --cached --stat"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "spec": "staged", "stat": true }),
-            }
-        );
-        assert_eq!(
-            classify("git diff --staged"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "spec": "staged" }),
-            }
-        );
-        assert_eq!(
-            classify("git log -5"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "limit": 5 }),
-            }
-        );
-        assert_eq!(
-            classify("git log -n 5"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "limit": 5 }),
-            }
-        );
+    fn read_only_git_uses_native_exec() {
+        for cmd in ["git status", "git log", "git diff"] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
     }
 
-    /// The engine now serves a revision/range, an optional pathspec tail, and
-    /// (for diff) `--stat` — this job's whole point (#2482). Each shape
-    /// routes to the exact args the engine needs; nothing is dropped.
     #[test]
-    fn git_read_routes_now_serve_revisions_pathspecs_and_stat() {
-        assert_eq!(
-            classify("git log A..B"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "revision": "A..B" }),
-            }
-        );
-        assert_eq!(
-            classify("git log HEAD~3"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "revision": "HEAD~3" }),
-            }
-        );
-        assert_eq!(
-            classify("git log -5 A..B -- src/lib.rs"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({
-                    "op": "log",
-                    "limit": 5,
-                    "revision": "A..B",
-                    "paths": ["src/lib.rs"],
-                }),
-            }
-        );
-        assert_eq!(
-            classify("git log -- src/lib.rs docs/"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "paths": ["src/lib.rs", "docs/"] }),
-            }
-        );
-        assert_eq!(
-            classify("git diff HEAD~1"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "rev": "HEAD~1" }),
-            }
-        );
-        assert_eq!(
-            classify("git diff A B"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "rev": "A", "rev2": "B" }),
-            }
-        );
-        assert_eq!(
-            classify("git diff A..B"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "rev": "A..B" }),
-            }
-        );
-        assert_eq!(
-            classify("git diff --stat"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "diff", "stat": true }),
-            }
-        );
-        assert_eq!(
-            classify("git diff --stat HEAD~1 -- src/lib.rs"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({
-                    "op": "diff",
-                    "rev": "HEAD~1",
-                    "stat": true,
-                    "paths": ["src/lib.rs"],
-                }),
-            }
-        );
-        // `A...B` (symmetric diff) and a bare token that also names a
-        // worktree path are both still positionally routed as a `revision` /
-        // `rev` — the router stays pure (no fs access) and unchanged; it is
-        // the embedded git engine that now tells these two apart from an
-        // ordinary revision and refuses them honestly instead of silently
-        // answering the wrong question or failing with "could not resolve
-        // commit".
-        assert_eq!(
-            classify("git log HEAD~1...HEAD"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "revision": "HEAD~1...HEAD" }),
-            }
-        );
-        assert_eq!(
-            classify("git log src/lib.rs"),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({ "op": "log", "revision": "src/lib.rs" }),
-            }
-        );
+    fn git_read_commands_preserve_operands() {
+        for cmd in [
+            "git status -s",
+            "git status --porcelain",
+            "git diff --cached",
+            "git diff --cached --stat",
+            "git diff --staged",
+            "git log -5",
+            "git log -n 5",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
     }
 
-    /// Near-misses that must STAY refused: the engine has no way to honor a
-    /// presentation flag, more than two revisions, or an empty pathspec, so
-    /// answering with a routed call would silently answer a different
-    /// question.
     #[test]
-    fn git_read_routes_still_gate_unservable_shapes() {
+    fn git_reads_preserve_revisions_pathspecs_and_stat() {
+        for cmd in [
+            "git log A..B",
+            "git log HEAD~3",
+            "git log -5 A..B -- src/lib.rs",
+            "git log -- src/lib.rs docs/",
+            "git diff HEAD~1",
+            "git diff A B",
+            "git diff A..B",
+            "git diff --stat",
+            "git diff --stat HEAD~1 -- src/lib.rs",
+            "git log HEAD~1...HEAD",
+            "git log src/lib.rs",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// Presentation options also belong to native Git, including shapes
+    /// the specialized interface never represented.
+    #[test]
+    fn git_presentation_options_stay_on_native_exec() {
         assert_eq!(classify("git log --oneline"), RouteDecision::Exec);
         assert_eq!(classify("git log -p"), RouteDecision::Exec);
         assert_eq!(classify("git log -p A..B"), RouteDecision::Exec);
@@ -1646,32 +1327,25 @@ mod tests {
     }
 
     #[test]
-    fn branch_listing_routes_preserve_the_requested_namespace() {
-        for (cmd, scope) in [
-            ("git branch", "local"),
-            ("git branch --list", "local"),
-            ("git branch -a", "all"),
-            ("git branch --all", "all"),
-            ("git branch --list --all", "all"),
-            ("git branch -a --list", "all"),
-            ("git branch -r", "remote"),
-            ("git branch --remotes", "remote"),
-            ("git branch --list -r", "remote"),
-            ("git branch --remotes --list", "remote"),
+    fn branch_listings_use_native_exec() {
+        for cmd in [
+            "git branch",
+            "git branch --list",
+            "git branch -a",
+            "git branch --all",
+            "git branch --list --all",
+            "git branch -a --list",
+            "git branch -r",
+            "git branch --remotes",
+            "git branch --list -r",
+            "git branch --remotes --list",
         ] {
-            assert_eq!(
-                classify(cmd),
-                RouteDecision::Route {
-                    tool: "git",
-                    args: json!({ "op": "branch-list", "scope": scope }),
-                },
-                "{cmd}"
-            );
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
         }
     }
 
     #[test]
-    fn branch_listing_call_routes_preserve_argument_semantics() {
+    fn unrouted_calls_preserve_extra_arguments() {
         let table = RouteTable::builtin();
         for command in ["git branch", "git branch --all", "git branch --remotes"] {
             assert_eq!(
@@ -1682,10 +1356,7 @@ mod tests {
                 ),
                 classify(command)
             );
-            // `timeout` still refuses; `cwd: "elsewhere"` does NOT resolve
-            // against `no_cd_match()` (a nonexistent workspace), so it
-            // refuses too — for a different reason than before PR1 (an
-            // unresolvable `cwd`, not a bare-call rule), same outcome.
+            // Call-level fields stay with the original command too.
             for extra in [json!({"cwd": "elsewhere"}), json!({"timeout": 5})] {
                 let mut call = extra;
                 call["command"] = json!(command);
@@ -1696,16 +1367,8 @@ mod tests {
                 );
             }
         }
-        // #2551 round 2 BLOCKER (flipped from the pre-round-2 assertion,
-        // per the review — this WAS "routes and silently drops cwd" for
-        // `cat`/`ls`, the exact class of bug the blocker fixes; `git
-        // status` now follows the SAME uniform rule as every other route,
-        // not just the scoped-read ones): a `cwd` field on any of these —
-        // `git status` included, `git` honours `cwd` for every op, not
-        // only `branch-list` — is the SAME question a leading `cd` asks.
-        // Against `no_cd_match()` (a nonexistent workspace) it never
-        // resolves, so all three now refuse rather than silently ignoring
-        // the field and running at the wrong (root) directory.
+        // A non-build route cannot honor `cwd`; keep the entire call on
+        // exec rather than silently discarding the requested directory.
         for command in ["git status", "cat file", "ls"] {
             assert_eq!(
                 table.classify_call(
@@ -1755,8 +1418,7 @@ mod tests {
         }
     }
 
-    /// TDD: state-modifying git is GATED as exec — NOT silently routed (owner
-    /// decision 2). Revert the gate (route every git) and this is red.
+    /// Native mutations and unknown subcommands retain the exec gate.
     #[test]
     fn state_modifying_git_gates_as_exec() {
         for cmd in [
@@ -1767,8 +1429,6 @@ mod tests {
             "git checkout -b feat",
             "git reset --hard",
             "git stash",
-            // read-only but not yet built-in-served (follow-up) → gate, not a
-            // misleading routed op error.
             "git show HEAD",
             "git branch topic",
             // a bare / unknown git reach gates.
@@ -1822,7 +1482,7 @@ mod tests {
 
     /// #1022: a simple shell-delete instinct routes to the governed fs_write
     /// tool instead of dead-ending on exec/absolute-deny. Recursive or
-    /// multi-target deletes stay gated/denied.
+    /// multi-target deletes retain native shell semantics and authority checks.
     #[test]
     fn simple_delete_routes_to_delete_file() {
         for cmd in [
@@ -2020,7 +1680,7 @@ mod tests {
 
     /// A build-lane route drops the rest of the call object (there is
     /// nowhere to put `timeout`), so `classify_call` must refuse to route a
-    /// call carrying it — same rule as the scoped git-read route. `cwd` is
+    /// call carrying it. `cwd` is
     /// NOT one of these any more (PR1) — see
     /// [`a_cwd_field_on_a_bare_call_routes_the_same_way`].
     #[test]
@@ -2183,8 +1843,8 @@ mod tests {
     /// repoA && cargo test`), which used to stay compound and never route
     /// at all even though `tools/shell.rs`'s `split_leading_cd` already
     /// folds it correctly for the confined shell's own dispatch. Folds now,
-    /// with `cwd` attached, for BOTH the build lane and the git read route,
-    /// and composes with #2549's tail-pipe route.
+    /// with `cwd` attached to the build lane, and composes with #2549's
+    /// tail-pipe route. Native Git retains its original shell call.
     // Not on Windows: the cd fold does not resolve there yet (fail-closed to
     // Exec, as before this change). Refusal tests still run on every platform.
     #[cfg(not(windows))]
@@ -2230,13 +1890,9 @@ mod tests {
                 args: json!({"argv": ["cargo", "test"], "cwd": "."}),
             }
         );
-        // The git read route folds the SAME `cwd`.
         assert_eq!(
             classify_at("cd sub && git status", &fx.root, &scope),
-            RouteDecision::Route {
-                tool: "git",
-                args: json!({"op": "status", "cwd": "sub"}),
-            }
+            RouteDecision::Exec
         );
     }
 
@@ -2323,13 +1979,13 @@ mod tests {
 
     /// #2551 round 2 BLOCKER (red first, real tempdir with `sub/x`/`sub/f`
     /// AND `x`/`f` at the root — distinct content, so reading/deleting the
-    /// WRONG one is provably wrong): `cwd` is honoured ONLY by `build_exec`
-    /// and `git` (`newt-git` reads it, `run_confined_build_lane` takes it as
-    /// a real parameter) — `read_file`/`list_dir`/`delete_file` all join
+    /// WRONG one is provably wrong): `cwd` is honoured only by `build_exec`
+    /// (`run_confined_build_lane` takes it as a real parameter) —
+    /// `read_file`/`list_dir`/`delete_file` all join
     /// `workspace + path` and never look at `args["cwd"]`. Attaching `cwd`
     /// to those routes anyway would leave `cd sub && rm x` deleting
     /// `<root>/x` instead of `<root>/sub/x` — a wrong-file DELETE gated only
-    /// by `fs_write` on the root, not on `sub`. Every non-build/git route
+    /// by `fs_write` on the root, not on `sub`. Every non-build route
     /// with a resolved `cwd != "."` now stays `Exec`; `cwd == "."` (the
     /// workspace root itself) is harmless and still routes.
     #[test]
@@ -2344,7 +2000,7 @@ mod tests {
             );
         }
         // The pre-existing sibling of the same bug: a `cwd` FIELD (not a
-        // leading `cd`) on a non-build/git route used to route and
+        // leading `cd`) on a non-build route used to route and
         // silently drop it.
         assert_eq!(
             RouteTable::builtin().classify_call(

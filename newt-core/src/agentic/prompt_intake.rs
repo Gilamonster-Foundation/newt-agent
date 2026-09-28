@@ -31,7 +31,6 @@ const MAX_CLARIFICATION_BYTES: usize = 384;
 /// Adjudication is one bounded side call, never a second agent turn. A batch
 /// larger than this is refused outright and every candidate stays `Pending`.
 pub const MAX_ADJUDICATION_BATCH: usize = 15;
-const RESEARCH_TOOL_ROUND_LIMIT: usize = 3;
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V1: &str = "prompt_comprehension_manifest_v1";
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_manifest_v2";
 /// #1971: adds `atomic_ask_kinds` and, for informational clauses only, their
@@ -66,10 +65,9 @@ pub enum PromptDisposition {
     Ask,
     /// The task is ready for normal execution.
     Act,
-    /// Answer or clarify with no mutations; only bounded reads are available.
+    /// Answer or clarify, using tools under the session's existing authority.
     Explain,
-    /// Gather bounded read-only evidence; mutations and capability grants are
-    /// unavailable.
+    /// Gather evidence, using tools under the session's existing authority.
     Research,
     /// Read/recover and update only the harness-owned plan ledger; workspace,
     /// execution, network, capability-grant, and generic MCP mutation paths
@@ -88,16 +86,13 @@ impl PromptDisposition {
         }
     }
 
-    /// Bound non-execution turns even when the session config allows a large
-    /// tool loop. `Ask` is terminal in the TUI and gets a zero-round defense in
-    /// depth for headless callers.
+    /// Response style does not change the operator's configured allowance.
+    /// `Ask` is terminal in the TUI and gets a zero-round defense in depth for
+    /// headless callers.
     pub fn tool_round_limit(self, max: usize) -> usize {
         match self {
             Self::Ask => 0,
-            Self::Act => max,
-            Self::Explain => max,
-            Self::Research => max.min(RESEARCH_TOOL_ROUND_LIMIT),
-            Self::Plan => max,
+            Self::Act | Self::Explain | Self::Research | Self::Plan => max,
         }
     }
 }

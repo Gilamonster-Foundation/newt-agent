@@ -1,5 +1,6 @@
 use super::*;
 use newt_core::agentic::PromptDisposition;
+use newt_core::CaveatsExt as _;
 
 #[test]
 fn operating_modes_have_the_canonical_names_and_human_descriptions() {
@@ -102,10 +103,14 @@ fn plan_and_diagnose_share_one_effective_disposition_with_the_executor() {
     apply_operating_mode_to_intake(OperatingMode::Diagnose, &mut diagnose);
     assert_eq!(diagnose.disposition(), PromptDisposition::Research);
     assert!(diagnose.model_card().contains("disposition: research"));
-    assert!(!newt_core::agentic::tool_allowed(
+    assert!(newt_core::agentic::tool_allowed(
         diagnose.disposition(),
-        "update_plan"
+        "run_command"
     ));
+    let authority =
+        operating_mode_caveats(OperatingMode::Diagnose, false, newt_core::Caveats::top());
+    assert!(!authority.permits_exec("git"));
+    assert!(!authority.permits_fs_write("/workspace/src/lib.rs"));
 
     let mut ask = newt_core::agentic::PromptIntake::analyze("Delete it.");
     apply_operating_mode_to_intake(OperatingMode::Plan, &mut ask);
@@ -167,6 +172,32 @@ fn explicit_action_modes_render_disposition_compatible_instructions() {
             "{configured:?} must render Plan-compatible instructions for protected Plan intake"
         );
     }
+}
+
+#[test]
+fn inferred_style_guidance_uses_session_grants_without_mode_switch_nudges() {
+    for configured in [
+        OperatingMode::Auto,
+        OperatingMode::Dev,
+        OperatingMode::Admin,
+        OperatingMode::FullAuto,
+    ] {
+        for effective in [OperatingMode::Diagnose, OperatingMode::Plan] {
+            let rendered = operating_mode_prompt(configured, effective);
+            assert!(rendered.contains("session grants"), "{rendered}");
+            for stale in [
+                "switch to /mode",
+                "recommend /mode",
+                "stop before planning",
+                "read-only prompt into an action prompt",
+            ] {
+                assert!(!rendered.contains(stale), "{stale}: {rendered}");
+            }
+        }
+    }
+    let explicit = operating_mode_prompt(OperatingMode::Diagnose, OperatingMode::Diagnose);
+    assert!(explicit.contains(OperatingMode::Diagnose.instructions()));
+    assert!(explicit.contains("switch to /mode plan"));
 }
 
 #[test]
@@ -263,28 +294,105 @@ fn auto_model_selection_rejects_self_escalation() {
 
 #[test]
 fn plan_and_diagnose_attenuate_caveats_while_full_auto_preserves_them() {
-    use newt_core::CaveatsExt as _;
-
     let base = newt_core::Caveats::top();
     for mode in [OperatingMode::Plan, OperatingMode::Diagnose] {
-        let effective = operating_mode_caveats(mode, base.clone());
+        let effective = operating_mode_caveats(mode, false, base.clone());
         assert!(effective.leq(&base), "{mode:?} must only attenuate");
         assert!(effective.permits_fs_read("/workspace/src/lib.rs"));
         assert!(!effective.permits_fs_write("/workspace/src/lib.rs"));
         assert!(!effective.permits_exec("cargo"));
     }
     assert!(
-        !operating_mode_caveats(OperatingMode::Plan, base.clone()).permits_net("example.com"),
+        !operating_mode_caveats(OperatingMode::Plan, false, base.clone())
+            .permits_net("example.com"),
         "Plan remains offline"
     );
     assert!(
-        operating_mode_caveats(OperatingMode::Diagnose, base.clone()).permits_net("example.com"),
+        operating_mode_caveats(OperatingMode::Diagnose, false, base.clone())
+            .permits_net("example.com"),
         "Diagnose may gather remote read-only evidence"
     );
     assert_eq!(
-        operating_mode_caveats(OperatingMode::FullAuto, base.clone()),
+        operating_mode_caveats(OperatingMode::FullAuto, false, base.clone()),
         base,
         "full-auto changes persistence, not authority"
+    );
+}
+
+#[test]
+fn inferred_operating_style_preserves_operator_authority() {
+    let bounded = newt_core::Caveats {
+        fs_read: newt_core::Scope::only(["/workspace".into()]),
+        fs_write: newt_core::Scope::only(["/workspace/src".into()]),
+        exec: newt_core::Scope::only(["git".into(), "cargo".into()]),
+        net: newt_core::Scope::only(["example.com".into()]),
+        ..newt_core::Caveats::top()
+    };
+    for base in [bounded, newt_core::Caveats::top()] {
+        for configured in [OperatingMode::Auto, OperatingMode::Dev] {
+            for prompt in [
+                "Investigate the parser regression.",
+                "Write a plan for the parser repair.",
+                "Are there uncommitted files in this repo?",
+            ] {
+                let intake = newt_core::agentic::PromptIntake::analyze(prompt);
+                let style = effective_operating_mode(configured, &intake, false, None);
+                if prompt.starts_with("Investigate") {
+                    assert_eq!(style, OperatingMode::Diagnose);
+                }
+                assert_eq!(
+                    operating_mode_caveats(configured, false, base.clone()),
+                    base,
+                    "{prompt}: inferred {style:?} must not remove an operator's grant"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn model_entered_plan_clamps_authority_without_changing_configured_mode() {
+    let base = newt_core::Caveats::top();
+    for configured in [
+        OperatingMode::Auto,
+        OperatingMode::Dev,
+        OperatingMode::FullAuto,
+    ] {
+        let clamped = operating_mode_caveats(configured, true, base.clone());
+        assert!(clamped.leq(&base));
+        assert!(clamped.permits_fs_read("/workspace/src/lib.rs"));
+        assert!(!clamped.permits_fs_write("/workspace/src/lib.rs"));
+        assert!(!clamped.permits_exec("git"));
+        assert!(!clamped.permits_net("example.com"));
+        assert_eq!(
+            operating_mode_caveats(configured, false, base.clone()),
+            base,
+            "leaving model Plan restores the operator's existing authority"
+        );
+    }
+}
+
+#[test]
+fn explicit_operating_mode_ceiling_composes_with_posture() {
+    let posture = newt_core::Caveats {
+        fs_read: newt_core::Scope::only(["/workspace".into()]),
+        net: newt_core::Scope::none(),
+        ..newt_core::Caveats::top()
+    };
+    let ceiling =
+        operating_mode_permission_clamp(OperatingMode::Diagnose, false, Some(posture.clone()))
+            .expect("explicit mode and posture both impose a ceiling");
+    assert_eq!(
+        ceiling.fs_read, posture.fs_read,
+        "the posture's read grant survives"
+    );
+    assert!(!ceiling.permits_fs_write("/workspace/source.rs"));
+    assert!(!ceiling.permits_exec("git"));
+    assert!(!ceiling.permits_net("example.com"));
+    assert_eq!(
+        operating_mode_permission_clamp(OperatingMode::Auto, false, Some(posture.clone())),
+        Some(posture),
+        "Auto must preserve the operator's existing posture exactly"
     );
 }
 
@@ -413,7 +521,9 @@ fn live_session_control_prompt_composes_mode_and_posture_without_stale_state() {
     );
 
     let overridden = session_control_prompt(OperatingMode::Dev, OperatingMode::Plan, None);
-    assert!(overridden.contains(OperatingMode::Plan.instructions()));
+    assert!(overridden.contains("Build a concrete plan"));
+    assert!(overridden.contains("active Plan-phase restrictions"));
+    assert!(!overridden.contains("recommend /mode"));
     assert!(
         !overridden.contains(OperatingMode::Dev.instructions()),
         "legacy Plan must not be paired with conflicting Dev instructions: {overridden}"

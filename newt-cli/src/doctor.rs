@@ -110,8 +110,14 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     // (L2) and which kernel backend fences it (L3) — separate axes.
     println!("\nShell engine (OCAP):");
     let (backend, l3_active) = newt_core::ocap_l3_backend();
+    let worker_available = newt_core::ShellEngine::Brush.validate_available().is_ok();
     match config.shell.as_ref().and_then(|s| s.engine) {
-        Some(engine) => println!("  configured engine (L2): {engine} (explicit [shell] engine)"),
+        Some(engine) => {
+            println!("  configured engine (L2): {engine} (explicit [shell] engine)");
+            if let Err(reason) = engine.validate_available() {
+                println!("  startup refusal: {reason}");
+            }
+        }
         None => {
             // #1243 Leg 1: the confined default is L3-gated and resolved
             // per-dispatch — report what THIS host resolves to right now, not a
@@ -120,7 +126,9 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
             // brush flip is not enabled (e.g. Windows keeps safe-subset).
             let resolved = newt_core::resolved_confined_default();
             let why = if resolved == newt_core::ShellEngine::Brush {
-                "kernel fence enforcing — brush confines dynamic constructs"
+                "native fence and authenticated worker transport available"
+            } else if !worker_available {
+                "authenticated worker transport unavailable — full shell grammar unavailable"
             } else {
                 "no per-run kernel fence here — safe-subset refuses dynamic constructs"
             };
@@ -130,11 +138,11 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
         }
     }
     println!("    · safe-subset — refuses $(...)/dynamic constructs (portable default)");
+    println!("    · host        — real /bin/sh (full grammar; restricted grants require native confinement)");
+    println!("{}", brush_engine_description(worker_available));
     println!(
-        "    · host        — real /bin/sh in the kernel jail (full grammar; --full-access auto-selects)"
-    );
-    println!(
-        "    · brush       — carried bash-in-Rust + L2 interceptor (cross-platform; confines restricted exec too; Windows full-access default)"
+        "  full-access default: {}",
+        newt_core::full_access_default_engine()
     );
     println!("  override per-run: --shell-engine <safe-subset|host|brush>");
     println!(
@@ -142,7 +150,7 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
         if l3_active {
             "available"
         } else {
-            "NOT available → a restricted fs grant runs advisory-only (sandbox_kind=None)"
+            "NOT available → a restricted fs grant is refused when its kernel floor cannot be met"
         }
     );
     println!(
@@ -204,7 +212,7 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
                         };
                         println!("  {} [stdio] — OK, {} tool(s): {list}", s.name, names.len());
                     }
-                    Err(e) => println!("  {} [stdio] — ERROR: {e}", s.name),
+                    Err(e) => println!("  {} [stdio] — ERROR: {e:#}", s.name),
                 }
             }
             newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
@@ -596,10 +604,29 @@ pub fn sign_ocap() -> anyhow::Result<i32> {
     Ok(if refused.is_empty() { 0 } else { 2 })
 }
 
+fn brush_engine_description(worker_available: bool) -> &'static str {
+    if worker_available {
+        "    · brush       — carried bash-in-Rust worker with static command/file policies; descendant confinement requires the native backend"
+    } else {
+        "    · brush       — unavailable: authenticated worker transport is not implemented on this platform; full shell grammar remains unavailable"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use newt_core::ocap::{Guarantee, RuntimeEvidence, LINUX_CEILING, MACOS_CEILING};
+
+    #[test]
+    fn brush_description_reports_transport_limit_without_parity_claims() {
+        let unavailable = brush_engine_description(false);
+        assert!(unavailable.contains("unavailable"));
+        assert!(unavailable.contains("authenticated worker transport"));
+        assert!(!unavailable.contains("Windows full-access default"));
+        let available = brush_engine_description(true);
+        assert!(available.contains("static command/file policies"));
+        assert!(!available.contains("confines restricted exec too"));
+    }
 
     #[test]
     fn posture_lines_are_derived_from_the_report_not_prose() {

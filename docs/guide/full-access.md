@@ -1,4 +1,68 @@
-# `--full-access`, and why confinement is the default
+# Full access inside a workspace
+
+To let Newt work freely inside one directory, start it with:
+
+```sh
+newt --workspace-access code /path/to/project
+```
+
+Commands can create, change, rename, and delete files and directories beneath
+that workspace, including recursive cleanup, without approving each in-scope
+filesystem operation.
+The native filesystem fence still protects outside targets, including `..`
+and symlink escapes. Explicit `--read` and `--write` grants can open additional
+paths. Network access follows the separately configured network permissions;
+this option grants no network access by itself.
+
+To persist this filesystem and executable preset, use an operator-owned, trusted
+config such as `~/.newt/config.toml` (or `$NEWT_CONFIG_DIR/config.toml`):
+
+```toml
+[tui.permissions]
+preset = "workspace_full_access"
+```
+
+Repository permission settings in an ambient `newt.toml` or project
+`.newt/config.toml` are not trusted. To select a particular operator config,
+set `NEWT_CONFIG` to its existing absolute path. This also avoids an ambient
+`newt.toml` taking precedence over the user config.
+
+The startup choice uses Newt's signed capability path and does not change
+authority in an already running session. `--workspace-access` conflicts with
+`--full-access` and `--yolo`; inherited global-access and bypass switches do not
+override the requested directory fence. The persistent preset alone does **not**
+clear inherited `NEWT_FULL_ACCESS` or `NEWT_DISABLE_OCAP`; use the explicit
+`--workspace-access` flag to select that confined startup behavior. An active
+posture or operating mode may still narrow the session's authority.
+
+On macOS, the current Bridle backend cannot enforce restricted network grants,
+including the default empty `net` list. Confined commands require the operator
+to explicitly allow unrestricted networking. For that choice, include this in
+the same trusted config:
+
+```toml
+[tui.permissions]
+preset = "workspace_full_access"
+net = ["*"]
+```
+
+The directory fence remains active. Destination filtering and the proposed
+traffic-monitor TUI are still [planned work](../design/network-console.md);
+this setting grants network access and does not provide those controls.
+
+Build, test, and formatting commands may ask for a calibrated Build grant to
+read toolchain/package caches beyond the workspace and use managed scratch.
+Allowing Build adds no network authority. Supported native `git commit` commands
+retain harness attribution/signing and default-branch protection: commit on a
+feature branch. Merge/rebase families and native Windows commit transport remain
+outside the current [native commit adapter's scope](../design/agent-toolchain.md#native-commit-adapter-scoped-implementation).
+
+`/help permissions` describes the startup choice. `/permissions` and `/allow`
+review session decisions; they do not edit the preset. Terminal permission
+prompts can grant access for the session and offer permanent grants for eligible
+filesystem, executable, and network requests.
+
+## Global full access
 
 By default Newt runs under the `workspace_dev` permission preset. The model
 can read and write inside the workspace and run a conservative set of dev
@@ -10,6 +74,10 @@ in the kernel where the OS allows.
 `--full-access` lifts that for one run. The workspace fence, the network
 leash, and the exec allowlist are all removed; `write_file` still asks. It is
 the `full_access` preset applied to this invocation only.
+
+The native commit adapter requires its helpers to remain outside every writable
+root, so it refuses a global filesystem-write grant. Use directory-scoped
+authority for supported native commits.
 
 ## Why have it at all
 

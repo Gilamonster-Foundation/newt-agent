@@ -95,6 +95,74 @@ fn content(message: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// Grounds the host's post-tool approval pause in a cold journal restore.
+#[test]
+fn completed_tool_batch_can_await_operator_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    let (calls, _) = begin(&mut session, "openai", 2);
+    let reply = session.tool_call(calls[0]).unwrap().reply;
+    for (ordinal, call) in calls.iter().enumerate() {
+        session
+            .resolve_tool_call(*call, &envelope("openai", ordinal, "approval requested"))
+            .unwrap();
+    }
+    session
+        .record_outcome(reply, "await_operator", "Awaiting approval.")
+        .unwrap();
+    let head = session.head();
+    drop(session);
+    let mut restored = Session::restore(dir.path(), head, "local-session").unwrap();
+    assert_eq!(restored.restored_messages().unwrap().len(), 4);
+    for call in calls {
+        assert_eq!(
+            restored.tool_call(call).unwrap().state,
+            ToolCallState::HostResolved
+        );
+    }
+    assert!(restored
+        .record_outcome(reply, "await_operator", "Again")
+        .unwrap_err()
+        .to_string()
+        .contains("terminal control outcome"));
+}
+
+#[test]
+fn operator_handoff_cannot_skip_unfinished_tool_deliveries() {
+    for delivered in 0..2 {
+        let mut session = Session::new(SessionConfig::default()).unwrap();
+        let (calls, _) = begin(&mut session, "openai", 2);
+        let reply = session.tool_call(calls[0]).unwrap().reply;
+        for (ordinal, call) in calls.iter().take(delivered).enumerate() {
+            session
+                .resolve_tool_call(*call, &envelope("openai", ordinal, "approval requested"))
+                .unwrap();
+        }
+        assert!(session
+            .record_outcome(reply, "await_operator", "Pending")
+            .is_err());
+    }
+}
+
+#[test]
+fn ordinary_model_reply_still_needs_a_question_verdict_to_await_operator() {
+    let mut session = Session::new(SessionConfig::default()).unwrap();
+    let request = session
+        .record_request(
+            json!({"messages":[{"role":"user","content":"task"}]}),
+            "openai",
+        )
+        .unwrap();
+    let reply = session
+        .record_reply(request.id, b"unadjudicated answer")
+        .unwrap();
+    assert!(session
+        .record_outcome(reply, "await_operator", "Question?")
+        .unwrap_err()
+        .to_string()
+        .contains("question verdict"));
+}
+
 #[test]
 fn identical_idless_calls_have_distinct_occurrences_and_exact_returns() {
     let mut session = Session::new(SessionConfig::default()).unwrap();

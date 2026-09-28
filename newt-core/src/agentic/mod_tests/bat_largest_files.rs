@@ -20,7 +20,8 @@
 //! Nemotron 2026-07-25): "highest line counts" classifies Research, is answered
 //! by `find` `sort=lines`+`show_lines` (NOT a bytesize fallback — the fixture
 //! inverts byte vs line order so a size sort would fail the assertion), and a
-//! `wc -l` shell reach is disposition-denied the same way `du` is for bytes.
+//! `wc -l` shell reach respects the fixture's explicit exec denial, just as
+//! `du` does for bytes. Prompt classification itself grants or removes nothing.
 //!
 //! Fast + fully simulated (scripted model, no live inference), so it runs in
 //! the per-PR suite.
@@ -37,7 +38,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 const PROMPT: &str = "What are the 10 largest Rust files in this workspace?";
 
 /// #1387 sibling: the line-count regression prompt. Same double-bind shape as
-/// #1257 (an evidence question the read-only turn must answer without shell) —
+/// #1257 (an evidence question in a session without shell authority) —
 /// here the metric is line count, answered by `find` sort=lines/show_lines, not
 /// a bytesize fallback (which the operator classes a failure).
 const LINE_COUNT_PROMPT: &str =
@@ -140,8 +141,8 @@ pub(super) async fn run_scenario_for(
 ) -> (String, u32, Option<crate::TurnEndReason>, String) {
     let intake = PromptIntake::analyze(prompt);
     // #1260/#1387: content classifies (the "largest"/"line count" evidence
-    // needles) — the `?` cliff no longer decides. Research keeps the bounded
-    // evidence loop.
+    // needles) — the `?` cliff no longer decides. Research describes the task;
+    // the session's explicit caveats below constrain its effects.
     //
     // #2051: the expected disposition is a parameter so a sibling BAT can
     // replay a non-evidence turn through the same simulated environment
@@ -163,9 +164,17 @@ pub(super) async fn run_scenario_for(
         .await;
 
     let messages = msgs_for(prompt);
-    let caveats = Caveats::top();
     let uri = server.uri();
     let ws = workspace.to_string_lossy().into_owned();
+    // These fixtures deliberately have no mutation or exec authority. A prose
+    // classifier is not the reason a fabricated write or shell call is denied.
+    let caveats = Caveats {
+        fs_read: crate::Scope::only([ws.clone()]),
+        fs_write: crate::Scope::none(),
+        exec: crate::Scope::none(),
+        net: crate::Scope::none(),
+        ..Caveats::top()
+    };
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let mut c = ChatCtx {
         overflow_retry: Default::default(),
@@ -241,7 +250,7 @@ pub(super) async fn run_scenario_for(
         estimate_ratio: None,
         estimation: crate::tokens::TokenEstimation::default(),
         summary_input_cap_floor_chars: 8_192,
-        exec_floor: None,
+        exec_floor: Some(&caveats.exec),
         write_ledger: None,
         attribution: None,
         cancel: None,
@@ -517,10 +526,9 @@ async fn rust_followup_answers_with_source_filtered_markdown_table() {
     assert_clean_footer(hallucinations, end_reason);
 }
 
-/// Flow 2b — line-count boxed-in path: the model reaches for `wc -l` (the
-/// shell answer to line counts). Research disposition-denies `run_command`
-/// honestly; the formal escalation stays available. Same shape as Flow 2 for
-/// the `du` pipeline — locks that line count does NOT require Act.
+/// Flow 2b: the model reaches for `wc -l` without a session exec grant. The
+/// actual authority denial reaches the model, and asking the human stays
+/// available. A different phrasing of the task cannot grant exec authority.
 #[tokio::test]
 async fn line_count_question_wc_denied_then_escalates_cleanly() {
     let ws = simulated_line_workspace();
@@ -555,8 +563,9 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
         "final answer returned: {reply}"
     );
     assert!(
-        wire.contains("Tool `run_command` is not available for this request"),
-        "Research refuses the wc -l shell honestly: {wire}"
+        wire.contains("capability denied")
+            && !wire.contains("Tool `run_command` is not available for this request"),
+        "the explicit exec denial, not the Research style, must govern wc -l: {wire}"
     );
     assert!(
         wire.contains("no human available this session"),
@@ -570,7 +579,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
 }
 
 /// Flow 2 — the boxed-in path made honest: the model first tries the `du`
-/// pipeline (disposition-denied — NOT miscounted, #1262), then formally asks
+/// pipeline (denied by session authority — NOT miscounted, #1262), then formally asks
 /// the human (#1259) instead of being trapped into penalized narration. The
 /// footer still renders clean (#1261).
 #[tokio::test]
@@ -604,11 +613,12 @@ async fn largest_files_question_pipeline_denied_then_escalates_cleanly() {
         reply.contains("Proceeding"),
         "final answer returned: {reply}"
     );
-    // The pipeline was DISPOSITION-refused (an honest gate), never hijacked as
+    // The pipeline was denied by OCAP authority, never hijacked as
     // a misdirected embedded-find (#1262 kept hallucinations at zero below).
     assert!(
-        wire.contains("Tool `run_command` is not available for this request"),
-        "the evidence turn refuses the shell honestly: {wire}"
+        wire.contains("capability denied")
+            && !wire.contains("Tool `run_command` is not available for this request"),
+        "the explicit exec denial, not the evidence style, must govern the shell: {wire}"
     );
     // The formal escalation dispatched (#1259): headless => the recoverable
     // no-human message — never the disposition refusal, never a hang.

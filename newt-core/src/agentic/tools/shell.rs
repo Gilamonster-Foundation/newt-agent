@@ -10,7 +10,7 @@ use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
-use super::{denial_recovery_hint, full_access_requested, ocap_disabled};
+use super::{denial_context, denial_recovery_hint, full_access_requested, ocap_disabled};
 use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {
@@ -542,22 +542,28 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
     // collapses `.`/`..` components on BOTH sides before comparing.
     let normalized =
         |token: &str| crate::caveats::lexically_normalize(&resolve_exec_cwd(cwd, Some(token)));
-    writes.iter().find_map(|write| {
-        let write_path = normalized(write);
-        reads
-            .iter()
-            .any(|read| normalized(read) == write_path)
-            .then(|| {
-                format!(
-                    "error: refusing to run this command — it reads '{write}' and \
+    // Empty operands and tokenizer placeholders do not name files. In
+    // particular, an unsupported descriptor operation must not become cwd
+    // through resolve_exec_cwd(None/empty) and collide with a real `.` operand.
+    writes
+        .iter()
+        .filter(|path| !path.is_empty())
+        .find_map(|write| {
+            let write_path = normalized(write);
+            reads
+                .iter()
+                .any(|read| !read.is_empty() && normalized(read) == write_path)
+                .then(|| {
+                    format!(
+                        "error: refusing to run this command — it reads '{write}' and \
                      also redirects output to '{write}' in the same pipeline. The \
                      shell truncates '{write}' before the command finishes reading \
                      it, destroying the input. Write to a new name and move it into \
                      place instead (e.g. `awk … f > f.tmp && mv f.tmp f`).\n\
                      Refused command: {cmd}"
-                )
-            })
-    })
+                    )
+                })
+        })
 }
 
 pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
@@ -582,9 +588,8 @@ pub(super) fn shell_engine() -> crate::ShellEngine {
         return engine;
     }
     // No engine was published (e.g. a non-CLI entry point that set
-    // NEWT_FULL_ACCESS directly). Honor the same auto-upgrade the CLI applies so
-    // `NEWT_FULL_ACCESS=1` alone still gets the full-grammar engine (`host` on
-    // unix, `brush` on Windows).
+    // NEWT_FULL_ACCESS directly). Honor the same supported default as the CLI:
+    // host on Linux/macOS, safe-subset where the worker is unavailable.
     if full_access_requested() {
         return crate::full_access_default_engine();
     }
@@ -625,13 +630,20 @@ fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     wall: std::time::Duration,
+    execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
 ) -> agent_bridle::Registry {
     use std::sync::Arc;
+    #[cfg(test)]
+    let _ = &command_broker;
     let shell: Arc<dyn agent_bridle::Tool> = match engine {
         crate::ShellEngine::SafeSubset => {
             // F20: the wall rides on the limits — see `shell_limits`.
             let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
                 .with_sandbox_policy(b1_run_command_sandbox_policy());
+            if let Some(lease) = execution_lease {
+                tool = tool.with_execution_lease(lease);
+            }
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
@@ -640,6 +652,9 @@ fn bridle_registry(
         crate::ShellEngine::Host => {
             let mut tool = agent_bridle::HostShellTool::new()
                 .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
+            if let Some(lease) = execution_lease {
+                tool = tool.with_execution_lease(lease);
+            }
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
@@ -655,6 +670,9 @@ fn bridle_registry(
             let shell = {
                 let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
                     .with_sandbox_policy(b1_run_command_sandbox_policy());
+                if let Some(lease) = execution_lease {
+                    tool = tool.with_execution_lease(lease);
+                }
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
                 }
@@ -662,26 +680,20 @@ fn bridle_registry(
             };
             #[cfg(not(test))]
             let shell = {
-                // The carried brush engine (agent-bridle 0.7): in-process bash + the
-                // L2 CommandInterceptor. The cross-platform engine — and on Windows
-                // the ONLY full-grammar option, since `host` needs `/bin/sh`.
-                #[cfg(windows)]
-                {
-                    use std::sync::Once;
-                    static WARN: Once = Once::new();
-                    WARN.call_once(|| {
-                        tracing::warn!(
-                            "using the 'brush' shell engine on Windows: run_command runs a \
-                         bash-in-Rust shell for internal-tooling compatibility. Native \
-                         PowerShell/cmd code paths are a FUTURE release — not written yet \
-                         (we are opinionated Linux developers who occasionally use a \
-                         MacBook). Bash-isms work; Windows-native shell semantics do not."
-                        );
-                    });
-                }
+                // Brush runs in an authenticated worker with static command/file
+                // policies. Unsupported targets refuse rather than bypassing its
+                // private transport; startup checks that capability.
                 let mut tool = agent_bridle::BrushShellTool::new()
+                    .with_max_output_bytes(shell_limits(wall).max_output_bytes)
+                    .expect("shared shell output limit fits Brush protocol bounds")
                     .with_timeout(wall)
                     .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
+                if let Some(lease) = execution_lease {
+                    tool = tool.with_execution_lease(lease);
+                }
+                if let Some(broker) = command_broker {
+                    tool = tool.with_command_broker(broker);
+                }
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
                 }
@@ -775,6 +787,37 @@ pub(super) async fn dispatch_bridled_shell(
     caveats: &crate::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
+    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None).await
+}
+
+/// A prepared build keeps the native build executor's strength floor while
+/// the same shell engine evaluates the original source and pipelines once.
+pub(super) async fn dispatch_bridled_build_shell(
+    args: serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+    sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    execution_lease: std::sync::Arc<dyn Send + Sync>,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+) -> agent_bridle::ToolResult<serde_json::Value> {
+    dispatch_bridled_shell_with_floor(
+        args,
+        caveats,
+        sink,
+        Some(agent_bridle::AxisEnforcement::Kernel),
+        Some(execution_lease),
+        command_broker,
+    )
+    .await
+}
+
+async fn dispatch_bridled_shell_with_floor(
+    args: serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+    sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    strength_floor: Option<agent_bridle::AxisEnforcement>,
+    execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+) -> agent_bridle::ToolResult<serde_json::Value> {
     let mut live = LiveOutputSession::start(sink);
     // NOTE (cross-platform review, `unconfined-fallback-on-missing-backend`):
     // run_command dispatches at the DEFAULT (Advisory) strength floor. On a
@@ -796,24 +839,47 @@ pub(super) async fn dispatch_bridled_shell(
     // this changes nothing but the wall clock: `caveats` (fs/net/exec
     // authority) passed to `.dispatch()` below is untouched.
     let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
-    let wall = cmd.map_or_else(
-        || std::time::Duration::from_secs(run_command_wall_secs()),
-        dispatch_wall,
-    );
+    let wall = if strength_floor.is_some() {
+        LIFECYCLE_BUILD_TIMEOUT
+    } else {
+        cmd.map_or_else(
+            || std::time::Duration::from_secs(run_command_wall_secs()),
+            dispatch_wall,
+        )
+    };
     // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
     // read roots for a build-tool command are added ONLY to the caveats used
     // for THIS dispatch, never folded back into the session's standing
     // authority (`widen_caveats` deliberately does not touch `fs_read` for an
     // exec grant — see its doc comment). Call-scoped, exactly like
     // `build_tool_caveats` for the lifecycle build lane.
-    let dispatch_caveats = dispatch_caveats_for_command(cmd.unwrap_or(""), caveats);
+    // A prepared build already calibrated and admitted its exact fence. Do
+    // not re-read operator environment roots after that authority decision.
+    let dispatch_caveats = if strength_floor.is_some() {
+        caveats.clone()
+    } else {
+        dispatch_caveats_for_command(cmd.unwrap_or(""), caveats)
+    };
     let registry = bridle_registry(
-        shell_engine(),
+        if command_broker.is_some() {
+            crate::ShellEngine::Brush
+        } else {
+            shell_engine()
+        },
         live.as_ref().map(LiveOutputSession::relay),
         wall,
+        execution_lease.clone(),
+        command_broker,
     );
     let grant = registry.mint_grant(dispatch_caveats);
-    let result = registry.dispatch("shell", args, &grant).await;
+    let result = match strength_floor {
+        Some(floor) => {
+            registry
+                .dispatch_with_strength_floor("shell", args, &grant, floor)
+                .await
+        }
+        None => registry.dispatch("shell", args, &grant).await,
+    };
     if let Some(live) = live.as_mut() {
         let ordinary_completion = result
             .as_ref()
@@ -845,7 +911,9 @@ pub(super) fn declared_filesystem_requests(
             continue;
         };
         let invalid = || {
-            format!("error: run_command {field} must be an array of nonempty absolute paths without NUL bytes")
+            format!(
+                "error: run_command {field} must be an array of nonempty absolute paths without NUL bytes"
+            )
         };
         for value in value.as_array().ok_or_else(invalid)? {
             let target = value.as_str().ok_or_else(invalid)?;
@@ -871,7 +939,7 @@ pub(super) fn declared_filesystem_requests(
     Ok(requests)
 }
 
-fn permits_filesystem_request(
+pub(super) fn permits_filesystem_request(
     caveats: &crate::caveats::Caveats,
     request: &PermissionRequest,
 ) -> bool {
@@ -889,6 +957,7 @@ pub(super) async fn exec_confined_command(
     // The directory the command runs in (#1159): the workspace root for
     // lifecycle, or a resolved workspace-confined cwd for run_command.
     cwd: &str,
+    workspace: &str,
     color: bool,
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
@@ -909,11 +978,50 @@ pub(super) async fn exec_confined_command(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, ExecOutcome) {
+    exec_confined_command_with_broker(
+        cmd,
+        cwd,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        filesystem_requests,
+        exec_floor,
+        permission_gate,
+        tool_offload,
+        spill_store,
+        live_tool_output,
+        presentation,
+        None,
+    )
+    .await
+}
+
+/// Broker-bearing native commands use Brush's runtime external-command hook.
+/// They retain the complete source and grant and are never replayed after a
+/// runtime denial: an earlier stage may already have changed the repository.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exec_confined_command_with_broker(
+    cmd: &str,
+    cwd: &str,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    filesystem_requests: &[PermissionRequest],
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    permission_gate: &mut Option<&mut dyn PermissionGate>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    presentation: &mut dyn ToolPresentation,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
     // point both the confined dispatch and the `--yolo` host-bypass share.
     if let Some(refusal) = same_file_redirect_refusal(cmd, cwd) {
-        return (refusal, ExecOutcome::Denied);
+        return with_denial_context((refusal, ExecOutcome::Denied), workspace, cwd, None);
     }
 
     // Venv injection (#783): the confined shell carries the venv via
@@ -936,7 +1044,8 @@ pub(super) async fn exec_confined_command(
     // command's leading token; else it falls through to the confined shell,
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
-    let host_bypass = ocap_disabled() && exec_floor_permits(exec_floor, cmd);
+    let host_bypass =
+        command_broker.is_none() && ocap_disabled() && exec_floor_permits(exec_floor, cmd);
 
     // #1176: shadow-OCAP — record the authority a leash WOULD have gated on
     // whenever this command runs UNCONFINED: the yolo/disable-ocap host bypass
@@ -982,9 +1091,14 @@ pub(super) async fn exec_confined_command(
         Some(gate) => match gate.refresh_caveats(caveats) {
             PermissionDecision::Allow(current) => Some(current),
             PermissionDecision::Deny => {
-                return (
-                    "capability denied: current permission authority was refused".to_string(),
-                    ExecOutcome::Denied,
+                return with_denial_context(
+                    (
+                        "capability denied: current permission authority was refused".to_string(),
+                        ExecOutcome::Denied,
+                    ),
+                    workspace,
+                    cwd,
+                    None,
                 );
             }
         },
@@ -1011,19 +1125,34 @@ pub(super) async fn exec_confined_command(
             {
                 Some(allowed)
             }
-            _ => return (
-                "capability denied: declared filesystem authority was not granted for this command"
-                    .into(),
-                ExecOutcome::Denied,
+            _ => return with_denial_context(
+                ("capability denied: declared filesystem authority was not granted for this command".into(), ExecOutcome::Denied),
+                workspace,
+                cwd,
+                Some(caveats),
             ),
         }
     };
     let caveats = admitted.as_ref().unwrap_or(caveats);
 
+    if let Some(refusal) = super::native_git::windows_appcontainer_native_git_refusal(cmd, caveats)
+    {
+        return (format!("error: {refusal}"), ExecOutcome::Unavailable);
+    }
+
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let dispatch_args = confined_dispatch_args(cmd, cwd);
-    match dispatch_bridled_shell(dispatch_args.clone(), caveats, live_tool_output.clone()).await {
+    let result = match dispatch_bridled_shell_with_floor(
+        dispatch_args.clone(),
+        caveats,
+        live_tool_output.clone(),
+        None,
+        None,
+        command_broker.clone(),
+    )
+    .await
+    {
         // The confined shell ran. Its envelope carries
         // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the leash
         // refused a capability — the STRUCTURED denial fields
@@ -1045,6 +1174,17 @@ pub(super) async fn exec_confined_command(
                     crate::denial_journal::DenialStage::Initial,
                     &envelope,
                 );
+                if command_broker.is_some() {
+                    return with_denial_context(
+                        (
+                            denied_run_command_result(&envelope, color),
+                            ExecOutcome::Denied,
+                        ),
+                        workspace,
+                        cwd,
+                        Some(caveats),
+                    );
+                }
                 // #263: an interactive gate may turn this denial into a human grant.
                 // ONE consult + ONE re-execution per call: a second denial (a
                 // different target reached on the re-run) surfaces as the standard
@@ -1073,12 +1213,21 @@ pub(super) async fn exec_confined_command(
                                 .iter()
                                 .all(|request| permits_filesystem_request(&widened, request))
                             {
-                                return (
-                                    "capability denied: declared filesystem authority was not retained for this command".into(),
-                                    ExecOutcome::Denied,
+                                return with_denial_context(
+                                    ("capability denied: declared filesystem authority was not retained for this command".into(), ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    None,
                                 );
                             }
-                            return match dispatch_bridled_shell(
+                            if let Some(refusal) =
+                                super::native_git::windows_appcontainer_native_git_refusal(
+                                    cmd, &widened,
+                                )
+                            {
+                                return (format!("error: {refusal}"), ExecOutcome::Unavailable);
+                            }
+                            let retried = match dispatch_bridled_shell(
                                 dispatch_args,
                                 &widened,
                                 live_tool_output,
@@ -1105,8 +1254,9 @@ pub(super) async fn exec_confined_command(
                                     ),
                                     envelope_outcome(&env2),
                                 ),
-                                Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+                                Err(e) => dispatch_error_result(e),
                             };
+                            return with_denial_context(retried, workspace, cwd, Some(&widened));
                         }
                     }
                 }
@@ -1124,8 +1274,33 @@ pub(super) async fn exec_confined_command(
         }
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
-        Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+        Err(e) => dispatch_error_result(e),
+    };
+    with_denial_context(result, workspace, cwd, Some(caveats))
+}
+
+/// Preserve the dispatch error alongside the execution class returned to the
+/// tool-event funnel. Both initial dispatch and the existing grant retry use it.
+pub(super) fn dispatch_error_result(error: agent_bridle::ToolError) -> (String, ExecOutcome) {
+    let outcome = if matches!(error, agent_bridle::ToolError::Denied { .. }) {
+        ExecOutcome::Denied
+    } else {
+        ExecOutcome::Unavailable
+    };
+    (format!("error: {error}"), outcome)
+}
+
+fn with_denial_context(
+    (mut text, outcome): (String, ExecOutcome),
+    workspace: &str,
+    cwd: &str,
+    caveats: Option<&crate::caveats::Caveats>,
+) -> (String, ExecOutcome) {
+    if outcome == ExecOutcome::Denied {
+        text.push('\n');
+        text.push_str(&denial_context(workspace, Some(cwd), caveats));
     }
+    (text, outcome)
 }
 
 /// #2315: the class of a completed envelope from its own facts — structured
@@ -1913,11 +2088,9 @@ fn absent_program_note(
     })
 }
 
-/// The phrase every absent-binary refusal carries. The loop guidance keys on
-/// it (`MISSING_EXECUTABLE_NEEDLES` in `agentic`) to recognise a blocker no
-/// edit can clear (#2273); one constant, so renderer and classifier cannot
-/// drift — #2277 changed this rendering once and the classifier kept grepping
-/// for brush's old `command not found`.
+/// The phrase every absent-binary refusal carries. The loop's exec-denial
+/// accounting uses this shared marker to distinguish a requestable host-binary
+/// grant from a binary that is not installed, without prescribing a repair.
 pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried userland";
 
 /// The suffix that separates "absent here but installed on the host" (a grant
@@ -2011,6 +2184,9 @@ fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'
 /// fence (a file-level Landlock rule cannot carry the
 /// `MAKE_REG`/`REFER`/`REMOVE_FILE` rights `index.lock` create+rename and
 /// object insertion need — a directory rule can).
+/// The incoming session must already permit writing the workspace root.
+/// A cached repository identity alone cannot authorize metadata writes for a
+/// read-only session or a grant limited to another path or an individual file.
 ///
 /// Deliberately scoped to a SIMPLE `git` invocation, not folded into the
 /// session `fs_write` scope: `write_file`/`edit_file` on git metadata stay
@@ -2035,7 +2211,9 @@ pub(super) fn dispatch_caveats_for_git_shell(
     workspace: &str,
     caveats: &crate::caveats::Caveats,
 ) -> crate::caveats::Caveats {
-    if leading_program(cmd) != Some("git") {
+    if leading_program(cmd) != Some("git")
+        || !crate::caveats::permits_path(&caveats.fs_write, workspace)
+    {
         return caveats.clone();
     }
     // Round 4, Blocker 1: NOT `own_gitdir_grants` — that re-resolves via a
@@ -2157,6 +2335,28 @@ fn host_path_lookup(prog: &str) -> Option<String> {
 /// the #263 re-execution path shares one formatter with the first dispatch.
 pub(super) fn shell_envelope_output(
     envelope: &serde_json::Value,
+    tool_output_lines: usize,
+    color: bool,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    presentation: Option<&mut dyn ToolPresentation>,
+) -> String {
+    shell_envelope_output_with_view(
+        envelope,
+        None,
+        tool_output_lines,
+        color,
+        tool_offload,
+        spill_store,
+        presentation,
+    )
+}
+
+/// Keep the captured envelope intact when the caller selects a smaller view.
+/// Retention and model-budget capping share the normal command-output path.
+pub(super) fn shell_envelope_output_with_view(
+    envelope: &serde_json::Value,
+    view: Option<&str>,
     _tool_output_lines: usize,
     _color: bool,
     tool_offload: bool,
@@ -2171,7 +2371,31 @@ pub(super) fn shell_envelope_output(
         .get("stderr")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let out = format!("{stdout}{stderr}");
+    let truncated_streams = match (
+        envelope
+            .get("stdout_truncated")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        envelope
+            .get("stderr_truncated")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    ) {
+        (true, true) => Some("stdout and stderr"),
+        (true, false) => Some("stdout"),
+        (false, true) => Some("stderr"),
+        (false, false) => None,
+    };
+    let capture_notice = truncated_streams
+        .map(|streams| format!("[{streams} capture truncated; omitted bytes are unavailable]"));
+    let annotate_capture = |text: &str| match &capture_notice {
+        Some(notice) => format!("{notice}\n{text}"),
+        None => text.to_owned(),
+    };
+    let out = annotate_capture(&format!("{stdout}{stderr}"));
+    let selected = view.map(annotate_capture);
+    let view = selected.as_deref().unwrap_or(&out);
+    let selected_view = view != out;
     // #1969: the exit code decides success, not the shape of the output.
     //
     // This used to be consulted ONLY when the output was empty, so every
@@ -2207,10 +2431,10 @@ pub(super) fn shell_envelope_output(
         };
     }
     {
-        // The terminal follows the full output tail even when the model-facing
-        // payload below is token-capped or replaced by a spill handle.
+        // The terminal follows the selected output before the model-facing
+        // token cap or spill teaser is applied.
         if let Some(presentation) = presentation {
-            presentation.override_result(out.clone());
+            presentation.override_result(view.to_owned());
         }
         // #726/#945: the MODEL-facing payload is capped by the shared TOKEN
         // budget using head+tail. When tool_offload is on, spill the FULL
@@ -2226,13 +2450,14 @@ pub(super) fn shell_envelope_output(
         // "will the cap truncate?" and "should we spill?" from ever diverging.
         let max_tokens = max_output_tokens();
         let est = output_budget::cap_estimator();
-        let should_spill = output_budget::should_spill_full_output(
-            out.len(),
-            out.chars().count(),
-            max_tokens,
-            tool_offload,
-        );
-        let capped = if should_spill {
+        let should_spill = (tool_offload && selected_view)
+            || output_budget::should_spill_full_output(
+                out.len(),
+                out.chars().count(),
+                max_tokens,
+                tool_offload,
+            );
+        let mut capped = if should_spill {
             match spill_store {
                 Some(store) => {
                     let (id, redacted) = content_spill::store_redacted_full(
@@ -2240,6 +2465,11 @@ pub(super) fn shell_envelope_output(
                         Some("run_command".to_string()),
                         store,
                     );
+                    let redacted = if selected_view {
+                        crate::agentic::compress::redact_secrets(view)
+                    } else {
+                        redacted
+                    };
                     let teaser_tokens = est
                         .tokens_for_chars(content_spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
                     match id {
@@ -2256,17 +2486,25 @@ pub(super) fn shell_envelope_output(
                         None => cap_model_output(&redacted, max_tokens),
                     }
                 }
-                None => cap_model_output(&out, max_tokens),
+                None => cap_model_output(view, max_tokens),
             }
         } else {
-            cap_model_output(&out, max_tokens)
+            cap_model_output(view, max_tokens)
         };
+        // A tiny or tail-only presentation budget cannot erase the fact that
+        // capture itself was incomplete. The retained source also carries it.
+        if let Some(notice) = &capture_notice {
+            if !capped.contains(notice) {
+                capped.push('\n');
+                capped.push_str(notice);
+            }
+        }
         // #898: if this command's output carries a forge "open a pull/merge
         // request" URL (git prints it on push of a new branch), append an
         // explicit next-step hint so the model opens the PR instead of stalling.
         // Detected from the UNcapped output so a long push log can't truncate the
         // URL away, and appended AFTER the cap so the hint always survives.
-        mark_failure(match pr_creation_url(&out) {
+        mark_failure(match pr_creation_url(view) {
             Some(url) => format!("{capped}{}", pr_next_step_hint(url)),
             None => capped,
         })

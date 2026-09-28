@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn inferred_response_style_keeps_the_authorized_command_surface() {
+    let defs = tool_definitions();
+    for disposition in [PromptDisposition::Explain, PromptDisposition::Research] {
+        assert_eq!(
+            filter_tools_for_disposition(defs.clone(), disposition),
+            defs
+        );
+        assert!(tool_allowed(disposition, "run_command"));
+        assert!(tool_allowed(disposition, "request_permissions"));
+    }
+    assert!(!tool_allowed(PromptDisposition::Plan, "run_command"));
+    assert!(!tool_allowed(PromptDisposition::Ask, "run_command"));
+}
+
+#[test]
 fn persona_preferences_keep_unlisted_tools_discoverable() {
     let defs = serde_json::json!([
         {"function": {"name": "mail__search"}},
@@ -40,13 +55,10 @@ async fn persona_preferences_do_not_veto_an_authorized_file_write() {
 }
 
 #[test]
-fn read_only_git_catalog_exposes_only_read_operations() {
+fn explicit_plan_git_extension_exposes_only_bounded_reads() {
     let full = serde_json::json!([crate::agentic::git_tool::git_tool_definition()]);
-    for disposition in [
-        PromptDisposition::Explain,
-        PromptDisposition::Research,
-        PromptDisposition::Plan,
-    ] {
+    {
+        let disposition = PromptDisposition::Plan;
         let filtered = filter_tools_for_disposition(full.clone(), disposition);
         assert_eq!(
             filtered.as_array().unwrap().len(),
@@ -179,11 +191,10 @@ fn persona_tool_allowed_admits_named_and_always_on_only() {
     );
 }
 
-/// Prompt disposition is an independent, fail-closed catalog boundary:
-/// non-Act turns retain only explicit read/recovery tools, so a generic MCP
-/// name cannot appear merely because its schema was connected to the session.
+/// Only explicit Plan/Ask restrict discovery. Inferred response style cannot
+/// remove tools; dispatch still checks real authority and MCP availability.
 #[test]
-fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
+fn explicit_plan_filters_catalog_without_treating_response_style_as_authority() {
     let defs = serde_json::json!([
         { "type": "function", "function": { "name": "read_file" } },
         { "type": "function", "function": { "name": "write_file" } },
@@ -205,10 +216,7 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
     };
 
     let research = filter_tools_for_disposition(defs.clone(), PromptDisposition::Research);
-    assert_eq!(
-        names(&research),
-        vec!["read_file", "select_operating_mode", "incident__read"]
-    );
+    assert_eq!(names(&research), names(&defs));
     let plan = filter_tools_for_disposition(defs.clone(), PromptDisposition::Plan);
     assert_eq!(
         names(&plan),
@@ -221,8 +229,8 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
     );
     assert!(tool_allowed(PromptDisposition::Explain, "read_file"));
     assert!(tool_allowed(PromptDisposition::Plan, "update_plan"));
-    assert!(!tool_allowed(PromptDisposition::Explain, "update_plan"));
-    assert!(!tool_allowed(PromptDisposition::Research, "update_plan"));
+    assert!(tool_allowed(PromptDisposition::Explain, "update_plan"));
+    assert!(tool_allowed(PromptDisposition::Research, "update_plan"));
     assert!(tool_allowed(PromptDisposition::Plan, "exit_plan_mode"));
     assert!(
         !tool_allowed(PromptDisposition::Plan, "web_fetch"),
@@ -244,7 +252,7 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
         PromptDisposition::Ask,
         "select_operating_mode"
     ));
-    assert!(!tool_allowed(PromptDisposition::Explain, "write_file"));
+    assert!(tool_allowed(PromptDisposition::Explain, "write_file"));
     assert!(tool_allowed(PromptDisposition::Research, "incident__read"));
     assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
     assert!(tool_allowed(PromptDisposition::Act, "incident__write"));
@@ -320,20 +328,19 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
         PromptDisposition::Research,
         "request_user_input"
     ));
-    // …but the capability-GRANT path stays excluded: an evidence turn must
-    // never mint caveats (the #1259 security boundary, pinned).
-    assert!(!tool_allowed(
+    // Permission questions remain available; only the operator can grant.
+    assert!(tool_allowed(
         PromptDisposition::Explain,
         "request_permissions"
     ));
-    assert!(!tool_allowed(
+    assert!(tool_allowed(
         PromptDisposition::Research,
         "request_permissions"
     ));
     assert_eq!(
         filter_tools_for_disposition(
             serde_json::json!({ "not": "a catalog" }),
-            PromptDisposition::Research
+            PromptDisposition::Plan
         ),
         serde_json::json!([]),
         "a non-Act catalog with no enumerable tool names must fail closed"

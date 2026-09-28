@@ -12,6 +12,7 @@ keywords = ["newt", "agent", "git", "ocap", "drake"]
 categories = ["development-tools"]
 
 [dependencies]
+agent-toolchain.workspace = true
 newt-core.workspace = true
 # MIT only — never grit-legacy (GPL-2.0). See the root Cargo.toml note.
 grit-lib.workspace = true
@@ -23,3 +24,8 @@ thiserror.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
+
+[[test]]
+name = "native_git_commit"
+harness = false

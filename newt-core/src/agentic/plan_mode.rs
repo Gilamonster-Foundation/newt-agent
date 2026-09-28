@@ -25,6 +25,16 @@ pub trait PlanModeControl: Send + Sync {
     /// actually call `set_plan_mode(false)`.
     fn request_exit(&self) -> Result<(), String>;
 
+    /// Whether an approval request is pending, without consuming it.
+    ///
+    /// Provider loops use this after recording a tool batch to yield to the
+    /// caller's approval hook. The clamp and request stay intact until that
+    /// hook handles the operator's answer. Legacy embedders that do not expose
+    /// this query retain their existing turn-end handoff behavior.
+    fn exit_requested(&self) -> bool {
+        false
+    }
+
     /// Take-and-clear whether [`Self::request_exit`] was called since the
     /// last take. The turn-end hook calls this once, at most, per turn.
     fn take_exit_requested(&self) -> bool;

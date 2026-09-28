@@ -7,6 +7,25 @@ async fn run_scheduled_tool(
     ledger: &crate::agentic::scheduled::SessionStepLedger,
     plan_mode_control: &dyn crate::agentic::PlanModeControl,
 ) -> String {
+    run_scheduled_tool_with_disposition(
+        name,
+        args,
+        ws,
+        ledger,
+        plan_mode_control,
+        PromptDisposition::Act,
+    )
+    .await
+}
+
+async fn run_scheduled_tool_with_disposition(
+    name: &str,
+    args: &serde_json::Value,
+    ws: &tempfile::TempDir,
+    ledger: &crate::agentic::scheduled::SessionStepLedger,
+    plan_mode_control: &dyn crate::agentic::PlanModeControl,
+    disposition: PromptDisposition,
+) -> String {
     execute_tool_with_collaborators(
         name,
         args,
@@ -21,7 +40,7 @@ async fn run_scheduled_tool(
             ..Default::default()
         },
         false,
-        PromptDisposition::Act,
+        disposition,
         None,
     )
     .await
@@ -152,25 +171,32 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         !other_session.is_plan_mode(),
         "one session must not change another"
     );
-    let denied_write = run_scheduled_tool(
-        "write_file",
-        &serde_json::json!({
-            "path": "must-not-write.txt",
-            "content": "no",
-        }),
-        &ws,
-        &ledger,
-        &control,
-    )
-    .await;
-    assert!(
+    for disposition in [
+        PromptDisposition::Act,
+        PromptDisposition::Explain,
+        PromptDisposition::Research,
+    ] {
+        let denied_write = run_scheduled_tool_with_disposition(
+            "write_file",
+            &serde_json::json!({
+                "path": "must-not-write.txt",
+                "content": "no",
+            }),
+            &ws,
+            &ledger,
+            &control,
+            disposition,
+        )
+        .await;
+        assert!(
         denied_write.contains("is not available for this request"),
         "a write later in the same tool round must hit the immediate Plan clamp: {denied_write}"
     );
-    assert!(
-        !ws.path().join("must-not-write.txt").exists(),
-        "entering Plan must prevent a later call from mutating the workspace"
-    );
+        assert!(
+            !ws.path().join("must-not-write.txt").exists(),
+            "entering Plan must prevent a later call from mutating the workspace"
+        );
+    }
     let exit = run_scheduled_tool(
         "exit_plan_mode",
         &serde_json::json!({}),
@@ -191,11 +217,9 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
     );
 }
 
-/// A non-Act disposition is an executor boundary, not just a reduced tool
-/// schema: fabricated mutations, exec, capability requests, and remote MCP
-/// calls must be refused before they reach their own dispatch logic.
+/// Explicit Plan is an executor boundary, not just a reduced tool schema.
 #[tokio::test]
-async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
+async fn explicit_plan_denies_mutation_exec_grants_and_generic_mcp() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats::top(); // prove disposition wins over ambient authority
 
@@ -208,7 +232,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         &mut no_mcp,
         None,
         None,
-        PromptDisposition::Research,
+        PromptDisposition::Plan,
     )
     .await;
     assert!(
@@ -228,7 +252,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         &mut no_mcp,
         None,
         None,
-        PromptDisposition::Explain,
+        PromptDisposition::Plan,
     )
     .await;
     assert!(
@@ -253,7 +277,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         &mut no_mcp,
         Some(&mut gate),
         None,
-        PromptDisposition::Research,
+        PromptDisposition::Plan,
     )
     .await;
     assert!(
@@ -262,7 +286,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
     );
     assert!(
         gate.asks.is_empty(),
-        "non-Act must not consult a grant gate"
+        "explicit Plan must not consult a grant gate"
     );
 
     let mut mcp = OneRemoteTool::new("incident__read");
@@ -274,10 +298,13 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         &mut mcp,
         None,
         None,
-        PromptDisposition::Research,
+        PromptDisposition::Plan,
     )
     .await;
-    assert!(remote.contains("requires OCAP permission"), "got: {remote}");
+    assert!(
+        remote.contains("not available for this request"),
+        "got: {remote}"
+    );
     assert!(
         !mcp.called,
         "a remote call without permission must not reach the server"
@@ -292,7 +319,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         &mut no_mcp,
         None,
         None,
-        PromptDisposition::Research,
+        PromptDisposition::Plan,
     )
     .await;
     assert!(
@@ -301,15 +328,79 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
     );
 }
 
-/// #2332: under Explain, `tool_search` for an authorized MCP tool searched
-/// the already-filtered catalog and answered as though the tool did not exist,
-/// so the model could never learn a review connector was there. Discovery now
-/// reports it as present but not callable, and dispatch still refuses the call:
-/// discovery widened, authority did not.
+/// Style cannot grant a denied effect or suppress an operator permission
+/// decision. Exercise the actual handlers, not only the advertised catalog.
+#[tokio::test]
+async fn inferred_style_enforces_caveats_and_preserves_permission_requests() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _ocap = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    for disposition in [PromptDisposition::Explain, PromptDisposition::Research] {
+        let write = run_tool_with_disposition(
+            "write_file",
+            serde_json::json!({"path": "denied.txt", "content": "no"}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            disposition,
+        )
+        .await;
+        assert!(
+            write.contains("capability denied: fs_write"),
+            "{disposition:?}: {write}"
+        );
+        let exec = run_tool_with_disposition(
+            "run_command",
+            serde_json::json!({"command": "touch denied.txt"}),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            disposition,
+        )
+        .await;
+        assert!(
+            exec.contains("capability denied:"),
+            "{disposition:?}: {exec}"
+        );
+        assert!(!ws.path().join("denied.txt").exists());
+        let mut gate = MockGate::new(true, &caveats);
+        let grant = run_tool_with_disposition(
+            "request_permissions",
+            serde_json::json!({
+                "capability": "fs_write",
+                "target": ws.path().join("allowed.txt"),
+                "reason": "requested task needs an output file",
+            }),
+            ws.path(),
+            &caveats,
+            &mut NoMcp,
+            Some(&mut gate),
+            None,
+            disposition,
+        )
+        .await;
+        assert_eq!(gate.asks.len(), 1, "{disposition:?}: {grant}");
+        assert!(!grant.contains("not available for this request"), "{grant}");
+    }
+}
+
+/// Inferred style preserves discovery while actual remote authority remains
+/// subject to the permission gate.
 #[tokio::test]
 async fn explain_discovery_finds_mcp_but_dispatch_requires_permission() {
     let ws = std::path::Path::new("/nonexistent-workspace");
-    let caveats = Caveats::top(); // disposition, not ambient authority, decides
+    let caveats = Caveats::top();
     let mut mcp = OneRemoteTool::new("review__fetch_change");
 
     let found = run_tool_with_disposition(
@@ -471,31 +562,37 @@ async fn auto_mode_selector_dispatches_through_session_control_without_current_w
     assert!(unavailable.contains("/mode auto"), "{unavailable}");
 }
 
-/// Permitted non-Act reads still honor their caveats, but they must not
-/// silently turn a denial into an interactive authority grant.
+/// Explicit Plan forbids new grants; inferred style preserves the operator's
+/// permission decision. A denied network request cannot be silently widened.
 #[tokio::test]
-async fn non_act_read_tools_do_not_consult_permission_gate() {
+async fn web_reads_respect_explicit_plan_and_operator_network_decisions() {
     let ws = tempfile::TempDir::new().unwrap();
     let mut caveats = Caveats::top();
     caveats.net = crate::caveats::Scope::none();
-    let mut gate = MockGate::new(true, &caveats);
     let mut mcp = NoMcp;
-
-    let _ = run_tool_with_disposition(
-        "web_fetch",
-        serde_json::json!({ "url": "https://example.com" }),
-        ws.path(),
-        &caveats,
-        &mut mcp,
-        Some(&mut gate),
-        None,
-        PromptDisposition::Research,
-    )
-    .await;
-    assert!(
-        gate.asks.is_empty(),
-        "a non-Act web read may be caveat-denied but must never mint net authority"
-    );
+    for (disposition, questions) in [
+        (PromptDisposition::Plan, 0),
+        (PromptDisposition::Explain, 1),
+        (PromptDisposition::Research, 1),
+    ] {
+        let mut gate = MockGate::new(false, &caveats);
+        let _ = run_tool_with_disposition(
+            "web_fetch",
+            serde_json::json!({ "url": "https://example.com" }),
+            ws.path(),
+            &caveats,
+            &mut mcp,
+            Some(&mut gate),
+            None,
+            disposition,
+        )
+        .await;
+        assert_eq!(
+            gate.asks.len(),
+            questions,
+            "{disposition:?} must preserve the explicit authority boundary"
+        );
+    }
 }
 
 /// #2424: the dispatch arm itself must route `render_report` to the wired

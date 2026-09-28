@@ -755,22 +755,35 @@ impl Session {
                 {
                     return Err(integrity("control outcome requires a recorded model reply"));
                 }
+                // A completed tool batch can ask the host to obtain approval.
+                // This is a harness intervention, not a model question verdict.
+                let tool_handoff = *control == ControlOutcome::AwaitOperator
+                    && self.outcomes.get(reply) == Some(&ControlOutcome::ToolDispatch)
+                    && self.tool_calls.values().any(|call| call.reply == *reply)
+                    && self
+                        .tool_calls
+                        .values()
+                        .filter(|call| call.reply == *reply)
+                        .all(|call| call.delivery.is_some());
                 if let Some(previous) = self.outcomes.get(reply) {
-                    if !matches!(
-                        previous,
-                        ControlOutcome::Continue | ControlOutcome::ToolDispatch
-                    ) || !matches!(
-                        control,
-                        ControlOutcome::Incomplete
-                            | ControlOutcome::Cancelled
-                            | ControlOutcome::Failed
-                    ) {
+                    if !tool_handoff
+                        && (!matches!(
+                            previous,
+                            ControlOutcome::Continue | ControlOutcome::ToolDispatch
+                        ) || !matches!(
+                            control,
+                            ControlOutcome::Incomplete
+                                | ControlOutcome::Cancelled
+                                | ControlOutcome::Failed
+                        ))
+                    {
                         return Err(integrity("reply already has a terminal control outcome"));
                     }
                 }
                 let value = self.checked_event(*event)?;
                 if !value.body().sources.contains(reply)
                     || value.body().origin != EventOrigin::Harness
+                    || (tool_handoff && value.body().kind != EventKind::Intervention)
                 {
                     return Err(integrity("control outcome has no model observation source"));
                 }
@@ -781,7 +794,8 @@ impl Session {
                         return Err(integrity("delivery requires an admitted answer verdict"))
                     }
                     ControlOutcome::AwaitOperator
-                        if self.verdicts.get(reply) != Some(&Verdict::Question) =>
+                        if !tool_handoff
+                            && self.verdicts.get(reply) != Some(&Verdict::Question) =>
                     {
                         return Err(integrity("awaiting operator requires a question verdict"))
                     }

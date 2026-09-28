@@ -23,6 +23,9 @@
 //! so it rides [`Gate::Always`](super::tools) and is advertised in eval /
 //! headless / ACP sessions too (where it prints the raw source).
 //!
+//! **Trust.** Reports are model-authored display. Rendering does not verify
+//! individual claims; any ledger annotation is limited to observed tool facts.
+//!
 //! [`render_markdown`]: super::render_markdown
 
 use super::display::term_cols;
@@ -298,9 +301,9 @@ pub(crate) fn execute_render_report(
 ) -> (String, Option<String>) {
     match compose_document(args) {
         Ok((markdown, ack)) => {
-            // #1947: capability claims are checked against the turn's tool
-            // ledger the way `claim_check` checks path claims against the
-            // workspace — append a visible refutation, never rewrite. Applied
+            // #1947: append only facts established by the turn's tool ledger.
+            // Arbitrary Markdown labels are not tool identities, and rendering
+            // does not independently verify report claims. Applied
             // to the MARKDOWN so the annotation renders in the operator's
             // document; `ack` (what the model sees) is left alone, because
             // this slice annotates the report rather than steering the model
@@ -369,28 +372,47 @@ mod tests {
                 .collect()
         }
 
-        /// The refutation reaches the document the OPERATOR sees.
         #[test]
-        fn an_unsupported_claim_is_annotated_in_the_rendered_document() {
-            let evidence = Evidence::from_events(&events(&[("list_audio_devices", true)]));
-            let doc = render(Some(&evidence));
-            assert!(doc.contains("capability check (#1947)"), "{doc}");
+        fn ordinary_verification_table_renders_without_invented_tool_names() {
+            let args = json!({
+                "title": "Refactor verification",
+                "sections": [{
+                    "heading": "Verification gates",
+                    "body": "| Gate | Result |\n|---|---|\n| cargo build --workspace | ✅ green |\n| Guard tests (16) | ✅ passed |"
+                }]
+            });
+            let mut evidence = Evidence::default();
+            evidence.record("run_command", true, Some(crate::ExecOutcome::Passed));
+            let (ack, doc) = execute_render_report(&args, false, Some(&evidence), None);
+            let (_, plain) = execute_render_report(&args, false, None, None);
+            assert_eq!(doc, plain, "human gate labels are ordinary report content");
+            assert!(ack.contains("report rendered"), "{ack}");
             assert!(
-                doc.contains("converse"),
-                "the refuted subject is named: {doc}"
+                !ack.contains("verified"),
+                "rendering is not verification: {ack}"
             );
         }
 
-        /// **Anti-vacuous twin.** The same call with corroborating evidence
-        /// renders no annotation — so the assertion above is about the
-        /// evidence, not about the wiring firing unconditionally.
+        /// The absence of any tool evidence reaches the operator's document.
         #[test]
-        fn a_corroborated_claim_renders_no_annotation() {
+        fn a_claim_without_tool_evidence_is_annotated_in_the_rendered_document() {
+            let evidence = Evidence::default();
+            let doc = render(Some(&evidence));
+            assert!(doc.contains("capability check (#1947)"), "{doc}");
+            assert!(
+                doc.contains("no tool ran in this turn"),
+                "only the actual ledger fact is asserted: {doc}"
+            );
+        }
+
+        /// Successful calls leave the model-authored report unmodified.
+        #[test]
+        fn successful_tool_history_renders_no_refutation() {
             let evidence = Evidence::from_events(&events(&[("voice__converse", true)]));
             let doc = render(Some(&evidence));
             assert!(
                 !doc.contains("capability check"),
-                "a corroborated report must render clean: {doc}"
+                "the ledger establishes no contradictory fact: {doc}"
             );
         }
 

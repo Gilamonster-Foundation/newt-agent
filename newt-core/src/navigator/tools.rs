@@ -58,7 +58,7 @@ pub fn goto_definition_tool_definition() -> serde_json::Value {
 /// Hits per `text_search` page. Sized so a typical page stays well under the
 /// model-facing spill cap (`TOOL_RESULT_SPILL_CAP`, 16k chars): a page the
 /// model asks for beats a spill handle it has to learn to redeem.
-const TEXT_SEARCH_PAGE_SIZE: usize = 25;
+pub(crate) const TEXT_SEARCH_PAGE_SIZE: usize = 25;
 
 #[must_use]
 pub fn text_search_tool_definition() -> serde_json::Value {
@@ -172,7 +172,7 @@ pub struct NavToolCtx<'a> {
     pub status: Option<&'a IndexStatus>,
 }
 
-fn index_id(ctx: &NavToolCtx<'_>) -> String {
+pub(crate) fn index_id(ctx: &NavToolCtx<'_>) -> String {
     ctx.status
         .map(|s| s.index_id())
         .or_else(|| ctx.usage.map(|u| u.index_id().to_string()))

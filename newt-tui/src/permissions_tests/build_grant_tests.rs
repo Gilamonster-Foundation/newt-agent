@@ -83,65 +83,64 @@ fn a_session_build_grant_covers_exec_of_the_same_build_tool() {
     assert!(!session_grant_covers(&grants, &rm));
 }
 
-/// Architect review round 1, #1: `session_grant_covers` decides WHETHER a
-/// Build-covered exec is allowed, but not what fence it runs under. Would
-/// fail before the fix: the covered exec ran under whatever the shell lane's
-/// CURRENT `baseline` allowed (here, a net host a prior, unrelated grant
-/// added), not the calibrated `build_tool_caveats` fence — `widen_caveats`
-/// only adds to `baseline`, it never narrows a wider net/exec/write axis
-/// back down. A session Build grant must clamp the covered exec to the build
-/// fence regardless of what else the shell lane has been granted.
+/// Build-covered execution keeps the calibrated filesystem fence and the
+/// invocation's existing network authority. Recalled grants cannot restore
+/// attenuated networking, and an explicit Plan ceiling still wins.
 #[test]
-fn a_build_covered_exec_runs_under_the_build_fence_not_a_wider_shell_baseline() {
+fn a_build_covered_exec_keeps_network_authority_and_the_build_fence() {
     let ws = "/ws";
-    let mut state = PermissionPromptState::default();
-    // The operator already granted Build authority for this workspace.
-    state
-        .session_grants
-        .insert((DenialKind::Build, ws.to_string()));
-
-    // The shell lane's CURRENT baseline is wider than the build fence: it
-    // carries a net grant some earlier, unrelated permission decision added.
-    let wide_baseline = Caveats {
-        fs_read: Scope::only([ws.to_string()]),
-        fs_write: Scope::only([ws.to_string()]),
-        exec: Scope::only(["cargo".to_string()]),
-        net: Scope::only(["crates.io".to_string()]),
-        max_calls: CountBound::Unlimited,
-        valid_for_generation: Scope::All,
-    };
-
-    let prompts = Rc::new(Cell::new(0));
-    let mut gate = scripted_gate(
-        &mut state,
-        wide_baseline.clone(),
-        None,
-        None,
-        vec![],
-        prompts.clone(),
-    );
     let cargo_test = PermissionRequest {
         tool: "run_command".into(),
         kind: DenialKind::Exec,
         target: "cargo".into(),
         reason: "cargo test".into(),
     };
-    let decision = gate.ask_with_caveats(&wide_baseline, std::slice::from_ref(&cargo_test));
-    let newt_core::PermissionDecision::Allow(caveats) = decision else {
-        panic!(
-            "a session Build grant must cover exec of the workspace's build tool without prompting"
+    for network in [Scope::none(), Scope::only(["crates.io".into()]), Scope::All] {
+        let mut state = PermissionPromptState::default();
+        state.session_grants.extend([
+            (DenialKind::Build, ws.to_string()),
+            (DenialKind::Net, "unrelated.example".to_string()),
+        ]);
+        let baseline = Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::All,
+            exec: Scope::none(),
+            net: network.clone(),
+            max_calls: CountBound::AtMost(7),
+            valid_for_generation: Scope::All,
+        };
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            Caveats::top(),
+            None,
+            None,
+            vec![],
+            prompts.clone(),
         );
-    };
-    assert!(
-        !caveats.permits_net("crates.io"),
-        "a Build-covered exec must run under the calibrated build fence \
-         (net denied), never the shell lane's wider current baseline"
-    );
-    assert_eq!(
-        prompts.get(),
-        0,
-        "covered by the session Build grant — no prompt expected"
-    );
+        for plan_active in [false, true] {
+            gate.preset_clamp = plan_active.then(newt_core::agentic::plan_phase_clamp);
+            let decision = gate.ask_with_caveats(&baseline, std::slice::from_ref(&cargo_test));
+            let newt_core::PermissionDecision::Allow(caveats) = decision else {
+                panic!("existing Build grant must not require another prompt");
+            };
+            assert_eq!(
+                caveats.net,
+                if plan_active {
+                    Scope::none()
+                } else {
+                    network.clone()
+                },
+                "build approval must preserve invocation attenuation and Plan ceilings"
+            );
+            assert_eq!(caveats.permits_exec("cargo"), !plan_active);
+            assert_eq!(caveats.permits_fs_write(ws), !plan_active);
+            assert!(!caveats.permits_fs_write("/outside"));
+            assert!(!caveats.permits_fs_read("/outside"));
+            assert_eq!(caveats.max_calls, baseline.max_calls);
+        }
+        assert_eq!(prompts.get(), 0, "the existing Build grant is reused");
+    }
 }
 
 /// Architect review round 2 (Reviewer FIX-FIRST, PR #2579, BLOCKER, red test

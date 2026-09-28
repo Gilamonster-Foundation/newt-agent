@@ -115,6 +115,27 @@ fn cap_model_output_passes_small_output_through_unchanged() {
 }
 
 #[test]
+fn cap_model_output_preserves_existing_handle_for_short_view() {
+    let store = content_spill::SessionSpillStore::new([20u8; 16]);
+    let (handle, _) = content_spill::store_redacted_full(
+        "first diagnostic\nlast diagnostic\n",
+        Some("run_command".into()),
+        &store,
+    );
+    let handle = handle.unwrap();
+    let hint = content_spill::tool_output_retrieval_hint(&handle);
+    for budget in [0, DEFAULT_MAX_OUTPUT_TOKENS] {
+        let out = cap_model_output_with_handle("last diagnostic", budget, 100, Some(&handle));
+        assert!(out.starts_with("last diagnostic"), "{out}");
+        assert!(!out.contains("first diagnostic"), "{out}");
+        assert!(
+            out.contains(&hint),
+            "short view lost its retained source: {out}"
+        );
+    }
+}
+
+#[test]
 fn cap_model_output_truncates_over_budget_as_head_tail() {
     let big = format!("HEAD_MARKER\n{}\nTAIL_MARKER", "middle\n".repeat(20_000));
     let out = cap_model_output_with_handle(&big, 1_000, 100, None);
@@ -297,6 +318,131 @@ fn shell_envelope_output_spills_full_output_before_head_tail_cap() {
     assert!(
         !rendered.contains("memory_fetch tool"),
         "operator saw the model teaser instead of raw shell output: {rendered}"
+    );
+}
+
+#[test]
+fn shell_envelope_selected_view_retains_exact_full_stream_text() {
+    let stdout = "stdout α\r\nfirst diagnostic\n";
+    let stderr = "stderr β\r\nlast diagnostic\n";
+    let envelope = serde_json::json!({"exit_code": 7, "stdout": stdout, "stderr": stderr});
+    let store = content_spill::SessionSpillStore::new([21u8; 16]);
+    let mut handles = Vec::new();
+    for trim in [OutputTrim::Head(1), OutputTrim::Tail(1)] {
+        let view = trim.apply(stdout, stderr);
+        let out = shell::shell_envelope_output_with_view(
+            &envelope,
+            Some(&view),
+            20,
+            false,
+            true,
+            Some(&store),
+            None,
+        );
+        assert!(
+            out.starts_with(&format!("error: command exited 7\n{view}")),
+            "{out}"
+        );
+        let handle = out
+            .split("spill:")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("selected view retains its full source");
+        let cid = content_spill::SpillCid::parse(handle).unwrap();
+        assert_eq!(
+            store.fetch(&cid).unwrap().redacted_text,
+            format!("{stdout}{stderr}")
+        );
+        handles.push(handle.to_owned());
+    }
+    assert_eq!(
+        handles[0], handles[1],
+        "a different view is not a different source"
+    );
+}
+
+#[test]
+fn shell_envelope_capture_truncation_survives_output_caps_and_retrieval() {
+    for (stdout_truncated, stderr_truncated, streams) in [
+        (true, false, "stdout"),
+        (false, true, "stderr"),
+        (true, true, "stdout and stderr"),
+    ] {
+        let store = content_spill::SessionSpillStore::new([22u8; 16]);
+        let envelope = serde_json::json!({
+            "exit_code": 0,
+            "stdout": "captured line\n".repeat(10_000),
+            "stderr": "last captured diagnostic\n",
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        });
+        let out = shell_envelope_output(&envelope, 20, false, true, Some(&store), None);
+        let notice = format!("{streams} capture truncated; omitted bytes are unavailable");
+        assert!(
+            out.contains(&notice),
+            "capture loss must be explicit: {out}"
+        );
+        let handle = out
+            .split("spill:")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("large capture has a retained-output handle");
+        let cid = content_spill::SpillCid::parse(handle).unwrap();
+        let retained = store.fetch(&cid).unwrap().redacted_text;
+        assert!(
+            retained.contains(&notice),
+            "re-reading must preserve capture loss"
+        );
+        assert!(retained.contains("last captured diagnostic"));
+    }
+}
+
+#[test]
+fn shell_envelope_capture_notice_survives_a_tiny_tail_budget() {
+    // Output settings are process-wide; isolate this configuration from the
+    // ordinary parallel test suite instead of racing its default budgets.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agentic::tools::tests::output_bounds::capture_notice_tiny_tail_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated output-cap test failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the exact child test must run"
+    );
+}
+
+#[test]
+#[ignore = "runs in an isolated child because output settings are process-wide"]
+fn capture_notice_tiny_tail_child() {
+    output_budget::set_max_output_tokens(2);
+    output_budget::set_output_head_tokens(0);
+    let store = content_spill::SessionSpillStore::new([23u8; 16]);
+    let envelope = serde_json::json!({
+        "exit_code": 0,
+        "stdout": format!("{}tail42", "captured line\n".repeat(100)),
+        "stderr": "",
+        "stdout_truncated": true,
+    });
+    let out = shell_envelope_output(&envelope, 20, false, true, Some(&store), None);
+    assert!(out.contains("tail42"), "tail selection survives: {out}");
+    assert!(
+        out.contains("spill:"),
+        "retained source is discoverable: {out}"
+    );
+    assert!(
+        out.ends_with("[stdout capture truncated; omitted bytes are unavailable]"),
+        "capture loss survives even when the cap drops its original prefix: {out}"
     );
 }
 

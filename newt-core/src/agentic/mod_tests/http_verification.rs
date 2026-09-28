@@ -145,8 +145,8 @@ async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check
 /// into penalized narration (the #1257 double-bind). Headless (no gate), the
 /// dispatch returns the recoverable no-human message — never the
 /// disposition-refusal, never a hang — and the turn completes normally.
-/// Contrast pin in the same run: an Act-only tool (`run_command`) under the
-/// same Explain turn still gets the disposition refusal (the boundary holds).
+/// Contrast pin in the same run: `run_command` without a session exec grant
+/// still gets an authority denial. The prose classification is not the boundary.
 #[tokio::test]
 async fn explain_turn_request_user_input_dispatches_and_completes() {
     let server = MockServer::start().await;
@@ -179,11 +179,15 @@ async fn explain_turn_request_user_input_dispatches_and_completes() {
         .await;
 
     let messages = msgs();
-    let caveats = Caveats::top();
+    let caveats = Caveats {
+        exec: crate::Scope::none(),
+        ..Caveats::top()
+    };
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
     c.prompt_disposition = PromptDisposition::Explain;
+    c.exec_floor = Some(&caveats.exec);
     let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp)
         .await
         .expect("an Explain turn asking the human completes, never errors");
@@ -209,10 +213,11 @@ async fn explain_turn_request_user_input_dispatches_and_completes() {
         !all.contains("Tool `request_user_input` is not available for this request"),
         "request_user_input must NOT be disposition-refused in an Explain turn"
     );
-    // The boundary still holds for Act-only tools in the SAME turn.
+    // The actual exec boundary still holds in the same turn.
     assert!(
-        all.contains("Tool `run_command` is not available for this request"),
-        "run_command must stay disposition-refused in an Explain turn: {all}"
+        all.contains("capability denied")
+            && !all.contains("Tool `run_command` is not available for this request"),
+        "run_command must respect the session exec denial regardless of Explain style: {all}"
     );
 }
 

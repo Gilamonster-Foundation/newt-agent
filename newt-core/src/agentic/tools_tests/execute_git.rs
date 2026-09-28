@@ -6,6 +6,93 @@ use super::*;
 /// GitCaveats deny it — exercises the arm's caveat projection without a repo.
 struct StubGit;
 
+#[tokio::test]
+async fn git_discovery_keeps_the_native_command_surface() {
+    let ws = tempfile::tempdir().unwrap();
+    let out = execute_tool_with_collaborators(
+        "tool_search",
+        &serde_json::json!({"query": "git"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut NoMcp,
+        ToolCollaborators {
+            git_tool: Some(&StubGit),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Explain,
+        None,
+    )
+    .await
+    .expect("fixture has no durable writer")
+    .unwrap();
+    assert!(out.contains("- run_command —"), "{out}");
+    assert!(
+        !out.contains("- git —"),
+        "legacy schema must not return through discovery: {out}"
+    );
+}
+
+/// Real Git grounds the default command surface: an ordinary question with
+/// operator-granted command authority must preserve flags and repository state.
+#[tokio::test]
+async fn ordinary_git_status_question_uses_native_git_with_existing_authority() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _routing = super::disable_ocap_tests::EnvVar::set("NEWT_NO_ROUTE", "0");
+    let _ocap = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let ws = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(ws.path().join("staged file.txt"), "staged\n").unwrap();
+    git(&["add", "--", "staged file.txt"]);
+    std::fs::write(ws.path().join("untracked.txt"), "untracked\n").unwrap();
+    let intake = crate::agentic::PromptIntake::analyze("are there uncommitted files in this repo?");
+    assert_ne!(intake.disposition(), PromptDisposition::Act);
+    for disposition in [intake.disposition(), PromptDisposition::Research] {
+        let out = execute_tool_with_collaborators(
+            "run_command",
+            &serde_json::json!({"command": "git status --porcelain=v1 --untracked-files=all"}),
+            &ws.path().to_string_lossy(),
+            false,
+            40,
+            &Caveats::top(),
+            &mut NoMcp,
+            ToolCollaborators {
+                git_tool: Some(&StubGit),
+                ..Default::default()
+            },
+            false,
+            disposition,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            out.contains("A  \"staged file.txt\""),
+            "{disposition:?}: {out}"
+        );
+        assert!(out.contains("?? untracked.txt"), "{disposition:?}: {out}");
+        assert!(
+            !out.contains("routed:"),
+            "native argv must not become a smaller Git dialect: {out}"
+        );
+    }
+}
+
 impl crate::agentic::GitTool for StubGit {
     fn dispatch(
         &self,
@@ -21,8 +108,7 @@ impl crate::agentic::GitTool for StubGit {
                 Err("capability denied: git commit not permitted".to_string())
             }
             "commit" => Ok("committed abc123: msg".to_string()),
-            // A dispatch failure for a routed read op, so the
-            // `[routed: …]` annotation wraps an errored result.
+            // A distinguishable legacy error proves native calls bypass it.
             "log" => Err("error: no such object HEAD".to_string()),
             // #1191: data-loss ops the gate guards — if we reach here, the
             // gate ALLOWED (the refusal path returns before dispatch).
@@ -82,31 +168,7 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
             ),
             ("git", serde_json::json!({"op": "fetch"}), false),
             ("git", serde_json::json!({}), false),
-            (
-                "run_command",
-                serde_json::json!({"command": "git branch --all"}),
-                true,
-            ),
-            (
-                "run_command",
-                serde_json::json!({"command": "git branch --all", "cwd": "elsewhere"}),
-                false,
-            ),
-            (
-                "run_command",
-                serde_json::json!({"command": "git branch created"}),
-                false,
-            ),
         ] {
-            if name == "run_command" {
-                let (presented_name, _) =
-                    tool_presentation(name, &args, ws.path(), &crate::caveats::Scope::All);
-                assert_eq!(
-                    presented_name,
-                    if accepted { "git" } else { "run_command" },
-                    "presentation must not discard argument semantics: {args}"
-                );
-            }
             let mut gate = MockGate::new(true, &caveats);
             let out = execute_tool_with_collaborators(
                 name,
@@ -137,7 +199,7 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
                 accepted,
                 "{disposition:?} {name} {args}: {out}"
             );
-            if !accepted && disposition != PromptDisposition::Act {
+            if !accepted && disposition == PromptDisposition::Plan {
                 assert!(
                     out.contains("not available for this request"),
                     "must reject before dispatch: {out}"
@@ -148,41 +210,14 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
                 "read-only calls never request an authority grant"
             );
         }
-        let allow = vec!["read_file".to_owned()];
-        let out = execute_tool_with_collaborators(
-            "run_command",
-            &serde_json::json!({"command": "git branch"}),
-            &ws.path().to_string_lossy(),
-            false,
-            20,
-            &caveats,
-            &mut NoMcp,
-            ToolCollaborators {
-                git_tool: Some(&StubGit),
-                persona_tools: Some(&allow),
-                ..Default::default()
-            },
-            false,
-            disposition,
-            None,
-        )
-        .await
-        .expect("legacy fixture has no durable writer")
-        .unwrap();
-        assert!(
-            !out.contains("persona") && out.contains("local branches: 1"),
-            "{out}"
-        );
     }
 }
 
-// #2516: a routed `run_command("git log")` whose embedded dispatch
-// errors must still classify as `tool_result_ok == false`. Before the fix,
-// `[routed: …]` was PREPENDED to the result, so `tool_result_ok`'s
-// prefix check (`error:`, `capability denied:`, …) never saw the `error:`
-// that starts the un-annotated output — an errored routed call read as ok.
+// Preserve native Git's failure and status even when a legacy adapter exists.
 #[tokio::test]
-async fn routed_git_dispatch_error_is_not_masked_by_the_routed_note() {
+async fn native_git_error_is_not_masked_or_replaced_by_an_embedded_result() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _ocap = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "1");
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats::top();
     let out = execute_tool_with_collaborators(
@@ -204,10 +239,14 @@ async fn routed_git_dispatch_error_is_not_masked_by_the_routed_note() {
     .await
     .expect("legacy fixture has no durable writer")
     .unwrap();
-    assert!(out.contains("[routed:"), "must still carry the note: {out}");
+    assert!(!out.contains("[routed:"), "native Git must execute: {out}");
+    assert!(
+        out.contains("not a git repository"),
+        "preserve native stderr: {out}"
+    );
     assert!(
         !super::super::tool_result_ok(&out),
-        "an errored routed call must not read as ok:true: {out}"
+        "a failed native command must not read as ok:true: {out}"
     );
 }
 

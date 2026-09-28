@@ -394,7 +394,7 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
         None,
         prompt_context,
         true,
-        true,
+        |_| true,
     );
 
     let directive = messages
@@ -447,7 +447,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         true,
-        true,
+        |_| true,
     );
     assert_eq!(nudges, 1, "prune must not refund the rescue budget");
     assert_eq!(messages.len(), 3, "prune must not touch the directive");
@@ -462,7 +462,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         false,
-        true,
+        |_| true,
     );
     assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
     assert_eq!(messages.len(), 3, "round 0 must not inject the directive");
@@ -477,7 +477,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         true,
-        true,
+        |_| true,
     );
     assert_eq!(nudges, 0, "summarization refunds the rescue budget");
     assert_eq!(directive_count(&messages), 1, "at most one directive alive");
@@ -490,4 +490,93 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
     );
     assert!(content.contains("tool call"), "{content}");
     assert!(!content.contains("stale directive"), "{content}");
+}
+
+#[test]
+fn post_compaction_optional_hint_obeys_each_provider_budget() {
+    let original = vec![
+        serde_json::json!({"role": "system", "content": "exact system policy"}),
+        serde_json::json!({"role": "user", "content": "exact operator request\nkeep these bytes"}),
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": "read-1", "type": "function", "function": {
+                "name": "read_file", "arguments": "{\"path\":\"state.txt\"}"
+            }
+        }]}),
+        serde_json::json!({"role": "tool", "tool_call_id": "read-1", "content": "exact result\r\nπ\n"}),
+    ];
+    let tools = serde_json::json!([{"type": "function", "function": {
+        "name": "read_file", "parameters": {"type": "object"}
+    }}]);
+    let est = crate::tokens::TokenEstimation::default();
+    let calibration = 1.25;
+    for provider in ["ollama", "openai", "anthropic"] {
+        let wire = |messages: &[serde_json::Value]| match provider {
+            "ollama" => messages.to_vec(),
+            "openai" => openai_chat_wire_messages(messages).unwrap(),
+            "anthropic" => anthropic_wire::anthropic_wire_messages(messages).unwrap().1,
+            _ => unreachable!(),
+        };
+        let cost = |messages: &[serde_json::Value]| {
+            calibrate_up(
+                estimate_request_tokens(&wire(messages), Some(&tools), est),
+                calibration,
+            )
+        };
+        let base_cost = cost(&original);
+        let prompt = prompt_read::PromptReadContext::new(None, "exact operator request", None);
+        let mut with_hint = original.clone();
+        let mut nudges = 1;
+        apply_post_compaction_continuation(
+            &mut with_hint,
+            &mut nudges,
+            CompressAction::StaticFallback,
+            None,
+            prompt,
+            true,
+            |_| true,
+        );
+        let hint_cost = cost(&with_hint);
+        assert!(hint_cost > base_cost);
+
+        for (budget, hint_expected) in [
+            (Some(base_cost), false),
+            (Some(hint_cost), true),
+            (None, true),
+            (Some(base_cost - 1), false),
+        ] {
+            let admits = |messages: &[serde_json::Value]| {
+                preflight_full_message_request(
+                    &wire(messages),
+                    Some(&tools),
+                    budget,
+                    calibration,
+                    est,
+                    "fixture",
+                )
+                .is_ok()
+            };
+            let mut messages = original.clone();
+            let mut nudges = 1;
+            apply_post_compaction_continuation(
+                &mut messages,
+                &mut nudges,
+                CompressAction::StaticFallback,
+                None,
+                prompt,
+                true,
+                admits,
+            );
+            assert_eq!(nudges, 0, "compaction still refunds narration rescue");
+            assert_eq!(
+                messages,
+                if hint_expected { &with_hint } else { &original }.clone(),
+                "{provider}, budget {budget:?}: only an admitted optional hint may change the transcript"
+            );
+            assert_eq!(
+                admits(&messages),
+                budget != Some(base_cost - 1),
+                "{provider}: an irreducible request must still fail final preflight"
+            );
+        }
+    }
 }

@@ -117,6 +117,7 @@ async fn run(
 
 #[tokio::test]
 async fn all_four_wires_deliver_a_real_answer_after_a_nudge_without_regeneration() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) = run(
             wire,
@@ -146,6 +147,13 @@ async fn all_four_wires_deliver_a_real_answer_after_a_nudge_without_regeneration
 
 #[tokio::test]
 async fn all_four_wires_preserve_questions_and_honestly_stop_exhausted_narration() {
+    // The two-round narration exhaustion below races the process-global
+    // `no_progress` brake (`crate::initiative::installed_no_progress()`):
+    // unguarded, this test can observe a `stop_after` a sibling test (e.g.
+    // `loop_controls::run_brake_loop`) installed under `GlobalSettingsGuard`
+    // for its own duration, stopping this turn after 2 idle rounds instead
+    // of the default 12. Holding the guard serializes against every writer.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) =
             run(wire, &["Which repository?"], &["\"question\""], 4).await;
@@ -171,6 +179,7 @@ async fn all_four_wires_preserve_questions_and_honestly_stop_exhausted_narration
 
 #[tokio::test]
 async fn all_four_wires_fail_loudly_on_malformed_adjudication_and_final_round_narration() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) =
             run(wire, &["Done."], &["prose surrounding \"answer\""], 4).await;
@@ -185,6 +194,7 @@ async fn all_four_wires_fail_loudly_on_malformed_adjudication_and_final_round_na
 
 #[tokio::test]
 async fn all_four_wires_record_validated_tools_and_stop_tool_only_caps_incomplete() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let (text, reason, requests) =
             run(wire, &["<tool>", "The file is absent."], &["\"answer\""], 3).await;
