@@ -482,6 +482,28 @@ jobs:
           if ($repeated -notmatch 'already present; no change') {
             throw 'NUL preparation was not idempotent after kernel readback.'
           }
+      - name: Probe confined DOS path lookup before host preparation
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source
+      - name: Prepare bounded DOS path lookup and verify confinement
+        if: always()
+        shell: pwsh
+        # No filesystem ancestor listing, device data access, or broader fallback.
+        # The native Git tests below retain their real status/staging assertions.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -NamespaceOnly
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1
+          $repeated = ./scripts/windows/Enable-AppContainerDosPaths.ps1
+          Write-Output $repeated
+          if ($repeated -notmatch 'already present; no change') {
+            throw 'DOS path preparation was not idempotent after kernel readback.'
+          }
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos
       - name: cargo test
         # `if: always()` so a clippy failure can't mask a test failure — both
         # surface in one run (same rationale as the Linux lint job).
