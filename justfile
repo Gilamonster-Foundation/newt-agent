@@ -352,6 +352,18 @@ check-mesh:
     cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
     cargo test --manifest-path newt-mesh/Cargo.toml
 
+# Run the vendored crossterm regression gate (newt #2644).
+# The vendor crate is excluded from the workspace (`[patch.crates-io]`), so
+# `just test` / `just check` never reach its unit tests. This recipe runs
+# the regression directly on the patched source; a future restoration of the
+# old `Err(_) => {}` arm must fail this gate before reaching main.
+# Unix-only: the test is `#[cfg(all(test, unix))]`.
+# PIPELINE PARITY: mirrors the "vendor crossterm regression gate" step in
+# .github/workflows/ci.yml.
+[unix]
+check-vendor-crossterm:
+    RUSTC_WRAPPER= cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_2644 -- --test-threads=1
+
 # --- Security audit (A1) ---
 
 # Security advisory gate. Fails on any RustSec advisory NOT in the tracked
