@@ -2262,6 +2262,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: the args of the most recently denied run_command — cleared when
+    // request_permissions consumes and re-runs it, or on the next turn.
+    let mut pending_rerun: Option<serde_json::Value> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -3991,6 +3994,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -6922,6 +6926,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<serde_json::Value> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -8667,6 +8673,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -9601,6 +9608,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<serde_json::Value> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -11102,6 +11111,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -11876,6 +11886,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<serde_json::Value> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let mut readonly_completion_retried = false;
@@ -12742,6 +12754,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,

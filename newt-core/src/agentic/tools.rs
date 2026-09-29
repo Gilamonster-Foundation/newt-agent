@@ -1784,11 +1784,20 @@ pub(super) fn permission_grant_succeeded(
 ) -> bool {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
-    name == "request_permissions"
-        && ok
-        && parse_capability(capability).is_some()
-        && !target.is_empty()
-        && result == permission_granted_result(capability, target)
+    if name != "request_permissions"
+        || !ok
+        || parse_capability(capability).is_none()
+        || target.is_empty()
+    {
+        return false;
+    }
+    // #2628: when a pending run_command was re-run on approval, the result is
+    // the command output rather than the "granted: … Retry" string.  Both
+    // shapes count as a successful grant for loop-suppression purposes.
+    result == permission_granted_result(capability, target)
+        || (!result.starts_with("denied:")
+            && !result.starts_with("no operator available")
+            && !result.starts_with("request_permissions:"))
 }
 
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
@@ -1806,26 +1815,35 @@ pub(super) fn permission_grant_succeeded(
 /// being merged: this one widens authority through the ocap gate, the other only
 /// gathers text. `request_permissions` is deliberately NOT routed through
 /// `request_user_input` — it mints caveats, which a free-text answer cannot.
+/// Returns `(Some(widened), message)` when the operator approved, `(None,
+/// message)` on denial or when no gate is available.  The `widened` caveats
+/// are threaded back to the dispatch arm for the #2628 one-shot re-run.
 fn execute_request_permissions(
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
     _color: bool,
     _tool_output_lines: usize,
     workspace: &str,
-) -> String {
+) -> (Option<crate::caveats::Caveats>, String) {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
     let reason = args["reason"].as_str().unwrap_or("").trim();
     let Some(kind) = parse_capability(capability) else {
-        return format!(
-            "request_permissions: unknown capability '{capability}'. Use one of: \
-             exec, fs_read, fs_write, net."
+        return (
+            None,
+            format!(
+                "request_permissions: unknown capability '{capability}'. Use one of: \
+                 exec, fs_read, fs_write, net."
+            ),
         );
     };
     if target.is_empty() {
-        return "request_permissions: 'target' is required — the executable path or command name (exec), \
+        return (
+            None,
+            "request_permissions: 'target' is required — the executable path or command name (exec), \
                    the path (fs_read/fs_write), or the host (net)."
-            .to_string();
+                .to_string(),
+        );
     }
 
     let request = PermissionRequest {
@@ -1842,14 +1860,17 @@ fn execute_request_permissions(
     let quoted_target = serde_json::json!(target);
     let mut out = match gate {
         // The gate consults the operator and (for a session grant) remembers it,
-        // exactly as a denial-driven prompt does. We do not re-execute anything
-        // here — the model retries its original tool call, which rides the #263
-        // re-exec path under the now-granted caveats.
+        // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
-            PermissionDecision::Allow(_widened) => permission_granted_result(capability, target),
-            PermissionDecision::Deny => format!(
-                "denied: the operator declined {capability} for {quoted_target}. \
-                 Do not retry it — take a different approach."
+            PermissionDecision::Allow(widened) => {
+                return (Some(widened), permission_granted_result(capability, target));
+            }
+            PermissionDecision::Deny => (
+                None,
+                format!(
+                    "denied: the operator declined {capability} for {quoted_target}. \
+                     Do not retry it — take a different approach."
+                ),
             ),
         },
         // Headless / eval / ACP: no interactive gate exists to grant authority.
@@ -1861,22 +1882,23 @@ fn execute_request_permissions(
         // to finish and burns rounds. Tell it to stop re-asking and proceed
         // within the authority it already has; only report the blocker if the
         // target is genuinely essential and out of scope.
-        None => format!(
-            "no operator available to grant {capability} for {quoted_target} — this session \
-             has no interactive permission gate (headless / eval / piped), so authority \
-             cannot be widened mid-run and re-calling request_permissions will not help. \
-             Proceed within the authority you already have and the tools available to you; \
-             if {quoted_target} is genuinely essential and outside your current scope, say so in \
-             your final answer rather than retrying it."
+        None => (
+            None,
+            format!(
+                "no operator available to grant {capability} for {quoted_target} — this session \
+                 has no interactive permission gate (headless / eval / piped), so authority \
+                 cannot be widened mid-run and re-calling request_permissions will not help. \
+                 Proceed within the authority you already have and the tools available to you; \
+                 if {quoted_target} is genuinely essential and outside your current scope, say so in \
+                 your final answer rather than retrying it."
+            ),
         ),
     };
-    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
-        && out != permission_granted_result(capability, target)
-    {
-        out.push('\n');
+    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+        out.1.push('\n');
         // A declined question supplies no fresh authority snapshot. In
         // particular, do not remint capabilities just to render diagnostics.
-        out.push_str(&denial_context(workspace, None, None));
+        out.1.push_str(&denial_context(workspace, None, None));
     }
     out
 }
@@ -3238,6 +3260,7 @@ async fn execute_authorized_tool(
         completed_spill_renderer: _,
         execution,
         routed_to: routed_to_slot,
+        pending_rerun,
     } = collab;
     let smart_harness = invocation.map(|call| call.harness());
     // #2315: hand the shell's execution class to the funnel, return the text.
@@ -3638,8 +3661,52 @@ async fn execute_authorized_tool(
         // headless / eval / ACP, where it answers "no operator available" rather
         // than blocking. Consumes the gate (mutually exclusive with the
         // run_command / fs arms that also use it — only one arm runs per call).
+        //
+        // #2628: on approval, if a pending_rerun slot carries the args of the
+        // denied run_command, re-run it immediately with the widened one-shot
+        // caveats so the model receives the result directly instead of a
+        // "Retry the original operation now" instruction.
         "request_permissions" => {
-            execute_request_permissions(args, permission_gate, color, tool_output_lines, workspace)
+            let rerun_args = pending_rerun.and_then(|slot| slot.take());
+            let (granted, msg) =
+                execute_request_permissions(args, permission_gate, color, tool_output_lines, workspace);
+            match (granted, rerun_args) {
+                (Some(widened), Some(rerun)) => {
+                    let raw_cmd = rerun["command"].as_str().unwrap_or("");
+                    let (cd_path, cmd_owned) = split_leading_cd(raw_cmd);
+                    let cmd = cmd_owned.as_str();
+                    let run_cwd = resolve_exec_cwd(
+                        workspace,
+                        cd_path
+                            .as_deref()
+                            .or_else(|| rerun.get("cwd").and_then(|v| v.as_str())),
+                    );
+                    let fs_reqs = match declared_filesystem_requests(&rerun, cmd, &run_cwd) {
+                        Ok(r) => r,
+                        Err(e) => return host_return(e),
+                    };
+                    executed(
+                        exec_confined_command(
+                            cmd,
+                            &run_cwd,
+                            workspace,
+                            color,
+                            tool_output_lines,
+                            &widened,
+                            &fs_reqs,
+                            exec_floor,
+                            &mut None, // one-shot: no further interactive prompting
+                            tool_offload,
+                            spill_store,
+                            live_tool_output.clone(),
+                            presentation,
+                        )
+                        .await,
+                    )
+                }
+                // No pending rerun or denied/headless: fall back to the grant/denial message.
+                (_, _) => msg,
+            }
         }
 
         // #728: the GENERIC ask-the-human tool — surfaces a free-text question to
@@ -3884,30 +3951,39 @@ async fn execute_authorized_tool(
                 Err(error) => return host_return(error),
             };
             if let Some(program) = build_shell::build_program(cmd) {
-                return executed(build_shell::execute(
-                    cmd,
-                    &program,
-                    &run_cwd,
-                    workspace,
-                    caveats,
-                    &filesystem_requests,
-                    &mut permission_gate,
-                    smart_harness,
-                    tool_output_lines,
-                    color,
-                    tool_offload,
-                    spill_store,
-                    live_tool_output.clone(),
-                    presentation,
-                    commit_broker,
-                ).await);
+                let result = executed(
+                    build_shell::execute(
+                        cmd,
+                        &program,
+                        &run_cwd,
+                        workspace,
+                        caveats,
+                        &filesystem_requests,
+                        &mut permission_gate,
+                        smart_harness,
+                        tool_output_lines,
+                        color,
+                        tool_offload,
+                        spill_store,
+                        live_tool_output.clone(),
+                        presentation,
+                        commit_broker,
+                    )
+                    .await,
+                );
+                if let Some(slot) = pending_rerun {
+                    if execution.and_then(|e| e.get()) == Some(&crate::ExecOutcome::Denied) {
+                        *slot = Some(raw_args.clone());
+                    }
+                }
+                return result;
             }
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
             // `objects/` for THIS dispatch only — see
             // `dispatch_caveats_for_git_shell`'s doc comment.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
-            executed(
+            let result = executed(
                 shell::exec_confined_command_with_broker(
                     cmd,
                     &run_cwd,
@@ -3925,7 +4001,13 @@ async fn execute_authorized_tool(
                     commit_broker,
                 )
                 .await,
-            )
+            );
+            if let Some(slot) = pending_rerun {
+                if execution.and_then(|e| e.get()) == Some(&crate::ExecOutcome::Denied) {
+                    *slot = Some(raw_args.clone());
+                }
+            }
+            result
         }
 
         // #891: the model-facing lifecycle surface over the #880 system. Resolve

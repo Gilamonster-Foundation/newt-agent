@@ -141,7 +141,8 @@ fn declined_permissions_report_defaults_without_refreshing_authority() {
                 false,
                 20,
                 "/parent/child",
-            );
+            )
+            .1;
             // The tool trims requested targets; diagnostics must reflect the
             // actual target asked of the gate and escape it as data.
             assert!(
@@ -327,7 +328,8 @@ fn request_permissions_grant_deny_and_no_gate() {
         false,
         20,
         "/workspace",
-    );
+    )
+    .1;
     assert!(out.starts_with("granted:"), "got: {out}");
     assert!(out.contains("Retry the original operation"), "got: {out}");
     assert_eq!(gate.asks.len(), 1);
@@ -344,7 +346,8 @@ fn request_permissions_grant_deny_and_no_gate() {
         false,
         20,
         "/workspace",
-    );
+    )
+    .1;
     assert!(out.starts_with("denied:"), "got: {out}");
     assert!(out.contains("different approach"), "got: {out}");
 
@@ -356,7 +359,8 @@ fn request_permissions_grant_deny_and_no_gate() {
         false,
         20,
         "/workspace",
-    );
+    )
+    .1;
     assert!(out.contains("no operator available"), "got: {out}");
 }
 
@@ -403,17 +407,18 @@ fn permission_grant_releases_only_cached_authority_failures() {
         let mut allow = MockGate::new(true, &Caveats::top());
         let mut deny = MockGate::new(false, &Caveats::top());
         let granted =
-            execute_request_permissions(&permission, Some(&mut allow), false, 20, "/workspace");
+            execute_request_permissions(&permission, Some(&mut allow), false, 20, "/workspace").1;
         for (name, request, result) in [
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, Some(&mut deny), false, 20, "/workspace"),
+                execute_request_permissions(&permission, Some(&mut deny), false, 20, "/workspace")
+                    .1,
             ),
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, None, false, 20, "/workspace"),
+                execute_request_permissions(&permission, None, false, 20, "/workspace").1,
             ),
             (
                 "request_permissions",
@@ -424,7 +429,8 @@ fn permission_grant_releases_only_cached_authority_failures() {
                     false,
                     20,
                     "/workspace",
-                ),
+                )
+                .1,
             ),
             ("read_file", args.clone(), granted.clone()),
             (
@@ -518,7 +524,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
                 let declined =
-                    execute_request_permissions(&permission, None, false, 20, "/workspace");
+                    execute_request_permissions(&permission, None, false, 20, "/workspace").1;
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -535,7 +541,8 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     false,
                     20,
                     "/workspace",
-                );
+                )
+                .1;
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -589,7 +596,7 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
     let mut gate = MockGate::new(true, &base);
     let permission = serde_json::json!({"capability": "fs_read", "target": file});
     let granted =
-        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace");
+        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace").1;
     assert!(granted.starts_with("granted:"), "{granted}");
     guard.record(
         "request_permissions",
@@ -642,7 +649,8 @@ fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
         false,
         20,
         "/workspace",
-    );
+    )
+    .1;
     // Preserves the recoverable "no operator" signal.
     assert!(out.contains("no operator available"), "got: {out}");
     // Tells the model to proceed within its existing authority (forward
@@ -676,7 +684,8 @@ fn request_permissions_coaches_bad_inputs() {
         false,
         20,
         "/workspace",
-    );
+    )
+    .1;
     assert!(out.contains("unknown capability"), "got: {out}");
     assert!(out.contains("fs_read"), "got: {out}");
     // Missing target → coach.
@@ -686,7 +695,8 @@ fn request_permissions_coaches_bad_inputs() {
         false,
         20,
         "/workspace",
-    );
+    )
+    .1;
     assert!(out.contains("'target' is required"), "got: {out}");
 }
 
@@ -1107,7 +1117,7 @@ fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
                 let args = serde_json::json!({"capability": capability, "target": target});
                 let mut gate = MockGate::new(true, &Caveats::top());
                 let result =
-                    execute_request_permissions(&args, Some(&mut gate), false, 20, "/workspace");
+                    execute_request_permissions(&args, Some(&mut gate), false, 20, "/workspace").1;
                 assert!(permission_grant_succeeded(
                     "request_permissions",
                     &args,
@@ -1704,4 +1714,112 @@ async fn lifecycle_build_grant_runs_real_cargo() {
             assert!(!ws.path().join("target").exists());
         }
     }
+}
+
+/// #2628 regression: after a `run_command` denial, the operator approving
+/// via `request_permissions` must cause the harness to re-run the command
+/// with the widened one-shot grant.  The model must receive the command
+/// result directly — never "Retry the original operation now".
+///
+/// Grounds: `pending_rerun` wiring through the dispatch arms.
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_request_permissions_reruns_denied_run_command() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    // A target path the command declares it will write (outside workspace so
+    // that the workspace-scoped write-scope does not accidentally permit it).
+    let outfile = dir.path().parent().unwrap().join("out_2628.txt");
+    let outfile_str = outfile.to_string_lossy().into_owned();
+
+    // Caveats with no fs_write — the declared write request will be denied.
+    let base = Caveats {
+        fs_write: Scope::none(),
+        ..Caveats::top()
+    };
+
+    // ── Step 1: run_command denied because it declares fs_write ──────────────
+    let mut deny_gate = MockGate::new(false, &base);
+    let mut pending_rerun: Option<serde_json::Value> = None;
+    let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result1 = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!("printf HELLO_2628 > {outfile_str}"),
+            "fs_write": [outfile_str.clone()],
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut deny_gate as &mut dyn PermissionGate),
+            execution: Some(&execution1),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // Verify the denial was observed and recorded for re-run.
+    assert_eq!(
+        execution1.get(),
+        Some(&ExecOutcome::Denied),
+        "run_command must be denied: {result1}"
+    );
+    assert!(
+        pending_rerun.is_some(),
+        "#2628: denied run_command must be stored in pending_rerun: {result1}"
+    );
+
+    // ── Step 2: request_permissions approved → harness re-runs the command ───
+    let mut allow_gate = MockGate::new(true, &base);
+    let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
+    let result2 = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({
+            "capability": "fs_write",
+            "target": outfile_str.clone(),
+            "reason": "#2628 regression test",
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut allow_gate as &mut dyn PermissionGate),
+            execution: Some(&execution2),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // The pending_rerun slot must be consumed (re-run happened).
+    assert!(
+        pending_rerun.is_none(),
+        "#2628: pending_rerun must be consumed after approval: {result2}"
+    );
+    // The model must NOT receive the old "Retry the original operation" message.
+    assert!(
+        !result2.contains("Retry the original operation"),
+        "#2628: harness must re-run the command directly, not instruct the model to retry: {result2}"
+    );
 }
