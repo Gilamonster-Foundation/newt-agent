@@ -90,8 +90,8 @@ pub(super) fn needs_pr_create_broker(source: &str) -> bool {
     fn contains(inspection: &ShellInspection) -> bool {
         inspection.commands.iter().any(|command| {
             command.program.as_deref().is_some_and(is_gh)
-                && command.argv.get(1).map(String::as_str) == Some("pr")
-                && command.argv.get(2).map(String::as_str) == Some("create")
+                && command.argv.get(1).and_then(|a| literal(a)).as_deref() == Some("pr")
+                && command.argv.get(2).and_then(|a| literal(a)).as_deref() == Some("create")
         }) || inspection
             .constructs
             .iter()
@@ -130,6 +130,14 @@ fn standalone_literal_argv(source: &str) -> Result<Vec<String>, String> {
 /// match it exactly or the whole call is refused.
 struct GovernedPush {
     remote: String,
+    /// The `<branch>` half of an explicit `<remote> <branch>:<branch>`
+    /// operand, if the model's command supplied one — never used to BUILD
+    /// the eventual refspec (that is always the workspace's own resolved
+    /// branch, fully qualified), only to verify the model's operand actually
+    /// names that same branch (issue-1188 review #2641, finding 2: a
+    /// `git push origin other:other` must not silently push the current
+    /// branch under a name the model never asked for).
+    requested_branch: Option<String>,
 }
 
 fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
@@ -151,9 +159,11 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
     match args.len() {
         0 => Ok(GovernedPush {
             remote: "origin".to_string(),
+            requested_branch: None,
         }),
         1 => Ok(GovernedPush {
             remote: args[0].clone(),
+            requested_branch: None,
         }),
         2 => {
             let remote = args[0].clone();
@@ -164,7 +174,10 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
                     "a governed push only pushes a branch to its own name",
                 ));
             }
-            Ok(GovernedPush { remote })
+            Ok(GovernedPush {
+                remote,
+                requested_branch: Some(src.trim_start_matches("refs/heads/").to_string()),
+            })
         }
         _ => Err(unresolved("unsupported governed push form")),
     }
@@ -208,6 +221,23 @@ fn plan_governed_push(
     let argv = standalone_literal_argv(source)?;
     let request = parse_governed_push(&argv)?;
 
+    // Finding 6 (issue-1188 review #2641): this broker runs entirely
+    // outside the confined shell's filesystem/exec fence, so it must bind
+    // itself to the SAME authority a confined command would have needed —
+    // read access to the repository it is about to operate on, and exec
+    // authority for `git` itself. Without this, a model-chosen `cwd` naming
+    // some OTHER operator repository (one the confined fence would have
+    // refused to even read) reaches a real host-side git process.
+    let cwd_str = cwd.to_string_lossy();
+    if !caveats.permits_fs_read(&cwd_str) {
+        return Err(format!(
+            "refused: '{cwd_str}' is outside this session's filesystem read authority"
+        ));
+    }
+    if !caveats.permits_exec("git") {
+        return Err("refused: no exec authority for 'git'".to_string());
+    }
+
     // A1: repo-local config that could redirect the push's transport,
     // credentials, or hooks is hostile input, refused before anything spawns.
     let listing = crate::git_hardening::local_config_listing(cwd).map_err(|e| e.to_string())?;
@@ -226,12 +256,26 @@ fn plan_governed_push(
             "refused: cannot push the default branch '{branch}' (open a feature branch instead)"
         ));
     }
+    // Finding 2: an explicit `<remote> <branch>:<branch>` operand must name
+    // the SAME branch this broker is about to push — never silently
+    // substituted, and never itself used to build the refspec below.
+    if let Some(requested) = &request.requested_branch {
+        if requested != &branch {
+            return Err(format!(
+                "refused: requested branch '{requested}' does not match the checked-out \
+                 branch '{branch}' — a governed push always pushes the workspace's own branch"
+            ));
+        }
+    }
 
     // A2: push the resolved URL, not the bare remote name — a repo-local
-    // `insteadOf` rewrite is already refused above, but resolving through
-    // `git remote get-url` (rather than trusting the argv's remote name) is
-    // what actually proves the two agree.
-    let url = crate::git_hardening::resolve_remote_url(cwd, &request.remote)?;
+    // `insteadOf` rewrite is already refused above. Resolve it through
+    // `credentialed_git` (the SAME config view — including the operator's
+    // own ambient global config — the actual push below runs under), not
+    // `hardened_git`'s ambient-config-free view: otherwise a global
+    // `url.*.insteadOf` could rewrite the destination AFTER the host check
+    // passes here but BEFORE the credentialed push dials it.
+    let url = resolve_remote_url_for_push(cwd, &request.remote)?;
     let host = crate::git_hardening::push_url_host(&url)?;
 
     ensure_net_granted(
@@ -241,8 +285,32 @@ fn plan_governed_push(
         &format!("push branch '{branch}' to {host} ({url})"),
     )?;
 
-    let refspec = format!("{branch}:{branch}");
+    // Finding 2: full ref identity, never a bare short name that could
+    // collide with `refs/heads/refs/heads/main`-shaped input, and no leading
+    // character `git push` would ever read as the force-push prefix.
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     Ok((url, refspec))
+}
+
+/// [`crate::git_hardening::resolve_remote_url`], but through
+/// [`crate::git_hardening::credentialed_git`]'s config view (finding 1,
+/// issue-1188 review #2641) — the same process family that will actually
+/// dial the URL, so an operator-global `url.*.insteadOf` rewrite is captured
+/// by the SAME host check that authorizes it, rather than checked against
+/// `hardened_git`'s ambient-config-free resolution and then silently
+/// rewritten by the time the credentialed push runs.
+fn resolve_remote_url_for_push(cwd: &Path, remote: &str) -> Result<String, String> {
+    let output = crate::git_hardening::credentialed_git(cwd, &["remote", "get-url", remote])
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "no such remote '{remote}': {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// issue-1188 amendment A4: the exact `gh pr create` this broker will
@@ -351,6 +419,30 @@ fn plan_governed_pr_create(
     let argv = standalone_literal_argv(source)?;
     let request = parse_governed_pr_create(&argv)?;
 
+    // Finding 6: same cwd authority/exec binding as the push broker.
+    let cwd_str = cwd.to_string_lossy();
+    if !caveats.permits_fs_read(&cwd_str) {
+        return Err(format!(
+            "refused: '{cwd_str}' is outside this session's filesystem read authority"
+        ));
+    }
+    if !caveats.permits_exec("gh") {
+        return Err("refused: no exec authority for 'gh'".to_string());
+    }
+
+    // Finding 3: A1's hostile-config refusal never ran on this path at all —
+    // `gh` shells out to Git for repository/branch resolution too, so the
+    // same transport/credential/hook gadgets [`hostile_push_config_key`]
+    // screens for a push apply here.
+    let listing = crate::git_hardening::local_config_listing(cwd).map_err(|e| e.to_string())?;
+    if let Some(key) = crate::git_hardening::hostile_push_config_key(&listing) {
+        return Err(format!(
+            "refused: repo-local git config sets '{key}', which a governed PR create \
+             cannot safely honor (transport/credential/hook gadget) — remove it \
+             from this repository's .git/config and retry"
+        ));
+    }
+
     let url = crate::git_hardening::resolve_remote_url(cwd, "origin")?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
@@ -411,7 +503,14 @@ fn ensure_net_granted(
         reason: format!("{action} — net does not permit '{host}'"),
     };
     match gate.ask(std::slice::from_ref(&request)) {
-        PermissionDecision::Allow(_) => Ok(()),
+        // Finding 6 (issue-1188 review #2641): the returned capability is the
+        // authority — an `Allow` that does not actually cover `host` (a gate
+        // that granted a DIFFERENT host, or nothing at all) must not be read
+        // as a yes just because the variant is `Allow`.
+        PermissionDecision::Allow(granted) if granted.permits_net(host) => Ok(()),
+        PermissionDecision::Allow(_) => Err(format!(
+            "refused: granted authority does not cover network access to '{host}'"
+        )),
         PermissionDecision::Deny => Err(format!(
             "refused: operator did not grant network access to '{host}'"
         )),
@@ -664,6 +763,20 @@ fn inspect_commands(
                 continue;
             }
             "update-ref" => return Err(unresolved("direct ref update")),
+            // Finding 7 (issue-1188 review #2641): a standalone top-level
+            // `git push` never reaches this preflight at all —
+            // `needs_push_broker` diverts it to the governed broker before
+            // `preflight` is even called. Anything that DOES land here
+            // (composed, redirected, or reached only through a descendant
+            // dispatcher like `timeout`/`find -exec`) must be refused
+            // outright rather than falling through to the confined shell,
+            // where it would run ungoverned by the broker's branch/force
+            // fixed-argv guarantees if net authority happened to be broader
+            // than the `net: none` narrowing this whole broker exists to
+            // route around.
+            "push" => return Err(unresolved(
+                "`git push` must be a single, standalone command handled by the governed push broker",
+            )),
             "symbolic-ref" => {
                 let words = literal_arguments(args)?;
                 let query_flags = ["-q", "--quiet", "--short", "--recurse", "--no-recurse"];
@@ -1624,7 +1737,7 @@ mod governed_push_tests {
         )
         .unwrap();
         assert_eq!(url, "https://github.com/o/r.git");
-        assert_eq!(refspec, "task:task");
+        assert_eq!(refspec, "refs/heads/task:refs/heads/task");
 
         // Bare `git push` (no operands) resolves the same way, from origin +
         // the repository's own branch.
@@ -1632,6 +1745,117 @@ mod governed_push_tests {
             plan_governed_push("git push", repo.path(), &Caveats::top(), &mut None).unwrap();
         assert_eq!(url2, url);
         assert_eq!(refspec2, refspec);
+    }
+
+    /// Finding 2 (issue-1188 review #2641): a `<remote> <branch>:<branch>`
+    /// operand that does NOT name the workspace's actual checked-out branch
+    /// must be refused, not silently substituted with the real branch. Would
+    /// have failed before the fix: `parse_governed_push` discarded the
+    /// operand after checking only `src == dst`, so this returned `Ok` and
+    /// silently pushed `task`, never `other`.
+    #[test]
+    fn refspec_operand_naming_a_different_branch_is_refused() {
+        let repo = repo_on_feature_branch(); // checked out on "task"
+        let err = plan_governed_push(
+            "git push origin other:other",
+            repo.path(),
+            &Caveats::top(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    /// Finding 6 (issue-1188 review #2641): the broker runs outside the
+    /// confined shell's own filesystem/exec fence entirely, so it must
+    /// re-check that authority itself. Would have failed before the fix:
+    /// neither check existed, so a restricted `Caveats` still reached
+    /// `resolve_remote_url`/the net gate.
+    #[test]
+    fn governed_push_requires_exec_authority_for_git() {
+        let repo = repo_on_feature_branch();
+        let no_exec = Caveats {
+            exec: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let err = plan_governed_push(
+            "git push origin task:task",
+            repo.path(),
+            &no_exec,
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("exec authority"), "{err}");
+    }
+
+    #[test]
+    fn governed_push_requires_read_authority_for_cwd() {
+        let repo = repo_on_feature_branch();
+        let no_read = Caveats {
+            fs_read: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let err = plan_governed_push(
+            "git push origin task:task",
+            repo.path(),
+            &no_read,
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("read authority"), "{err}");
+    }
+
+    /// Finding 6 (issue-1188 review #2641): `PermissionDecision::Allow`'s
+    /// returned capability must actually cover the requested host — a gate
+    /// that grants a DIFFERENT host must not be read as a yes just because
+    /// the variant is `Allow`. Would have failed before the fix:
+    /// `ensure_net_granted` discarded the returned `Caveats` entirely.
+    #[test]
+    fn allow_decision_that_does_not_cover_the_host_is_refused() {
+        let repo = repo_on_feature_branch();
+        struct WrongHostGate;
+        impl PermissionGate for WrongHostGate {
+            fn ask(&mut self, _requests: &[PermissionRequest]) -> PermissionDecision {
+                PermissionDecision::Allow(Caveats {
+                    net: crate::caveats::Scope::only(["other.example".to_string()]),
+                    ..Caveats::top()
+                })
+            }
+            fn ask_question(&mut self, _question: &str) -> crate::agentic::HumanQuestionOutcome {
+                crate::agentic::HumanQuestionOutcome::Unavailable
+            }
+        }
+        let restricted = Caveats {
+            net: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let mut gate = WrongHostGate;
+        let err = plan_governed_push(
+            "git push origin task:task",
+            repo.path(),
+            &restricted,
+            &mut Some(&mut gate),
+        )
+        .unwrap_err();
+        assert!(err.contains("does not cover"), "{err}");
+    }
+
+    /// Finding 7 (issue-1188 review #2641): a `git push` reached only through
+    /// a descendant dispatcher (never a standalone top-level command) must be
+    /// refused outright by ordinary preflight, not silently fall through to
+    /// the confined shell where the broker's branch/force guarantees do not
+    /// apply. Would have failed before the fix: `push` had no arm in
+    /// `inspect_commands`'s verb match, so it hit the `_ => continue`
+    /// catch-all and executed normally.
+    #[test]
+    fn delegated_push_is_refused_by_ordinary_preflight() {
+        let source = "timeout 5 git push origin task:task";
+        assert!(
+            !needs_push_broker(source),
+            "a descendant-only push must not (yet) route to the governed broker: {source}"
+        );
+        let err = preflight(source, Path::new("."), &Caveats::top(), &mut None, false);
+        assert!(err.is_err(), "{source}: {err:?}");
     }
 
     /// The exact `gh pr create` argv this broker resolves — `--repo` is
@@ -1715,5 +1939,62 @@ mod governed_push_tests {
         )
         .unwrap_err();
         assert!(err.contains("github.com"), "{err}");
+    }
+
+    /// Finding 3 (issue-1188 review #2641): the PR-create broker never ran
+    /// A1's hostile-config check at all. Would have failed before the fix:
+    /// `plan_governed_pr_create` resolved straight through to `Ok`.
+    #[test]
+    fn pr_create_refuses_hostile_repo_local_config() {
+        let repo = repo_on_feature_branch();
+        git(
+            repo.path(),
+            &[
+                "config",
+                "--local",
+                "core.sshCommand",
+                "ssh -oProxyCommand=evil",
+            ],
+        );
+        let err = plan_governed_pr_create(
+            "gh pr create --title t --body b",
+            repo.path(),
+            &Caveats::top(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("core.sshcommand"), "{err}");
+    }
+
+    /// Finding 6 (issue-1188 review #2641): the PR-create broker must bind
+    /// itself to the same authority the push broker does.
+    #[test]
+    fn pr_create_requires_exec_and_read_authority() {
+        let repo = repo_on_feature_branch();
+        let no_exec = Caveats {
+            exec: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let err = plan_governed_pr_create(
+            "gh pr create --title t --body b",
+            repo.path(),
+            &no_exec,
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("exec authority"), "{err}");
+
+        let no_read = Caveats {
+            fs_read: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let err = plan_governed_pr_create(
+            "gh pr create --title t --body b",
+            repo.path(),
+            &no_read,
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("read authority"), "{err}");
     }
 }
