@@ -576,7 +576,9 @@ fn redirect_denial_reason_names_the_redirect_target_not_the_original_host() {
     // src/context.rs): `format!("network access to {host:?} is not within
     // the granted authority")`. The original request went to `a.example.com`;
     // it must not appear in the recovered host.
-    let reason = "network access to \"b.example.net\" is not within the granted authority";
+    // `e.to_string()` on the `ToolError::Denied` this becomes — `Display`
+    // prepends `"denied: "` (vendor/agent-bridle-core/src/error.rs).
+    let reason = "denied: network access to \"b.example.net\" is not within the granted authority";
     assert_eq!(
         parse_net_denial_host(reason).as_deref(),
         Some("b.example.net"),
@@ -596,7 +598,7 @@ fn redirect_denial_reason_names_the_redirect_target_not_the_original_host() {
 /// reason is not an EXACT match for `check_net`'s literal format.
 #[test]
 fn malformed_redirect_location_text_does_not_forge_a_net_denial() {
-    let reason = "redirect Location \"http://[network access to \
+    let reason = "denied: redirect Location \"http://[network access to \
                    \"x.example\" is not within the granted authority]\" \
                    is not a valid URL: invalid IPv6 address";
     assert_eq!(

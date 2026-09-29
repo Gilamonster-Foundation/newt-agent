@@ -1972,6 +1972,28 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
     }
 }
 
+/// Extract the denied host from a `web_fetch` leash-refusal reason IFF the
+/// reason is an EXACT match for the literal text
+/// `agent_bridle_core::ToolContext::check_net` emits — never a substring
+/// check (#2645 round 2). `check_net`'s format is
+/// `format!("network access to {host:?} is not within the granted authority")`;
+/// requiring the anchored prefix/suffix (not `.contains`) means wrapper text
+/// around an untrusted, interpolated string — e.g. agent-bridle-tool-web's
+/// `redirect Location {location:?} is not a valid URL: {e}` when a server
+/// sends a malformed `Location` — can never satisfy the match merely by
+/// *containing* both trigger phrases somewhere in a longer message.
+fn parse_net_denial_host(reason: &str) -> Option<String> {
+    // `ToolError`'s `Display` prepends `"denied: "` to every `Denied` variant's
+    // `reason` (vendor/agent-bridle-core/src/error.rs); `reason` here is
+    // `e.to_string()`, so the anchor must account for that fixed prefix too.
+    let host = reason
+        .strip_prefix("denied: network access to \"")?
+        .strip_suffix("\" is not within the granted authority")?;
+    // A real hostname/IP never contains a literal `"` — `check_net`'s
+    // `{host:?}` would escape one. Bail rather than guess at unescaping.
+    (!host.is_empty() && !host.contains('"')).then(|| host.to_string())
+}
+
 /// MCP `_meta` extension by which an admitted connector declares the exact URL
 /// prefixes a tool can read.  The value is an array of absolute HTTP(S) URLs.
 ///
@@ -5065,12 +5087,24 @@ async fn execute_authorized_tool(
                     // (net is checked before any subprocess exists), so it
                     // needs its own append or `newt ocap denials` never sees
                     // a `web_fetch` net denial at all.
-                    if let Some(host) = host_of_url(url) {
-                        if reason.contains("is not within the granted authority")
-                            && reason.contains("network access to")
-                        {
-                            crate::denial_journal::record_net_denial("web_fetch", &host, &reason);
-                        }
+                    //
+                    // #2645 round 2: `ToolContext::check_net` is re-run on
+                    // EVERY redirect hop inside agent-bridle-tool-web (not
+                    // vendored here — an upstream, published dependency), so
+                    // a denial can name a redirect target, not `url`'s own
+                    // host. There is no typed net-denial carrier through
+                    // `ToolError::Denied { reason: String }` today (that gap
+                    // is upstream work for agent-bridle-core, which IS
+                    // vendored and NOT to be edited here); `parse_net_denial_host`
+                    // is the newt-side substitute: it anchors on the FULL,
+                    // exact text `check_net` emits — not a substring check —
+                    // so untrusted text a server controls (e.g. an invalid
+                    // redirect Location echoed into a URL-parse error) can't
+                    // forge a match by merely containing the two trigger
+                    // phrases, and the host is the one `check_net` actually
+                    // denied, whichever hop it was.
+                    if let Some(host) = parse_net_denial_host(&reason) {
+                        crate::denial_journal::record_net_denial("web_fetch", &host, &reason);
                     }
                     render_web_fetch_error(url, &reason, &*mcp, persona_tools, disposition)
                 }
