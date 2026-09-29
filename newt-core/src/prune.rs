@@ -352,10 +352,12 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             )
         }
         "read_file" => {
-            format!(
-                "[read_file] read '{}' -> {status}, {lines} lines ({chars} chars)",
-                arg("path")
-            )
+            let path = arg("path");
+            #[cfg(feature = "ast")]
+            if let Some(outline) = rust_outline_summary(&path, args, content) {
+                return outline;
+            }
+            format!("[read_file] read '{path}' -> {status}, {lines} lines ({chars} chars)",)
         }
         "write_file" => {
             format!(
@@ -388,6 +390,32 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
         }
         _ => format!("[{name}] result elided -> {status}, {lines} lines ({chars} chars)"),
     }
+}
+
+/// A `read_file` one-liner replacement: an outline of the read range instead
+/// of a line count (#2557). `None` falls back to the plain one-liner — for a
+/// non-`.rs` path, a fragment with no definitions, or the `ast` feature off.
+#[cfg(feature = "ast")]
+fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Option<String> {
+    if !path.ends_with(".rs") {
+        return None;
+    }
+    let first_line = args
+        .and_then(|a| a.get("offset"))
+        .and_then(Value::as_u64)
+        .filter(|&o| o > 0)
+        .unwrap_or(1) as usize;
+    let entries = crate::ast_outline::outline_rust(content, first_line)?;
+    if entries.is_empty() {
+        return None;
+    }
+    let last_line = first_line + content.lines().count().saturating_sub(1);
+    let body = crate::ast_outline::render_outline(&entries);
+    let outline = format!(
+        "[read_file] {path} lines {first_line}-{last_line} — outline (re-read any span with \
+         offset/limit):\n{body}",
+    );
+    (json_str_len(&outline) < json_str_len(content)).then_some(outline)
 }
 
 /// Does `content` look like a [`one_line_summary`] this module produced?
@@ -740,6 +768,37 @@ mod tests {
             line,
             format!("[read_file] read 'src/main.rs' -> ok, 120 lines ({chars} chars)")
         );
+    }
+
+    /// #2557 regression: an aged `read_file` result on a real `.rs` file
+    /// becomes a tree-sitter outline whose spans match the source — not a
+    /// bare line count. Would have failed before `rust_outline_summary`
+    /// existed (the old code always produced the `-> ok, N lines` one-liner).
+    #[cfg(feature = "ast")]
+    #[test]
+    fn aged_rust_read_becomes_an_outline_with_matching_spans() {
+        let source = "\
+fn compact_responses_input(x: u32) -> u32 {
+    // a real read would carry many lines of body here — pad past the
+    // pass-2 threshold so the rewrite actually fires.
+    let mut y = x;
+    y += 1;
+    y += 1;
+    y
+}
+
+pub(crate) enum ResponsesCompaction {
+    Kept,
+    Dropped,
+}
+";
+        let line = summarize_one("read_file", json!({"path": "src/agentic/mod.rs"}), source);
+        assert!(
+            line.starts_with("[read_file] src/agentic/mod.rs lines 1-13 — outline"),
+            "got: {line}"
+        );
+        assert!(line.contains("    1-8\tfn compact_responses_input(x: u32) -> u32"));
+        assert!(line.contains("    10-13\tpub(crate) enum ResponsesCompaction"));
     }
 
     #[test]
