@@ -52,6 +52,7 @@
 //! lives in one `Backend` implementation and every inline surface inherits it.
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
@@ -180,11 +181,56 @@ impl<W: Write> AnchoredBackend<W> {
     }
 }
 
+/// How long [`bounded_query`] waits for a terminal query before giving up on
+/// it, regardless of what the query itself does.
+///
+/// Crossterm 0.28.1's `read_position_raw` (unix) advertises its own 2 s
+/// timeout, but its retry loop has a bug (#2644): `poll_internal`'s `Err` arm
+/// falls through to the top of the `loop` instead of returning, so under a
+/// pty that answers `poll`/`read` with an error rather than a plain timeout —
+/// observed under `vhs`'s bundled `ttyd` — the query retries forever with a
+/// fresh 2 s window each time and never returns at all. That is a crossterm
+/// defect this call site cannot patch upstream, so it is bounded here
+/// instead, at the boundary. Comfortably past crossterm's own advertised 2 s
+/// so a terminal that is merely slow still gets its answer.
+const CURSOR_QUERY_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Run a terminal query with an EXTERNAL bound — see [`CURSOR_QUERY_TIMEOUT`]
+/// for why the query's own advertised timeout is not enough to trust.
+///
+/// The query talks to the real terminal over stdout/stdin, not through any
+/// borrowed state, so it can run on a helper thread with nothing to smuggle
+/// across the boundary. **Degrade, do not refuse** (this module's own rule,
+/// stated up top): if the terminal never answers, that thread is leaked
+/// blocked on the read — cheaper than a hung startup, and newt's process is
+/// short-lived either way.
+fn bounded_query<T: Send + 'static>(
+    query: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver may already be gone (we timed out) — a dropped
+        // receiver just makes this send a no-op, not a panic.
+        let _ = tx.send(query());
+    });
+    rx.recv_timeout(CURSOR_QUERY_TIMEOUT).unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the terminal query did not answer within the bound",
+        ))
+    })
+}
+
 impl<W: Write> Backend for AnchoredBackend<W> {
     /// **The one overridden answer.** A failure here is a terminal that did
     /// not reply, not a broken terminal: fall back and keep going.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        match self.inner.get_cursor_position() {
+        // Bounded (#2644): `self.inner.get_cursor_position()` delegates to
+        // `crossterm::cursor::position()`, which does not touch `self.inner`'s
+        // writer at all (ratatui's `CrosstermBackend` impl calls the free
+        // function directly) — so the same query runs unbounded here via
+        // `bounded_query` instead of the direct, possibly-forever call.
+        match bounded_query(|| crossterm::cursor::position().map(|(x, y)| Position { x, y })) {
             Ok(position) => Ok(position),
             Err(err) => {
                 warn_once(&err);
@@ -663,5 +709,51 @@ mod screen_lease_collision {
         let rows = super::lease_bottom_rows(6, OnCollision::Refuse)
             .expect("with the screen free, the inline surface opens");
         assert!(matches!(rows.region(), Region::Rows { height: 6, .. }));
+    }
+}
+
+#[cfg(test)]
+mod bounded_query_tests {
+    use super::{bounded_query, CURSOR_QUERY_TIMEOUT};
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    /// #2644 regression: crossterm 0.28.1's DSR retry loop has a bug where a
+    /// pty answering `poll`/`read` with an error (vhs's bundled `ttyd`, not
+    /// reproducible with a plain "never answers" fake pty) makes it retry
+    /// forever and never return — not even after its own advertised 2s
+    /// timeout. `bounded_query` is the fix: it must give up and return an
+    /// error once `CURSOR_QUERY_TIMEOUT` has passed, no matter what the
+    /// query itself is doing. This closure models "never answers" the way
+    /// the buggy retry loop does: it simply never returns.
+    #[test]
+    fn a_query_that_never_answers_fails_closed_within_the_bound() {
+        let start = Instant::now();
+        let result: io::Result<()> = bounded_query(|| {
+            std::thread::sleep(Duration::from_secs(20));
+            Ok(())
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "a terminal that never answers must fail closed, not hang the caller"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded_query took {elapsed:?} to give up — the bound \
+             ({CURSOR_QUERY_TIMEOUT:?}) did not apply"
+        );
+    }
+
+    /// TWIN: an answer that arrives promptly is not held back by the bound.
+    #[test]
+    fn a_query_that_answers_promptly_is_not_delayed() {
+        let start = Instant::now();
+        let result = bounded_query(|| Ok(42));
+        assert_eq!(result.unwrap(), 42);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a prompt answer should not wait for the bound"
+        );
     }
 }
