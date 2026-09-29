@@ -233,6 +233,8 @@ check:
     # workspace run already covers, and they include a real-file-lock test
     # (dock_registry) seen failing under load.
     cargo clippy -p newt-core --no-default-features --all-targets -- -D warnings || rc=1
+    # PIPELINE PARITY: the "vendor crossterm regression gate (newt #2644)" ci.yml step.
+    just check-vendor-crossterm || rc=1
     # PIPELINE PARITY: mirrors the "test (newt-interaction, inward protocol
     # layer)" step in .github/workflows/ci.yml's lean job. newt-interaction
     # (#1828) is the inward protocol layer and must build with no feature at

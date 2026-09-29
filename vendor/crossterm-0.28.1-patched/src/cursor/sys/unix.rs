@@ -128,11 +128,17 @@ mod newt_2644_tests {
         let elapsed = start.elapsed();
 
         match result {
-            Err(e) => {
-                // Patched: poll error returned immediately.
+            // Patched: the poll error is returned promptly. A swallowed error that only
+            // surfaces when the absolute deadline expires is the pre-fix bug, so it fails.
+            Err(e) if elapsed < Duration::from_millis(1000) => {
                 let _ = writeln!(err, " OK err_kind={:?} elapsed_ms={}", e.kind(), elapsed.as_millis());
                 let _ = err.flush();
                 std::process::exit(0);
+            }
+            Err(e) => {
+                let _ = writeln!(err, " FAIL_SLOW_ERR err_kind={:?} elapsed_ms={}", e.kind(), elapsed.as_millis());
+                let _ = err.flush();
+                std::process::exit(2);
             }
             Ok(pos) => {
                 let _ = writeln!(err, " FAIL_GOT_OK pos={:?}", pos);
