@@ -101,6 +101,7 @@ fn read_migrating_operates_on_the_resolved_path_not_the_shown_one() {
             let _ = text;
             Ok(())
         },
+        &mut |_| {},
     )
     .unwrap();
     assert!(reads.borrow().iter().all(|p| p == resolved), "{reads:?}");

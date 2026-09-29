@@ -31,6 +31,7 @@ pub fn read_persona_file(
 ) -> std::io::Result<String> {
     read_migrating(
         path,
+        path,
         "persona",
         migrate_persona_text,
         true,
@@ -80,10 +81,11 @@ pub fn read_config_file(
     let mut reported = false;
     let result = read_migrating(
         path,
+        operated,
         "config",
         migrate_config_text,
         destination.is_some(),
-        |_| std::fs::read_to_string(operated),
+        |p| std::fs::read_to_string(p),
         |_, text| {
             destination
                 .expect("rewrite holds the config lock")
@@ -120,6 +122,7 @@ pub fn read_config_file(
 /// subscriber, or a terminal. A host may retain the value until a safe point.
 pub(super) fn read_migrating(
     path: &Path,
+    operated: &Path,
     kind: &str,
     migrate: fn(&str) -> Option<Migration>,
     rewrite: bool,
@@ -127,7 +130,7 @@ pub(super) fn read_migrating(
     write: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
     report: &mut dyn FnMut(Notice<'static>),
 ) -> std::io::Result<String> {
-    let raw = read(path)?;
+    let raw = read(operated)?;
     let Some(migration) = migrate(&raw) else {
         return Ok(raw);
     };
@@ -146,7 +149,7 @@ pub(super) fn read_migrating(
     }
     // Preserve the changed-source check: a non-cooperating editor may write
     // despite the lock. The latest bytes always win over our original snapshot.
-    match read(path) {
+    match read(operated) {
         Ok(current) if current != raw => {
             let latest = migrate(&current);
             let changes = latest.as_ref().map(|m| m.changes.join(", "));
@@ -174,7 +177,7 @@ pub(super) fn read_migrating(
         }
         Ok(_) => {}
     }
-    let notice = match write(path, &migration.text) {
+    let notice = match write(operated, &migration.text) {
         Ok(()) => Notice::new(
             Level::Ok,
             "",

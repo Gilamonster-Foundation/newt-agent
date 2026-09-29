@@ -14,6 +14,7 @@ fn migration_notice_values_cover_read_revalidation_and_write_outcomes() {
         let latest = OLD.replace("standard", "insistent");
         let result = read_migrating(
             Path::new("operator.toml"),
+            Path::new("operator.toml"),
             "config",
             migrate_config_text,
             scenario != "memory",
@@ -93,6 +94,7 @@ fn migration_notice_clean_reads_are_quiet_and_failed_attempts_are_not_cached() {
     for text in ["# clean\n", OLD, OLD] {
         read_migrating(
             Path::new("same.toml"),
+            Path::new("same.toml"),
             "config",
             migrate_config_text,
             false,
@@ -113,6 +115,7 @@ fn migration_notice_clean_reads_are_quiet_and_failed_attempts_are_not_cached() {
 fn migration_notice_initial_read_error_never_runs_the_writer() {
     let mut notices = Vec::new();
     let result = read_migrating(
+        Path::new("missing.toml"),
         Path::new("missing.toml"),
         "config",
         migrate_config_text,
