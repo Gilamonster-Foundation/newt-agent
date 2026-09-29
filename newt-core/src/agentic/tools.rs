@@ -73,7 +73,7 @@ use shell::{
 };
 use shell::{
     declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,
-    permits_filesystem_request, resolve_exec_cwd, split_leading_cd, UNGRANTED_FS_AUTHORITY_DENIAL,
+    permits_filesystem_request, resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
 use shell::{
@@ -1251,6 +1251,7 @@ fn lifecycle_build_request(
         kind: DenialKind::Build,
         target: workspace.into(),
         reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites within the workspace and its build scratch directory; {network}. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
+        harness_bound: false,
     }
 }
 
@@ -1667,6 +1668,7 @@ fn fs_gate_allows(
         kind,
         target: full_path.to_string(),
         reason: format!("{} does not permit '{full_path}'", kind.as_str()),
+        harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&request)) {
         PermissionDecision::Allow(widened) => tui_permits_path(axis(&widened), full_path),
@@ -1717,6 +1719,7 @@ fn git_data_loss_confirmed(gate: &mut dyn PermissionGate, op: &str) -> bool {
         reason: format!(
             "git {op} DESTROYS work irrecoverably (a dropped stash / deleted              branch cannot be recovered) — confirm before proceeding"
         ),
+        harness_bound: false,
     };
     matches!(
         gate.ask(std::slice::from_ref(&request)),
@@ -1730,6 +1733,7 @@ fn git_gate_allows(gate: &mut dyn PermissionGate, op: &str) -> bool {
         kind: DenialKind::GitWrite,
         target: op.to_string(),
         reason: format!("git {op} is outside the granted git-write authority"),
+        harness_bound: false,
     };
     matches!(
         gate.ask(std::slice::from_ref(&request)),
@@ -1894,8 +1898,9 @@ fn execute_request_permissions(
         kind,
         target: target.to_string(),
         reason: match bound {
-            // #2636 round1 finding 4: harness-authored disclosure of the
-            // execution this approval triggers — never the model's `reason`.
+            // #2636 finding 4: harness-authored disclosure of the execution this
+            // approval triggers — never the model's `reason`. The `harness_bound`
+            // field (not the prefix string) is what reason_is_model_authored checks.
             Some(pending) => format!(
                 "{BOUND_REASON_PREFIX}approving this widens {capability} for '{target}' and \
                  IMMEDIATELY re-runs the command it was denied for, ONCE, under exactly that \
@@ -1905,6 +1910,7 @@ fn execute_request_permissions(
             None if reason.is_empty() => format!("model requested {capability} for '{target}'"),
             None => reason.to_string(),
         },
+        harness_bound: bound.is_some(),
     };
 
     let quoted_target = serde_json::json!(target);
@@ -1913,7 +1919,12 @@ fn execute_request_permissions(
         // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(widened) => {
-                if bound.is_some() {
+                if bound.is_some_and(|pending| {
+                    pending
+                        .missing
+                        .iter()
+                        .all(|request| permits_filesystem_request(&widened, request))
+                }) {
                     g.consume_pending_once(kind, target);
                 }
                 return (Some(widened), permission_granted_result(capability, target));
@@ -3420,6 +3431,7 @@ async fn execute_authorized_tool(
             kind: DenialKind::RemoteTool,
             target: name.to_string(),
             reason: "Approve this remote MCP operation. Persona preferences and server tool hints do not grant permission.".into(),
+            harness_bound: false,
         };
         let grant = matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
             .then_some(McpGrant::HumanApproved);
@@ -4060,6 +4072,7 @@ async fn execute_authorized_tool(
             // `dispatch_caveats_for_git_shell`'s doc comment.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
             let commit_broker_used = commit_broker.is_some();
+            let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
             let result = executed(
                 shell::exec_confined_command_with_broker(
                     cmd,
@@ -4076,29 +4089,18 @@ async fn execute_authorized_tool(
                     live_tool_output.clone(),
                     presentation,
                     commit_broker,
+                    &mut fs_pre_exec_missing,
                 )
                 .await,
             );
-            // #2636 (round1 findings 1 & 3): capture ONLY the one denial shape
-            // #2628 is meant for — refused before anything ran, purely for
-            // undeclared filesystem authority (`UNGRANTED_FS_AUTHORITY_DENIAL`,
-            // checked by prefix since `with_denial_context` appends a diagnostic
-            // suffix). Every other denial (a broker-bearing runtime refusal, a
-            // compound command that partially ran, an exec/net denial) produces
-            // a different message and is never captured. A native-Git
-            // commit-producing command is excluded even then: replay drops
-            // `commit_broker` and `git_shell_caveats`, which would bypass the
-            // attribution/signing policy and the gitdir-write caveat this
-            // dispatch applied — finding 3's "route through the original
-            // dispatch policy, never a bypass". Bind the record to the exact
-            // missing authority so an unrelated later grant cannot replay it.
-            if let Some(slot) = pending_rerun {
-                if !commit_broker_used && result.starts_with(UNGRANTED_FS_AUTHORITY_DENIAL) {
-                    let missing: Vec<_> = filesystem_requests
-                        .iter()
-                        .filter(|request| !permits_filesystem_request(caveats, request))
-                        .cloned()
-                        .collect();
+            // #2636 finding 1: use the typed out-param from the pre-exec denial
+            // path — only a denial that fired BEFORE the child ran populates
+            // fs_pre_exec_missing. Child stdout that happens to contain the
+            // denial string does not. A native-Git commit-producing command is
+            // excluded (commit_broker_used) to prevent replaying under a bypass
+            // of the attribution/signing policy and the gitdir-write caveat.
+            if let (Some(slot), Some(missing)) = (pending_rerun, fs_pre_exec_missing) {
+                if !commit_broker_used {
                     *slot = Some(PendingRerun {
                         cmd: cmd.to_string(),
                         cwd: run_cwd.clone(),
@@ -5210,6 +5212,7 @@ async fn execute_authorized_tool(
                         kind: DenialKind::Net,
                         target: host.clone(),
                         reason: format!("net does not permit '{host}'"),
+                        harness_bound: false,
                     };
                     match gate.ask(std::slice::from_ref(&request)) {
                         PermissionDecision::Allow(widened) => Some(widened),

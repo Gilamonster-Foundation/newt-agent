@@ -2058,3 +2058,164 @@ async fn approved_request_permissions_reruns_denied_run_command() {
         "the denied second write must not have run"
     );
 }
+
+/// #2636 finding 1 (FIX-FIRST): string-based denial capture fires on successful child
+/// output. A command that succeeds but prints `UNGRANTED_FS_AUTHORITY_DENIAL` as its
+/// stdout must NOT populate the pending_rerun slot — no typed pre-exec denial was issued.
+/// Before the fix the string check fires and the slot is populated → assertion red.
+#[cfg(unix)]
+#[tokio::test]
+async fn forged_denial_string_in_stdout_does_not_populate_pending_rerun() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    let outer = tempfile::tempdir().unwrap();
+    let workspace = outer.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+
+    // A file containing the denial string verbatim — the "forged output" shape.
+    let bait = workspace.join("bait.txt");
+    std::fs::write(&bait, super::super::shell::UNGRANTED_FS_AUTHORITY_DENIAL).unwrap();
+    let bait_str = bait.to_string_lossy().into_owned();
+
+    let base = Caveats {
+        fs_read: crate::caveats::Scope::All,
+        fs_write: crate::caveats::Scope::none(),
+        ..Caveats::top()
+    };
+    let mut allow_gate = MockGate::new(true, &base);
+    let mut pending_rerun: Option<super::super::PendingRerun> = None;
+
+    let result = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!("/bin/cat {bait_str}"),
+            "fs_read": [bait_str],
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut allow_gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // cat succeeded; the denial string appeared in child stdout, not from a typed denial.
+    assert!(
+        result.contains(super::super::shell::UNGRANTED_FS_AUTHORITY_DENIAL),
+        "cat must output the forged string: {result}"
+    );
+    assert!(
+        pending_rerun.is_none(),
+        "#2636 finding 1: successful cat of a forged-string file must not populate \
+         pending_rerun (string capture cannot distinguish child output from a real denial)"
+    );
+}
+
+/// #2636 finding 3 (FIX-FIRST): consume_pending_once must NOT be called when the
+/// operator's grant does not cover the pending command's missing authority set.
+/// Currently execute_request_permissions calls consume before the coverage check → red.
+#[cfg(unix)]
+#[tokio::test]
+async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let consumed = Rc::new(Cell::new(false));
+
+    struct ConsumeSpy {
+        consumed: Rc<Cell<bool>>,
+        base: Caveats,
+    }
+    impl PermissionGate for ConsumeSpy {
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            let grants: Vec<_> = requests
+                .iter()
+                .map(|r| (r.kind, r.target.clone()))
+                .collect();
+            PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {
+            self.consumed.set(true);
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace_str = ws.path().to_string_lossy().into_owned();
+    let other_path = ws.path().join("other.txt").to_string_lossy().into_owned();
+    let out_path = ws.path().join("out.txt").to_string_lossy().into_owned();
+
+    let base = Caveats {
+        fs_write: crate::caveats::Scope::none(),
+        ..Caveats::top()
+    };
+    // The pending command needs FsWrite(other_path) to replay.
+    let missing_req = PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::FsWrite,
+        target: other_path.clone(),
+        reason: "test".to_string(),
+        harness_bound: false,
+    };
+    // The operator approves FsWrite(out_path) — a DIFFERENT target than missing_req.
+    let mut pending_slot: Option<super::super::PendingRerun> = Some(super::super::PendingRerun {
+        cmd: format!("/bin/touch {other_path}"),
+        cwd: workspace_str.clone(),
+        declared: vec![missing_req.clone()],
+        missing: vec![missing_req],
+    });
+
+    let mut spy = ConsumeSpy {
+        consumed: consumed.clone(),
+        base: base.clone(),
+    };
+    let _ = execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({
+            "capability": "fs_write",
+            "target": out_path,
+            "reason": "test grant",
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut spy as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_slot),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        !consumed.get(),
+        "#2636 finding 3: consume_pending_once must not fire when the approved grant \
+         does not cover the pending missing set (FsWrite({out_path}) ≠ FsWrite({other_path}))"
+    );
+}

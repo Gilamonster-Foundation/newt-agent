@@ -225,6 +225,12 @@ pub struct PermissionRequest {
     /// The denial text the model would otherwise see — shown to the human
     /// for context.
     pub reason: String,
+    /// #2636 finding 4: true when the harness wrote the `reason` from the
+    /// bound denial record (not the model's tool call). `reason_is_model_authored`
+    /// uses this field, not the `BOUND_REASON_PREFIX` string check, so a model
+    /// that forges the prefix cannot suppress the "(model says unverified)" label.
+    #[serde(default)]
+    pub harness_bound: bool,
 }
 
 /// #2636 (round1 finding 4): prefix marking a `request_permissions` reason

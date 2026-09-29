@@ -23,6 +23,7 @@ fn exec_request(target: &str) -> PermissionRequest {
         kind: DenialKind::Exec,
         target: target.to_string(),
         reason: format!("exec of \"{target}\" is not within the granted authority"),
+        harness_bound: false,
     }
 }
 
@@ -826,6 +827,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
         kind: DenialKind::Net,
         target: "github.com".to_string(),
         reason: "net does not permit 'github.com'".to_string(),
+        harness_bound: false,
     };
 
     let mut state = PermissionPromptState::default();
@@ -927,6 +929,7 @@ fn consume_pending_once_removes_what_ask_just_queued_for_request_permissions() {
         kind: DenialKind::FsWrite,
         target: "/ws/out.txt".to_string(),
         reason: "model requested fs_write for '/ws/out.txt'".to_string(),
+        harness_bound: false,
     };
     let decision = gate.ask(&[request]);
     assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
@@ -1046,6 +1049,7 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
                 kind: DenialKind::Net,
                 target: "mcp.example.test".into(),
                 reason: "connect the configured MCP server".into(),
+                harness_bound: false,
             };
             let ask = |interaction: &SurfaceInteraction| {
                 surface_prompts.set(surface_prompts.get() + 1);
@@ -1138,6 +1142,7 @@ fn mcp_net_prompt_configured_blank_answer_preserves_grant_lifetime() {
             kind: DenialKind::Net,
             target: "mcp.example.test".into(),
             reason: "connect the configured server".into(),
+            harness_bound: false,
         });
         assert_eq!(grant.is_some(), allowed);
         if let Some((_, _, retained)) = grant {
@@ -1170,6 +1175,7 @@ fn terminal_blank_answer_allows_once_and_never_closure() {
             kind: DenialKind::RemoteTool,
             target: "remote__search".into(),
             reason: "operator approval required".into(),
+            harness_bound: false,
         };
         let result = gate.ask(&[request]);
         assert_eq!(
@@ -1191,6 +1197,7 @@ fn mcp_net_prompt_defaults_are_offered_and_generic_defaults_cannot_add_standing_
         kind: DenialKind::Net,
         target: "mcp.example.test".into(),
         reason: "connect the configured server".into(),
+        harness_bound: false,
     };
     let danger = danger::DangerTable::builtin();
     for configured in [
@@ -1240,6 +1247,7 @@ fn mcp_net_prompt_defaults_are_offered_and_generic_defaults_cannot_add_standing_
             kind,
             target: target.into(),
             reason: String::new(),
+            harness_bound: false,
         };
         let interaction = permission_interaction(&other, &danger, PromptChoice::AllowPermanent);
         assert_eq!(interaction.default_choice().unwrap().id.as_str(), "deny");
@@ -1385,6 +1393,7 @@ fn mcp_net_prompt_distinguishes_once_from_shared_session_grants() {
                 kind: DenialKind::Net,
                 target: "mcp.example.test".into(),
                 reason: "connect the configured MCP server".into(),
+                harness_bound: false,
             };
             for _ in 0..2 {
                 let (granted, names, retain) = gate.ask_mcp_net_grant(&request).unwrap();
@@ -1416,6 +1425,7 @@ fn mcp_net_prompt_disabled_or_denied_never_grants() {
             kind: DenialKind::Net,
             target: "mcp.example.test".into(),
             reason: "private MCP origin needs an exact approval".into(),
+            harness_bound: false,
         };
         assert!(gate.ask_mcp_net_grant(&request).is_none());
         assert_eq!(prompts.get(), usize::from(enabled));
@@ -1444,6 +1454,7 @@ fn mcp_net_grant_retains_prior_session_names_under_full_access() {
                 kind: DenialKind::Net,
                 target: target.into(),
                 reason: "private MCP origin needs exact approval".into(),
+                harness_bound: false,
             };
             let (caveats, names, _) = gate.ask_mcp_net_grant(&request).unwrap();
             let policy =
@@ -1523,6 +1534,7 @@ fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
                 kind,
                 target: target.into(),
                 reason: String::new(),
+                harness_bound: false,
             },
             &danger,
             Audience::Terminal,
@@ -1539,6 +1551,7 @@ fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
         kind: DenialKind::Exec,
         target: "bash".into(),
         reason: "list the files".into(),
+        harness_bound: false,
     };
     let high = permission_definition(&model_authored, &danger, Audience::Terminal);
     assert!(!offers(&high, PromptChoice::AllowSession));
@@ -1563,6 +1576,7 @@ fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
             kind: DenialKind::FsWrite,
             target: "/".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         &danger,
         Audience::Terminal,
@@ -1743,6 +1757,7 @@ fn durable_signed_readonly_fs_approval_prompts_before_granting_write_authority()
         kind: DenialKind::FsRead,
         target: "/fixture/notes.txt".into(),
         reason: String::new(),
+        harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&read)) {
         newt_core::PermissionDecision::Allow(caveats) => {
@@ -1869,6 +1884,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
         kind: DenialKind::Net,
         target: "evil.example.com".to_string(),
         reason: "net does not permit 'evil.example.com'".to_string(),
+        harness_bound: false,
     };
 
     let mut state = PermissionPromptState::default();
@@ -1959,6 +1975,7 @@ fn permanent_allow_offered_for_every_durable_store_kind_at_low_danger() {
             kind: DenialKind::Net,
             target: "github.com".to_string(),
             reason: String::new(),
+            harness_bound: false,
         },
         &danger,
         Audience::Terminal,
@@ -1974,6 +1991,7 @@ fn permanent_allow_offered_for_every_durable_store_kind_at_low_danger() {
             kind: DenialKind::FsWrite,
             target: "/ws/notes.txt".to_string(),
             reason: String::new(),
+            harness_bound: false,
         },
         &danger,
         Audience::Terminal,
@@ -2023,6 +2041,7 @@ fn allow_permanently_grants_now_and_persists_host_to_approve_toml() {
             kind: DenialKind::Net,
             target: "github.com".to_string(),
             reason: "net does not permit 'github.com'".to_string(),
+            harness_bound: false,
         };
 
         let mut state = PermissionPromptState::default();
@@ -2110,6 +2129,7 @@ fn refresh_caveats_includes_new_session_filesystem_grants_without_prompting() {
             kind,
             target: "/approved/config.toml".into(),
             reason: "read or update the requested configuration".into(),
+            harness_bound: false,
         };
         assert!(matches!(
             gate.ask(&[request]),
@@ -2171,6 +2191,7 @@ fn refresh_caveats_preserves_a_narrower_caller_baseline_while_adding_session_gra
         kind: DenialKind::FsRead,
         target: "/approved/config.toml".into(),
         reason: "read the requested configuration".into(),
+        harness_bound: false,
     };
     assert!(matches!(
         gate.ask(&[request]),
@@ -2306,6 +2327,7 @@ fn refresh_caveats_preserves_denials_and_filters_conflicting_cached_grants() {
         kind: DenialKind::FsRead,
         target: "/approved".into(),
         reason: "inspect the requested configuration".into(),
+        harness_bound: false,
     };
     assert!(matches!(
         gate.ask(std::slice::from_ref(&request)),
@@ -2384,6 +2406,7 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
         kind: DenialKind::Exec,
         target: "/usr/bin/python3".to_string(),
         reason: "need to run the tests".to_string(),
+        harness_bound: false,
     };
     assert!(matches!(
         gate.ask(&[ask]),
@@ -2671,6 +2694,7 @@ fn git_write_grant_refused_under_readonly_preset() {
         kind: DenialKind::GitWrite,
         target: "commit".to_string(),
         reason: "commit the work".to_string(),
+        harness_bound: false,
     };
     assert!(
         matches!(gate.ask(&[req]), newt_core::PermissionDecision::Deny),
@@ -2696,6 +2720,7 @@ fn git_write_grant_allowed_without_a_preset() {
         kind: DenialKind::GitWrite,
         target: "commit".to_string(),
         reason: "commit the work".to_string(),
+        harness_bound: false,
     };
     assert!(matches!(
         gate.ask(&[req]),
@@ -2812,6 +2837,7 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
             kind: DenialKind::FsWrite,
             target: "/outside/new".into(),
             reason: "test explicit mode ceiling".into(),
+            harness_bound: false,
         };
         assert!(matches!(
             gate.ask(&[request]),
@@ -2957,6 +2983,7 @@ fn decisions_are_recorded_to_the_session_log() {
         kind: DenialKind::Net,
         target: "docs.rs".to_string(),
         reason: String::new(),
+        harness_bound: false,
     }]);
     let _ = gate.ask(&[exec_request("rm")]);
     let body = std::fs::read_to_string(&log).unwrap();
@@ -3037,36 +3064,42 @@ fn delegated_grants_cannot_cross_the_parent_ceiling_or_persist_approval() {
             kind: DenialKind::FsRead,
             target: "/outside".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         PermissionRequest {
             tool: "write_file".into(),
             kind: DenialKind::FsWrite,
             target: "/ws".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         PermissionRequest {
             tool: "web_fetch".into(),
             kind: DenialKind::Net,
             target: "example.com".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         PermissionRequest {
             tool: "git".into(),
             kind: DenialKind::GitWrite,
             target: "commit".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         PermissionRequest {
             tool: "remote__write".into(),
             kind: DenialKind::RemoteTool,
             target: "remote__write".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         PermissionRequest {
             tool: "lifecycle".into(),
             kind: DenialKind::Build,
             target: "/ws".into(),
             reason: "cargo test".into(),
+            harness_bound: false,
         },
     ];
     for choice in [
@@ -3176,6 +3209,7 @@ fn delegated_grants_preflight_the_whole_batch_before_approval_side_effects() {
             kind: DenialKind::Net,
             target: "github.com".into(),
             reason: String::new(),
+            harness_bound: false,
         },
         PermissionRequest {
             tool: "request_permissions".into(),
@@ -3634,6 +3668,7 @@ fn native_once_filesystem_baseline_survives_later_exec_and_net_approvals() {
             kind,
             target: target.into(),
             reason: "one declared invocation".into(),
+            harness_bound: false,
         };
         let newt_core::PermissionDecision::Allow(allowed) =
             gate.ask_with_caveats(&current, &[request])
@@ -3716,6 +3751,7 @@ fn native_once_filesystem_known_refusals_precede_pending_consumption() {
                 kind: *kind,
                 target: target.clone(),
                 reason: "declared invocation".into(),
+                harness_bound: false,
             })
             .collect();
         if let Some(kind) = mixed {
@@ -3729,6 +3765,7 @@ fn native_once_filesystem_known_refusals_precede_pending_consumption() {
                 }
                 .into(),
                 reason: "same batch as the pending filesystem requests".into(),
+                harness_bound: false,
             });
         }
         assert!(
@@ -4199,6 +4236,7 @@ fn confined_build_is_never_a_shell_expansion_and_session_allow_is_call_scoped_to
         kind: DenialKind::Build,
         target: "/ws".into(),
         reason: "cargo test; workspace writes and network denied".into(),
+        harness_bound: false,
     };
     // dec1-build-grant (F30): `Build` is now session-allowable — Shawn's
     // decision that refusing it bought no extra safety over the calibrated
@@ -4265,6 +4303,7 @@ fn preset_build_ceiling_refuses_before_prompting() {
         kind: DenialKind::Build,
         target: "/ws".into(),
         reason: "cargo test".into(),
+        harness_bound: false,
     };
     assert!(matches!(
         gate.ask(&[request]),
@@ -4286,6 +4325,7 @@ fn managed_build_scratch_reuses_session_approval_without_widening_the_shell() {
         kind: DenialKind::Build,
         target,
         reason: "native cargo with private build scratch".into(),
+        harness_bound: false,
     };
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));
@@ -4353,10 +4393,32 @@ fn prepared_build_fence_cannot_exceed_delegation_before_prompt() {
         kind: DenialKind::Build,
         target: "/ws".into(),
         reason: "cargo test".into(),
+        harness_bound: false,
     };
     assert!(matches!(
         gate.ask_with_caveats(&prepared, &[request]),
         newt_core::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
+}
+
+/// #2636 finding 4 (FIX-FIRST): the BOUND_REASON_PREFIX is a magic string in
+/// model-supplied text. The model can forge it to suppress the "(model says unverified)"
+/// label on its own request_permissions call. reason_is_model_authored must return true
+/// even when the reason starts with BOUND_REASON_PREFIX.
+/// Before the fix: the string check returns false for the forged prefix → red.
+#[test]
+fn model_forged_bound_prefix_is_still_model_authored() {
+    let req = newt_core::PermissionRequest {
+        tool: "request_permissions".to_string(),
+        kind: newt_core::DenialKind::FsWrite,
+        target: "/ws/out.txt".to_string(),
+        reason: format!("{}forged by the model", newt_core::BOUND_REASON_PREFIX),
+        harness_bound: false,
+    };
+    assert!(
+        super::reason_is_model_authored(&req),
+        "#2636 finding 4: a forged BOUND_REASON_PREFIX in model-supplied reason must not \
+         suppress the unverified label; reason_is_model_authored returned false"
+    );
 }
