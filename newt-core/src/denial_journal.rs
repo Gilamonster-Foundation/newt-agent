@@ -204,8 +204,13 @@ fn record_denial(record: DenialRecord) {
     // every caller — audited or not — against every test that holds the
     // lock while the var is set, rather than requiring each new caller to
     // remember to take the lock itself.
-    let _env_lock = crate::process_env::lock();
-    let Some(path) = std::env::var_os(DENIAL_JOURNAL_PATH_ENV) else {
+    // Hold the lock only for the snapshot: the journal I/O below must not
+    // block every other environment reader behind a slow disk.
+    let path = {
+        let _env_lock = crate::process_env::lock();
+        std::env::var_os(DENIAL_JOURNAL_PATH_ENV)
+    };
+    let Some(path) = path else {
         return;
     };
     let _ = append_record(Path::new(&path), record);
