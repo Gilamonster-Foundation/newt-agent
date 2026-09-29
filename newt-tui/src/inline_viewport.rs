@@ -184,7 +184,20 @@ impl<W: Write> Backend for AnchoredBackend<W> {
     /// **The one overridden answer.** A failure here is a terminal that did
     /// not reply, not a broken terminal: fall back and keep going.
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        match self.inner.get_cursor_position() {
+        // #2644 round 2: this used to detach the query onto a helper thread
+        // and time out `recv_timeout` around it — but dropping the receiver
+        // does not cancel `crossterm::cursor::position()`. The leaked thread
+        // kept consuming terminal input under crossterm's shared event-reader
+        // mutex and could still be mid-`read_position_raw` (raw mode enabled,
+        // termios saved) when the caller had already moved on and the cockpit
+        // entered its own raw-mode guard — a live reader plus a termios owner
+        // left behind (PR #2646 review). The actual defect was in crossterm's
+        // retry loop, not in this call being synchronous; it is patched at
+        // the source instead (`vendor/crossterm-0.28.1-patched/`, wired via
+        // workspace `[patch.crates-io]`), so the call here is synchronous
+        // again and crossterm's own raw-mode enable/disable cleanup runs
+        // uninterrupted, exactly as ratatui's `CrosstermBackend` expects.
+        match crossterm::cursor::position().map(|(x, y)| Position { x, y }) {
             Ok(position) => Ok(position),
             Err(err) => {
                 warn_once(&err);
