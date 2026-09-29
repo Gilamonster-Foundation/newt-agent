@@ -101,9 +101,9 @@ const RENDER_REPORT_DESCRIPTION: &str =
      missing. Prefer ONE report with `sections` over many small calls. The tool \
      result you receive back is a short ack, not the rendered text — the \
      document has already been shown to the user, so do not repeat it in your \
-     reply. If you change your reading of the request after rendering, call \
-     render_report again rather than pasting a correction silently in the reply. \
-     Reporting findings does not complete an unfinished execution request: \
+     reply. If your reading changes after rendering, explicitly state \
+     \"Correction: [one-line reason] — supersedes the report above\" before the \
+     corrected version. Reporting findings does not complete an unfinished execution request: \
      continue the requested work with tools. When the task is complete, keep the \
      final reply brief and include only new information.";
 
@@ -626,6 +626,17 @@ mod tests {
         assert!(
             REPORT_DELIVERY_GUIDANCE.contains("Do not repeat"),
             "nudge must still discourage silent repetition: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        // The tool description and the delivery nudge must prescribe ONE
+        // correction path, or a model following either can still produce a
+        // second, unlabelled table.
+        assert!(
+            RENDER_REPORT_DESCRIPTION.contains("supersedes the report above"),
+            "tool description must prescribe the same correction statement: {RENDER_REPORT_DESCRIPTION}"
+        );
+        assert!(
+            !RENDER_REPORT_DESCRIPTION.contains("render_report again"),
+            "tool description must not offer a second, unlabelled correction path: {RENDER_REPORT_DESCRIPTION}"
         );
     }
 }
