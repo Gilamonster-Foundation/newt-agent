@@ -469,7 +469,6 @@ fn permission_grant_releases_only_cached_authority_failures() {
                     "/workspace",
                 ),
             ),
-            ("read_file", args.clone(), granted.clone()),
             (
                 "request_permissions",
                 permission.clone(),

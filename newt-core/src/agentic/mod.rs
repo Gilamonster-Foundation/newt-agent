@@ -3866,34 +3866,25 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // #2637: an exact bare re-read is NEVER refused — serve it
             // silently from the memo when the file's actual current content
             // still matches; otherwise fall through to a real read below.
-            if let Some(cached) =
+            if let Some(content) =
                 repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
             {
                 print_synthetic_tool_result(
                     name,
                     &args,
                     workspace,
-                    &cached.content,
+                    &content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
-                // #2637 review P1/P2: the receipt, not `cached.content`, goes
-                // to the model — the full page is already in the outgoing
-                // context, and the receipt still passes the live disclosure
-                // fence (same chokepoint a real tool result takes).
-                let receipt = maybe_offload_tool_result(
-                    name,
-                    cached.unchanged_receipt(),
-                    tool_offload,
-                    spill_store,
-                    disclosure,
-                );
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
                 smart_harness::push_tool_resolution(
                     &mut messages,
-                    serde_json::json!({ "role": "tool", "content": receipt }),
+                    serde_json::json!({ "role": "tool", "content": offloaded }),
                     batch.as_ref(),
                     call_index,
                 )?;
@@ -4323,30 +4314,6 @@ impl ReadScope<'_> {
     }
 }
 
-/// #2637 review P2/doctrine ruling: what a `RepeatCallGuard::cached_read` hit
-/// hands back to a call site. `content` is the full prior page (for the
-/// terminal echo only); the model-facing message is the short receipt built
-/// by `unchanged_receipt`, never `content` itself — the whole point of the
-/// cache is that `content` is already sitting in the outgoing context.
-struct CachedReadHit {
-    path: String,
-    content: String,
-    content_id: content_addressable::RawContentId,
-}
-
-impl CachedReadHit {
-    /// A short, successful observation — not a refusal — naming the still-
-    /// verified identity of the page already in context. Per the review's
-    /// doctrine ruling: never demands a different call, an explicit range, or
-    /// negotiation; it just avoids resending bytes the model already has.
-    fn unchanged_receipt(&self) -> String {
-        format!(
-            "unchanged since the earlier read of `{}` (content id {}); it is above.",
-            self.path, self.content_id
-        )
-    }
-}
-
 #[derive(Default)]
 struct RepeatCallGuard {
     /// `(name + canonical args)` → the prior outcome that should steer an exact repeat.
@@ -4533,20 +4500,12 @@ impl RepeatCallGuard {
     /// A mismatch or an unprovable freshness check drops the memo and returns
     /// `None`, so the caller falls through to a real read — which then
     /// re-memoizes from the real outcome. This never itself denies access.
-    ///
-    /// Review P2 (context savings): a live memo means the original full page
-    /// is still in the outgoing context — it was delivered when the memo was
-    /// created and is only ever released by a real workspace change or a
-    /// committed compaction (`release_read_memos`), both of which drop the
-    /// memo outright. So a HIT never needs to resend the bytes: the caller
-    /// sends a short unchanged-receipt instead of `content`, and `content` is
-    /// returned only so the caller can still echo it to the terminal/log.
     fn cached_read(
         &mut self,
         name: &str,
         args: &serde_json::Value,
         read_scope: ReadScope<'_>,
-    ) -> Option<CachedReadHit> {
+    ) -> Option<String> {
         let path = Self::bare_read_file_path(name, args)?;
         let key = Self::key(name, args);
         let Some(RepeatMemo::ReadRange {
@@ -4558,11 +4517,7 @@ impl RepeatCallGuard {
             return None;
         };
         if read_scope.content_id_of(&path).as_ref() == Some(content_id) {
-            Some(CachedReadHit {
-                path,
-                content: content.clone(),
-                content_id: *content_id,
-            })
+            Some(content.clone())
         } else {
             self.repeat_memos.remove(&key);
             None
@@ -8773,33 +8728,28 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // #2637: never refuse an exact bare re-read — serve it silently
             // from the memo when the file's actual current content still
             // matches; otherwise fall through to a real read below.
-            if let Some(cached) =
+            if let Some(content) =
                 repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
             {
                 print_synthetic_tool_result(
                     name,
                     &args,
                     workspace,
-                    &cached.content,
+                    &content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
-                let receipt = maybe_offload_tool_result(
-                    name,
-                    cached.unchanged_receipt(),
-                    tool_offload,
-                    spill_store,
-                    disclosure,
-                );
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
                 smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
-                        "content": receipt,
+                        "content": offloaded,
                     }),
                     batch.as_ref(),
                     call_index,
@@ -11260,33 +11210,28 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // #2637: never refuse an exact bare re-read — serve it silently
             // from the memo when the file's actual current content still
             // matches; otherwise fall through to a real read below.
-            if let Some(cached) =
+            if let Some(content) =
                 repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
             {
                 print_synthetic_tool_result(
                     name,
                     &args,
                     workspace,
-                    &cached.content,
+                    &content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
-                let receipt = maybe_offload_tool_result(
-                    name,
-                    cached.unchanged_receipt(),
-                    tool_offload,
-                    spill_store,
-                    disclosure,
-                );
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
                 smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
-                        "content": receipt,
+                        "content": offloaded,
                     }),
                     batch.as_ref(),
                     call_index,
@@ -12936,33 +12881,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // #2637: never refuse an exact bare re-read — serve it silently
             // from the memo when the file's actual current content still
             // matches; otherwise fall through to a real read below.
-            if let Some(cached) =
+            if let Some(content) =
                 repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
             {
                 print_synthetic_tool_result(
                     name,
                     &args,
                     workspace,
-                    &cached.content,
+                    &content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
-                let receipt = maybe_offload_tool_result(
-                    name,
-                    cached.unchanged_receipt(),
-                    tool_offload,
-                    spill_store,
-                    disclosure,
-                );
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
                 smart_harness::push_tool_resolution(
                     &mut input,
                     serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": receipt,
+                        "output": offloaded,
                     }),
                     batch.as_ref(),
                     call_index,

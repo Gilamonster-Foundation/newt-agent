@@ -825,36 +825,16 @@ impl Respond for LongHaulResponder {
 }
 
 /// #2637: a bare `read_file` repeat is NEVER refused any more (the doctrine
-/// fix) — every round's freshest tool-role message must be EITHER the exact,
-/// full file content (a real read: the first round, or the first round after
-/// a compaction released the cache) OR a short "unchanged since ... (content
-/// id ...)" receipt naming the exact content id of that same file content (a
-/// cache hit — review P2/P3: the doctrine ruling accepts a bound, successful
-/// receipt in place of resending bytes already in context; it is not a
-/// refusal). Anything else is a bug (truncation, corruption, a stray
-/// refusal, or a receipt whose id does not match the real content).
-/// Returns `true` when this round was a receipt (cache hit).
-fn assert_haul_round_is_full_content_or_receipt(
-    round: usize,
-    expected: &str,
-    content: &str,
-) -> bool {
-    if content == expected {
-        return false;
-    }
-    let expected_id = content_addressable::RawContentId::from_content(expected.as_bytes());
-    assert!(
-        content.starts_with("unchanged since") && content.contains(&expected_id.to_string()),
-        "round {round}: expected either the exact file content or an unchanged-receipt \
-         naming content id {expected_id} — #2637 doctrine forbids ever refusing it, but \
-         got: {content:?}"
+/// fix) — every round's freshest tool-role message must be the exact, full
+/// file content, whether served from the cache or from a real re-read.
+/// There is no "steered" shape left to classify; anything that is not the
+/// expected content is a bug (truncation, corruption, or a stray refusal).
+fn assert_haul_round_is_full_content(round: usize, expected: &str, content: &str) {
+    assert_eq!(
+        content, expected,
+        "round {round}: a bare read_file repeat must return the exact file content \
+         (cached or fresh) — #2637 doctrine forbids ever refusing it"
     );
-    assert!(
-        content.len() < expected.len(),
-        "round {round}: a receipt must be far shorter than the full content it \
-         certifies (review P2/P3 — the whole point is not resending the bytes)"
-    );
-    true
 }
 
 /// Three prior turns, then the active task — the reviewer's multi-turn
@@ -973,15 +953,11 @@ async fn forty_rounds_single_turn_stay_bounded_with_fresh_results_intact() {
     assert_eq!(log.len(), 40, "all 40 tool rounds dispatched");
     // #2637: `read_file{"path":"big.txt"}` repeats byte-for-byte every
     // round. It is NEVER refused — every round from the 2nd on carries a
-    // prior tool result, and it is always either the exact file content or a
-    // short unchanged-receipt naming it (review P2/P3), whether served from
-    // the cache or by a real re-read (a compaction released the memo).
-    // Round 0's request has no prior tool result yet (nothing has run), so
-    // its `last_tool` is legitimately `None`.
+    // prior tool result, and it is always the exact file content, whether
+    // served from the cache or by a real re-read (a compaction released the
+    // memo). Round 0's request has no prior tool result yet (nothing has
+    // run), so its `last_tool` is legitimately `None`.
     let mut fresh_rounds = 0;
-    let mut receipt_rounds = 0;
-    let mut receipt_bytes = 0usize;
-    let full_content = line.repeat(64);
     for (round, (len, last_tool)) in log.iter().enumerate() {
         assert!(
             *len <= threshold + 6,
@@ -990,36 +966,16 @@ async fn forty_rounds_single_turn_stay_bounded_with_fresh_results_intact() {
         );
         match last_tool {
             Some(content) => {
-                if assert_haul_round_is_full_content_or_receipt(round, &full_content, content) {
-                    receipt_rounds += 1;
-                    receipt_bytes += content.len();
-                } else {
-                    fresh_rounds += 1;
-                }
+                assert_haul_round_is_full_content(round, &line.repeat(64), content);
+                fresh_rounds += 1;
             }
             None => assert_eq!(round, 0, "only round 0 may lack a prior tool result"),
         }
     }
     assert_eq!(
-        fresh_rounds + receipt_rounds,
+        fresh_rounds,
         log.len() - 1,
-        "every round but the first must carry the read_file content or its receipt \
-         — #2637: never refused"
-    );
-    assert!(
-        receipt_rounds > 0,
-        "an unchanged repeat under compression pressure must hit the cache at least \
-         once in 40 rounds — otherwise the cache buys nothing (review P2/P3)"
-    );
-    // Review P2/P3 (context savings): the whole point of a receipt is that it
-    // is far cheaper than resending the file — pin an actual number instead
-    // of asserting the mechanism fired and stopping there.
-    assert!(
-        receipt_bytes < receipt_rounds * (full_content.len() / 10),
-        "receipts averaged {} bytes over {receipt_rounds} hits — expected well under a \
-         tenth of the {}-byte file they certify",
-        receipt_bytes / receipt_rounds,
-        full_content.len()
+        "every round but the first must carry the full read_file content — #2637: never refused"
     );
     assert!(summarizer_calls >= 2, "the long haul compresses repeatedly");
     assert!(
@@ -1057,10 +1013,8 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
     assert_eq!(log.len(), 30, "all 30 tool rounds dispatched");
     // #2637: see the sibling forty-round test — an identical `read_file` is
     // NEVER refused, so every round but the first (no prior tool result yet)
-    // carries the full content or its receipt (review P2/P3).
+    // carries the full, exact content.
     let mut fresh_rounds = 0;
-    let mut receipt_rounds = 0;
-    let full_content = line.repeat(64);
     for (round, (len, last_tool)) in log.iter().enumerate() {
         assert!(
             *len <= threshold + 6,
@@ -1068,20 +1022,16 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
         );
         match last_tool {
             Some(content) => {
-                if assert_haul_round_is_full_content_or_receipt(round, &full_content, content) {
-                    receipt_rounds += 1;
-                } else {
-                    fresh_rounds += 1;
-                }
+                assert_haul_round_is_full_content(round, &line.repeat(64), content);
+                fresh_rounds += 1;
             }
             None => assert_eq!(round, 0, "only round 0 may lack a prior tool result"),
         }
     }
     assert_eq!(
-        fresh_rounds + receipt_rounds,
+        fresh_rounds,
         log.len() - 1,
-        "every round but the first must carry the read_file content or its receipt \
-         — #2637: never refused"
+        "every round but the first must carry the full read_file content — #2637: never refused"
     );
     assert!(summarizer_calls >= 2);
     assert!(

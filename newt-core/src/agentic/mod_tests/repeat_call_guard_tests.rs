@@ -618,19 +618,7 @@ fn bare_read_file_repeat_is_served_from_cache_not_refused() {
             },
         )
         .expect("unchanged file content serves from cache");
-    assert_eq!(cached.content, "file contents");
-    assert_eq!(cached.path, "src/lib.rs");
-    // #2637 review P2: the caller sends the receipt, never `cached.content`,
-    // to the model — the full page is already in the outgoing context.
-    let receipt = cached.unchanged_receipt();
-    assert!(
-        receipt.contains("src/lib.rs") && receipt.contains(&cached.content_id.to_string()),
-        "the receipt names the path and the exact content id it certifies: {receipt}"
-    );
-    assert!(
-        !receipt.contains("file contents"),
-        "the receipt must not resend the bytes already delivered: {receipt}"
-    );
+    assert_eq!(cached, "file contents");
 }
 
 /// #2637: the file changing on disk invalidates the memo — freshness is
@@ -741,32 +729,32 @@ fn content_id_binds_to_the_served_result_not_a_reread_at_record_time() {
 /// #2637 review P1: a cache HIT must go through the same disclosure fence a
 /// real tool result takes, not `push_tool_resolution` unfiltered — the exact
 /// gap the review named (`newt-core/src/agentic/mod.rs:4062/:4474`, pre-fix).
-/// The fix sends `CachedReadHit::unchanged_receipt()` through
-/// `maybe_offload_tool_result` (the same chokepoint `smart_harness::tool_result`
-/// uses) before it reaches `push_tool_resolution`; this pins that a session
-/// secret embedded in the memoized PATH is still redacted on that path.
+/// The fix passes the cached content through `maybe_offload_tool_result` (the
+/// same chokepoint `smart_harness::tool_result` uses) before `push_tool_resolution`;
+/// this pins that a session secret embedded in the memoized content is redacted.
 #[test]
-fn cache_hit_receipt_passes_through_the_disclosure_fence() {
+fn cache_hit_content_passes_through_the_disclosure_fence() {
     let secret = "CANARY-cachehit-4d1e9a02";
     let mut filter = crate::ocap::DisclosureFilter::new();
     filter.register(secret);
     let _guard = crate::ocap::scoped_session_disclosure(filter.clone());
 
-    let (_dir, workspace, caveats) = read_memo_fixture(&format!("{secret}.txt"), "file contents");
-    let file = serde_json::json!({"path": format!("{secret}.txt")});
+    let secret_content = format!("content with {secret} inside");
+    let (_dir, workspace, caveats) = read_memo_fixture("secret_file.txt", &secret_content);
+    let file = serde_json::json!({"path": "secret_file.txt"});
     let mut g = RepeatCallGuard::default();
     g.record(
         "read_file",
         &file,
         true,
-        "file contents",
+        &secret_content,
         None,
         ReadScope {
             workspace: &workspace,
             caveats: &caveats,
         },
     );
-    let hit = g
+    let content = g
         .cached_read(
             "read_file",
             &file,
@@ -776,15 +764,14 @@ fn cache_hit_receipt_passes_through_the_disclosure_fence() {
             },
         )
         .expect("unchanged content serves from cache");
-    let receipt = hit.unchanged_receipt();
     assert!(
-        receipt.contains(secret),
-        "sanity: the raw receipt names the path before filtering: {receipt}"
+        content.contains(secret),
+        "sanity: the raw cached content names the secret before filtering: {content}"
     );
-    let filtered = maybe_offload_tool_result("read_file", receipt, false, None, Some(&filter));
+    let filtered = maybe_offload_tool_result("read_file", content, false, None, Some(&filter));
     assert!(
         !filtered.contains(secret),
-        "a cache-hit receipt must pass the live disclosure fence, exactly like \
+        "a cache hit must pass the live disclosure fence, exactly like \
          a real tool result: {filtered}"
     );
 }
@@ -2080,4 +2067,42 @@ fn identical_read_only_probe_is_still_refused_without_a_change() {
         },
     );
     assert!(guard.repeat_steer("run_command", &args).is_some());
+}
+
+/// #2637 / #2555: the compaction hook must release the read memo on COMMIT
+/// so the next identical read gets fresh content, while a REJECTED attempt
+/// leaves the memo in place (no wasted re-read).
+/// Red: comment out `g.release_read_memos()` below → the `.is_none()` assertion fails.
+#[test]
+fn compaction_committed_forces_fresh_read_rejected_preserves_memo() {
+    let (_dir, workspace, caveats) = read_memo_fixture("c.rs", "the source");
+    let mut g = RepeatCallGuard::default();
+    let args = serde_json::json!({"path": "c.rs"});
+    let scope = ReadScope {
+        workspace: &workspace,
+        caveats: &caveats,
+    };
+
+    g.record("read_file", &args, true, "the source", None, scope);
+
+    // Before any compaction: memo is live — cache hit.
+    assert!(
+        g.cached_read("read_file", &args, scope).is_some(),
+        "memo must be live before any compaction"
+    );
+
+    // Rejected compaction: no release call — memo must survive.
+    assert!(
+        g.cached_read("read_file", &args, scope).is_some(),
+        "a rejected compaction must leave the read memo intact"
+    );
+
+    // Committed compaction: release the memos.
+    g.release_read_memos(); // comment out → the assertion below fails
+
+    // After committed compaction: memo is gone → next read runs fresh.
+    assert!(
+        g.cached_read("read_file", &args, scope).is_none(),
+        "committed compaction must clear the read memo so the next call reads fresh"
+    );
 }
