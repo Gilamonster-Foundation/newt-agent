@@ -4020,14 +4020,15 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
     }
 }
 
-/// PR #2626 review P2-3: the model-picker's result is explicit operator
-/// intent, honored against the served set from the CURRENT probe rather than
-/// the (possibly narrower) `ambiguous_warm` snapshot the picker was raised
-/// from — `None` (cancel, or a picked model the server no longer lists) is
-/// the only case that falls through to refusal. Pure so the decision is
-/// unit-testable without driving a real terminal or probe.
-fn resolve_modal_choice(picked: Option<String>, served_at_probe: &[String]) -> Option<String> {
-    picked.filter(|m| served_at_probe.contains(m))
+/// PR #2626 review residual finding 3: the model-picker's result is explicit
+/// operator intent, honored against the roster the picker ITSELF fetched
+/// fresh right before returning — never a snapshot taken before the picker
+/// opened (roster can change while the picker is open: refresh, load/unload,
+/// or simply time passing). `None` (cancel, or a picked model that isn't in
+/// that fresh roster) is the only case that falls through to refusal. Pure
+/// so the decision is unit-testable without driving a real terminal or probe.
+fn resolve_modal_choice(picked: Option<(String, Vec<String>)>) -> Option<String> {
+    picked.and_then(|(m, served)| served.contains(&m).then_some(m))
 }
 
 /// The shared adopt tail: probe results (live or pre-warmed) → the choice's
@@ -4065,7 +4066,6 @@ fn finish_adoption(
             // declaration; Managed Shared may prefer a warm model).
             let (synth, requested) = adoption_inputs(choice);
             let warm_at_probe = warm.clone();
-            let models_at_probe = models.clone();
             let declared_name = synth.effective_model().map(str::to_string);
             let mut adoption =
                 backend_probe::adopt(&synth, &Served { models, warm }, requested.as_deref());
@@ -4150,17 +4150,17 @@ fn finish_adoption(
                             .then(|| models_panel::choose(choice, None).ok().flatten())
                             .flatten();
                         #[cfg(not(feature = "rich-tui"))]
-                        let picked: Option<String> = None;
-                        // PR #2626 review P2-3: the picker offers every
-                        // served model (including ones not warm at probe
-                        // time, and its own load/refresh controls), but this
-                        // arm used to accept a choice only when it belonged
-                        // to the STALE `ambiguous_warm` snapshot — silently
-                        // discarding any other deliberate pick as if it were
-                        // a cancel. Validate against the served set from
-                        // THIS probe instead: any model the backend actually
-                        // lists is honored as explicit intent.
-                        match resolve_modal_choice(picked, &models_at_probe) {
+                        let picked: Option<(String, Vec<String>)> = None;
+                        // PR #2626 review residual finding 3: the picker
+                        // offers every served model (including ones not warm
+                        // at probe time, and its own load/refresh controls),
+                        // and the roster can change again while the picker
+                        // is open. Validate against the roster the picker
+                        // ITSELF fetched fresh right before returning — not
+                        // `models_at_probe`, which is the OUTER probe from
+                        // before the picker ever opened and can no longer
+                        // speak for what the backend serves now.
+                        match resolve_modal_choice(picked) {
                             Some(m) => {
                                 lines.push(format!("backend default → {m} (picked)"));
                                 adoption.model = Some(m);
