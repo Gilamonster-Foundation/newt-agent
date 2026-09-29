@@ -1359,10 +1359,20 @@ async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
     let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
-    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
-        .unwrap()
-        .output()
-        .unwrap();
+    let init = {
+        let mut cmd = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"]).unwrap();
+        // Windows CI: temp fixture owned by a different principal. Inject safe.directory
+        // only for this test fixture, not in production hardened_git.
+        #[cfg(windows)]
+        if let Ok(canonical) = ws.path().canonicalize() {
+            if let Some(dir) = canonical.to_str() {
+                cmd.env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "safe.directory")
+                    .env("GIT_CONFIG_VALUE_0", dir);
+            }
+        }
+        cmd.output().unwrap()
+    };
     assert!(init.status.success(), "{init:?}");
     std::fs::write(ws.path().join("native-only.txt"), "native evidence\n").unwrap();
     let mut caveats = caveats_no_exec(ws.path());
@@ -1458,10 +1468,20 @@ async fn state_modifying_git_add_is_not_routed() {
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
     let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
-    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
-        .unwrap()
-        .output()
-        .unwrap();
+    let init = {
+        let mut cmd = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"]).unwrap();
+        // Windows CI: temp fixture owned by a different principal. Inject safe.directory
+        // only for this test fixture, not in production hardened_git.
+        #[cfg(windows)]
+        if let Ok(canonical) = ws.path().canonicalize() {
+            if let Some(dir) = canonical.to_str() {
+                cmd.env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "safe.directory")
+                    .env("GIT_CONFIG_VALUE_0", dir);
+            }
+        }
+        cmd.output().unwrap()
+    };
     assert!(init.status.success(), "{init:?}");
     std::fs::write(ws.path().join("stage-me.txt"), "stage this file\n").unwrap();
     let mut caveats = caveats_no_exec(ws.path());
@@ -1479,11 +1499,20 @@ async fn state_modifying_git_add_is_not_routed() {
         !out.contains("routed"),
         "git add must NOT route to the git built-in; got: {out}"
     );
-    let staged =
-        crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
-            .unwrap()
-            .output()
-            .unwrap();
+    let staged = {
+        let mut cmd =
+            crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
+                .unwrap();
+        #[cfg(windows)]
+        if let Ok(canonical) = ws.path().canonicalize() {
+            if let Some(dir) = canonical.to_str() {
+                cmd.env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "safe.directory")
+                    .env("GIT_CONFIG_VALUE_0", dir);
+            }
+        }
+        cmd.output().unwrap()
+    };
     assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
     #[cfg(target_os = "windows")]
     {

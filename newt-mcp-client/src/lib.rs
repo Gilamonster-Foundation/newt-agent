@@ -778,7 +778,6 @@ fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
 /// the WHOLE spawn (L3 BOUND), and a stdio child can't bind a host
 /// allow-list either way (see `caveats::spawn_net_scope`). `Scope::All` and
 /// `Scope::none()` still pass through unchanged.
-#[cfg(unix)]
 fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     use newt_core::caveats::Scope;
     let mut caveats = session.clone();
@@ -933,20 +932,13 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        // Admit exec of the configured server command; keep its runtime authority
-        // (fs) from the session leash; `net` is narrowed to `none` by
-        // `spawn_caveats` (`spawn_net_scope`) — a host list cannot be enforced
-        // by any spawn backend, so narrowing loses nothing a child could honor.
-        let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
-            format!("authorizing confined spawn of MCP server `{}`", entry.name)
-        })?;
-
         // agent-bridle 0.8's L3 admission bound only resolves a RESTRICTED
         // `net` axis when `child_network == DenyDirect`; under the default
         // `LandlockOnly` a `net: none` server is `Unknown` and every confined
         // spawn fails closed with "not decidable ... (L3 BOUND)".
-        // `spawn_caveats` above has already narrowed any host-scoped session
-        // grant to `none`, so the child's net is always `All` or `none` here.
+        // `spawn_caveats` (via `prepare_stdio_caveats`) has already narrowed any
+        // host-scoped session grant to `none`, so the child's net is always `All`
+        // or `none` here.
         // `DenyDirect` is then a no-op on `All`, and resolves `none` to
         // `Kernel`-decidable on Linux. Non-Unix MCP takes the raw Tokio path
         // (`#[cfg(not(unix))]` below) — env-scrubbed but unconfined.

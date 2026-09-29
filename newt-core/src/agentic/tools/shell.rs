@@ -599,22 +599,7 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
 }
 
 pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
-    let mut env = venv_env_map();
-    // Windows: git's ownership check rejects temp fixture dirs owned by a
-    // different principal (common in CI). Append safe.directory for the exact
-    // canonical cwd to the git config env vars (not safe.directory=*).
-    #[cfg(windows)]
-    if let Ok(canonical) = std::path::Path::new(cwd).canonicalize() {
-        if let Some(canonical_str) = canonical.to_str() {
-            if let Some(count_str) = env.get("GIT_CONFIG_COUNT").map(String::as_str) {
-                if let Ok(count) = count_str.parse::<usize>() {
-                    env.insert(format!("GIT_CONFIG_KEY_{count}"), "safe.directory".into());
-                    env.insert(format!("GIT_CONFIG_VALUE_{count}"), canonical_str.into());
-                    env.insert("GIT_CONFIG_COUNT".into(), (count + 1).to_string());
-                }
-            }
-        }
-    }
+    let env = venv_env_map();
     serde_json::json!({
         "cmd": cmd,
         "cwd": cwd,

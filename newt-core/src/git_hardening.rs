@@ -481,17 +481,6 @@ pub fn hardened_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat");
-    // Windows: git's ownership check rejects directories owned by a different
-    // principal (common in CI temp fixtures). Mark the exact canonical cwd as
-    // safe so git can operate there. Not `safe.directory=*`.
-    #[cfg(windows)]
-    if let Ok(canonical) = cwd.canonicalize() {
-        if let Some(dir) = canonical.to_str() {
-            c.env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "safe.directory")
-                .env("GIT_CONFIG_VALUE_0", dir);
-        }
-    }
     // F26 v1 tried `GIT_CEILING_DIRECTORIES=cwd's parent` here, but this
     // builder is shared by `metadata_git`, which also backs the TUI's
     // HEAD/dirty line, the ACP worker's diff, and crew — a ceiling here
