@@ -3863,6 +3863,31 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: an exact bare re-read is NEVER refused — serve it
+            // silently from the memo when the file's actual current content
+            // still matches; otherwise fall through to a real read below.
+            if let Some(cached) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &cached,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                }
+                smart_harness::push_tool_resolution(
+                    &mut messages,
+                    serde_json::json!({ "role": "tool", "content": cached }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats — steer
             // instead of re-executing a dead or already-useful call. The bogus
             // emission is still counted above; we just don't run it again.
@@ -4034,7 +4059,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 routed_to.get(),
             );
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -4234,17 +4266,50 @@ enum RepeatMemo {
         subject: String,
         advice: &'static str,
     },
-    /// #2555: a successful, argument-bare `read_file` (no explicit `offset`/
-    /// `limit`) — the shape that loops when a weak model re-pages the same
-    /// file. Released by ANY workspace change (the existing `Failure`
-    /// release already covers that) and, additionally, by compaction
-    /// (`RepeatCallGuard::release_read_memos`) — a post-compaction re-read is
-    /// legitimate because the working-set card no longer holds the page. An
-    /// explicit `offset`/`limit` call is never memoized at all (see
-    /// `classify_repeat_memo`), so a deliberate paging scan always runs.
+    /// #2555/#2637: a successful, argument-bare `read_file` (no explicit
+    /// `offset`/`limit`) — the shape that loops when a weak model re-pages
+    /// the same file. Per the harness-design doctrine this NEVER refuses the
+    /// repeat: `RepeatCallGuard::cached_read` re-verifies `content_id`
+    /// against the file's ACTUAL current bytes (never the recorded-tool-call
+    /// bookkeeping) and, on a match, replays `content` silently; on a
+    /// mismatch it drops the memo and a real read runs. Also released by ANY
+    /// workspace change (the existing `Failure` release already covers that)
+    /// and by compaction (`RepeatCallGuard::release_read_memos`) — a
+    /// post-compaction re-read is legitimate because the working-set card no
+    /// longer holds the page. An explicit `offset`/`limit` call is never
+    /// memoized at all (see `classify_repeat_memo`), so a deliberate paging
+    /// scan always runs.
     ReadRange {
         path: String,
+        content_id: content_addressable::RawContentId,
+        content: String,
     },
+}
+
+/// #2637: the confinement context a `ReadRange` freshness check runs
+/// through — bundled so `record`/`classify_repeat_memo`/`cached_read` take
+/// one param instead of two (clippy's `too_many_arguments`), not because
+/// `workspace` and `caveats` are conceptually one thing.
+#[derive(Clone, Copy)]
+struct ReadScope<'a> {
+    workspace: &'a str,
+    caveats: &'a crate::caveats::Caveats,
+}
+
+impl ReadScope<'_> {
+    /// Content identity of `path`'s ACTUAL current bytes, through the same
+    /// confinement/authorization path a real `read_file` uses
+    /// (`tools::authorized_read`) — never a hand-rolled fs read, and never
+    /// trusting that no recorded workspace-changing tool ran since the last
+    /// memo as proof of "unchanged" (an editor or background process can
+    /// change a file without going through any tool this guard observes).
+    /// `None` when the read cannot be authorized right now (no gate offered
+    /// here) — callers treat that as "freshness unprovable", never as a grant.
+    fn content_id_of(&self, path: &str) -> Option<content_addressable::RawContentId> {
+        tools::authorized_read("read_file", path, self.workspace, self.caveats, None)
+            .ok()
+            .map(|contents| content_addressable::RawContentId::from_content(contents.as_bytes()))
+    }
 }
 
 #[derive(Default)]
@@ -4285,13 +4350,12 @@ impl RepeatCallGuard {
                 "You already observed {subject} with `{name}` and received output. Do NOT repeat \
                  the identical call — {advice}"
             ),
-            RepeatMemo::ReadRange { path } => format!(
-                "You already read `{path}` with these exact arguments and nothing in the \
-                 workspace has changed since — the contents are still the ones you have. Do NOT \
-                 repeat the identical `{name}` call — use the earlier result, pass an explicit \
-                 `offset`/`limit` to read a different range, read a different file, or make your \
-                 next edit."
-            ),
+            // #2637: never refuse a bare re-read. `RepeatCallGuard::cached_read`
+            // is called before this at every call site and either serves the
+            // memo silently (content unchanged) or drops it and lets a real
+            // read run (content changed / freshness unprovable) — this arm is
+            // unreachable in practice, kept only so the match stays exhaustive.
+            RepeatMemo::ReadRange { .. } => return None,
         };
         // disclosure-gate-live-path (#5): the steer is a SYNTHETIC model-ingress
         // message re-injected as a `{"role":"tool"}` turn, bypassing the
@@ -4364,6 +4428,7 @@ impl RepeatCallGuard {
         ok: bool,
         result: &str,
         execution: Option<crate::ExecOutcome>,
+        read_scope: ReadScope<'_>,
     ) -> Option<RepeatMemo> {
         if !ok {
             let lower = result.to_ascii_lowercase();
@@ -4399,7 +4464,15 @@ impl RepeatCallGuard {
             });
         }
         if let Some(path) = Self::bare_read_file_path(name, args) {
-            return Some(RepeatMemo::ReadRange { path });
+            // #2637: no content id, no memo — a fresh read still ran and
+            // returned the right content; it just isn't cached, so the next
+            // repeat runs fresh too. Never a refusal either way.
+            let content_id = read_scope.content_id_of(&path)?;
+            return Some(RepeatMemo::ReadRange {
+                path,
+                content_id,
+                content: result.to_string(),
+            });
         }
         None
     }
@@ -4415,6 +4488,36 @@ impl RepeatCallGuard {
         Some(args.get("path")?.as_str()?.to_string())
     }
 
+    /// #2637: silently serve an exact bare `read_file` repeat when it is
+    /// PROVEN unchanged right now, per the harness doctrine (never refuse a
+    /// successful re-read; make the redundant one cheap and silent instead).
+    /// A mismatch or an unprovable freshness check drops the memo and returns
+    /// `None`, so the caller falls through to a real read — which then
+    /// re-memoizes from the real outcome. This never itself denies access.
+    fn cached_read(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        read_scope: ReadScope<'_>,
+    ) -> Option<String> {
+        let path = Self::bare_read_file_path(name, args)?;
+        let key = Self::key(name, args);
+        let Some(RepeatMemo::ReadRange {
+            content_id,
+            content,
+            ..
+        }) = self.repeat_memos.get(&key)
+        else {
+            return None;
+        };
+        if read_scope.content_id_of(&path).as_ref() == Some(content_id) {
+            Some(content.clone())
+        } else {
+            self.repeat_memos.remove(&key);
+            None
+        }
+    }
+
     /// Record a just-executed call's outcome. Failures are also counted for
     /// run diagnostics; success-shaped memos are not hard failures.
     fn record(
@@ -4424,6 +4527,7 @@ impl RepeatCallGuard {
         ok: bool,
         result: &str,
         execution: Option<crate::ExecOutcome>,
+        read_scope: ReadScope<'_>,
     ) {
         if tools::permission_grant_succeeded(name, args, ok, result) {
             self.repeat_memos.retain(|_, memo| {
@@ -4459,7 +4563,9 @@ impl RepeatCallGuard {
         if !ok {
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
         }
-        if let Some(memo) = Self::classify_repeat_memo(name, args, ok, result, execution) {
+        if let Some(memo) =
+            Self::classify_repeat_memo(name, args, ok, result, execution, read_scope)
+        {
             self.repeat_memos.insert(Self::key(name, args), memo);
         }
     }
@@ -8611,6 +8717,35 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: never refuse an exact bare re-read — serve it silently
+            // from the memo when the file's actual current content still
+            // matches; otherwise fall through to a real read below.
+            if let Some(cached) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &cached,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                }
+                smart_harness::push_tool_resolution(
+                    &mut messages,
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": cached,
+                    }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats (mirrors the
             // Ollama path; Responses uses function_call_output). Counted as a
             // hallucination above first when applicable.
@@ -8779,7 +8914,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 routed_to.get(),
             );
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -11055,6 +11197,35 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: never refuse an exact bare re-read — serve it silently
+            // from the memo when the file's actual current content still
+            // matches; otherwise fall through to a real read below.
+            if let Some(cached) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &cached,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                }
+                smart_harness::push_tool_resolution(
+                    &mut messages,
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": cached,
+                    }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats (mirrors
             // the OpenAI path).
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
@@ -11213,7 +11384,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 routed_to.get(),
             );
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -12688,6 +12866,35 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: never refuse an exact bare re-read — serve it silently
+            // from the memo when the file's actual current content still
+            // matches; otherwise fall through to a real read below.
+            if let Some(cached) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &cached,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                }
+                smart_harness::push_tool_resolution(
+                    &mut input,
+                    serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": cached,
+                    }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats (Responses
             // shape: echo a function_call_output with the steer).
             // Counted as a hallucination above first when applicable.
@@ -12866,7 +13073,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings

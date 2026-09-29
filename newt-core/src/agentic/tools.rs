@@ -1610,7 +1610,7 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
 /// or only a #263 permission-gate grant (the human approving this exact
 /// out-of-scope path)? That distinction decides whether the read is
 /// object-bound. `Err` carries the model-facing refusal or read error.
-fn authorized_read(
+pub(super) fn authorized_read(
     tool: &str,
     path: &str,
     workspace: &str,

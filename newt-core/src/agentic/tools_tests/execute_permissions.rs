@@ -1,4 +1,5 @@
 use super::*;
+use crate::agentic::ReadScope;
 use crate::ExecOutcome;
 
 /// Brush rejects this cwd before starting its worker, so the unit harness can
@@ -374,8 +375,22 @@ fn permission_grant_releases_only_cached_authority_failures() {
             false,
             &denied_fs_result("fs_read", "report.txt"),
             None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
         );
-        guard.record("list_dir", &args, false, "error: not a directory", None);
+        guard.record(
+            "list_dir",
+            &args,
+            false,
+            "error: not a directory",
+            None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
+        );
         let command = serde_json::json!({"command": "compiler report.txt"});
         guard.record(
             "run_command",
@@ -386,6 +401,10 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 "x".repeat(240)
             ),
             None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
         );
         let os_error = serde_json::json!({"command": "check permissions"});
         guard.record(
@@ -394,10 +413,34 @@ fn permission_grant_releases_only_cached_authority_failures() {
             false,
             "error: fixture asserted Permission denied",
             None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
         );
-        guard.record("state_get", &args, true, "no such key: report.txt", None);
+        guard.record(
+            "state_get",
+            &args,
+            true,
+            "no such key: report.txt",
+            None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
+        );
         let fetch = serde_json::json!({"url": "https://example.test/report"});
-        guard.record("web_fetch", &fetch, true, "observed report", None);
+        guard.record(
+            "web_fetch",
+            &fetch,
+            true,
+            "observed report",
+            None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
+        );
         assert!(guard.repeat_steer("read_file", &args).is_some());
 
         let mut allow = MockGate::new(true, &Caveats::top());
@@ -443,7 +486,17 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 granted.clone(),
             ),
         ] {
-            guard.record(name, &request, tool_result_ok(&result), &result, None);
+            guard.record(
+                name,
+                &request,
+                tool_result_ok(&result),
+                &result,
+                None,
+                ReadScope {
+                    workspace: "/workspace",
+                    caveats: &Caveats::top(),
+                },
+            );
             assert!(
                 guard.repeat_steer("read_file", &args).is_some(),
                 "{name}: {result}"
@@ -456,6 +509,10 @@ fn permission_grant_releases_only_cached_authority_failures() {
             tool_result_ok(&granted),
             &granted,
             None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
         );
         assert!(
             guard.repeat_steer("read_file", &args).is_none(),
@@ -508,13 +565,27 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 "error: command exited 101\ncompilation failed",
             ] {
                 let mut guard = RepeatCallGuard::default();
-                guard.record(name, &command, tool_result_ok(failed), failed, outcome);
+                guard.record(
+                    name,
+                    &command,
+                    tool_result_ok(failed),
+                    failed,
+                    outcome,
+                    ReadScope {
+                        workspace: "/workspace",
+                        caveats: &Caveats::top(),
+                    },
+                );
                 guard.record(
                     "read_file",
                     &unrelated,
                     false,
                     "error: not a directory",
                     None,
+                    ReadScope {
+                        workspace: "/workspace",
+                        caveats: &Caveats::top(),
+                    },
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
                 let declined =
@@ -525,6 +596,10 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     tool_result_ok(&declined),
                     &declined,
                     None,
+                    ReadScope {
+                        workspace: "/workspace",
+                        caveats: &Caveats::top(),
+                    },
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
 
@@ -542,6 +617,10 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     tool_result_ok(&granted),
                     &granted,
                     None,
+                    ReadScope {
+                        workspace: "/workspace",
+                        caveats: &Caveats::top(),
+                    },
                 );
                 assert_eq!(
                     guard.repeat_steer(name, &command).is_none(),
@@ -554,7 +633,17 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     2,
                     "executed failures remain history"
                 );
-                guard.record(name, &command, tool_result_ok(failed), failed, outcome);
+                guard.record(
+                    name,
+                    &command,
+                    tool_result_ok(failed),
+                    failed,
+                    outcome,
+                    ReadScope {
+                        workspace: "/workspace",
+                        caveats: &Caveats::top(),
+                    },
+                );
                 assert!(
                     guard.repeat_steer(name, &command).is_some(),
                     "a retry that still fails must be memoized again"
@@ -583,7 +672,17 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
     let mut guard = RepeatCallGuard::default();
     let denied = run_tool("list_dir", args.clone(), workspace.path(), &base, None).await;
     assert!(denied.starts_with("capability denied:"), "{denied}");
-    guard.record("list_dir", &args, tool_result_ok(&denied), &denied, None);
+    guard.record(
+        "list_dir",
+        &args,
+        tool_result_ok(&denied),
+        &denied,
+        None,
+        ReadScope {
+            workspace: &workspace.path().to_string_lossy(),
+            caveats: &base,
+        },
+    );
     assert!(guard.repeat_steer("list_dir", &args).is_some());
 
     let mut gate = MockGate::new(true, &base);
@@ -597,6 +696,10 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
         tool_result_ok(&granted),
         &granted,
         None,
+        ReadScope {
+            workspace: &workspace.path().to_string_lossy(),
+            caveats: &base,
+        },
     );
     assert!(
         guard.repeat_steer("list_dir", &args).is_none(),
@@ -613,13 +716,27 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
         .asks
         .iter()
         .all(|(_, target)| target == &format!("fs_read:{}", file.display())));
-    guard.record("list_dir", &args, tool_result_ok(&retried), &retried, None);
+    guard.record(
+        "list_dir",
+        &args,
+        tool_result_ok(&retried),
+        &retried,
+        None,
+        ReadScope {
+            workspace: &workspace.path().to_string_lossy(),
+            caveats: &base,
+        },
+    );
     guard.record(
         "request_permissions",
         &permission,
         tool_result_ok(&granted),
         &granted,
         None,
+        ReadScope {
+            workspace: &workspace.path().to_string_lossy(),
+            caveats: &base,
+        },
     );
     assert!(
         guard.repeat_steer("list_dir", &args).is_some(),
@@ -1418,6 +1535,10 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
         tool_result_ok(&denied),
         &denied,
         execution.get().copied(),
+        ReadScope {
+            workspace: &root.to_string_lossy(),
+            caveats: &baseline,
+        },
     );
     assert!(repeats.repeat_steer("run_command", &command).is_some());
 
@@ -1437,6 +1558,10 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
         tool_result_ok(&grant),
         &grant,
         None,
+        ReadScope {
+            workspace: &root.to_string_lossy(),
+            caveats: &baseline,
+        },
     );
     assert!(
         repeats.repeat_steer("run_command", &command).is_none(),
