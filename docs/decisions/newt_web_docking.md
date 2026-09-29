@@ -304,10 +304,13 @@ dock; `pubkey_words` stays as a display of each key.
   Each confirmation re-checks, after "yes", that the pairing compared is still the one held. On
   the hub the check, the signature and consuming the staged record hold the staging lock the
   pairing steps take (`promote_staged_host`), so a racing step cannot slip between them.
-- *Restart.* Re-docking restarts the host under the same key against a hub that kept running.
-  The host's uplink reserves its envelope sequences durably in its state dir (agent-mesh
-  `bind_outbound_only_reserving`, agent-mesh#100), so its successor starts above them. A hub
-  that restarts while its hosts keep running needs the same treatment; that is a follow-up.
+- *Restart.* Dock keys are stable (K8.4), so either end may restart while its peer keeps
+  running. Every dock bus (the host's uplink, the hub, and the K7 direct-dial responder)
+  reserves its envelope sequences durably in its state dir (`newt_mesh::dock::dock_sequences`,
+  agent-mesh#100), so a successor under the same key starts above them. Closing a hub releases
+  its held uplink polls, so it can rebind its port at once. Off Unix, agent-mesh has no durable
+  store; those buses sequence in memory, and a peer that outlived one drops its successor until
+  the old sequences are passed.
 - *Confirmation on both ends before either side is approved.* The host (`newt-mesh dock`) shows
   the code and writes its approval of the hub only on "yes" at its terminal; the hub keeps the
   exchange with the staged host, and `newt dock approve --staged` recomputes the code, shows it,

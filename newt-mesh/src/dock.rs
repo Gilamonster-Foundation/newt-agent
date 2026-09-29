@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agent_mesh_bus::{Bus, PeerEndpoint, RequestContext, Topic};
+use agent_mesh_bus::{Bus, BusOptions, PeerEndpoint, RequestContext, SequenceReservations, Topic};
 use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
 use newt_core::dock_registry::PairingStep;
 use serde::{Deserialize, Serialize};
@@ -442,7 +442,8 @@ pub struct NewtDockService {
 }
 
 impl NewtDockService {
-    /// Bind on `port` (0 = ephemeral) and serve docks from `state_dir`.
+    /// Bind on `port` (0 = ephemeral) and serve docks from `state_dir`, where
+    /// its envelope sequences are also reserved ([`dock_sequences`]).
     ///
     /// # Errors
     /// Propagates a bus bind failure.
@@ -454,7 +455,7 @@ impl NewtDockService {
     ) -> anyhow::Result<Self> {
         let agent_pubkey = agent.verifying_key().to_bytes();
         let user_fp = user.fingerprint();
-        let bus = Bus::bind(user, agent, port).await?;
+        let bus = bind_dock(user, agent, port, &state_dir).await?;
         let topic = Topic::new(user_fp, DOCK_TOPIC);
         // handle_requests_with_context gives us the VERIFIED caller principal
         // (the envelope signer), so the responder authorizes WHICH agent is
@@ -512,6 +513,38 @@ impl From<PeerEndpoint> for DockPeer {
     }
 }
 
+/// Where a derived dock key reserves its envelope sequences, in `state_dir`:
+/// a dock key is stable across restarts (K8.4), so a peer that outlives this
+/// bus must admit its successor (agent-mesh#100). `None` off Unix, where
+/// agent-mesh has no durable store; such a bus sequences in memory, and a peer
+/// that outlives it drops its successor until it passes the old sequences.
+pub(crate) fn dock_sequences(
+    state_dir: &Path,
+    agent: &AgentKey,
+) -> Option<std::sync::Arc<dyn SequenceReservations>> {
+    let path = state_dir.join(format!("dock-sequence-{}", agent.fingerprint().hex()));
+    cfg!(unix).then(|| {
+        std::sync::Arc::new(agent_mesh_bus::FileSequenceReservations::new(path))
+            as std::sync::Arc<dyn SequenceReservations>
+    })
+}
+
+/// Bind a dock bus on `port` (0 = ephemeral) under a derived dock key, its
+/// sequences reserved in `state_dir` ([`dock_sequences`]).
+async fn bind_dock(
+    user: &UserKey,
+    agent: AgentKey,
+    port: u16,
+    state_dir: &Path,
+) -> anyhow::Result<Bus> {
+    Ok(match dock_sequences(state_dir, &agent) {
+        Some(reserved) => {
+            Bus::bind_with_reserving(user, agent, port, BusOptions::default(), reserved).await?
+        }
+        None => Bus::bind(user, agent, port).await?,
+    })
+}
+
 /// The dock **dialer**: a hub-side bus that requests docks from peers.
 pub struct DockClient {
     bus: Bus,
@@ -522,14 +555,21 @@ pub struct DockClient {
 }
 
 impl DockClient {
-    /// Bind a hub-side dial bus (0 = ephemeral port).
+    /// Bind a hub-side dial bus (0 = ephemeral port), reserving its envelope
+    /// sequences in `state_dir`, so hosts that outlive a hub restart still
+    /// admit it ([`dock_sequences`]).
     ///
     /// # Errors
-    /// Propagates a bus bind failure.
-    pub async fn bind(user: &UserKey, agent: AgentKey, port: u16) -> anyhow::Result<Self> {
+    /// Propagates a bus bind failure, or an unreadable sequence reservation.
+    pub async fn bind(
+        user: &UserKey,
+        agent: AgentKey,
+        port: u16,
+        state_dir: &Path,
+    ) -> anyhow::Result<Self> {
         let user_fp = user.fingerprint();
         let hub_pubkey = agent.public_bytes();
-        let bus = Bus::bind(user, agent, port).await?;
+        let bus = bind_dock(user, agent, port, state_dir).await?;
         let uplinks = std::sync::Arc::default();
         Ok(Self {
             bus,
@@ -672,11 +712,12 @@ impl DockClient {
         }
     }
 
-    /// Close the dial bus.
+    /// Release every held uplink poll, then close the dial bus.
     ///
     /// # Errors
     /// Propagates a bus close failure.
     pub async fn close(self) -> anyhow::Result<()> {
+        self.uplinks.close();
         Ok(self.bus.close().await?)
     }
 }
@@ -1198,7 +1239,9 @@ mod tests {
         let hub_agent = agent(&user, "hub", vec!["hub".into()]);
         let hub_pubkey = hub_agent.verifying_key().to_bytes();
         approve_caller(&user, dir.path(), &hub_pubkey, DockScope::MirrorInject);
-        let client = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        let client = DockClient::bind(&user, hub_agent, 0, dir.path())
+            .await
+            .unwrap();
         let pubkey = svc.agent_pubkey();
         let port = svc.local_port();
 
@@ -1243,6 +1286,60 @@ mod tests {
         client.close().await.unwrap();
     }
 
+    /// A direct-dial responder restarted under its derived key, on the same
+    /// port, is admitted by a hub that kept running: its replies are sequenced
+    /// above its predecessor's (agent-mesh#100). Real loopback QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn a_hub_admits_a_responder_restarted_under_its_key() {
+        let user = UserKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(dir.path(), dir.path(), 100).unwrap();
+        store.create("responder session", None).unwrap();
+        let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
+        approve_caller(
+            &user,
+            dir.path(),
+            &hub_agent.public_bytes(),
+            DockScope::Mirror,
+        );
+        let hub = DockClient::bind(&user, hub_agent, 0, dir.path())
+            .await
+            .unwrap();
+        let bind = |port| {
+            NewtDockService::bind(
+                &user,
+                dock_agent(&user, DockRole::Host, "nuc1"),
+                dir.path().to_path_buf(),
+                port,
+            )
+        };
+
+        let svc = bind(0).await.unwrap();
+        let (pubkey, port) = (svc.agent_pubkey(), svc.local_port());
+        for _ in 0..3 {
+            hub.list_sessions(loopback(pubkey, port)).await.unwrap();
+        }
+        svc.close().await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let svc = loop {
+            match bind(port).await {
+                Ok(svc) => break svc,
+                Err(e) if tokio::time::Instant::now() > deadline => panic!("rebind: {e}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        };
+        let sessions = hub.list_sessions(loopback(pubkey, port)).await.unwrap();
+        assert!(
+            sessions.iter().any(|s| s.title == "responder session"),
+            "{sessions:?}"
+        );
+
+        svc.close().await.unwrap();
+        hub.close().await.unwrap();
+    }
+
     /// THE keystone hostile test (PR #1643 security closure): three agents share
     /// ONE operator UserKey — A the resource-owning responder, B an APPROVED hub,
     /// C an UNAPPROVED sibling. Same operator is authentication, not
@@ -1275,10 +1372,17 @@ mod tests {
         let b_agent = agent(&user, "approved-hub", vec!["hub".into()]);
         let b_pubkey = b_agent.verifying_key().to_bytes();
         approve_caller(&user, dir.path(), &b_pubkey, DockScope::MirrorInject);
-        let b = DockClient::bind(&user, b_agent, 0).await.unwrap();
-        let c = DockClient::bind(&user, agent(&user, "sibling-c", vec!["hub".into()]), 0)
+        let b = DockClient::bind(&user, b_agent, 0, dir.path())
             .await
             .unwrap();
+        let c = DockClient::bind(
+            &user,
+            agent(&user, "sibling-c", vec!["hub".into()]),
+            0,
+            dir.path(),
+        )
+        .await
+        .unwrap();
 
         // B (approved) is served.
         assert!(
@@ -1336,7 +1440,9 @@ mod tests {
 
         let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
         let hub_pubkey = hub_agent.public_bytes();
-        let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        let hub = DockClient::bind(&user, hub_agent, 0, hub_dir.path())
+            .await
+            .unwrap();
         hub.serve_uplinks(hub_dir.path().to_path_buf());
         approve_caller(&user, host_dir.path(), &hub_pubkey, DockScope::Mirror);
 
@@ -1442,7 +1548,9 @@ mod tests {
 
         let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
         let hub_pubkey = hub_agent.public_bytes();
-        let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        let hub = DockClient::bind(&user, hub_agent, 0, hub_dir.path())
+            .await
+            .unwrap();
         hub.serve_uplinks(hub_dir.path().to_path_buf());
         let host_agent = dock_agent(&user, DockRole::Host, "nuc2");
         let (host_fp, host_pubkey) = (host_agent.fingerprint(), host_agent.public_bytes());
@@ -1609,6 +1717,82 @@ mod tests {
         hub.close().await.unwrap();
     }
 
+    /// A hub restarted under its derived key, on the same port, is served by a
+    /// host whose uplink outlived it: the new hub's replies are sequenced above
+    /// the old one's, so the host admits them (agent-mesh#100). Real loopback
+    /// QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn a_host_that_outlives_its_hub_is_served_by_the_restarted_hub() {
+        let user = UserKey::generate();
+        let (hub_dir, host_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store =
+            newt_core::ConversationStore::new(host_dir.path(), host_dir.path(), 100).unwrap();
+        store.create("long-lived session", None).unwrap();
+        // Rebinding the closed hub's port waits, within a bound, for the old
+        // endpoint to release it.
+        async fn start_hub(user: &UserKey, dir: &Path, port: u16) -> DockClient {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let key = dock_agent(user, DockRole::Hub, "home-hub");
+                match DockClient::bind(user, key, port, dir).await {
+                    Ok(hub) => {
+                        hub.serve_uplinks(dir.to_path_buf());
+                        return hub;
+                    }
+                    Err(e) if tokio::time::Instant::now() > deadline => panic!("rebind: {e}"),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        }
+        async fn served(hub: &DockClient, host: Fingerprint) -> bool {
+            let uplinks = hub.uplinks();
+            tokio::time::timeout(Duration::from_secs(45), uplinks.wait_for_uplink(host))
+                .await
+                .is_ok()
+        }
+        let hub_pubkey = dock_agent(&user, DockRole::Hub, "home-hub").public_bytes();
+        let host_agent = dock_agent(&user, DockRole::Host, "laptop");
+        let host_fp = host_agent.fingerprint();
+        approve_caller(
+            &user,
+            hub_dir.path(),
+            &host_agent.public_bytes(),
+            DockScope::Mirror,
+        );
+        approve_caller(&user, host_dir.path(), &hub_pubkey, DockScope::Mirror);
+
+        let hub = start_hub(&user, hub_dir.path(), 0).await;
+        let port = hub.local_port();
+        let host = crate::DockUplink::start(
+            &user,
+            "laptop",
+            host_dir.path().to_path_buf(),
+            loopback(hub_pubkey, port),
+        )
+        .await
+        .unwrap();
+        assert!(served(&hub, host_fp).await, "the host uplinks");
+        for _ in 0..3 {
+            hub.list_sessions(DockPeer::Uplink(host_fp)).await.unwrap();
+        }
+        hub.close().await.unwrap();
+
+        let hub = start_hub(&user, hub_dir.path(), port).await;
+        assert!(
+            served(&hub, host_fp).await,
+            "the host uplinks to the restarted hub"
+        );
+        let sessions = hub.list_sessions(DockPeer::Uplink(host_fp)).await.unwrap();
+        assert!(
+            sessions.iter().any(|s| s.title == "long-lived session"),
+            "{sessions:?}"
+        );
+
+        host.close().await;
+        hub.close().await.unwrap();
+    }
+
     /// K8-c acceptance: a docked host serves list, transcript and inject to its
     /// hub over an uplink it dialed, while accepting no inbound connection. The
     /// host authorizes the hub against its own registry on every request
@@ -1629,7 +1813,9 @@ mod tests {
 
         let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
         let hub_pubkey = hub_agent.public_bytes();
-        let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        let hub = DockClient::bind(&user, hub_agent, 0, dir.path())
+            .await
+            .unwrap();
         hub.serve_uplinks(dir.path().to_path_buf());
         let host_agent = dock_agent(&user, DockRole::Host, "laptop");
         let (host_fp, host_pubkey) = (host_agent.fingerprint(), host_agent.public_bytes());
