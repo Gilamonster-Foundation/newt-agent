@@ -205,6 +205,14 @@ struct GauntletResponder {
     summary_in_marker_request: Arc<AtomicBool>,
     old_placeholder_seen: Arc<AtomicBool>,
     static_marker_instead: bool,
+    /// #2555: `read_file` normally repeats with NO explicit range, which the
+    /// new repeat-read steer now short-circuits after the first sight —
+    /// shrinking the pre-compaction growth this fixture's tight margins were
+    /// tuned against. `true` has the mock pass an explicit (inert) `offset`,
+    /// which the guard never memoizes, restoring full-content growth on
+    /// every repeat for a test whose property is about the MARGIN, not about
+    /// the repeat-read guard itself.
+    explicit_offset: bool,
 }
 
 impl Respond for GauntletResponder {
@@ -238,9 +246,14 @@ impl Respond for GauntletResponder {
             }));
         }
         if body.get("tools").is_some() {
+            let arguments = if self.explicit_offset {
+                serde_json::json!({ "path": "big.txt", "offset": 0 })
+            } else {
+                serde_json::json!({ "path": "big.txt" })
+            };
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": { "content": "", "tool_calls": [{
-                    "function": { "name": "read_file", "arguments": { "path": "big.txt" } }
+                    "function": { "name": "read_file", "arguments": arguments }
                 }]}
             }))
         } else {
@@ -271,6 +284,7 @@ async fn active_task_survives_compression() {
             summary_in_marker_request: summary_in_marker.clone(),
             old_placeholder_seen: old_placeholder.clone(),
             static_marker_instead: false,
+            explicit_offset: false,
         })
         .mount(&server)
         .await;
@@ -381,6 +395,7 @@ async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
             summary_in_marker_request: summary_in_marker.clone(),
             old_placeholder_seen: old_placeholder.clone(),
             static_marker_instead: false,
+            explicit_offset: false,
         })
         .mount(&server)
         .await;
@@ -502,6 +517,7 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
             summary_in_marker_request: static_in_marker.clone(),
             old_placeholder_seen: old_placeholder.clone(),
             static_marker_instead: true,
+            explicit_offset: false,
         })
         .mount(&server)
         .await;
@@ -621,6 +637,7 @@ async fn optional_continuation_cannot_abort_a_fitting_static_fallback() {
             summary_in_marker_request: static_in_marker.clone(),
             old_placeholder_seen: Arc::new(AtomicBool::new(false)),
             static_marker_instead: true,
+            explicit_offset: true,
         })
         .mount(&server)
         .await;
@@ -771,9 +788,12 @@ async fn openai_loop_compresses_with_the_same_pipeline() {
 // let the self-poisoning boundary bug through.
 // -----------------------------------------------------------------------
 
-/// Per-request long-haul observations: `(dispatched message count,
-/// length of the last tool-role message — the freshest result)`.
-type HaulLog = Arc<Mutex<Vec<(usize, Option<usize>)>>>;
+/// Per-request long-haul observations: `(dispatched message count, the
+/// last tool-role message's content — the freshest result)`. #2555: the
+/// FULL content (not just its length) is kept so assertions can tell a
+/// steered repeat-read (short, names the tool) apart from a corrupted or
+/// truncated fresh result, which a bare length could not.
+type HaulLog = Arc<Mutex<Vec<(usize, Option<String>)>>>;
 
 /// Endless-work responder: each round calls a (hallucinated) write-ish
 /// tool and then `read_file` of `path` while tools are offered (the loop
@@ -795,13 +815,16 @@ impl Respond for LongHaulResponder {
         if body.get("tools").is_some() {
             let empty = Vec::new();
             let msgs = body["messages"].as_array().unwrap_or(&empty);
-            let last_tool_len = msgs
+            let last_tool_content = msgs
                 .iter()
                 .rev()
                 .find(|m| m["role"].as_str() == Some("tool"))
                 .and_then(|m| m["content"].as_str())
-                .map(|c| c.chars().count());
-            self.log.lock().unwrap().push((msgs.len(), last_tool_len));
+                .map(str::to_string);
+            self.log
+                .lock()
+                .unwrap()
+                .push((msgs.len(), last_tool_content));
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": { "content": "", "tool_calls": [
                     { "function": { "name": "apply_patch", "arguments": {} } },
@@ -812,6 +835,26 @@ impl Respond for LongHaulResponder {
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({ "message": { "content": "long haul done" } }))
         }
+    }
+}
+
+/// #2555: classify a long-haul round's freshest tool-role message as either
+/// the FULL fixture content (`Fresh`) or the repeat-read steer text
+/// (`Steered`) — anything else is a shape neither the guard nor a genuine
+/// read should ever produce (truncation, corruption, an empty string).
+#[derive(Debug, PartialEq, Eq)]
+enum HaulRound {
+    Fresh,
+    Steered,
+}
+
+fn classify_haul_round(content: &str) -> HaulRound {
+    if content.contains("You already read") && content.contains("read_file") {
+        HaulRound::Steered
+    } else if content.len() > 1_000 {
+        HaulRound::Fresh
+    } else {
+        panic!("tool result is neither a fresh read nor a recognized repeat-steer: {content:?}");
     }
 }
 
@@ -869,7 +912,7 @@ async fn run_long_haul(
     threshold: usize,
     file: &'static str,
     content: &str,
-) -> (Vec<(usize, Option<usize>)>, usize, String, bool) {
+) -> (Vec<(usize, Option<String>)>, usize, String, bool) {
     // Repeated identical reads are intentional compression pressure here.
     // Exercise the configured round cap, independently of the stagnation
     // policy (covered by the progress and no-progress loop fixtures).
@@ -929,21 +972,43 @@ async fn forty_rounds_single_turn_stay_bounded_with_fresh_results_intact() {
     assert_eq!(reply, "long haul done");
     assert!(!latched, "count-only pressure must never latch anti-thrash");
     assert_eq!(log.len(), 40, "all 40 tool rounds dispatched");
+    // #2555: `read_file{"path":"big.txt"}` repeats byte-for-byte every
+    // round, which is now steered UNLESS a compaction just released the
+    // memo. So a round's freshest tool result is legitimately either shape
+    // — `classify_haul_round` panics on anything else (corruption/
+    // truncation), which is what this loop used to guard against directly.
+    let mut fresh_rounds = 0;
+    let mut steered_rounds = 0;
     for (round, (len, last_tool)) in log.iter().enumerate() {
         assert!(
             *len <= threshold + 6,
             "round {round}: dispatched {len} messages — the count must stay \
                  bounded after every compression (threshold {threshold} + slack)"
         );
-        if let Some(n) = last_tool {
-            assert!(
-                *n > 1_000,
-                "round {round}: the fresh tool result was destroyed before \
-                     dispatch ({n} chars — a one-liner)"
-            );
+        if let Some(content) = last_tool {
+            match classify_haul_round(content) {
+                HaulRound::Fresh => fresh_rounds += 1,
+                HaulRound::Steered => steered_rounds += 1,
+            }
         }
     }
     assert!(summarizer_calls >= 2, "the long haul compresses repeatedly");
+    // The guard must actually engage (repeated pre-compaction reads are
+    // steered)...
+    assert!(
+        steered_rounds > 0,
+        "40 identical reads under a count-only trigger must steer at least \
+             one repeat, or the repeat-read guard silently regressed"
+    );
+    // ...AND every compaction this run performed (summarizer_calls) must
+    // have released the memo for at least one following fresh re-read —
+    // the #2555 property under test: a post-compaction re-read is allowed.
+    assert!(
+        fresh_rounds >= summarizer_calls,
+        "expected at least one fresh re-read per compaction event \
+             ({summarizer_calls} compactions, {fresh_rounds} fresh rounds) — \
+             the post-compaction re-read must be allowed, not steered"
+    );
     assert!(
         summarizer_calls <= 16,
         "summarizer invocations must be bounded, not per-round \
@@ -977,19 +1042,35 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
     assert_eq!(reply, "long haul done");
     assert!(!latched, "count-only pressure must never latch anti-thrash");
     assert_eq!(log.len(), 30, "all 30 tool rounds dispatched");
+    // #2555: see the sibling forty-round test — an identical `read_file` is
+    // now steered unless a compaction just released the memo, so a round's
+    // freshest result is legitimately either shape.
+    let mut fresh_rounds = 0;
+    let mut steered_rounds = 0;
     for (round, (len, last_tool)) in log.iter().enumerate() {
         assert!(
             *len <= threshold + 6,
             "round {round}: dispatched {len} messages — bounded"
         );
-        if let Some(n) = last_tool {
-            assert!(
-                *n > 1_000,
-                "round {round}: fresh tool result destroyed pre-dispatch ({n} chars)"
-            );
+        if let Some(content) = last_tool {
+            match classify_haul_round(content) {
+                HaulRound::Fresh => fresh_rounds += 1,
+                HaulRound::Steered => steered_rounds += 1,
+            }
         }
     }
     assert!(summarizer_calls >= 2);
+    assert!(
+        steered_rounds > 0,
+        "30 identical reads under a count-only trigger must steer at least \
+             one repeat, or the repeat-read guard silently regressed"
+    );
+    assert!(
+        fresh_rounds >= summarizer_calls,
+        "expected at least one fresh re-read per compaction event \
+             ({summarizer_calls} compactions, {fresh_rounds} fresh rounds) — \
+             the post-compaction re-read must be allowed, not steered"
+    );
     assert!(
         summarizer_calls <= 14,
         "summarizer invocations must be bounded, not per-round \

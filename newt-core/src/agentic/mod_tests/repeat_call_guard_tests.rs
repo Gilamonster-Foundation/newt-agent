@@ -210,7 +210,9 @@ async fn successful_script_edit_releases_the_exact_failed_command() {
 #[test]
 fn ignores_successes_and_distinct_calls() {
     let mut g = RepeatCallGuard::default();
-    let a = serde_json::json!({"path": "f.rs"});
+    // #2555: an explicit offset/limit read is never memoized — this must stay
+    // repeatable regardless of the new bare-read `ReadRange` steer below.
+    let a = serde_json::json!({"path": "f.rs", "offset": 0});
     g.record("read_file", &a, true, "file contents", None); // success → not remembered
     assert!(g.repeat_steer("read_file", &a).is_none());
     // A failure under different args does not short-circuit a distinct call.
@@ -282,8 +284,9 @@ fn steers_no_result_repeats_on_second_issuance() {
         .expect("2nd identical empty plan_get steers");
     assert!(plan_steer.contains("update_plan"), "{plan_steer}");
 
-    // A genuine success with content is still NEVER steered on repeat.
-    let f = serde_json::json!({"path": "f.rs"});
+    // #2555: an EXPLICIT-range read is still NEVER steered on repeat (a
+    // bare read_file — no offset/limit — is covered by its own test below).
+    let f = serde_json::json!({"path": "f.rs", "offset": 0});
     g.record("read_file", &f, true, "file contents", None);
     assert!(g.repeat_steer("read_file", &f).is_none());
 
@@ -325,11 +328,12 @@ fn steers_duplicate_successful_web_fetch() {
         "distinct URLs still run"
     );
 
-    let file = serde_json::json!({"path": "src/lib.rs"});
+    // #2555: an EXPLICIT-range read is still never steered.
+    let file = serde_json::json!({"path": "src/lib.rs", "limit": 200});
     g.record("read_file", &file, true, "file contents", None);
     assert!(
         g.repeat_steer("read_file", &file).is_none(),
-        "ordinary successful reads are still not steered"
+        "explicit-range reads are still not steered"
     );
 }
 
@@ -377,7 +381,9 @@ fn does_not_steer_successful_write_capable_run_command() {
 
 #[test]
 fn classifier_leaves_ordinary_successes_repeatable() {
-    let file = serde_json::json!({"path": "src/lib.rs"});
+    // #2555: an EXPLICIT-range read is a deliberate paging scan and is never
+    // memoized — a bare read (no offset/limit) IS, covered by its own test.
+    let file = serde_json::json!({"path": "src/lib.rs", "offset": 0});
     assert_eq!(
         RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
         None
@@ -395,6 +401,80 @@ fn classifier_leaves_ordinary_successes_repeatable() {
     assert!(
         g.repeat_memos.is_empty(),
         "ordinary successful calls must stay repeatable"
+    );
+}
+
+/// #2555: a bare `read_file` (no explicit `offset`/`limit`) IS memoized and
+/// steered on an exact repeat.
+#[test]
+fn bare_read_file_repeat_is_steered() {
+    let file = serde_json::json!({"path": "src/lib.rs"});
+    assert!(matches!(
+        RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
+        Some(RepeatMemo::ReadRange { .. })
+    ));
+
+    let mut g = RepeatCallGuard::default();
+    assert!(
+        g.repeat_steer("read_file", &file).is_none(),
+        "first read runs"
+    );
+    g.record("read_file", &file, true, "file contents", None);
+    let steer = g
+        .repeat_steer("read_file", &file)
+        .expect("2nd identical bare read_file steers");
+    assert!(steer.contains("already read"), "{steer}");
+    assert!(steer.contains("src/lib.rs"), "{steer}");
+    assert!(steer.contains("offset"), "{steer}");
+}
+
+/// #2555: ANY workspace change releases the memo (not only an edit of the
+/// SAME file) — the model's next read is asking about the tree it just
+/// changed, so "nothing has changed since" no longer holds.
+#[test]
+fn bare_read_file_memo_is_released_by_any_workspace_change() {
+    let file = serde_json::json!({"path": "a.rs"});
+    let mut g = RepeatCallGuard::default();
+    g.record("read_file", &file, true, "file contents", None);
+    assert!(g.repeat_steer("read_file", &file).is_some());
+    g.record(
+        "write_file",
+        &serde_json::json!({"path": "b.rs", "content": "x"}),
+        true,
+        "wrote b.rs",
+        None,
+    );
+    assert!(
+        g.repeat_steer("read_file", &file).is_none(),
+        "a workspace write to a DIFFERENT file still releases the memo"
+    );
+}
+
+/// #2555: the compaction release hook — `release_read_memos` drops every
+/// `ReadRange` memo (what `record_compaction_artifact` and the Responses
+/// loop's `Compacted` outcome call once a compaction actually commits) but
+/// leaves failure/no-result/evidence memos untouched, since those describe
+/// an outcome compaction does not invalidate.
+#[test]
+fn release_read_memos_drops_only_read_range_memos() {
+    let mut g = RepeatCallGuard::default();
+    let file = serde_json::json!({"path": "a.rs"});
+    g.record("read_file", &file, true, "file contents", None);
+    let failing = serde_json::json!({"command": "cargo check"});
+    g.record("run_command", &failing, false, "error: boom", None);
+    assert!(g.repeat_steer("read_file", &file).is_some());
+    assert!(g.repeat_steer("run_command", &failing).is_some());
+
+    g.release_read_memos();
+
+    assert!(
+        g.repeat_steer("read_file", &file).is_none(),
+        "compaction releases the read-range memo — a post-compaction re-read \
+         is legitimate because the working-set card no longer holds the page"
+    );
+    assert!(
+        g.repeat_steer("run_command", &failing).is_some(),
+        "compaction must not release an unrelated failure memo"
     );
 }
 

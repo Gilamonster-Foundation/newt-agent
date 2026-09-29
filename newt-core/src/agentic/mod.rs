@@ -2601,6 +2601,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     // Persist provenance only after the transformed working
                     // set and its continuation have been installed.
                     record_compaction_artifact(
+                        &mut repeat_calls,
                         artifact_sink,
                         artifact_context,
                         outcome.action,
@@ -2948,6 +2949,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     },
                                 );
                                 record_compaction_artifact(
+                                    &mut repeat_calls,
                                     artifact_sink,
                                     artifact_context,
                                     outcome.action,
@@ -3634,6 +3636,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             },
                         );
                         record_compaction_artifact(
+                            &mut repeat_calls,
                             artifact_sink,
                             artifact_context,
                             outcome.action,
@@ -3677,6 +3680,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             messages = fallback.messages;
                             prompt_tracker.invalidate();
                             record_compaction_artifact(
+                                &mut repeat_calls,
                                 artifact_sink,
                                 artifact_context,
                                 CompressAction::Pruned,
@@ -4230,6 +4234,17 @@ enum RepeatMemo {
         subject: String,
         advice: &'static str,
     },
+    /// #2555: a successful, argument-bare `read_file` (no explicit `offset`/
+    /// `limit`) — the shape that loops when a weak model re-pages the same
+    /// file. Released by ANY workspace change (the existing `Failure`
+    /// release already covers that) and, additionally, by compaction
+    /// (`RepeatCallGuard::release_read_memos`) — a post-compaction re-read is
+    /// legitimate because the working-set card no longer holds the page. An
+    /// explicit `offset`/`limit` call is never memoized at all (see
+    /// `classify_repeat_memo`), so a deliberate paging scan always runs.
+    ReadRange {
+        path: String,
+    },
 }
 
 #[derive(Default)]
@@ -4269,6 +4284,13 @@ impl RepeatCallGuard {
             RepeatMemo::EvidenceObserved { subject, advice } => format!(
                 "You already observed {subject} with `{name}` and received output. Do NOT repeat \
                  the identical call — {advice}"
+            ),
+            RepeatMemo::ReadRange { path } => format!(
+                "You already read `{path}` with these exact arguments and nothing in the \
+                 workspace has changed since — the contents are still the ones you have. Do NOT \
+                 repeat the identical `{name}` call — use the earlier result, pass an explicit \
+                 `offset`/`limit` to read a different range, read a different file, or make your \
+                 next edit."
             ),
         };
         // disclosure-gate-live-path (#5): the steer is a SYNTHETIC model-ingress
@@ -4376,7 +4398,21 @@ impl RepeatCallGuard {
                          file, or make the next edit/test decision.",
             });
         }
+        if let Some(path) = Self::bare_read_file_path(name, args) {
+            return Some(RepeatMemo::ReadRange { path });
+        }
         None
+    }
+
+    /// #2555: the path of a `read_file` call with NO explicit `offset`/`limit`
+    /// — the shape a weak model repeats byte-for-byte when it re-pages a file
+    /// it already has. A call that names an explicit range is a deliberate
+    /// scan and is never memoized (it always runs, whatever the outcome).
+    fn bare_read_file_path(name: &str, args: &serde_json::Value) -> Option<String> {
+        if name != "read_file" || args.get("offset").is_some() || args.get("limit").is_some() {
+            return None;
+        }
+        Some(args.get("path")?.as_str()?.to_string())
     }
 
     /// Record a just-executed call's outcome. Failures are also counted for
@@ -4402,10 +4438,18 @@ impl RepeatCallGuard {
         }
         // #2374/F37: a failure memo describes the tree it ran against. After a
         // real workspace change the identical call is the re-check the repair
-        // loop needs, so the memo is released in every mode.
+        // loop needs, so the memo is released in every mode. #2555: a
+        // `ReadRange` memo is released the same way — ANY workspace change
+        // (not just an edit of the memoized file) invalidates "nothing has
+        // changed since", because the model's next read is asking about the
+        // tree it just modified.
         if ok && may_change_workspace(name, args) {
-            self.repeat_memos
-                .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
+            self.repeat_memos.retain(|_, memo| {
+                !matches!(
+                    memo,
+                    RepeatMemo::Failure { .. } | RepeatMemo::ReadRange { .. }
+                )
+            });
         }
         if name == "update_plan" && ok {
             self.repeat_memos.retain(|key, _| {
@@ -4424,6 +4468,17 @@ impl RepeatCallGuard {
     /// a cap exit was thrash, not lack of rounds (Step 27.5).
     fn total_failures(&self) -> usize {
         self.fails_by_tool.values().sum()
+    }
+
+    /// #2555: release every `ReadRange` memo. Called at the ONE checkpoint
+    /// each backend loop's compaction reaches once it actually fires
+    /// (`record_compaction_artifact` for the three legacy chat loops;
+    /// `compact_responses_input`'s `Compacted` outcome for the Responses
+    /// loop) — never on a rejected/no-op compaction attempt, which changed
+    /// nothing the model could have already seen.
+    fn release_read_memos(&mut self) {
+        self.repeat_memos
+            .retain(|_, memo| !matches!(memo, RepeatMemo::ReadRange { .. }));
     }
 }
 
@@ -5152,6 +5207,13 @@ fn maybe_offload_tool_result(
 
 #[allow(clippy::too_many_arguments)]
 fn record_compaction_artifact(
+    // #2555: this is the ONE checkpoint every compaction that actually fired
+    // reaches, across all three legacy chat loops (the Responses loop's
+    // equivalent single entry point is `compact_responses_input`) — so it is
+    // also where the repeat-read steer memo is released. A post-compaction
+    // re-read is legitimate (the working-set card no longer holds the page),
+    // so the memo must not outlive the compaction that invalidated it.
+    repeat_calls: &mut RepeatCallGuard,
     artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
     artifact_context: Option<artifact_read::ArtifactReadContext<'_>>,
     action: CompressAction,
@@ -5170,6 +5232,7 @@ fn record_compaction_artifact(
     floor_trend: FloorTrend,
     color: bool,
 ) {
+    repeat_calls.release_read_memos();
     let (Some(sink), Some(context)) = (artifact_sink, artifact_context) else {
         return;
     };
@@ -7207,6 +7270,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         },
                     );
                     record_compaction_artifact(
+                        &mut repeat_calls,
                         artifact_sink,
                         artifact_context,
                         outcome.action,
@@ -7612,6 +7676,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     },
                                 );
                                 record_compaction_artifact(
+                                    &mut repeat_calls,
                                     artifact_sink,
                                     artifact_context,
                                     outcome.action,
@@ -9856,6 +9921,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         },
                     );
                     record_compaction_artifact(
+                        &mut repeat_calls,
                         artifact_sink,
                         artifact_context,
                         outcome.action,
@@ -10140,6 +10206,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     },
                                 );
                                 record_compaction_artifact(
+                                    &mut repeat_calls,
                                     artifact_sink,
                                     artifact_context,
                                     outcome.action,
@@ -12047,6 +12114,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             hallucination_count,
                         ));
                     };
+                    // #2555: this loop's ONE compaction entry point
+                    // (`compact_responses_input`) reports a committed
+                    // compaction as `Compacted` — release repeat-read memos
+                    // there, mirroring `record_compaction_artifact`'s hook
+                    // in the three legacy chat loops.
+                    if matches!(outcome, ResponsesCompaction::Compacted) {
+                        repeat_calls.release_read_memos();
+                    }
                     proactive_rejection = outcome.rejection();
                 }
             }
@@ -12209,6 +12284,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                     hallucination_count,
                                 ));
                             };
+                            // #2555: same release as the proactive branch above.
+                            if matches!(outcome, ResponsesCompaction::Compacted) {
+                                repeat_calls.release_read_memos();
+                            }
                             match outcome {
                                 ResponsesCompaction::Compacted | ResponsesCompaction::NotFired => {}
                                 // ZERO second inference: surface the original 400 with the
@@ -12942,6 +13021,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     hallucination_count,
                 ));
             };
+            // #2555: same release as the proactive branch above.
+            if matches!(outcome, ResponsesCompaction::Compacted) {
+                repeat_calls.release_read_memos();
+            }
             summary_rejection = outcome.rejection();
         }
     }
