@@ -23,6 +23,9 @@
 //! so it rides [`Gate::Always`](super::tools) and is advertised in eval /
 //! headless / ACP sessions too (where it prints the raw source).
 //!
+//! **Trust.** Reports are model-authored display. Rendering does not verify
+//! individual claims; any ledger annotation is limited to observed tool facts.
+//!
 //! [`render_markdown`]: super::render_markdown
 
 use super::display::term_cols;
@@ -98,15 +101,21 @@ const RENDER_REPORT_DESCRIPTION: &str =
      missing. Prefer ONE report with `sections` over many small calls. The tool \
      result you receive back is a short ack, not the rendered text — the \
      document has already been shown to the user, so do not repeat it in your \
-     reply. Reporting findings does not complete an unfinished execution request: \
+     reply. If your reading changes after rendering, explicitly state \
+     \"Correction: [one-line reason] — supersedes the report above\" before the \
+     corrected version. Reporting findings does not complete an unfinished execution request: \
      continue the requested work with tools. When the task is complete, keep the \
      final reply brief and include only new information.";
 
 const REPORT_DELIVERY_GUIDANCE: &str =
-    "The report is already visible to the user. Do not repeat its contents. \
-     Continue any unfinished requested work with tools; rendering a report is \
-     not completion of that work. When the task is complete, keep the final \
-     reply brief and include only new information.";
+    "The report is already visible to the user. Do not repeat its contents in \
+     your reply. If the report was wrong or you have changed your reading of \
+     the request, say so explicitly — start your reply with a statement such \
+     as \"Correction: [one-line reason] — supersedes the report above\" — and \
+     then give the corrected version. A silent second copy of the table is not \
+     a correction. Continue any unfinished requested work with tools; rendering \
+     a report is not completion of that work. When the task is complete, keep \
+     the final reply brief and include only new information.";
 
 /// The `render_report` tool definition. Registered `Gate::Always` (no injected
 /// capability required — see the module docs), so it is advertised every
@@ -298,9 +307,9 @@ pub(crate) fn execute_render_report(
 ) -> (String, Option<String>) {
     match compose_document(args) {
         Ok((markdown, ack)) => {
-            // #1947: capability claims are checked against the turn's tool
-            // ledger the way `claim_check` checks path claims against the
-            // workspace — append a visible refutation, never rewrite. Applied
+            // #1947: append only facts established by the turn's tool ledger.
+            // Arbitrary Markdown labels are not tool identities, and rendering
+            // does not independently verify report claims. Applied
             // to the MARKDOWN so the annotation renders in the operator's
             // document; `ack` (what the model sees) is left alone, because
             // this slice annotates the report rather than steering the model
@@ -369,28 +378,47 @@ mod tests {
                 .collect()
         }
 
-        /// The refutation reaches the document the OPERATOR sees.
         #[test]
-        fn an_unsupported_claim_is_annotated_in_the_rendered_document() {
-            let evidence = Evidence::from_events(&events(&[("list_audio_devices", true)]));
-            let doc = render(Some(&evidence));
-            assert!(doc.contains("capability check (#1947)"), "{doc}");
+        fn ordinary_verification_table_renders_without_invented_tool_names() {
+            let args = json!({
+                "title": "Refactor verification",
+                "sections": [{
+                    "heading": "Verification gates",
+                    "body": "| Gate | Result |\n|---|---|\n| cargo build --workspace | ✅ green |\n| Guard tests (16) | ✅ passed |"
+                }]
+            });
+            let mut evidence = Evidence::default();
+            evidence.record("run_command", true, Some(crate::ExecOutcome::Passed));
+            let (ack, doc) = execute_render_report(&args, false, Some(&evidence), None);
+            let (_, plain) = execute_render_report(&args, false, None, None);
+            assert_eq!(doc, plain, "human gate labels are ordinary report content");
+            assert!(ack.contains("report rendered"), "{ack}");
             assert!(
-                doc.contains("converse"),
-                "the refuted subject is named: {doc}"
+                !ack.contains("verified"),
+                "rendering is not verification: {ack}"
             );
         }
 
-        /// **Anti-vacuous twin.** The same call with corroborating evidence
-        /// renders no annotation — so the assertion above is about the
-        /// evidence, not about the wiring firing unconditionally.
+        /// The absence of any tool evidence reaches the operator's document.
         #[test]
-        fn a_corroborated_claim_renders_no_annotation() {
+        fn a_claim_without_tool_evidence_is_annotated_in_the_rendered_document() {
+            let evidence = Evidence::default();
+            let doc = render(Some(&evidence));
+            assert!(doc.contains("capability check (#1947)"), "{doc}");
+            assert!(
+                doc.contains("no tool ran in this turn"),
+                "only the actual ledger fact is asserted: {doc}"
+            );
+        }
+
+        /// Successful calls leave the model-authored report unmodified.
+        #[test]
+        fn successful_tool_history_renders_no_refutation() {
             let evidence = Evidence::from_events(&events(&[("voice__converse", true)]));
             let doc = render(Some(&evidence));
             assert!(
                 !doc.contains("capability check"),
-                "a corroborated report must render clean: {doc}"
+                "the ledger establishes no contradictory fact: {doc}"
             );
         }
 
@@ -577,6 +605,38 @@ mod tests {
             !latest.markdown.contains("Refactor plan v1"),
             "the draft slot holds ONE revision, not a history: {}",
             latest.markdown
+        );
+    }
+
+    /// #2625 regression: the post-render nudge must give the model an explicit
+    /// correction format ("Correction: … supersedes the report above") instead of
+    /// an unconditional "do not repeat". Fails on main if the nudge text lacks it.
+    #[test]
+    fn report_delivery_nudge_permits_explicit_correction() {
+        assert!(
+            REPORT_DELIVERY_GUIDANCE.contains("supersedes the report above"),
+            "nudge must provide the correction form the model can use: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        assert!(
+            REPORT_DELIVERY_GUIDANCE.contains("Correction:"),
+            "nudge must name the prefix the model should start with: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        // The original advisory must still be present so the model's first instinct
+        // (no repeat) is unchanged when the report was right.
+        assert!(
+            REPORT_DELIVERY_GUIDANCE.contains("Do not repeat"),
+            "nudge must still discourage silent repetition: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        // The tool description and the delivery nudge must prescribe ONE
+        // correction path, or a model following either can still produce a
+        // second, unlabelled table.
+        assert!(
+            RENDER_REPORT_DESCRIPTION.contains("supersedes the report above"),
+            "tool description must prescribe the same correction statement: {RENDER_REPORT_DESCRIPTION}"
+        );
+        assert!(
+            !RENDER_REPORT_DESCRIPTION.contains("render_report again"),
+            "tool description must not offer a second, unlabelled correction path: {RENDER_REPORT_DESCRIPTION}"
         );
     }
 }

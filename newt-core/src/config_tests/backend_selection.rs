@@ -490,7 +490,7 @@ fn a_provider_only_config_selects_the_provider_on_normal_and_profile_paths() {
         )
         .unwrap();
     // Normal path: no synthesized backend, the provider is selected.
-    let resolved = Config::resolve_runtime_unpublished().unwrap();
+    let resolved = Config::resolve_runtime_unpublished(&mut |_| {}).unwrap();
     assert!(
         resolved.backends.is_empty(),
         "no synthetic localhost backend beside a provider"
@@ -520,7 +520,7 @@ fn a_provider_only_config_selects_the_provider_on_normal_and_profile_paths() {
     ));
     // Fully bare (no providers either): the localhost fallback remains.
     std::fs::write(dir.path().join("config.toml"), "# empty\n").unwrap();
-    let resolved = Config::resolve_runtime_unpublished().unwrap();
+    let resolved = Config::resolve_runtime_unpublished(&mut |_| {}).unwrap();
     assert_eq!(resolved.backends.len(), 1);
     assert_eq!(resolved.backends[0].name, "ollama");
     assert!(resolved.is_unconfigured());

@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// Fixed, content-free marker appended inside the protected active-prompt
@@ -30,7 +31,6 @@ const MAX_CLARIFICATION_BYTES: usize = 384;
 /// Adjudication is one bounded side call, never a second agent turn. A batch
 /// larger than this is refused outright and every candidate stays `Pending`.
 pub const MAX_ADJUDICATION_BATCH: usize = 15;
-const RESEARCH_TOOL_ROUND_LIMIT: usize = 3;
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V1: &str = "prompt_comprehension_manifest_v1";
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_manifest_v2";
 /// #1971: adds `atomic_ask_kinds` and, for informational clauses only, their
@@ -65,10 +65,9 @@ pub enum PromptDisposition {
     Ask,
     /// The task is ready for normal execution.
     Act,
-    /// Answer or clarify with no mutations; only bounded reads are available.
+    /// Answer or clarify, using tools under the session's existing authority.
     Explain,
-    /// Gather bounded read-only evidence; mutations and capability grants are
-    /// unavailable.
+    /// Gather evidence, using tools under the session's existing authority.
     Research,
     /// Read/recover and update only the harness-owned plan ledger; workspace,
     /// execution, network, capability-grant, and generic MCP mutation paths
@@ -87,16 +86,13 @@ impl PromptDisposition {
         }
     }
 
-    /// Bound non-execution turns even when the session config allows a large
-    /// tool loop. `Ask` is terminal in the TUI and gets a zero-round defense in
-    /// depth for headless callers.
+    /// Response style does not change the operator's configured allowance.
+    /// `Ask` is terminal in the TUI and gets a zero-round defense in depth for
+    /// headless callers.
     pub fn tool_round_limit(self, max: usize) -> usize {
         match self {
             Self::Ask => 0,
-            Self::Act => max,
-            Self::Explain => max,
-            Self::Research => max.min(RESEARCH_TOOL_ROUND_LIMIT),
-            Self::Plan => max,
+            Self::Act | Self::Explain | Self::Research | Self::Plan => max,
         }
     }
 }
@@ -196,6 +192,12 @@ pub struct DecisionLock {
     /// An intake-bound overflow is not a decision the operator can answer in
     /// place. The operator must split the request before execution can resume.
     overflow: bool,
+    /// The operator-supplied text this lock resolved to, when one is known —
+    /// a classifier proposal's summary, or the `value` half of an explicit
+    /// `N: value` reply (#2515 items 5/6 round 2). `None` when the reply gave
+    /// no text (a bare `1:`) or the lock has another source; display falls
+    /// back to `question` in that case.
+    answer: Option<String>,
 }
 
 impl DecisionLock {
@@ -221,6 +223,12 @@ impl DecisionLock {
     /// assumption, so the two never share a representation.
     pub fn assumption(&self) -> Option<&str> {
         self.assumption.as_deref()
+    }
+
+    /// The confirmed answer text for a lock, falling back to the question
+    /// when no answer text is known (#2515 items 5/6 round 2).
+    pub fn answer_or_question(&self) -> &str {
+        self.answer.as_deref().unwrap_or(&self.question)
     }
 }
 
@@ -319,7 +327,74 @@ pub struct PromptIntake {
     /// wrong instead of re-emitting the identical block, which is the whole
     /// difference between a blocked session and one that looks hung.
     last_rejection: Option<ClarificationRejection>,
+    /// Free text the operator wants to talk through before locking anything,
+    /// set by a `/discuss …` reply to a pending clarification. Not a decision
+    /// answer: no ordinal is resolved and no state locks. The harness reads
+    /// this to run one bounded, tool-less side call and show the operator the
+    /// model's answer, then clears it — the batch stays pending underneath.
+    pending_discussion: Option<String>,
+    /// A classifier's read of an operator reply that carried no explicit
+    /// ordinal, offered but not yet acted on (#2517 — "confirm-then-lock").
+    ///
+    /// Single-shot: [`Self::resolve_with_operator_answer`] either locks it
+    /// (the very next reply is a bare affirmation) or discards it (anything
+    /// else — including a reply that looks like a NEW attempt at an answer).
+    /// It never survives a second turn and never locks on its own; only an
+    /// operator confirmation following it can. This is what keeps a
+    /// classifier's guess from becoming the same silent inference the
+    /// harness has always refused to do from a bare "continue" — the guess
+    /// is shown, named, and requires its own explicit yes.
+    proposed_answer: Option<ProposedAnswer>,
+    /// The proposal that was outstanding when the LAST refusal happened, if
+    /// any (#2517 follow-up, addendum item 5). A classifier's proposal is
+    /// consumed unconditionally by the next reply (see
+    /// [`Self::resolve_with_operator_answer`]), so a reply that fails to
+    /// parse as an ordinal — `NoOrdinals` / `ReadsAsQuestion` — silently drops
+    /// it with nothing said. This mirrors it into the refusal text instead of
+    /// letting the operator lose track of whether it is still on the table.
+    last_rejection_proposal: Option<ProposedAnswer>,
 }
+
+/// A single classifier-proposed decision, named for display in
+/// [`PromptIntake::proposed_answer_notice`] and resolved back to a `decisions`
+/// index in [`PromptIntake::resolve_with_operator_answer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProposedAnswer {
+    /// Absolute index into `manifest.decisions` — NOT the displayed ordinal,
+    /// which shifts as other decisions lock (same reasoning as
+    /// `pending_indices`).
+    index: usize,
+    /// A short, human-readable label for what the classifier read the reply
+    /// as choosing, shown back to the operator so a wrong guess is obvious
+    /// before it can be confirmed.
+    summary: String,
+}
+
+/// Exact-match affirmations that confirm a pending classifier proposal.
+/// Deliberately a closed, exact-match list rather than a substring scan —
+/// the classifier already did the semantic work; this step is a narrow,
+/// auditable lexical check, not a second round of inference.
+const CONFIRMATION_WORDS: &[&str] = &[
+    "y",
+    "yes",
+    "yes.",
+    "yep",
+    "yeah",
+    "yup",
+    "correct",
+    "right",
+    "confirm",
+    "confirmed",
+    "ok",
+    "okay",
+    "sure",
+    "do it",
+    "go ahead",
+    "proceed",
+    "that one",
+    "that's right",
+    "sounds right",
+];
 
 impl PromptIntake {
     /// Analyze a new operator prompt before any model-visible work begins,
@@ -377,12 +452,16 @@ impl PromptIntake {
                         source: None,
                         assumption: None,
                         overflow: false,
+                        answer: None,
                     }],
                 },
                 disposition: PromptDisposition::Ask,
                 post_lock_disposition: PromptDisposition::Explain,
                 source: DispositionSource::Inferred,
                 last_rejection: None,
+                pending_discussion: None,
+                proposed_answer: None,
+                last_rejection_proposal: None,
             };
             debug_assert!(intake.validate().is_ok());
             return intake;
@@ -410,6 +489,9 @@ impl PromptIntake {
             post_lock_disposition,
             source: DispositionSource::Inferred,
             last_rejection: None,
+            pending_discussion: None,
+            proposed_answer: None,
+            last_rejection_proposal: None,
         };
         debug_assert!(intake.validate().is_ok());
         intake
@@ -489,6 +571,12 @@ impl PromptIntake {
             let question = truncate_chars(&decision.question, MAX_CLARIFICATION_BYTES);
             rendered.push_str(&format!("{}. {}\n", ordinal + 1, question));
         }
+        // #2517: named on every batch, not only after a rejection — the
+        // operator's first reaction to a locked-format prompt is often to
+        // want to talk about it, not to retype it correctly.
+        rendered.push_str(
+            "(`/discuss <what's on your mind>` talks it through first — nothing here is lost.)\n",
+        );
         rendered.trim_end().to_string()
     }
 
@@ -500,6 +588,106 @@ impl PromptIntake {
     /// response to a rejected answer.
     pub fn last_rejection(&self) -> Option<&ClarificationRejection> {
         self.last_rejection.as_ref()
+    }
+
+    /// Take the pending `/discuss` text, if a reply asked to talk it through
+    /// instead of answering. Clears it: the harness runs one bounded side
+    /// call in response, and a stale discussion must never replay itself on
+    /// the next unrelated rejection.
+    pub fn take_pending_discussion(&mut self) -> Option<String> {
+        self.pending_discussion.take()
+    }
+
+    /// Offer a classifier's read of a non-explicit reply, naming which
+    /// PENDING decision (displayed ordinal, 1-based) it believes the operator
+    /// meant and a short label for what that choice was. Ignored — returns an
+    /// unchanged clone — if `ordinal` is not currently pending: a stale or
+    /// out-of-range proposal must never silently attach to the wrong item.
+    ///
+    /// This only OFFERS; nothing locks until [`Self::resolve_with_operator_answer`]
+    /// sees the operator's own next reply confirm it (#2517).
+    pub fn propose_answer(&self, ordinal: usize, summary: impl Into<String>) -> Self {
+        let mut proposed = self.clone();
+        let pending = proposed.pending_indices();
+        let Some(index) = ordinal.checked_sub(1).and_then(|i| pending.get(i).copied()) else {
+            return proposed;
+        };
+        proposed.proposed_answer = Some(ProposedAnswer {
+            index,
+            summary: summary.into(),
+        });
+        proposed
+    }
+
+    /// One line naming the classifier's proposal and how to confirm or
+    /// override it, or `None` if nothing is proposed. Shown in place of the
+    /// ordinary rejection — a proposal is progress, not a refusal.
+    pub fn proposed_answer_notice(&self) -> Option<String> {
+        let proposal = self.proposed_answer.as_ref()?;
+        let ordinal = self.proposal_ordinal(proposal);
+        Some(format!(
+            "I read that as choosing {ordinal}: \"{}\" — reply `yes` to lock it, \
+             or answer explicitly (`{ordinal}: …`) if that's not right.",
+            proposal.summary
+        ))
+    }
+
+    /// The displayed ordinal (1-based) a proposal's absolute `decisions`
+    /// index currently maps to. Shared by [`Self::proposed_answer_notice`]
+    /// and [`Self::last_rejection_explanation`] so the two can never disagree
+    /// about which numbered item a proposal names.
+    fn proposal_ordinal(&self, proposal: &ProposedAnswer) -> usize {
+        self.pending_indices()
+            .iter()
+            .position(|&i| i == proposal.index)
+            .map_or(0, |p| p + 1)
+    }
+
+    /// Why the last clarification reply was refused, PLUS a reminder that a
+    /// classifier's proposal is still on the table when one was outstanding
+    /// at the time (addendum item 5) — `None` when nothing was refused.
+    ///
+    /// This is the one place refusal text is assembled; the harness prints
+    /// this instead of calling [`ClarificationRejection::explain`] directly,
+    /// so the proposal reminder can never be added at one call site and
+    /// missed at another.
+    pub fn last_rejection_explanation(&self) -> Option<String> {
+        let rejection = self.last_rejection.as_ref()?;
+        let mut text = rejection.explain();
+        if let Some(proposal) = self.last_rejection_proposal.as_ref() {
+            let ordinal = self.proposal_ordinal(proposal);
+            text.push_str(&format!(
+                "\n(the reading I proposed is still waiting — reply `yes` to take it: \
+                 {ordinal}: \"{}\".)",
+                proposal.summary
+            ));
+        }
+        Some(text)
+    }
+
+    /// Addendum item 6: one "locked N: answer" line per decision that was
+    /// `Pending` in `previous` and is `Locked` in `self` — the confirmation
+    /// printed for the one moment that changes state, so a wrong lock is
+    /// visible before the turn proceeds. The ordinal is `previous`'s own
+    /// displayed numbering (the same mapping [`Self::clarification_batch`]
+    /// rendered when the operator answered it), never renumbered against
+    /// `self`, where a lock has already removed the item from "pending".
+    ///
+    /// #2515 items 5/6 round 2: names the ANSWER a proposal or an explicit
+    /// `N: value` supplied, not the question, so the confirmation reads as
+    /// "what you got" rather than "what was asked" — falling back to the
+    /// question only when no answer text is known ([`DecisionLock::answer_or_question`]).
+    pub fn newly_locked_lines(&self, previous: &Self) -> Vec<String> {
+        previous
+            .pending_indices()
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &index)| {
+                let decision = self.manifest.decisions.get(index)?;
+                (decision.status == DecisionStatus::Locked)
+                    .then(|| format!("locked {}: {}", position + 1, decision.answer_or_question()))
+            })
+            .collect()
     }
 
     /// The absolute `decisions` indices that are still pending, in order.
@@ -550,21 +738,86 @@ impl PromptIntake {
             return self.clone();
         }
         let mut resolved = self.clone();
+        // Addendum item 5: cleared up front so a stale proposal from an
+        // EARLIER rejection's explanation never survives into this one's.
+        resolved.last_rejection_proposal = None;
+        // #2515 items 5/6 round 2: a classifier's proposal now survives a
+        // refusal — it is cleared ONLY on lock, on an explicit reply that
+        // gives real ordinals (a "new attempt", Ok or Incomplete/OutOfRange),
+        // or by `propose_answer` replacing it outright. A bare confirmation
+        // word locks it on ANY turn it is still outstanding, not only the
+        // very next one.
+        let outstanding_proposal = resolved.proposed_answer.clone();
+        if let Some(proposal) = outstanding_proposal.clone() {
+            let normalized = answer.trim().to_ascii_lowercase();
+            if CONFIRMATION_WORDS.contains(&normalized.as_str()) {
+                resolved.proposed_answer = None;
+                if let Some(decision) = resolved.manifest.decisions.get_mut(proposal.index) {
+                    decision.status = DecisionStatus::Locked;
+                    decision.source = Some(DecisionSource::Operator);
+                    decision.answer = Some(proposal.summary);
+                }
+                resolved.last_rejection = None;
+                resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
+                    resolved.post_lock_disposition
+                } else {
+                    PromptDisposition::Ask
+                };
+                debug_assert!(resolved.validate().is_ok());
+                return resolved;
+            }
+        }
+        // #2517: the escape hatch. A `/discuss …` reply is never an answer —
+        // it asks to talk the batch through before committing to one. This is
+        // checked before the ordinal parser so a discussion request can never
+        // itself be misread as a malformed answer and rejected; nothing locks
+        // and the batch stays exactly as pending as it was, proposal included.
+        if let Some(text) = discussion_request(answer) {
+            resolved.last_rejection = None;
+            resolved.pending_discussion = Some(text);
+            debug_assert!(resolved.validate().is_ok());
+            return resolved;
+        }
         // #1689 item 4: the same mapping `clarification_batch` renders from.
         let pending = resolved.pending_indices();
 
         match explicit_answer_outcome(answer, &pending) {
             Ok(indices) => {
-                for index in indices {
+                // A real ordinal reply is a new attempt — whatever it names,
+                // an outstanding proposal is no longer the operator's most
+                // recent word on the batch.
+                resolved.proposed_answer = None;
+                for (index, value) in indices {
                     let decision = &mut resolved.manifest.decisions[index];
                     decision.status = DecisionStatus::Locked;
                     decision.source = Some(DecisionSource::Operator);
+                    decision.answer = value;
                 }
                 resolved.last_rejection = None;
             }
             // #1689 item 1: carry WHY, so the harness can say something other
             // than the identical block a second time.
-            Err(rejection) => resolved.last_rejection = Some(rejection),
+            Err(rejection) => {
+                // Addendum item 5: only the two kinds a bare, non-ordinal
+                // reply produces (`NoOrdinals`/`ReadsAsQuestion`) are the ones
+                // a classifier proposal was offered against — `Incomplete`
+                // and `OutOfRange` mean the operator DID give ordinals (a new
+                // attempt), so the proposal is discarded same as the Ok arm;
+                // there is nothing ambiguous for it to still apply to.
+                if matches!(
+                    rejection,
+                    ClarificationRejection::NoOrdinals | ClarificationRejection::ReadsAsQuestion
+                ) {
+                    // The proposal is a non-ordinal reply's refusal too, so it
+                    // stays in `resolved.proposed_answer` (never taken above)
+                    // for a later `yes` to confirm; mirrored here only for
+                    // THIS turn's refusal text.
+                    resolved.last_rejection_proposal = outstanding_proposal;
+                } else {
+                    resolved.proposed_answer = None;
+                }
+                resolved.last_rejection = Some(rejection);
+            }
         }
 
         resolved.disposition = if resolved.manifest.pending_decision_count() == 0 {
@@ -729,6 +982,7 @@ impl PromptIntake {
                 source: None,
                 assumption: None,
                 overflow: false,
+                answer: None,
             });
         }
         widened.disposition = PromptDisposition::Ask;
@@ -1143,6 +1397,9 @@ impl Default for DispositionLexicon {
                 "edit",
                 "delete",
                 "fix",
+                // Checked before research, so "refactor the largest file"
+                // acts instead of falling to the research needle "largest".
+                "refactor",
                 "build",
                 "run ",
                 "execute",
@@ -1160,6 +1417,38 @@ impl Default for DispositionLexicon {
                 "open a pr",
                 "open pr",
                 "merge",
+                // #2562 round 2 (PR-2562 review, "data not stemming" ruling,
+                // part 2): whole-word matching (#2553 finding 3) means a bare
+                // gerund/participle ("fixing", "refactoring", "implemented")
+                // is NOT added here — those are description words as often
+                // as commands ("explain refactoring", "how is caching
+                // implemented?"), and alone they already reach Act through
+                // the terminal fallback (measured: 22/22 ordinary
+                // imperatives). What whole-word matching broke instead is
+                // the MIXED prompt whose only action cue is one of these
+                // unambiguous REQUEST PHRASES, which used to win only by
+                // accidentally substring-matching a bare verb needle
+                // elsewhere in the same clause — restore those explicitly:
+                "needs fixing",
+                "need fixing",
+                "needs refactoring",
+                "need refactoring",
+                "get it fixed",
+                "get them fixed",
+                "get it committed",
+                // #2562 round 3 (PR-2562 review round 2): bare "rerun" /
+                // "re-run" GAINED authority on an explanatory prompt that
+                // merely NAMES the word ("explain why the rerun flag
+                // exists"). "run " no longer matches inside "rerun the
+                // tests" either way ("re" is alphanumeric-adjacent, so the
+                // left edge fails the whole-word check — correctly: "rerun"
+                // is one word, not "run" plus a prefix) — but the fix is
+                // request PHRASES, not the bare word, same asymmetry as
+                // "needs fixing" above.
+                "rerun the",
+                "re-run the",
+                "please rerun",
+                "please re-run",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1185,10 +1474,36 @@ impl Default for DispositionLexicon {
                 // Research and giving Research the capability is the fix for
                 // "Research is too strict".
                 "line count",
+                // Whole-word matching (#2553 finding 3) no longer lets
+                // "line count" match inside "line counts" — add the plural
+                // as its own entry rather than reopen substring matching.
+                "line counts",
                 "most lines",
                 "fewest lines",
                 "longest file",
                 "shortest file",
+                // #2562 round 2 (PR-2562 review, "data not stemming" ruling,
+                // part 1, BLOCKING): whole-word matching stopped these
+                // needles from matching their own inflections, which
+                // silently fell through to the Act fallback — a read-only
+                // gerund GAINING mutation authority ("auditing the
+                // permission table" → Act). GERUNDS ONLY (round 3, PR-2562
+                // review round 2): a gerund names an ACTIVITY, and a request
+                // built on one is read-only — safe to over-match, since at
+                // worst an ambiguous prompt loses authority rather than
+                // gaining it. The matching NOUN forms (`investigation`,
+                // `analysis`, `diagnosis`, `comparison`, `audits`) were
+                // tried and reverted: a noun names a THING, and ordinary
+                // mutation requests routinely name things ("update the
+                // diagnosis message", "add a comparison test") — those nouns
+                // cost Act on everyday edits, exactly #2558 test 1.
+                "researching",
+                "auditing",
+                "investigating",
+                "analyzing",
+                "diagnosing",
+                "exploring",
+                "comparing",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1207,6 +1522,14 @@ impl Default for DispositionLexicon {
                 // #2332: keeps "Could you tell me what X does?" an answer once
                 // `could you ` makes a question a request.
                 "tell me",
+                // #2562 round 2/round 3: same "data not stemming" ruling —
+                // see the research list's matching comment above. GERUNDS
+                // ONLY: `summary`/`description`/`explanation` are nouns and
+                // were reverted (round 3) after they cost Act on
+                // "update the description field", "add a summary line".
+                "explaining",
+                "summarizing",
+                "describing",
             ]
             .map(str::to_string)
             .to_vec(),
@@ -1277,6 +1600,43 @@ impl Default for DispositionLexicon {
     }
 }
 
+/// Whole-word substring match (#2553 finding 3): `needle` matches `haystack`
+/// only where its outer edges land on a word boundary. Checked only on edges
+/// that are themselves word characters — a needle already padded with a space
+/// or quote (`" test \""`, `"run "`) supplies its own boundary on that side
+/// and needs no further check. This is what keeps `"refactor"` off
+/// `"refactoring"` (suffix, no trailing boundary) while still matching
+/// `"refactor the largest file"` (#2553's original case), and applies to
+/// every lexicon entry, not a special case for one word.
+///
+/// `_` counts as a word character (#2562 round 3, PR-2562 review round 2):
+/// `char::is_alphanumeric` alone treats `_` as a boundary, so an identifier
+/// leaked a needle into authority — `explain what fix_path does` hit `fix`,
+/// `describe the build_graph function` hit `build`, `summary_stats` hit
+/// `summary` — granting or stealing Act on a purely explanatory question
+/// about code. The old substring matcher had the same flaw, so this closes
+/// a pre-existing gap in finding 3's own class, not a fresh regression.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let end = abs + needle.len();
+        let left_ok = !needle.chars().next().is_some_and(is_word)
+            || !haystack[..abs].chars().next_back().is_some_and(is_word);
+        let right_ok = !needle.chars().next_back().is_some_and(is_word)
+            || !haystack[end..].chars().next().is_some_and(is_word);
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 fn infer_disposition(prompt: &str, asks: &[AtomicAsk]) -> PromptDisposition {
     infer_disposition_with(prompt, asks, &DispositionLexicon::default())
 }
@@ -1320,7 +1680,11 @@ fn infer_disposition_with(
     // Padding makes a lexicon entry with a leading-space word boundary match at
     // the beginning of a prompt without losing that boundary inside prose.
     let padded = format!(" {lower}");
-    let hit = |needles: &[String]| needles.iter().any(|n| !n.is_empty() && padded.contains(n));
+    let hit = |needles: &[String]| {
+        needles
+            .iter()
+            .any(|n| !n.is_empty() && contains_word(&padded, n))
+    };
     if hit(&lexicon.action) {
         return PromptDisposition::Act;
     }
@@ -1372,6 +1736,7 @@ fn extract_decisions(asks: &[AtomicAsk]) -> (Vec<DecisionLock>, bool) {
                 source,
                 assumption: None,
                 overflow: false,
+                answer: None,
             });
         }
     }
@@ -1387,6 +1752,7 @@ fn overflow_decision() -> DecisionLock {
         source: None,
         assumption: None,
         overflow: true,
+        answer: None,
     }
 }
 
@@ -1565,45 +1931,72 @@ impl ClarificationRejection {
         };
         format!(
             "that reply did not lock the batch: {detail}.\n\
-             (`/new` abandons this prompt and starts a fresh conversation.)"
+             (`/discuss <what's on your mind>` talks it through without losing the batch; \
+             `/new` abandons this prompt and starts a fresh conversation.)"
         )
     }
 }
 
+/// Punctuation a human uses to number a choice, tried in this order. `:` is
+/// tried first because it can never be mistaken for a decimal point or a
+/// parenthetical close, so it stays the unambiguous default when a line could
+/// match more than one.
+const ORDINAL_SEPARATORS: [char; 3] = [':', '.', ')'];
+
 /// Resolve explicit operator answers, or say why the reply was refused.
+/// The `Option<String>` alongside each index is the trimmed `value` text
+/// after the ordinal's separator, `None` when the reply gave none (a bare
+/// `1:`) — used to name the locked ANSWER rather than just the question
+/// (#2515 items 5/6 round 2).
 ///
 /// #1689 items 1 and 2.
 fn explicit_answer_outcome(
     answer: &str,
     pending: &[usize],
-) -> Result<Vec<usize>, ClarificationRejection> {
+) -> Result<Vec<(usize, Option<String>)>, ClarificationRejection> {
     let answer = answer.trim();
     if answer.is_empty() {
         return Err(ClarificationRejection::NoOrdinals);
     }
-    let mut resolved = BTreeSet::new();
+    let mut resolved = BTreeMap::new();
     let mut saw_ordinal = false;
     let mut out_of_range = None;
     for line in answer.lines() {
         let line = line.trim();
         let line = line.strip_prefix("decision ").unwrap_or(line);
-        let Some((ordinal, value)) = line.split_once(':') else {
+        // #2517 follow-up: a human numbering a choice reaches for `.` or `)`
+        // at least as often as `:` — "1. Widen the local surface", "1) …".
+        // Try each separator the operator might reasonably use rather than
+        // rejecting a perfectly explicit ordinal over punctuation choice.
+        // `.` is guarded against a decimal number ("3.14"): a digit
+        // immediately after the dot means it was never a list marker.
+        let Some((ordinal, value)) = ORDINAL_SEPARATORS.iter().find_map(|sep| {
+            let (ordinal, value) = line.split_once(*sep)?;
+            if *sep == '.' && value.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            Some((ordinal, value))
+        }) else {
             continue;
         };
-        if value.trim().is_empty() {
-            continue;
-        }
         let Ok(ordinal) = ordinal.trim().parse::<usize>() else {
             continue;
         };
+        // An empty value is fine now that the separator itself (not the text
+        // after it) is what makes this a real ordinal rather than free text:
+        // "1." and "1)" alone are explicit enough to lock, the same way a
+        // bare `1:` was already accepted — the pending item's own question is
+        // the value, not the reply's text.
         saw_ordinal = true;
+        let value = value.trim();
+        let value = (!value.is_empty()).then(|| value.to_string());
         let Some(pending_ordinal) = ordinal.checked_sub(1) else {
             out_of_range = Some(ordinal);
             continue;
         };
         match pending.get(pending_ordinal) {
             Some(index) => {
-                resolved.insert(*index);
+                resolved.insert(*index, value);
             }
             None => out_of_range = Some(ordinal),
         }
@@ -1642,7 +2035,30 @@ fn explicit_answer_outcome(
 /// explained instead of silently repeated.
 #[cfg(test)]
 fn explicit_answer_indices(answer: &str, pending: &[usize]) -> Option<Vec<usize>> {
-    explicit_answer_outcome(answer, pending).ok()
+    explicit_answer_outcome(answer, pending)
+        .ok()
+        .map(|resolved| resolved.into_iter().map(|(index, _value)| index).collect())
+}
+
+/// Recognize the `/discuss` escape hatch and return the text to discuss, if
+/// any. `/discuss` alone (or with only whitespace after it) still counts —
+/// the operator may simply want the batch re-explained.
+///
+/// #2517: the strict `N: value` gate has no answer for an operator who
+/// disagrees with the question rather than merely mistyping the reply; the
+/// only prior way out was `/new`, which throws the whole prompt away. This
+/// gives "I want to talk about this first" its own recognized shape instead
+/// of forcing it through the ordinal parser, where it always read as
+/// [`ClarificationRejection::NoOrdinals`] or [`ClarificationRejection::ReadsAsQuestion`].
+pub fn discussion_request(answer: &str) -> Option<String> {
+    let rest = answer
+        .strip_prefix("/discuss")
+        .or_else(|| answer.strip_prefix("/chat"))?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        // `/discussion-of-x` or `/chatty` — not the command.
+        return None;
+    }
+    Some(rest.trim().to_string())
 }
 
 fn looks_like_unresolved_question(answer: &str) -> bool {

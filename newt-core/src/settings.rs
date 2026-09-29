@@ -15,6 +15,25 @@
 //! <name>`) or the model (`/model <name>`) in the TUI, and read once at
 //! startup to seed `NEWT_PROVIDER` / `NEWT_DGX_MODEL`.
 //!
+//! # Per project
+//!
+//! A switch is remembered **per project**, so changing backend in one repo
+//! does not move every other repo. The choice lives in this operator-owned
+//! file — never in the repo, whose overlay cannot set a backend — as a bounded
+//! table keyed by the canonical repo root:
+//!
+//! ```toml
+//! [projects."/path/to/repo"]
+//! provider = "dgx1"
+//! used = 7
+//! ```
+//!
+//! An entry exists only while it differs from the global `[session]` choice
+//! (or the default backend), is dropped when switched back, is capped at
+//! [`MAX_PROJECTS`] with least-recently-switched eviction (a start never writes), and is pruned when its
+//! path no longer exists. `[session]` is now hand-set: the app no longer
+//! writes it.
+//!
 //! # Design
 //!
 //! * **Lowest precedence on restore.** An explicit `NEWT_PROVIDER` /
@@ -83,6 +102,25 @@ impl Session {
         self.provider.is_none() && self.model.is_none()
     }
 
+    /// The global `[session]` choice overlaid by `project`'s entry, if any. An
+    /// entry that names a provider owns the model too (a model belongs to the
+    /// provider it was chosen under, so the global model never bleeds onto it).
+    pub fn for_project(doc: &toml::Table, project: &str) -> Self {
+        let global = Self::from_doc(doc);
+        let Some(entry) = project_entry(doc, project) else {
+            return global;
+        };
+        let (provider, model) = (entry.provider, entry.model);
+        Self {
+            model: match (&provider, model) {
+                (_, Some(m)) => Some(m),
+                (Some(_), None) => None,
+                (None, None) => global.model,
+            },
+            provider: provider.or(global.provider),
+        }
+    }
+
     /// Decide what to restore. `current_provider` is the value `NEWT_PROVIDER`
     /// already holds (an explicit env var or a `--loadout`'s provider) — `None`
     /// if unset; a pinned provider is left untouched. `model_pinned` is whether
@@ -137,16 +175,114 @@ pub fn should_persist(ephemeral: bool) -> bool {
     !ephemeral
 }
 
+/// Most per-project entries kept; the least recently switched is evicted first.
+pub const MAX_PROJECTS: usize = 32;
+
+/// One `[projects.<root>]` entry: the axes that differ from the global choice.
+struct Entry {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+fn project_entry(doc: &toml::Table, project: &str) -> Option<Entry> {
+    let t = doc.get("projects")?.as_table()?.get(project)?.as_table()?;
+    let read = |k: &str| {
+        t.get(k)
+            .and_then(toml::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(Entry {
+        provider: read("provider"),
+        model: read("model"),
+    })
+}
+
+/// A `/backends` or `/model` switch, to be recorded for one project.
+#[derive(Debug, Clone, Copy)]
+pub enum Choice<'a> {
+    Provider(&'a str),
+    Model(&'a str),
+}
+
+/// Record `choice` for `project` in `doc`: keep only what differs from the
+/// global `[session]` choice (`default_provider` is the config default backend,
+/// the baseline when `[session]` names none), drop the entry when nothing does,
+/// then prune paths that no longer `exist` and evict least-recently-switched beyond
+/// [`MAX_PROJECTS`]. Pure over `doc` so it unit-tests without a filesystem.
+pub fn apply_project_choice(
+    doc: &mut toml::Table,
+    project: &str,
+    choice: Choice<'_>,
+    default_provider: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) {
+    let global = Session::from_doc(doc);
+    let old = project_entry(doc, project);
+    let old_provider = old.and_then(|e| e.provider);
+    // A provider switch clears the model, as in-session.
+    let (mut provider, mut model) = match choice {
+        Choice::Provider(name) => (Some(name.to_string()), None),
+        Choice::Model(name) => (old_provider, Some(name.to_string())),
+    };
+    let baseline = global.provider.as_deref().or(default_provider);
+    if provider.as_deref() == baseline {
+        provider = None;
+    }
+    if provider.is_none() && model == global.model {
+        model = None;
+    }
+    let projects = doc
+        .entry("projects".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !projects.is_table() {
+        *projects = toml::Value::Table(toml::Table::new());
+    }
+    let Some(projects) = projects.as_table_mut() else {
+        return;
+    };
+    projects.retain(|path, _| exists(path));
+    let used = |v: &toml::Value| v.get("used").and_then(toml::Value::as_integer).unwrap_or(0);
+    let tick = projects.values().map(used).max().unwrap_or(0) + 1;
+    projects.remove(project);
+    if provider.is_some() || model.is_some() {
+        let mut t = toml::Table::new();
+        for (k, v) in [("provider", provider), ("model", model)] {
+            if let Some(v) = v {
+                t.insert(k.into(), toml::Value::String(v));
+            }
+        }
+        t.insert("used".into(), toml::Value::Integer(tick));
+        projects.insert(project.to_string(), toml::Value::Table(t));
+    }
+    while projects.len() > MAX_PROJECTS {
+        let Some(lru) = projects
+            .iter()
+            .min_by_key(|(_, v)| used(v))
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        projects.remove(&lru);
+    }
+    if projects.is_empty() {
+        doc.remove("projects");
+    }
+}
+
 /// The self-documenting header re-emitted on every write. (Comments inside the
 /// body are not round-tripped through [`toml::Table`]; this header always is.)
 const HEADER: &str = "\
 # newt — sticky user preferences (hand-editable).
 #
 # Auto-updated when you switch the backend (/backends <name>) or model
-# (/model <name>) in the TUI, so your last choice is restored on the next
-# start. Restore is the LOWEST precedence: an explicit NEWT_PROVIDER /
-# NEWT_DGX_MODEL in the environment, or a --loadout, always wins. Delete this
-# file to forget the last selection.
+# (/model <name>) in the TUI: the choice is remembered PER PROJECT, under
+# [projects.\"<repo root>\"], and restored the next time newt starts there.
+# Only choices that differ from [session] (your own default, hand-set) are
+# kept; at most 32 projects, least recently SWITCHED dropped (reads never touch it), missing (or unmounted) paths pruned.
+# Restore is the LOWEST precedence: an explicit NEWT_PROVIDER / NEWT_DGX_MODEL
+# in the environment, a --backend-* flag or a --loadout, or a resumed
+# conversation's pin, always wins. Delete this file to forget every choice.
 #
 # Hand-editable, but note: an in-app /backends or /model write preserves other
 # keys/tables yet drops inline comments — keep durable notes in config.toml.
@@ -213,39 +349,83 @@ fn write_doc(path: &Path, doc: &toml::Table) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
-/// Load the recorded session selections from `~/.newt/settings.toml`. Empty on
-/// any error.
-pub fn load() -> Session {
-    settings_path()
-        .map(|path| Session::from_doc(&read_doc(&path)))
-        .unwrap_or_default()
+/// The repo root for `cwd`: the parent of the nearest ancestor `.git` (a dir,
+/// or a linked worktree's file), else `cwd`. Pure over the injected `exists`.
+fn root_for(cwd: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    crate::config::find_ancestor_dir(cwd, Path::new(".git"), exists)
+        .and_then(|git| git.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
-/// Read-modify-write `~/.newt/settings.toml`, preserving unknown content.
-/// Best-effort: a path we can't resolve or a write we can't perform is a no-op.
-fn update(mutate: impl FnOnce(&mut toml::Table)) {
+/// The session's workspace, when it is not the process cwd (`newt headless
+/// --cwd DIR`). ponytail: process-wide instead of threading a parameter through
+/// every `/backends`/`/model` call site; one session per process.
+static WORKSPACE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Declare the session workspace so the per-project key follows it, not the
+/// directory the process happened to be launched from.
+pub fn set_workspace(dir: &Path) {
+    if let Ok(mut w) = WORKSPACE.lock() {
+        *w = Some(dir.to_path_buf());
+    }
+}
+
+/// The project root for `workspace` (else `cwd`). Pure over `exists`.
+fn key_for(workspace: Option<&Path>, cwd: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    root_for(workspace.unwrap_or(cwd), exists)
+}
+
+/// The canonical project root of the session workspace (no subprocess).
+fn project_key() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let ws = WORKSPACE.lock().ok().and_then(|w| w.clone());
+    let root = key_for(ws.as_deref(), &cwd, |p| p.exists());
+    Some(
+        root.canonicalize()
+            .unwrap_or(root)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Load the selections for the current project (global `[session]` overlaid by
+/// this project's entry) from `~/.newt/settings.toml`. Empty on any error.
+pub fn load() -> Session {
     let Some(path) = settings_path() else {
+        return Session::default();
+    };
+    let doc = read_doc(&path);
+    match project_key() {
+        Some(key) => Session::for_project(&doc, &key),
+        None => Session::from_doc(&doc),
+    }
+}
+
+/// Read-modify-write `~/.newt/settings.toml` for the current project,
+/// preserving unknown content. Best-effort: a path we can't resolve or a write
+/// we can't perform is a no-op.
+fn update(choice: Choice<'_>, default_provider: Option<&str>) {
+    let (Some(path), Some(key)) = (settings_path(), project_key()) else {
         return;
     };
     let mut doc = read_doc(&path);
-    mutate(&mut doc);
+    apply_project_choice(&mut doc, &key, choice, default_provider, |p| {
+        Path::new(p).exists()
+    });
     let _ = write_doc(&path, &doc);
 }
 
-/// Persist the provider chosen via `/backends <name>`, clearing any stale model
-/// override (mirrors the session's `NEWT_DGX_MODEL` reset so the named backend's
-/// own default model applies on the next start). Best-effort.
-pub fn record_provider(name: &str) {
-    update(|doc| {
-        apply_session_key(doc, "provider", Some(name));
-        apply_session_key(doc, "model", None);
-    });
+/// Persist the provider chosen via `/backends <name>` for this project,
+/// clearing any stale model override (mirrors the session's `NEWT_DGX_MODEL`
+/// reset). `default_provider` is the config's default backend. Best-effort.
+pub fn record_provider(name: &str, default_provider: Option<&str>) {
+    update(Choice::Provider(name), default_provider);
 }
 
-/// Persist the model chosen via `/model <name>` (leaving the provider as-is).
-/// Best-effort.
-pub fn record_model(name: &str) {
-    update(|doc| apply_session_key(doc, "model", Some(name)));
+/// Persist the model chosen via `/model <name>` for this project (leaving the
+/// provider as-is). Best-effort.
+pub fn record_model(name: &str, default_provider: Option<&str>) {
+    update(Choice::Model(name), default_provider);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,5 +587,153 @@ mod tests {
         let mut d = doc("[session]\nmodel = \"a\"\n");
         apply_session_key(&mut d, "model", None);
         assert!(!d.contains_key("session"));
+    }
+
+    // ---- per-project sticky choice (dec4) — pure, in-memory ----------------
+
+    fn all_exist(_: &str) -> bool {
+        true
+    }
+
+    fn switch(d: &mut toml::Table, proj: &str, c: Choice<'_>) {
+        apply_project_choice(d, proj, c, Some("dflt"), all_exist);
+    }
+
+    /// (a)+(b): a switch in A leaves B on the global choice; A restores its own.
+    #[test]
+    fn a_switch_in_one_project_does_not_move_another() {
+        let mut d = doc("[session]\nprovider = \"g\"\n");
+        switch(&mut d, "/a", Choice::Provider("y"));
+        assert_eq!(
+            Session::for_project(&d, "/a").provider.as_deref(),
+            Some("y")
+        );
+        assert_eq!(
+            Session::for_project(&d, "/b").provider.as_deref(),
+            Some("g")
+        );
+        // The global table is never written by a switch.
+        assert_eq!(Session::from_doc(&d).provider.as_deref(), Some("g"));
+    }
+
+    /// (c): switching back to the global/default choice removes the entry.
+    #[test]
+    fn switching_back_removes_the_entry() {
+        let mut d = doc("[session]\nprovider = \"g\"\n");
+        switch(&mut d, "/a", Choice::Provider("y"));
+        switch(&mut d, "/a", Choice::Provider("g"));
+        assert!(!d.contains_key("projects"));
+        // With no global provider the baseline is the config default.
+        let mut d = doc("");
+        switch(&mut d, "/a", Choice::Provider("y"));
+        switch(&mut d, "/a", Choice::Provider("dflt"));
+        assert!(!d.contains_key("projects"));
+    }
+
+    /// A model pick is kept per project and a provider switch clears it.
+    #[test]
+    fn model_is_per_project_and_a_provider_switch_clears_it() {
+        let mut d = doc("[session]\nprovider = \"g\"\nmodel = \"gm\"\n");
+        switch(&mut d, "/a", Choice::Model("m1"));
+        let s = Session::for_project(&d, "/a");
+        assert_eq!(
+            (s.provider.as_deref(), s.model.as_deref()),
+            (Some("g"), Some("m1"))
+        );
+        switch(&mut d, "/a", Choice::Provider("y"));
+        let s = Session::for_project(&d, "/a");
+        assert_eq!(
+            (s.provider.as_deref(), s.model.as_deref()),
+            (Some("y"), None)
+        );
+    }
+
+    /// (d): 33 projects leave 32, and the least recently switched one is gone.
+    #[test]
+    fn the_table_is_capped_and_evicts_the_lru() {
+        let mut d = doc("");
+        for i in 0..=MAX_PROJECTS {
+            switch(&mut d, &format!("/p{i}"), Choice::Provider("y"));
+        }
+        let t = d["projects"].as_table().expect("projects table");
+        assert_eq!(t.len(), MAX_PROJECTS);
+        assert!(!t.contains_key("/p0"), "the oldest entry is evicted");
+        assert!(t.contains_key(&format!("/p{MAX_PROJECTS}")));
+    }
+
+    /// Recency, not insertion order: re-using an old project protects it.
+    #[test]
+    fn a_reused_project_is_not_the_lru() {
+        let mut d = doc("");
+        for i in 0..MAX_PROJECTS {
+            switch(&mut d, &format!("/p{i}"), Choice::Provider("y"));
+        }
+        switch(&mut d, "/p0", Choice::Provider("z"));
+        switch(&mut d, "/new", Choice::Provider("y"));
+        let t = d["projects"].as_table().expect("projects table");
+        assert!(t.contains_key("/p0") && !t.contains_key("/p1"));
+    }
+
+    /// (e): a path that no longer exists is pruned on the next write.
+    #[test]
+    fn a_deleted_path_is_pruned_on_the_next_write() {
+        let mut d = doc("");
+        switch(&mut d, "/gone", Choice::Provider("y"));
+        apply_project_choice(&mut d, "/here", Choice::Provider("y"), Some("dflt"), |p| {
+            p != "/gone"
+        });
+        let t = d["projects"].as_table().expect("projects table");
+        assert!(!t.contains_key("/gone") && t.contains_key("/here"));
+    }
+
+    /// (f): ephemeral sessions write nothing (the gate the callers use).
+    #[test]
+    fn ephemeral_writes_nothing() {
+        assert!(!should_persist(true));
+    }
+
+    /// (g): the restore is lowest precedence — an env/flag-pinned provider is
+    /// left alone even when the project has its own entry.
+    #[test]
+    fn a_pinned_provider_beats_the_project_entry() {
+        let mut d = doc("");
+        switch(&mut d, "/a", Choice::Provider("y"));
+        let r = Session::for_project(&d, "/a").restore(Some("flag"), false, |_| true);
+        assert_eq!(r.provider, None);
+    }
+
+    /// Unknown content and the header survive a project write.
+    #[test]
+    fn project_write_preserves_unknown_content() {
+        let mut d = doc("[custom]\nk = 1\n");
+        switch(&mut d, "/a", Choice::Provider("y"));
+        assert!(d.contains_key("custom"));
+        assert!(to_toml_string(&d).expect("ser").contains("PER PROJECT"));
+    }
+
+    /// The root is the nearest ancestor holding `.git` (dir or worktree file),
+    /// else the cwd itself.
+    #[test]
+    fn root_is_the_git_ancestor_else_cwd() {
+        let repo = Path::new("/r");
+        let has_git = |p: &Path| p == repo.join(".git");
+        assert_eq!(root_for(Path::new("/r/a/b"), has_git), repo);
+        assert_eq!(root_for(Path::new("/r"), has_git), repo);
+        assert_eq!(root_for(Path::new("/x/y"), |_| false), Path::new("/x/y"));
+    }
+
+    /// PR #2578 review: `newt headless --cwd A` launched from inside B keys on
+    /// A, never on the process cwd B.
+    #[test]
+    fn the_workspace_beats_the_process_cwd() {
+        let has_git = |p: &Path| p == Path::new("/a/.git") || p == Path::new("/b/.git");
+        assert_eq!(
+            key_for(Some(Path::new("/a/sub")), Path::new("/b"), has_git),
+            Path::new("/a")
+        );
+        assert_eq!(key_for(None, Path::new("/b"), has_git), Path::new("/b"));
+        let mut d = doc("");
+        switch(&mut d, "/b", Choice::Provider("y"));
+        assert_eq!(Session::for_project(&d, "/a").provider, None);
     }
 }

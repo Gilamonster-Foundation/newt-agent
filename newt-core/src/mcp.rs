@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent_identity::{Secret, SecretRef};
 use crate::error::{NewtError, Result};
@@ -123,7 +123,8 @@ pub fn resolve_secret_under_trust(value: &SecretValue, trust: McpTrust) -> Resul
                 "a discovered (untrusted) MCP config source (a project `.mcp.json` or \
                  `~/.claude.json`) may not use a `{ env | file | cmd }` secret reference — \
                  only newt-owned config (`config.toml`, `~/.newt/mcp.toml`) may name a command \
-                 to run or a file to read. `newt mcp import` this server to adopt it as trusted."
+                 to run or a file to read. Adopt the server as trusted with `newt mcp import` (the \
+                 untrusted-server refusal names the exact command)."
                     .to_string(),
             )),
         },
@@ -147,20 +148,102 @@ pub enum AdmissionDenied {
     /// the repo. Untrusted config may not spawn a process, dial an endpoint, or
     /// expose tools until it is explicitly approved; no such approval record
     /// exists yet and headless has no interactive path, so it fails closed.
-    UntrustedNotApproved,
+    /// Carries the server and where it came from so the ONE `Display` can name
+    /// the exact `newt mcp import` command that fixes it.
+    UntrustedNotApproved {
+        /// The entry's name — untrusted text, rendered Debug-quoted, and put in a
+        /// command only if it passes [`is_portable_import_name`].
+        server: String,
+        /// Where discovery found it, when known.
+        origin: Option<McpOrigin>,
+    },
 }
 
 impl std::fmt::Display for AdmissionDenied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Disabled => write!(f, "disabled (`enabled = false`)"),
-            Self::UntrustedNotApproved => write!(
+            Self::UntrustedNotApproved { server, origin } => write!(
                 f,
                 "untrusted MCP config not approved — a discovered `.mcp.json` / \
                  `~/.claude.json` / project overlay may not spawn or dial without an \
-                 approval recorded outside the repo; `newt mcp import` to adopt it as trusted"
+                 approval recorded outside the repo; {}",
+                import_fix_hint(server, origin.as_ref())
             ),
         }
+    }
+}
+
+/// Whether `name` may be imported: imported names later participate in tool
+/// prefixes and token-store lookup, so they must be one portable path component
+/// (no separators, traversal aliases, controls, or Windows-reserved punctuation).
+#[must_use]
+pub fn is_portable_import_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let safe_shape = name.len() <= 128
+        && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'));
+    // Tool calls use `server__tool` on the wire. Reject names that contain that
+    // separator either now or after the default hyphen-to-underscore mapping;
+    // otherwise `split_once("__")` routes the call to the wrong server.
+    let unambiguous_namespace = runtime_server_prefix_is_unambiguous(name, false)
+        && runtime_server_prefix_is_unambiguous(name, true);
+    // Windows treats these basenames as devices even when an extension follows
+    // (`CON.json`, `LPT1.meta.json`, ...), so they are not portable token names.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let windows_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    // Win32 strips trailing dots when resolving a path component, so a name
+    // ending in `.` can alias a different token-store filename.
+    safe_shape && unambiguous_namespace && !windows_device && !name.ends_with('.')
+}
+
+/// Quote `arg` for a paste-ready shell command: left bare if it is only
+/// `[A-Za-z0-9._/~+-]`, else single-quoted with embedded `'` escaped as `'\''`.
+#[must_use]
+pub fn shell_quote_arg(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/~+-".contains(c))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+/// The fix for a refused untrusted server: the exact `newt mcp import` command
+/// for where it came from. Never puts an untrusted string into a paste-ready
+/// command: a name that cannot be imported is Debug-quoted (escaping control
+/// bytes) and no command is printed.
+#[must_use]
+pub fn import_fix_hint(server: &str, origin: Option<&McpOrigin>) -> String {
+    if !is_portable_import_name(server) {
+        return format!(
+            "server {server:?} cannot be imported under that name; rename it in its source file"
+        );
+    }
+    match origin {
+        Some(McpOrigin::ClaudeUser) => {
+            format!("adopt it as trusted with `newt mcp import --from-claude --name {server}`")
+        }
+        Some(McpOrigin::File(path)) => format!(
+            "adopt it as trusted with `newt mcp import {} --name {server}`",
+            shell_quote_arg(&path.to_string_lossy())
+        ),
+        None => format!(
+            "adopt server {server:?} as trusted with `newt mcp import` on the file that \
+             defines it (`newt mcp list` shows where each server came from)"
+        ),
     }
 }
 
@@ -201,7 +284,10 @@ pub fn admit(entry: &McpServerEntry) -> std::result::Result<AdmittedServer<'_>, 
     }
     match entry.trust {
         McpTrust::Trusted => Ok(AdmittedServer { entry }),
-        McpTrust::Untrusted => Err(AdmissionDenied::UntrustedNotApproved),
+        McpTrust::Untrusted => Err(AdmissionDenied::UntrustedNotApproved {
+            server: entry.name.clone(),
+            origin: entry.origin.clone(),
+        }),
     }
 }
 
@@ -498,6 +584,22 @@ pub struct McpServerEntry {
     /// and defaults to [`McpTrust::Trusted`] — see [`McpTrust`].
     #[serde(skip)]
     pub trust: McpTrust,
+
+    /// Where a borrowed (untrusted) entry was discovered, so a refusal can name
+    /// the exact `newt mcp import` command for that source. Set at discovery;
+    /// **never serialized**; `None` for newt-owned entries and for borrowed ones
+    /// whose file is not tracked (a resolved project overlay).
+    #[serde(skip)]
+    pub origin: Option<McpOrigin>,
+}
+
+/// The file a borrowed MCP entry came from — enough to build its import command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpOrigin {
+    /// `~/.claude.json` — imported with `newt mcp import --from-claude`.
+    ClaudeUser,
+    /// A project file such as `<workspace>/.mcp.json` — imported by path.
+    File(PathBuf),
 }
 
 impl McpServerEntry {
@@ -1061,6 +1163,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
                         trust: McpTrust::Untrusted,
+                        origin: None,
                     })
                 }
                 (None, Some(command)) => {
@@ -1112,6 +1215,7 @@ pub fn parse_codex_mcp_toml(text: &str) -> Vec<McpServerEntry> {
                         login_argv: Vec::new(),
                         request_timeout_secs: tool_timeout_sec,
                         trust: McpTrust::Untrusted,
+                        origin: None,
                     })
                 }
                 // Neither transport, or both transports at once.
@@ -1454,14 +1558,29 @@ pub fn discover_report_with_namespace_mode(
     if let Some(path) = newt_mcp_toml {
         append(load_newt_mcp_toml(path), McpSource::UserMcpFile);
     }
+    // Borrowed files record where they came from, so a refusal can name the
+    // import command for that exact file.
+    let stamp = |mut entries: Vec<McpServerEntry>, origin: McpOrigin| {
+        for entry in &mut entries {
+            entry.origin = Some(origin.clone());
+        }
+        entries
+    };
     if let Some(home) = home {
         append(
-            load_claude_file(&home.join(".claude.json")),
+            stamp(
+                load_claude_file(&home.join(".claude.json")),
+                McpOrigin::ClaudeUser,
+            ),
             McpSource::ClaudeUser,
         );
     }
+    let project_file = workspace.join(".mcp.json");
     append(
-        load_claude_file(&workspace.join(".mcp.json")),
+        stamp(
+            load_claude_file(&project_file),
+            McpOrigin::File(project_file.clone()),
+        ),
         McpSource::ClaudeProject,
     );
     dedup_report(sources, sanitize_server_names)

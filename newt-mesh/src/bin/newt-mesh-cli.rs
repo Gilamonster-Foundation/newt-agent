@@ -1,12 +1,17 @@
 //! `newt-mesh` CLI binary.
 //!
-//! Two operations:
+//! Operations:
 //!
 //! - `newt-mesh announce` — bind a responder service on the LAN that
 //!   answers `InferenceRequest`s using the local Ollama backend.
 //! - `newt-mesh ask <peer_fp> <prompt>` — resolve a peer by
 //!   fingerprint (full or short prefix) via mDNS, then send it an
 //!   `InferenceRequest` and print the reply.
+//! - `newt-mesh dock-key` — print this installation's dock keys, to copy to
+//!   the other end of a dock.
+//! - `newt-mesh dock <hub-key>@<addr>` — dock this host to an approved hub
+//!   over an uplink it dials, until undocked (K8,
+//!   `docs/decisions/newt_web_docking.md`).
 //!
 //! The trust root is loaded from `~/.agent-mesh/user.key` by default;
 //! both subcommands accept a `--user-key` override.
@@ -91,6 +96,32 @@ enum Command {
         #[arg(long, default_value = "30s")]
         timeout: String,
     },
+    /// Print this installation's dock keys — as a hub and as a host — and
+    /// their words, to copy to the other end of a dock.
+    DockKey {
+        /// The newt state dir (default: the newt config dir, `~/.newt`).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Dock this host to a hub: dial it and serve its dock requests over that
+    /// uplink until the hub is revoked here (`newt dock revoke`), dock exposure
+    /// is disabled (`/dock disable`), or you press Ctrl-C. The first time, the
+    /// host and hub pair by Numeric Comparison: both show a 6-digit code, and
+    /// each side is approved only when its operator confirms the codes match.
+    Dock {
+        /// The hub, as `<hub-key>@<ip>:<port>`: the hub key its
+        /// `newt-mesh dock-key` prints, and its `NEWT_WEB_DOCK_UPLINK_PORT`.
+        hub: String,
+        /// Let the hub inject prompts too (`mirror-inject`). Default: mirror.
+        #[arg(long)]
+        inject: bool,
+        /// A label for the hub in this host's dock registry.
+        #[arg(long, default_value = "hub")]
+        label: String,
+        /// The newt state dir (default: the newt config dir, `~/.newt`).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -122,7 +153,158 @@ async fn main() -> Result<()> {
             user_key,
             timeout,
         } => ask(user_key, peer_fp, prompt, tier, model, max_tokens, timeout).await,
+        Command::DockKey { state_dir } => dock_key(&state_dir_or_default(state_dir)?),
+        Command::Dock {
+            hub,
+            inject,
+            label,
+            state_dir,
+        } => dock(&hub, inject, &label, state_dir_or_default(state_dir)?).await,
     }
+}
+
+/// The newt state dir: `state_dir`, or the newt config dir where `newt dock`
+/// keeps its registry and the operator identity lives.
+fn state_dir_or_default(state_dir: Option<PathBuf>) -> Result<PathBuf> {
+    state_dir
+        .or_else(newt_core::Config::user_config_dir)
+        .context("cannot locate the newt state dir; pass --state-dir")
+}
+
+/// The operator identity and dock instance a dock key is derived from.
+fn dock_identity(state_dir: &std::path::Path) -> Result<(UserKey, String)> {
+    let identity = state_dir.join("identity.pem");
+    let user = UserKey::load(&identity)
+        .with_context(|| format!("load the operator identity {}", identity.display()))?;
+    let instance = newt_mesh::dock_instance(state_dir).context("read the dock instance name")?;
+    Ok((user, instance))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Run the `dock-key` subcommand.
+fn dock_key(state_dir: &std::path::Path) -> Result<()> {
+    let (user, instance) = dock_identity(state_dir)?;
+    println!("dock instance: {instance}");
+    for role in [newt_mesh::DockRole::Hub, newt_mesh::DockRole::Host] {
+        let key = newt_mesh::dock_agent(&user, role, &instance).public_bytes();
+        println!(
+            "{:<4} key: {}\n          words: {}",
+            role.name(),
+            hex(&key),
+            newt_core::dock_registry::pubkey_words(&key).join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// Parse `<hub-key>@<ip>:<port>` into the hub's dial endpoint.
+fn parse_hub(spec: &str) -> Result<newt_mesh::PeerEndpoint> {
+    let (key, addr) = spec
+        .split_once('@')
+        .context("the hub is `<hub-key>@<ip>:<port>`")?;
+    let key = newt_core::dock_registry::decode_agent_pubkey(key)
+        .context("the hub key must be 64 hex characters")?;
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("`{addr}` is not an `<ip>:<port>`"))?;
+    Ok(newt_mesh::PeerEndpoint::new(key, addr))
+}
+
+/// Run the `dock` subcommand.
+async fn dock(hub_spec: &str, inject: bool, label: &str, state_dir: PathBuf) -> Result<()> {
+    use newt_core::dock_registry::{self as registry, DockScope};
+    use newt_mesh::{HubStanding, UplinkState};
+    let hub = parse_hub(hub_spec)?;
+    let hub_key = hub.agent_pubkey;
+    let hub_fp = registry::agent_fingerprint_of_pubkey(&hub_key);
+    if newt_mesh::hub_standing(&state_dir, &hub_fp) == HubStanding::Disabled {
+        anyhow::bail!("dock exposure is disabled on this host (`/dock enable` to allow it)");
+    }
+    let (user, instance) = dock_identity(&state_dir)?;
+    println!(
+        "docking host `{instance}` to hub {}\n  hub words: {}",
+        hub.addr,
+        registry::pubkey_words(&hub_key).join(" ")
+    );
+    let mut uplink = newt_mesh::DockUplink::start(&user, &instance, state_dir.clone(), hub).await?;
+    let mut shown = None;
+    let mut state = uplink.state();
+    loop {
+        println!("uplink: {state:?}");
+        if let Some(pairing) = uplink.pairing().filter(|p| shown.as_ref() != Some(p)) {
+            println!(
+                "pairing code: {}\nThe hub shows this SAME code on `newt dock approve --staged`.",
+                pairing.code
+            );
+            if newt_mesh::hub_standing(&state_dir, &hub_fp) == HubStanding::NotApproved {
+                let scope = if inject {
+                    DockScope::MirrorInject
+                } else {
+                    DockScope::Mirror
+                };
+                let prompt = format!(
+                    "Does the hub show pairing code {}? Approve it here ({})?",
+                    pairing.code,
+                    scope.as_wire()
+                );
+                let confirmed = tokio::task::spawn_blocking(move || confirm_at_terminal(&prompt))
+                    .await
+                    .unwrap_or(false);
+                if !confirmed {
+                    println!("not approved; closing the uplink");
+                    uplink.close().await;
+                    return Ok(());
+                }
+                if uplink.pairing().as_ref() != Some(&pairing) {
+                    // The hub no longer holds the pairing just compared.
+                    println!("the pairing changed while you compared codes; not approved");
+                    continue;
+                }
+                registry::approve_dock_with_identity(
+                    &state_dir.join("config.toml"),
+                    &state_dir.join("identity.pem"),
+                    &hub_fp,
+                    label,
+                    &hex(&hub_key),
+                    scope,
+                    &pairing.transcript_id,
+                )?;
+                println!("approved the hub here; it is served once it promotes this host");
+            }
+            shown = Some(pairing);
+        }
+        if matches!(state, UplinkState::Undocked | UplinkState::Closed) {
+            break;
+        }
+        state = tokio::select! {
+            next = uplink.changed() => next,
+            _ = tokio::signal::ctrl_c() => {
+                println!("closing the uplink…");
+                uplink.close().await;
+                return Ok(());
+            }
+        };
+    }
+    uplink.close().await;
+    if state == UplinkState::Undocked {
+        println!("undocked: this host no longer serves the hub");
+    }
+    Ok(())
+}
+
+/// Ask `question` at this terminal; blank or no terminal declines.
+fn confirm_at_terminal(question: &str) -> bool {
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
+    newt_core::interaction_terminal::confirmed_on_terminal(
+        &window,
+        &newt_core::interaction_form::confirm(question.to_owned(), "", "yes, they match", "no"),
+        false,
+    )
 }
 
 /// Run the `announce` subcommand.
@@ -313,6 +495,17 @@ fn parse_duration(s: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_hub_takes_a_key_and_an_address() {
+        let key = "ab".repeat(32);
+        let hub = parse_hub(&format!("{key}@10.0.0.5:7000")).unwrap();
+        assert_eq!(hub.agent_pubkey, [0xab; 32]);
+        assert_eq!(hub.addr.to_string(), "10.0.0.5:7000");
+        assert!(parse_hub(&format!("{key}10.0.0.5:7000")).is_err(), "no @");
+        assert!(parse_hub("abcd@10.0.0.5:7000").is_err(), "short key");
+        assert!(parse_hub(&format!("{key}@home.lab")).is_err(), "no port");
+    }
 
     #[test]
     fn parse_duration_handles_ms() {

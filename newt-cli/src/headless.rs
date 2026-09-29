@@ -23,8 +23,16 @@
 //!   OCAP stays ON.
 //!   Instead of full access, [`confined_bench_caveats`] seeds a workspace-fenced
 //!   authority — reads/exec/net stay open, but writes are confined to the
-//!   workspace and the container's mutable system roots (a `Scope::Only`
-//!   fs_write, never `Scope::All`). A `Scope::Only` write auto-consents at the
+//!   workspace, the configured scratch root (the platform temp dir unless
+//!   `NEWT_SCRATCH_DIR` / `[scratch] dir` names an absolute one), the private
+//!   managed workspace Build partition under default scratch settings, and explicit
+//!   `NEWT_WRITE_PATHS` grants (a `Scope::Only`
+//!   fs_write, never `Scope::All`). The container's mutable system roots
+//!   (`/usr /usr/local /var /etc /opt /root /home`, the #1487 bench rationale:
+//!   package installs) are OPT-IN: this lane is the default, and a default must
+//!   be safe on a developer host, where `/home` held `~/.rustup`, `~/.ssh` and
+//!   every other checkout. Bench containers pass them via `NEWT_WRITE_PATHS`.
+//!   A `Scope::Only` write auto-consents at the
 //!   tool gate (the preset IS the operator's consent — see
 //!   `tools::confirm_unrestricted_fs_mutation`), so in-fence writes run with no
 //!   prompt. This is the lane the 0.7.6 OCAP-parity gate measures against the
@@ -38,8 +46,8 @@
 //! when Landlock is absent, so a spawned command's writes are then advisory, not
 //! kernel-enforced. Combined with `fs_read = All` + `net = All`, this lane is a
 //! **bench isolation control for disposable containers, not a security sandbox**
-//! against a hostile agent. The fence is also deliberately broad on this first
-//! cut (workspace + standard mutable roots); tightening it is a later ratchet.
+//! against a hostile agent. The fence started broad on its first cut (#1487); the
+//! standard mutable roots have since moved behind an explicit grant.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -84,6 +92,7 @@ pub struct HeadlessArgs {
     /// nothing here re-checks it. Carried rather than re-derived so the record
     /// can state what the run could and could not inherit.
     pub launch: newt_launch::LaunchConfig,
+    /// Initial round allowance; progress renewal follows the configured grace.
     pub max_rounds: Option<usize>,
     /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
     /// Newt gates input at the tighter of `[context].input_ceiling_pct` and the
@@ -114,6 +123,18 @@ pub struct HeadlessArgs {
 /// and the content id of the entries it actually holds — the receipt's `seed`.
 /// Refused here, before any backend work, when the JSON is not an object of
 /// string values or names an empty key (which `state_set` would also refuse).
+/// F16: the model was never told its absolute workspace root — only the
+/// tool schemas said paths are "relative to the workspace root", never what
+/// that root *is*. Observed cost: replay 2488-r6 invented `cwd=/workspace`
+/// (a test-fixture path, not a real one) and burned 30 minutes treating the
+/// resulting "could not find Cargo.toml" as an external blocker. Seed the
+/// driver's transcript with one system message naming the real root, the
+/// same fact `newt-tui`'s interactive loop already states via its
+/// `Workspace: {path}` line (`newt-tui/src/lib.rs`).
+fn workspace_root_system_message(workspace: &str) -> newt_core::MemMessage {
+    newt_core::MemMessage::system(format!("Workspace root: {workspace}"))
+}
+
 fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
     use newt_core::ScratchpadStore;
     let entries: std::collections::BTreeMap<String, String> = serde_json::from_str(json)
@@ -269,22 +290,14 @@ fn headless_principal(
 /// The cognition level this backend can actually receive from Newt. Responses
 /// always has a defined `reasoning.effort` projection; Chat Completions must
 /// explicitly opt into the local generation fields; Ollama has no projection.
-/// The contract and driver both consume this one answer.
+/// This describes wire projection only; the driver retains semantic intent.
 fn projected_cognition(
     cognition: Option<Cognition>,
     kind: BackendKind,
     api: OpenAiApi,
     chat_capability: ChatCompletionsCapability,
 ) -> Option<Cognition> {
-    match (kind, api) {
-        (BackendKind::Openai, OpenAiApi::Responses) => cognition,
-        (BackendKind::Openai, OpenAiApi::ChatCompletions)
-            if chat_capability.cognition == Some(true) =>
-        {
-            cognition
-        }
-        _ => None,
-    }
+    newt_core::agentic::projected_cognition(cognition, kind, api, chat_capability)
 }
 
 /// Run one task headless and emit its trace. Returns the process exit code:
@@ -313,7 +326,10 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             // warn-and-continue.
             resolve_profile(path)?
         }
-        None => newt_core::Config::resolve_runtime_unpublished().context("resolving config")?,
+        None => crate::migration_notices::read(|report| {
+            newt_core::Config::resolve_runtime_unpublished(report)
+        })
+        .context("resolving config")?,
     };
     // NOTHING is published yet: the process-global settings land only after
     // the backend pick + capability sidecar VALIDATE below — a refused
@@ -492,9 +508,15 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.output_allowance = output_allowance;
+    dc.overflow_retry = cfg
+        .find_model_tuning(&model)
+        .and_then(|t| t.overflow_retry)
+        .unwrap_or_default();
     dc.run_allowance = run_allowance;
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
+    dc.responses_capability = decision.responses();
+    dc.openai_api = api;
     dc.reasoning_replay_scope = decision.reasoning_replay_scope();
     // Paired with the line above ON PURPOSE. `headless` resolves the
     // model's capabilities from the same backend the TUI does; omitting this
@@ -509,6 +531,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         newt_core::tenacity::cli_tenacity(),
         args.max_rounds,
     );
+    if let Some(tui) = &cfg.tui {
+        dc.workflow_grace_rounds = tui.workflow_grace_rounds;
+    }
     // OCAP-ON confined lane: replace the default unconfined caveat with a
     // workspace-fenced authority. The tool gate consults `dc.caveats` and the
     // permission_gate stays `None` — an in-fence write auto-consents; an
@@ -516,15 +541,40 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // touches; the driver + tool layer are unchanged.
     let smart_config = cfg.smart_harness.clone().unwrap_or_default();
     let smart_enabled = args.smart_harness || smart_config.enabled;
+    // #2524 item 1: the operator's signed OCAP durable grants, folded into
+    // `dc.caveats` below. Resolved once, outside the `Confined` branch, so the
+    // admitted-grants list is available for the contract record regardless of
+    // lane (empty in the `Yolo` lane, whose `Caveats::top()` has no `Only`
+    // axis to widen).
+    let (ocap_store, ocap_load_warnings) = resolve_ocap_store();
+    for warning in &ocap_load_warnings {
+        eprintln!("newt: OCAP policy: {warning}");
+    }
+    let mut ocap_admitted_grants: Vec<String> = Vec::new();
     if lane == HeadlessLane::Confined {
-        dc.caveats = confined_bench_caveats(&workspace);
+        // Scratch is resolved ONCE, here: it builds the fence AND becomes the
+        // child's `TMPDIR` (the brush child does not inherit newt's ambient env;
+        // the seam delivers this value, and without it the child's tools would
+        // fall back to the platform temp dir, which a configured fence need not
+        // grant).
+        // The smart lane instead keeps only calibrated build paths already
+        // covered by this baseline; it must not gain an external scratch grant.
+        let scratch = resolve_fence_scratch(std::path::Path::new(&workspace));
+        if let (false, Some(root)) = (smart_enabled, scratch.first()) {
+            // Same single-threaded-at-this-point contract as the lane's other
+            // env writes above.
+            unsafe { std::env::set_var("NEWT_CHILD_TMPDIR", root) };
+        }
+        dc.caveats = confined_bench_caveats(&workspace, &scratch);
+        let scoped = newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
+        calibrate_headless_filesystem(&mut dc.caveats, &scoped, smart_enabled);
         if smart_enabled {
-            let scoped =
-                newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
-            dc.caveats.fs_read = scoped.fs_read;
-            dc.caveats.fs_write = scoped.fs_write;
             newt_core::caveats::apply_cli_fs_grants(&mut dc.caveats, &workspace);
         }
+        // Fold AFTER the lane's own fence (and any smart-lane narrowing +
+        // explicit CLI grants) is in place, so a durable grant widens the
+        // final fence rather than one a later step immediately re-narrows.
+        ocap_admitted_grants = fold_ocap_grants(&mut dc.caveats, &ocap_store);
     }
     let launch = smart_launch(&args.launch, smart_enabled, args.hermetic_explicit);
     anyhow::ensure!(
@@ -602,12 +652,14 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         apply_context_window(&mut dc, cw);
     }
     // Captured before `dc` moves into the driver: the cap the run ACTUALLY
-    // uses (post `--max-rounds`), for the contract's effective_config.
+    // uses initially (post `--max-rounds`), for the contract's effective_config.
     let max_rounds = dc.max_tool_rounds as u32;
-    let mut driver = TurnDriver::new(dc)
-        .with_cognition(cognition)
-        .with_tenacity(runtime.tenacity)
-        .with_initiative(runtime.initiative);
+    let read_scope = dc.caveats.fs_read.clone();
+    let mut driver =
+        TurnDriver::with_transcript(dc, vec![workspace_root_system_message(&workspace)])
+            .with_cognition(runtime.cognition)
+            .with_tenacity(runtime.tenacity)
+            .with_initiative(runtime.initiative);
     if runtime.crew {
         driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
             // The crew runner needs an owned flattened Config; the
@@ -625,6 +677,70 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     } else {
         "off"
     };
+    // #2552 round 3 (F26 v4): decide WHERE `workspace` sits relative to a
+    // repo — its own toplevel, a SUBDIRECTORY of a larger one, or no repo at
+    // all — ONCE, and make every git source below obey the SAME three-way
+    // decision. Round 1's bug was `status_before.is_none()` (a symptom) and
+    // `GitEngine::open(workspace).is_some()` (a DIFFERENT, upward-discovering
+    // check) disagreeing. Round 2 collapsed "subdirectory" and "not a repo"
+    // into one case and dropped subtree-scoped status entirely for it — round
+    // 2's review: that re-creates the exact "nothing changed" bug this PR
+    // fixes for the everyday `--cwd repo/crate` invocation, which has no
+    // nested repos of its own to fall back on.
+    let repo_location = newt_core::agentic::locate_workspace_repo(&workspace, &read_scope);
+    // U7: the workspace's changed-path set at run start, diffed against the same
+    // probe at exit so the hand-back names what THIS run changed, not prior dirt.
+    // `Root`-shaped only at the repo's own toplevel; `None` off-repo. A
+    // subdirectory's own (subtree-scoped) delta is computed later, in
+    // `files_changed_delta`, since it needs the prefix AND an `after` probe.
+    let status_before = matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot
+    )
+    .then(|| newt_core::agentic::snapshot_workspace(&workspace, &read_scope))
+    .flatten();
+    // #2552 round 3: the subtree-scoped equivalent of `status_before`, for a
+    // workspace that is a SUBDIRECTORY of a larger repo — restores F26 v2's
+    // scoping as a real third case rather than dropping it (round 2's
+    // review: dropping it re-creates the "nothing changed" bug this PR fixes
+    // for the everyday `--cwd repo/crate` invocation).
+    let subtree_before = match &repo_location {
+        newt_core::agentic::WorkspaceRepoLocation::InsideRepo { prefix } => {
+            newt_core::agentic::snapshot_workspace_subtree(&workspace, prefix, &read_scope)
+        }
+        _ => None,
+    };
+    // Multi-repo recon PR2: nested first-level repos can exist whether
+    // `workspace` is a subdirectory of a larger repo OR not a repo at all —
+    // gated on NOT being the repo's own toplevel, same as `status_before`'s
+    // complement, never on whether a status snapshot came back.
+    let nested_before = (!matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot
+    ))
+    .then(|| newt_core::agentic::snapshot_nested_repos(&workspace, &read_scope));
+    // #2537: HEAD before the run, via newt-git's OWN embedded engine (never a
+    // shelled-out `git`) — the baseline the hand-back diffs against to name
+    // commit(s) this run actually produced. The engine is opened whenever
+    // `workspace` is inside SOME repo (own root OR a subdirectory of one) —
+    // `commits`/HEAD use ONLY the engine's `head_snapshot`/`commits_since`
+    // (run-window commit IDs, no path content), never its STATUS methods, so
+    // opening it for a subdirectory of a larger repo cannot leak a path
+    // (#2552 round 3: an unannounced commit to the enclosing repo is exactly
+    // what an operator running from `repo/crate` most needs to see). `None`
+    // off-repo, or when the read scope can't open the legacy engine (bounded
+    // fs_read); the hand-back then reports "unavailable"/omits `commits`,
+    // never a guess.
+    let head_before = (!matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::NotARepo
+    ))
+    .then(|| newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok())
+    .flatten()
+    .and_then(|e| {
+        e.head_snapshot(&newt_core::git_caveats::GitCaveats::read_only())
+            .ok()
+    });
     let started = Instant::now();
     driver
         .submit(instruction.trim())
@@ -670,7 +786,19 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // the agent as having done nothing). `Err` is only a spawn/thread failure
     // with no trajectory at all.
     let o_opt = outcome.as_ref().ok();
-    let clean = matches!(&outcome, Ok(o) if o.error.is_none());
+    // A failed `head()` used to `?`-return before ANY record was written. It is
+    // now a failed run that still hands back its record (U7).
+    let head_error = match (&mut smart_manifest, &smart_harness) {
+        (Some(manifest), Some(harness)) => match harness.head() {
+            Ok(head) => {
+                manifest["head"] = serde_json::json!(head.to_string());
+                None
+            }
+            Err(e) => Some(format!("smart-harness head unavailable: {e}")),
+        },
+        _ => None,
+    };
+    let clean = head_error.is_none() && matches!(&outcome, Ok(o) if o.error.is_none());
     // ONE derivation, two renderings (#2212). `outcome` is decided first and
     // `status` is a function of it, so the trace line and the contract record
     // cannot disagree about whether the turn finished. They used to be
@@ -687,16 +815,13 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     );
     let outcome_label = headless_contract::outcome_label(terminal);
     let status = headless_contract::status_label(terminal);
-    let error = match &outcome {
+    let error = head_error.or_else(|| match &outcome {
         Ok(o) => o.error.clone(),
         Err(e) => Some(e.clone()),
-    };
+    });
     let reply_chars = o_opt.map(|o| o.reply.len()).unwrap_or(0);
     let usage = o_opt.and_then(|o| o.usage.as_ref().map(|u| u.total()));
     let halluc = o_opt.map(|o| o.hallucinations).unwrap_or(0);
-    if let (Some(manifest), Some(harness)) = (&mut smart_manifest, &smart_harness) {
-        manifest["head"] = serde_json::json!(harness.head()?.to_string());
-    }
     // The per-tool trajectory — the material for the failure taxonomy. The
     // single highest-signal field is `write_calls`: a failed task with 0 writes
     // never ACTED (the initiative target); with writes it acted but wrong. Only
@@ -721,6 +846,56 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         }
         None => (0, 0, None, "None".to_string(), serde_json::Value::Null),
     };
+    // #2537: hand-back commit truth. Re-open the embedded engine at exit
+    // (the working tree may have changed under an already-open handle) and
+    // ask its OWN `status`/`log` — never a shelled-out `git` — for what this
+    // run left dirty and what it committed. The repo location is re-checked
+    // fresh (in case the run itself `git init`ed the workspace — #2552 round
+    // 2). The engine is opened whenever `workspace` is inside SOME repo (own
+    // root OR a subdirectory of one — #2552 round 3), but its STATUS methods
+    // (`uncommitted_paths`) are used ONLY at the repo's own toplevel:
+    // `GitEngine::open` discovers upward exactly like the shelled `git` did
+    // before F26, so its unscoped status would hand a workspace-subdirectory
+    // run the ENCLOSING repo's dirty set (#2552 round 2 blocker 1) — a
+    // subdirectory's current dirty set instead comes from
+    // `snapshot_workspace_subtree` inside `uncommitted_repo_file_list`,
+    // below. The engine's `commits_since` carries only run-window commit
+    // IDs, never path content, so it IS safe to use for a subdirectory too
+    // (round 3: an unannounced commit to the enclosing repo is what an
+    // operator running from `repo/crate` most needs to see).
+    let git_caveats = newt_core::git_caveats::GitCaveats::read_only();
+    let repo_location = newt_core::agentic::locate_workspace_repo(&workspace, &read_scope);
+    let is_root_repo = matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot
+    );
+    let git_engine = (!matches!(
+        repo_location,
+        newt_core::agentic::WorkspaceRepoLocation::NotARepo
+    ))
+    .then(|| newt_git::GitEngine::open(std::path::Path::new(&workspace), &read_scope).ok())
+    .flatten();
+    let uncommitted_at_exit = is_root_repo
+        .then(|| {
+            git_engine
+                .as_ref()
+                .and_then(|e| uncommitted_paths(e, &git_caveats))
+        })
+        .flatten();
+    let uncommitted_delta = uncommitted_repo_file_list(
+        uncommitted_at_exit,
+        &repo_location,
+        &nested_before,
+        &workspace,
+        &read_scope,
+    );
+    let commits_this_run = git_engine.as_ref().and_then(|engine| {
+        commits_since(
+            engine,
+            &git_caveats,
+            head_before.as_ref().and_then(|h| h.head.as_deref()),
+        )
+    });
     let mut record = serde_json::json!({
         "kind": "solve_result",
         "task_file": instruction_file.to_string_lossy(),
@@ -767,6 +942,23 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         "resume_from": launch.continuity.parent_frame(),
         "trajectory": trajectory,
         "error": error,
+        // Harness-written, never the model's claim; solve_result only (the
+        // contract record is field-pinned). Carries no hash or id.
+        "handback": headless_contract::handback(
+            files_changed_delta(
+                &status_before,
+                &subtree_before,
+                &repo_location,
+                &nested_before,
+                &workspace,
+                &read_scope,
+            ),
+            o_opt.map_or(&[][..], |o| &o.tool_events[..]),
+            &end_reason,
+            reply_chars > 0,
+            uncommitted_delta,
+            commits_this_run.clone(),
+        ),
     });
     headless_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
     // #2313: per-attempt usage, and the attempt ledger's chain lines ahead of
@@ -833,6 +1025,9 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             tenacity: tenacity_level,
             initiative: initiative_level,
             cognition: cognition_level,
+            semantic_cognition: o_opt.map(|o| o.semantic_cognition),
+            responses_capability: o_opt.and_then(|o| o.responses_capability.as_ref()),
+            reasoning_effort: o_opt.and_then(|o| o.reasoning_effort),
             crew: crew_level,
             ocap: if lane == HeadlessLane::Yolo {
                 "off"
@@ -848,6 +1043,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
             output_allowance: o_opt.and_then(|o| o.output_allowance),
             run_allowance,
             features: o_opt.map(|o| o.features),
+            durable_grants: &ocap_admitted_grants,
             // The headless driver always arms action nudges; whether the loop
             // has a gate at all depends on the wire and SmartHarness.
             verification: Some(newt_core::agentic::verification_receipt(
@@ -897,7 +1093,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
 /// publish explicitly.
 fn resolve_profile(path: &std::path::Path) -> Result<newt_core::ResolvedConfig> {
     use anyhow::Context as _;
-    Config::load(path)
+    crate::migration_notices::read(|report| Config::load(path, report))
         .with_context(|| format!("loading --profile {}", path.display()))?
         .prepare_runtime()
         .with_context(|| format!("preparing --profile {}", path.display()))
@@ -961,22 +1157,20 @@ fn pick_backend(
 ///
 /// Reads / exec / net stay fully open (a bench task legitimately reads the
 /// whole tree, runs arbitrary toolchains, and installs packages over the
-/// network), but **writes are fenced** to the workspace plus the mutable system
-/// roots a container's package managers and toolchains need (`/tmp`, `/usr`,
-/// `/usr/local`, `/var`, `/etc`, `/opt`, `/root`, `/home`) — plus any per-task
-/// `NEWT_WRITE_PATHS` grant. The fence is a `Scope::Only`, **never**
-/// `Scope::All`: that is the whole point of the lane (a `Scope::Only` write
-/// auto-consents at the tool gate, so in-fence writes run promptless while a
-/// write to an un-granted absolute path fails closed), and it is what the 0.7.6
-/// OCAP-parity gate measures. The fence is deliberately broad on this first cut
-/// so parity isolates *"does routing every op through the caveat lattice + the
-/// bridled shell break tasks?"* from *"is the fence too tight?"*; tightening
-/// per-task is a later ratchet.
+/// network), but **writes are fenced** to the workspace, the configured scratch
+/// root (see [`fence_scratch_roots`]) and any explicit `NEWT_WRITE_PATHS` grant.
+/// The mutable system roots and `$HOME` are opt-in by grant (#1487's bench
+/// rationale preserved: a container passes them; a default must be safe on a
+/// developer host). The fence is a `Scope::Only`, **never** `Scope::All`: that is
+/// the whole point of the lane (a `Scope::Only` write auto-consents at the tool
+/// gate, so in-fence writes run promptless while a write to an un-granted
+/// absolute path fails closed), and it is what the 0.7.6 OCAP-parity gate
+/// measures.
 ///
 /// Matching at the enforcement site (`tools::tui_permits_path`) is by
 /// lexically-normalized path **prefix**, so a root entry covers everything
 /// beneath it (`/usr` grants `/usr/lib/python3/...`).
-fn confined_bench_caveats(workspace: &str) -> Caveats {
+fn confined_bench_caveats(workspace: &str, scratch: &[String]) -> Caveats {
     // The per-task extra write grants the harness may pass (same env the
     // interactive `--write` grants flow through). `split_paths` keeps a Windows
     // drive-letter grant intact rather than shattering it on `:`. Read here so
@@ -990,27 +1184,277 @@ fn confined_bench_caveats(workspace: &str) -> Caveats {
                 .collect()
         })
         .unwrap_or_default();
-    confined_bench_caveats_with_grants(workspace, &extra)
+    confined_bench_caveats_with_grants(workspace, scratch, &extra)
+}
+
+/// Smart isolation narrows the startup fence; calibration cannot grant a new
+/// scratch or toolchain path. The ordinary lane keeps its baseline and names
+/// already-covered Build roots explicitly because Build admission uses the
+/// lattice's exact-set `leq`, while filesystem grants cover descendants.
+/// Neither projection creates scratch or bypasses per-invocation Build admission.
+fn calibrate_headless_filesystem(baseline: &mut Caveats, build: &Caveats, smart: bool) {
+    for (scope, requested) in [
+        (&mut baseline.fs_read, &build.fs_read),
+        (&mut baseline.fs_write, &build.fs_write),
+    ] {
+        let covered = headless_fs_intersection(scope, requested);
+        if smart {
+            *scope = covered;
+        } else if let (Scope::Only(roots), Scope::Only(covered)) = (scope, covered) {
+            roots.extend(covered);
+        }
+    }
+}
+
+fn headless_fs_intersection(left: &Scope<String>, right: &Scope<String>) -> Scope<String> {
+    use newt_core::caveats::permits_path;
+    let (Scope::Only(left), Scope::Only(right)) = (left, right) else {
+        return if matches!(left, Scope::All) {
+            right.clone()
+        } else {
+            left.clone()
+        };
+    };
+    let mut covered = std::collections::BTreeSet::new();
+    for (candidates, allowed) in [(left, right), (right, left)] {
+        let physical = Scope::only(
+            allowed
+                .iter()
+                .filter_map(|path| resolve_headless_grant(path)),
+        );
+        covered.extend(
+            candidates
+                .iter()
+                .filter(|path| {
+                    resolve_headless_grant(path).is_some_and(|path| permits_path(&physical, &path))
+                })
+                .cloned(),
+        );
+    }
+    // Keep the exact declared spelling for Build's set-based admission check.
+    Scope::Only(covered)
+}
+
+/// Read-only admission check for an uncreated path, including canonical aliases
+/// such as macOS `/tmp`. An existing symlink must resolve; never walk past a
+/// dangling link or a permissions error. Runtime object-bound checks remain the
+/// executor's responsibility, including managed scratch's held directory leases.
+fn resolve_headless_grant(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let suffix = path.strip_prefix(ancestor).ok()?;
+                if suffix
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return None;
+                }
+                return Some(
+                    ancestor
+                        .canonicalize()
+                        .ok()?
+                        .join(suffix)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// The fence's scratch root(s), resolved at run start. Scratch is CONFIGURATION
+/// (`NEWT_SCRATCH_DIR` / `[scratch] dir`, via the existing resolver). With
+/// default scratch settings the policy also names the exact managed Build
+/// partition, which can live outside the platform temp root. An operator Build
+/// override must already be covered by the configured fence or explicit grants.
+fn resolve_fence_scratch(workspace: &std::path::Path) -> Vec<String> {
+    let managed = newt_core::scratch::build_scratch_override()
+        .is_none()
+        .then(|| newt_core::confined_exec::build_scratch_root(workspace));
+    fence_scratch_roots(
+        &newt_core::scratch::scratch_dir(),
+        &std::env::temp_dir(),
+        managed.as_deref(),
+    )
+}
+
+/// The fence's scratch root(s): the configured scratch dir when it is ABSOLUTE
+/// (an operator relocated it, e.g. to `/var/tmp` or a PVC), else the platform
+/// temp dir (`temp_dir`, which honours `TMPDIR`) plus the exact managed Build
+/// partition, when no Build override is configured. The temp root stays first:
+/// ordinary commands continue to use it as their `TMPDIR`. A relative scratch
+/// dir already lives inside the workspace and uses this default temp policy.
+/// Pure; no directory is allocated and no shared Build parent is granted.
+fn fence_scratch_roots(
+    scratch_dir: &str,
+    temp_dir: &std::path::Path,
+    managed_build: Option<&std::path::Path>,
+) -> Vec<String> {
+    if std::path::Path::new(scratch_dir).is_absolute() {
+        vec![scratch_dir.to_string()]
+    } else {
+        let mut roots = vec![temp_dir.to_string_lossy().into_owned()];
+        roots.extend(managed_build.map(|path| path.to_string_lossy().into_owned()));
+        roots
+    }
+}
+
+/// Fold this run's VERIFIED OCAP `approve.toml` entries (#2524 item 1) into
+/// `caveats`: attenuate-only, never a bypass. `newt_core::widen_caveats`
+/// only ever *inserts into an already-`Scope::Only` axis* — an axis left at
+/// `Scope::All` (reads/exec/net in the default confined lane,
+/// [`confined_bench_caveats`]) is untouched, so folding can never turn an
+/// open axis into something narrower, and it can never turn a fenced axis
+/// open either. It only reaches a fenced (`Scope::Only`) axis — exactly the
+/// smart-harness lane's `confined_exec::build_tool_caveats` fence, the
+/// "canvas" case the brief names (a child MCP server needs a path outside the
+/// workspace opened in `fs_read`).
+///
+/// `store` must already be the output of [`newt_core::ocap_store::load_store`],
+/// which drops any unsigned/bad-signature approve loudly at load
+/// (fail-closed); this only re-shapes what survived that check via
+/// [`newt_core::ocap_store::approved_grants`] (pure), so it never itself
+/// widens past what the signature covers, and it never even sees an
+/// unverified entry to fold. Returns the admitted grants as
+/// `"<axis>:<target>"` labels for the contract receipt (#2524 item 1
+/// observability requirement) — never invents a second receipt shape.
+fn fold_ocap_grants(
+    caveats: &mut Caveats,
+    store: &newt_core::ocap_store::PolicySet,
+) -> Vec<String> {
+    // Defence in depth (#2532 review, should-fix 2): `load_store` only checks
+    // the signature, not danger — `sign_ocap` refuses a High-danger target
+    // today, but a differently-signed store (an older build, a script with
+    // the key) is not re-checked here. Filter through the SAME production
+    // danger predicate `sign_ocap` already blesses against, so headless can
+    // never admit a signed `/`/`$HOME`/interpreter grant the TUI would drop
+    // (`recalled_grants`, `permissions.rs`).
+    let is_high_danger = newt_tui::ocap_high_danger_predicate();
+    let grants: Vec<_> = newt_core::ocap_store::approved_grants(store)
+        .into_iter()
+        .filter(|(kind, target)| !is_high_danger(denial_kind_to_capability_class(*kind), target))
+        .collect();
+    if grants.is_empty() {
+        return Vec::new();
+    }
+    // Contract honesty (#2532 review, item 3): a grant onto an axis that is
+    // already `Scope::All` (or already covers this exact target) changes
+    // nothing — recording it plainly as "admitted" implies the operator's
+    // signature is why the tool can act, when the confined lane already
+    // allowed it. Check "would this actually widen?" BEFORE folding (the
+    // same `CaveatsExt::permits_*` the enforcement path checks against) and
+    // label a no-op instead of dropping it, so the store entry is still
+    // visible on the contract but not mistaken for the reason access worked.
+    let already_permitted: Vec<_> = grants
+        .iter()
+        .map(|(kind, target)| grant_already_permitted(caveats, *kind, target))
+        .collect();
+    *caveats = newt_core::widen_caveats(caveats, &grants);
+    grants
+        .into_iter()
+        .zip(already_permitted)
+        .map(|((kind, target), no_op)| {
+            let label = format!("{}:{target}", ocap_grant_axis_label(kind));
+            if no_op {
+                format!("{label} (no-op: already permitted)")
+            } else {
+                label
+            }
+        })
+        .collect()
+}
+
+/// Would folding this grant change anything? Mirrors [`CaveatsExt`]'s
+/// per-axis check so the contract only records a grant that actually widened
+/// a fenced axis (see [`fold_ocap_grants`]).
+fn grant_already_permitted(caveats: &Caveats, kind: newt_core::DenialKind, target: &str) -> bool {
+    use newt_core::caveats::CaveatsExt;
+    match kind {
+        newt_core::DenialKind::FsRead => caveats.permits_fs_read(target),
+        newt_core::DenialKind::FsWrite => caveats.permits_fs_write(target),
+        newt_core::DenialKind::Exec => caveats.permits_exec(target),
+        newt_core::DenialKind::Net => caveats.permits_net(target),
+        _ => false,
+    }
+}
+
+/// Map an [`approved_grants`](newt_core::ocap_store::approved_grants) axis
+/// back to the [`CapabilityClass`](newt_core::ocap_store::CapabilityClass)
+/// `ocap_high_danger_predicate` expects. `FsRead` and `FsWrite` both fold to
+/// `Fs` — the predicate already classifies fs as a write (the conservative
+/// reading of a durable fs grant); the axes this function never sees
+/// (`RemoteTool`/`GitWrite`/`Build`) are not produced by `approved_grants`.
+fn denial_kind_to_capability_class(
+    kind: newt_core::DenialKind,
+) -> newt_core::ocap_store::CapabilityClass {
+    match kind {
+        newt_core::DenialKind::Exec => newt_core::ocap_store::CapabilityClass::Exec,
+        newt_core::DenialKind::Net => newt_core::ocap_store::CapabilityClass::Net,
+        _ => newt_core::ocap_store::CapabilityClass::Fs,
+    }
+}
+
+/// The contract-record axis label for a folded grant — `newt_core::DenialKind`
+/// has no `Display`/label of its own outside the danger table, and this is
+/// the one place that needs a short, stable string.
+fn ocap_grant_axis_label(kind: newt_core::DenialKind) -> &'static str {
+    match kind {
+        newt_core::DenialKind::Exec => "exec",
+        newt_core::DenialKind::FsRead => "fs_read",
+        newt_core::DenialKind::FsWrite => "fs_write",
+        newt_core::DenialKind::Net => "net",
+        newt_core::DenialKind::RemoteTool => "remote_tool",
+        newt_core::DenialKind::GitWrite => "git_write",
+        newt_core::DenialKind::Build => "build",
+    }
+}
+
+/// Load the GLOBAL operator OCAP store (`~/.newt/ocap/*.toml`, via
+/// `Config::user_config_path` — **never** a repo `.newt/config.toml**: the
+/// ambient/project config path is a different resolver entirely, so this
+/// simply never consults it, the same guard class as the lifecycle-pin
+/// ambient-config exclusion). A missing config dir (no `$HOME`, isolated
+/// test env with nothing configured) yields an empty store, not an error —
+/// headless without OCAP configured behaves exactly as it does today.
+fn resolve_ocap_store() -> (newt_core::ocap_store::PolicySet, Vec<String>) {
+    let Some(config_path) = newt_core::Config::user_config_path() else {
+        return (newt_core::ocap_store::PolicySet::default(), Vec::new());
+    };
+    // Read-only: `load_user_key` errors (never mints) when the key is absent,
+    // so a headless run on a fresh host/CI/scratch `--config-dir` never
+    // writes an identity.pem as a side effect of checking for approves — "no
+    // key" folds down to "no approves", already `load_store`'s rule for a
+    // missing/invalid root key.
+    let root_vk = newt_identity::default_key_path()
+        .ok()
+        .and_then(|p| newt_identity::load_user_key(&p).ok())
+        .map(|user| user.public().as_bytes());
+    newt_core::ocap_store::load_store(&config_path, root_vk)
 }
 
 /// Pure core of [`confined_bench_caveats`]: the workspace fence plus explicit
 /// extra write roots, with no environment access (so it is deterministic and
 /// parallel-safe to test).
-fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[String]) -> Caveats {
-    let mut write_roots: Vec<String> = [
-        workspace,
-        "/tmp",
-        "/usr",
-        "/usr/local",
-        "/var",
-        "/etc",
-        "/opt",
-        "/root",
-        "/home",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+fn confined_bench_caveats_with_grants(
+    workspace: &str,
+    scratch_roots: &[String],
+    extra_write_roots: &[String],
+) -> Caveats {
+    // The workspace, the resolved scratch root(s) passed in, and explicit grants.
+    // `$HOME`, `/root` and the system roots are OPT-IN via `NEWT_WRITE_PATHS`: a
+    // confined `run_command` once rewrote the operator's `~/.rustup` because
+    // `/home` was a built-in root. Disposable bench containers that need package
+    // installs ask for the broad roots.
+    let mut write_roots: Vec<String> = vec![workspace.to_string()];
+    write_roots.extend(scratch_roots.iter().cloned());
     write_roots.extend(extra_write_roots.iter().cloned());
     // Built axis-by-axis rather than narrowing `Caveats::top()`: a headless
     // dispatch path must not even MENTION `Caveats::top()` (the `#94` no-top-leak
@@ -1026,10 +1470,314 @@ fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[Stri
     }
 }
 
+/// The union/per-repo/unprobed shape shared by [`nested_delta_by_repo`] and
+/// [`nested_current_by_repo`] — one named struct instead of a 3-element
+/// tuple (`clippy::type_complexity`).
+struct NestedByRepo {
+    files: Vec<String>,
+    by_repo: Vec<(String, Vec<String>)>,
+    unprobed: Vec<String>,
+}
+
+/// `(files, by_repo)` for a nested-repo DELTA, shared by [`files_changed_delta`]'s
+/// `NotARepo` and `InsideRepo` branches — the ONE place that turns
+/// `nested_files_changed_between` plus a per-repo diff into the `by_repo`
+/// breakdown, so the two branches cannot drift in how they compute it.
+fn nested_delta_by_repo(
+    before: &[newt_core::agentic::NestedRepoSnapshot],
+    after: &[newt_core::agentic::NestedRepoSnapshot],
+) -> NestedByRepo {
+    let (files, unprobed) = newt_core::agentic::nested_files_changed_between(before, after);
+    let by_repo = after
+        .iter()
+        .map(|repo| {
+            let before_status = before
+                .iter()
+                .find(|b| b.repo == repo.repo)
+                .and_then(|b| b.status.as_ref());
+            let files = match (before_status, repo.status.as_ref()) {
+                (Some(b), Some(a)) => newt_core::agentic::files_changed_between(b, a),
+                _ => Vec::new(),
+            };
+            (repo.repo.clone(), files)
+        })
+        .collect();
+    NestedByRepo {
+        files,
+        by_repo,
+        unprobed,
+    }
+}
+
+/// `(files, by_repo)` for a nested-repo CURRENT set (not a delta), shared by
+/// [`uncommitted_repo_file_list`]'s `NotARepo` and `InsideRepo` branches.
+fn nested_current_by_repo(snapshots: &[newt_core::agentic::NestedRepoSnapshot]) -> NestedByRepo {
+    let (files, unprobed) = newt_core::agentic::nested_current_paths(snapshots);
+    let by_repo = snapshots
+        .iter()
+        .map(|repo| {
+            let files = repo
+                .status
+                .as_ref()
+                .map(|s| s.keys().cloned().collect())
+                .unwrap_or_default();
+            (repo.repo.clone(), files)
+        })
+        .collect();
+    NestedByRepo {
+        files,
+        by_repo,
+        unprobed,
+    }
+}
+
+/// Multi-repo recon PR2 / #2552 round 3: the hand-back's `files_changed`
+/// input — the workspace root's own status DELTA when it IS a repo toplevel
+/// (unchanged), the SUBTREE-scoped delta (workspace-relative, UNION'd with
+/// any nested repos the subdirectory itself contains) when it is a
+/// subdirectory of a larger repo, or the union of nested-repo deltas alone
+/// when it is not a repo at all. `nested_before` empty/`None` at either
+/// non-root case, with no subtree edit either, stays `"unavailable"`,
+/// matching the `None`-means-nothing-to-report convention rather than
+/// fabricating an empty list.
+fn files_changed_delta(
+    status_before: &Option<newt_core::agentic::StatusSnapshot>,
+    subtree_before: &Option<newt_core::agentic::StatusSnapshot>,
+    repo_location: &newt_core::agentic::WorkspaceRepoLocation,
+    nested_before: &Option<Vec<newt_core::agentic::NestedRepoSnapshot>>,
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> Option<headless_contract::RepoFileList> {
+    if let Some(before) = status_before {
+        let after = newt_core::agentic::snapshot_workspace(workspace, read_scope)?;
+        return Some(headless_contract::RepoFileList::Root(
+            newt_core::agentic::files_changed_between(before, &after),
+        ));
+    }
+    if let newt_core::agentic::WorkspaceRepoLocation::InsideRepo { prefix } = repo_location {
+        let before = subtree_before.as_ref()?;
+        let after = newt_core::agentic::snapshot_workspace_subtree(workspace, prefix, read_scope)?;
+        let mut files = newt_core::agentic::files_changed_between(before, &after);
+        let (by_repo, unprobed) = match nested_before.as_ref() {
+            Some(nb) if !nb.is_empty() => {
+                let after_nested = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+                let nested = nested_delta_by_repo(nb, &after_nested);
+                files.extend(nested.files);
+                (nested.by_repo, nested.unprobed)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        files.sort();
+        return Some(headless_contract::RepoFileList::Subtree {
+            files,
+            by_repo,
+            unprobed,
+        });
+    }
+    let before = nested_before.as_ref()?;
+    if before.is_empty() {
+        return None;
+    }
+    let after = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+    let nested = nested_delta_by_repo(before, &after);
+    Some(headless_contract::RepoFileList::Nested {
+        files: nested.files,
+        by_repo: nested.by_repo,
+        unprobed: nested.unprobed,
+    })
+}
+
+/// Multi-repo recon PR2 / #2552 round 3: the hand-back's `uncommitted_files`
+/// input — the workspace root's CURRENT dirty set (via the embedded git
+/// engine, unchanged) at a repo toplevel, the SUBTREE-scoped current set
+/// (UNION'd with any nested repos the subdirectory itself contains) at a
+/// subdirectory of a larger repo, or the union of each nested repo's own
+/// current dirty set alone when there is no repo at all.
+fn uncommitted_repo_file_list(
+    uncommitted_at_exit: Option<Vec<String>>,
+    repo_location: &newt_core::agentic::WorkspaceRepoLocation,
+    nested_before: &Option<Vec<newt_core::agentic::NestedRepoSnapshot>>,
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> Option<headless_contract::RepoFileList> {
+    match repo_location {
+        newt_core::agentic::WorkspaceRepoLocation::OwnRoot => {
+            uncommitted_at_exit.map(headless_contract::RepoFileList::Root)
+        }
+        newt_core::agentic::WorkspaceRepoLocation::InsideRepo { prefix } => {
+            let subtree =
+                newt_core::agentic::snapshot_workspace_subtree(workspace, prefix, read_scope)?;
+            let mut files: Vec<String> = subtree.into_keys().collect();
+            let (by_repo, unprobed) = match nested_before.as_ref() {
+                Some(nb) if !nb.is_empty() => {
+                    let snapshots =
+                        newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+                    let nested = nested_current_by_repo(&snapshots);
+                    files.extend(nested.files);
+                    (nested.by_repo, nested.unprobed)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            files.sort();
+            Some(headless_contract::RepoFileList::Subtree {
+                files,
+                by_repo,
+                unprobed,
+            })
+        }
+        newt_core::agentic::WorkspaceRepoLocation::NotARepo => {
+            let before = nested_before.as_ref()?;
+            if before.is_empty() {
+                return None;
+            }
+            let snapshots = newt_core::agentic::snapshot_nested_repos(workspace, read_scope);
+            let nested = nested_current_by_repo(&snapshots);
+            Some(headless_contract::RepoFileList::Nested {
+                files: nested.files,
+                by_repo: nested.by_repo,
+                unprobed: nested.unprobed,
+            })
+        }
+    }
+}
+
+/// #2537: the workspace's CURRENT staged+unstaged+untracked paths, sorted
+/// and deduplicated — the hand-back's "uncommitted at exit" list. `None`
+/// only when `engine.status` itself fails (the caller already turns "no
+/// repo at all" into `None` by `GitEngine::open` failing first).
+fn uncommitted_paths(
+    engine: &newt_git::GitEngine,
+    caveats: &newt_core::git_caveats::GitCaveats,
+) -> Option<Vec<String>> {
+    let s = engine.status(caveats).ok()?;
+    let mut paths: Vec<String> = s
+        .staged
+        .iter()
+        .chain(s.unstaged.iter())
+        .map(|f| f.path.clone())
+        .chain(s.untracked)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+/// #2537: commit id(s) created since `before_oid`, on whatever ref is
+/// currently checked out — works the same under a detached HEAD, since
+/// [`newt_git::GitEngine::head_snapshot`] reads it either way. `Some(vec![])`
+/// when HEAD did not move (nothing to commit); `None` when either endpoint
+/// could not be resolved (no prior HEAD to diff from — an unborn repo, or
+/// the engine could not be opened at all).
+fn commits_since(
+    engine: &newt_git::GitEngine,
+    caveats: &newt_core::git_caveats::GitCaveats,
+    before_oid: Option<&str>,
+) -> Option<Vec<String>> {
+    let before_oid = before_oid?;
+    let after_oid = engine.head_snapshot(caveats).ok()?.head?;
+    if after_oid == before_oid {
+        return Some(Vec::new());
+    }
+    engine
+        .log(
+            caveats,
+            headless_contract::HANDBACK_MAX_FILES,
+            Some(&format!("{before_oid}..{after_oid}")),
+            &[],
+        )
+        .ok()
+        .map(|commits| commits.into_iter().map(|c| c.id).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+    #[cfg(unix)]
+    use newt_core::ScopeExt as _;
+
+    /// #2552 round 3: `commits_since` — the exact function `handback`'s
+    /// `commits` field is built from — is reached whenever `workspace` is
+    /// inside SOME repo (`WorkspaceRepoLocation::InsideRepo`, not just
+    /// `OwnRoot`), and correctly names a commit made from the subdirectory.
+    ///
+    /// Grounds a real limitation found while writing this test: an
+    /// end-to-end test through the FULL `newt headless` binary, with the
+    /// MODEL making the commit via a tool call, is not currently
+    /// constructible — `newt_core::agentic::driver::TurnDriver` hardcodes
+    /// `git_tool: None` (no builder wires a `GitTool` impl for any
+    /// `TurnDriver`-based run, headless included), and a shell `git commit`
+    /// via `run_command` is deliberately refused (`tools.rs`: "refusing to
+    /// create a git commit via the shell — that bypasses harness-managed
+    /// commit attribution"). So no headless run — subdirectory or repo
+    /// root alike — can populate `commits` from a MODEL action today; this
+    /// is orthogonal to and predates #2552. This test instead grounds
+    /// `commits_since` itself against a REAL git repo and the REAL embedded
+    /// `newt_git::GitEngine` (never mocked), the same call
+    /// `uncommitted_delta`'s exit-time block makes — proving the mechanism
+    /// this PR widened to the `InsideRepo` case is correct, at the level
+    /// that is actually testable.
+    #[test]
+    fn commits_since_names_a_commit_made_from_a_repo_subdirectory() {
+        let repo = tempfile::tempdir().expect("repo root");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git")
+                .status
+                .success());
+        };
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "t@example.com"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        let crate_dir = repo.path().join("crate");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(crate_dir.join("lib.rs"), "one\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "init"]);
+
+        let read_scope = newt_core::Scope::All;
+        let crate_str = crate_dir.to_string_lossy().into_owned();
+        assert!(
+            matches!(
+                newt_core::agentic::locate_workspace_repo(&crate_str, &read_scope),
+                newt_core::agentic::WorkspaceRepoLocation::InsideRepo { .. }
+            ),
+            "crate/ must resolve as a SUBDIRECTORY of the enclosing repo"
+        );
+
+        let engine = newt_git::GitEngine::open(&crate_dir, &read_scope)
+            .expect("the engine must open for a repo subdirectory too (#2552 blocker 1)");
+        let caveats = newt_core::git_caveats::GitCaveats::read_only();
+        let before = engine
+            .head_snapshot(&caveats)
+            .expect("head_snapshot must succeed");
+
+        std::fs::write(crate_dir.join("lib.rs"), "one\ntwo\n").unwrap();
+        git(&crate_dir, &["add", "-A"]);
+        git(&crate_dir, &["commit", "-q", "-m", "during the run"]);
+        let after_head = git_rev_parse_head(repo.path());
+
+        let commits = commits_since(&engine, &caveats, before.head.as_deref())
+            .expect("commits_since must resolve, not unavailable");
+        assert_eq!(
+            commits,
+            vec![after_head],
+            "the commit made from crate/ must be named"
+        );
+    }
+
+    #[cfg(test)]
+    fn git_rev_parse_head(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
 
     /// #2314: the seed id is of the entries, not the file's spelling, and a
     /// seed the store could not faithfully hold is refused before any run.
@@ -1045,6 +1793,20 @@ mod tests {
         assert!(seed_scratchpad(r#"{"a": 1}"#).is_err(), "non-string value");
         assert!(seed_scratchpad(r#"["a"]"#).is_err(), "not an object");
         assert!(seed_scratchpad(r#"{" ": "v"}"#).is_err(), "blank key");
+    }
+
+    /// F16 (red first): the seeded message names the real root and is a
+    /// `system` message, so it precedes the task in the wire transcript
+    /// exactly like newt-tui's `Workspace: {path}` line.
+    #[test]
+    fn workspace_root_system_message_names_the_real_root() {
+        let msg = workspace_root_system_message("/home/dev/proj");
+        assert_eq!(msg.role, newt_core::memory::Role::System);
+        assert!(
+            msg.content.contains("/home/dev/proj"),
+            "message must name the real workspace root, got: {}",
+            msg.content
+        );
     }
 
     #[test]
@@ -1528,7 +2290,8 @@ mod tests {
     /// None`, silently DENIES) — the exact WS1 trap the lane exists to avoid.
     #[test]
     fn confined_caveats_fence_writes_never_all() {
-        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
         assert!(
             !matches!(cv.fs_write, Scope::All),
             "confined lane must NEVER grant fs_write = Scope::All"
@@ -1546,12 +2309,24 @@ mod tests {
 
     #[test]
     fn confined_caveats_permit_workspace_and_scratch_writes() {
-        let cv = confined_bench_caveats_with_grants("/app/task", &[]);
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
         // The workspace root and the standard mutable roots are writable
         // (exact-match here; the enforcement site adds prefix coverage).
         assert!(cv.permits_fs_write("/app/task"), "workspace root writable");
-        assert!(cv.permits_fs_write("/tmp"), "scratch writable");
-        assert!(cv.permits_fs_write("/usr"), "package-manager root writable");
+        // Changed ON PURPOSE (was: `/tmp` writable as a literal). The scratch root
+        // now comes in as a parameter, resolved from configuration by the caller.
+        assert!(
+            cv.permits_fs_write("/srv/scratch"),
+            "configured scratch writable"
+        );
+        assert!(
+            !cv.permits_fs_write("/tmp"),
+            "/tmp is no longer a built-in root"
+        );
+        // Changed ON PURPOSE (was: `/usr` writable). The default lane is a default on a
+        // developer host, so system roots are opt-in via NEWT_WRITE_PATHS.
+        assert!(!cv.permits_fs_write("/usr"), "system roots are opt-in");
         // An un-granted absolute path outside every root is NOT writable.
         assert!(
             !cv.permits_fs_write("/boot/vmlinuz"),
@@ -1559,12 +2334,461 @@ mod tests {
         );
     }
 
+    /// The default lane's fence must not contain `$HOME`, `/root` or system
+    /// roots: a confined `run_command` (`rustup default nightly`) rewrote the
+    /// operator's `~/.rustup` because `/home` was a built-in write root.
+    #[test]
+    fn confined_fence_excludes_home_and_system_roots_by_default() {
+        use newt_core::caveats::permits_path;
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
+        for p in [
+            "/home/u/.rustup/settings.toml",
+            "/home/u/.ssh/id",
+            "/root/x",
+            "/usr/bin/x",
+            "/etc/passwd",
+        ] {
+            assert!(!permits_path(&cv.fs_write, p), "{p} must not be writable");
+        }
+        for p in ["/app/task/src/x", "/srv/scratch/x"] {
+            assert!(permits_path(&cv.fs_write, p), "{p} must be writable");
+        }
+    }
+
+    #[test]
+    fn confined_fence_broad_roots_are_opt_in_by_grant() {
+        use newt_core::caveats::permits_path;
+        let grants = ["/data/scratch".to_string(), "/home".to_string()];
+        let cv =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &grants);
+        assert!(permits_path(&cv.fs_write, "/data/scratch/f"));
+        assert!(permits_path(&cv.fs_write, "/home/u/x"));
+    }
+
+    /// The smart-harness lane narrows the default fence, never widens it: its
+    /// isolation forbids a model-writable ancestor (`/tmp`), so it cannot be
+    /// EQUAL, but every root it grants must already be inside the default's.
+    #[test]
+    fn smart_fence_is_within_the_default_fence() {
+        use newt_core::caveats::permits_path;
+        let default =
+            confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
+        let build = newt_core::confined_exec::build_tool_caveats("/app/task".as_ref());
+        let mut smart = default.clone();
+        calibrate_headless_filesystem(&mut smart, &build, true);
+        let Scope::Only(roots) = &smart.fs_write else {
+            panic!("smart fs_write must be an explicit Scope::Only");
+        };
+        for root in roots {
+            assert!(
+                permits_path(&default.fs_write, root),
+                "{root} outside default"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_build_projection_admits_only_covered_paths_in_both_modes() {
+        use newt_core::caveats::permits_path;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace").to_string_lossy().into_owned();
+        let scratch = root.join("scratch").to_string_lossy().into_owned();
+        let partition = root
+            .join("scratch/build/workspace")
+            .to_string_lossy()
+            .into_owned();
+        let build = Caveats {
+            fs_read: Scope::only([workspace.clone(), partition.clone()]),
+            fs_write: Scope::only([workspace.clone(), partition]),
+            ..Caveats::top()
+        };
+        for smart in [false, true] {
+            let default =
+                confined_bench_caveats_with_grants(&workspace, std::slice::from_ref(&scratch), &[]);
+            let mut session = default.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert!(
+                build.leq(&session),
+                "already-granted build paths need exact declarations for admission: smart={smart}"
+            );
+            let Scope::Only(roots) = &session.fs_write else {
+                panic!("writes must remain fenced");
+            };
+            assert!(roots
+                .iter()
+                .all(|root| permits_path(&default.fs_write, root)));
+            assert!(!permits_path(
+                &session.fs_write,
+                &root.join("outside").to_string_lossy()
+            ));
+        }
+    }
+
+    #[test]
+    fn headless_build_projection_admits_the_covered_managed_partition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().canonicalize().unwrap();
+        let scratch = newt_core::confined_exec::build_scratch_dir(&workspace);
+        let scratch_parent = scratch.parent().unwrap().parent().unwrap();
+        let baseline = confined_bench_caveats_with_grants(
+            &workspace.to_string_lossy(),
+            &[scratch_parent.to_string_lossy().into_owned()],
+            &[],
+        );
+        let request = newt_core::confined_exec::build_tool_request(
+            &workspace,
+            &workspace,
+            "cargo",
+            ["check"],
+            &baseline.net,
+        );
+        for smart in [false, true] {
+            let mut session = baseline.clone();
+            calibrate_headless_filesystem(&mut session, request.caveats(), smart);
+            assert!(
+                request.caveats().leq(&session),
+                "covered build: smart={smart}"
+            );
+        }
+        assert!(
+            !scratch.parent().unwrap().exists(),
+            "admission must not allocate scratch"
+        );
+    }
+
+    #[test]
+    fn default_scratch_policy_admits_only_its_managed_build_partition() {
+        use newt_core::caveats::permits_path;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let ordinary_temp = root.join("ordinary-temp");
+        let partition = root.join("managed-build/workspace");
+        let configured = root.join("configured-scratch");
+        let build = Caveats {
+            fs_read: Scope::only([
+                workspace.to_string_lossy().into_owned(),
+                partition.to_string_lossy().into_owned(),
+            ]),
+            fs_write: Scope::only([
+                workspace.to_string_lossy().into_owned(),
+                partition.to_string_lossy().into_owned(),
+            ]),
+            ..Caveats::top()
+        };
+        let roots = fence_scratch_roots(".scratch", &ordinary_temp, Some(&partition));
+        assert_eq!(roots[0], ordinary_temp.to_string_lossy());
+        assert_eq!(roots.len(), 2);
+        let baseline =
+            confined_bench_caveats_with_grants(&workspace.to_string_lossy(), &roots, &[]);
+        for smart in [false, true] {
+            let mut session = baseline.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert!(build.leq(&session), "default Build: smart={smart}");
+            for denied in [
+                partition.parent().unwrap().to_path_buf(),
+                partition.with_file_name("other-workspace"),
+            ] {
+                assert!(!permits_path(&session.fs_write, &denied.to_string_lossy()));
+            }
+            // An absolute general scratch setting excludes the managed default;
+            // an explicit Build override supplies no managed default at all.
+            for roots in [
+                fence_scratch_roots(
+                    &configured.to_string_lossy(),
+                    &ordinary_temp,
+                    Some(&partition),
+                ),
+                fence_scratch_roots(".scratch", &ordinary_temp, None),
+            ] {
+                let mut session =
+                    confined_bench_caveats_with_grants(&workspace.to_string_lossy(), &roots, &[]);
+                calibrate_headless_filesystem(&mut session, &build, smart);
+                assert!(
+                    !build.leq(&session),
+                    "configured scratch requires coverage: smart={smart}"
+                );
+            }
+        }
+        for planned in [&workspace, &ordinary_temp, &partition, &configured] {
+            assert!(!planned.exists(), "startup must only plan paths");
+        }
+    }
+
+    #[test]
+    fn headless_build_projection_preserves_narrow_reads_and_other_authority() {
+        use newt_core::caveats::CountBound;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let workspace = root.join("workspace").to_string_lossy().into_owned();
+        let build = Caveats {
+            fs_read: Scope::only([
+                workspace.clone(),
+                root.join("toolchain").to_string_lossy().into_owned(),
+            ]),
+            fs_write: Scope::only([
+                workspace.clone(),
+                root.join("outside/scratch").to_string_lossy().into_owned(),
+            ]),
+            ..Caveats::top()
+        };
+        for smart in [false, true] {
+            let mut session = Caveats {
+                fs_read: Scope::only([workspace.clone()]),
+                fs_write: Scope::only([workspace.clone()]),
+                exec: Scope::none(),
+                net: Scope::none(),
+                max_calls: CountBound::AtMost(3),
+                valid_for_generation: Scope::only([42]),
+            };
+            let baseline = session.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert_eq!(session, baseline, "startup may not acquire authority");
+            assert!(!build.leq(&session));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_build_projection_handles_aliases_without_granting_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let granted = root.join("granted");
+        let outside = root.join("outside");
+        std::fs::create_dir(&granted).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let alias = root.join("alias");
+        symlink(&granted, &alias).unwrap();
+        symlink(&outside, granted.join("escape")).unwrap();
+        for smart in [false, true] {
+            let mut session = confined_bench_caveats_with_grants(
+                "/app/task",
+                &[alias.to_string_lossy().into_owned()],
+                &[],
+            );
+            let admitted = granted
+                .join("uncreated-build")
+                .to_string_lossy()
+                .into_owned();
+            let escaped = granted
+                .join("escape/uncreated-build")
+                .to_string_lossy()
+                .into_owned();
+            let build = Caveats {
+                fs_read: Scope::All,
+                fs_write: Scope::only([admitted.clone(), escaped.clone()]),
+                ..Caveats::top()
+            };
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            assert!(
+                session.fs_write.permits(&admitted),
+                "canonical alias: smart={smart}"
+            );
+            assert!(
+                !session.fs_write.permits(&escaped),
+                "symlink escape: smart={smart}"
+            );
+            assert!(!granted.join("uncreated-build").exists());
+            assert!(!outside.join("uncreated-build").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_custom_scratch_denies_build_before_effects_in_both_modes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let configured = tempfile::tempdir().unwrap();
+        let baseline = confined_bench_caveats_with_grants(
+            &workspace.to_string_lossy(),
+            &[configured
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()],
+            &[],
+        );
+        let build = newt_core::confined_exec::build_tool_caveats(&workspace);
+        let scratch = newt_core::confined_exec::build_scratch_dir(&workspace);
+        let partition = scratch.parent().unwrap();
+        assert!(
+            !partition.exists(),
+            "planning a Build must not create its scratch"
+        );
+        for smart in [false, true] {
+            let mut session = baseline.clone();
+            calibrate_headless_filesystem(&mut session, &build, smart);
+            let marker = workspace.join(format!("unapproved-build-{smart}"));
+            let output = newt_core::execute_tool(
+                "build_exec",
+                &serde_json::json!({"argv": ["touch", marker.to_string_lossy()], "timeout_secs": 5}),
+                &workspace.to_string_lossy(),
+                false,
+                20,
+                &session,
+                &mut newt_core::NoMcp,
+                None, None, None, None, None, None, None,
+                None, None, None, None, None, None,
+            ).await;
+            assert!(
+                output.contains("requires explicit confined build authority; no command ran"),
+                "custom scratch cannot authorize the managed partition: smart={smart}: {output}"
+            );
+            assert!(!marker.exists());
+            assert!(
+                !partition.exists(),
+                "a refused Build must not allocate scratch"
+            );
+        }
+    }
+
+    /// The ordinary temp root follows an absolute scratch setting, otherwise
+    /// the platform temp dir. The managed Build addition is tested separately.
+    #[test]
+    fn fence_scratch_root_comes_from_configuration_then_temp_dir() {
+        use newt_core::caveats::permits_path;
+        // `fence_scratch_roots` asks the HOST whether a dir is absolute, so the
+        // "configured absolute dir" and the fallback must be absolute ON THE
+        // RUNNING HOST: `/srv/scratch` has no drive on Windows and would be
+        // "relative" there. Built from the platform temp dir, they are absolute
+        // everywhere; only the fence paths are compared as component paths.
+        let base = std::env::temp_dir();
+        let configured = base.join("newt-scratch-test");
+        let temp = base.join("newt-fallback-test");
+        let (configured_s, temp_s) = (
+            configured.to_string_lossy().into_owned(),
+            temp.to_string_lossy().into_owned(),
+        );
+        let writable = |cv: &Caveats, dir: &std::path::Path| {
+            permits_path(&cv.fs_write, &dir.join("x").to_string_lossy())
+        };
+        // Configured absolute dir wins, and the temp dir is NOT also granted.
+        let roots = fence_scratch_roots(&configured_s, &temp, None);
+        assert_eq!(roots, std::slice::from_ref(&configured_s));
+        let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
+        assert!(writable(&cv, &configured));
+        assert!(!writable(&cv, &temp));
+        assert!(!writable(&cv, &base), "the temp dir itself is not granted");
+        // A relative general scratch setting with no managed Build default
+        // supplied (an explicit Build override) retains only platform temp.
+        let roots = fence_scratch_roots(".scratch", &temp, None);
+        assert_eq!(roots, [temp_s]);
+        let cv = confined_bench_caveats_with_grants("/app/task", &roots, &[]);
+        assert!(writable(&cv, &temp));
+        assert!(!writable(&cv, &configured));
+        // No scratch root at all: workspace + explicit grants only.
+        let cv = confined_bench_caveats_with_grants("/app/task", &[], &[]);
+        assert!(!writable(&cv, &temp));
+        assert!(permits_path(&cv.fs_write, "/app/task/x"));
+    }
+
     #[test]
     fn confined_caveats_honor_write_paths_grant() {
-        let cv = confined_bench_caveats_with_grants("/app/task", &["/data/scratch".to_string()]);
+        let cv = confined_bench_caveats_with_grants(
+            "/app/task",
+            &["/srv/scratch".to_string()],
+            &["/data/scratch".to_string()],
+        );
         assert!(
             cv.permits_fs_write("/data/scratch"),
             "a per-task NEWT_WRITE_PATHS grant joins the fence"
         );
+    }
+
+    /// RED-FIRST evidence for #2524 item 1's verify-first claim (a): before
+    /// this PR, nothing in `headless.rs` read `ocap_store` at all (grep finds
+    /// no `ocap_store` reference outside this test) — a signed `[[fs]]` read
+    /// grant for a path outside the workspace could not reach a confined
+    /// headless `fs_read`/`fs_write` even in principle. This test pins the
+    /// fix: `fold_ocap_grants` widens a fenced axis with a verified store's
+    /// approve entries and NEVER touches an axis already `Scope::All`.
+    #[test]
+    fn fold_ocap_grants_widens_a_fenced_axis_but_never_touches_an_open_one() {
+        use newt_core::ocap_store::{build_store, Verdict};
+        let (store, warnings) = build_store(&[(
+            Verdict::Approve,
+            Some("[[fs]]\npath = \"/opt/canvas-token\"\n".to_string()),
+        )]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Confined default lane: fs_read is already Scope::All (open) — must
+        // stay untouched (folding must never even mention widening an open
+        // axis, matching the `#94` no-top-leak posture).
+        let mut open = confined_bench_caveats_with_grants("/app/task", &[], &[]);
+        assert_eq!(open.fs_read, Scope::All);
+        let admitted = fold_ocap_grants(&mut open, &store);
+        assert_eq!(open.fs_read, Scope::All, "an open axis must stay open");
+        // #2532 review, item 3: the axis was already open, so this changed
+        // nothing — still listed (store provenance stays visible), labeled a
+        // no-op rather than implying the signature widened anything.
+        assert_eq!(
+            admitted,
+            vec!["fs_read:/opt/canvas-token (no-op: already permitted)".to_string()]
+        );
+        // Smart-lane fenced axis: the grant must actually widen it — this is
+        // the canvas gap the brief names (an MCP child's token file, outside
+        // the workspace).
+        let mut fenced =
+            newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/app/task"));
+        assert!(!fenced.permits_fs_read("/opt/canvas-token"));
+        fold_ocap_grants(&mut fenced, &store);
+        assert!(fenced.permits_fs_read("/opt/canvas-token"));
+        // Read-only entry: fs_write must NOT gain the grant.
+        assert!(!fenced.permits_fs_write("/opt/canvas-token"));
+    }
+
+    /// #2532 review, should-fix 2, RED FIRST: `load_store` verifies only the
+    /// SIGNATURE (`verify_approves`), never danger — `sign_ocap` refuses a
+    /// High-danger target today, but a `PolicySet` reaching `fold_ocap_grants`
+    /// from any other path (an older build, a script holding the key) is not
+    /// re-checked. Before the fix, a validly-signed `/` fs entry folded
+    /// straight into headless caveats though the TUI's `recalled_grants`
+    /// drops any `DangerTier::High` target (`permissions.rs`). This test
+    /// forces exactly that shape past `sign_approves`'s own refusal (`|_, _|
+    /// false` as the `is_high_danger` predicate, mirroring the disposable-key
+    /// signing helper other tests in this module already use) and pins that
+    /// `fold_ocap_grants` still refuses it.
+    #[test]
+    fn fold_ocap_grants_refuses_a_signed_high_danger_root() {
+        use newt_core::ocap_store::PolicyFile;
+        let key = newt_identity::UserKey::generate();
+        let mut file = PolicyFile::parse("[[fs]]\npath = '/'\nwrite = true\n").expect("parse");
+        let (signed, refused) = newt_core::ocap_store::sign_approves(
+            &mut file,
+            |_, _| false,
+            |p| key.sign(p).to_bytes(),
+        );
+        assert_eq!(signed, 1, "the forged signature must still verify");
+        assert!(refused.is_empty());
+        let (store, warnings) = newt_core::ocap_store::build_store(&[(
+            newt_core::ocap_store::Verdict::Approve,
+            Some(file.to_toml().expect("serialize")),
+        )]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut caveats =
+            newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/app/task"));
+        let admitted = fold_ocap_grants(&mut caveats, &store);
+        assert!(
+            admitted.is_empty(),
+            "a High-danger root must never be admitted, signature or not: {admitted:?}"
+        );
+        assert!(!caveats.permits_fs_write("/etc/shadow"));
+    }
+
+    /// An unsigned/unverified `approve.toml` is never even IN the `PolicySet`
+    /// this function is handed in production (`ocap_store::load_store`
+    /// verifies before returning); `fold_ocap_grants` itself does no
+    /// verification, so an empty (unverified-dropped) store folds nothing.
+    #[test]
+    fn fold_ocap_grants_of_an_empty_store_admits_nothing() {
+        let store = newt_core::ocap_store::PolicySet::default();
+        let mut caveats =
+            newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/app/task"));
+        let admitted = fold_ocap_grants(&mut caveats, &store);
+        assert!(admitted.is_empty());
+        assert!(!caveats.permits_fs_read("/opt/canvas-token"));
     }
 }

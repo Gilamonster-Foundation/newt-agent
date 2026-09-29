@@ -32,8 +32,9 @@
 //!   are migrated away and inventory-gated),
 //! - **#8** the child cannot inherit credentials or authority switches — its
 //!   environment is EMPTY plus only the explicit grants,
-//! - **#9** an empty `net` fence becomes a kernel deny-all (Landlock ABI-v4 /
-//!   Seatbelt), so untrusted code has no network without an explicit grant,
+//! - **#9** an empty `net` fence requires deny-all enforcement. A platform whose
+//!   complete network authority is unknown refuses the spawn (including current
+//!   Seatbelt restricted-net admission), rather than imply a proved boundary,
 //! - **#10** where the required kernel enforcement is unavailable the spawn is
 //!   **refused**, never silently downgraded to an unconfined run.
 //!
@@ -94,12 +95,10 @@ pub enum NetGrant {
     /// * **Linux** — the child is wrapped in `newt-net-guard`, which installs
     ///   the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition to*
     ///   the inherited Landlock fs fence.
-    /// * **macOS** — the child's `net` caveat is narrowed to deny-all, so the
-    ///   Seatbelt fence is generated with `(deny network*)` — kernel-denies
-    ///   TCP/UDP/loopback **and AF_UNIX `connect`** (strictly stronger than the
-    ///   Linux seccomp deny, which allows AF_UNIX). Proven by the
-    ///   `macos_seatbelt_adversarial` suite; see
-    ///   `docs/security/platform/macos-evidence.md`.
+    /// * **macOS** — the child's `net` caveat is narrowed to deny-all. Current
+    ///   Bridle admission refuses every restricted Seatbelt net scope because
+    ///   OS-deputy egress is not proven bounded. Generated direct-socket rules
+    ///   are defense in depth, not evidence of a complete network boundary.
     ///
     /// On a platform with neither floor the spawn is **refused**
     /// (`ExecRefused::ConfinementUnenforceable`), never run with a weaker net
@@ -131,6 +130,10 @@ pub struct ExecRequest {
     /// SIGKILLs the child's whole process group at the deadline so a hostile
     /// child cannot hang the harness indefinitely.
     timeout: Option<Duration>,
+    /// Per-run scratch directories (a build's `TMPDIR`): created fresh and
+    /// owner-only just before spawning, removed when the run ends, so building
+    /// a request never touches the filesystem.
+    scratch_dirs: Vec<PathBuf>,
 }
 
 impl ExecRequest {
@@ -154,7 +157,17 @@ impl ExecRequest {
             timeout: None,
             net_grant: NetGrant::Unrestricted,
             net_guard_bin: None,
+            scratch_dirs: Vec::new(),
         }
+    }
+
+    /// Give the run a private scratch `dir`: created just before spawning
+    /// (owner-only, refused if anything already exists there, symlink
+    /// included) and removed when the run ends. See [`ScratchDir`].
+    #[must_use]
+    pub fn scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dirs.push(dir.into());
+        self
     }
 
     /// Set the kernel network floor. [`NetGrant::DenyAll`] wraps the child in
@@ -211,6 +224,18 @@ impl ExecRequest {
     #[must_use]
     pub fn caveats(&self) -> &Caveats {
         &self.caveats
+    }
+
+    /// Acquire this request's private scratch only after admission. The guards
+    /// keep the same cleanup lifetime for native argv and confined shell runs.
+    pub(crate) fn prepare_scratch(&self) -> std::io::Result<Vec<ScratchDir>> {
+        self.scratch_dirs
+            .iter()
+            .map(|dir| {
+                crate::scratch::validate_build_grant(dir, &self.caveats.fs_write)?;
+                ScratchDir::create(dir)
+            })
+            .collect()
     }
 }
 
@@ -364,6 +389,7 @@ impl ConstrainedExecutor {
                 "confined execution cancelled before spawn",
             )));
         }
+        let _scratch = req.prepare_scratch().map_err(ExecRefused::Spawn)?;
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
         // escapes the process group — can be terminated with one `cgroup.kill`.
@@ -530,15 +556,11 @@ impl ConstrainedExecutor {
             }
             #[cfg(target_os = "macos")]
             NetGrant::DenyAll => {
-                // macOS has no seccomp guard, but it has a KERNEL egress denial
-                // of its own: the Seatbelt fence generated from an empty `net`
-                // scope is `(deny network*)`, which denies TCP/UDP/loopback AND
-                // AF_UNIX `connect` — strictly stronger than the Linux
-                // socket()-family deny (macos-evidence §2). Narrow the net axis
-                // to deny-all and let Seatbelt back it; the caller's strength
-                // floor (Kernel for AgentInfluenced) then verifies at mint that
-                // the fence really is kernel-grade. Fail-closed: no Seatbelt on
-                // this host → refuse, never run with a weaker floor than asked.
+                // Preserve the requested deny-all scope for Bridle admission.
+                // Seatbelt availability alone does not prove the network floor:
+                // current Bridle reports restricted macOS networking as
+                // unenforceable and refuses it before spawning. Never weaken
+                // the requested boundary merely because sandbox-exec exists.
                 if !agent_bridle::seatbelt_is_supported() {
                     return Err(ExecRefused::ConfinementUnenforceable(
                         "NetGrant::DenyAll needs a kernel egress floor; the Seatbelt \
@@ -912,18 +934,95 @@ pub fn kill_process_group(pgid: u32) {
 /// admission. macOS's /usr/bin/git is an xcrun shim; its selected developer
 /// directory can live outside Bridle's default /Library runtime roots.
 pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
-    let policy = agent_bridle::SandboxPolicy::default();
+    // agent-bridle 0.8's L3 admission bound (`AdmittedFence::admit`) only
+    // resolves a RESTRICTED `net` axis when `child_network == DenyDirect`;
+    // under the default `LandlockOnly` the axis is `Unknown` and every
+    // `ConstrainedExecutor` spawn fails closed with "not decidable against
+    // the delegated grant ∪ declared runtime closure (L3 BOUND)". This
+    // STRENGTHENS the fence (adds the seccomp `socket()` + io_uring deny on
+    // top of Landlock's TCP-only rule) — it widens nothing. Matches the
+    // floor `b1_run_command_sandbox_policy` already applies to the
+    // run_command lane (see its doc comment).
+    let policy = agent_bridle::SandboxPolicy {
+        child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
+        macos_private_ptys: cfg!(target_os = "macos"),
+        ..agent_bridle::SandboxPolicy::default()
+    };
     #[cfg(target_os = "macos")]
     {
         let mut policy = policy;
         if let Some(developer) = selected_developer_directory() {
             policy.base_read_paths.extra.push(developer.to_owned());
+            // Xcode's launchers load libraries beside Contents/Developer.
+            // Reading the selected tools without these sibling frameworks
+            // admits the executable but leaves dyld unable to start it.
+            if let Some(contents) = Path::new(developer).parent() {
+                for name in ["Frameworks", "SharedFrameworks"] {
+                    let frameworks = contents.join(name);
+                    if frameworks.is_dir() {
+                        policy
+                            .base_read_paths
+                            .extra
+                            .push(frameworks.to_string_lossy().into_owned());
+                    }
+                }
+            }
         }
         policy
     }
     #[cfg(not(target_os = "macos"))]
     policy
 }
+
+/// The Xcode binaries a bare-name exec grant already reaches: for each granted
+/// name whose `/usr/bin/<name>` is present, `<developer>/usr/bin/<name>`.
+///
+/// On macOS `/usr/bin/python3`, `/usr/bin/git`, `/usr/bin/clang` and the rest
+/// are xcrun shims that only forward to that binary, and the shell lane puts
+/// `<developer>/usr/bin` first on the child's PATH so the shim's per-user xcrun
+/// cache is never needed. A bare grant resolves only against the system dirs,
+/// though, so without the twin the kernel refused the very binary PATH chose
+/// (`execvp() of 'python3' failed: Operation not permitted`). Admitting it is
+/// the grant the operator already made, as agent-bridle admits `/bin/bash` for
+/// a granted `/bin/sh`. Empty off macOS or with no selected developer dir.
+#[must_use]
+pub(crate) fn developer_exec_twins<'a>(exec: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = selected_developer_directory() {
+        return exec
+            .into_iter()
+            .filter(|name| !name.contains('/') && Path::new("/usr/bin").join(name).is_file())
+            .map(|name| Path::new(developer).join("usr/bin").join(name))
+            .filter_map(|twin| twin.canonicalize().ok())
+            .filter(|twin| twin.is_file())
+            .flat_map(|twin| {
+                // A framework build's `Versions/<v>/bin/<name>` is itself a
+                // launcher that re-spawns a companion inside its bundle.
+                let companions: Vec<PathBuf> = twin
+                    .parent()
+                    .and_then(Path::parent)
+                    .map(|version| {
+                        FRAMEWORK_LAUNCHER_COMPANIONS
+                            .iter()
+                            .map(|relative| version.join(relative))
+                            .filter(|companion| companion.is_file())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                std::iter::once(twin).chain(companions)
+            })
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    }
+    let _ = exec;
+    Vec::new()
+}
+
+/// What a macOS framework launcher (`<Name>.framework/Versions/<v>/bin/<tool>`)
+/// re-spawns, relative to its `Versions/<v>` directory. Python's framework build
+/// runs its interpreter from an app bundle so it gets a bundle identity.
+#[cfg(target_os = "macos")]
+const FRAMEWORK_LAUNCHER_COMPANIONS: &[&str] = &["Resources/Python.app/Contents/MacOS/Python"];
 
 /// The system's selected toolchain, resolved once without repository env/cwd.
 #[cfg(target_os = "macos")]
@@ -976,33 +1075,235 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
 /// tool homes before replacing HOME; no shell credentials or global target /
 /// compiler-cache authority are inherited. Cargo build scripts and tests inherit
 /// the same kernel fence as the compiler.
+/// `network` is the caller's existing operator-granted scope, never authority
+/// acquired by approving a build. Restricted scopes remain subject to Bridle's
+/// admission checks; an unsupported host boundary is refused, not widened.
 #[must_use]
 pub fn build_tool_request(
     workspace: &Path,
     cwd: &Path,
     program: impl Into<String>,
     args: impl IntoIterator<Item = impl Into<String>>,
+    network: &Scope<String>,
 ) -> ExecRequest {
-    let root = workspace.to_string_lossy();
-    let mut request = ExecRequest::new(
+    let mut caveats = build_tool_caveats(workspace);
+    caveats.net = network.clone();
+    toolchain_request(
         ExecOrigin::AgentInfluenced,
+        workspace,
+        cwd,
         program,
         args,
-        cwd,
-        build_tool_caveats(workspace),
+        caveats,
     )
-    .net_grant(NetGrant::DenyAll)
-    .env("HOME", root.as_ref())
-    .env("TMPDIR", root.as_ref())
-    .env(
-        "CARGO_TARGET_DIR",
-        workspace.join("target").to_string_lossy(),
-    )
-    // Operator Cargo config may name an out-of-fence compiler cache daemon.
-    // A confined build uses the compiler directly, not that ambient deputy.
+    .net_grant(if network == &Scope::none() {
+        NetGrant::DenyAll
+    } else {
+        NetGrant::Unrestricted
+    })
     .env("CARGO_NET_OFFLINE", "true")
-    .env("RUSTC_WRAPPER", "")
-    .env("RUSTC_WORKSPACE_WRAPPER", "");
+}
+
+/// A build's unique temporary directory under a private managed base outside
+/// Git worktrees, or the explicit operator override. The Build gate admits its
+/// workspace-specific root before the executor creates anything. The existing
+/// execution lease retains scratch through completion and cancellation.
+#[must_use]
+pub fn build_scratch_dir(workspace: &Path) -> PathBuf {
+    scratch_dir_under(workspace, Some(crate::scratch::build_scratch_base()))
+}
+
+/// The stable per-workspace scratch root used by Build requests and their run
+/// directories. This only plans a path; allocation remains after admission.
+/// An explicit operator Build scratch override is reflected in this path and
+/// still needs coverage by the caller's authority.
+#[must_use]
+pub fn build_scratch_root(workspace: &Path) -> PathBuf {
+    operator_build_scratch_root(workspace, Some(crate::scratch::build_scratch_base()))
+        .expect("the Build scratch base is always configured or managed")
+}
+
+fn scratch_dir_under(workspace: &Path, base: Option<PathBuf>) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    operator_build_scratch_root(workspace, base)
+        .unwrap_or_else(|| workspace.join("target").join("tmp"))
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+}
+
+/// Stable per-workspace root, so the fence can grant it before any run exists.
+/// Managed defaults use a compact locator; explicit bases retain the full CID.
+fn operator_build_scratch_root(workspace: &Path, base: Option<PathBuf>) -> Option<PathBuf> {
+    base.map(|base| {
+        let identity =
+            content_addressable::RawContentId::from_content(workspace.to_string_lossy().as_bytes());
+        crate::scratch::managed_build_partition(&base, &identity)
+            .unwrap_or_else(|| base.join(identity.to_string()))
+    })
+}
+
+/// A run's private scratch directory. [`ScratchDir::create`] makes it owner-only
+/// and refuses if the path already exists (so a pre-planted directory or
+/// symlink is never followed or reused); `Drop` removes exactly that directory,
+/// then the `tmp` and `target` parents only if they are left empty.
+pub(crate) struct ScratchDir {
+    path: PathBuf,
+    /// `target/` did not exist before this run created it.
+    created_target: bool,
+    managed: Option<crate::scratch::ManagedRun>,
+}
+
+impl ScratchDir {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        if let Some(managed) = crate::scratch::acquire_build_run(path)? {
+            return Ok(Self {
+                path: path.to_owned(),
+                created_target: false,
+                managed: Some(managed),
+            });
+        }
+        let tmp = path.parent().unwrap_or(path);
+        let target = tmp.parent().unwrap_or(tmp);
+        let created_target = !target.exists();
+        // `create_dir`, not `create_dir_all`: the workspace (or the operator's
+        // base) must already exist. A missing one is a refusal, never created.
+        match std::fs::create_dir(target) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        }
+        Self::private_dir(tmp, false)?;
+        Self::private_dir(path, true)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            created_target,
+            managed: None,
+        })
+    }
+
+    /// Make one directory, owner-only on unix. `exclusive`: fail if it exists.
+    fn private_dir(dir: &Path, exclusive: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        let builder = {
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        match builder.create(dir) {
+            Err(error) if !exclusive && error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        }
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if self.managed.is_some() {
+            return;
+        }
+        // Never follow a link: only a real directory is removed.
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+        if let Some(tmp) = self.path.parent() {
+            let _ = std::fs::remove_dir(tmp);
+            if self.created_target {
+                if let Some(target) = tmp.parent() {
+                    let _ = std::fs::remove_dir(target);
+                }
+            }
+        }
+    }
+}
+
+/// The crates.io hosts `cargo fetch` reaches: the sparse index and the
+/// download CDN. These are the destinations the dependency-fetch gate asks for.
+pub const CRATES_IO_FETCH_HOSTS: &[&str] = &["index.crates.io", "static.crates.io"];
+
+/// Fill the operator's Cargo package cache with the crates `Cargo.lock` pins, so
+/// the offline build lane ([`build_tool_request`]) can resolve them.
+///
+/// `cargo fetch --locked` compiles nothing and runs no build script, and
+/// `--locked` binds every download to the lockfile's checksums. The argv is
+/// fixed here, never model-supplied, so it runs as [`ExecOrigin::TrustedInfra`]:
+/// host restrictions remain subject to Bridle's platform admission checks.
+/// The fetch path is registered as `dependency-fetch-egress` in
+/// `docs/security/ocap-deviations.md`; callers must hold the operator's `net`
+/// grant for [`CRATES_IO_FETCH_HOSTS`] before running this. `network` carries
+/// that authority (including an explicit unrestricted grant); this builder
+/// never grants a host the caller did not provide.
+#[must_use]
+pub fn dependency_fetch_request(
+    workspace: &Path,
+    cwd: &Path,
+    network: &Scope<String>,
+) -> ExecRequest {
+    let writes: Vec<String> = operator_tool_home("CARGO_HOME", ".cargo")
+        .map(|home| cargo_home_fetch_write_roots(&home))
+        .unwrap_or_default();
+    let mut caveats = build_tool_caveats_with_writes(workspace, &writes);
+    caveats.net = network.clone();
+    toolchain_request(
+        ExecOrigin::TrustedInfra,
+        workspace,
+        cwd,
+        "cargo",
+        ["fetch", "--locked"],
+        caveats,
+    )
+}
+
+/// What a fetch writes under `$CARGO_HOME`: the registry (index cache, `.crate`
+/// files, extracted sources) and cargo's package-cache lock files. Not the
+/// whole directory, which holds `credentials.toml`.
+fn cargo_home_fetch_write_roots(cargo_home: &str) -> Vec<String> {
+    let base = Path::new(cargo_home);
+    [
+        "registry",
+        ".package-cache",
+        ".package-cache-mutate",
+        ".global-cache",
+        ".global-cache-journal",
+        ".global-cache-wal",
+        ".global-cache-shm",
+    ]
+    .into_iter()
+    .map(|entry| base.join(entry).to_string_lossy().into_owned())
+    .collect()
+}
+
+/// The environment every toolchain child shares: an env-empty start, scratch
+/// and target inside the workspace, operator tool homes, and a PATH that finds
+/// the real compiler. Network policy is the caller's.
+fn toolchain_request(
+    origin: ExecOrigin,
+    workspace: &Path,
+    cwd: &Path,
+    program: impl Into<String>,
+    args: impl IntoIterator<Item = impl Into<String>>,
+    caveats: Caveats,
+) -> ExecRequest {
+    let root = workspace.to_string_lossy();
+    let scratch = build_scratch_dir(workspace);
+    let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
+        .env("HOME", root.as_ref())
+        .env("TMPDIR", scratch.to_string_lossy())
+        .env("TMP", scratch.to_string_lossy())
+        .env("TEMP", scratch.to_string_lossy())
+        .scratch_dir(scratch)
+        .env(
+            "CARGO_TARGET_DIR",
+            workspace.join("target").to_string_lossy(),
+        )
+        // Operator Cargo config may name an out-of-fence compiler cache daemon.
+        // A confined build uses the compiler directly, not that ambient deputy.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "");
     for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
         if let Some(path) = operator_tool_home(name, default) {
             request = request.env(name, path);
@@ -1060,10 +1361,10 @@ fn selected_macos_sdk() -> Option<String> {
 /// key in the tool output the model sees, and the net fence alone (which stops
 /// the *child* exfiltrating) does not close the child→output→model channel.
 ///
-/// The dangerous halves stay fully fenced — `fs_write` is the workspace only (no
-/// poisoning the shared cache, no shared `/tmp`), `net` is an empty deny-all, and
-/// scratch belongs in the fence (callers point `TMPDIR` at the workspace). A
-/// child a hostile build spawns inherits the same Landlock fence.
+/// Writes cover the workspace and its private build scratch partition, never
+/// the shared cache or shared temporary parent. The baseline denies networking;
+/// build requests retain the caller's separately authorized network scope.
+/// Descendants inherit the same filesystem fence.
 #[must_use]
 pub fn build_tool_caveats(workspace: &Path) -> Caveats {
     build_tool_caveats_with_writes(workspace, &[])
@@ -1077,14 +1378,31 @@ pub fn build_tool_caveats(workspace: &Path) -> Caveats {
 /// add roots the OPERATOR configured, not anything the repository controls.
 #[must_use]
 pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[String]) -> Caveats {
+    build_caveats_with_scratch(
+        workspace,
+        extra_write_roots,
+        Some(crate::scratch::build_scratch_base()),
+    )
+}
+
+fn build_caveats_with_scratch(
+    workspace: &Path,
+    extra_write_roots: &[String],
+    scratch_base: Option<PathBuf>,
+) -> Caveats {
+    let scratch = operator_build_scratch_root(workspace, scratch_base)
+        .map(|root| root.to_string_lossy().into_owned());
     let mut write_roots = vec![workspace.to_string_lossy().into_owned()];
     write_roots.extend(extra_write_roots.iter().cloned());
+    write_roots.extend(scratch.clone());
+    let mut read_roots = build_tool_read_roots(workspace);
+    read_roots.extend(scratch);
     Caveats {
         // Calibrated reads: workspace + the toolchain/package-cache roots build
         // tools need — NOT all of `$HOME` (so ~/.ssh etc. stay unreadable). The
         // system dirs (/usr, /lib, loaders) are covered by the sandbox backend's
         // base read paths; here we add the workspace and the per-user caches.
-        fs_read: Scope::only(build_tool_read_roots(workspace)),
+        fs_read: Scope::only(read_roots),
         fs_write: Scope::only(write_roots),
         exec: Scope::All,
         net: Scope::none(),
@@ -1101,22 +1419,268 @@ pub fn build_tool_caveats_with_writes(workspace: &Path, extra_write_roots: &[Str
 /// reopen the read-then-disclose path.
 fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
     let mut roots = vec![workspace.to_string_lossy().into_owned()];
-    // (env var that overrides the default, default subdir under HOME)
-    for (var, default) in [
-        ("CARGO_HOME", ".cargo"),
-        ("RUSTUP_HOME", ".rustup"),
-        ("XDG_CACHE_HOME", ".cache"),
-    ] {
-        if let Some(path) = operator_tool_home(var, default) {
-            roots.push(path);
-        }
+    roots.extend(toolchain_read_roots());
+    roots
+}
+
+/// The per-user toolchain / package-cache roots alone (no workspace), derived
+/// from the operator's environment. Shared by [`build_tool_read_roots`] and by
+/// [`crate::agentic::permissions::widen_caveats`]'s build-tool exec arm — an
+/// `exec` grant for `cargo`/`just`/`make` carries the same calibrated reads a
+/// lifecycle build gets, one derivation, not two (dec1-build-grant, F35).
+///
+/// dec1-build-grant round 3 (architect review, PR #2579): every root here is
+/// non-secret by construction — narrow this list rather than the callers, and
+/// every caller inherits the fix. `$CARGO_HOME` is narrowed to
+/// [`cargo_home_read_roots`] (never the whole directory — that grant let
+/// `cargo --version; cat $CARGO_HOME/credentials.toml` read the secret
+/// straight through it), and `$XDG_CACHE_HOME` is dropped entirely: nothing
+/// in this repo has shown a build needs it, and it can hold arbitrary
+/// per-tool state (an ML CLI's auth token cache, for one). If a real build
+/// ever needs a specific cache subdirectory, grant that subdirectory with a
+/// comment naming why — never the whole cache root.
+#[must_use]
+pub fn toolchain_read_roots() -> Vec<String> {
+    let mut roots = Vec::new();
+    if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
+        roots.extend(cargo_home_read_roots(&home));
+    }
+    if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
+        roots.push(path);
+    }
+    // System C toolchain headers: world-readable OS files with zero
+    // disclosure value (P0 U6e) — this is a read-then-disclose fence, and
+    // headers carry nothing worth disclosing. macOS is covered by the
+    // SDK/Developer roots added above instead.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        roots.push("/usr/include".to_string());
+        roots.push("/usr/local/include".to_string());
+    }
+    // The exact `~/.local/bin` root only — never a wider `~/.local` or
+    // `$HOME` grant. `$XDG_BIN_HOME`, if set, overrides it; XDG_BIN_HOME is
+    // a proposed, not ratified, XDG variable, so this is deliberately not
+    // presented as a standard default.
+    if let Some(path) = operator_tool_home("XDG_BIN_HOME", ".local/bin") {
+        roots.push(path);
     }
     roots
+}
+
+/// `$CARGO_HOME`'s narrow, non-secret read set (dec1-build-grant round 3):
+/// `bin/` (cached toolchain binaries), `registry/` (downloaded crate
+/// sources), `git/` (vendored git dependencies) — what `cargo build`/`cargo
+/// test` reads to resolve dependencies with the network denied — plus the
+/// config file, if the operator has one. NEVER `credentials.toml` /
+/// `credentials`: those hold registry auth tokens, and the whole-directory
+/// grant this replaces handed them to ANY confined command whose leading
+/// token merely looked like a build tool. A subdir that doesn't exist yet is
+/// a harmless no-op grant, so this never probes the filesystem — same style
+/// as the rest of this module's root derivation.
+fn cargo_home_read_roots(cargo_home: &str) -> Vec<String> {
+    let base = Path::new(cargo_home);
+    let mut roots: Vec<String> = ["bin", "registry", "git"]
+        .into_iter()
+        .map(|subdir| base.join(subdir).to_string_lossy().into_owned())
+        .collect();
+    roots.push(base.join("config.toml").to_string_lossy().into_owned());
+    roots.push(base.join("config").to_string_lossy().into_owned());
+    roots
+}
+
+/// Build-tool exec names whose grant carries the toolchain read roots and, in
+/// the TUI danger table, is covered by an existing session build grant —
+/// pure DATA (three-Cs), not a `match` arm, so a new build tool is a data
+/// edit. Compared against the target's file-name component, so a pathful
+/// `/usr/bin/cargo` matches too.
+pub const BUILD_TOOL_EXEC: &[&str] = &["cargo", "just", "make"];
+
+/// Is `target` a build-tool exec name (see [`BUILD_TOOL_EXEC`])? Compares the
+/// file-name component, matching the danger table's `is_interpreter` convention.
+#[must_use]
+pub fn is_build_tool_exec(target: &str) -> bool {
+    let trimmed = target.trim();
+    let name = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(trimmed);
+    BUILD_TOOL_EXEC.contains(&name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dec1-build-grant: the build-tool predicate matches a bare name and a
+    /// pathful target on its file-name component, and rejects an unrelated
+    /// command — the same convention `DangerTable::is_interpreter` uses.
+    #[test]
+    fn is_build_tool_exec_matches_known_names_only() {
+        assert!(is_build_tool_exec("cargo"));
+        assert!(is_build_tool_exec("just"));
+        assert!(is_build_tool_exec("make"));
+        assert!(is_build_tool_exec("/usr/bin/cargo"));
+        assert!(!is_build_tool_exec("rm"));
+        assert!(!is_build_tool_exec("bash"));
+    }
+
+    /// RAII guard that restores an env var to its value at construction on
+    /// drop, so a failed assertion mid-test does not leak the fake `HOME` (or
+    /// a cleared `XDG_BIN_HOME`) into every later test in the process.
+    struct EnvRestore {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                saved: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            crate::process_env::set_or_remove(
+                self.key,
+                self.saved.as_deref().and_then(|v| v.to_str()),
+            );
+        }
+    }
+
+    /// Regression for the P0 U6e build-lane read fence: the lane could not
+    /// compile any crate with a C build script (`stdc-predef.h: Permission
+    /// denied`) or resolve `just` from `~/.local/bin` (`Permission denied`).
+    ///
+    /// Deterministic (holds `process_env::lock`, pins `HOME` to a fake path,
+    /// clears `XDG_BIN_HOME` for the default case) rather than reading the
+    /// ambient environment — a runner with `XDG_BIN_HOME` set or no `HOME`
+    /// must not flip or skip this assertion.
+    ///
+    /// The forbidden check reuses [`crate::caveats::permits_path`] — the same
+    /// containment logic the fence itself enforces — so it is an
+    /// ancestor-or-equal check, not string equality: a root of `$HOME` itself
+    /// would pass an equality check against `$HOME/.newt` but must fail this
+    /// one, since it would still disclose everything under it.
+    #[test]
+    fn build_tool_read_roots_include_c_headers_and_local_bin() {
+        let _env = crate::process_env::lock();
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_xdg_bin = EnvRestore::capture("XDG_BIN_HOME");
+        // Built from temp_dir so it is absolute on every platform: a bare
+        // `/fake-…` has no drive prefix on Windows, and operator_tool_home
+        // (correctly) drops a non-absolute root.
+        let fake_home = std::env::temp_dir().join("fake-home-for-build-tool-read-roots-test");
+        let abs_bin_home = std::env::temp_dir()
+            .join("abs-bin-home")
+            .to_string_lossy()
+            .into_owned();
+        crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
+        crate::process_env::remove_var("XDG_BIN_HOME");
+
+        let roots = build_tool_read_roots(Path::new("/workspace"));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(roots.iter().any(|r| r == "/usr/include"));
+            assert!(roots.iter().any(|r| r == "/usr/local/include"));
+        }
+        let local_bin = fake_home.join(".local/bin").to_string_lossy().into_owned();
+        assert!(roots.contains(&local_bin));
+
+        // Ancestor-or-equal, not equality: no root may CONTAIN these HOME
+        // subtrees (or HOME itself) via the same prefix logic the fs fence
+        // enforces in production.
+        let read_scope = Scope::only(roots.clone());
+        for forbidden in [
+            fake_home.clone(),
+            fake_home.join(".newt"),
+            fake_home.join(".config"),
+            fake_home.join(".local/share"),
+            fake_home.join(".ssh"),
+        ] {
+            let forbidden = forbidden.to_string_lossy().into_owned();
+            assert!(
+                !crate::caveats::permits_path(&read_scope, &forbidden),
+                "a build-lane root must not grant read over {forbidden}"
+            );
+        }
+
+        // An absolute XDG_BIN_HOME override replaces the default.
+        crate::process_env::set_var("XDG_BIN_HOME", &abs_bin_home);
+        let roots_abs = build_tool_read_roots(Path::new("/workspace"));
+        assert!(roots_abs.contains(&abs_bin_home));
+        assert!(!roots_abs.contains(&local_bin));
+
+        // A relative XDG_BIN_HOME must be skipped, per operator_tool_home,
+        // not silently fall back to the default `~/.local/bin`.
+        crate::process_env::set_var("XDG_BIN_HOME", "relative/bin");
+        let roots_relative = build_tool_read_roots(Path::new("/workspace"));
+        assert!(!roots_relative.iter().any(|r| r == "relative/bin"));
+        assert!(!roots_relative.contains(&local_bin));
+    }
+
+    /// dec1-build-grant round 3 (architect review, PR #2579), red test (a):
+    /// the whole `$CARGO_HOME` directory is no longer a root — a hostile
+    /// `cargo --version; cat $CARGO_HOME/credentials.toml` read the secret
+    /// straight through that grant. `toolchain_read_roots` now narrows
+    /// `$CARGO_HOME` to `bin/`/`registry/`/`git/` + a config file, and drops
+    /// `$XDG_CACHE_HOME` entirely. Would fail before the fix: `roots`
+    /// contained the bare `$CARGO_HOME` and `$XDG_CACHE_HOME` strings, which
+    /// `permits_path` (ancestor-or-equal, the same check the fence itself
+    /// uses) would have found to cover `credentials.toml` and
+    /// `huggingface/token`.
+    #[test]
+    fn toolchain_read_roots_narrows_cargo_home_and_drops_the_cache_dir() {
+        let _env = crate::process_env::lock();
+        let _restore_home = EnvRestore::capture("HOME");
+        let _restore_cargo = EnvRestore::capture("CARGO_HOME");
+        let _restore_xdg_cache = EnvRestore::capture("XDG_CACHE_HOME");
+        let fake_home = std::env::temp_dir().join("fake-home-for-toolchain-read-roots-test");
+        crate::process_env::set_var("HOME", fake_home.to_str().unwrap());
+        crate::process_env::remove_var("CARGO_HOME");
+        crate::process_env::remove_var("XDG_CACHE_HOME");
+
+        let roots = toolchain_read_roots();
+        let cargo_home = fake_home.join(".cargo");
+
+        // The narrow subdirs a real build needs ARE granted.
+        for subdir in ["bin", "registry", "git"] {
+            let expected = cargo_home.join(subdir).to_string_lossy().into_owned();
+            assert!(roots.contains(&expected), "missing {expected} in {roots:?}");
+        }
+        for config in ["config.toml", "config"] {
+            let expected = cargo_home.join(config).to_string_lossy().into_owned();
+            assert!(roots.contains(&expected), "missing {expected} in {roots:?}");
+        }
+        // The whole CARGO_HOME directory itself is never a root — a
+        // directory grant would also cover credentials.toml.
+        assert!(!roots
+            .iter()
+            .any(|r| r == cargo_home.to_string_lossy().as_ref()));
+
+        // The credential files are never covered — ancestor-or-equal check,
+        // the same containment logic the fence itself enforces.
+        let read_scope = Scope::only(roots.clone());
+        for secret in ["credentials.toml", "credentials"] {
+            let forbidden = cargo_home.join(secret).to_string_lossy().into_owned();
+            assert!(
+                !crate::caveats::permits_path(&read_scope, &forbidden),
+                "toolchain_read_roots must never grant read over {forbidden}"
+            );
+        }
+
+        // $XDG_CACHE_HOME is dropped entirely — not a root, and no path
+        // beneath the default cache dir is covered either.
+        let default_cache = fake_home.join(".cache").to_string_lossy().into_owned();
+        assert!(!roots.iter().any(|r| r == &default_cache));
+        let hf_token = fake_home
+            .join(".cache/huggingface/token")
+            .to_string_lossy()
+            .into_owned();
+        assert!(!crate::caveats::permits_path(&read_scope, &hf_token));
+    }
 
     #[test]
     fn already_cancelled_request_never_attempts_spawn() {
@@ -1134,37 +1698,110 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fetch_is_online_to_crates_io_only_and_never_writes_credentials() {
+        let _env = crate::process_env::lock();
+        let network = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+        let request = dependency_fetch_request(Path::new("/ws"), Path::new("/ws/sub"), &network);
+        assert_eq!(request.origin, ExecOrigin::TrustedInfra);
+        assert_eq!(request.net_grant, NetGrant::Unrestricted);
+        assert_eq!(request.args, ["fetch", "--locked"]);
+        assert_eq!(
+            request.caveats.net,
+            Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()))
+        );
+        assert!(request
+            .env_grants()
+            .iter()
+            .all(|(name, _)| name != "CARGO_NET_OFFLINE"));
+        if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
+            let home = Path::new(&home);
+            let registry = home.join("registry").to_string_lossy().into_owned();
+            let credentials = home.join("credentials.toml").to_string_lossy().into_owned();
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &registry
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &credentials
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &credentials
+            ));
+        }
+    }
+
+    #[test]
+    fn dependency_fetch_network_grant_does_not_expand_filesystem_authority() {
+        let _env = crate::process_env::lock();
+        let ws = Path::new("/ws");
+        let narrow = Scope::only(CRATES_IO_FETCH_HOSTS.iter().map(|host| (*host).to_owned()));
+        let baseline = dependency_fetch_request(ws, ws, &narrow);
+        let request = dependency_fetch_request(ws, ws, &Scope::All);
+        assert_eq!(request.caveats.net, Scope::All);
+        assert_eq!(request.caveats.fs_read, baseline.caveats.fs_read);
+        assert_eq!(request.caveats.fs_write, baseline.caveats.fs_write);
+        assert_eq!(request.args, baseline.args);
+        let denied = dependency_fetch_request(ws, ws, &Scope::none());
+        assert_eq!(denied.caveats.net, Scope::none());
+    }
+
+    #[test]
     fn build_request_discovers_toolchain_before_replacing_home() {
-        let request = build_tool_request(Path::new("/ws"), Path::new("/ws"), "cargo", ["test"]);
+        let _env = crate::process_env::lock();
+        let request = build_tool_request(
+            Path::new("/ws"),
+            Path::new("/ws"),
+            "cargo",
+            ["test"],
+            &Scope::none(),
+        );
         let env: std::collections::BTreeMap<_, _> = request.env_grants().iter().cloned().collect();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/ws"));
         assert_eq!(
             env.get("CARGO_TARGET_DIR").map(std::path::Path::new),
             Some(Path::new("/ws").join("target").as_path())
         );
-        for name in ["CARGO_HOME", "RUSTUP_HOME"] {
-            if let Some(path) = operator_tool_home(
-                name,
-                if name == "CARGO_HOME" {
-                    ".cargo"
-                } else {
-                    ".rustup"
-                },
-            ) {
-                assert_eq!(env.get(name), Some(&path));
+        // `RUSTUP_HOME` env matches an operator override and is fully
+        // readable (never a secret; toolchains only).
+        if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
+            assert_eq!(env.get("RUSTUP_HOME"), Some(&path));
+            assert!(crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &path
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &path
+            ));
+        }
+        // `CARGO_HOME` env still resolves to the whole home (cargo itself
+        // needs that to find its own layout) — but the READ grant is the
+        // narrowed `cargo_home_read_roots` set (round 3, PR #2579): the
+        // subdirs a build needs are readable, `credentials.toml` is not.
+        if let Some(path) = operator_tool_home("CARGO_HOME", ".cargo") {
+            assert_eq!(env.get("CARGO_HOME"), Some(&path));
+            for subdir in ["bin", "registry", "git"] {
                 assert!(crate::caveats::permits_path(
                     &request.caveats.fs_read,
-                    &path
-                ));
-                assert!(!crate::caveats::permits_path(
-                    &request.caveats.fs_write,
-                    &path
+                    &Path::new(&path).join(subdir).to_string_lossy()
                 ));
             }
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_read,
+                &Path::new(&path).join("credentials.toml").to_string_lossy()
+            ));
+            assert!(!crate::caveats::permits_path(
+                &request.caveats.fs_write,
+                &path
+            ));
         }
         assert!(env.keys().all(|name| [
             "HOME",
             "TMPDIR",
+            "TMP",
+            "TEMP",
             "PATH",
             "CARGO_HOME",
             "RUSTUP_HOME",
@@ -1177,7 +1814,149 @@ mod tests {
         .contains(&name.as_str())));
         assert_eq!(request.net_grant, NetGrant::DenyAll);
         assert_eq!(request.caveats.exec, Scope::All);
-        assert_eq!(request.caveats.fs_write, Scope::only(["/ws".to_owned()]));
+        // The proposed Build fence includes only this workspace's private
+        // scratch partition, not its shared temporary parent.
+        assert_eq!(
+            request.caveats.fs_write,
+            build_tool_caveats(Path::new("/ws")).fs_write
+        );
+        let scratch = &request.scratch_dirs[0];
+        assert_eq!(request.scratch_dirs.len(), 1);
+        assert_eq!(env.get("TMPDIR").map(Path::new), Some(scratch.as_path()));
+        assert!(!scratch.starts_with("/ws"), "{scratch:?}");
+        assert!(crate::caveats::permits_path(
+            &request.caveats.fs_write,
+            &scratch.to_string_lossy()
+        ));
+        assert!(crate::caveats::permits_path(
+            &request.caveats.fs_read,
+            &scratch.to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn each_build_scratch_dir_is_unique() {
+        let ws = Path::new("/ws");
+        assert_ne!(build_scratch_dir(ws), build_scratch_dir(ws));
+    }
+
+    #[test]
+    fn build_network_authority_preserves_granted_scope_and_filesystem_fence() {
+        let _env = crate::process_env::lock();
+        let ws = Path::new("/ws");
+        let baseline = build_tool_caveats(ws);
+        for network in [
+            Scope::none(),
+            Scope::only(["example.test".into()]),
+            Scope::All,
+        ] {
+            let request = build_tool_request(ws, ws, "cargo", ["test"], &network);
+            assert_eq!(request.caveats.net, network);
+            assert_eq!(request.caveats.fs_read, baseline.fs_read);
+            assert_eq!(request.caveats.fs_write, baseline.fs_write);
+            assert_eq!(request.caveats.exec, baseline.exec);
+            assert_eq!(request.origin, ExecOrigin::AgentInfluenced);
+            assert_eq!(
+                request.net_grant,
+                if network == Scope::none() {
+                    NetGrant::DenyAll
+                } else {
+                    NetGrant::Unrestricted
+                }
+            );
+            assert!(request
+                .env_grants()
+                .contains(&("CARGO_NET_OFFLINE".into(), "true".into())));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_dir_is_owner_only_and_gone_after_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = tempfile::tempdir().unwrap();
+        let path = build_scratch_dir(ws.path());
+        let guard = ScratchDir::create(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o700);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        std::fs::write(path.join("cc.tmp"), b"x").unwrap();
+        drop(guard);
+        assert!(!path.exists(), "scratch dir must be removed");
+        assert!(
+            !ws.path().join("target").exists(),
+            "an empty target/ this run created is removed too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_cleanup_deletes_nothing_else() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = ws.path().join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("debug/keep"), b"k").unwrap();
+        let other = ScratchDir::create(&build_scratch_dir(ws.path())).unwrap();
+        let path = build_scratch_dir(ws.path());
+        drop(ScratchDir::create(&path).unwrap());
+        assert!(target.join("debug/keep").is_file());
+        assert!(other.path.is_dir(), "a concurrent run's dir is untouched");
+        drop(other);
+        assert!(target.join("debug/keep").is_file());
+    }
+
+    /// A pre-existing symlink (or anything) at the scratch path is refused,
+    /// never followed into another place, and its target is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_scratch_path_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = scratch_dir_under(ws.path(), None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &path).unwrap();
+        assert!(ScratchDir::create(&path).is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(elsewhere.path().is_dir());
+    }
+
+    /// A missing workspace is a refusal: the scratch guard creates `target/`
+    /// and below, never the workspace itself or its ancestors.
+    #[test]
+    fn a_missing_workspace_is_refused_not_created() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("missing").join("ws");
+        assert!(ScratchDir::create(&scratch_dir_under(&ws, None)).is_err());
+        assert!(!root.path().join("missing").exists());
+    }
+
+    /// End to end: the child's TMPDIR is the scratch dir, and it is gone once
+    /// the lane returns, whether or not this host can enforce the fence.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_lane_run_leaves_no_scratch_behind() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let req = build_tool_request(
+            &ws,
+            &ws,
+            "sh",
+            ["-c", "printf %s \"$TMPDIR\"; touch \"$TMPDIR/x\""],
+            &Scope::none(),
+        );
+        let scratch = req.scratch_dirs[0].clone();
+        if let Ok(out) = ConstrainedExecutor::run(&req) {
+            if out.success {
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    scratch.to_string_lossy()
+                );
+            }
+        }
+        assert!(!scratch.exists());
     }
 
     #[test]
@@ -1187,9 +1966,11 @@ mod tests {
         // kernel-enforced. TrustedInfra carries the default (advisory) floor.
         let caveats = workspace_confined_caveats(Path::new("/ws"));
         let agent_cx = mint_context(ExecOrigin::AgentInfluenced, &caveats).unwrap();
-        assert_eq!(agent_cx.strength_floor(), AxisEnforcement::Kernel);
+        assert_eq!(agent_cx.strength_floor().exec(), AxisEnforcement::Kernel);
+        assert_eq!(agent_cx.strength_floor().net(), AxisEnforcement::Kernel);
         let trusted_cx = mint_context(ExecOrigin::TrustedInfra, &caveats).unwrap();
-        assert_ne!(trusted_cx.strength_floor(), AxisEnforcement::Kernel);
+        assert_ne!(trusted_cx.strength_floor().exec(), AxisEnforcement::Kernel);
+        assert_ne!(trusted_cx.strength_floor().net(), AxisEnforcement::Kernel);
     }
 
     #[test]
@@ -1275,12 +2056,71 @@ mod tests {
         assert!(!cav.fs_write.permits(&"/etc".to_string()));
         assert!(
             !cav.fs_write.permits(&"/tmp".to_string()),
-            "no write to shared /tmp — scratch goes in-workspace via TMPDIR"
+            "no write to shared /tmp — only the private workspace scratch partition"
         );
         assert!(
             !cav.net.permits(&"evil.example".to_string()),
             "no network — the exfil channel is closed"
         );
+    }
+
+    /// Grounds `build_scratch_dir` against a real build-lane child: its
+    /// `TMPDIR` is writable under the fence and lies outside the workspace.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_build_lane_child_gets_a_writable_scratch_dir_outside_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws = ws.path().canonicalize().unwrap();
+        let script = "import os, tempfile\n\
+            d = tempfile.mkdtemp(); open(os.path.join(d, 'x'), 'w').write('ok'); print(d)\n";
+        // Exercise scratch filesystem confinement; macOS cannot enforce restricted net.
+        let req = build_tool_request(&ws, &ws, "python3", ["-c", script], &Scope::All);
+        let out = ConstrainedExecutor::run(&req).expect("the build lane spawns");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.success, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            !std::path::Path::new(stdout.trim()).starts_with(&ws),
+            "{stdout}"
+        );
+    }
+
+    /// #2604 escape hatch: an operator build scratch base moves the run out of
+    /// the repo, to `<base>/<workspace id>/<run>`, and the fence grants exactly
+    /// that per-workspace root. With no base, nothing is added.
+    #[test]
+    fn an_operator_build_scratch_base_moves_the_run_and_is_granted() {
+        let ws = Path::new("/ws");
+        let base = std::env::temp_dir().join("operator-build-scratch");
+        let root = operator_build_scratch_root(ws, Some(base.clone())).unwrap();
+        assert_eq!(root.parent(), Some(base.as_path()));
+        assert_eq!(
+            Some(root.clone()),
+            operator_build_scratch_root(ws, Some(base.clone()))
+        );
+        assert_ne!(
+            Some(root.clone()),
+            operator_build_scratch_root(Path::new("/other"), Some(base.clone()))
+        );
+
+        let run = scratch_dir_under(ws, Some(base.clone()));
+        assert_eq!(run.parent(), Some(root.as_path()));
+        assert!(
+            !run.starts_with(ws),
+            "an operator base leaves the workspace"
+        );
+
+        let root = root.to_string_lossy().into_owned();
+        let cav = build_caveats_with_scratch(ws, &[], Some(base));
+        assert!(crate::caveats::permits_path(
+            &cav.fs_write,
+            &run.to_string_lossy()
+        ));
+        assert!(crate::caveats::permits_path(&cav.fs_read, &root));
+
+        let default = build_caveats_with_scratch(ws, &[], None);
+        assert_eq!(default.fs_write, Scope::only(["/ws".to_owned()]));
+        assert!(scratch_dir_under(ws, None).starts_with("/ws/target/tmp"));
     }
 
     #[test]

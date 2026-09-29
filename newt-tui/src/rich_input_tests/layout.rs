@@ -576,16 +576,22 @@ fn header_shows_context_budget_gauge_when_known() {
             .collect()
     };
     assert!(
-        text(Some((972_000, 1_024_000))).contains("972k/1024k"),
+        text(Some((972_000, Some(1_024_000)))).contains("972k/1024k"),
         "the gauge shows used/budget once the budget is known"
     );
     assert!(
         !text(None).contains("k/"),
-        "no gauge until a budget is known"
+        "no gauge until a turn has reported usage"
     );
     assert!(
-        !text(Some((100, 0))).contains("k/"),
+        !text(Some((100, Some(0)))).contains("k/"),
         "a zero budget shows no gauge (no divide-by-zero, no noise)"
+    );
+    // #2466: usage is known but no context window is — show `used/?`, not
+    // the learned ratchet presented as if it were the window.
+    assert!(
+        text(Some((31_000, None))).contains("31k/?"),
+        "no window known → used/?, never a bare hidden gauge"
     );
 }
 

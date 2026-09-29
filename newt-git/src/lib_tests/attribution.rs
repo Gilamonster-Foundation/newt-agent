@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn commit_carries_the_coauthor_trailer_in_the_message() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     std::fs::write(dir.path().join("c.txt"), "x\n").unwrap();
     let t = tool(dir.path());
     t.dispatch(
@@ -52,7 +52,7 @@ fn commit_carries_the_coauthor_trailer_in_the_message() {
 /// real commit read back via system git.
 #[test]
 fn bare_model_subject_still_gets_harness_managed_attribution() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     std::fs::write(dir.path().join("p.txt"), "x\n").unwrap();
     let t = tool(dir.path());
     t.dispatch(
@@ -102,7 +102,7 @@ fn bare_model_subject_still_gets_harness_managed_attribution() {
 /// mocked `finalize_commit_message` tests against actual history.
 #[test]
 fn model_switch_between_commits_attributes_each_to_the_live_model() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     let p = dir.path();
     // Session boots under model A.
     let mut t = tool(p);
@@ -217,7 +217,7 @@ fn model_switch_between_commits_attributes_each_to_the_live_model() {
 /// switched model is what lands. Real-resource (real git).
 #[test]
 fn amend_after_a_model_switch_resigns_with_the_live_model() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     let p = dir.path();
     let mut t = tool(p);
     t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
@@ -287,7 +287,7 @@ fn amend_after_a_model_switch_resigns_with_the_live_model() {
 /// Real-resource (real git).
 #[test]
 fn amend_with_no_message_refreshes_attribution_after_a_model_switch() {
-    let dir = repo_with_commit();
+    let dir = repo_with_commit_on_task_branch();
     let p = dir.path();
     let mut t = tool(p);
     t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(

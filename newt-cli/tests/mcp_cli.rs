@@ -62,7 +62,7 @@ fn newt(sb: &Sandbox) -> Command {
 }
 
 fn load_config(path: &Path) -> newt_core::Config {
-    newt_core::Config::load(path).unwrap()
+    newt_core::Config::load(path, &mut |_| {}).unwrap()
 }
 
 // Families under `mcp_cli/`. The composed private-MCP UAT stays inline
@@ -448,6 +448,7 @@ mod composed_private_mcp_uat {
 
         let (reply, _, _, hallucinations) = newt_core::chat_complete(
             ChatCtx {
+                overflow_retry: Default::default(),
                 run_allowance: None,
                 verify_outcomes: false,
                 round_cap_hit: None,
@@ -479,6 +480,8 @@ mod composed_private_mcp_uat {
                 persona_tools: Some(&persona_tools),
                 cognition: None,
                 chat_completions_capability: Default::default(),
+                responses_capability: Default::default(),
+                openai_api: Default::default(),
                 output_allowance: None,
                 attempt_ledger: None,
                 reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,

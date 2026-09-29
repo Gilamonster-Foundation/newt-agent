@@ -6,8 +6,8 @@ use std::path::Path;
 
 pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     let mut config = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
 
     // Surface the prompt set to its built-in default (visible + editable) when
@@ -28,6 +28,11 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     println!("# [tui] footer    = \"auto\" | \"on\" | \"off\"   (auto = rich prompt on a TTY)");
     println!("# [tui] markdown  = \"auto\" | \"on\" | \"off\"   (auto = render RichTUI Markdown when styled)");
     println!("# [tui] spill_lines = 3   (collapsed live + completed tool rows; 0 = unbounded completion only)");
+    println!("# [tui.permissions] preset = \"workspace_full_access\" runs commands and allows");
+    println!(
+        "#   create/change/rename/delete inside the workspace; net remains separately configured."
+    );
+    println!("#   One-run equivalent: newt --workspace-access code <directory>");
     println!("#");
     println!("# [context] input_ceiling_pct = 80   (percentage input bound; the active max-output");
     println!("#           reserve may be tighter; invalid values fall back to 80; valid 1..=99)");

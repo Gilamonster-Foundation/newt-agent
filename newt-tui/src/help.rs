@@ -61,8 +61,9 @@ static TENACITY_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
   /psyche tenacity list      list every level
 
 Tenacity is how long the agent pursues the task. `relentless` lifts the
-tool-round limit; an explicit `/rounds` still wins. It is set only
-explicitly (flag, /psyche, a conversation's pin, obsessive), never by a
+initial tool-round allowance; an explicit `/rounds` overrides that initial value.
+Fresh progress can renew either allowance; `workflow_grace_rounds = 0` makes
+it a hard cap. Tenacity is set only explicitly (flag, /psyche, a conversation's pin, obsessive), never by a
 persona or config. How soon the agent acts is initiative: /help initiative.",
         levels = levels.join(" | "),
     )
@@ -282,13 +283,16 @@ This is the interactive wrapper around `newt summarizer ...`."
         }
         "rounds" => {
             "\
-/rounds [show|<n>|double|reset|config|unlimited] — session tool-call round limit
+/rounds [show|<n>|double|reset|config|unlimited] — initial tool-call round allowance
 
-Human-only override for how many tool-call rounds the agent may run in a
-single turn. It does not edit config and lasts only for this session.
-  /rounds             show the effective limit
-  /rounds 50          allow 50 tool-call rounds per turn
-  /rounds double      double the current effective limit
+Human-only override for the initial allowance in each turn. Fresh evidence,
+workspace changes, and new verification can renew it automatically without
+operator nudges. Set `workflow_grace_rounds = 0` for a hard round cap.
+Explicit inference budgets, cancellation, and the no-progress brake still apply.
+This command does not edit config and lasts only for this session.
+  /rounds             show the initial allowance
+  /rounds 50          start with 50 tool-call rounds per turn
+  /rounds double      double the current initial allowance
   /rounds reset       clear the override; derive from tenacity + config/model
                       (`default` and `auto` are aliases)
   /rounds config      use config/model tuning even under relentless tenacity
@@ -419,6 +423,14 @@ changes). Define personas in config."
 Read-only: what you've allowed/denied this session and the posture's optional
 authority floor, when configured. Durable grants are made by editing
 [tui.permissions] in config, not here.
+
+For full access inside one directory, start:
+  newt --workspace-access code <directory>
+Commands can create, change, rename, and delete inside that workspace; native
+filesystem confinement still rejects outside targets, including symlink and
+parent-directory escapes. Network access remains separately configured.
+The trusted-config equivalent is [tui.permissions] preset = \"workspace_full_access\".
+This startup choice does not change a running session's authority.
 
 Usage:
   /permissions                overview of this session's prompt flow
@@ -782,7 +794,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)",
         "  /summarizer              - show or change the summarizer backend and knobs",
-        "  /rounds [n|double|reset|config|unlimited] - set this session's tool-call round limit",
+        "  /rounds [n|double|reset|config|unlimited] - set this session's initial tool-call round allowance",
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
@@ -790,6 +802,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
+        "  /discuss [text]          - talk through a pending clarification batch instead of answering it (alias: /chat); \
+         says so if nothing is pending",
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
         "  /end                     - the same, recorded as ended by /end rather than /new (it no longer exits — use /exit)",
         "  /restart                 - the same, recorded as a restart",

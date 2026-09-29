@@ -126,32 +126,18 @@ impl DenialRecord {
     }
 }
 
-/// Where a pre-chain journal is moved to when the chain is adopted.
+/// Where a pre-chain journal is moved to when the chain is adopted. Thin,
+/// `DenialRecord`-specialized wrapper over [`event_journal::pre_chain_path`],
+/// shared with every other migrating journal.
 #[must_use]
 pub fn pre_chain_path(path: &Path) -> PathBuf {
-    path.with_extension("pre-chain")
+    event_journal::pre_chain_path(path)
 }
 
 /// Move a pre-chain journal aside, once, so the chain starts from a clean file.
-///
-/// The bytes are kept — an operator can still read them — but they are not
-/// mixed into a chain they were never part of, and no second decode arm is
-/// carried here to parse them. Skipped entirely once a head ref exists, which
-/// is the steady state after the first chained append.
+/// `DenialRecord`-specialized wrapper over [`event_journal::rotate_pre_chain`].
 fn rotate_pre_chain(path: &Path) -> std::io::Result<()> {
-    if event_journal::read_head(path).is_some() {
-        return Ok(());
-    }
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Ok(());
-    };
-    let Some(first) = body.lines().find(|line| !line.trim().is_empty()) else {
-        return Ok(());
-    };
-    if serde_json::from_str::<DenialLine>(first).is_ok() {
-        return Ok(()); // Already a chain, just missing its ref.
-    }
-    std::fs::rename(path, pre_chain_path(path))
+    event_journal::rotate_pre_chain::<DenialRecord>(path)
 }
 
 /// Append one record as a chained line, advancing the head ref beside it.

@@ -214,6 +214,13 @@ after one round.
 | `off` | `--non-interactive true` | full-access/yolo bench lane |
 | `on` | `--confined` + `NEWT_BENCH_OCAP=on` | workspace-fenced Newt write tools |
 
+> **Note (2026-09-21, #2501):** before this date the `on` lane's write fence also
+> listed `/usr /usr/local /var /etc /opt /root /home`, so a task that wrote under
+> `$HOME` or a system root succeeded. It is now the workspace, `/tmp` and explicit
+> `NEWT_WRITE_PATHS` grants only. Rows measured before and after that change are
+> not comparable for any task that wrote outside the workspace and `/tmp`; this
+> host-run matrix does not pass the broad roots.
+
 Defaults are all four postures, both OCAP modes, and all directories beneath
 `tasks/`. Qualification requires that complete 4 × 2 axis. Subset `POSTURES` or
 `OCAP_MODES` are accepted only with `MODE=exploratory`. `TASKS_DIR` may point to

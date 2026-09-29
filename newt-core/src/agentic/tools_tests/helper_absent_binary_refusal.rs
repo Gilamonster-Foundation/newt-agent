@@ -12,7 +12,7 @@
 //! | state | envelope | next move |
 //! |---|---|---|
 //! | denied by a grant | `denied:true`, `denials[kind=exec]`, exit 126 | ask for the grant |
-//! | not carried, on host | exit 127, no denials, host PATH resolves | ask for `exec:<abs path>` |
+//! | not carried, on host | exit 127, no denials, host PATH resolves | build authority for project validation, or direct `exec:<abs path>` |
 //! | not on this host | exit 127, no denials, host PATH misses | no grant helps |
 //!
 //! The discriminator is STRUCTURED (exit code + the `denials` array), never a
@@ -107,6 +107,19 @@ fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
         !msg.contains("not installed on this host"),
         "the host HAS this binary; must not claim otherwise: {msg}"
     );
+    for guidance in [
+        "project compiler/test validation",
+        "if lifecycle is advertised",
+        "prefer lifecycle action=build",
+        "explicit offline build authority",
+        "does not grant compiler descendants",
+        "do not retry a declined grant",
+    ] {
+        assert!(
+            msg.contains(guidance),
+            "host-present absence must explain the build route ({guidance}): {msg}"
+        );
+    }
 }
 
 /// ABSENT FROM THE HOST: no grant can conjure a binary that is not installed,
@@ -126,6 +139,10 @@ fn absent_from_host_says_so_and_does_not_coach_a_useless_grant() {
     assert!(
         !msg.contains("exec:/"),
         "must NOT ask for a grant that cannot help, got: {msg}"
+    );
+    assert!(
+        !msg.contains("lifecycle"),
+        "build authority cannot supply a missing host binary: {msg}"
     );
 }
 
@@ -322,4 +339,79 @@ fn a_127_brush_did_not_attribute_to_a_missing_program_is_not_an_absence() {
         &empty_exec(),
     )
     .is_some());
+}
+
+/// A later pipeline stage owns the exit code, so `rg … | head` exits 0 with
+/// brush's `command not found: rg` on stderr. A live ornith-35b run saw only
+/// that bare line three times (`rg`, `timeout`, `mkdir`). The output is kept
+/// and the absence is named after it, and the result stays a success.
+#[test]
+fn a_piped_absence_keeps_its_output_and_names_the_program() {
+    let piped = serde_json::json!({
+        "exit_code": 0,
+        "stdout": "partial\n",
+        "stderr": format!("error: command not found: {ABSENT}\n"),
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        &format!("{ABSENT} x | head"),
+        &piped,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "partial".to_owned(),
+    );
+    assert!(text.starts_with("partial\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "error: {ABSENT}: {}",
+            super::super::shell::ABSENT_BINARY_MARKER
+        )),
+        "{text}"
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Passed);
+}
+
+/// An ordinary, unrelated failure must fall through untouched as an honest
+/// failure — never relabelled into a `capability denied` sandbox denial and
+/// never offered an exec-grant target. This pins the reviewer's invariant on
+/// #2633: a non-zero exit carries no authoritative sandbox-refusal evidence of
+/// its own, so it is rendered as itself (see shell.rs's `confined_result`).
+#[test]
+fn an_unrelated_failure_is_not_a_child_exec_denial() {
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "error: test assertion failed\n",
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        "cargo test",
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "error: test assertion failed".to_owned(),
+    );
+    assert_eq!(text, "error: test assertion failed");
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
+}
+
+/// A failure whose stderr merely *names* a child but names nothing the
+/// sandbox actually refused carries no resolvable, invocation-bound target,
+/// so no structured denial is minted — never guess a grant target. This is
+/// the guard against re-deriving a sandbox denial from child stderr: only the
+/// leash's own structured refusal (#2421) could ever mint one.
+#[test]
+fn an_unresolvable_child_name_is_not_a_named_denial() {
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": format!("fatal: cannot exec '{ABSENT}': Permission denied\n"),
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        &format!("git {ABSENT}"),
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "fatal: cannot exec".to_owned(),
+    );
+    assert_eq!(text, "fatal: cannot exec");
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
 }

@@ -174,6 +174,20 @@ impl AttemptLedger {
         &self.lines
     }
 
+    /// The latest primary-role attempt: the inference call whose response the
+    /// loop is handling now (attempt ids are over the REQUEST, so this names
+    /// "the attempt that asked"). The causal parent of anything the harness
+    /// derives from that response.
+    #[must_use]
+    pub fn latest_primary(&self) -> Option<content_addressable::ContentId> {
+        self.lines
+            .iter()
+            .rev()
+            .map(|line| &line.node.payload)
+            .find(|record| record.key.role == "primary")
+            .map(|record| record.id)
+    }
+
     /// The chain head, reported only when the lines were emitted.
     #[must_use]
     pub fn head(&self) -> Option<&content_addressable::ContentId> {

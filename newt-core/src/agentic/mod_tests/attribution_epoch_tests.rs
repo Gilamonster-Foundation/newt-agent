@@ -2,210 +2,247 @@ use super::*;
 use crate::attribution::AttributionLedger;
 use std::cell::RefCell;
 
-/// The canonical "A edits → C1 → A edits more → turn ends → switch B → C2"
-/// regression (#1709 req 6): C2 must credit A + B. A's "edits more" (post-C1
-/// work) re-records fresh after the C1 epoch clear, so it survives the turn
-/// boundary into C2's snapshot; B is recorded after the switch. Without
-/// the epoch clear (the old end-of-turn blanket clear), A's post-C1 record
-/// was deduped against the pre-C1 entry and then wiped, so C2 lost A.
+fn ledger() -> RefCell<AttributionLedger> {
+    RefCell::new(AttributionLedger::new(
+        crate::agent_identity::DEFAULT_AGENT_EMAIL,
+    ))
+}
+
+fn edit(ledger: &RefCell<AttributionLedger>, model: &str) {
+    ledger_note_attribution(
+        Some(ledger),
+        model,
+        "edit_file",
+        &serde_json::json!({}),
+        true,
+    );
+}
+
+/// A edits -> C1 -> A edits more -> switch B -> C2 must credit A + B.
 #[test]
 fn epoch_clear_lets_post_commit_work_survive_to_the_next_commit() {
-    let ledger = RefCell::new(AttributionLedger::new(
-        crate::agent_identity::DEFAULT_AGENT_EMAIL,
-    ));
-    let attr: Option<&RefCell<AttributionLedger>> = Some(&ledger);
-    let write = serde_json::json!({});
-    let commit = serde_json::json!({"op": "commit"});
+    let ledger = ledger();
+    let git = ConfirmedGit::default();
+    edit(&ledger, "model-a");
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "model-a", "git");
+    git.publish();
+    epoch.finish(&serde_json::json!({"op":"commit"}), true);
+    assert!(ledger.borrow().is_empty());
 
-    // "A edits" — a non-read-only tool call records the active model A.
-    ledger_note_attribution(attr, "model-a", "edit_file", &write, true);
-    assert_eq!(ledger.borrow().contributors().len(), 1);
-    assert_eq!(ledger.borrow().contributors()[0].model, "model-a");
+    edit(&ledger, "model-a");
+    edit(&ledger, "model-b");
+    assert_eq!(pending_models(&ledger), ["model-a", "model-b"]);
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "model-b", "git");
+    git.publish();
+    epoch.finish(&serde_json::json!({"op":"commit"}), true);
+    assert!(ledger.borrow().is_empty());
+}
 
-    // "C1" — the commit call records A (the commit is non-read-only), THEN
-    // the epoch clear consumes the whole ledger (the pre-commit contributors
-    // are already credited on C1 via the loop-top snapshot).
-    ledger_note_attribution(attr, "model-a", "git", &commit, true);
-    ledger_consume_at_commit_epoch(attr, "git", &commit, true, "committed abc123 fix");
-    assert!(
-        ledger.borrow().is_empty(),
-        "C1 epoch boundary consumed the ledger"
-    );
+#[test]
+fn a_failed_commit_consumes_nothing() {
+    let ledger = ledger();
+    let git = ConfirmedGit::default();
+    edit(&ledger, "model-a");
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "model-b", "git");
+    epoch.finish(&serde_json::json!({"op":"commit"}), false);
+    assert_eq!(pending_models(&ledger), ["model-a"]);
+}
 
-    // "A edits more" — A re-records FRESH (the dedup set was reset by the
-    // epoch clear), so A's post-C1 contribution is now pending.
-    ledger_note_attribution(attr, "model-a", "edit_file", &write, true);
-    assert_eq!(
-        ledger.borrow().contributors().len(),
-        1,
-        "A re-recorded fresh after the epoch clear"
-    );
+#[test]
+fn operations_without_publication_preserve_contributors() {
+    for op in [
+        "status", "log", "diff", "add", "branch", "checkout", "stash", "rebase",
+    ] {
+        let ledger = ledger();
+        let git = ConfirmedGit::default();
+        edit(&ledger, "model-a");
+        let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "model-a", "git");
+        epoch.finish(&serde_json::json!({"op":op}), true);
+        assert_eq!(
+            pending_models(&ledger),
+            ["model-a"],
+            "{op} without a confirmed commit"
+        );
+    }
+}
 
-    // "turn ends" — NO blanket clear (req 5: removed). The ledger survives
-    // the turn boundary with A still pending.
+#[test]
+fn confirmed_embedded_publication_consumes_without_result_parsing() {
+    for (op, ok) in [
+        ("commit", true),
+        ("amend", true),
+        ("rebase", true),
+        ("commit", false),
+    ] {
+        let ledger = ledger();
+        let git = ConfirmedGit::default();
+        edit(&ledger, "earlier-model");
+        let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "active-model", "git");
+        git.publish();
+        epoch.finish(&serde_json::json!({"op":op}), ok);
+        assert!(ledger.borrow().is_empty(), "confirmed {op}, result ok={ok}");
+    }
+}
 
-    // "switch B" — B edits; B records alongside A.
-    ledger_note_attribution(attr, "model-b", "edit_file", &write, true);
-    let pending: Vec<String> = ledger
+#[test]
+fn rebase_all_drop_preserves_pending_contributors() {
+    let ledger = ledger();
+    let git = ConfirmedGit::default();
+    edit(&ledger, "model-a");
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "model-a", "git");
+    // LocalGitTool emits no success event for a produced==0 rebase.
+    epoch.finish(&serde_json::json!({"op":"rebase"}), true);
+    assert_eq!(pending_models(&ledger), ["model-a"]);
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "model-a", "git");
+    git.publish();
+    epoch.finish(&serde_json::json!({"op":"rebase"}), true);
+    assert!(ledger.borrow().is_empty());
+}
+
+#[test]
+fn an_earlier_success_is_not_consumed_again_during_a_later_call() {
+    let ledger = ledger();
+    let git = ConfirmedGit::default();
+    git.publish();
+    edit(&ledger, "post-commit-model");
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "next-model", "edit_file");
+    epoch.finish(&serde_json::json!({}), true);
+    assert_eq!(pending_models(&ledger), ["post-commit-model", "next-model"]);
+}
+
+#[test]
+fn attribution_without_a_git_collaborator_still_records_material_work() {
+    let ledger = ledger();
+    let epoch = AttributionEpoch::new(Some(&ledger), None, "model-a", "edit_file");
+    epoch.finish(&serde_json::json!({}), true);
+    assert_eq!(pending_models(&ledger), ["model-a"]);
+}
+
+#[derive(Default)]
+struct ConfirmedGit {
+    commits: std::sync::atomic::AtomicUsize,
+}
+
+impl ConfirmedGit {
+    fn publish(&self) {
+        self.commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl GitTool for ConfirmedGit {
+    fn confirmed_commit_count(&self) -> usize {
+        self.commits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn dispatch(
+        &self,
+        _op: &str,
+        _args: &serde_json::Value,
+        _caveats: &crate::git_caveats::GitCaveats,
+        _session: &crate::caveats::Caveats,
+    ) -> Result<String, String> {
+        unreachable!("the fixture publishes the same host-only success signal directly")
+    }
+}
+
+fn pending_models(ledger: &RefCell<AttributionLedger>) -> Vec<String> {
+    ledger
         .borrow()
         .contributors()
         .iter()
         .map(|c| c.model.clone())
-        .collect();
-    assert_eq!(
-        pending,
-        vec!["model-a".to_string(), "model-b".to_string()],
-        "C2's snapshot credits A (edits more) + B: {pending:?}"
-    );
-
-    // "C2" — the loop-top snapshot of this ledger is exactly what the
-    // finalizer merges with the active model, so C2 credits A + B (plus the
-    // active-at-commit model, deduped). The epoch invariant holds.
-    ledger_consume_at_commit_epoch(attr, "git", &commit, true, "committed def456 more");
-    assert!(
-        ledger.borrow().is_empty(),
-        "C2 epoch boundary consumed the ledger"
-    );
+        .collect()
 }
 
-/// A FAILED commit consumes nothing (#1709 req 4) — the same contributors
-/// remain pending for the next attempt.
 #[test]
-fn a_failed_commit_consumes_nothing() {
+fn confirmed_native_epoch_consumes_foreign_credit_even_when_the_tail_fails() {
     let ledger = RefCell::new(AttributionLedger::new(
         crate::agent_identity::DEFAULT_AGENT_EMAIL,
     ));
-    let attr: Option<&RefCell<AttributionLedger>> = Some(&ledger);
-    let write = serde_json::json!({});
-    let commit = serde_json::json!({"op": "commit"});
-
-    ledger_note_attribution(attr, "model-a", "edit_file", &write, true);
-    // A failed commit records nothing (ok=false) and consumes nothing.
-    ledger_note_attribution(attr, "model-a", "git", &commit, false);
-    ledger_consume_at_commit_epoch(attr, "git", &commit, false, "error: denied");
-    assert_eq!(
-        ledger.borrow().contributors().len(),
-        1,
-        "a failed commit must NOT consume the contributor"
-    );
-}
-
-/// Only commit-PRODUCING git ops are epoch boundaries; read-only / staging /
-/// ref ops create no commit and must not consume the ledger.
-#[test]
-fn only_commit_producing_git_ops_are_epoch_boundaries() {
-    assert!(is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "commit"})
-    ));
-    assert!(is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "amend"})
-    ));
-    assert!(is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "rebase"})
-    ));
-    // Read-only / staging / ref ops are NOT epoch boundaries.
-    assert!(!is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "status"})
-    ));
-    assert!(!is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "log"})
-    ));
-    assert!(!is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "diff"})
-    ));
-    assert!(!is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "add"})
-    ));
-    assert!(!is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "branch"})
-    ));
-    assert!(!is_commit_producing_git_call(
-        "git",
-        &serde_json::json!({"op": "checkout"})
-    ));
-    // A non-git tool is never a commit epoch.
-    assert!(!is_commit_producing_git_call(
+    let git = ConfirmedGit::default();
+    ledger_note_attribution(
+        Some(&ledger),
+        "earlier-model",
         "edit_file",
-        &serde_json::json!({})
-    ));
-    assert!(!is_commit_producing_git_call(
-        "run_command",
-        &serde_json::json!({"command": "git commit"})
-    ));
+        &serde_json::json!({}),
+        true,
+    );
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "active-model", "run_command");
+    git.publish();
+    // Native Git landed, but a later command's exit status makes the whole
+    // shell tool fail. The result is deliberately unrelated to Git's output.
+    epoch.finish(
+        &serde_json::json!({"command":"git commit -m change && false"}),
+        false,
+    );
+    assert_eq!(
+        pending_models(&ledger),
+        ["active-model"],
+        "consume old credit, retain possible post-commit effects"
+    );
+
+    ledger_note_attribution(
+        Some(&ledger),
+        "active-model",
+        "edit_file",
+        &serde_json::json!({}),
+        true,
+    );
+    ledger_note_attribution(
+        Some(&ledger),
+        "next-model",
+        "edit_file",
+        &serde_json::json!({}),
+        true,
+    );
+    assert_eq!(
+        pending_models(&ledger),
+        ["active-model", "next-model"],
+        "later work survives the next turn's snapshot"
+    );
 }
 
-/// `parse_rebase_produced` reads the `produced` count out of the rebase
-/// tool result string. It is the signal that distinguishes an attribution
-/// epoch (`produced > 0`) from a successful-but-commitless history op
-/// (`produced == 0`, e.g. an all-drop plan).
 #[test]
-fn parse_rebase_produced_reads_the_commit_count() {
-    assert_eq!(
-        parse_rebase_produced("rebased onto abc → def123 (3 commit(s), 1 dropped)"),
-        Some(3)
-    );
-    // All-drop plan: zero commits produced.
-    assert_eq!(
-        parse_rebase_produced("rebased onto abc → def123 (0 commit(s), 2 dropped)"),
-        Some(0)
-    );
-    // Unrecognized shape → None (caller falls back to the safe clear).
-    assert_eq!(parse_rebase_produced("rebased onto abc"), None);
-    assert_eq!(parse_rebase_produced(""), None);
-}
-
-/// The requested regression: a rebase that produced ZERO commits (an
-/// all-drop plan) is a successful history operation but NOT an attribution
-/// epoch. The pending contributor ledger/snapshot is PRESERVED — a later
-/// commit in the same lifecycle still credits those contributors — and the
-/// epoch clear does NOT fire. A rebase that produced > 0 IS an epoch: the
-/// ledger is consumed.
-#[test]
-fn rebase_all_drop_preserves_pending_contributors() {
+fn a_successful_tool_message_without_a_confirmed_commit_never_consumes_credit() {
     let ledger = RefCell::new(AttributionLedger::new(
         crate::agent_identity::DEFAULT_AGENT_EMAIL,
     ));
-    let attr: Option<&RefCell<AttributionLedger>> = Some(&ledger);
-    let write = serde_json::json!({});
-    let rebase = serde_json::json!({"op": "rebase"});
-
-    // Model A does work → recorded as a pending contributor.
-    ledger_note_attribution(attr, "model-a", "edit_file", &write, true);
-    assert_eq!(ledger.borrow().contributors().len(), 1);
-
-    // All-drop rebase: produced == 0. It is NOT an epoch — the ledger is
-    // preserved (the contributor remains pending for a later commit).
-    ledger_consume_at_commit_epoch(
-        attr,
-        "git",
-        &rebase,
+    let git = ConfirmedGit::default();
+    ledger_note_attribution(
+        Some(&ledger),
+        "earlier-model",
+        "edit_file",
+        &serde_json::json!({}),
         true,
-        "rebased onto abc → def123 (0 commit(s), 2 dropped)",
     );
+    let epoch = AttributionEpoch::new(Some(&ledger), Some(&git), "active-model", "git");
+    epoch.finish(&serde_json::json!({"op":"commit"}), true);
     assert_eq!(
-        ledger.borrow().contributors().len(),
-        1,
-        "a 0-produced rebase must NOT consume the pending contributor"
+        pending_models(&ledger),
+        ["earlier-model", "active-model"],
+        "output text is not publication evidence"
     );
+}
 
-    // A rebase that DID produce commits is an epoch — the ledger clears.
-    ledger_consume_at_commit_epoch(
-        attr,
-        "git",
-        &rebase,
+#[test]
+fn confirmed_native_epoch_is_observed_when_tool_scope_is_cancelled() {
+    let ledger = RefCell::new(AttributionLedger::new(
+        crate::agent_identity::DEFAULT_AGENT_EMAIL,
+    ));
+    let git = ConfirmedGit::default();
+    ledger_note_attribution(
+        Some(&ledger),
+        "earlier-model",
+        "edit_file",
+        &serde_json::json!({}),
         true,
-        "rebased onto abc → def456 (2 commit(s), 0 dropped)",
     );
-    assert!(
-        ledger.borrow().is_empty(),
-        "a >0-produced rebase IS an epoch: the ledger is consumed"
-    );
+    {
+        let _epoch =
+            AttributionEpoch::new(Some(&ledger), Some(&git), "active-model", "run_command");
+        git.publish();
+        // An early return/cancel drops the scope before normal result accounting.
+    }
+    assert_eq!(pending_models(&ledger), ["active-model"]);
 }

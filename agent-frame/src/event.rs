@@ -35,6 +35,8 @@ pub enum EventOrigin {
     Model,
     /// A tool execution supplied the material.
     Tool,
+    /// Imported historical data, not a witnessed action by any current actor.
+    Historical,
     /// The harness supplied the material, including auxiliary model output.
     Harness,
 }

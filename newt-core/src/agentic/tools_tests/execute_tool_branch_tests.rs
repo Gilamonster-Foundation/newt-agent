@@ -275,6 +275,10 @@ mod git_scope;
 mod plan_disposition;
 
 #[cfg(test)]
+#[path = "execute_navigation.rs"]
+mod navigation_authority;
+
+#[cfg(test)]
 #[path = "execute_crew.rs"]
 mod crew;
 
@@ -283,12 +287,20 @@ mod crew;
 mod find;
 
 #[cfg(test)]
+#[path = "reads_do_not_publish.rs"]
+mod reads_do_not_publish;
+
+#[cfg(test)]
 #[path = "execute_display.rs"]
 mod display;
 
 #[cfg(test)]
 #[path = "execute_filesystem.rs"]
 mod filesystem;
+
+#[cfg(test)]
+#[path = "read_file_char_offset.rs"]
+mod read_file_char_offset;
 
 #[cfg(test)]
 #[path = "execute_file_artifacts.rs"]

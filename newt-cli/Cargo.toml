@@ -23,6 +23,7 @@ path = "src/lib.rs"
 [dependencies]
 async-trait.workspace = true
 newt-core.workspace = true
+newt-git.workspace = true
 newt-inference.workspace = true
 newt-scheduler.workspace = true
 newt-skills.workspace = true

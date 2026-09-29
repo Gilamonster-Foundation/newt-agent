@@ -4,6 +4,14 @@ The `newt-agent` crate provides the `newt` command and CLI entry points for the
 local coding agent. The [workspace README](../README.md) covers installation,
 configuration, and interactive use.
 
+With Smart Harness enabled, `newt --resume <conversation> --adopt-frame`
+explicitly admits that selected saved conversation into Frame. The saved
+history is verified and retained as quoted historical context; old tool claims
+do not become new execution receipts. Later resumes follow the admitted Frame
+without importing again. The option requires an explicit interactive resume,
+does not authorize other tabs, and leaves backend selection and permission
+gates unchanged.
+
 `newt mcp import --merge --grant-net` skips existing servers without creating
 an empty authoritative config or granting their imported hosts. Adopted
 servers and exact host grants share the existing atomic config transaction.

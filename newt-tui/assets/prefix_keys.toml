@@ -1,0 +1,25 @@
+# newt's meta-prefix bindings — which key, after the prefix chord, names which
+# of newt's own operations. The prefix itself is `[tui] prefix_key` (default
+# `ctrl+space`), settable from `/settings prefix`. The semantics are tmux's and
+# herdr's with a different chord, so "like herdr, but the prefix is ctrl+space"
+# is the whole explanation.
+#
+# Read by `newt-tui/src/prefix.rs` through `include_str!`: a malformed table is
+# a test failure, never an operator's broken keyboard. Pressing the prefix
+# twice sends the prefix chord itself through, as tmux does.
+#
+# Operations (the only names the parser accepts):
+#   zoom    — fill the screen / restore (a panel)
+#   resize  — resize mode: ↑/↓ one row, Enter or Esc to finish (a panel)
+#   redraw  — clear and repaint
+#   help    — show these bindings
+
+[bindings]
+z = "zoom"
+r = "resize"
+l = "redraw"
+"?" = "help"
+# `/` too: easier to hit than `?` (no shift) right after ctrl+space, and it
+# is only a meta key right after the prefix, so a panel's own `/` filter is
+# untouched.
+"/" = "help"

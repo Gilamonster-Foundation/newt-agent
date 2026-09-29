@@ -370,3 +370,252 @@ fn a_host_127_the_shell_did_not_attribute_is_failed() {
     let own = "lookup: definitely-absent-2315: not found\n";
     assert_eq!(host(envelope(127, "", own, false)).1, ExecOutcome::Failed);
 }
+
+/// P0 U6: a timed-out confined run must say what happened and what to do —
+/// the limit, that the command was killed, and the lane for long builds — and
+/// the tool description must state the limit up front. Both texts come from one
+/// owner, so they cannot disagree.
+#[test]
+fn a_timed_out_run_is_actionable_and_the_description_states_the_limit() {
+    let limit = agent_bridle::LimitsPolicy::default().default_timeout_secs;
+    let (text, class) = confined(
+        "make test",
+        envelope(124, "partial", "command timed out after 60s\n", true),
+    );
+    assert_eq!(class, ExecOutcome::TimedOut);
+    for needle in [
+        format!("{limit}s"),
+        "killed".into(),
+        "lifecycle".into(),
+        "action=build".into(),
+    ] {
+        let needle: String = needle;
+        assert!(text.contains(&needle), "missing {needle:?}: {text}");
+    }
+    assert!(text.contains("partial"), "partial output survives: {text}");
+
+    // An ordinary failure gets no timeout coaching.
+    let (plain, _) = confined("cargo test", failing_compile_envelope());
+    assert!(!plain.contains("action=build"), "{plain}");
+
+    let defs = crate::agentic::tools::tool_definitions();
+    let run_command = defs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["function"]["name"] == "run_command")
+        .unwrap();
+    let description = run_command["function"]["description"].as_str().unwrap();
+    assert!(
+        description.contains(&format!("{limit} seconds")) && description.contains("action=build"),
+        "the description must state the wall up front: {description}"
+    );
+}
+
+/// U6d: a model followed "use lifecycle action=build" by calling
+/// `phase="build"` ("unknown lifecycle phase"). The coaching must give the
+/// LITERAL call, with a real phase, in both the timeout result and the tool
+/// description (one owner for the text).
+#[test]
+fn timeout_coaching_gives_the_literal_lifecycle_call() {
+    const CALL: &str = r#"{"action":"build","phase":"test"}"#;
+    let (text, _) = confined("make test", envelope(124, "", "", true));
+    assert!(
+        text.contains(CALL),
+        "the result must show the call shape: {text}"
+    );
+    assert!(text.contains("not `build`"), "phase is not `build`: {text}");
+    let defs = crate::agentic::tools::tool_definitions();
+    let description = defs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["function"]["name"] == "run_command")
+        .unwrap()["function"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        description.contains(CALL),
+        "the description must too: {description}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2482 item 6 (follow-up to #2521): `tool_ok` must ground `ok` in the
+// dispatch OUTCOME whenever one exists, not fall through to the text-prefix
+// classifier. Before this fix, only `Denied` was outcome-gated; a `Passed`
+// run_command whose stdout happens to start with `error:` still ledgered
+// `ok = false`, and a `Failed`/`TimedOut` run whose rendered text does NOT
+// start with a recognized prefix still ledgered `ok = true`.
+// ---------------------------------------------------------------------------
+
+/// Red-first: exit 0, stdout starts with `error:` — must be `ok = true`.
+#[test]
+fn passed_with_error_shaped_stdout_is_ok() {
+    let (text, class) = confined(
+        "cat log",
+        envelope(0, "error: quoted from a log\n", "", false),
+    );
+    assert_eq!(class, ExecOutcome::Passed);
+    assert!(
+        tool_ok(&text, Some(class)),
+        "a Passed run must be ok regardless of error-shaped output text: {text}"
+    );
+}
+
+/// Twin: a non-zero exit whose rendered text does NOT start with a
+/// recognized failure prefix must still be `ok = false` — the outcome
+/// decides, not the text. `confined_result` prefixes every `Failed` render
+/// with `error:`, so construct the disagreement directly against `tool_ok`,
+/// the unit under test.
+#[test]
+fn failed_without_error_shaped_text_is_not_ok() {
+    let text = "no recognized prefix here";
+    assert!(
+        !text.trim_start().starts_with("error:"),
+        "test setup: {text}"
+    );
+    assert!(
+        !tool_ok(text, Some(ExecOutcome::Failed)),
+        "a Failed run must not be ok even when its text has no error prefix: {text}"
+    );
+}
+
+/// Every `ExecOutcome` variant must be classified: `Passed` is the only
+/// success, all four failure shapes are `ok = false`.
+#[test]
+fn every_exec_outcome_variant_is_classified() {
+    assert!(tool_ok("anything", Some(ExecOutcome::Passed)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::Failed)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::Denied)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::TimedOut)));
+    assert!(!tool_ok("anything", Some(ExecOutcome::Unavailable)));
+}
+
+/// `None` (no execution outcome recorded — the common case for built-ins)
+/// keeps falling back to the text classifier, unchanged.
+#[test]
+fn none_execution_falls_back_to_text_classifier() {
+    assert!(tool_ok("fine", None));
+    assert!(!tool_ok("error: nope", None));
+}
+
+// =========================================================================
+// #2553 review finding 1 — a real `read_file` ENOENT dispatch reads as ok.
+// =========================================================================
+
+/// **Reproduces a review finding through the real dispatch path, not a
+/// simulated string.** `read_file` never touches an `ExecOutcome` slot (only
+/// `run_command`/build paths do), so `tool_ok` falls back to
+/// `tool_result_ok`'s text classifier for every read. `authorized_read`'s
+/// ENOENT text now reads `"error: reading {path}: {e}"`, fixed to use the
+/// one `"error:"` convention `tool_result_ok` checks for (previously
+/// `"error reading {path}: {e}"` — a space, not a colon, after `error` —
+/// which did not match and let a real missing-file read ledger `ok = true`,
+/// blinding the repeat-call guard across four repeated reads of the same
+/// nonexistent path on a live refactor run).
+#[tokio::test]
+async fn a_real_read_file_enoent_dispatch_ledgers_as_ok() {
+    use crate::agentic::NoMcp;
+    use crate::caveats::{Caveats, CountBound, Scope};
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    };
+
+    let out = crate::agentic::tools::dispatch::execute_tool(
+        "read_file",
+        &serde_json::json!({"path": "does/not/exist.txt"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !tool_ok(&out, None),
+        "a real ENOENT read must not ledger ok=true: {out}"
+    );
+}
+
+/// **Mirror-bug regression: a successful read is not a failure just because
+/// its file content starts with the word "error".** Architect review of the
+/// finding-1 fix flagged that widening `tool_result_ok` to match a bare
+/// `"error "` prefix (tried first, then reverted) would misclassify a
+/// successful `read_file` whose *content* happens to start with `"error "`
+/// text. The fix instead corrected the producer sites to spell failures with
+/// the one `"error:"` convention, leaving the classifier strict — so a real
+/// successful read of file content starting with `"error handling..."` must
+/// still ledger `ok = true`.
+#[tokio::test]
+async fn a_real_read_file_success_with_error_prefixed_content_ledgers_as_ok() {
+    use crate::agentic::NoMcp;
+    use crate::caveats::{Caveats, CountBound, Scope};
+
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("notes.txt"),
+        "error handling is centralized in this module",
+    )
+    .unwrap();
+
+    let caveats = Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    };
+
+    let out = crate::agentic::tools::dispatch::execute_tool(
+        "read_file",
+        &serde_json::json!({"path": "notes.txt"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        tool_ok(&out, None),
+        "a successful read whose content starts with 'error ' must ledger ok=true: {out}"
+    );
+}

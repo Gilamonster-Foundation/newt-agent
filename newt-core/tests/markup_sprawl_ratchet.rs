@@ -1604,6 +1604,7 @@ fn parent_gated_test_children_are_excluded_structurally() {
         "newt-tui/src/lib_tests/core.rs",
         "newt-tui/src/prompt_visibility_test.rs",
         "newt-core/src/tty/pty_notice_test.rs",
+        "newt-core/src/tty/pty_migration_notice_tests.rs",
     ];
     let leaked: Vec<_> = children.iter().filter(|c| visited.contains(**c)).collect();
     assert!(
@@ -1746,19 +1747,29 @@ fn the_real_workspace_root_set_is_unchanged() {
     let roots = production_roots(&workspace_root());
     assert_eq!(
         roots.len(),
-        26,
-        "25 production members + newt-web; a change here rescopes every \
+        27,
+        "26 production members + newt-web; a change here rescopes every \
          law and every baseline. Moved 21 -> 22 by #1828 A2.0, which adds \
          the `newt-interaction` protocol crate; 22 -> 23 by the \
          `crates/newt-launch` launch-configuration crate; 23 -> 24 by \
          `agent-frame`, the derivation kernel incubated here through 0.1.0 \
          (#2246); 24 -> 26 adds agent-harness and agent-harness-py for \
-         the smart-harness implementation of #2243. All production laws \
-         also scan these two new crates"
+         the smart-harness implementation of #2243; 26 -> 27 adds the \
+         extractable agent-toolchain crate. All production laws also scan \
+         these new crates; their existing baselines do not increase"
     );
-    for member in ["agent-harness", "agent-harness-py"] {
+    for member in ["agent-harness", "agent-harness-py", "agent-toolchain"] {
         assert!(roots.contains(&workspace_root().join(member).join("src")));
     }
+    let toolchain_lib = workspace_root().join("agent-toolchain/src/lib.rs");
+    let mut scanned_toolchain = false;
+    for_each_production_line(&roots, &no_extra_skips, &mut |path, _, _| {
+        scanned_toolchain |= path == toolchain_lib;
+    });
+    assert!(
+        scanned_toolchain,
+        "the production-law walker must visit the new agent-toolchain crate"
+    );
     let names: Vec<String> = roots
         .iter()
         .map(|r| rel(&workspace_root(), r))

@@ -23,6 +23,7 @@ fn ctx<'a>(
     caveats: &'a Caveats,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -53,6 +54,8 @@ fn ctx<'a>(
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,

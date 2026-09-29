@@ -211,10 +211,10 @@ Newt never infers these extensions from the model display name. With
 
 | Cognition | Thinking | `max_tokens` | Temperature | `top_p` |
 |---|---:|---:|---:|---:|
-| `glancing` | off | 2,048 | 0.0 | 1.0 |
-| `pondering` | on | 4,096 | 0.6 | 0.95 |
-| `deliberating` | on | 10,000 | 0.6 | 0.95 |
-| `contemplating` | on | 16,000 | 0.6 | 0.95 |
+| `zen` | off | 2,048 | 0.0 | 1.0 |
+| `rational` | on | 4,096 | 0.6 | 0.95 |
+| `thoughtful` | on | 10,000 | 0.6 | 0.95 |
+| `meticulous` | on | 16,000 | 0.6 | 0.95 |
 
 `chat_template_kwargs = true` permits Newt to project thinking as
 `enable_thinking` plus `truncate_history_thinking = true`.
@@ -232,6 +232,42 @@ response. Every parsed Chat Completions response emits a
 `chat_completion_finish` trace event; an incident also emits
 `reasoning_overflow` with attempted/succeeded status and an estimated reasoning
 token count.
+
+### 2b. Advertised Responses effort and semantic intent
+
+Responses endpoints may declare the fixed effort values they accept:
+
+```toml
+[backends.capability.responses]
+reasoning_effort = ["minimal", "low", "medium", "high"]
+```
+
+A model card uses the same declaration under `[capability.responses]`.
+The existing exact destination and serving-model binding gates the card;
+an inline backend declaration replaces its effort list. Values must form a
+nonempty, duplicate-free subset in the semantic order shown above. Unknown
+values and inconsistent ordering are errors. The maximum is the last accepted
+value in that order, never the lexically greatest string. A Chat thinking
+boolean does not establish a Responses effort declaration.
+
+Without a declaration, the existing four levels retain their fixed mapping:
+`zen` → `minimal`, `rational` → `low`, `thoughtful` → `medium`, and
+`meticulous` → `high`. With a declaration, a selected value outside the list
+fails clearly before inference. Newt does not guess additional effort values
+from a model name or probe the provider. Explicit output allowance still wins
+over the cognition table; accepted Responses effort and local output
+reservation resolve together for the turn.
+
+Semantic cognition is retained even where the provider accepts no cognition
+fields. The turn captures semantic intent, the selected API and the applicable
+capability decision; sibling changes cannot retarget that turn. Unsupported
+Chat fields remain omitted and do not acquire a cognition-derived output
+reservation. Headless `effective_config.cognition` keeps its existing projected
+meaning. The additive `semantic_cognition` records captured intent: null means
+an instantiated turn had no resolved selection, while absence means no turn
+outcome supplied it. Admitted Responses turns also report their captured
+`responses_capability` and actual `reasoning_effort`. These declarations do not
+themselves enable self-review or other techniques.
 
 ### 3. Kill the name gate — in the right order
 

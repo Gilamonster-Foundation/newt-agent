@@ -49,16 +49,22 @@ fn paginate_read_small_file_is_returned_verbatim_without_a_footer() {
 #[test]
 fn paginate_read_char_backstop_tracks_the_token_budget() {
     // #726: the char backstop is now token-derived (budget × chars/token),
-    // NOT a hardcoded 100k. One enormous line: the line window can't help;
-    // the token-derived char backstop must. With a 1000-token budget the
-    // backstop is ~4000 chars, so a 50k-char line is truncated near there.
+    // NOT a hardcoded 100k. Two lines, the first enormous: the line window
+    // can't help; the token-derived char backstop must. With a 1000-token
+    // budget the backstop is ~4000 chars.
+    //
+    // #2563 (round 2): round 1 emitted an over-budget single line WHOLE,
+    // which is unbounded with offload off and re-spills forever with offload
+    // on. Every page — including the single-oversized-line case — MUST stay
+    // under the char cap; the model resumes mid-line via the footer's
+    // `char_offset` (checked below), never by an unbounded whole-line page.
     let budget = 1_000;
     let max_chars = crate::tokens::TokenEstimation::default().chars_for_tokens(budget);
-    let body = "x".repeat(50_000);
+    let body = format!("{}\nshort second line", "x".repeat(50_000));
     let out = paginate_read(&body, None, None, budget);
     assert!(
         out.len() < max_chars + 300,
-        "char-capped to the token budget (~{max_chars} chars): {} bytes",
+        "the oversized first line stays under the cap, not emitted whole: {} bytes",
         out.len()
     );
     assert!(out.contains("truncated"), "marks the truncation");
@@ -66,15 +72,21 @@ fn paginate_read_char_backstop_tracks_the_token_budget() {
         out.contains("~1000 tokens"),
         "footer names the token budget: {out:?}"
     );
-
-    // A LARGER budget keeps more of the same line — the backstop tracks the
-    // budget rather than a fixed constant.
-    let wide = paginate_read(&body, None, None, 4_000);
     assert!(
-        wide.len() > out.len(),
-        "a wider token budget keeps more chars: {} vs {}",
-        wide.len(),
-        out.len()
+        out.contains("offset=1 char_offset="),
+        "footer resumes MID-LINE via char_offset, not at the next line: {out:?}"
+    );
+
+    // A multi-line body that fits within one WHOLE line per page still tracks
+    // the budget for the boundary it cuts on (the ordinary, non-oversized case).
+    let many_lines = "y".repeat(30) + "\n";
+    let wide_body = many_lines.repeat(500);
+    let max_chars = crate::tokens::TokenEstimation::default().chars_for_tokens(budget);
+    let wide_out = paginate_read(&wide_body, None, None, budget);
+    assert!(
+        wide_out.len() < max_chars + 300,
+        "char-capped to the token budget (~{max_chars} chars): {} bytes",
+        wide_out.len()
     );
 }
 
@@ -100,6 +112,27 @@ fn cap_model_output_passes_small_output_through_unchanged() {
     // Well under budget → exact bytes, no marker.
     let small = "hello\nworld\n";
     assert_eq!(cap_model_output(small, DEFAULT_MAX_OUTPUT_TOKENS), small);
+}
+
+#[test]
+fn cap_model_output_preserves_existing_handle_for_short_view() {
+    let store = content_spill::SessionSpillStore::new([20u8; 16]);
+    let (handle, _) = content_spill::store_redacted_full(
+        "first diagnostic\nlast diagnostic\n",
+        Some("run_command".into()),
+        &store,
+    );
+    let handle = handle.unwrap();
+    let hint = content_spill::tool_output_retrieval_hint(&handle);
+    for budget in [0, DEFAULT_MAX_OUTPUT_TOKENS] {
+        let out = cap_model_output_with_handle("last diagnostic", budget, 100, Some(&handle));
+        assert!(out.starts_with("last diagnostic"), "{out}");
+        assert!(!out.contains("first diagnostic"), "{out}");
+        assert!(
+            out.contains(&hint),
+            "short view lost its retained source: {out}"
+        );
+    }
 }
 
 #[test]
@@ -289,6 +322,131 @@ fn shell_envelope_output_spills_full_output_before_head_tail_cap() {
 }
 
 #[test]
+fn shell_envelope_selected_view_retains_exact_full_stream_text() {
+    let stdout = "stdout α\r\nfirst diagnostic\n";
+    let stderr = "stderr β\r\nlast diagnostic\n";
+    let envelope = serde_json::json!({"exit_code": 7, "stdout": stdout, "stderr": stderr});
+    let store = content_spill::SessionSpillStore::new([21u8; 16]);
+    let mut handles = Vec::new();
+    for trim in [OutputTrim::Head(1), OutputTrim::Tail(1)] {
+        let view = trim.apply(stdout, stderr);
+        let out = shell::shell_envelope_output_with_view(
+            &envelope,
+            Some(&view),
+            20,
+            false,
+            true,
+            Some(&store),
+            None,
+        );
+        assert!(
+            out.starts_with(&format!("error: command exited 7\n{view}")),
+            "{out}"
+        );
+        let handle = out
+            .split("spill:")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("selected view retains its full source");
+        let cid = content_spill::SpillCid::parse(handle).unwrap();
+        assert_eq!(
+            store.fetch(&cid).unwrap().redacted_text,
+            format!("{stdout}{stderr}")
+        );
+        handles.push(handle.to_owned());
+    }
+    assert_eq!(
+        handles[0], handles[1],
+        "a different view is not a different source"
+    );
+}
+
+#[test]
+fn shell_envelope_capture_truncation_survives_output_caps_and_retrieval() {
+    for (stdout_truncated, stderr_truncated, streams) in [
+        (true, false, "stdout"),
+        (false, true, "stderr"),
+        (true, true, "stdout and stderr"),
+    ] {
+        let store = content_spill::SessionSpillStore::new([22u8; 16]);
+        let envelope = serde_json::json!({
+            "exit_code": 0,
+            "stdout": "captured line\n".repeat(10_000),
+            "stderr": "last captured diagnostic\n",
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        });
+        let out = shell_envelope_output(&envelope, 20, false, true, Some(&store), None);
+        let notice = format!("{streams} capture truncated; omitted bytes are unavailable");
+        assert!(
+            out.contains(&notice),
+            "capture loss must be explicit: {out}"
+        );
+        let handle = out
+            .split("spill:")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("large capture has a retained-output handle");
+        let cid = content_spill::SpillCid::parse(handle).unwrap();
+        let retained = store.fetch(&cid).unwrap().redacted_text;
+        assert!(
+            retained.contains(&notice),
+            "re-reading must preserve capture loss"
+        );
+        assert!(retained.contains("last captured diagnostic"));
+    }
+}
+
+#[test]
+fn shell_envelope_capture_notice_survives_a_tiny_tail_budget() {
+    // Output settings are process-wide; isolate this configuration from the
+    // ordinary parallel test suite instead of racing its default budgets.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agentic::tools::tests::output_bounds::capture_notice_tiny_tail_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated output-cap test failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the exact child test must run"
+    );
+}
+
+#[test]
+#[ignore = "runs in an isolated child because output settings are process-wide"]
+fn capture_notice_tiny_tail_child() {
+    output_budget::set_max_output_tokens(2);
+    output_budget::set_output_head_tokens(0);
+    let store = content_spill::SessionSpillStore::new([23u8; 16]);
+    let envelope = serde_json::json!({
+        "exit_code": 0,
+        "stdout": format!("{}tail42", "captured line\n".repeat(100)),
+        "stderr": "",
+        "stdout_truncated": true,
+    });
+    let out = shell_envelope_output(&envelope, 20, false, true, Some(&store), None);
+    assert!(out.contains("tail42"), "tail selection survives: {out}");
+    assert!(
+        out.contains("spill:"),
+        "retained source is discoverable: {out}"
+    );
+    assert!(
+        out.ends_with("[stdout capture truncated; omitted bytes are unavailable]"),
+        "capture loss survives even when the cap drops its original prefix: {out}"
+    );
+}
+
+#[test]
 fn shell_envelope_without_streams_commits_the_exit_result() {
     let envelope = serde_json::json!({
         "exit_code": 3,
@@ -308,5 +466,54 @@ fn shell_envelope_without_streams_commits_the_exit_result() {
     assert_eq!(
         String::from_utf8(display.into_inner()).unwrap(),
         "⚙  run_command: exit 3\n▒ error: command exited 3\n…\n"
+    );
+}
+
+// ---- read_file never produces a spill handle (live 2026-09-23) ----
+//
+// read_file's page cap (~30k chars) exceeded the model-facing spill cap (16k),
+// so every large-file read reached the model as a teaser + `spill:` handle:
+// "the tool truncated the payload … and only the spill address was returned,
+// not the actual text" (ornith-1.5-35b, refactoring newt-core/src/agentic/mod.rs).
+// A page the model can continue with `offset=N` beats a handle it must redeem.
+
+#[test]
+fn a_char_capped_page_ends_on_a_whole_line_and_names_the_exact_resume_offset() {
+    let body: String = (1..=3_000)
+        .map(|n| format!("line {n:05} {}", "y".repeat(30)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out = paginate_read(&body, None, None, 1_000);
+    let (page, footer) = out
+        .rsplit_once("\n\n[")
+        .expect("a truncated page has a footer");
+    let last = page.lines().last().unwrap();
+    assert!(last.ends_with(&"y".repeat(30)), "no half line: {last:?}");
+    let shown: usize = last[5..10].parse().unwrap();
+    assert!(
+        footer.contains(&format!("offset={}", shown + 1)),
+        "resume exactly after line {shown}: {footer}"
+    );
+}
+
+#[test]
+fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
+    let body = (1..=5_000)
+        .map(|n| format!("line {n} {}", "z".repeat(40)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cap = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
+    let on = read_file_page(&body, None, None, None, true);
+    assert!(
+        on.chars().count() <= cap,
+        "{} chars would spill",
+        on.chars().count()
+    );
+    assert!(on.contains("offset="), "says how to continue");
+    // Offload off: nothing would spill, so the ordinary (larger) cap applies.
+    let off = read_file_page(&body, None, None, None, false);
+    assert!(
+        off.chars().count() > cap,
+        "offload off keeps the full budget"
     );
 }

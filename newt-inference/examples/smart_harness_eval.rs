@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
             &case.reply,
             case.antecedent.as_deref(),
             Some(&case.task),
+            None,
         );
         let started = Instant::now();
         let old = baseline.classify(&case.reply);

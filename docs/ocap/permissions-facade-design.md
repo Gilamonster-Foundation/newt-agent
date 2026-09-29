@@ -387,7 +387,10 @@ window. Each verb is defined by the algebra operation it compiles to.
     `tools.rs:1018`), so a model-supplied `target:"/home/user"` or `"/"` that the
     human session-allows becomes a whole-subtree grant. §7-F3 specifies the
     danger-tiering fix (interpreter/shell exec targets and broad fs prefixes
-    must force step-up or be un-settable from a plain session-allow).
+    must force step-up or be un-settable from a plain session-allow — except
+    `DenialKind::Build`, deliberately session-allowable despite High tier
+    because it is bounded by the calibrated `build_tool_caveats` fence rather
+    than open-ended, dec1-build-grant #2483 F30).
 - **The algebra already has the axis.** `Caveats.valid_for_generation:
   Scope<u64>` (`agent-mesh-protocol/src/caveats.rs:155`) is a causal-counter
   window, top = `Scope::top()` (`caveats.rs:169`), composed by `meet`

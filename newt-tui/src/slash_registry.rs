@@ -716,6 +716,18 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2515: the clarification gate's own escape hatch. Reaches
+        // `dispatch_slash_with_ask` only when NOTHING is pending — the chat
+        // loop intercepts it earlier and routes it to the pending batch
+        // instead (`chat.rs`, the `discussion_request` check ahead of the
+        // slash-registry branch).
+        "discuss",
+        &["chat"],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::None_,
+    ),
+    cmd(
         // The one that is obviously distinct: `/start` SWITCHES without
         // finalizing — it skips close-time note extraction, leaves the
         // outgoing conversation OPEN and resumable, and takes a title.
@@ -836,6 +848,43 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
+    ),
+    cmd_on(
+        // The meta prefix (ctrl+space by default): a `/settings` field that
+        // was never a verb, like `compaction`. Journal, because the write
+        // goes through `apply_and_record`; it also persists to config.
+        "prefix",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
+        // Sandbox git profile fields: never verbs. Journal, because the write
+        // goes through `apply_and_record`; both persist to agent-identity.toml.
+        "git-author",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
+        "git-config",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
+    ),
+    cmd_on(
+        "git-signing",
+        &[],
+        Family::Tuning,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
     ),
     cmd(
         // Absorbed as the form's first `Text` field in #2009 PR5, and

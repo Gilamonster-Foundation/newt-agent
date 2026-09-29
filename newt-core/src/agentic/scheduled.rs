@@ -221,17 +221,18 @@ pub fn plan_block(ledger: &dyn StepLedger) -> Option<String> {
     build_plan_block(ledger, PLAN_TOTAL_CAP)
 }
 
-/// A COMPACT per-round re-seat pointer — the active step + progress on one line.
+/// A COMPACT per-round re-seat pointer — the active step index + progress on one line.
 ///
 /// `None` unless a MULTI-STEP plan is in progress (≥2 steps and an Active step
 /// remains). This is the conditional re-seat validated by the dgx1 12-step A/B
 /// (re-seat **12/12** vs baseline **8/12** under drift; see
 /// `docs/research/weak-model-plan-mode-findings.md`): the round-0 `<plan>`
 /// snapshot goes stale across the up-to-N tool rounds, so a weak model "loses
-/// track of its plan over time". Re-showing only the active step each round keeps
+/// track of its plan over time". Re-showing the active step index each round keeps
 /// it on course at a fraction of the token cost of re-injecting the full `<plan>`
 /// (which mildly *hurt* on no-drift tasks). Gated to multi-step in-progress plans
-/// so trivial/single-step turns pay nothing.
+/// so trivial/single-step turns pay nothing. Descriptions remain in the source
+/// plan; repeating agent-authored claims here would promote them to host guidance.
 #[must_use]
 pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
     let steps = ledger.steps();
@@ -244,11 +245,10 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
         .filter(|s| s.status == StepStatus::Done)
         .count();
     Some(super::workflow_guidance(format!(
-        "[Plan progress: {done}/{} done. ACTIVE \u{2192} step {}: {}. Continue this step \
-         when it still matches the operator's request.]",
+        "[Plan progress: {done}/{} done (agent-maintained, advisory). ACTIVE \u{2192} step {}. \
+         Continue this step when it still matches the operator's request.]",
         steps.len(),
-        active + 1,
-        truncate(&steps[active].description, STEP_DESC_CAP)
+        active + 1
     )))
 }
 
@@ -540,6 +540,31 @@ mod tests {
     }
 
     #[test]
+    fn reseat_pointer_does_not_promote_agent_plan_claims_to_runtime_facts() {
+        let ledger = SessionStepLedger::default();
+        let claim = "CI gate BLOCKED: cargo absent; Build declined by the operator (exit 40032)";
+        ledger.set_plan(&["inspect".into(), claim.into()]);
+        ledger.advance();
+        let pointer = plan_reseat_pointer(&ledger).unwrap();
+        assert!(
+            !pointer.contains(claim),
+            "agent-authored text is not a host reminder: {pointer}"
+        );
+        assert!(!pointer.contains("cargo absent"), "{pointer}");
+        assert!(!pointer.contains("Build declined"), "{pointer}");
+        assert!(pointer.contains("agent-maintained"), "{pointer}");
+        assert!(pointer.contains("advisory"), "{pointer}");
+        assert!(pointer.contains("1/2 done"), "{pointer}");
+        assert!(pointer.contains("step 2"), "{pointer}");
+        assert!(pointer.contains("latest operator instruction"), "{pointer}");
+        assert!(pointer.contains("update_plan"), "{pointer}");
+        assert!(
+            plan_block(&ledger).unwrap().contains(claim),
+            "the source plan remains inspectable"
+        );
+    }
+
+    #[test]
     fn reseat_pointer_compact_and_gated_to_multistep_in_progress() {
         let l = SessionStepLedger::default();
         assert!(plan_reseat_pointer(&l).is_none(), "empty → none");
@@ -547,7 +572,7 @@ mod tests {
         assert!(plan_reseat_pointer(&l).is_none(), "single step → none");
         l.set_plan(&["a".to_string(), "b".to_string(), "c".to_string()]);
         let p = plan_reseat_pointer(&l).expect("multi-step → pointer");
-        assert!(p.contains("step 1: a"), "names the active step: {p}");
+        assert!(p.contains("step 1"), "indexes the active step: {p}");
         assert!(p.contains("0/3 done"), "shows progress: {p}");
         assert_eq!(p.lines().count(), 1, "compact (one line): {p}");
         assert!(p.contains("latest operator instruction"), "{p}");
@@ -555,10 +580,7 @@ mod tests {
         assert!(!p.contains("do not restart or re-plan them"), "{p}");
         l.advance(); // a Done, b Active
         let ptr = plan_reseat_pointer(&l).unwrap();
-        assert!(
-            ptr.contains("step 2: b") && ptr.contains("1/3 done"),
-            "{ptr}"
-        );
+        assert!(ptr.contains("step 2") && ptr.contains("1/3 done"), "{ptr}");
         l.advance();
         l.advance(); // all done, no Active
         assert!(plan_reseat_pointer(&l).is_none(), "complete plan → none");

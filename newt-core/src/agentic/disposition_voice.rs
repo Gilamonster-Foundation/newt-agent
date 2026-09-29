@@ -99,13 +99,13 @@ impl Default for DispositionVoices {
                 },
                 DispositionVoice {
                     disposition: PromptDisposition::Explain,
-                    card_action: "harness_action: answer without mutation; bounded read/recovery tools only".to_string(),
-                    denied_guidance: "Only the bounded read-only evidence and recovery tools are available here. Choose one of those, or answer directly.".to_string(),
+                    card_action: "harness_action: answer the question using the evidence needed; tools and permission requests remain subject to session grants".to_string(),
+                    denied_guidance: "Use the available tools within session grants, or ask for the permission needed to complete the request.".to_string(),
                 },
                 DispositionVoice {
                     disposition: PromptDisposition::Research,
-                    card_action: "harness_action: gather bounded read-only evidence; do not mutate or request capability grants".to_string(),
-                    denied_guidance: "Only the bounded read-only evidence and recovery tools are available here. Capability grants, execution, mutations, and generic MCP calls need an explicit action request from the operator.".to_string(),
+                    card_action: "harness_action: investigate and report supported findings; tools and permission requests remain subject to session grants".to_string(),
+                    denied_guidance: "Gather the evidence needed within session grants, or ask for the permission needed to complete the investigation.".to_string(),
                 },
                 DispositionVoice {
                     disposition: PromptDisposition::Plan,
@@ -222,6 +222,26 @@ mod tests {
         DispositionSource::Inferred,
         DispositionSource::SessionPolicy,
     ];
+
+    #[test]
+    fn evidence_style_guidance_defers_authority_to_session_grants() {
+        let voices = DispositionVoices::default();
+        for disposition in [PromptDisposition::Explain, PromptDisposition::Research] {
+            let voice = voices.voice(disposition).expect("configured voice");
+            for text in [&voice.card_action, &voice.denied_guidance] {
+                assert!(text.contains("session grants"), "{text}");
+                assert!(text.contains("permission"), "{text}");
+                for stale in [
+                    "bounded read/recovery tools only",
+                    "Only the bounded read-only",
+                    "do not mutate or request capability grants",
+                    "need an explicit action request",
+                ] {
+                    assert!(!text.contains(stale), "{text}");
+                }
+            }
+        }
+    }
 
     /// Whole-word membership, so `model-entered` does not count as `mode`.
     fn names_any(text: &str, words: &[&str]) -> Option<String> {

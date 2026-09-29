@@ -83,7 +83,7 @@ fn attribution_ledger_uses_resolved_identity_email() {
 }
 
 #[test]
-fn runtime_context_block_instructs_shell_git_identity() {
+fn runtime_context_block_reports_identity_without_a_special_git_dialect() {
     let id = newt_core::AgentIdentity::default();
     let blk = runtime_context_block(
         "m",
@@ -92,11 +92,10 @@ fn runtime_context_block_instructs_shell_git_identity() {
         &id,
         newt_core::agentic::PromptDisposition::Act,
     );
-    // The shell-git fallback (for a model that bypasses the embedded tool)
-    // must carry the resolved User no-reply email.
-    assert!(blk.contains("user.email='309460085+newt-agent@users.noreply.github.com'"));
-    assert!(blk.contains("user.name='newt-agent'"));
-    assert!(blk.contains("git -c user.name="));
+    assert!(blk.contains("newt-agent <309460085+newt-agent@users.noreply.github.com>"));
+    assert!(!blk.contains("Prefer the `git` tool"));
+    assert!(!blk.contains("op=amend"));
+    assert!(!blk.contains("git -c user.name="));
 
     let custom = newt_core::AgentIdentity {
         name: "custom".into(),
@@ -110,8 +109,7 @@ fn runtime_context_block_instructs_shell_git_identity() {
         &custom,
         newt_core::agentic::PromptDisposition::Act,
     );
-    assert!(custom_blk.contains("user.email='custom@example.com'"));
-    assert!(custom_blk.contains("user.name='custom'"));
+    assert!(custom_blk.contains("custom <custom@example.com>"));
 }
 
 #[test]
@@ -614,19 +612,19 @@ fn tool_round_limit_override_resolves_and_reports() {
     );
     assert_eq!(
         tool_round_limit_status(25, None, None),
-        "tool-call round limit: 25 (config/model default)"
+        "initial tool-call round allowance: 25 (config/model default)"
     );
     assert_eq!(
         tool_round_limit_status(25, None, Some(50)),
-        "tool-call round limit: 50 this session (config/model default 25)"
+        "initial tool-call round allowance: 50 this session (config/model default 25)"
     );
     assert_eq!(
         tool_round_limit_status(25, Some(Tenacity::Relentless), None),
-        "tool-call round limit: 10000 (effectively unlimited; explicit relentless tenacity; config/model default 25)"
+        "initial tool-call round allowance: 10000 (effectively unlimited; explicit relentless tenacity; config/model default 25)"
     );
     assert_eq!(
         tool_round_limit_status(25, Some(Tenacity::Relentless), Some(7)),
-        "tool-call round limit: 7 this session (explicit relentless tenacity default 10000 (effectively unlimited); config/model default 25)"
+        "initial tool-call round allowance: 7 this session (explicit relentless tenacity default 10000 (effectively unlimited); config/model default 25)"
     );
     assert!(
         tool_round_limit_status(25, None, Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS))
@@ -679,7 +677,7 @@ fn psyche_apply_summary_includes_the_effective_round_source() {
         "{summary}"
     );
     assert!(
-        summary.contains("tool-call round limit: 7 this session"),
+        summary.contains("initial tool-call round allowance: 7 this session"),
         "{summary}"
     );
     assert!(
@@ -1532,37 +1530,152 @@ fn slash_workspace_returns_true() {
 }
 
 #[test]
-fn permission_audit_lines_lists_newest_entries_and_ignores_bad_lines() {
+fn permission_audit_lines_lists_newest_entries_and_reports_bad_lines_as_breaks() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("permission-log.jsonl");
-    std::fs::write(
+    newt_core::permission_journal::append_record(
         &path,
-        "\
-{\"ts_claim\":\"t0\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"exec\",\"target\":\"/bin/echo\",\"decision\":\"allow\",\"scope\":\"session\"}\n\
-this is not json\n\
-{\"ts_claim\":\"t1\",\"conversation_id\":\"c\",\"tool\":\"run_command\",\"kind\":\"net\",\"target\":\"https://example.com\",\"decision\":\"deny\",\"scope\":\"once\"}\n\
-",
+        newt_core::PermissionRecord::new(
+            "c",
+            "run_command",
+            newt_core::DenialKind::Exec,
+            "/bin/echo",
+            "allow",
+            "session",
+        ),
+    )
+    .unwrap();
+    // An interrupted append mid-chain: not readable as a chain line, and must
+    // surface as tamper evidence rather than vanish — item 3, #2529 round 2.
+    // Simulated as a snapshot rewrite (read the legacy bytes, add the garbage
+    // line, write the whole file back once) rather than a real append-mode
+    // writer, so this fixture isn't mistaken for a second journal writer by
+    // the `content_addressable_ratchet` scan (it looks for `append(true)` +
+    // `serde_json::to_string` together — see that test's `journal_tier`).
+    {
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        contents.push_str("this is not json\n");
+        std::fs::write(&path, contents).unwrap();
+    }
+    newt_core::permission_journal::append_record(
+        &path,
+        newt_core::PermissionRecord::new(
+            "c",
+            "run_command",
+            newt_core::DenialKind::Net,
+            "https://example.com",
+            "deny",
+            "once",
+        ),
     )
     .unwrap();
 
     let lines = permission_audit_lines(&path, 5);
-    assert_eq!(
-        lines.first(),
-        Some(&"permission audit: 2 of 2 (newest first)".to_string())
+    assert!(
+        lines[0].starts_with("!! CHAIN BROKEN"),
+        "an unparseable line must be reported, not silently dropped: {lines:?}"
     );
-    assert!(lines[1].contains("deny"));
-    assert!(lines[1].contains("once"));
-    assert!(lines[1].contains("net"));
-    assert!(lines[1].contains("https://example.com"));
-    assert!(lines[2].contains("allow"));
+    let audit_header = lines
+        .iter()
+        .position(|l| l == "permission audit: 2 of 2 (newest first)")
+        .expect("audit header must still be present");
+    assert!(lines[audit_header + 1].contains("deny"));
+    assert!(lines[audit_header + 1].contains("once"));
+    assert!(lines[audit_header + 1].contains("net"));
+    assert!(lines[audit_header + 1].contains("https://example.com"));
+    assert!(lines[audit_header + 2].contains("allow"));
 
     let limited = permission_audit_lines(&path, 1);
     assert_eq!(
-        limited,
-        vec![
+        limited[limited.len() - 2..],
+        [
             "permission audit: 1 of 2 (newest first)".to_string(),
             "  deny    once      net      https://example.com via run_command".to_string()
         ]
+    );
+}
+
+/// Item 1, #2529 round 2: a rotated pre-chain sibling exists — say so, and
+/// render its lines (within `limit`) as unchained history rather than
+/// silently omitting them.
+#[test]
+fn permission_audit_lines_surfaces_the_pre_chain_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permission-log.jsonl");
+    let pre_chain = newt_core::permission_journal::pre_chain_path(&path);
+    let legacy = newt_core::PermissionRecord::new(
+        "c",
+        "run_command",
+        newt_core::DenialKind::Exec,
+        "/bin/legacy",
+        "allow",
+        "once",
+    );
+    std::fs::write(
+        &pre_chain,
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+    )
+    .unwrap();
+    newt_core::permission_journal::append_record(
+        &path,
+        newt_core::PermissionRecord::new(
+            "c",
+            "run_command",
+            newt_core::DenialKind::Exec,
+            "/bin/new",
+            "allow",
+            "once",
+        ),
+    )
+    .unwrap();
+
+    let lines = permission_audit_lines(&path, 5);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("pre-chain migration")
+                && l.contains(&pre_chain.display().to_string())),
+        "must name the pre-chain sibling: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("/bin/legacy") && l.contains("unchained")),
+        "must render the unchained legacy record: {lines:?}"
+    );
+}
+
+/// Item 4, #2529 round 2: a log never appended-to since the upgrade is still
+/// a flat `PermissionRecord` body (not yet rotated) — read it as unchained
+/// history, never report it as empty.
+#[test]
+fn permission_audit_lines_reads_an_unrotated_flat_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("permission-log.jsonl");
+    let legacy = newt_core::PermissionRecord::new(
+        "c",
+        "run_command",
+        newt_core::DenialKind::Exec,
+        "/bin/legacy",
+        "allow",
+        "once",
+    );
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+    )
+    .unwrap();
+
+    let lines = permission_audit_lines(&path, 5);
+    assert!(
+        !lines.iter().any(|l| l == "no permission log entries yet"),
+        "a flat pre-chain body must not read as empty: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("/bin/legacy") && l.contains("unchained")),
+        "must render the unrotated legacy record: {lines:?}"
     );
 }
 

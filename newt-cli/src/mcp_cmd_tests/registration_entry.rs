@@ -195,7 +195,8 @@ fn mcp_add_import_parses() {
     ])
     .is_ok());
     assert!(crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-codex", "--all"]).is_ok());
-    assert!(crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-claude"]).is_err());
+    // No selector parses: the command then lists the server names.
+    assert!(crate::Cli::try_parse_from(["newt", "mcp", "import", "--from-claude"]).is_ok());
     assert!(crate::Cli::try_parse_from([
         "newt",
         "mcp",

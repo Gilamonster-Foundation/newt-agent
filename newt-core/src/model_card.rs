@@ -231,6 +231,10 @@ impl ChatCompletionsCapability {
     }
 }
 
+#[path = "model_card_effort.rs"]
+mod effort;
+pub use effort::{ReasoningEffort, ReasoningEffortLadder, ResponsesCapability};
+
 /// Reasoning capability bits the harness reads (retires the `reasoning.rs`
 /// name-match in a later issue).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -253,6 +257,9 @@ pub struct Capability {
     /// Explicit extensions for OpenAI-compatible Chat Completions servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_completions: Option<ChatCompletionsCapability>,
+    /// Explicit accepted effort values for the Responses wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses: Option<ResponsesCapability>,
 }
 
 impl Capability {
@@ -266,6 +273,10 @@ impl Capability {
             thinking_default: o.thinking_default.or(self.thinking_default),
             reasoning_content_field: o.reasoning_content_field.or(self.reasoning_content_field),
             reasoning_replay_scope: o.reasoning_replay_scope.or(self.reasoning_replay_scope),
+            responses: match (self.responses, o.responses) {
+                (Some(base), Some(overlay)) => Some(base.merge(overlay)),
+                (base, overlay) => overlay.or(base),
+            },
             chat_completions: match (self.chat_completions, o.chat_completions) {
                 (Some(base), Some(overlay)) => Some(base.merge(overlay)),
                 (base, overlay) => overlay.or(base),
@@ -690,6 +701,14 @@ impl CapabilityDecision {
         self.effective
             .as_ref()
             .and_then(|c| c.chat_completions)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn responses(&self) -> ResponsesCapability {
+        self.effective
+            .as_ref()
+            .and_then(|c| c.responses.clone())
             .unwrap_or_default()
     }
 

@@ -65,6 +65,17 @@ pub fn print_newt(msg: &str, color: bool, verbose: bool) {
     println!("{}", newt_line(msg, color, verbose));
 }
 
+/// The marker printed before a reply's first line.
+pub const REPLY_MARKER: &str = "▸  ";
+
+/// Display width of [`REPLY_MARKER`] (pinned by a test).
+pub const REPLY_MARKER_COLS: usize = 3;
+
+/// Wrap width for Markdown rendered after the reply marker (#2442).
+pub fn reply_cols(cols: usize) -> usize {
+    cols.saturating_sub(REPLY_MARKER_COLS)
+}
+
 /// The narrator line [`print_newt`] prints, as a string.
 ///
 /// Split out so a caller holding a [`crate::tty::PromptWindow`] can route the
@@ -227,9 +238,16 @@ pub fn fmt_tokens_compact(n: u32) -> String {
     }
 }
 
-/// `used/budget` gauge in `k`, e.g. `"899k/1024k"`.
-pub fn fmt_token_gauge(used: u32, budget: u32) -> String {
-    format!("{}/{}", fmt_tokens_k(used), fmt_tokens_k(budget))
+/// `used/budget` gauge in `k`, e.g. `"899k/1024k"`. `budget: None` means no
+/// context window is known for the active model (issue #2466): rather than
+/// presenting the learned ratchet (`max_ok_input`) as if it were the window,
+/// the denominator renders as `?` so the operator sees "unmeasured", not a
+/// false ceiling.
+pub fn fmt_token_gauge(used: u32, budget: Option<u32>) -> String {
+    match budget {
+        Some(b) => format!("{}/{}", fmt_tokens_k(used), fmt_tokens_k(b)),
+        None => format!("{}/?", fmt_tokens_k(used)),
+    }
 }
 
 /// Fill-level band for the gauge — color-type-agnostic so each caller maps it to
@@ -1241,6 +1259,9 @@ pub(crate) struct ToolDisplay<W: Write> {
     /// global here — so a call site cannot silently get the wrong mode.
     summary: bool,
     result_override: Option<String>,
+    /// What the OPERATOR should see when it differs from what the model got
+    /// (see [`ToolPresentation::display_source`]). Consumed by `result`.
+    display_source: Option<String>,
     file_change: Option<std::sync::Arc<crate::agentic::FileChangePresentation>>,
     /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
     /// When present, completed tool output ADDITIONALLY renders as an interactive
@@ -1264,6 +1285,7 @@ impl<W: Write> ToolDisplay<W> {
             spill_lines,
             summary,
             result_override: None,
+            display_source: None,
             file_change: None,
             completed_spill_renderer: None,
         }
@@ -1363,9 +1385,14 @@ impl<W: Write> ToolDisplay<W> {
     }
 
     pub(crate) fn result(&mut self, output: &str) {
-        let raw_output = output;
+        // The operator's view starts from the display source when a tool gave
+        // one (the full receipt behind a model-facing headline), else from
+        // what the model got. Escaping overrides and file-change byte ranges
+        // are both bound to this display text, never to the model's.
+        let source = self.display_source.take();
+        let raw_output = source.as_deref().unwrap_or(output);
         let overridden = self.result_override.take();
-        let output = overridden.as_deref().unwrap_or(output);
+        let output = overridden.as_deref().unwrap_or(raw_output);
         let change = self
             .file_change
             .take()
@@ -1522,6 +1549,10 @@ pub(crate) trait ToolPresentation: Send {
     fn document(&mut self, output: &str);
     fn override_result(&mut self, output: String);
     fn file_change(&mut self, _change: std::sync::Arc<crate::agentic::FileChangePresentation>) {}
+    /// The operator's full view of a result whose model-facing text is
+    /// shorter: a mutation tells the model "Modified (+1 -1)" while the
+    /// operator keeps the diff. Hosts without a display ignore it.
+    fn display_source(&mut self, _full: String) {}
 }
 
 impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
@@ -1574,6 +1605,10 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
     fn file_change(&mut self, change: std::sync::Arc<crate::agentic::FileChangePresentation>) {
         self.file_change = Some(change);
     }
+
+    fn display_source(&mut self, full: String) {
+        self.display_source = Some(full);
+    }
 }
 
 /// Print a tool-call header so the user can see what the agent is doing.
@@ -1607,3 +1642,58 @@ pub(crate) fn print_tool_output(output: &str, _tool_output_lines: usize, color: 
 #[cfg(test)]
 #[path = "display_tests/mod.rs"]
 mod display_tests;
+
+/// Presentation boundary for config reads made while preparing core-owned
+/// thinking/tool output. Flush after the result exists, through the same line
+/// owner as that presentation, and preserve redirected stderr.
+pub(super) fn with_migration_notices<T>(
+    operation: impl FnOnce(&mut dyn FnMut(crate::tty::Notice<'static>)) -> T,
+) -> T {
+    use std::io::IsTerminal as _;
+    let mut notices = Vec::new();
+    let result = operation(&mut |notice| notices.push(notice));
+    let caps = if std::io::stderr().is_terminal() {
+        crate::tty::LineCaps::detect()
+    } else {
+        crate::tty::LineCaps::None
+    };
+    for notice in notices {
+        let _ = notice.diagnostic(caps, false, std::io::stderr());
+    }
+    result
+}
+
+#[cfg(all(test, feature = "markdown"))]
+mod reply_wrap_tests {
+    use super::*;
+    use crate::agentic::{render_markdown, RenderOpts};
+
+    /// #2442: the `▸  ` marker is printed outside the Markdown renderer, so a
+    /// first line wrapped to the full width overflowed and the terminal
+    /// split it mid-word. Marker + first line must fit in `cols`.
+    #[test]
+    fn marker_plus_first_line_fits_terminal_width() {
+        let cols = 20;
+        let out = render_markdown(
+            "alpha bravo charlie delta echo foxtrot",
+            RenderOpts {
+                color: true,
+                cols: reply_cols(cols),
+            },
+        );
+        let first = out.lines().next().unwrap();
+        let w = crate::tty::width::str_width(&crate::tty::width::strip_ansi(first));
+        assert!(
+            REPLY_MARKER_COLS + w <= cols,
+            "first line {first:?} is {w} cols"
+        );
+    }
+
+    #[test]
+    fn marker_width_matches_constant() {
+        assert_eq!(
+            crate::tty::width::str_width(REPLY_MARKER),
+            REPLY_MARKER_COLS
+        );
+    }
+}

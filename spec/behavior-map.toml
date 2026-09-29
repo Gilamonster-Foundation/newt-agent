@@ -187,7 +187,7 @@ path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
 
 [BHV-TOOLS-002]
-description = "Missing or duplicate correlation ids terminate the turn (no fabricated outputs, no follow-up); a validated batch has non-empty, pairwise-distinct ids."
+description = "Correlation ids are provider-issued, or DERIVED by the harness from the call and its causal parent (the inference attempt that produced the reply) for calls the harness itself recovered from reply text; an id is never invented for a provider call that arrived without one. Missing or duplicate provider ids are never dispatched and never answered with fabricated outputs: the uncorrelatable calls are withdrawn from the transcript and the model is re-asked within a bounded budget, after which the turn terminates; a validated batch has non-empty, pairwise-distinct ids."
 [BHV-TOOLS-002.status]
 lean = "spec"
 rust = "tested"
@@ -211,7 +211,40 @@ path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_blank_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/tool_round_cap/responses_protocol.rs"
-symbol = "responses_missing_call_id_aborts_without_a_followup_request"
+symbol = "responses_missing_call_id_aborts_after_the_reask_budget"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/tool_round_cap/responses_protocol.rs"
+symbol = "responses_idless_call_is_re_asked_then_recovers"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "three_idless_batches_in_a_row_abort_with_todays_error"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/openai_stream_loop.rs"
+symbol = "streamed_idless_tool_call_is_re_asked_and_the_turn_completes"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/openai_stream_loop.rs"
+symbol = "streamed_duplicate_ids_reach_the_shared_validator"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/openai_sse_strict_tests.rs"
+symbol = "stream_leaves_missing_blank_and_repeated_ids_to_the_batch_validator"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "a_recovered_call_completes_with_a_derived_id_and_a_reshaped_turn"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "identical_reply_text_in_two_rounds_derives_different_ids"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "two_identical_calls_in_one_reply_get_distinct_ids"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "a_native_idless_call_never_gets_a_derived_id"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/anthropic_loop.rs"
+symbol = "a_recovered_call_replays_as_tool_use_with_a_derived_id"
+[[BHV-TOOLS-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/anthropic_loop.rs"
+symbol = "idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block"
 [[BHV-TOOLS-002.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
@@ -337,6 +370,85 @@ symbol = "tests::transport_sets_store_false_for_stateless_no_retention"
 [[BHV-STORAGE-001.refs.production]]
 path = "newt-core/src/responses_wire.rs"
 symbol = "STORE_RESPONSE_SERVER_SIDE"
+
+# ───────────────────────── Embedded git engine (#2485) ────────────────────────
+# RECON item 2 (p0-git-tool-honesty): a ref-moving history op (rebase) must
+# leave the working tree consistent with the ref it just moved, or refuse
+# before moving it — never move the ref and leave the tree stale.
+
+[BHV-GIT-001]
+description = "A ref-moving git op (e.g. rebase, checkout) leaves the working tree equal to the new HEAD, or refuses before moving the ref; it never advances the ref while leaving the tree stale."
+[BHV-GIT-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/rebase.rs"
+symbol = "rebase_drops_a_commit"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/rebase.rs"
+symbol = "rebase_refuses_on_a_dirty_tree"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/checkout_branch.rs"
+symbol = "checkout_switches_to_a_different_commit_on_a_clean_tree"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/checkout_branch.rs"
+symbol = "checkout_refuses_a_different_commit_on_a_dirty_tree"
+[[BHV-GIT-001.refs.rust_tests]]
+path = "newt-git/src/lib_tests/checkout_branch.rs"
+symbol = "checkout_refuses_when_the_target_tree_would_overwrite_an_ignored_file"
+[[BHV-GIT-001.refs.production]]
+path = "newt-git/src/lib.rs"
+symbol = "rebase"
+[[BHV-GIT-001.refs.production]]
+path = "newt-git/src/lib.rs"
+symbol = "checkout"
+
+# ───────────────── Native Git AppContainer boundary (#2610) ─────────────────
+
+[BHV-GIT-002]
+description = "On Windows, after ordinary filesystem admission and only when the effective restricted backend is AppContainer, an already exec-authorized single literal direct Git program is refused before spawn with a named unavailable result, because Git for Windows needs current-directory ancestor traversal outside the admitted roots. Newt does not widen those roots or retry unconfined; missing exec authority retains the normal capability denial, and text merely mentioning Git plus compound or dynamic shell source retains ordinary confined-executor semantics."
+[BHV-GIT-002.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "tests::appcontainer_refuses_recognized_native_git_without_matching_text"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "native_git_status_requires_exec_and_reads_the_actual_repository"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "state_modifying_git_add_is_not_routed"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "native_git_exec_grant_retry_is_refused_before_spawn"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "windows_disable_ocap_keeps_native_git_available"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "tests::native_staging_uses_current_workspace_grants"
+tier = "unit"
+[[BHV-GIT-002.refs.production]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "literal_native_git_program"
+[[BHV-GIT-002.refs.production]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "windows_appcontainer_native_git_refusal"
+[[BHV-GIT-002.refs.production]]
+path = "newt-core/src/agentic/tools/shell.rs"
+symbol = "exec_confined_command_with_broker"
 
 # ─────────────────────── Chat-loop dispatch recovery (#1533) ──────────────────
 # The temporal contract for the chat loops' dispatch recovery, machine-checked by
@@ -1315,3 +1427,278 @@ tier = "unit"
 [[BHV-ESC-002.refs.production]]
 path = "newt-tui/src/cockpit/presenter.rs"
 symbol = "escape_during_turn"
+
+[BHV-ROUTE-001]
+description = "A run_command(\"git …\") call is never silently rewritten to Newt's smaller Git interface: routing and direct-tool correction leave its command and fields intact for native Git handling, including flags, revisions/ranges, -- pathspecs, cwd, and timeout. The routing table has no Git reach, and the direct-tool correction does not treat Git as a tool. This preserves Git's command and output semantics instead of dropping operands or refusing with a smaller supported-op list."
+[BHV-ROUTE-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::native_git_commands_keep_flags_revisions_pathspecs_and_cwd"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_read_commands_preserve_operands"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_reads_preserve_revisions_pathspecs_and_stat"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::git_presentation_options_stay_on_native_exec"
+tier = "unit"
+[[BHV-ROUTE-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/helper_shell_routing.rs"
+symbol = "git_commands_are_never_redirected_to_a_special_tool"
+tier = "unit"
+[[BHV-ROUTE-001.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "SHELL_ROUTES"
+[[BHV-ROUTE-001.refs.production]]
+path = "newt-core/src/agentic/tools/catalog.rs"
+symbol = "run_command_redirect"
+
+# ─────────────────────────────── OCAP durable grants ─────────────────────────
+
+[BHV-OCAP-001]
+description = "A durable grant (`~/.newt/ocap/approve.toml` `[[fs]]`/`[[exec]]`/`[[net]]`) reaches a session's caveats ONLY when its signature verifies against the operator's root key; an unsigned or bad-signature entry never widens caveats, folds nothing, and is dropped with a visible warning rather than silently honored (#2524 item 1) — and never a high-danger root: both surfaces filter approved grants through the same production danger predicate before widening, so a validly-signed `/`/`$HOME`/interpreter entry is refused on TUI and headless alike, even if it reached the store by a path other than `sign_ocap`'s own refusal (#2532 round 2, should-fix 2)."
+[BHV-OCAP-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-tui/src/permissions_tests/ocap_grant_fold.rs"
+symbol = "fold_ocap_approvals_widens_recalled_caveats_like_a_durable_grant"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-tui/src/permissions_tests/ocap_grant_fold.rs"
+symbol = "folding_never_resurrects_an_unverified_approve"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/src/headless.rs"
+symbol = "tests::fold_ocap_grants_widens_a_fenced_axis_but_never_touches_an_open_one"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/src/headless.rs"
+symbol = "tests::fold_ocap_grants_of_an_empty_store_admits_nothing"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/tests/headless_cli.rs"
+symbol = "a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_contract"
+tier = "unit"
+[[BHV-OCAP-001.refs.rust_tests]]
+path = "newt-cli/src/headless.rs"
+symbol = "tests::fold_ocap_grants_refuses_a_signed_high_danger_root"
+tier = "unit"
+[[BHV-OCAP-001.refs.production]]
+path = "newt-core/src/ocap_store.rs"
+symbol = "approved_grants"
+[[BHV-OCAP-001.refs.production]]
+path = "newt-tui/src/permissions.rs"
+symbol = "fold_ocap_approvals"
+[[BHV-OCAP-001.refs.production]]
+path = "newt-cli/src/headless.rs"
+symbol = "fold_ocap_grants"
+
+[BHV-ROUTE-002]
+description = "A recognised build command issued through run_command runs in the build lane: run_command(\"cargo build|check|test|clippy …\") and run_command(\"just <recipe>\") route to the confined build lane (the same leq/permission-gate re-check and 30-minute LIFECYCLE_BUILD_TIMEOUT as lifecycle action=build), running the model's LITERAL argv verbatim — never a re-resolved phase command, so no operand is ever dropped. cargo run/install/publish and any --config/-Z flag stay on the exec path; a call carrying timeout alongside command is refused rather than silently dropping that field. A clean build argv piped ONLY to `tail -N`/`tail -n N`/`head -N`/`head -n N` (optionally with a preceding `2>&1`) also routes (F23 / #2524 'tail-pipe-routes'): the build's real exit code decides the outcome, and the trim is applied to the rendered output on the harness side, never inside a shell that could mask the exit code — the exact hazard an un-routed `| tail` created. Anything wider (multiple pipes, `tail -f`/`head -c`, a redirect before the pipe, a non-tail/head pipe target, or a missing/zero/non-numeric count) stays on the ordinary compound-command refusal. PR1 (multi-repo-recon, r10-r12 evidence): a leading `cd <dir> && `/`cd <dir>; ` — the workspace root (F24's original case) OR a real subdirectory — folds into a routed `cwd` when `<dir>` canonicalizes to a real directory inside both the canonical workspace AND the call's fs-read fence (the SAME question a real `cd` answers, via std::fs::canonicalize, replacing F24's lexical exact-match-only check); a `cwd` FIELD on an otherwise-bare call resolves the SAME way, UNLESS a leading `cd` was already folded, in which case the two combine on DIFFERENT directories (the fold resolves against the workspace, a real shell resolves the `cd` against the `cwd` field) and the call stays Exec. A target that does not exist, is a file not a directory, resolves (through any symlink) outside the workspace or fence, `cd -`/`cd ~`, a quoted/glob/metacharacter-carrying dir, unquoted internal whitespace, or a second `cd` all stay compound/Exec; the fence check runs on both the lexical AND canonicalized path/scope, so a symlinked workspace root or an in-fence symlink pointing outside the fence are both handled correctly. The routed note names the folded directory (empty for the workspace root itself, `cwd=\".\"`). F27 (r14a evidence): a single trailing `; echo <arg>`/`&& echo <arg>` (plus a trailing `2>&1` on what remains) is stripped before classification when `<arg>` provably only reports `$?`/`${PIPESTATUS[0]}` and nothing else with a real side effect (no other `$` expansion, no command substitution, no redirect, no further `;`/`&&`/`|`, no newline/CR — checked on the raw argument, since a real shell always starts a new command at a newline regardless of what a `$?`-scrub would leave behind) and the kept build half itself contains no quote character (the rightmost-`;`/`&&` split has no notion of quoting, so a quoted separator could otherwise become the split point and route a different command than the shell would run). Anything not provably inert (unrelated text/variables, a command substitution, a redirect, `||`, a second trailing echo, a newline, a quote in the kept half) stays compound. A stripped call is flagged (`mark_echo_dropped`) and the routed note says the echo was dropped and the lane's own exit code is the real one, mirroring F23/#2549's trim note and PR1/#2551's `cd`/`cwd` clause. F28 (#2483 evidence, NOTES-2483.md F28/F30): a leading `timeout [OPTIONS]… <DURATION>` wrapper (`-s SIG`/`--signal=SIG`, `-k DUR`/`--kill-after=DUR`, `--preserve-status`, `--foreground` in any order, then a plain digits-only duration with an optional single `s`/`m`/`h`/`d` suffix — never a quoted string or a `$` variable) is stripped from the FRONT of the command, in the same pre-classification pass as the `cd` fold/tail trim/exit-echo strip, BEFORE the pipe/meta/tokenize lookup — composing with all three: a folded `cd`, a piped `tail`/`head` trim, and a stripped exit-echo all still apply to the remainder. The wrapper is dropped ONLY when the remainder alone routes to the build lane (`build_exec`); a wrapper around a non-routable command (`timeout 5 rm -rf x`) stays Exec, and exactly one wrapper is ever stripped — a second leading `timeout` in the remainder (`timeout 1 timeout 2 …`) is never itself stripped. A stripped call carries the parsed duration as `timeout_secs` (`mark_timeout_secs`); the build lane applies `min(timeout_secs, LIFECYCLE_BUILD_TIMEOUT)` as its actual wall (0 meaning \"no timeout\", i.e. the lane's own wall), and the routed note names whichever wall actually applies — the model's own bound when it is the shorter of the two, or the lane's 30-minute limit when it caps it. Round 1's `-s SIG`/`--signal=SIG` and `-k DUR`/`--kill-after=DUR` values must themselves be plain (signal: letters/digits only; kill-after: the same plain-duration grammar) — a metacharacter in an option's value refuses the whole strip rather than silently discarding it."
+[BHV-ROUTE-002.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cargo_build_commands_route_with_literal_argv"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::just_recipe_routes_with_literal_argv"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cargo_near_misses_never_route"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::build_route_call_requires_bare_call"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::build_piped_to_tail_or_head_routes_with_the_trim"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::build_piped_to_anything_else_never_routes"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "routed_cargo_test_reaches_the_confined_build_lane"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_failing_build_piped_to_tail_still_reports_the_real_failure"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cd_into_a_real_subdirectory_routes_with_cwd"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cd_stays_exec_when_the_target_does_not_resolve_or_is_out_of_authority"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cd_through_a_symlink_that_escapes_the_workspace_stays_exec"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::cd_into_a_real_subdirectory_outside_the_fence_stays_exec"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_cwd_field_on_a_bare_call_routes_the_same_way"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_noop_cd_to_the_workspace_root_still_routes_and_says_so"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_cd_prefixed_subdirectory_routes_and_says_so"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/repeat_call_guard_tests.rs"
+symbol = "a_routed_cd_prefixed_gate_pass_still_resets_the_brake"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_folded_cd_with_2_and_1_and_a_trailing_exit_echo_routes_with_cwd"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::every_trailing_exit_echo_variant_is_stripped_and_routes"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_trailing_echo_that_is_not_provably_inert_stays_compound"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_trailing_exit_echo_on_a_command_that_would_fail_still_routes"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "a_failing_build_with_a_trailing_exit_echo_still_reports_the_real_failure"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_newline_in_the_echo_tail_refuses_the_whole_strip"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_quote_inside_the_kept_half_refuses_the_whole_strip"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_leading_timeout_wrapper_is_stripped_and_the_build_routes"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_leading_timeout_wrapper_composes_with_the_cd_fold"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_leading_timeout_wrapper_composes_with_the_tail_trim"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_leading_timeout_wrapper_composes_with_the_exit_echo_strip"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_timeout_wrapper_around_a_non_routable_command_stays_exec"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::a_timeout_wrapper_with_a_shell_variable_duration_stays_exec"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "tests::two_stacked_timeout_wrappers_never_recursively_strip"
+tier = "unit"
+[[BHV-ROUTE-002.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/repeat_call_guard_tests.rs"
+symbol = "a_routed_timeout_wrapped_gate_pass_still_resets_the_brake"
+tier = "unit"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "build_lane_route"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "build_piped_to_trim_route"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "resolve_workspace_relative_dir"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "run_confined_build_lane"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "OutputTrim"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "strip_trailing_exit_echo"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "mark_echo_dropped"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "strip_leading_timeout"
+[[BHV-ROUTE-002.refs.production]]
+path = "newt-core/src/agentic/routing.rs"
+symbol = "mark_timeout_secs"
+
+[BHV-TOOLOK-001]
+description = "The ledgered `ok` bit is the dispatch OUTCOME whenever one exists: `ExecOutcome::Passed` is `ok = true`, `Failed`/`Denied`/`TimedOut`/`Unavailable` are `ok = false`, every variant named explicitly (no `_ =>`). The rendered text's prefix classifier (`tool_result_ok`) is used ONLY when no outcome was recorded (`execution = None`) — so a `run_command` that exits 0 with `error:`-shaped stdout is `ok = true`, and a non-zero exit whose render lacks a recognized failure prefix is still `ok = false` (#2482 item 6, follow-up to #2521/#2419)."
+[BHV-TOOLOK-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "passed_with_error_shaped_stdout_is_ok"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "failed_without_error_shaped_text_is_not_ok"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "every_exec_outcome_variant_is_classified"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/exit_code_ok_tests.rs"
+symbol = "none_execution_falls_back_to_text_classifier"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.rust_tests]]
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "missing_permission_gate_mcp_refusal_records_not_ok_on_the_chat_wire"
+tier = "unit"
+[[BHV-TOOLOK-001.refs.production]]
+path = "newt-core/src/agentic/tools.rs"
+symbol = "tool_ok"

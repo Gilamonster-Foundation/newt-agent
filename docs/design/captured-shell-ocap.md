@@ -23,9 +23,10 @@ confinement.
 
 Two facts shape the answer:
 - **Ambient env can't work, by design.** newt's confined shell already runs
-  `do_not_inherit_env(true)` (`newt-core/src/agentic/tools.rs:207`) — it does **not**
-  inherit the host's ambient environment, which is why `venv_cmd_prefix` *injects*
-  `export VIRTUAL_ENV=…` explicitly. So `pa login` exporting a token into a parent shell
+  `do_not_inherit_env(true)` (agent-bridle's brush engine) — it does **not**
+  inherit the host's ambient environment, which is why newt hands the values a child
+  needs to the engine explicitly, through its `env` seam (`venv_env_map` in
+  `newt-core/src/agentic/tools/shell.rs`). So `pa login` exporting a token into a parent shell
   is invisible to confined commands. That block is **OCAP working**, not a bug: an env-var
   token is ambient authority readable by every command — the Confused Deputy you're
   defending against.

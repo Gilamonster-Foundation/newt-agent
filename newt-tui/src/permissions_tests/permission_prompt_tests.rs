@@ -809,8 +809,17 @@ fn authorization_prompts_enabled_consults_the_operator() {
 #[test]
 fn allow_permanent_records_session_scope_when_net_persist_fails() {
     let root = tempfile::TempDir::new().unwrap();
-    let config = root.path().join("blocked-config-dir");
-    std::fs::create_dir_all(&config).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    // #2535/#2524 PR1: the durable write moved from `[tui.permissions] net`
+    // to `persist_approve`'s `<config dir>/ocap/approve.toml`. Block THAT
+    // path by pre-occupying `ocap` with a plain file, so `create_dir_all`
+    // fails and the gate falls back to session-only.
+    std::fs::write(root.path().join("ocap"), b"not a directory").unwrap();
+    let key_path = root.path().join("identity.pem");
+    agent_mesh_protocol::UserKey::generate()
+        .save(&key_path)
+        .unwrap();
     let base = base_caveats("/ws");
     let net_req = newt_core::PermissionRequest {
         tool: "web_fetch".to_string(),
@@ -824,7 +833,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
         let mut gate = PromptPermissionGate {
             state: &mut state,
             base,
-            key_path: None,
+            key_path: Some(key_path),
             conversation_id: "conv-config-fail".to_string(),
             log_path: None,
             denials_path: None,
@@ -1036,26 +1045,29 @@ fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
             }
             assert_eq!(cancel.load(Ordering::Relaxed), cancelled);
             assert_eq!(exit.load(Ordering::Relaxed), exited);
-            if outcome == HumanQuestionOutcome::Answer("A".into()) {
-                let permissions = newt_core::Config::load(&config)
-                    .unwrap()
-                    .tui
-                    .unwrap()
-                    .permissions;
-                assert_eq!(permissions.net, vec![request.target]);
-            } else {
-                assert!(!config.exists(), "only a permanent answer writes config");
-            }
+            // #2535/#2524 PR1 (P-1): a permanent answer no longer writes
+            // `config.toml` — it signs `~/.newt/ocap/approve.toml` instead,
+            // and this fixture's gate has no `key_path` (no root key), so
+            // even that falls back to session-only. Nothing is ever written
+            // to `config.toml` from this path any more.
+            assert!(
+                !config.exists(),
+                "a permanent answer no longer writes config"
+            );
         }
     }
 }
 
 #[test]
 fn mcp_net_prompt_configured_blank_answer_preserves_grant_lifetime() {
+    // #2535/#2524 PR1 (P-1): `AllowPermanent` no longer writes `config.toml`
+    // at all (durable net grants sign into `approve.toml` now), and this
+    // fixture's gate has no `key_path`, so even that falls back to
+    // session-only — `config.toml` is never created by any of these.
     for (configured, allowed, remembered, persisted) in [
         (None, true, false, false),
         (Some(PromptChoice::AllowSession), true, true, false),
-        (Some(PromptChoice::AllowPermanent), true, true, true),
+        (Some(PromptChoice::AllowPermanent), true, true, false),
         (Some(PromptChoice::Deny), false, false, false),
         (Some(PromptChoice::Back), false, false, false),
     ] {
@@ -1889,8 +1901,12 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
     assert!(fresh.decisions.is_empty());
 }
 
+/// #2535/#2524 PR1: every durable-store kind (exec/fs/net) offers permanent
+/// allow at Low danger now, not just net — `persist_approve` signs whichever
+/// axis the answer names. A high-danger exec target still never offers it
+/// (unchanged; covered by the `a0_freeze_goldens` interpreter golden).
 #[test]
-fn permanent_allow_offered_for_net_only() {
+fn permanent_allow_offered_for_every_durable_store_kind_at_low_danger() {
     let danger = danger::DangerTable::builtin();
     let net = plain::render(&permission_definition(
         &PermissionRequest {
@@ -1907,37 +1923,50 @@ fn permanent_allow_offered_for_net_only() {
         &danger,
         Audience::Terminal,
     ));
-    assert!(
-        net.contains("[A]llow permanently"),
-        "net must offer it: {net}"
-    );
-    assert!(
-        !exec.contains("[A]llow permanently"),
-        "exec must NOT: {exec}"
-    );
+    let fs_write = plain::render(&permission_definition(
+        &PermissionRequest {
+            tool: "run_command".to_string(),
+            kind: DenialKind::FsWrite,
+            target: "/ws/notes.txt".to_string(),
+            reason: String::new(),
+        },
+        &danger,
+        Audience::Terminal,
+    ));
+    for (label, rendered) in [("net", &net), ("exec", &exec), ("fs write", &fs_write)] {
+        assert!(
+            rendered.contains("[A]llow permanently"),
+            "{label} must offer it: {rendered}"
+        );
+    }
     assert!(net.contains("[P]ermanently deny") && exec.contains("[P]ermanently deny"));
 }
 
+/// #2535/#2524 PR1 (P-1): `[A]llow permanently` on a net host now signs and
+/// appends to `~/.newt/ocap/approve.toml` — `[tui.permissions] net` in
+/// `config.toml` is no longer a durable-grant WRITE target (it stays a
+/// legacy READ path, unexercised here since nothing writes it any more).
 #[test]
-fn allow_permanently_grants_now_and_persists_host_to_config() {
-    for (preset, wildcard, force_full_access) in [
-        ("workspace_dev", false, false),
-        ("workspace_dev", true, false),
-        ("workspace_dev", false, true),
-        ("full_access", false, false),
+fn allow_permanently_grants_now_and_persists_host_to_approve_toml() {
+    for (preset, force_full_access) in [
+        ("workspace_dev", false),
+        ("workspace_dev", true),
+        ("full_access", false),
     ] {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
-        let net = if wildcard { r#"["*"]"# } else { "[]" };
         std::fs::write(
             &config,
-            format!("# my config\n[tui.permissions]\npreset = \"{preset}\"\nnet = {net}\n"),
+            format!("# my config\n[tui.permissions]\npreset = \"{preset}\"\nnet = []\n"),
         )
         .unwrap();
+        let key_path = dir.path().join("identity.pem");
+        let root = agent_mesh_protocol::UserKey::generate();
+        root.save(&key_path).unwrap();
         let base = if force_full_access {
             Caveats::top()
         } else {
-            newt_core::Config::load(&config)
+            crate::migration_notices::read(|report| newt_core::Config::load(&config, report))
                 .unwrap()
                 .tui
                 .unwrap()
@@ -1957,7 +1986,7 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
             let mut gate = PromptPermissionGate {
                 state: &mut state,
                 base,
-                key_path: None,
+                key_path: Some(key_path.clone()),
                 conversation_id: "conv-904a".to_string(),
                 log_path: None,
                 denials_path: None,
@@ -1991,30 +2020,28 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
             .session_grants
             .contains(&(DenialKind::Net, "github.com".to_string())));
         assert_eq!(state.decisions[0].scope, "permanent");
+
+        // The config file's `[tui.permissions] net` is untouched — the
+        // durable write moved to the signed store.
         let written = std::fs::read_to_string(&config).unwrap();
         assert!(written.contains("# my config"), "comment lost: {written}");
         assert!(
-            written.contains("github.com"),
-            "host not persisted: {written}"
+            !written.contains("github.com"),
+            "P-1: net is no longer written to config.toml: {written}"
         );
-        let permissions = newt_core::Config::load(&config)
-            .unwrap()
-            .tui
-            .unwrap()
-            .permissions;
-        assert!(permissions.net.contains(&"github.com".to_string()));
-        let reloaded = if force_full_access {
-            Caveats::top()
-        } else {
-            permissions.to_caveats("/ws")
-        };
-        let policy = newt_mcp_client::HttpNetworkPolicy::with_explicit_hosts(
-            &reloaded.net,
-            &permissions.net,
-        );
-        assert!(
-            policy.explicitly_grants_host("github.com"),
-            "a fresh session honors permanent MCP grants in every mode"
+
+        // The signed store carries the grant, and reloading it through the
+        // real verify-at-load path recognizes it as live.
+        let approve_path = dir.path().join("ocap").join("approve.toml");
+        let approve_text = std::fs::read_to_string(&approve_path).unwrap();
+        assert!(approve_text.contains("github.com"), "{approve_text}");
+        assert!(approve_text.contains("sig ="), "{approve_text}");
+        let (set, warnings) =
+            newt_core::ocap_store::load_store(&config, Some(root.public().as_bytes()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            newt_core::ocap_store::evaluate_request(&set, DenialKind::Net, "github.com"),
+            Some(newt_core::ocap_store::Verdict::Approve)
         );
     }
 }
@@ -2682,6 +2709,78 @@ fn session_grant_cannot_pierce_the_preset_floor() {
 }
 
 #[test]
+fn explicit_operating_mode_ceiling_survives_permission_grants() {
+    use crate::OperatingMode;
+
+    for (configured, model_plan_phase) in [
+        (OperatingMode::Diagnose, false),
+        (OperatingMode::Plan, false),
+        (OperatingMode::Auto, true),
+    ] {
+        let mut state = PermissionPromptState::default();
+        state.session_grants.extend([
+            (DenialKind::Exec, "git".into()),
+            (DenialKind::FsWrite, "/outside/recalled".into()),
+        ]);
+        let base = crate::operating_mode_caveats(configured, model_plan_phase, base_caveats("/ws"));
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce, PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        gate.preset_clamp =
+            crate::operating_mode_permission_clamp(configured, model_plan_phase, None);
+        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+            panic!("refresh returns the attenuated authority");
+        };
+        assert_eq!(
+            refreshed.fs_read, base.fs_read,
+            "the existing read grant survives"
+        );
+        assert!(
+            !refreshed.permits_exec("git"),
+            "recalled exec bypassed {configured:?}"
+        );
+        assert_eq!(
+            refreshed.fs_write,
+            Scope::none(),
+            "recalled write bypassed {configured:?}"
+        );
+
+        for _ in 0..2 {
+            let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")])
+            else {
+                panic!("scripted operator allowed the request");
+            };
+            assert!(
+                !granted.permits_exec("npm"),
+                "new grant bypassed {configured:?}"
+            );
+        }
+        assert_eq!(prompts.get(), 2, "once and session choices were exercised");
+        let request = PermissionRequest {
+            tool: "write_file".into(),
+            kind: DenialKind::FsWrite,
+            target: "/outside/new".into(),
+            reason: "test explicit mode ceiling".into(),
+        };
+        assert!(matches!(
+            gate.ask(&[request]),
+            newt_core::PermissionDecision::Deny
+        ));
+    }
+
+    assert!(
+        crate::operating_mode_permission_clamp(OperatingMode::Auto, false, None).is_none(),
+        "an inferred working style must not introduce a grant ceiling"
+    );
+}
+
+#[test]
 fn allow_session_never_reprompts_until_restart() {
     let prompts = Rc::new(Cell::new(0));
     let base = base_caveats("/ws");
@@ -2816,10 +2915,8 @@ fn decisions_are_recorded_to_the_session_log() {
     }]);
     let _ = gate.ask(&[exec_request("rm")]);
     let body = std::fs::read_to_string(&log).unwrap();
-    let records: Vec<newt_core::PermissionRecord> = body
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let records =
+        newt_core::permission_journal::records(&newt_core::permission_journal::read_jsonl(&body));
     assert_eq!(records.len(), 3);
     assert!(records.iter().all(|r| r.conversation_id == "conv-test"));
     assert_eq!(
@@ -3347,6 +3444,9 @@ async fn native_once_filesystem_pending_grants_survive_until_the_declared_retry(
     std::fs::write(&output, "BEFORE\n").unwrap();
     let baseline = Caveats {
         exec: Scope::only(["/bin/echo".into()]),
+        // This macOS fixture tests one-shot filesystem/exec attenuation.
+        // Restricted networking is unavailable independently of those grants.
+        net: Scope::All,
         ..newt_core::confined_exec::workspace_confined_caveats(&root)
     };
     let mut state = PermissionPromptState::default();
@@ -4047,7 +4147,7 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
 // Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 05:48 EDT | Date: 2026-09-18
 
 #[test]
-fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
+fn confined_build_is_never_a_shell_expansion_and_session_allow_is_call_scoped_too() {
     let base = base_caveats("/ws");
     let request = newt_core::PermissionRequest {
         tool: "lifecycle".into(),
@@ -4055,9 +4155,17 @@ fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
         target: "/ws".into(),
         reason: "cargo test; workspace writes and network denied".into(),
     };
+    // dec1-build-grant (F30): `Build` is now session-allowable — Shawn's
+    // decision that refusing it bought no extra safety over the calibrated
+    // `build_tool_caveats` fence an allow-once already grants, only a repeat
+    // prompt on every build/test/check in a session. What must stay true
+    // either way, and what this test still pins: the returned caveats for
+    // THIS call are the calibrated build fence, never a widened shell
+    // `Caveats::exec`/`fs_write` — session scope means "don't ask again for
+    // this workspace's build", not "the shell may now run cargo unconfined".
     for (choice, permitted) in [
         (PromptChoice::AllowOnce, true),
-        (PromptChoice::AllowSession, false),
+        (PromptChoice::AllowSession, true),
         (PromptChoice::Deny, false),
     ] {
         let mut state = PermissionPromptState::default();
@@ -4074,7 +4182,16 @@ fn confined_build_is_once_only_and_does_not_expand_shell_authority() {
             newt_core::PermissionDecision::Deny => assert!(!permitted),
         }
         drop(gate);
-        assert!(state.session_grants.is_empty());
+        if choice == PromptChoice::AllowSession {
+            assert!(
+                state
+                    .session_grants
+                    .contains(&(DenialKind::Build, "/ws".to_string())),
+                "session allow must remember the workspace's build grant"
+            );
+        } else {
+            assert!(state.session_grants.is_empty());
+        }
     }
     let build = newt_core::confined_exec::build_tool_caveats(std::path::Path::new("/ws"));
     assert!(ceiling_permits(&build, DenialKind::Build, "/ws"));
@@ -4109,6 +4226,62 @@ fn preset_build_ceiling_refuses_before_prompting() {
         newt_core::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
+}
+
+#[test]
+fn managed_build_scratch_reuses_session_approval_without_widening_the_shell() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let target = workspace.to_string_lossy().into_owned();
+    let base = base_caveats(&target);
+    let mut build = newt_core::confined_exec::build_tool_caveats(&workspace);
+    build.net = Scope::All;
+    let request = PermissionRequest {
+        tool: "lifecycle".into(),
+        kind: DenialKind::Build,
+        target,
+        reason: "native cargo with private build scratch".into(),
+    };
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowSession],
+        prompts.clone(),
+    );
+    for _ in 0..2 {
+        let decision = gate.ask_with_caveats(&build, std::slice::from_ref(&request));
+        let newt_core::PermissionDecision::Allow(actual) = decision else {
+            panic!("approved Build refused")
+        };
+        assert_eq!(actual, build);
+    }
+    assert_eq!(
+        prompts.get(),
+        1,
+        "one session approval covers subsequent builds"
+    );
+    assert_eq!(
+        base.fs_write,
+        Scope::only([workspace.to_string_lossy().into_owned()])
+    );
+    let scratch = newt_core::confined_exec::build_scratch_dir(&workspace);
+    assert!(
+        !scratch.exists(),
+        "permission projection creates no scratch"
+    );
+    assert!(!newt_core::caveats::permits_path(
+        &base.fs_write,
+        &scratch.to_string_lossy()
+    ));
+    assert!(newt_core::caveats::permits_path(
+        &build.fs_write,
+        &scratch.to_string_lossy()
+    ));
+    assert!(!ceiling_permits(&base, DenialKind::Build, &request.target));
 }
 
 #[test]

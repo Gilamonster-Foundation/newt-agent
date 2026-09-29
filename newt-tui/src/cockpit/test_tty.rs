@@ -30,6 +30,7 @@ pub(crate) struct TestTty {
     master: RawFd,
     saved_in: RawFd,
     saved_out: RawFd,
+    saved_err: Option<RawFd>,
     painted: Arc<Mutex<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     responder: Option<std::thread::JoinHandle<()>>,
@@ -98,10 +99,24 @@ impl TestTty {
                 master,
                 saved_in,
                 saved_out,
+                saved_err: None,
                 painted,
                 stop,
                 responder: Some(responder),
             }
+        }
+    }
+
+    /// Include stderr in this owned terminal for diagnostic-routing cases.
+    pub(crate) fn capture_stderr(&mut self) {
+        assert!(self.saved_err.is_none());
+        // SAFETY: this fixture owns the process descriptors and restores fd 2
+        // before closing its saved duplicate in Drop.
+        unsafe {
+            let saved = libc::dup(2);
+            assert!(saved >= 0);
+            assert!(libc::dup2(1, 2) >= 0);
+            self.saved_err = Some(saved);
         }
     }
 
@@ -264,6 +279,10 @@ impl Drop for TestTty {
         }
         // SAFETY: putting fd 0/1 back and closing what we opened.
         unsafe {
+            if let Some(saved) = self.saved_err.take() {
+                libc::dup2(saved, 2);
+                libc::close(saved);
+            }
             libc::dup2(self.saved_in, 0);
             libc::dup2(self.saved_out, 1);
             libc::close(self.saved_in);

@@ -20,6 +20,7 @@ pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a
 /// persona's `cognition:` (psyche sibling of [`tenacity`] and [`initiative`]).
 pub mod cognition;
+pub mod commit_signing;
 pub mod config;
 pub mod confined_exec;
 pub mod conversation;
@@ -35,8 +36,10 @@ pub mod event_journal;
 pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;
+mod native_git_broker;
 pub mod netguard;
 pub mod owned_hosts;
+pub mod permission_journal;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
 // Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
@@ -44,6 +47,7 @@ pub mod owned_hosts;
 pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
+pub mod grant_tree;
 pub mod grounding;
 /// The initiative dial: how much the agent looks before acting (split from
 /// [`tenacity`]), with the per-model-family defaults.
@@ -166,7 +170,9 @@ pub mod pyo3_module;
 /// Carried-coreutils dispatch (agent-bridle #206): a newt binary calls this at
 /// the top of `main` to become dispatch-capable, so the brush engine's carried
 /// `ls`/`cat` shims re-exec against the newt binary itself.
-pub use agent_bridle::maybe_dispatch;
+pub fn maybe_dispatch() -> Option<i32> {
+    native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
+}
 pub use agent_identity::{
     default_operator, AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef,
     AGENT_IDENTITY_FILENAME, DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_NAME, GITHUB_APP_BOT_EMAIL,

@@ -35,6 +35,28 @@ fn sandbox() -> Sandbox {
     }
 }
 
+/// Controlled stdio transport fixtures must reach the MCP handshake.
+/// macOS currently refuses every restricted network grant before spawn. Declare
+/// network authority explicitly for these known self-MCP/echo children while
+/// preserving read-only filesystem access and exact configured-command exec.
+/// Other platforms keep the default net:none positive control.
+fn stdio_transport_sandbox() -> Sandbox {
+    #[cfg(not(target_os = "macos"))]
+    {
+        sandbox()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let sb = sandbox();
+        std::fs::write(
+            sb.config_dir.join("config.toml"),
+            "[tui.permissions]\npreset = \"read_only\"\nnet = [\"*\"]\n",
+        )
+        .unwrap();
+        sb
+    }
+}
+
 fn newt(sb: &Sandbox) -> Command {
     let mut cmd = Command::cargo_bin("newt").unwrap();
     cmd.env("NEWT_CONFIG_DIR", &sb.config_dir)
@@ -53,7 +75,7 @@ fn newt_bin() -> String {
 
 #[test]
 fn probe_derives_identity_tools_and_posture_from_a_live_server() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
     newt(&sb)
         .args(["mcp", "probe", &newt_bin(), "--arg", "mcp", "--yes"])
         .assert()
@@ -68,7 +90,7 @@ fn probe_derives_identity_tools_and_posture_from_a_live_server() {
 
 #[test]
 fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
     newt(&sb)
         .args([
             "mcp",
@@ -83,7 +105,7 @@ fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
         .success()
         // Status lines live on stderr; stdout is report-only.
         .stderr(predicate::str::contains("Registered MCP server"));
-    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml")).unwrap();
+    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml"), &mut |_| {}).unwrap();
     assert_eq!(cfg.mcp_servers.len(), 1);
     assert_eq!(cfg.mcp_servers[0].name, "newt-mcp-server");
     assert_eq!(cfg.mcp_servers[0].args, vec!["mcp"]);
@@ -114,7 +136,7 @@ fn probe_save_writes_the_config_and_duplicate_suggests_a_rename() {
 
 #[test]
 fn probe_to_catalog_then_install_round_trips() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
     newt(&sb)
         .args([
             "mcp",
@@ -142,7 +164,7 @@ fn probe_to_catalog_then_install_round_trips() {
         .args(["mcp", "install", "self-probe"])
         .assert()
         .success();
-    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml")).unwrap();
+    let cfg = newt_core::Config::load(&sb.config_dir.join("config.toml"), &mut |_| {}).unwrap();
     assert_eq!(cfg.mcp_servers[0].name, "self-probe");
     assert_eq!(cfg.mcp_servers[0].args, vec!["mcp"]);
 }
@@ -170,7 +192,8 @@ fn probe_without_yes_fails_closed_off_a_terminal() {
 #[cfg(unix)]
 #[test]
 fn probe_never_certifies_a_stdin_echoing_process() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
+    let config_before = std::fs::read(sb.config_dir.join("config.toml")).ok();
     // `/bin/cat` echoes the initialize request back verbatim (matching id, no
     // error) — before handshake validation this "probed OK" with zero tools
     // and was saveable. It must be rejected as not-an-MCP-server.
@@ -179,10 +202,38 @@ fn probe_never_certifies_a_stdin_echoing_process() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not an MCP server"));
-    assert!(
-        !sb.config_dir.join("config.toml").exists(),
-        "a non-server must never be registered"
+    assert_eq!(
+        std::fs::read(sb.config_dir.join("config.toml")).ok(),
+        config_before,
+        "a non-server must never change registration or fixture authority"
     );
+    assert!(!sb.config_dir.join("mcp-catalog.toml").exists());
+}
+
+/// Default probe authority remains fail-closed on macOS. The positive
+/// transport fixtures above do not turn --yes into network permission or
+/// weaken this real restricted-spawn assertion.
+#[cfg(target_os = "macos")]
+#[test]
+fn probe_default_network_refusal_never_saves_registration_or_catalog() {
+    let sb = sandbox();
+    newt(&sb)
+        .args([
+            "mcp",
+            "probe",
+            &newt_bin(),
+            "--arg",
+            "mcp",
+            "--save",
+            "--to-catalog",
+            "--yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Net axis"))
+        .stderr(predicate::str::contains("L3 BOUND"));
+    assert!(!sb.config_dir.join("config.toml").exists());
+    assert!(!sb.config_dir.join("mcp-catalog.toml").exists());
 }
 
 #[test]
@@ -199,7 +250,7 @@ fn probe_failure_reports_every_candidate_tried() {
 
 #[test]
 fn probe_json_emits_a_machine_readable_report() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
     let assert = newt(&sb)
         .args([
             "mcp",
@@ -293,7 +344,7 @@ async fn probe_url_reports_auth_required_on_401() {
 
 #[test]
 fn probe_json_with_save_keeps_stdout_a_single_json_value() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
     let assert = newt(&sb)
         .args([
             "mcp",
@@ -363,7 +414,7 @@ fn unreadable_catalog_drop_in_fails_install_loudly() {
 
 #[test]
 fn probe_rules_project_drop_in_beats_the_user_one() {
-    let sb = sandbox();
+    let sb = stdio_transport_sandbox();
     // User rules would never speak MCP; the project rules pin `mcp`. Success
     // proves the project file won the whole-file replacement.
     std::fs::write(

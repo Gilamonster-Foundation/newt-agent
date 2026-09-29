@@ -27,26 +27,7 @@
 
 pub use agent_mesh_protocol::caveats::{Caveats, CountBound, Scope};
 
-/// Per-axis "permits this concrete item?" check.
-///
-/// `All` permits everything; `Only(s)` permits exactly the members of `s`.
-/// Defined as a trait because the upstream `agent-mesh-protocol::Scope` ships
-/// only the lattice algebra; this is the dispatch-site adaptor. Constructors
-/// (`Scope::only`, `Scope::none`) are inherent on the upstream type — no
-/// re-definition needed.
-pub trait ScopeExt<T: Ord + Clone> {
-    /// Does this scope authorize `item`?
-    fn permits(&self, item: &T) -> bool;
-}
-
-impl<T: Ord + Clone> ScopeExt<T> for Scope<T> {
-    fn permits(&self, item: &T) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(set) => set.contains(item),
-        }
-    }
-}
+pub use agent_toolchain::caveats::ScopeExt;
 
 /// "Does this bound permit one more call?" — the dispatch-site form of the
 /// `max_calls` axis. Defined as an extension trait because the upstream
@@ -165,12 +146,25 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
             })
             .unwrap_or_default()
     };
-    lock_fs_to_workspace(
-        caveats,
-        workspace,
-        &parse("NEWT_READ_PATHS"),
-        &parse("NEWT_WRITE_PATHS"),
-    );
+    // The workspace's own git metadata (HEAD, index, objects, the checked-out
+    // branch's ref) lives outside `workspace` for a linked worktree — grant
+    // READ so `git status`/`diff`/`log` work there (F32, #2537). Deliberately
+    // READ-ONLY: the real commit path is the in-process `git` tool
+    // (`newt-git`'s `GitEngine::commit`/`amend`/`rebase`, guarded there by
+    // `refuse_if_default_branch`), not a write grant on these paths — a write
+    // grant here would let `write_file`/`edit_file` retarget `HEAD` to `main`
+    // or corrupt the shared `objects/` store with no prompt (PR #2577 review).
+    // `own_gitdir_grants` still computes a `write` set (kept for callers that
+    // reason about it directly, e.g. `newt-git`'s explicit-`cwd` dispatch
+    // check); folding it into the SHELL lane's kernel fence is deliberately
+    // out of scope here — that is an operator decision, not this function's
+    // to make.
+    let own_git = crate::git_hardening::own_gitdir_grants(std::path::Path::new(workspace));
+    let mut read = parse("NEWT_READ_PATHS");
+    read.extend(own_git.read);
+    let write = parse("NEWT_WRITE_PATHS");
+
+    lock_fs_to_workspace(caveats, workspace, &read, &write);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +227,43 @@ pub fn permits_path(scope: &Scope<String>, full_path: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Spawn net scope (agent-bridle 0.8 admission narrowing)
+// ---------------------------------------------------------------------------
+
+/// The `net` caveat to hand a **spawned child** (confined shell / stdio MCP
+/// server), as opposed to the in-process `web_fetch` caller that can actually
+/// enforce a host allow-list.
+///
+/// Under agent-bridle 0.8, admission fails closed (L3 BOUND) on the Linux
+/// Landlock backend when the delegated `net` scope is a non-empty host list:
+/// `Scope::Only(_)` resolves to `Unknown` (only `Scope::none()` is bindable
+/// to a kernel primitive there), and `Unknown` refuses at admission
+/// independent of enforcement strength. A spawned child was never able to
+/// honor a host-scoped allow-list anyway — no kernel primitive here bounds
+/// *which* host a TCP socket reaches, only whether it may open one at all —
+/// so that grant was already advisory-only for a spawn. Narrowing it to
+/// `Scope::none()` here loses nothing a spawn could actually enforce, and
+/// makes admission decidable on Linux (`none` + `ChildNetworkPolicy::DenyDirect`
+/// ⇒ `Kernel`).
+///
+/// **Measured on Linux** (Landlock + `DenyDirect` → `Kernel`-decidable after
+/// this narrowing). On macOS, Seatbelt still refuses a restricted `net` scope
+/// — including `none` — independently; a separate agent-bridle fix is under
+/// way. On Windows, AppContainer can bind `net:none`, but other axes (e.g.
+/// restricted exec) can still refuse; behaviour is unvalidated here.
+///
+/// `Scope::All` and `Scope::none()` pass through unchanged: `All` is already
+/// unrestricted (nothing to narrow), and `none()` is already the bindable
+/// shape. Only a non-empty `Only(_)` host list is narrowed.
+#[must_use]
+pub fn spawn_net_scope(net: &Scope<String>) -> Scope<String> {
+    match net {
+        Scope::Only(set) if !set.is_empty() => Scope::none(),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +286,18 @@ mod tests {
 
     fn s(v: &[&str]) -> std::collections::BTreeSet<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn spawn_net_scope_narrows_a_nonempty_host_list_to_none() {
+        let hosts = Scope::only(["api.example.com".to_string()]);
+        assert_eq!(spawn_net_scope(&hosts), Scope::none());
+    }
+
+    #[test]
+    fn spawn_net_scope_preserves_all_and_empty() {
+        assert_eq!(spawn_net_scope(&Scope::All), Scope::All);
+        assert_eq!(spawn_net_scope(&Scope::none()), Scope::none());
     }
 
     #[test]
@@ -383,6 +426,71 @@ mod tests {
         assert!(
             !c.permits_exec("cargo-x"),
             "a different program sharing a prefix must not match"
+        );
+    }
+
+    /// PR #2577 round 2, item 2: `apply_cli_fs_grants` must extend `fs_read`
+    /// with the workspace's own git metadata (F32/#2537) but NEVER `fs_write`
+    /// — a write grant there let `write_file` retarget `HEAD` to `main` or
+    /// corrupt the shared `objects/` store with no prompt. Real `git`, real
+    /// tempdirs, `#[cfg(unix)]` per the real-resource testing tier.
+    #[cfg(unix)]
+    #[test]
+    fn own_gitdir_grants_are_read_only_in_session_caveats() {
+        let root = tempfile::tempdir().unwrap();
+        // Git resolves macOS's /var alias; compare the same physical paths.
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        git(&main, &["add", "seed"]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+
+        std::env::remove_var("NEWT_READ_PATHS");
+        std::env::remove_var("NEWT_WRITE_PATHS");
+        let mut caveats = Caveats::top();
+        apply_cli_fs_grants(&mut caveats, &wt.to_string_lossy());
+
+        let common_dir = main.join(".git");
+        assert!(
+            permits_path(
+                &caveats.fs_read,
+                &common_dir.join("objects").to_string_lossy()
+            ),
+            "the common git dir must be READ-granted"
+        );
+        assert!(
+            !permits_path(
+                &caveats.fs_write,
+                &common_dir.join("objects").to_string_lossy()
+            ),
+            "the common git dir's objects/ must NOT be write-granted"
+        );
+        assert!(
+            !permits_path(
+                &caveats.fs_write,
+                &common_dir.join("worktrees/wt/HEAD").to_string_lossy()
+            ),
+            "the worktree's HEAD must NOT be write-granted — that would let a \
+             model retarget it to main with no prompt"
         );
     }
 }

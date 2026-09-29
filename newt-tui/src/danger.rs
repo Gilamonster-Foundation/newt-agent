@@ -27,6 +27,10 @@
 //! sticky grant of a broad fs root is a whole-tree permit. The operator may
 //! `[a]llow once` per op or `[d]eny`; `[k]ey allow` (step-up, **P3, unbuilt**)
 //! is the intended standing path for these.
+//!
+//! One exception: `DenialKind::Build` IS session-allowable despite staying
+//! High tier (dec1-build-grant, #2483 F30) — it is bounded by the calibrated
+//! `build_tool_caveats` fence, not an open-ended interpreter/broad-root grant.
 
 use newt_core::DenialKind;
 use std::collections::BTreeSet;
@@ -163,7 +167,7 @@ impl DangerTable {
             }
             // Net, RemoteTool, and GitWrite are never high-danger (guarded by
             // `classify` above); unreachable in practice, but keep the match total.
-            DenialKind::Build => Some("Build scripts and tests may execute arbitrary code inside the workspace fence; toolchain/cache reads are allowed, network is denied.".into()),
+            DenialKind::Build => Some("Build scripts and tests may execute arbitrary code inside the workspace fence; toolchain/cache reads are allowed. Networking follows the existing operator grant; build approval grants no additional network access.".into()),
             DenialKind::Net | DenialKind::RemoteTool | DenialKind::GitWrite => None,
         }
     }
@@ -286,6 +290,16 @@ mod tests {
             .blast_radius(DenialKind::FsWrite, "/home/me/project")
             .unwrap();
         assert!(ws.contains("broad filesystem root"), "got: {ws}");
+
+        // Build requests carry their actual network scope separately. The
+        // generic warning must not contradict an existing operator grant.
+        let build = t.blast_radius(DenialKind::Build, "/ws").unwrap();
+        assert!(!build.contains("network is denied"), "got: {build}");
+        assert!(build.contains("existing operator grant"), "got: {build}");
+        assert!(
+            build.contains("no additional network access"),
+            "got: {build}"
+        );
 
         // No banner for a low-danger grant.
         assert!(t.blast_radius(DenialKind::Exec, "ls").is_none());

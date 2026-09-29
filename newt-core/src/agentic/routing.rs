@@ -1,46 +1,28 @@
 //! Hidden tool-call routing — facade **P4** (§4 of
 //! `docs/ocap/permissions-facade-design.md`).
 //!
-//! Capable models emit tool calls learned from *other* harnesses —
-//! `run_command("cat X")`, `run_command("ls")`, `run_command("find … ")`,
-//! `run_command("rm X")`, `run_command("git status")` — instead of newt's
-//! governed built-ins (`read_file` / `list_dir` / `find` / `delete_file` / the
-//! embedded `git` tool). Each such reach lands as a wasted round, and worse, an
-//! operation the model could have done *within authority* can trip an **exec**
-//! denial when it arrives as a shell command (§4.1).
+//! Faithful single-tool shell calls can use the governed built-in directly:
+//! `cat X` → `read_file`, `ls` → `list_dir`, and supported build commands →
+//! `build_exec`. Each route retains the destination tool's authority checks.
+//! Other calls use ordinary exec under the existing OCAP boundary.
 //!
-//! P4 **promotes faithful one-tool reaches to a silent rewrite**: the call is
-//! transparently re-dispatched to the OCAP-governed built-in (no model
-//! retraining), and **everything else is gated** as ordinary exec.
+//! Native Git commands always use exec. Translating them into a smaller Git
+//! interface changes the requested flags, revisions, or output shape; the
+//! installed Git executable is responsible for its own command semantics.
 //!
-//! ## Routing is NOT a bypass (§4.4)
-//!
-//! A routed call goes through the **same** fs / git caveat checks the built-in
-//! always runs — [`RouteDecision::Route`] only changes *which built-in serves
-//! the call*, never *whether it is within authority*. An out-of-scope
-//! `cat /etc/shadow` routes to `read_file{path:"/etc/shadow"}` and is denied by
-//! the fs floor exactly as a direct `read_file` would be. Routing is the L2
-//! convenience engine; the L3 boundary (the confined shell, the fs fence) is
-//! untouched, and is **never** disabled by the routing escape (§7-F5 — see
-//! `tools::routing_disabled`, a switch distinct from `--disable-ocap`).
-//!
-//! ## The route/gate split is DATA, not `match` arms (three-Cs)
-//!
-//! Per the repo's language-pack / lexicon convention (`CLAUDE.md` → "the three
-//! Cs"), the knowledge of *which* shell reaches route, and *which git
-//! subcommands are read-only*, lives in pure data — the [`SHELL_ROUTES`] slice
-//! and the [`GIT_READ_ONLY_SUBCOMMANDS`] set — read by [`RouteTable::classify`],
-//! a pure function (no fs, no env, no I/O). A new read reach, or a newly
-//! read-only git subcommand, is a **data edit** (and a future drop-in
-//! `[tui.permissions]` override), never a logic change.
+//! [`SHELL_ROUTES`] records which shell programs route. Classification also
+//! checks argument semantics and resolves any leading `cd` against the
+//! caller's workspace and read scope. A command that cannot be translated
+//! faithfully stays on the normal exec path.
 
 use serde_json::{json, Value};
+use std::path::Path;
 
 /// What to do with a shell command the model passed to `run_command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteDecision {
     /// Silently route to this governed built-in with these translated args. The
-    /// built-in applies the SAME fs / git caveat checks — routing is not a
+    /// built-in applies the same authority checks — routing is not a
     /// bypass.
     Route { tool: &'static str, args: Value },
     /// Leave the command on the normal exec path (the confined shell / #263
@@ -88,16 +70,20 @@ const SHELL_ROUTES: &[ShellRoute] = &[
     },
 ];
 
-/// The git subcommands that are **read-only** and route to the embedded `git`
-/// tool's read path — pure DATA.
-///
-/// These map one-to-one onto the embedded git tool's read ops
-/// (`status`/`log`/`diff`). State-modifying subcommands (`add`, `stash`,
-/// `checkout`, `reset`, `commit`, `push`, `amend`, `rebase`, `branch-delete`,
-/// …) are **NOT** here: they GATE as exec (owner decision 2). `show` has no
-/// embedded read op yet. `branch` mixes reads and mutations, so it uses the
-/// exact argument translation in [`branch_list_route`] instead of this set.
-const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &["status", "log", "diff"];
+/// `cargo` subcommands that route to the confined build lane (`build_exec`,
+/// `tools.rs`) — pure DATA. Deliberately excludes `run`/`install`/`publish`
+/// and anything else that changes what's installed or reaches the network;
+/// those stay on the exec path.
+const CARGO_BUILD_SUBCOMMANDS: &[&str] = &["build", "check", "test", "clippy"];
+
+/// Is `program` a build tool this repo recognises — the single table both
+/// [`RouteTable::classify`]'s clean-argv route AND (F20) the confined shell's
+/// per-call wall clock read, so a compound build command (`cargo test …; echo
+/// …`) that CANNOT route still gets classified as a build reach by the same
+/// rule, instead of a second hand-maintained list.
+pub(crate) fn is_build_tool_program(program: &str) -> bool {
+    program == "cargo" || program == "just"
+}
 
 /// Shell control / redirection / substitution metacharacters. A command
 /// containing any of these is **compound** (`cat f | grep x`, `cat a && cat b`,
@@ -113,54 +99,200 @@ const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')']
 /// literal glob would misbehave — so such a command gates instead of routing.
 const GLOB: &[char] = &['*', '?', '[', ']'];
 
+/// Tokens the SHELL would transform before a program ever sees them — a
+/// quote, an escape, a `~` expansion, or a glob (`GLOB` above). The build
+/// route runs the model's argv **literally** (no shell in between), so any
+/// operand carrying one of these routes with the WRONG argv: `cargo test
+/// "a b"` would see two literal tokens `"a` and `b"` instead of one quoted
+/// string, `--manifest-path ~/x` would see a literal `~` instead of $HOME,
+/// `cargo build --bin *` would see a literal `*` instead of the shell's
+/// expansion. #2533 round 2: refuse to route rather than run a silently
+/// different command with `ok: true`.
+const BUILD_UNSAFE: &[char] = &['"', '\'', '\\', '~', '*', '?', '[', ']'];
+
 /// The route/gate table — pure DATA, read by [`RouteTable::classify`].
 #[derive(Debug, Clone)]
 pub(crate) struct RouteTable {
     shell_routes: &'static [ShellRoute],
-    git_read_only: &'static [&'static str],
 }
 
 impl RouteTable {
-    /// The built-in table: the [`SHELL_ROUTES`] reaches plus the
-    /// [`GIT_READ_ONLY_SUBCOMMANDS`] set. Composed from data (three-Cs) so a
-    /// future `[tui.permissions]` override layers on the same shape.
+    /// The built-in table of shell calls that have faithful translations.
     #[must_use]
     pub(crate) fn builtin() -> Self {
         Self {
             shell_routes: SHELL_ROUTES,
-            git_read_only: GIT_READ_ONLY_SUBCOMMANDS,
         }
     }
 
-    /// Classify a complete call without discarding argument semantics on the
-    /// newly scoped Git read route. Other routes retain their existing policy.
+    /// Classify a complete call without discarding argument semantics.
+    /// `workspace` is the session's workspace root; `read_scope` is
+    /// the call's fs-read fence (F24/PR1's `cd`/`cwd` fold, below, needs
+    /// both — the caller's own values, never read from the process).
     #[must_use]
-    pub(crate) fn classify_call(&self, call: &Value) -> RouteDecision {
-        let decision = self.classify(call.get("command").and_then(Value::as_str).unwrap_or(""));
-        let scoped_git_read = matches!(
-            &decision,
-            RouteDecision::Route { tool: "git", args }
-                if args.get("op").and_then(Value::as_str)
-                    .is_some_and(super::git_tool::is_scoped_read_op)
+    pub(crate) fn classify_call(
+        &self,
+        call: &Value,
+        workspace: &Path,
+        read_scope: &crate::caveats::Scope<String>,
+    ) -> RouteDecision {
+        let decision = self.classify(
+            call.get("command").and_then(Value::as_str).unwrap_or(""),
+            workspace,
+            read_scope,
         );
-        if scoped_git_read
-            && !call
-                .as_object()
-                .is_some_and(|args| args.keys().all(|key| key == "command"))
-        {
-            RouteDecision::Exec
+        let RouteDecision::Route { tool, .. } = &decision else {
+            return decision;
+        };
+        // Every route discards the rest of the call object once routed —
+        // none has anywhere to put a `timeout` the model also sent. #2551
+        // round 2 (the BLOCKER's "same rule" for the `cwd`-field path, and
+        // its pre-existing sibling: `{command:"cat f", cwd:"sub"}` used to
+        // route and silently drop `cwd`): a `cwd` field is allowed
+        // alongside `command` only for `build_exec`, which actually reads
+        // it ([`attach_cwd`]). Other routes require bare `command`.
+        let extra_keys_allowed: &[&str] = if *tool == "build_exec" {
+            &["command", "cwd"]
+        } else {
+            &["command"]
+        };
+        let keys_ok = call.as_object().is_some_and(|obj| {
+            obj.keys()
+                .all(|key| extra_keys_allowed.contains(&key.as_str()))
+        });
+        if !keys_ok {
+            return RouteDecision::Exec;
+        }
+        // A leading `cd` INSIDE `command` already resolved a `cwd` above —
+        // that is the question `cd` itself answers, so a `cwd` FIELD
+        // alongside it is never silently combined into a second, different
+        // directory. #2551 round 3: the leading `cd` was folded and
+        // resolved against `workspace`, but a real shell resolves a
+        // RELATIVE leading `cd` against the call's `cwd` field, not the
+        // workspace root — `{command:"cd sub && cargo test", cwd:"other"}`
+        // routes to `<root>/sub` while the shell would run in
+        // `<root>/other/sub`. Refuse rather than silently building/reading
+        // the wrong directory.
+        let already_has_cwd =
+            matches!(&decision, RouteDecision::Route { args, .. } if args.get("cwd").is_some());
+        if already_has_cwd {
+            return if call.get("cwd").is_some() {
+                RouteDecision::Exec
+            } else {
+                decision
+            };
+        }
+        // PR1: a model-supplied `cwd` FIELD on an otherwise-bare call is the
+        // SAME question a leading `cd` asks — resolved the SAME way
+        // ([`attach_cwd`]'s build-only rule applies here too).
+        // A call with no `cwd` field at all (the original bare shape) is
+        // unaffected: `decision` returned as-is.
+        let Some(cwd_field) = call.get("cwd").and_then(Value::as_str) else {
+            return decision;
+        };
+        match resolve_workspace_relative_dir(cwd_field, workspace, read_scope) {
+            Some(cwd) => attach_cwd(decision, cwd),
+            None => RouteDecision::Exec,
+        }
+    }
+
+    /// Classify a `run_command` shell-command string. `workspace`/
+    /// `read_scope` feed PR1's `cd`-fold (below) — real filesystem reads
+    /// (`std::fs::canonicalize`), no longer the pure table lookup this was
+    /// before #2550/PR1; every other branch stays a data lookup.
+    #[must_use]
+    pub(crate) fn classify(
+        &self,
+        command: &str,
+        workspace: &Path,
+        read_scope: &crate::caveats::Scope<String>,
+    ) -> RouteDecision {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return RouteDecision::Exec;
+        }
+        // PR1 (r10-r12 evidence, multi-repo-recon rows 1/2/4/6): almost
+        // every `run_command` began with `cd <dir> && …` — not only the
+        // workspace root (#2550's F24 case) but a SUBDIRECTORY (`cd
+        // repoA && cargo test`), which used to stay compound and never
+        // route at all, even though `tools/shell.rs`'s `split_leading_cd`
+        // ALREADY folds it into a correct `cwd` for the confined shell's
+        // own dispatch. Fold it here too, BEFORE any other check (the
+        // tail-pipe attempt, the SHELL_META refusal), so `<rest>` is
+        // classified exactly as if it had been sent alone from `<dir>`.
+        let (effective, cwd) = fold_leading_cd(trimmed, workspace, read_scope);
+        // F27 (r14a evidence): a trailing `; echo "EXIT: $?"` (or the same
+        // idea with `&&`, `EXIT=`, `exit `, `${PIPESTATUS[0]}`, …) is a
+        // no-op once the command routes — the routed result already
+        // reports the REAL exit code, never masked by the shell's own `$?`
+        // the way `| tail`'s exit code masks a piped build's. Strip it
+        // BEFORE the ordinary classification below, same pass as the `cd`
+        // fold above, so the two compose.
+        let (effective, echo_dropped) = strip_trailing_exit_echo(effective);
+        let decision = self.classify_stripped(effective);
+        let decision = if echo_dropped {
+            mark_echo_dropped(decision)
         } else {
             decision
+        };
+        match cwd {
+            Some(cwd) => attach_cwd(decision, cwd),
+            None => decision,
         }
     }
 
-    /// Classify a `run_command` shell-command string. **Pure** — no fs, no env,
-    /// no I/O — so it is a direct table lookup (TDD: data-driven decision).
-    #[must_use]
-    pub(crate) fn classify(&self, command: &str) -> RouteDecision {
-        let command = command.trim();
-        if command.is_empty() {
-            return RouteDecision::Exec;
+    /// The classification table lookup itself, over an ALREADY-stripped
+    /// command (no leading no-op `cd`). Split out of [`Self::classify`] so
+    /// the `cd`-prefix handling has exactly one seam to annotate the
+    /// result, rather than every early return needing to remember it.
+    ///
+    /// F28 (#2483 evidence, `newt-eval/NOTES-2483.md`): the FIRST thing
+    /// checked, before the pipe/meta/tokenize logic below — a leading
+    /// `timeout [OPTIONS]… <DURATION>` wrapper ([`strip_leading_timeout`])
+    /// is stripped and the remainder classified through
+    /// [`Self::classify_build_shapes`] (the un-timeout-aware body, so a
+    /// SECOND leading `timeout` in the remainder — `timeout 1 timeout 2 …`
+    /// — is never itself stripped: the "exactly one wrapper" rule). The
+    /// wrapper is dropped ONLY when the remainder alone routes to the build
+    /// lane (`build_exec`) — a non-routable remainder (`timeout 5 rm -rf
+    /// x`) stays `Exec`, same as the bare `rm` case always was.
+    fn classify_stripped(&self, command: &str) -> RouteDecision {
+        if let Some((timeout_secs, remainder)) = strip_leading_timeout(command) {
+            return match self.classify_build_shapes(remainder) {
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args,
+                } => mark_timeout_secs(
+                    RouteDecision::Route {
+                        tool: "build_exec",
+                        args,
+                    },
+                    timeout_secs,
+                ),
+                _ => RouteDecision::Exec,
+            };
+        }
+        self.classify_build_shapes(command)
+    }
+
+    /// The pipe/meta/tokenize table lookup, unaware of a leading `timeout`
+    /// wrapper — [`Self::classify_stripped`]'s ONLY caller, so a leading
+    /// `timeout` in the remainder it is handed (the two-wrapper case) is
+    /// never stripped a second time.
+    fn classify_build_shapes(&self, command: &str) -> RouteDecision {
+        // F23 / #2524 "tail-pipe-routes": recognise EXACTLY `<clean build
+        // argv> [2>&1] | tail -N` (or `head -N`) BEFORE the blanket
+        // compound-command refusal below — the model pipes ONLY to cut
+        // output (see `build_piped_to_trim_route`'s doc), and a masked exit
+        // code from `| tail` is the exact hazard `note_verified_pass`'s doc
+        // comment (mod.rs) names as why an un-routed `run_command` pass
+        // can't be trusted. Only short-circuits on an actual match; any
+        // other pipe shape (multiple pipes, `tail -f`, a redirect before the
+        // pipe, a grep, …) falls through unchanged to the refusal below.
+        if command.contains('|') {
+            if let route @ RouteDecision::Route { .. } = build_piped_to_trim_route(command) {
+                return route;
+            }
         }
         // Compound / redirected / substituted commands never route (see
         // SHELL_META): a single built-in cannot reproduce a pipe/chain/redirect.
@@ -172,21 +304,14 @@ impl RouteTable {
             return RouteDecision::Exec;
         };
 
-        // Read-only VCS reaches route BY SUBCOMMAND (the route/gate split is
-        // DATA). A read-only subcommand routes to the embedded git tool's read
-        // path; a state-modifying / unknown / absent subcommand GATES as exec.
-        if program == "git" {
-            let sub = tokens.next();
-            if sub == Some("branch") {
-                return branch_list_route(&tokens.collect::<Vec<_>>());
-            }
-            return match sub {
-                Some(sub) if self.git_read_only.contains(&sub) => RouteDecision::Route {
-                    tool: "git",
-                    args: json!({ "op": sub }),
-                },
-                _ => RouteDecision::Exec,
-            };
+        // A recognised build/test invocation routes to the confined build
+        // lane — the model's literal argv runs verbatim (see
+        // `build_lane_route`'s doc comment): F11's fix for the model that
+        // never calls `lifecycle` and instead times out under
+        // `run_command`'s 60s wall.
+        if is_build_tool_program(program) {
+            let rest: Vec<&str> = tokens.collect();
+            return build_lane_route(program, &rest);
         }
 
         // Whole-command reaches that map onto governed built-ins.
@@ -198,21 +323,679 @@ impl RouteTable {
     }
 }
 
-/// Only list shapes whose namespace the embedded operation can preserve.
-/// Never drop a branch operand, mutation flag, or unsupported result filter.
-fn branch_list_route(rest: &[&str]) -> RouteDecision {
-    let scope = match rest {
-        [] | ["--list"] => "local",
-        [flag] | ["--list", flag] | [flag, "--list"] => match *flag {
-            "-a" | "--all" => "all",
-            "-r" | "--remotes" => "remote",
-            _ => return RouteDecision::Exec,
-        },
-        _ => return RouteDecision::Exec,
+/// Resolve `dir` (a `cd` argument or a `cwd` field — the SAME question
+/// either way) against `workspace`: the path `workspace`/`read_scope` grant
+/// a real `cd <dir>` would land in. Returns `Some(<relative path>)` (`.`
+/// for `workspace` itself) or `None` — never a different directory than a
+/// real shell would reach, and never one outside this call's authority.
+///
+/// `<dir>` must first be a plain, unquoted, non-glob, metacharacter-free,
+/// whitespace-free token (checked against the SAME [`SHELL_META`]/[`GLOB`]/
+/// [`BUILD_UNSAFE`] tables the rest of this module already refuses on, plus
+/// no internal whitespace — `cd /a b` is TWO arguments to a real `cd` and
+/// fails there, #2550 round 2) — `cd -`, `cd ~`, a quoted or globbed dir
+/// never qualifies. #2551 round 2: a `..` component in `<dir>` ALSO refuses
+/// outright, checked on the un-normalized token (never re-added by
+/// `#2550`'s original reasoning: `std::fs::canonicalize` resolves
+/// PHYSICALLY, following every symlink to its real target, while a real
+/// shell's `cd` defaults to LOGICAL (`-L`) — `cd link/..` lands wherever
+/// `link` pointed in bash, not one physical level up from where it
+/// resolves. Refusing any `..` sidesteps that divergence entirely rather
+/// than trying to emulate it.
+///
+/// Then PR1's real check, replacing #2550's lexical "does `<dir>` normalize
+/// to the workspace root" with the actual question: does `<dir>`
+/// canonicalize (through any symlink) to a real DIRECTORY inside both the
+/// canonical workspace AND this call's fs-read fence
+/// ([`crate::caveats::permits_path`], the SAME containment check the
+/// interactive tool gate and the headless coder apply path both use)? A
+/// missing directory, a file, an out-of-workspace absolute path, and a
+/// symlink that resolves outside all fail identically to how a real `cd`
+/// (or a real out-of-scope read) would refuse — this is the question `cd`
+/// itself answers, not a parallel heuristic.
+///
+/// #2551 round 2 should-fix: the fence is checked on BOTH the lexical join
+/// (`workspace.join(dir)`, matching how `read_file`'s own fs gate checks a
+/// path — see `tools.rs`; a symlinked WORKSPACE root cannot itself mismatch
+/// a fence granted by its original string) AND the canonical path (a
+/// symlink INSIDE a granted root that points to a real directory OUTSIDE
+/// the fence — `sub` granted, `sub/link` → `<root>/other` — used to pass
+/// the lexical check alone and route with a `cwd` the fence never granted).
+fn resolve_workspace_relative_dir(
+    dir: &str,
+    workspace: &Path,
+    read_scope: &crate::caveats::Scope<String>,
+) -> Option<String> {
+    if dir.is_empty()
+        || dir == "-"
+        || dir.starts_with('~')
+        || dir.contains(SHELL_META)
+        || dir.contains(GLOB)
+        || dir.contains(BUILD_UNSAFE)
+        || dir.contains(char::is_whitespace)
+        || Path::new(dir)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let lexical = workspace.join(dir);
+    if !crate::caveats::permits_path(read_scope, &lexical.to_string_lossy()) {
+        return None;
+    }
+    let canonical_workspace = workspace.canonicalize().ok()?;
+    let canonical_dir = lexical.canonicalize().ok()?;
+    if !canonical_dir.is_dir() || !canonical_dir.starts_with(&canonical_workspace) {
+        return None;
+    }
+    // #2551 round 3 nit: the fence was granted against the (possibly
+    // symlinked) WORKSPACE string, e.g. macOS `/tmp/ws` for a canonical
+    // `/private/tmp/ws`. Checking `canonical_dir` against the un-canonicalized
+    // `read_scope` then fails for every `<dir>`, including `.` — canonicalize
+    // the scope's own roots the same way before checking the canonical side,
+    // so a symlinked workspace root still folds `cd`s.
+    if !crate::caveats::permits_path(
+        &canonicalize_scope(read_scope),
+        &canonical_dir.to_string_lossy(),
+    ) {
+        return None;
+    }
+    let relative = canonical_dir.strip_prefix(&canonical_workspace).ok()?;
+    Some(if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.to_string_lossy().into_owned()
+    })
+}
+
+/// Canonicalize each root in a read-fence scope, for comparing against an
+/// already-canonicalized candidate path. A root that fails to canonicalize
+/// (does not exist, dangling symlink) is kept as-is — it simply will not
+/// match a canonical candidate, which is fail-closed, not a widening.
+fn canonicalize_scope(scope: &crate::caveats::Scope<String>) -> crate::caveats::Scope<String> {
+    match scope {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(set.iter().map(|root| {
+            std::fs::canonicalize(root)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.clone())
+        })),
+    }
+}
+
+/// Insert a resolved `cwd` into a route's args — the one seam both
+/// [`RouteTable::classify`]'s leading-`cd` fold and [`RouteTable::
+/// classify_call`]'s `cwd`-field fold use, so a routed call's `cwd` is
+/// attached identically regardless of which shape asked for it.
+///
+/// #2551 round 2 BLOCKER: `cwd` is honoured only by `build_exec`
+/// (`run_confined_build_lane`) —
+/// `read_file`/`list_dir`/`find`/`delete_file` all join `workspace + path`
+/// and never look at `args["cwd"]`. Attaching it to any OTHER route would
+/// leave the built-in silently acting on `workspace` while the routed note
+/// (and the model) believed it ran in the folded directory — measured: `cd
+/// sub && rm x` would have deleted `<root>/x`, not `<root>/sub/x`. So a
+/// resolved `cwd != "."` on any other route refuses (`Exec`) instead —
+/// `cwd == "."` (the workspace root itself) is harmless for any tool, since
+/// that IS where they already run.
+fn attach_cwd(decision: RouteDecision, cwd: String) -> RouteDecision {
+    let RouteDecision::Route { tool, mut args } = decision else {
+        return decision;
     };
+    if tool != "build_exec" {
+        return if cwd == "." {
+            RouteDecision::Route { tool, args }
+        } else {
+            RouteDecision::Exec
+        };
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("cwd".to_string(), Value::String(cwd));
+    }
+    RouteDecision::Route { tool, args }
+}
+
+/// Split a leading `cd <dir> && <rest>` or `cd <dir>; <rest>` — exactly ONE
+/// `cd`, at the FIRST `&&` or `;` (whichever comes first): `cd a && cd b &&
+/// x` yields `dir="a"`, `rest="cd b && x"`, and `rest` still contains `&&`
+/// so [`RouteTable::classify_stripped`]'s ordinary compound-command refusal
+/// catches the second `cd` — no separate "two `cd`s" check needed. `cd
+/// <dir>` with no `&&`/`;` at all (nothing to run) and any other leading
+/// token return `None` — command untouched.
+fn split_leading_cd(command: &str) -> Option<(&str, &str)> {
+    let after = command.strip_prefix("cd ")?;
+    let amp = after.find("&&");
+    let semi = after.find(';');
+    let (dir, rest) = match (amp, semi) {
+        (Some(a), Some(s)) if s < a => (&after[..s], &after[s + 1..]),
+        (Some(a), _) => (&after[..a], &after[a + 2..]),
+        (None, Some(s)) => (&after[..s], &after[s + 1..]),
+        (None, None) => return None,
+    };
+    Some((dir.trim(), rest.trim_start()))
+}
+
+/// Fold a leading `cd <dir> && `/`cd <dir>; ` off `command` when `<dir>`
+/// resolves inside the workspace and fence ([`resolve_workspace_relative_dir`]).
+/// Returns `(effective_command, Some(relative_dir))` when folded,
+/// `(command, None)` otherwise — subsumes #2550's workspace-root case
+/// (`<dir>` resolves to `.`) under the same mechanism, so `cd <root> &&
+/// cargo test` still routes, just via this path now.
+fn fold_leading_cd<'a>(
+    command: &'a str,
+    workspace: &Path,
+    read_scope: &crate::caveats::Scope<String>,
+) -> (&'a str, Option<String>) {
+    let Some((dir, rest)) = split_leading_cd(command) else {
+        return (command, None);
+    };
+    match resolve_workspace_relative_dir(dir, workspace, read_scope) {
+        Some(cwd) => (rest, Some(cwd)),
+        None => (command, None),
+    }
+}
+
+/// F27 (r14a evidence, `newt-eval/NOTES-2483.md`): strip a single trailing
+/// `; echo <arg>` / `&& echo <arg>` whose argument merely reports `$?` (or
+/// `${PIPESTATUS[0]}`) — a routed call already reports its REAL exit code,
+/// so the echo adds nothing and its only effect was to keep the whole
+/// command compound (`;`/`&&` is [`SHELL_META`]), forcing it to run
+/// un-routed in the confined shell where `$?` after `cmd; echo …$?…` is
+/// always 0 (the shell's own exit code), silently masking a real failure.
+/// Also strips a trailing `2>&1` off what remains, mirroring
+/// [`build_piped_to_trim_route`]'s own local strip — the r14a shape pairs
+/// the two (`cargo test 2>&1; echo "EXIT: $?"`).
+///
+/// Returns `(command, false)` unchanged unless the echo's argument is
+/// PROVABLY inert once dropped ([`is_inert_exit_status_arg`]) — an argument
+/// with a command substitution or a redirect could have a real side effect
+/// that must not silently vanish, and a bare `||` (not `&&`/`;`) or a second
+/// `;`/`&&` surviving in what would become the build half both fall through
+/// unchanged, refused downstream by the ordinary [`SHELL_META`] check
+/// exactly as before this function existed. `(effective, true)` on a strip —
+/// the `bool` lets [`RouteTable::classify`] flag the routed call
+/// ([`mark_echo_dropped`]) so the rendered note can say so (#2554 round 2,
+/// mirroring #2549's trim note and #2551's `cd`/`cwd` clause).
+///
+/// #2554 round 2 should-fix: also refuses when the KEPT half contains a
+/// quote character. `split_trailing_echo`'s rightmost-separator search has
+/// no notion of quoting, so a `;`/`&&` INSIDE a quoted argument can become
+/// the "separator" (`rm "x; echo "$?""` — one `rm` of a file literally named
+/// `x; echo "$?"` in the shell) and the kept half is then not provably the
+/// command a real shell would run. The r14a evidence never quotes the build
+/// half, so refusing any quote there costs nothing real.
+fn strip_trailing_exit_echo(command: &str) -> (&str, bool) {
+    let Some((build_part, echo_arg)) = split_trailing_echo(command) else {
+        return (command, false);
+    };
+    if build_part.contains(['\'', '"']) {
+        return (command, false);
+    }
+    if !is_inert_exit_status_arg(echo_arg) {
+        return (command, false);
+    }
+    let build_part = build_part.trim();
+    let build_part = build_part
+        .strip_suffix("2>&1")
+        .map_or(build_part, str::trim);
+    (build_part, true)
+}
+
+/// Split `command` on its RIGHTMOST `&&` or `;`, only when the tail (after
+/// trimming) is `echo <arg>` with a non-empty `<arg>`. `None` when there is
+/// no trailing `echo` at all (including when the only separator is `||`,
+/// which this never matches).
+fn split_trailing_echo(command: &str) -> Option<(&str, &str)> {
+    let amp = command.rfind("&&").map(|i| (i, i + 2));
+    let semi = command.rfind(';').map(|i| (i, i + 1));
+    let (sep_start, tail_start) = match (amp, semi) {
+        (Some(a), Some(s)) => {
+            if a.0 > s.0 {
+                a
+            } else {
+                s
+            }
+        }
+        (Some(a), None) => a,
+        (None, Some(s)) => s,
+        (None, None) => return None,
+    };
+    let build_part = &command[..sep_start];
+    let echo_arg = command[tail_start..].trim_start().strip_prefix("echo ")?;
+    let echo_arg = echo_arg.trim();
+    if echo_arg.is_empty() {
+        return None;
+    }
+    Some((build_part, echo_arg))
+}
+
+/// Is `arg` (the raw text after `echo `, still possibly quoted) safe to
+/// drop entirely? `echo` itself has no side effect beyond stdout, so any
+/// number of inert words is fine — the actual hazard is an argument that
+/// hides a REAL side effect: a command substitution (`` ` `` / `$(`), a
+/// redirect, a further `;`/`&&`/`|` smuggled inside, or — #2554 round 2
+/// should-fix, the sharpest hole — a NEWLINE, which a real shell always
+/// treats as starting a brand-new command, never more `echo` argument text.
+/// Requires at least one reference to `$?` or `${PIPESTATUS[0]}` (otherwise
+/// this isn't an exit-status echo at all — `echo "$HOME"` must stay
+/// compound) and, once every such reference is removed, nothing from
+/// [`SHELL_META`] (which already lists `\n`) or a bare `\r` may remain.
+fn is_inert_exit_status_arg(arg: &str) -> bool {
+    // Checked on the RAW argument, before any quote-unwrapping or `$?`
+    // scrubbing: `echo EXIT=$?<LF>git add -A` scrubs to `<LF>git add -A`,
+    // and a check that ran only on the scrubbed text could still miss a
+    // newline hiding a real command — reject it outright here instead.
+    if arg.contains(['\n', '\r']) {
+        return false;
+    }
+    let inner = if let Some(unquoted) = arg.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        // #2554 round 2 should-fix: a stray inner `"` (`"$?""` unwraps to
+        // `$?"`) is not this shape either — refuse rather than guess which
+        // half of a broken quote pairing the shell would have honoured.
+        if unquoted.contains('"') {
+            return false;
+        }
+        unquoted
+    } else if arg.contains(['"', '\'']) {
+        // An unmatched or single quote isn't this shape — refuse rather
+        // than guess at shell quoting rules.
+        return false;
+    } else {
+        arg
+    };
+    if !inner.contains("$?") && !inner.contains("${PIPESTATUS[0]}") {
+        return false;
+    }
+    let scrubbed = inner.replace("${PIPESTATUS[0]}", "").replace("$?", "");
+    !scrubbed
+        .chars()
+        .any(|c| SHELL_META.contains(&c) || c == '\r')
+}
+
+/// Flag a routed `build_exec` call as having had a trailing exit-code `echo`
+/// dropped — read by `tools.rs`'s note so the model is told the `EXIT: N`
+/// line it asked for was replaced by the lane's own (real) exit code,
+/// rather than simply vanishing. A no-op for any other route: the flag only
+/// has a rendered meaning on the build lane.
+fn mark_echo_dropped(decision: RouteDecision) -> RouteDecision {
+    match decision {
+        RouteDecision::Route {
+            tool: "build_exec",
+            mut args,
+        } => {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("echo_dropped".to_string(), Value::Bool(true));
+            }
+            RouteDecision::Route {
+                tool: "build_exec",
+                args,
+            }
+        }
+        other => other,
+    }
+}
+
+/// F28 (#2483 evidence, `newt-eval/NOTES-2483.md` F28/F30): the model's own
+/// natural instinct for a slow build was `timeout 300 cargo build -p
+/// newt-core` — `timeout` classifies as an interpreter and raised a
+/// high-danger permission prompt (denied outright headless), even though
+/// the build lane already enforces its own wall
+/// (`LIFECYCLE_BUILD_TIMEOUT` in `tools/shell.rs`, 30 min) — the
+/// wrapper adds nothing and only blocks a routable build from routing.
+///
+/// Strips exactly ONE leading `timeout [OPTIONS]… <DURATION>` and returns
+/// the rest of the command, trimmed. Recognises `-s SIG`/`--signal=SIG`,
+/// `-k DUR`/`--kill-after=DUR`, `--preserve-status`, `--foreground` (any
+/// order, zero or more), then exactly one plain `<DURATION>` token — digits
+/// only, with an optional single trailing `s`/`m`/`h`/`d` suffix. `None`
+/// when the leading token isn't `timeout`, an option isn't recognised, or
+/// what follows the options isn't a plain duration (a quoted string, a `$`
+/// variable, an expression) — the command is left untouched, refused
+/// downstream exactly as before this function existed. Whether the
+/// REMAINDER is itself routable (and so whether the strip actually applies)
+/// is [`RouteTable::classify_stripped`]'s call, not this function's — this
+/// is pure lexical stripping only.
+fn strip_leading_timeout(command: &str) -> Option<(u64, &str)> {
+    let after = command.strip_prefix("timeout")?;
+    let mut rest = after.strip_prefix(char::is_whitespace)?.trim_start();
+    loop {
+        let (token, tail) = split_first_token(rest)?;
+        match consume_timeout_option(token, tail) {
+            Some(next_rest) => rest = next_rest.trim_start(),
+            None => break,
+        }
+    }
+    let (duration, tail) = split_first_token(rest)?;
+    if !is_plain_duration(duration) {
+        return None;
+    }
+    let remainder = tail.trim_start();
+    if remainder.is_empty() {
+        return None;
+    }
+    Some((duration_secs(duration), remainder))
+}
+
+/// Parse a value [`is_plain_duration`] already validated (digits, optional
+/// trailing `s`/`m`/`h`/`d`) into whole seconds — GNU `timeout`'s own units.
+/// No suffix means seconds, `timeout`'s own default.
+fn duration_secs(token: &str) -> u64 {
+    let (digits, multiplier) = match token.chars().last() {
+        Some('s') => (&token[..token.len() - 1], 1),
+        Some('m') => (&token[..token.len() - 1], 60),
+        Some('h') => (&token[..token.len() - 1], 3600),
+        Some('d') => (&token[..token.len() - 1], 86400),
+        _ => (token, 1),
+    };
+    digits
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_mul(multiplier)
+}
+
+/// Split `s` (already left-trimmed by the caller where it matters) into its
+/// first whitespace-delimited token and everything after it. `None` for an
+/// empty/all-whitespace `s`.
+fn split_first_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    match s.find(char::is_whitespace) {
+        Some(i) => Some((&s[..i], &s[i..])),
+        None => Some((s, "")),
+    }
+}
+
+/// Is `token` one of `timeout`'s recognised OPTIONS, and if so, what remains
+/// of the command after consuming it (and its value, for the two flags that
+/// take one as a SEPARATE next token)? `None` for anything else, including
+/// an option `timeout` supports but this grammar doesn't model (fused short
+/// forms like `-sTERM`) — refusing rather than guessing keeps the strip
+/// faithful to the exact grammar the brief specifies.
+fn consume_timeout_option<'a>(token: &str, tail: &'a str) -> Option<&'a str> {
+    match token {
+        "--preserve-status" | "--foreground" => Some(tail),
+        "-s" => {
+            split_first_token(tail).and_then(|(value, rest)| is_plain_signal(value).then_some(rest))
+        }
+        "-k" => split_first_token(tail)
+            .and_then(|(value, rest)| is_plain_duration(value).then_some(rest)),
+        _ if token.starts_with("--signal=") => {
+            is_plain_signal(&token["--signal=".len()..]).then_some(tail)
+        }
+        _ if token.starts_with("--kill-after=") => {
+            is_plain_duration(&token["--kill-after=".len()..]).then_some(tail)
+        }
+        _ => None,
+    }
+}
+
+/// Is `token` a plain `timeout` `-s`/`--signal` SIGNAL — letters and digits
+/// only (`TERM`, `SIGKILL`, `9`)? No metacharacter can hide in a value this
+/// narrow, so no separate refusal is needed downstream (Blocker 1, PR-F28
+/// review): a metacharacter here — `$(...)`, `` ` ``, `;`, `|`, `>`, `&`, a
+/// quote — used to be accepted verbatim and silently vanish once the
+/// `timeout` prefix was stripped, discarding a command substitution the real
+/// shell would have run.
+fn is_plain_signal(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Is `token` a plain `timeout` DURATION — digits only, with an optional
+/// single trailing `s`/`m`/`h`/`d` suffix? Never a quoted string, a `$`
+/// variable, or an expression: those need a real shell to resolve, so the
+/// command they'd appear in stays compound/`Exec`.
+fn is_plain_duration(token: &str) -> bool {
+    let digits = match token.chars().last() {
+        Some('s' | 'm' | 'h' | 'd') => &token[..token.len() - 1],
+        _ => token,
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Carry a routed `build_exec` call's leading `timeout N …` duration as
+/// `timeout_secs` — read by `tools.rs`'s `build_exec` arm, which applies
+/// `min(timeout_secs, LIFECYCLE_BUILD_TIMEOUT)` as the lane's ACTUAL wall,
+/// rather than round 1's `timeout_dropped: true` flag, which discarded the
+/// model's own (possibly shorter) bound entirely (PR-F28 review, Blocker 2).
+/// Mirrors [`mark_echo_dropped`]'s shape.
+fn mark_timeout_secs(decision: RouteDecision, timeout_secs: u64) -> RouteDecision {
+    match decision {
+        RouteDecision::Route {
+            tool: "build_exec",
+            mut args,
+        } => {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    "timeout_secs".to_string(),
+                    Value::Number(timeout_secs.into()),
+                );
+            }
+            RouteDecision::Route {
+                tool: "build_exec",
+                args,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Recognise EXACTLY `<clean build argv> [2>&1] | tail -N` (or `tail -n N` /
+/// `head -N` / `head -n N`) and nothing wider (F23 / #2524
+/// "tail-pipe-routes"). Measured (2488-r9): the model's own natural call to
+/// verify a build was `cargo … 2>&1 | tail -40` — piping ONLY to cut a long
+/// build's output, not to chain semantics onto it. Because the pipe made it
+/// compound, it refused to route (`SHELL_META`) and ran in the confined
+/// shell instead, where `| tail` masks cargo's real exit code — exactly the
+/// hazard `note_verified_pass`'s doc comment (`mod.rs`) names as why a
+/// piped `run_command` pass can never count as verified. Route the build
+/// argv the model actually wrote (`build_lane_route`, unchanged, still
+/// refuses an unsafe operand or a non-build-tool program) and apply the
+/// trim to the OUTPUT on the harness side instead, so the exit code the
+/// harness sees is cargo's, never `tail`'s.
+///
+/// Returns `RouteDecision::Exec` for anything this exact shape does not
+/// cover: more than one pipe, a pipe to anything but bare `tail`/`head`
+/// with a positive line count, `tail -f` / `head -c`, or a redirect/other
+/// metacharacter surviving in the build half (checked via the existing
+/// [`SHELL_META`] table — reused, not duplicated) — those fall through to
+/// the ordinary compound-command refusal in [`RouteTable::classify`].
+fn build_piped_to_trim_route(command: &str) -> RouteDecision {
+    let Some((build_part, trim_part)) = split_single_pipe(command) else {
+        return RouteDecision::Exec;
+    };
+    let build_part = build_part.trim();
+    let build_part = build_part
+        .strip_suffix("2>&1")
+        .map_or(build_part, str::trim);
+    // Any OTHER shell metacharacter surviving in the build half (a redirect
+    // BEFORE the pipe, a second chain, …) refuses — same table the blanket
+    // compound-command check uses, so a redirect stays refused exactly as
+    // today.
+    if build_part.contains(SHELL_META) {
+        return RouteDecision::Exec;
+    }
+    let Some(trim) = parse_trim_spec(trim_part.trim()) else {
+        return RouteDecision::Exec;
+    };
+    let mut tokens = build_part.split_ascii_whitespace();
+    let Some(program) = tokens.next() else {
+        return RouteDecision::Exec;
+    };
+    if !is_build_tool_program(program) {
+        return RouteDecision::Exec;
+    }
+    let rest: Vec<&str> = tokens.collect();
+    match build_lane_route(program, &rest) {
+        RouteDecision::Route {
+            tool: "build_exec",
+            mut args,
+        } => {
+            args["trim"] = trim;
+            RouteDecision::Route {
+                tool: "build_exec",
+                args,
+            }
+        }
+        // `build_lane_route` itself refused (unsafe operand, unrecognised
+        // subcommand, …) — the same refusal applies with or without the
+        // trailing pipe.
+        other => other,
+    }
+}
+
+/// Split `command` on exactly ONE `|`. `None` for zero pipes or more than
+/// one — the brief's own "multiple pipes … do NOT route" refusal, checked
+/// here rather than downstream so a `| tail -40 | head` never even reaches
+/// [`parse_trim_spec`].
+fn split_single_pipe(command: &str) -> Option<(&str, &str)> {
+    let mut parts = command.split('|');
+    let build_part = parts.next()?;
+    let trim_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((build_part, trim_part))
+}
+
+/// `tail -N` / `tail -n N` / `head -N` / `head -n N` — a bare positive
+/// integer line count and nothing else. `tail -f` (follow), `head -c`
+/// (bytes), extra operands, or a missing/zero/non-numeric count are all
+/// refused — this is the ONE place that decides the trim shape is safe to
+/// apply, so it stays conservative rather than guessing at intent.
+fn parse_trim_spec(spec: &str) -> Option<Value> {
+    let tokens: Vec<&str> = spec.split_ascii_whitespace().collect();
+    let mode = match tokens.first().copied() {
+        Some("tail") => "tail",
+        Some("head") => "head",
+        _ => return None,
+    };
+    let n_str = match &tokens[1..] {
+        [flag] if flag.len() > 1 && flag.starts_with('-') => &flag[1..],
+        ["-n", n] => *n,
+        _ => return None,
+    };
+    // PR #2549 round 2: `u32::from_str` tolerates a leading `+` (unsigned
+    // parsers reject `-`, not `+`), so `tail -n +40` / `head -n +40` — GNU's
+    // "start AT line 40", a real and DIFFERENT flag shape from "last/first
+    // 40 lines" — parsed as if it meant `-n 40`, showing the wrong output
+    // slice under a false "as `| tail -40` asked" provenance claim.
+    // `head -n +N` isn't even documented by GNU head, so treating it as `-n
+    // N` had no basis either way. Check the STRING, not `parse`'s leniency:
+    // every byte must be an ASCII digit — refuses `+40`, a stray `-` inside
+    // the `-n` form, and any other non-digit that `u32::from_str` might
+    // someday tolerate.
+    if n_str.is_empty() || !n_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u32 = n_str.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(json!({ "mode": mode, "n": n }))
+}
+
+/// A `run_command` reach that maps onto the confined **build lane**
+/// (`build_exec` in `tools.rs`, sharing `run_confined_build_lane` with
+/// `lifecycle action=build`) rather than a governed read built-in. Unlike
+/// every other route in this table, the routed call runs the model's
+/// **literal argv verbatim** — never a re-resolved phase command — so no
+/// operand (`-p x`, a test filter, …) is ever silently dropped. A `cwd`
+/// (from a leading `cd` or a `cwd` field) is resolved and attached by
+/// [`RouteTable::classify`]/[`RouteTable::classify_call`] (PR1); `timeout`
+/// still has nowhere to go, so a call carrying it stays Exec.
+fn build_lane_route(program: &str, rest: &[&str]) -> RouteDecision {
+    // See `BUILD_UNSAFE`: a quoted, escaped, `~`-relative or globbed operand
+    // cannot be routed faithfully (there is no shell downstream to expand
+    // it), so gate the whole call to exec rather than run a mangled argv.
+    if rest.iter().any(|tok| tok.contains(BUILD_UNSAFE)) {
+        return RouteDecision::Exec;
+    }
+    match program {
+        "cargo" => cargo_build_route(rest),
+        "just" => just_build_route(rest),
+        _ => RouteDecision::Exec,
+    }
+}
+
+/// `cargo build|check|test|clippy [args…]`. `--config`/`-Z…` change what
+/// cargo does (config override / unstable flags outside the calibrated
+/// fence) and never route; translation must not widen or drop arguments.
+fn cargo_build_route(rest: &[&str]) -> RouteDecision {
+    // #2524 follow-up (F23 evidence): 2488-r9's own command was `cargo
+    // +stable test …` — cargo's leading `+toolchain` selector, ONE token,
+    // before the subcommand. Accept it and KEEP it in the routed argv (the
+    // build lane must run the SAME toolchain the model asked for, never a
+    // silently different default one). A `+` token that isn't a valid
+    // selector (`is_toolchain_selector`) refuses the whole call rather than
+    // stripping it and running something else.
+    let (toolchain, rest) = match rest.split_first() {
+        Some((first, tail)) if first.starts_with('+') => {
+            if !is_toolchain_selector(first) {
+                return RouteDecision::Exec;
+            }
+            (Some(*first), tail)
+        }
+        _ => (None, rest),
+    };
+    let Some((sub, rest)) = rest.split_first() else {
+        return RouteDecision::Exec;
+    };
+    if !CARGO_BUILD_SUBCOMMANDS.contains(sub) {
+        return RouteDecision::Exec;
+    }
+    if rest
+        .iter()
+        .any(|tok| *tok == "--config" || tok.starts_with("--config=") || tok.starts_with("-Z"))
+    {
+        return RouteDecision::Exec;
+    }
+    let mut argv = vec!["cargo".to_string()];
+    argv.extend(toolchain.map(str::to_string));
+    argv.push((*sub).to_string());
+    argv.extend(rest.iter().map(|t| (*t).to_string()));
     RouteDecision::Route {
-        tool: "git",
-        args: json!({ "op": "branch-list", "scope": scope }),
+        tool: "build_exec",
+        args: json!({ "argv": argv }),
+    }
+}
+
+/// Is `token` a valid cargo/rustup toolchain selector (`+stable`,
+/// `+nightly`, `+1.85.0`, `+nightly-2026-09-01`)? The name after `+` is
+/// restricted to `[A-Za-z0-9._-]+` — rustup toolchain names are a channel,
+/// an optional date, and an optional target triple, dot/dash-separated;
+/// nothing in that alphabet is a shell metacharacter, so this can never
+/// smuggle one past `BUILD_UNSAFE`/`SHELL_META`. A bare `+`, an empty name,
+/// or anything else refuses — see [`cargo_build_route`], which refuses the
+/// WHOLE call on a `false` here rather than silently dropping the token.
+///
+/// `pub(crate)` (#2524 follow-up / #2548 interaction): `mod.rs`'s
+/// `is_progress_verification` reads `routed argv[1]` as the gate
+/// subcommand — for a routed `cargo +stable test`, that slot is `+stable`,
+/// not `test`, so a genuine pass would silently never count without also
+/// skipping the selector there. ONE rule, shared, not re-derived.
+pub(crate) fn is_toolchain_selector(token: &str) -> bool {
+    match token.strip_prefix('+') {
+        Some(name) if !name.is_empty() => name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+        _ => false,
+    }
+}
+
+/// `just <recipe>` — a single non-flag recipe name, no other operands.
+/// Whether a justfile actually exists is a filesystem fact this pure
+/// classifier cannot see; the dispatch site (`tools.rs`'s `build_exec` arm)
+/// checks it before running and refuses if there is none.
+fn just_build_route(rest: &[&str]) -> RouteDecision {
+    match rest {
+        [recipe] if !recipe.starts_with('-') => RouteDecision::Route {
+            tool: "build_exec",
+            args: json!({ "argv": ["just", recipe] }),
+        },
+        _ => RouteDecision::Exec,
     }
 }
 
@@ -262,7 +1045,7 @@ fn operands<'a>(rest: &[&'a str]) -> Vec<&'a str> {
 
 /// Translate `rm [-f] <path>` / `unlink <path>` into `delete_file`.
 /// Recursive/tree deletes, multiple operands, globs, and unknown flags stay on
-/// the exec path, where the absolute deny-list refuses them before the shell.
+/// the exec path under its command grants and native filesystem confinement.
 fn build_delete_route(rest: &[&str]) -> RouteDecision {
     let mut operands = Vec::new();
     let mut end_of_flags = false;
@@ -372,8 +1155,68 @@ pub(crate) fn audit_line(original: &str, decision: &RouteDecision) -> Option<Str
 mod tests {
     use super::*;
 
+    /// A workspace no test command's `cd <dir> &&` prefix (if any) could
+    /// ever resolve against (it does not exist on disk), so PR1's `cd`-fold
+    /// never fires for a test that doesn't ask for it explicitly (via
+    /// [`classify_at`]/[`CdFixture`]) — and for a command with no leading
+    /// `cd` at all, `fold_leading_cd` never touches the filesystem, so a
+    /// nonexistent path costs nothing.
+    fn no_cd_match() -> &'static Path {
+        Path::new("/never-matches-a-test-cwd")
+    }
+
     fn classify(cmd: &str) -> RouteDecision {
-        RouteTable::builtin().classify(cmd)
+        RouteTable::builtin().classify(cmd, no_cd_match(), &crate::caveats::Scope::All)
+    }
+
+    fn classify_at(
+        cmd: &str,
+        workspace: &Path,
+        read_scope: &crate::caveats::Scope<String>,
+    ) -> RouteDecision {
+        RouteTable::builtin().classify(cmd, workspace, read_scope)
+    }
+
+    /// A real workspace tree for PR1's `cd`-fold tests: `root/`, `root/sub/`
+    /// (a real subdirectory to `cd` into), and `root/file.txt` (exists, but
+    /// is not a directory). The brief's own boundary needs a REAL
+    /// filesystem — `std::fs::canonicalize` is the question a real `cd`
+    /// answers, and no mock stands in for it.
+    struct CdFixture {
+        _dir: tempfile::TempDir,
+        root: std::path::PathBuf,
+        #[allow(dead_code)]
+        sub: std::path::PathBuf,
+    }
+
+    impl CdFixture {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            // Canonicalize up front: a platform tempdir may itself be
+            // reached through a symlink (macOS: `/tmp` → `/private/tmp`),
+            // and every assertion below must compare against the SAME
+            // canonical form `resolve_workspace_relative_dir` produces.
+            let root = dir.path().canonicalize().expect("canonicalize tempdir");
+            let sub = root.join("sub");
+            std::fs::create_dir(&sub).expect("mkdir sub");
+            std::fs::write(root.join("file.txt"), b"not a directory").expect("write file");
+            // #2551 round 2 BLOCKER fixture: `x`/`f` at BOTH the root and
+            // `sub/`, distinct content, so a test that reads/deletes the
+            // WRONG one is provably wrong rather than accidentally right.
+            std::fs::write(root.join("x"), b"root x").expect("write root x");
+            std::fs::write(root.join("f"), b"root f").expect("write root f");
+            std::fs::write(sub.join("x"), b"sub x").expect("write sub x");
+            std::fs::write(sub.join("f"), b"sub f").expect("write sub f");
+            Self {
+                _dir: dir,
+                root,
+                sub,
+            }
+        }
+
+        fn read_scope(&self) -> crate::caveats::Scope<String> {
+            crate::caveats::Scope::only([self.root.to_string_lossy().into_owned()])
+        }
     }
 
     /// TDD: `cat <path>` is a silent Rewrite to the governed `read_file`
@@ -397,71 +1240,144 @@ mod tests {
         );
     }
 
-    /// TDD: read-only `git status` is a silent Rewrite to the governed `git`
-    /// built-in read path.
     #[test]
-    fn read_only_git_routes_to_the_git_builtin() {
-        for (cmd, op) in [
-            ("git status", "status"),
-            ("git status -s", "status"),
-            ("git log", "log"),
-            ("git diff", "diff"),
+    fn native_git_commands_keep_flags_revisions_pathspecs_and_cwd() {
+        let fx = CdFixture::new();
+        let table = RouteTable::builtin();
+        for command in [
+            "git status",
+            "git status --porcelain=v1 --untracked-files=all",
+            "git log -5 A..B -- src/lib.rs docs/",
+            "git log HEAD~1...HEAD -- 'src/a b.rs'",
+            "git diff --cached --stat HEAD~1 -- src/lib.rs",
+            "git diff --word-diff A B -- '*.rs'",
+            "git branch",
+            "git branch --all",
+            "git branch --remotes",
+            "git -C sub status",
+            "git --git-dir=sub/.git status",
+            "cd sub && git status",
+            "cd sub; git log -n 5 -- src/lib.rs",
         ] {
-            assert_eq!(
-                classify(cmd),
-                RouteDecision::Route {
-                    tool: "git",
-                    args: json!({ "op": op }),
-                },
-                "{cmd}"
-            );
+            for extra in [json!({}), json!({"cwd": "sub"}), json!({"timeout": 5})] {
+                let mut call = extra;
+                call["command"] = json!(command);
+                assert_eq!(
+                    table.classify_call(&call, &fx.root, &fx.read_scope()),
+                    RouteDecision::Exec,
+                    "preserve the original shell request: {call}"
+                );
+            }
         }
     }
 
     #[test]
-    fn branch_listing_routes_preserve_the_requested_namespace() {
-        for (cmd, scope) in [
-            ("git branch", "local"),
-            ("git branch --list", "local"),
-            ("git branch -a", "all"),
-            ("git branch --all", "all"),
-            ("git branch --list --all", "all"),
-            ("git branch -a --list", "all"),
-            ("git branch -r", "remote"),
-            ("git branch --remotes", "remote"),
-            ("git branch --list -r", "remote"),
-            ("git branch --remotes --list", "remote"),
-        ] {
-            assert_eq!(
-                classify(cmd),
-                RouteDecision::Route {
-                    tool: "git",
-                    args: json!({ "op": "branch-list", "scope": scope }),
-                },
-                "{cmd}"
-            );
+    fn read_only_git_uses_native_exec() {
+        for cmd in ["git status", "git log", "git diff"] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
         }
     }
 
     #[test]
-    fn branch_listing_call_routes_preserve_argument_semantics() {
+    fn git_read_commands_preserve_operands() {
+        for cmd in [
+            "git status -s",
+            "git status --porcelain",
+            "git diff --cached",
+            "git diff --cached --stat",
+            "git diff --staged",
+            "git log -5",
+            "git log -n 5",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn git_reads_preserve_revisions_pathspecs_and_stat() {
+        for cmd in [
+            "git log A..B",
+            "git log HEAD~3",
+            "git log -5 A..B -- src/lib.rs",
+            "git log -- src/lib.rs docs/",
+            "git diff HEAD~1",
+            "git diff A B",
+            "git diff A..B",
+            "git diff --stat",
+            "git diff --stat HEAD~1 -- src/lib.rs",
+            "git log HEAD~1...HEAD",
+            "git log src/lib.rs",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// Presentation options also belong to native Git, including shapes
+    /// the specialized interface never represented.
+    #[test]
+    fn git_presentation_options_stay_on_native_exec() {
+        assert_eq!(classify("git log --oneline"), RouteDecision::Exec);
+        assert_eq!(classify("git log -p"), RouteDecision::Exec);
+        assert_eq!(classify("git log -p A..B"), RouteDecision::Exec);
+        assert_eq!(classify("git diff --word-diff"), RouteDecision::Exec);
+        assert_eq!(classify("git diff --name-only"), RouteDecision::Exec);
+        assert_eq!(classify("git diff A B C"), RouteDecision::Exec);
+        assert_eq!(classify("git log --all"), RouteDecision::Exec);
+        assert_eq!(classify("git diff --numstat"), RouteDecision::Exec);
+    }
+
+    #[test]
+    fn branch_listings_use_native_exec() {
+        for cmd in [
+            "git branch",
+            "git branch --list",
+            "git branch -a",
+            "git branch --all",
+            "git branch --list --all",
+            "git branch -a --list",
+            "git branch -r",
+            "git branch --remotes",
+            "git branch --list -r",
+            "git branch --remotes --list",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn unrouted_calls_preserve_extra_arguments() {
         let table = RouteTable::builtin();
         for command in ["git branch", "git branch --all", "git branch --remotes"] {
             assert_eq!(
-                table.classify_call(&json!({"command": command})),
+                table.classify_call(
+                    &json!({"command": command}),
+                    no_cd_match(),
+                    &crate::caveats::Scope::All
+                ),
                 classify(command)
             );
+            // Call-level fields stay with the original command too.
             for extra in [json!({"cwd": "elsewhere"}), json!({"timeout": 5})] {
                 let mut call = extra;
                 call["command"] = json!(command);
-                assert_eq!(table.classify_call(&call), RouteDecision::Exec, "{call}");
+                assert_eq!(
+                    table.classify_call(&call, no_cd_match(), &crate::caveats::Scope::All),
+                    RouteDecision::Exec,
+                    "{call}"
+                );
             }
         }
-        // This repair does not alter the existing routes' argument policy.
+        // A non-build route cannot honor `cwd`; keep the entire call on
+        // exec rather than silently discarding the requested directory.
         for command in ["git status", "cat file", "ls"] {
             assert_eq!(
-                table.classify_call(&json!({"command": command, "cwd": "elsewhere"})),
-                classify(command)
+                table.classify_call(
+                    &json!({"command": command, "cwd": "elsewhere"}),
+                    no_cd_match(),
+                    &crate::caveats::Scope::All
+                ),
+                RouteDecision::Exec,
+                "{command}"
             );
         }
     }
@@ -502,8 +1418,7 @@ mod tests {
         }
     }
 
-    /// TDD: state-modifying git is GATED as exec — NOT silently routed (owner
-    /// decision 2). Revert the gate (route every git) and this is red.
+    /// Native mutations and unknown subcommands retain the exec gate.
     #[test]
     fn state_modifying_git_gates_as_exec() {
         for cmd in [
@@ -514,8 +1429,6 @@ mod tests {
             "git checkout -b feat",
             "git reset --hard",
             "git stash",
-            // read-only but not yet built-in-served (follow-up) → gate, not a
-            // misleading routed op error.
             "git show HEAD",
             "git branch topic",
             // a bare / unknown git reach gates.
@@ -569,7 +1482,7 @@ mod tests {
 
     /// #1022: a simple shell-delete instinct routes to the governed fs_write
     /// tool instead of dead-ending on exec/absolute-deny. Recursive or
-    /// multi-target deletes stay gated/denied.
+    /// multi-target deletes retain native shell semantics and authority checks.
     #[test]
     fn simple_delete_routes_to_delete_file() {
         for cmd in [
@@ -634,6 +1547,200 @@ mod tests {
         }
     }
 
+    /// F11: `cargo build|check|test|clippy` routes to `build_exec` carrying
+    /// the model's LITERAL argv — never a resolved phase command, so no
+    /// operand (`-p newt-core`, a test filter, …) is dropped.
+    #[test]
+    fn cargo_build_commands_route_with_literal_argv() {
+        assert_eq!(
+            classify("cargo test -p newt-core"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "test", "-p", "newt-core"] }),
+            }
+        );
+        for (cmd, argv) in [
+            ("cargo build", json!(["cargo", "build"])),
+            ("cargo check", json!(["cargo", "check"])),
+            (
+                "cargo clippy --workspace",
+                json!(["cargo", "clippy", "--workspace"]),
+            ),
+            (
+                "cargo test -p x --lib -- --test-threads=1",
+                json!([
+                    "cargo",
+                    "test",
+                    "-p",
+                    "x",
+                    "--lib",
+                    "--",
+                    "--test-threads=1"
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args: json!({ "argv": argv }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    /// `just <recipe>` routes the same way; anything more than a bare recipe
+    /// name gates rather than guessing.
+    #[test]
+    fn just_recipe_routes_with_literal_argv() {
+        assert_eq!(
+            classify("just test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["just", "test"] }),
+            }
+        );
+        for cmd in ["just", "just test extra", "just -n test", "just --list"] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// Near-misses that change what runs, or reach outside the calibrated
+    /// fence, must NEVER route: `cargo run`/`install`/`publish` execute or
+    /// publish something; `--config`/`-Z…` are config overrides / unstable
+    /// flags. `cargo test | tail` is compound and already gated by
+    /// `SHELL_META`, exercised here for this route specifically.
+    #[test]
+    fn cargo_near_misses_never_route() {
+        for cmd in [
+            "cargo run",
+            "cargo install ripgrep",
+            "cargo publish",
+            "cargo test --config net.offline=false",
+            "cargo build -Zunstable-options",
+            "cargo test | tail",
+            "cargo",
+            "cargo frobnicate",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// #2524 follow-up (F23 evidence): a leading `+toolchain` selector
+    /// routes, kept verbatim in the argv, for every valid rustup toolchain
+    /// name shape.
+    #[test]
+    fn cargo_toolchain_selector_routes_and_is_kept_in_the_argv() {
+        assert_eq!(
+            classify("cargo +stable test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "+stable", "test"] }),
+            }
+        );
+        for (cmd, argv) in [
+            (
+                "cargo +nightly build",
+                json!(["cargo", "+nightly", "build"]),
+            ),
+            ("cargo +1.85.0 check", json!(["cargo", "+1.85.0", "check"])),
+            (
+                "cargo +nightly-2026-09-01 clippy",
+                json!(["cargo", "+nightly-2026-09-01", "clippy"]),
+            ),
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args: json!({ "argv": argv }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    /// An invalid or empty `+` token refuses the WHOLE call — never
+    /// silently dropped, never routed with a different toolchain than the
+    /// model asked for.
+    #[test]
+    fn cargo_invalid_toolchain_selector_never_routes() {
+        for cmd in [
+            "cargo + test",
+            // `$` is a SHELL_META character; also caught by the top-level
+            // compound-command refusal before this ever reaches
+            // `cargo_build_route`, but exercised here for this shape too.
+            "cargo +$X test",
+            "cargo +stable/../etc test",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// A build-lane route drops the rest of the call object (there is
+    /// nowhere to put `timeout`), so `classify_call` must refuse to route a
+    /// call carrying it. `cwd` is
+    /// NOT one of these any more (PR1) — see
+    /// [`a_cwd_field_on_a_bare_call_routes_the_same_way`].
+    #[test]
+    fn build_route_call_requires_bare_call() {
+        let table = RouteTable::builtin();
+        assert_eq!(
+            table.classify_call(
+                &json!({"command": "cargo test"}),
+                no_cd_match(),
+                &crate::caveats::Scope::All
+            ),
+            classify("cargo test")
+        );
+        let call = json!({"command": "cargo test", "timeout": 5});
+        assert_eq!(
+            table.classify_call(&call, no_cd_match(), &crate::caveats::Scope::All),
+            RouteDecision::Exec,
+            "{call}"
+        );
+    }
+
+    /// PR1: a model-supplied `cwd` FIELD on an otherwise-bare call is the
+    /// SAME question a leading `cd` asks, resolved the SAME way.
+    #[test]
+    fn a_cwd_field_on_a_bare_call_routes_the_same_way() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        let table = RouteTable::builtin();
+        assert_eq!(
+            table.classify_call(
+                &json!({"command": "cargo test", "cwd": "sub"}),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({"argv": ["cargo", "test"], "cwd": "sub"}),
+            }
+        );
+        // Still refuses a call carrying anything besides `command`/`cwd`.
+        assert_eq!(
+            table.classify_call(
+                &json!({"command": "cargo test", "cwd": "sub", "timeout": 5}),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Exec
+        );
+        // An unresolvable `cwd` field refuses rather than silently dropping
+        // it and running in the wrong place.
+        assert_eq!(
+            table.classify_call(
+                &json!({"command": "cargo test", "cwd": "missing"}),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Exec
+        );
+    }
+
     /// TDD: every silent rewrite is logged — `audit_line` is `Some` for a Route
     /// (carrying the original command + the governed built-in) and `None` for
     /// an Exec (nothing rewritten).
@@ -646,5 +1753,652 @@ mod tests {
 
         // An Exec decision produces no audit line — nothing was rewritten.
         assert_eq!(audit_line("git add .", &classify("git add .")), None);
+    }
+
+    /// F23 / #2524 "tail-pipe-routes" (red first): the LITERAL shape
+    /// measured in 2488-r9 — a clean build argv, with its `+stable`
+    /// toolchain selector, piped only to cut output — routes, carrying the
+    /// build's own argv (toolchain included) plus the trim the pipe asked
+    /// for. The `+toolchain` support itself is `is_toolchain_selector`'s.
+    #[test]
+    fn build_piped_to_tail_or_head_routes_with_the_trim() {
+        assert_eq!(
+            classify(
+                "cargo +stable test -j 4 -p newt-core --test config_publishing_ratchet 2>&1 | tail -40"
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "+stable", "test", "-j", "4", "-p", "newt-core",
+                              "--test", "config_publishing_ratchet"],
+                    "trim": {"mode": "tail", "n": 40},
+                }),
+            }
+        );
+        // Every recognised variant: with/without `2>&1`, `-N` and `-n N`,
+        // `tail` and `head`, and `just`.
+        for (cmd, mode, n) in [
+            ("cargo test -p newt-core | tail -40", "tail", 40),
+            ("cargo test -p newt-core | tail -n 40", "tail", 40),
+            ("cargo build | head -20", "head", 20),
+            ("cargo build | head -n 20", "head", 20),
+            ("just test 2>&1 | tail -5", "tail", 5),
+        ] {
+            let RouteDecision::Route { tool, args } = classify(cmd) else {
+                panic!("{cmd} must route");
+            };
+            assert_eq!(tool, "build_exec", "{cmd}");
+            assert_eq!(args["trim"]["mode"], mode, "{cmd}");
+            assert_eq!(args["trim"]["n"], n, "{cmd}");
+        }
+    }
+
+    /// Anything wider than the exact recognised shape stays refused — the
+    /// SAME `SHELL_META` compound-command refusal every other pipe already
+    /// gets, never a new leniency.
+    #[test]
+    fn build_piped_to_anything_else_never_routes() {
+        for cmd in [
+            // Multiple pipes.
+            "cargo test | tail -40 | head",
+            // Follows, doesn't cut — a live stream, not a bounded trim.
+            "cargo test | tail -f",
+            // Bytes, not lines.
+            "cargo build | head -c 10",
+            // Not tail/head at all.
+            "cargo test | grep FAILED",
+            // A redirect BEFORE the pipe: still compound, still refused.
+            "cargo test > log.txt | tail -40",
+            // Missing, zero, or non-numeric N.
+            "cargo test | tail",
+            "cargo test | tail -0",
+            "cargo test | tail -n 0",
+            "cargo test | tail -abc",
+            // Extra operands after the count.
+            "cargo test | tail -40 extra",
+            // Not a recognised build tool program.
+            "pytest | tail -40",
+            // An operand `build_lane_route` itself would already refuse
+            // (near-miss subcommand) — still refused with the pipe.
+            "cargo run | tail -40",
+            // PR #2549 round 2: GNU's `-n +N` means "start AT line N", a
+            // real and DIFFERENT shape from `-n N` ("last/first N lines").
+            // `u32::from_str` tolerates a leading `+`, so this must be an
+            // explicit string check, not left to `parse`'s leniency.
+            "cargo test | tail -n +40",
+            "cargo test | head -n +40",
+            "cargo test | tail -+40",
+            // Two pipes with nothing between them (`||`) splits into THREE
+            // parts on `split_single_pipe`'s own code path — refused the
+            // same way as any other multi-pipe shape, exercised explicitly.
+            "cargo test || tail -40",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// PR1 (r10-r12 evidence, multi-repo-recon rows 1/2/4/6, red first):
+    /// almost every `run_command` began with `cd <dir> && …` — not only the
+    /// workspace root (#2550's F24 case) but a real SUBDIRECTORY (`cd
+    /// repoA && cargo test`), which used to stay compound and never route
+    /// at all even though `tools/shell.rs`'s `split_leading_cd` already
+    /// folds it correctly for the confined shell's own dispatch. Folds now,
+    /// with `cwd` attached to the build lane, and composes with #2549's
+    /// tail-pipe route. Native Git retains its original shell call.
+    // Not on Windows: the cd fold does not resolve there yet (fail-closed to
+    // Exec, as before this change). Refusal tests still run on every platform.
+    #[cfg(not(windows))]
+    #[test]
+    fn cd_into_a_real_subdirectory_routes_with_cwd() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        assert_eq!(
+            classify_at("cd sub && cargo test", &fx.root, &scope),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({"argv": ["cargo", "test"], "cwd": "sub"}),
+            }
+        );
+        // `;` is safe here — unlike #2550's boundary, which excluded it
+        // because the strip was a lexical guess. If `std::fs::canonicalize`
+        // succeeds, the `cd` succeeds, and the separator never changed
+        // that answer.
+        assert_eq!(
+            classify_at("cd sub; cargo test", &fx.root, &scope),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({"argv": ["cargo", "test"], "cwd": "sub"}),
+            }
+        );
+        let RouteDecision::Route { args, .. } =
+            classify_at("cd sub && cargo test | tail -20", &fx.root, &scope)
+        else {
+            panic!("must route");
+        };
+        assert_eq!(args["cwd"], "sub");
+        assert_eq!(args["trim"], json!({"mode": "tail", "n": 20}));
+        // The workspace root itself — #2550's original case — now routes
+        // via this SAME mechanism; `cwd` resolves to `.`.
+        assert_eq!(
+            classify_at(
+                &format!("cd {} && cargo test", fx.root.display()),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({"argv": ["cargo", "test"], "cwd": "."}),
+            }
+        );
+        assert_eq!(
+            classify_at("cd sub && git status", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// Everything the brief named as staying `Exec`: a target that does not
+    /// exist, is a file not a directory, is outside the workspace (a `..`
+    /// climb), `cd -`/`cd ~`, a quoted/globbed/metacharacter dir, two
+    /// `cd`s, unquoted internal whitespace (bash's real `cd` sees TWO
+    /// arguments there and fails — `&&` never runs the rest), and a
+    /// non-routable `<rest>` even past a genuinely resolvable `cd`.
+    #[test]
+    fn cd_stays_exec_when_the_target_does_not_resolve_or_is_out_of_authority() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        for cmd in [
+            "cd missing && cargo test",
+            "cd file.txt && cargo test",
+            "cd ../outside-the-workspace && cargo test",
+            "cd - && cargo test",
+            "cd ~ && cargo test",
+            "cd \"sub\" && cargo test",
+            "cd su* && cargo test",
+            "cd sub$X && cargo test",
+            // Two `cd`s: `rest` after the first fold is `cd sub && cargo
+            // test`, which still contains `&&` — `classify_stripped`'s
+            // ordinary compound refusal catches it, no separate check.
+            "cd sub && cd sub && cargo test",
+            // A resolvable `cd`, but `<rest>` isn't routable — the fold
+            // changes what's classified, not whether it routes.
+            "cd sub && rm -rf x",
+            // Unquoted internal whitespace: the ONLY correctly quoted
+            // spelling is already refused by `BUILD_UNSAFE`'s `"`, so
+            // without this refusal the broken command would route while
+            // the correct one would not.
+            "cd su b && cargo test",
+        ] {
+            assert_eq!(
+                classify_at(cmd, &fx.root, &scope),
+                RouteDecision::Exec,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// A symlink INSIDE the workspace whose target resolves OUTSIDE it
+    /// stays `Exec` — `std::fs::canonicalize` follows the link, so the
+    /// containment check sees the REAL destination, not the lexical path
+    /// the model typed.
+    #[cfg(not(windows))]
+    #[test]
+    fn cd_through_a_symlink_that_escapes_the_workspace_stays_exec() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        // `std::env::temp_dir()` is an ANCESTOR of `fx.root` (tempfile
+        // creates its dirs under it), so it is guaranteed to exist and to
+        // be outside `fx.root` specifically.
+        let outside = std::env::temp_dir();
+        std::os::unix::fs::symlink(&outside, fx.root.join("escape")).expect("symlink");
+        assert_eq!(
+            classify_at("cd escape && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// A resolvable directory OUTSIDE this call's fs-read fence (even
+    /// though it is genuinely inside the workspace on disk) stays `Exec` —
+    /// the fence, not just the workspace boundary, decides authority.
+    #[test]
+    fn cd_into_a_real_subdirectory_outside_the_fence_stays_exec() {
+        let fx = CdFixture::new();
+        // A fence that grants only a DIFFERENT root — `sub` is a real
+        // directory inside the workspace, but outside THIS call's fence.
+        let elsewhere = tempfile::TempDir::new().expect("tempdir");
+        let scope = crate::caveats::Scope::only([elsewhere
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .to_string_lossy()
+            .into_owned()]);
+        assert_eq!(
+            classify_at("cd sub && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 2 BLOCKER (red first, real tempdir with `sub/x`/`sub/f`
+    /// AND `x`/`f` at the root — distinct content, so reading/deleting the
+    /// WRONG one is provably wrong): `cwd` is honoured only by `build_exec`
+    /// (`run_confined_build_lane` takes it as a real parameter) —
+    /// `read_file`/`list_dir`/`delete_file` all join
+    /// `workspace + path` and never look at `args["cwd"]`. Attaching `cwd`
+    /// to those routes anyway would leave `cd sub && rm x` deleting
+    /// `<root>/x` instead of `<root>/sub/x` — a wrong-file DELETE gated only
+    /// by `fs_write` on the root, not on `sub`. Every non-build route
+    /// with a resolved `cwd != "."` now stays `Exec`; `cwd == "."` (the
+    /// workspace root itself) is harmless and still routes.
+    #[test]
+    fn a_resolved_cwd_never_reaches_a_route_that_does_not_honour_it() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        for cmd in ["cd sub && rm x", "cd sub && cat f", "cd sub && ls"] {
+            assert_eq!(
+                classify_at(cmd, &fx.root, &scope),
+                RouteDecision::Exec,
+                "{cmd}"
+            );
+        }
+        // The pre-existing sibling of the same bug: a `cwd` FIELD (not a
+        // leading `cd`) on a non-build route used to route and
+        // silently drop it.
+        assert_eq!(
+            RouteTable::builtin().classify_call(
+                &json!({"command": "cat f", "cwd": "sub"}),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Exec
+        );
+        // `cwd == "."` (the workspace root itself) is harmless — those
+        // tools already run there, so nothing is silently dropped.
+        // Not on Windows: the cd fold does not resolve there yet and stays
+        // Exec (fail-closed); the refusals above still run on every platform.
+        #[cfg(not(windows))]
+        assert_eq!(
+            classify_at(
+                &format!("cd {} && cat f", fx.root.display()),
+                &fx.root,
+                &scope
+            ),
+            RouteDecision::Route {
+                tool: "read_file",
+                args: json!({ "path": "f" }),
+            }
+        );
+    }
+
+    /// #2551 round 2 should-fix (red first): the fence must hold on the
+    /// CANONICAL path too, not just the lexical join. A fence granting only
+    /// `sub` and a symlink `sub/link` → a REAL sibling directory `other`
+    /// (never granted): `workspace.join("sub/link")` lexically starts with
+    /// the granted `sub` prefix, but the directory it actually reaches is
+    /// outside the fence. Checking only the lexical join would route with
+    /// `cwd="other"` — a directory the fence never authorized.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_symlink_whose_real_target_is_outside_the_fence_stays_exec() {
+        let fx = CdFixture::new();
+        let other = fx.root.join("other");
+        std::fs::create_dir(&other).expect("mkdir other");
+        std::os::unix::fs::symlink(&other, fx.sub.join("link")).expect("symlink");
+        // Grant ONLY `sub` — `other` is genuinely inside the WORKSPACE, but
+        // never inside THIS call's fence.
+        let scope = crate::caveats::Scope::only([fx.sub.to_string_lossy().into_owned()]);
+        assert_eq!(
+            classify_at("cd sub/link && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 2 should-fix (dropped from #2550 round 2, re-added, red
+    /// first): ANY `..` component in `<dir>` refuses outright, even one
+    /// that would resolve harmlessly. `std::fs::canonicalize` resolves
+    /// PHYSICALLY (follows every symlink to its real target); a real
+    /// shell's `cd` defaults to LOGICAL (`-L`) and never re-resolves a
+    /// symlink component once it has descended through it. With `link →
+    /// <root>/a/b`, `cd link/..` lands at `<root>` in bash (logical: pop
+    /// the textual `link` component) but at `<root>/a` if routed
+    /// (physical: canonicalize resolves `link` first, then climbs one
+    /// REAL level) — two different directories from the same command.
+    /// Refusing any `..` sidesteps the divergence entirely rather than
+    /// trying to emulate bash's logical resolution.
+    #[test]
+    fn a_parent_dir_component_in_the_cd_target_always_refuses() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        // Even a `..` that would resolve harmlessly (back to a sibling
+        // that IS granted) still refuses — the component itself is what's
+        // refused, not its eventual resolution.
+        assert_eq!(
+            classify_at("cd sub/../sub && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+        assert_eq!(
+            classify_at("cd sub/.. && cargo test", &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 3 should-fix: a folded leading `cd` resolves `<dir>`
+    /// against `workspace`, but when the call ALSO carries a `cwd` field, a
+    /// real shell resolves the relative `cd` against THAT directory, not the
+    /// workspace root. `{command:"cd sub && cargo test", cwd:"other"}` used
+    /// to route to `<root>/sub` while the shell would run in
+    /// `<root>/other/sub` (or fail, if that path does not exist) — a
+    /// wrong-directory build that still counted as a pass. Refuse instead of
+    /// resolving the fold against the field: simpler, and the review's
+    /// evidence never combines the two.
+    #[test]
+    fn a_cwd_field_alongside_a_folded_leading_cd_refuses() {
+        let fx = CdFixture::new();
+        let other = fx.root.join("other");
+        std::fs::create_dir(&other).expect("mkdir other");
+        std::fs::create_dir(other.join("sub")).expect("mkdir other/sub");
+        let scope = fx.read_scope();
+        let call = json!({ "command": "cd sub && cargo test", "cwd": "other" });
+        assert_eq!(
+            RouteTable::builtin().classify_call(&call, &fx.root, &scope),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2551 round 3 nit: the round-2 dual fence check compares a canonical
+    /// candidate path against the UN-canonicalized `read_scope` roots, so a
+    /// workspace reached through a symlinked path (macOS `/tmp` →
+    /// `/private/tmp`) fails the canonical check for every `<dir>`,
+    /// including `.` — no `cd` ever routes. Canonicalizing the scope's own
+    /// roots before that comparison fixes it. Deliberately does NOT
+    /// canonicalize the tempdir path up front (unlike `CdFixture::new`),
+    /// so the workspace root passed to `classify_call` is itself the
+    /// symlinked string this test is about.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_symlinked_workspace_root_still_folds_a_cd() {
+        let real = tempfile::TempDir::new().expect("tempdir");
+        let real_root = real.path().canonicalize().expect("canonicalize tempdir");
+        std::fs::create_dir(real_root.join("sub")).expect("mkdir sub");
+        let parent = real_root.parent().expect("tempdir has a parent");
+        let link = parent.join(format!(
+            "{}-link",
+            real_root.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&real_root, &link).expect("symlink workspace root");
+        let scope = crate::caveats::Scope::only([link.to_string_lossy().into_owned()]);
+        let call = json!({ "command": "cd sub && cargo test" });
+        assert_eq!(
+            RouteTable::builtin().classify_call(&call, &link, &scope),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "test"], "cwd": "sub" }),
+            }
+        );
+        std::fs::remove_file(&link).ok();
+    }
+
+    /// F27 (r14a evidence): the exact measured shape — a folded leading
+    /// `cd`, a build piped through `2>&1`, and a trailing exit-status echo
+    /// — routes with `cwd` attached, same as if the echo were never there.
+    #[test]
+    fn a_folded_cd_with_2_and_1_and_a_trailing_exit_echo_routes_with_cwd() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        assert_eq!(
+            classify_at(
+                "cd sub && cargo test 2>&1; echo \"EXIT: $?\"",
+                &fx.root,
+                &scope,
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({ "argv": ["cargo", "test"], "cwd": "sub", "echo_dropped": true }),
+            }
+        );
+    }
+
+    /// F27: every echo-suffix variant from the evidence routes, whether the
+    /// separator is `;` or `&&`, quoted or bare, `EXIT:`/`EXIT=`/`exit `-
+    /// prefixed, or referencing `${PIPESTATUS[0]}` instead of `$?`.
+    #[test]
+    fn every_trailing_exit_echo_variant_is_stripped_and_routes() {
+        for cmd in [
+            "cargo test; echo \"EXIT: $?\"",
+            "cargo test && echo \"EXIT: $?\"",
+            "cargo test; echo \"EXIT=$?\"",
+            "cargo test; echo \"exit $?\"",
+            "cargo test; echo $?",
+            "cargo test; echo \"TEST_EXIT=${PIPESTATUS[0]}\"",
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "build_exec",
+                    args: json!({ "argv": ["cargo", "test"], "echo_dropped": true }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    /// F27 negative cases: anything that is NOT provably an inert
+    /// exit-status echo stays compound (`Exec`), exactly as before this
+    /// change — an echo of unrelated text or a variable, a command
+    /// substitution, a redirect, `||` (not `&&`/`;`), and two trailing
+    /// echoes (the first one is not the one that gets dropped, and it
+    /// keeps its own `;` in what remains).
+    #[test]
+    fn a_trailing_echo_that_is_not_provably_inert_stays_compound() {
+        for cmd in [
+            "cargo test; echo \"$HOME\"",
+            "cargo test; echo $(date)",
+            "cargo test; echo x > f",
+            "cargo test || echo \"$?\"",
+            "cargo test; echo a; echo \"$?\"",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
+    /// F27: routing decides nothing about the build's own outcome — a
+    /// failing build still routes with the echo stripped, and it is the
+    /// confined build lane (never the shell's own masked `$?`) that reports
+    /// the real failure. See `disable_ocap_tests.rs` for the end-to-end
+    /// dispatch confirmation that the reported exit code is the REAL one.
+    #[test]
+    fn a_trailing_exit_echo_on_a_command_that_would_fail_still_routes() {
+        assert_eq!(
+            classify("cargo test --this-flag-does-not-exist; echo \"EXIT: $?\""),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test", "--this-flag-does-not-exist"],
+                    "echo_dropped": true,
+                }),
+            }
+        );
+    }
+
+    /// #2554 round 2 should-fix (red first): a newline inside the echo tail
+    /// must never be treated as more argument text — `cargo test; echo
+    /// EXIT=$?<LF>touch marker` used to scrub to `<LF>touch marker`, see no
+    /// forbidden character in a hand-rolled table that omitted `\n`, and
+    /// silently DROP `touch marker` while routing the build. `\n` is
+    /// checked directly now, before any scrubbing.
+    #[test]
+    fn a_newline_in_the_echo_tail_refuses_the_whole_strip() {
+        assert_eq!(
+            classify("cargo test; echo EXIT=$?\ntouch marker"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// #2554 round 2 should-fix (red first): the rightmost-`;`/`&&` search
+    /// has no notion of quoting, so a separator INSIDE a quoted argument
+    /// could become the split point. `rm "x; echo "$?""` is ONE `rm` of a
+    /// file literally named `x; echo "$?"` in a real shell; splitting it
+    /// used to route `rm "x` as `delete_file { path: "\"x" }` — a different
+    /// file than the shell would ever touch. A quote anywhere in the kept
+    /// half now refuses the whole strip.
+    #[test]
+    fn a_quote_inside_the_kept_half_refuses_the_whole_strip() {
+        assert_eq!(classify("rm \"x; echo \"$?\"\""), RouteDecision::Exec);
+    }
+
+    /// F28 (#2483 evidence, F28/F30): the model's own instinct — `timeout
+    /// 300 cargo build -p newt-core` — routes with the wrapper stripped and
+    /// the literal cargo argv preserved, flagged so the note can say why no
+    /// `timeout` wall applies.
+    #[test]
+    fn a_leading_timeout_wrapper_is_stripped_and_the_build_routes() {
+        assert_eq!(
+            classify("timeout 300 cargo build -p newt-core"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "build", "-p", "newt-core"],
+                    "timeout_secs": 300,
+                }),
+            }
+        );
+    }
+
+    /// F28: composes with the `cd` fold (#2551) — both the folded `cwd` AND
+    /// the dropped `timeout` are attached to the same routed call.
+    #[test]
+    fn a_leading_timeout_wrapper_composes_with_the_cd_fold() {
+        let fx = CdFixture::new();
+        let scope = fx.read_scope();
+        assert_eq!(
+            classify_at(
+                "cd sub && timeout 300 cargo build -p newt-core",
+                &fx.root,
+                &scope,
+            ),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "build", "-p", "newt-core"],
+                    "cwd": "sub",
+                    "timeout_secs": 300,
+                }),
+            }
+        );
+    }
+
+    /// F28: composes with the tail-pipe trim (#2524/#2549) — the trim is
+    /// applied AND the `timeout` wrapper is dropped.
+    #[test]
+    fn a_leading_timeout_wrapper_composes_with_the_tail_trim() {
+        assert_eq!(
+            classify("timeout 300 cargo build 2>&1 | tail -20"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "build"],
+                    "trim": { "mode": "tail", "n": 20 },
+                    "timeout_secs": 300,
+                }),
+            }
+        );
+    }
+
+    /// F28: composes with the trailing exit-echo strip (#2554) — the echo is
+    /// dropped AND the `timeout` wrapper is dropped.
+    #[test]
+    fn a_leading_timeout_wrapper_composes_with_the_exit_echo_strip() {
+        assert_eq!(
+            classify("timeout 300 cargo build -p newt-core; echo \"EXIT: $?\""),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "build", "-p", "newt-core"],
+                    "echo_dropped": true,
+                    "timeout_secs": 300,
+                }),
+            }
+        );
+    }
+
+    /// F28 negative: the command after the wrapper is NOT itself routable
+    /// (`rm` never routes to the build lane) — the whole thing stays `Exec`,
+    /// refused downstream exactly as today, never a "half-stripped" route.
+    #[test]
+    fn a_timeout_wrapper_around_a_non_routable_command_stays_exec() {
+        assert_eq!(classify("timeout 5 rm -rf x"), RouteDecision::Exec);
+    }
+
+    /// F28 negative: a shell-variable duration (`$T`) is not a plain token —
+    /// the whole command stays compound/`Exec` rather than guessing at what
+    /// the shell would have expanded it to.
+    #[test]
+    fn a_timeout_wrapper_with_a_shell_variable_duration_stays_exec() {
+        assert_eq!(classify("timeout $T cargo test"), RouteDecision::Exec);
+    }
+
+    /// F28 negative: two stacked `timeout` wrappers never recursively strip
+    /// — only exactly one leading wrapper is ever removed.
+    #[test]
+    fn two_stacked_timeout_wrappers_never_recursively_strip() {
+        assert_eq!(
+            classify("timeout 1 timeout 2 cargo test"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 (red first): `-s`'s value used to be
+    /// accepted as ANY next token, so a command substitution hiding in it
+    /// silently vanished once the `timeout` prefix was stripped — the shell
+    /// WOULD have run `touch pwned`. The whole strip must refuse instead of
+    /// discarding text the model asked the shell to execute.
+    #[test]
+    fn a_metacharacter_in_the_signal_value_refuses_the_whole_strip() {
+        assert_eq!(
+            classify("timeout -s $(touch${IFS}pwned) 5 cargo test"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 (red first): same hole via `--kill-after=`'s
+    /// value — a `;`-chained command hiding after the `=` used to be
+    /// accepted and dropped along with the rest of the wrapper.
+    #[test]
+    fn a_metacharacter_in_the_kill_after_value_refuses_the_whole_strip() {
+        assert_eq!(
+            classify("timeout --kill-after=1;touch${IFS}x 5 cargo test"),
+            RouteDecision::Exec
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 non-regression: value validation must not
+    /// over-refuse a plain signal name — `-s KILL` still strips and routes.
+    #[test]
+    fn a_plain_signal_value_still_strips_and_routes() {
+        assert_eq!(
+            classify("timeout -s KILL 5 cargo test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test"],
+                    "timeout_secs": 5,
+                }),
+            }
+        );
+    }
+
+    /// PR-F28 review, Blocker 1 non-regression: a plain `--signal=`/`-k`
+    /// combination (long-form signal, short-form kill-after) still strips
+    /// and routes.
+    #[test]
+    fn a_plain_signal_and_kill_after_value_still_strips_and_routes() {
+        assert_eq!(
+            classify("timeout --signal=TERM -k 5 60 cargo test"),
+            RouteDecision::Route {
+                tool: "build_exec",
+                args: json!({
+                    "argv": ["cargo", "test"],
+                    "timeout_secs": 60,
+                }),
+            }
+        );
     }
 }

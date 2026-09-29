@@ -515,11 +515,16 @@ pub fn agent_fingerprint_of_pubkey(pubkey: &[u8; 32]) -> String {
 /// non-hex nibble — so callers fail closed.
 #[must_use]
 pub fn decode_agent_pubkey(hex: &str) -> Option<[u8; 32]> {
+    decode_hex::<32>(hex)
+}
+
+/// Decode exactly `N` bytes from `2 * N` hex chars; `None` on anything else.
+fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
     let hex = hex.trim();
-    if hex.len() != 64 {
+    if hex.len() != 2 * N {
         return None;
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; N];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
@@ -562,6 +567,99 @@ pub fn pubkey_words(pubkey: &[u8; 32]) -> [&'static str; crate::sas_transcript::
     payload.extend_from_slice(b"newt/dock-pubkey-words/v1");
     push_field(&mut payload, pubkey);
     crate::sas_transcript::sas_words(&Fingerprint::of_bytes(&payload))
+}
+
+/// Digits in a [`Pairing::code`].
+pub const PAIRING_CODE_DIGITS: usize = 6;
+
+/// The commitment a host sends first when it pairs with a hub (Numeric
+/// Comparison, K8.8): it binds both dock keys to the host's secret nonce, so
+/// the host is committed to that nonce before it sees the hub's.
+#[must_use]
+pub fn pairing_commitment(
+    hub_pubkey: &[u8; 32],
+    host_pubkey: &[u8; 32],
+    host_nonce: &[u8; 16],
+) -> [u8; 32] {
+    let mut payload = Vec::with_capacity(112);
+    payload.extend_from_slice(b"newt/dock-pairing-commit/v1");
+    push_field(&mut payload, hub_pubkey);
+    push_field(&mut payload, host_pubkey);
+    push_field(&mut payload, host_nonce);
+    Fingerprint::of_bytes(&payload).0
+}
+
+/// A completed pairing of a hub and a host (Numeric Comparison, K8.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pairing {
+    /// The [`PAIRING_CODE_DIGITS`]-digit code both operators compare before
+    /// either side approves the other.
+    pub code: String,
+    /// What was paired: both keys, the commitment and both nonces.
+    pub transcript: PairingTranscript,
+    /// The transcript's content id — what each side's signed approval
+    /// commits to as its `transcript_id`.
+    pub transcript_id: String,
+}
+
+/// The record of one Numeric Comparison pairing, content-addressed so the id
+/// both signed approvals carry is the dag-cbor CID of what was compared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingTranscript {
+    /// The pairing protocol, `newt/dock-pairing/v1`.
+    pub protocol: String,
+    /// The hub's dock key, hex.
+    pub hub_pubkey: String,
+    /// The host's dock key, hex.
+    pub host_pubkey: String,
+    /// The host's commitment to its nonce, hex.
+    pub host_commitment: String,
+    /// The hub's nonce, hex.
+    pub hub_nonce: String,
+    /// The host's nonce, hex, which opens its commitment.
+    pub host_nonce: String,
+}
+
+impl content_addressable::ContentAddressable for PairingTranscript {
+    fn canonical_form(&self) -> Result<Vec<u8>, content_addressable::ContentError> {
+        content_addressable::canonical::to_canonical_dagcbor(self)
+    }
+}
+
+/// Derive the pairing of a hub and host from both dock keys, in role order,
+/// the host's commitment and both nonces. Neither end can steer the code: the
+/// host committed to its nonce before seeing the hub's, and the hub chose its
+/// nonce before seeing the host's. `None` only if the transcript cannot be
+/// encoded.
+#[must_use]
+pub fn pairing(
+    hub_pubkey: &[u8; 32],
+    host_pubkey: &[u8; 32],
+    hub_nonce: &[u8; 16],
+    host_nonce: &[u8; 16],
+) -> Option<Pairing> {
+    use content_addressable::ContentAddressable as _;
+    let transcript = PairingTranscript {
+        protocol: "newt/dock-pairing/v1".into(),
+        hub_pubkey: hex(hub_pubkey),
+        host_pubkey: hex(host_pubkey),
+        host_commitment: hex(&pairing_commitment(hub_pubkey, host_pubkey, host_nonce)),
+        hub_nonce: hex(hub_nonce),
+        host_nonce: hex(host_nonce),
+    };
+    let id = transcript.content_id().ok()?;
+    // The code is its own derivation from the transcript, domain-separated
+    // from the id, so displaying it reveals nothing the id is used for.
+    let mut payload = b"newt/dock-pairing-code/v1".to_vec();
+    push_field(&mut payload, &transcript.canonical_form().ok()?);
+    let digest = Fingerprint::of_bytes(&payload);
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest.0[..8]);
+    Some(Pairing {
+        code: format!("{:06}", u64::from_be_bytes(head) % 1_000_000),
+        transcript,
+        transcript_id: id.to_string(),
+    })
 }
 
 /// The human-verifiable output of a dock approval: the 6-word mnemonic of the
@@ -619,6 +717,332 @@ pub fn dock_ceremony(
     }
 }
 
+/// How long an unapproved host stays staged after its last uplink poll.
+pub const STAGED_HOST_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Most hosts staged at once. Staging a new host past this is refused, so
+/// distinct proposals cannot grow the store without bound.
+pub const MAX_STAGED_HOSTS: usize = 64;
+
+/// A host that uplinked to this hub without an approval (K8.5): a proposal,
+/// never an authority. It is unsigned, and nothing reads it but
+/// `newt dock approve --staged`, which turns it into a signed [`DockRecord`]
+/// only after the operator confirms its key words at this terminal (the K4
+/// stage-then-promote rule). It expires [`STAGED_HOST_TTL`] after the host's
+/// last poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedHost {
+    /// `BLAKE3(peer_pubkey)`, as the hub verified it against the poll's signer.
+    pub peer_agent_fingerprint: String,
+    /// The host's dock agent public key, hex.
+    pub peer_pubkey: String,
+    /// The host's dock instance name, as the host reported it. Unverified: the
+    /// operator confirms the key, not the name.
+    pub peer_label: String,
+    /// When the host last polled, in seconds since the Unix epoch.
+    pub last_seen_unix: u64,
+    /// The dock key of the hub that staged it, hex.
+    pub hub_pubkey: String,
+    /// The host's pairing commitment, hex, once it has sent one (K8.8).
+    #[serde(default)]
+    pub host_commitment: Option<String>,
+    /// The hub's pairing nonce, hex, sent in reply to that commitment.
+    #[serde(default)]
+    pub hub_nonce: Option<String>,
+    /// The host's pairing nonce, hex, once revealed and checked against its
+    /// commitment.
+    #[serde(default)]
+    pub host_nonce: Option<String>,
+}
+
+impl StagedHost {
+    /// The completed pairing, once the host has revealed a nonce that opens
+    /// its commitment. `None` while pairing is incomplete or does not verify.
+    #[must_use]
+    pub fn pairing(&self) -> Option<Pairing> {
+        let hub = decode_hex::<32>(&self.hub_pubkey)?;
+        let host = decode_hex::<32>(&self.peer_pubkey)?;
+        let commitment = decode_hex::<32>(self.host_commitment.as_deref()?)?;
+        let hub_nonce = decode_hex::<16>(self.hub_nonce.as_deref()?)?;
+        let host_nonce = decode_hex::<16>(self.host_nonce.as_deref()?)?;
+        (pairing_commitment(&hub, &host, &host_nonce) == commitment)
+            .then(|| pairing(&hub, &host, &hub_nonce, &host_nonce))
+            .flatten()
+    }
+}
+
+/// A pairing step a host's poll carries to its hub (K8.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingStep {
+    /// Start (or restart) pairing: the host's commitment.
+    Commit([u8; 32]),
+    /// The host's nonce, opening its commitment.
+    Reveal([u8; 16]),
+}
+
+/// The hub's answer to a [`PairingStep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingReply {
+    /// The hub's fresh nonce, answering a commitment.
+    Nonce([u8; 16]),
+    /// The nonce opened the commitment: pairing is complete.
+    Paired,
+    /// The nonce did not open the commitment, or there was none: pairing is
+    /// cleared and must restart.
+    Failed,
+}
+
+impl content_addressable::ContentAddressable for StagedHost {
+    fn canonical_form(&self) -> Result<Vec<u8>, content_addressable::ContentError> {
+        content_addressable::canonical::to_canonical_dagcbor(self)
+    }
+}
+
+/// A staged host as stored: the proposal and its content id, so a reader can
+/// recompute the id and detect an edited proposal. The file is named for the
+/// host's fingerprint, which only locates it.
+#[derive(Debug, Serialize, Deserialize)]
+struct StagedFile {
+    id: content_addressable::ContentId,
+    host: StagedHost,
+}
+
+/// Stage (or refresh) an unapproved host that polled this hub. Only the
+/// fingerprint of `pubkey` names the file, so a host cannot write another's.
+///
+/// # Errors
+/// A label that is not a plain instance name (1–80 of `[A-Za-z0-9._-]`), or
+/// the staging file could not be written.
+pub fn stage_host(
+    config_path: &Path,
+    pubkey: &[u8; 32],
+    label: &str,
+    hub_pubkey: &[u8; 32],
+    now: std::time::SystemTime,
+) -> anyhow::Result<()> {
+    if !is_host_label(label) {
+        anyhow::bail!("host label {label:?} is not a plain instance name");
+    }
+    let peer_agent_fingerprint = agent_fingerprint_of_pubkey(pubkey);
+    let staged = StagedHost {
+        peer_pubkey: hex(pubkey),
+        peer_label: label.to_owned(),
+        last_seen_unix: unix_secs(now),
+        hub_pubkey: hex(hub_pubkey),
+        peer_agent_fingerprint,
+        host_commitment: None,
+        hub_nonce: None,
+        host_nonce: None,
+    };
+    let dir = staged_dir(config_path);
+    std::fs::create_dir_all(&dir)?;
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    let live = read_staged(&dir, now, true);
+    let staged_count = live.len();
+    let mut staged = staged;
+    match live
+        .into_iter()
+        .find(|held| held.peer_agent_fingerprint == staged.peer_agent_fingerprint)
+    {
+        // A refresh keeps the pairing under way with this same hub.
+        Some(held) if held.hub_pubkey == staged.hub_pubkey => {
+            staged.host_commitment = held.host_commitment;
+            staged.hub_nonce = held.hub_nonce;
+            staged.host_nonce = held.host_nonce;
+        }
+        Some(_) => {}
+        None if staged_count >= MAX_STAGED_HOSTS => {
+            anyhow::bail!("{MAX_STAGED_HOSTS} hosts are already staged; approve or wait them out");
+        }
+        None => {}
+    }
+    write_staged(&dir, staged)
+}
+
+/// Apply a host's pairing `step` to its staged record, and answer it (K8.8).
+/// A commitment (re)starts pairing with `fresh_nonce` as the hub's nonce; a
+/// reveal completes it only if it opens the stored commitment, and otherwise
+/// clears it. The host must already be staged by this hub.
+///
+/// # Errors
+/// The host is not staged (or not by this hub), or the record cannot be
+/// written.
+pub fn pair_staged_host(
+    config_path: &Path,
+    host_pubkey: &[u8; 32],
+    hub_pubkey: &[u8; 32],
+    step: PairingStep,
+    fresh_nonce: [u8; 16],
+    now: std::time::SystemTime,
+) -> anyhow::Result<PairingReply> {
+    let dir = staged_dir(config_path);
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    let fp = agent_fingerprint_of_pubkey(host_pubkey);
+    let hub_hex = hex(hub_pubkey);
+    let mut staged = read_staged(&dir, now, false)
+        .into_iter()
+        .find(|held| held.peer_agent_fingerprint == fp && held.hub_pubkey == hub_hex)
+        .ok_or_else(|| anyhow::anyhow!("host {fp} is not staged by this hub"))?;
+    let reply = match step {
+        PairingStep::Commit(commitment) => {
+            staged.host_commitment = Some(hex(&commitment));
+            staged.hub_nonce = Some(hex(&fresh_nonce));
+            staged.host_nonce = None;
+            PairingReply::Nonce(fresh_nonce)
+        }
+        PairingStep::Reveal(host_nonce) => {
+            let opens = staged
+                .host_commitment
+                .as_deref()
+                .and_then(decode_hex::<32>)
+                .filter(|_| staged.hub_nonce.is_some())
+                .is_some_and(|c| pairing_commitment(hub_pubkey, host_pubkey, &host_nonce) == c);
+            if opens {
+                staged.host_nonce = Some(hex(&host_nonce));
+                PairingReply::Paired
+            } else {
+                staged.host_commitment = None;
+                staged.hub_nonce = None;
+                staged.host_nonce = None;
+                PairingReply::Failed
+            }
+        }
+    };
+    write_staged(&dir, staged)?;
+    Ok(reply)
+}
+
+fn write_staged(dir: &Path, staged: StagedHost) -> anyhow::Result<()> {
+    use content_addressable::ContentAddressable as _;
+    let file = StagedFile {
+        id: staged.content_id()?,
+        host: staged,
+    };
+    let path = dir.join(format!("{}.toml", file.host.peer_agent_fingerprint));
+    crate::atomic_fs::atomic_write(&path, toml::to_string(&file)?.as_bytes())?;
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The hosts staged and live at `now`, by label: observed no later than `now`
+/// and less than [`STAGED_HOST_TTL`] before it. A file that does not parse,
+/// whose content id does not match its proposal, that is not named for its own
+/// key's fingerprint, or whose label [`stage_host`] would refuse is skipped.
+#[must_use]
+pub fn staged_hosts(config_path: &Path, now: std::time::SystemTime) -> Vec<StagedHost> {
+    read_staged(&staged_dir(config_path), now, false)
+}
+
+/// Read the live staged hosts in `dir`; with `reap`, delete every other file
+/// there (expired, from the future, or failing verification).
+fn read_staged(dir: &Path, now: std::time::SystemTime, reap: bool) -> Vec<StagedHost> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let now = unix_secs(now);
+    let oldest = now.saturating_sub(STAGED_HOST_TTL.as_secs());
+    let mut hosts: Vec<StagedHost> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "toml" {
+                return None;
+            }
+            let host = verified_staged(&path)
+                .filter(|host| host.last_seen_unix > oldest && host.last_seen_unix <= now);
+            if host.is_none() && reap {
+                let _ = std::fs::remove_file(&path);
+            }
+            host
+        })
+        .collect();
+    hosts.sort_by(|a, b| a.peer_label.cmp(&b.peer_label));
+    hosts
+}
+
+fn verified_staged(path: &Path) -> Option<StagedHost> {
+    use content_addressable::ContentAddressable as _;
+    let file: StagedFile = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let host = file.host;
+    let addressed = host.content_id().ok()? == file.id;
+    let named_for_key = path.file_stem()?.to_str()? == host.peer_agent_fingerprint;
+    (addressed
+        && named_for_key
+        && fingerprint_binds_pubkey(&host.peer_agent_fingerprint, &host.peer_pubkey)
+        && decode_agent_pubkey(&host.hub_pubkey).is_some()
+        && is_host_label(&host.peer_label))
+    .then_some(host)
+}
+
+/// Forget a staged host, once it is approved. Already gone is not an error.
+///
+/// # Errors
+/// The staging file exists but could not be removed.
+pub fn unstage_host(config_path: &Path, peer_agent_fingerprint: &str) -> anyhow::Result<()> {
+    let dir = staged_dir(config_path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    remove_staged(&dir, peer_agent_fingerprint)
+}
+
+/// Promote the staged host `peer_agent_fingerprint` under the pairing its
+/// operator compared, `transcript_id`: `approve` signs the approval, and the
+/// staged record is consumed. All of it holds the staging lock the pairing
+/// steps take, so the host cannot pair again between the check and the
+/// signature, and a newer pairing is never consumed in the old one's place.
+/// Lock order: staging, then (inside `approve`) the registry.
+///
+/// # Errors
+/// The host is no longer staged or no longer holds that pairing — nothing is
+/// signed and the record is left as it is — or `approve` fails, or the staged
+/// record cannot be removed.
+pub fn promote_staged_host<T>(
+    config_path: &Path,
+    peer_agent_fingerprint: &str,
+    transcript_id: &str,
+    approve: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let dir = staged_dir(config_path);
+    let _lock = crate::atomic_fs::acquire_lock(&crate::atomic_fs::lock_path_for(&dir))?;
+    let held = read_staged(&dir, std::time::SystemTime::now(), false)
+        .into_iter()
+        .find(|host| host.peer_agent_fingerprint == peer_agent_fingerprint)
+        .and_then(|host| host.pairing());
+    if held.is_none_or(|p| p.transcript_id != transcript_id) {
+        anyhow::bail!("the host no longer holds the pairing compared; nothing was approved");
+    }
+    let approved = approve()?;
+    remove_staged(&dir, peer_agent_fingerprint)?;
+    Ok(approved)
+}
+
+fn remove_staged(dir: &Path, peer_agent_fingerprint: &str) -> anyhow::Result<()> {
+    match std::fs::remove_file(dir.join(format!("{peer_agent_fingerprint}.toml"))) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn is_host_label(label: &str) -> bool {
+    (1..=80).contains(&label.len())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn unix_secs(at: std::time::SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn staged_dir(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("ocap").join("docks.staged")
+}
+
 fn docks_dir(config_path: &Path) -> PathBuf {
     config_path.with_file_name("ocap").join("docks.d")
 }
@@ -668,6 +1092,7 @@ fn signing_payload(issuer: &str, subject: &str, record: &DockRecord) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use content_addressable::ContentAddressable as _;
     use tempfile::TempDir;
 
     /// A pubkey whose every byte is `seed`, as 64 hex chars.
@@ -1299,5 +1724,233 @@ mod tests {
             reg_c_with_key.approved(&fp(0)).is_some(),
             "with the co-located operator root key the bearer grant resolves"
         );
+    }
+
+    const HUB: [u8; 32] = [9; 32];
+
+    #[test]
+    fn a_pairing_code_is_six_digits_bound_to_both_keys_and_both_nonces() {
+        let p = pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]).unwrap();
+        assert_eq!(p.code.len(), PAIRING_CODE_DIGITS);
+        let id = p.transcript.content_id().unwrap();
+        assert_eq!(
+            p.transcript_id,
+            id.to_string(),
+            "the id is the transcript's CID"
+        );
+        assert_eq!(
+            p.transcript_id
+                .parse::<content_addressable::ContentId>()
+                .unwrap(),
+            id
+        );
+        assert!(p.code.bytes().all(|b| b.is_ascii_digit()), "{}", p.code);
+        assert_eq!(
+            p,
+            pairing(&[1; 32], &[2; 32], &[3; 16], &[4; 16]).unwrap(),
+            "deterministic"
+        );
+        for other in [
+            pairing(&[2; 32], &[1; 32], &[3; 16], &[4; 16]),
+            pairing(&[1; 32], &[2; 32], &[5; 16], &[4; 16]),
+            pairing(&[1; 32], &[2; 32], &[3; 16], &[5; 16]),
+        ] {
+            assert_ne!(other.unwrap().transcript_id, p.transcript_id);
+        }
+    }
+
+    /// The hub side of Numeric Comparison: a commitment gets a fresh hub
+    /// nonce; only the nonce that opens it completes pairing, to the code the
+    /// host derives itself; a wrong nonce clears it; a refresh keeps it.
+    #[test]
+    fn a_staged_host_pairs_only_by_opening_its_commitment() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let (host, host_nonce, hub_nonce) = ([7u8; 32], [5u8; 16], [6u8; 16]);
+        let commit = PairingStep::Commit(pairing_commitment(&HUB, &host, &host_nonce));
+        let step = |s| pair_staged_host(&config, &host, &HUB, s, hub_nonce, at(1)).unwrap();
+        let live = || staged_hosts(&config, at(1)).remove(0);
+
+        assert!(
+            pair_staged_host(&config, &host, &HUB, commit, hub_nonce, at(1)).is_err(),
+            "only a staged host pairs"
+        );
+        stage_host(&config, &host, "nuc1", &HUB, at(1)).unwrap();
+        assert_eq!(step(commit), PairingReply::Nonce(hub_nonce));
+        assert_eq!(live().pairing(), None, "not complete before the reveal");
+
+        assert_eq!(step(PairingStep::Reveal([0; 16])), PairingReply::Failed);
+        assert_eq!(
+            live().host_commitment,
+            None,
+            "a failed reveal clears pairing"
+        );
+
+        step(commit);
+        assert_eq!(step(PairingStep::Reveal(host_nonce)), PairingReply::Paired);
+        let expected = pairing(&HUB, &host, &hub_nonce, &host_nonce).unwrap();
+        assert_eq!(live().pairing(), Some(expected.clone()));
+
+        stage_host(&config, &host, "nuc1", &HUB, at(1)).unwrap();
+        assert_eq!(
+            live().pairing(),
+            Some(expected),
+            "a refresh keeps the pairing"
+        );
+        stage_host(&config, &host, "nuc1", &[8; 32], at(1)).unwrap();
+        assert_eq!(live().pairing(), None, "another hub's staging starts over");
+    }
+
+    /// A staged host is promoted only under the pairing its operator compared,
+    /// and atomically: a pairing step that races the promotion waits for it,
+    /// then finds the record consumed rather than re-pairing a host whose old
+    /// pairing is being signed (#2616).
+    #[test]
+    fn a_staged_host_is_promoted_only_under_the_pairing_compared_and_atomically() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let (host, now) = ([7u8; 32], std::time::SystemTime::now());
+        let fp = agent_fingerprint_of_pubkey(&host);
+        let step = |s| pair_staged_host(&config, &host, &HUB, s, [6; 16], now);
+        stage_host(&config, &host, "nuc1", &HUB, now).unwrap();
+        step(PairingStep::Commit(pairing_commitment(
+            &HUB, &host, &[5; 16],
+        )))
+        .unwrap();
+        step(PairingStep::Reveal([5; 16])).unwrap();
+        let compared = staged_hosts(&config, now)[0].pairing().unwrap();
+
+        let refused = promote_staged_host(&config, &fp, "another", || -> anyhow::Result<()> {
+            panic!("nothing is signed under a pairing the host does not hold")
+        });
+        assert!(refused.is_err());
+        assert_eq!(staged_hosts(&config, now).len(), 1, "the record is left");
+
+        let (started, racing) = std::sync::mpsc::channel();
+        let promoted = promote_staged_host(&config, &fp, &compared.transcript_id, || {
+            let config = config.clone();
+            let race = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let commit = PairingStep::Commit(pairing_commitment(&HUB, &host, &[8; 16]));
+                pair_staged_host(&config, &host, &HUB, commit, [6; 16], now)
+            });
+            racing.recv().unwrap();
+            // Long enough for an unlocked step to land before the signature.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(race)
+        })
+        .unwrap();
+        assert!(
+            promoted.join().unwrap().is_err(),
+            "the racing step waited, then found the host promoted"
+        );
+        assert!(staged_hosts(&config, now).is_empty(), "consumed");
+    }
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_staged_host_is_listed_until_it_expires_and_gone_once_unstaged() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let pubkey = [7u8; 32];
+        stage_host(&config, &pubkey, "nuc1", &HUB, at(1_000)).unwrap();
+
+        let staged = staged_hosts(&config, at(1_000));
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].peer_label, "nuc1");
+        assert_eq!(
+            staged[0].peer_agent_fingerprint,
+            agent_fingerprint_of_pubkey(&pubkey)
+        );
+        assert_eq!(decode_agent_pubkey(&staged[0].peer_pubkey), Some(pubkey));
+
+        let ttl = STAGED_HOST_TTL.as_secs();
+        assert_eq!(staged_hosts(&config, at(1_000 + ttl - 1)).len(), 1);
+        assert!(staged_hosts(&config, at(1_000 + ttl)).is_empty(), "expired");
+
+        stage_host(&config, &pubkey, "nuc1", &HUB, at(1_000 + ttl)).unwrap();
+        assert_eq!(staged_hosts(&config, at(1_000 + ttl)).len(), 1, "refreshed");
+
+        unstage_host(&config, &staged[0].peer_agent_fingerprint).unwrap();
+        assert!(staged_hosts(&config, at(1_000 + ttl)).is_empty());
+        unstage_host(&config, &staged[0].peer_agent_fingerprint).unwrap();
+    }
+
+    #[test]
+    fn a_label_that_is_not_an_instance_name_is_not_staged() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        for label in ["", "nuc 1", "nuc\n1", "../x", &"a".repeat(81)] {
+            assert!(
+                stage_host(&config, &[7u8; 32], label, &HUB, at(1)).is_err(),
+                "{label:?}"
+            );
+        }
+        assert!(staged_hosts(&config, at(1)).is_empty());
+    }
+
+    #[test]
+    fn a_staged_file_not_named_for_its_own_key_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        stage_host(&config, &[7u8; 32], "nuc1", &HUB, at(1)).unwrap();
+        let staged_dir = staged_dir(&config);
+        let genuine = staged_dir.join(format!("{}.toml", agent_fingerprint_of_pubkey(&[7u8; 32])));
+        let other = agent_fingerprint_of_pubkey(&[8u8; 32]);
+        std::fs::rename(genuine, staged_dir.join(format!("{other}.toml"))).unwrap();
+        assert!(staged_hosts(&config, at(1)).is_empty());
+    }
+
+    #[test]
+    fn an_edited_proposal_no_longer_matches_its_content_id() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        stage_host(&config, &[7u8; 32], "nuc1", &HUB, at(1)).unwrap();
+        let path =
+            staged_dir(&config).join(format!("{}.toml", agent_fingerprint_of_pubkey(&[7u8; 32])));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"nuc1\""), "{text}");
+        std::fs::write(&path, text.replace("\"nuc1\"", "\"nuc9\"")).unwrap();
+        assert!(
+            staged_hosts(&config, at(1)).is_empty(),
+            "an edited label is not trusted"
+        );
+    }
+
+    #[test]
+    fn a_proposal_observed_in_the_future_is_not_live() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        stage_host(&config, &[7u8; 32], "nuc1", &HUB, at(1_000)).unwrap();
+        assert!(staged_hosts(&config, at(999)).is_empty());
+        assert_eq!(staged_hosts(&config, at(1_000)).len(), 1);
+    }
+
+    #[test]
+    fn staging_reaps_dead_entries_and_caps_the_store() {
+        let dir = TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        let key = |i: usize| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            k
+        };
+        for i in 0..MAX_STAGED_HOSTS {
+            stage_host(&config, &key(i), &format!("h{i}"), &HUB, at(1)).unwrap();
+        }
+        assert!(
+            stage_host(&config, &key(MAX_STAGED_HOSTS), "late", &HUB, at(1)).is_err(),
+            "a new host past the cap is refused"
+        );
+        stage_host(&config, &key(0), "h0", &HUB, at(1)).unwrap();
+
+        let files = || std::fs::read_dir(staged_dir(&config)).unwrap().count();
+        assert_eq!(files(), MAX_STAGED_HOSTS);
+        let later = at(1 + STAGED_HOST_TTL.as_secs());
+        stage_host(&config, &key(MAX_STAGED_HOSTS), "late", &HUB, later).unwrap();
+        assert_eq!(files(), 1, "expired entries are reaped when staging");
     }
 }

@@ -120,6 +120,10 @@ fn default_soul_no_longer_hardcodes_a_plan_path() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn registered_agents_provider_block_reaches_prompt() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect (Config::resolve().publish_runtime_settings());
+    // hold the guard for the whole test, not just its assertions.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     // A registered AgentsProvider should compose its instruction block into
     // the assembled system prompt via build_system_prompt_additions.
     let dir = tempfile::TempDir::new().unwrap();
@@ -141,6 +145,55 @@ async fn registered_agents_provider_block_reaches_prompt() {
     );
     assert!(prompt.contains("# Project instructions"));
     assert!(prompt.contains("Run just check before PRs."));
+}
+
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn historical_notes_preserve_content_without_redefining_the_live_workspace() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::TempDir::new().unwrap();
+    let old_workspace = dir.path().join("previous-repository");
+    let workspace = dir.path().join("current-repository");
+    fs::create_dir_all(&old_workspace).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let note = format!(
+        "The workspace root is {} on branch previous-work; use the retired_git tool.",
+        old_workspace.display()
+    );
+    let notes_path = dir.path().join("NOTES.md");
+    let original_notes = format!("{note}\n§\n");
+    fs::write(&notes_path, &original_notes).unwrap();
+
+    let mut memory = newt_core::MemoryManager::new();
+    memory.add_provider(newt_core::NoteStore::new(&notes_path, 2200));
+    let ctx = newt_core::SessionContext {
+        workspace: workspace.to_string_lossy().into_owned(),
+        session_id: "current-session".into(),
+    };
+    memory.initialize_all(&ctx).await;
+    let prompt = rebuild_system_prompt(&ctx.workspace, &memory, None, &ctx.session_id);
+
+    assert_eq!(fs::read_to_string(&notes_path).unwrap(), original_notes);
+    assert_eq!(prompt.matches(&note).count(), 1, "retain the note verbatim");
+    let note_position = prompt.find(&note).unwrap();
+    let history_position = prompt
+        .find("Historical notes from prior sessions")
+        .expect("cross-session notes must be framed as historical context");
+    assert!(history_position < note_position);
+    assert!(prompt.contains("Workspace, branch, and tool availability may be stale"));
+    assert!(prompt.contains("do not redefine current runtime state"));
+    let live_workspace_position = prompt
+        .find(&format!("Workspace: {}", workspace.display()))
+        .expect("the prompt must identify the actual initialized workspace");
+    assert!(note_position < live_workspace_position);
+    let live_context = &prompt[live_workspace_position..];
+    assert!(live_context.contains("current runtime root"));
+    assert!(live_context.contains("Relative tool paths resolve here"));
+    assert!(live_context
+        .contains("run_command starts here unless its cwd or command selects another directory"));
+    assert!(
+        live_context.contains("Other requested paths remain governed by the session's permissions")
+    );
 }
 
 /// Pins the process-wide inputs skill resolution reads — `NEWT_CONFIG`,

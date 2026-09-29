@@ -124,7 +124,7 @@ env = {{ Y = {{ cmd = "touch '{ref_m}'" }} }}
 
     let cfg = {
         let _guard = EnvGuard::install(home.path(), config_dir.path(), project.path());
-        Config::resolve().expect("resolve() folds the walked-up project config")
+        Config::resolve(&mut |_| {}).expect("resolve() folds the walked-up project config")
     };
 
     // Route through `discover()` exactly as the TUI/CLI connect path does — the
@@ -199,7 +199,7 @@ env = {{ TOKEN = "${{cmd:touch '{m}' && printf s3cr3t}}" }}
 
     let cfg = {
         let _guard = EnvGuard::install(home.path(), config_dir.path(), cwd.path());
-        Config::resolve().expect("resolve() loads the user config as the base")
+        Config::resolve(&mut |_| {}).expect("resolve() loads the user config as the base")
     };
 
     let entries = discover(&cfg.mcp_servers, None, None, cwd.path());
@@ -263,7 +263,7 @@ env = {{ Y = {{ cmd = "touch '{ref_m}'" }} }}
         // `$NEWT_CONFIG` cleared by the guard → the `./newt.toml` candidate is
         // the implicit fallthrough (ambient), not an operator-explicit choice.
         let _guard = EnvGuard::install(home.path(), config_dir.path(), repo.path());
-        Config::resolve().expect("resolve() picks the ambient ./newt.toml as base")
+        Config::resolve(&mut |_| {}).expect("resolve() picks the ambient ./newt.toml as base")
     };
 
     let entries = discover(&cfg.mcp_servers, None, None, repo.path());
@@ -336,7 +336,7 @@ env = {{ TOKEN = "${{cmd:touch '{m}' && printf s3cr3t}}" }}
         // guard restores the prior value on drop.
         // SAFETY: single-threaded within this `#[serial]` test.
         unsafe { std::env::set_var("NEWT_CONFIG", "./newt.toml") };
-        Config::resolve().expect("resolve() honors the explicit $NEWT_CONFIG base")
+        Config::resolve(&mut |_| {}).expect("resolve() honors the explicit $NEWT_CONFIG base")
     };
 
     let entries = discover(&cfg.mcp_servers, None, None, repo.path());
@@ -378,7 +378,7 @@ env = {{ TOKEN = "${{cmd:touch '{m}' && printf s3cr3t}}" }}
     std::fs::write(&path, toml).unwrap();
 
     // `--config <path>` == `Config::load(path)`.
-    let cfg = Config::load(&path).expect("load an operator-chosen newt.toml");
+    let cfg = Config::load(&path, &mut |_| {}).expect("load an operator-chosen newt.toml");
     let entries = discover(&cfg.mcp_servers, None, None, dir.path());
     let vault = entries
         .iter()

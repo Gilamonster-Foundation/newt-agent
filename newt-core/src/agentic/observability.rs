@@ -51,7 +51,16 @@ pub enum ToolCallDialect {
 /// trace line (`kind` is the ADR §5 event name). These lines carry no
 /// `contract_version` key, so the external evaluator's contract scan skips
 /// them structurally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The identity the harness derived for one call it recovered from reply text:
+/// the full content id (the identity) and the wire locator rendered from its
+/// digest (what a provider sees as `tool_call_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredIdentity {
+    pub locator: String,
+    pub cid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParseSignal {
     /// The round produced content but no native tool call and no recovery hit
@@ -63,6 +72,10 @@ pub enum ParseSignal {
     RecoveredToolCall {
         round: usize,
         dialect: ToolCallDialect,
+        /// The derived identity of each recovered call, in call order. Empty
+        /// on a wire that does not require ids (the Ollama arm).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        calls: Vec<RecoveredIdentity>,
     },
 }
 
@@ -74,9 +87,14 @@ pub fn round_parse_signal(
     content_nonempty: bool,
     native_calls: bool,
     recovered: Option<ToolCallDialect>,
+    identities: Vec<RecoveredIdentity>,
 ) -> Option<ParseSignal> {
     if let Some(dialect) = recovered {
-        return Some(ParseSignal::RecoveredToolCall { round, dialect });
+        return Some(ParseSignal::RecoveredToolCall {
+            round,
+            dialect,
+            calls: identities,
+        });
     }
     if !native_calls && content_nonempty {
         return Some(ParseSignal::NoParseableToolCall { round });
@@ -139,6 +157,13 @@ pub enum BehaviorSignal {
         finish_reason: String,
         reasoning_tokens_estimate: usize,
     },
+    /// F34: a reasoning overflow was re-dispatched once at the next-lower
+    /// cognition level (labels, e.g. `thoughtful` → `rational`).
+    CognitionDropRetry {
+        round: usize,
+        from: String,
+        to: String,
+    },
 }
 
 impl BehaviorSignal {
@@ -168,6 +193,10 @@ pub struct SolveObservation {
     pub behavior_signals: Vec<BehaviorSignal>,
     /// The output cap the turn's wire applied (#2312), when it applied one.
     pub output_allowance: Option<OutputAllowance>,
+    /// Captured Responses declarations, present only after policy admission.
+    pub responses_capability: Option<crate::model_card::ResponsesCapability>,
+    /// The actual accepted Responses effort, independent of semantic intent.
+    pub reasoning_effort: Option<crate::model_card::ReasoningEffort>,
     /// The reply is harness-written text (an empty-response note, a refusal
     /// placeholder, a cap-exit fallback), not a model claim (#2372).
     pub harness_reply: bool,
@@ -500,7 +529,7 @@ mod tests {
     #[test]
     fn content_without_any_call_signals_no_parseable_tool_call() {
         assert_eq!(
-            round_parse_signal(2, true, false, None),
+            round_parse_signal(2, true, false, None, vec![]),
             Some(ParseSignal::NoParseableToolCall { round: 2 })
         );
     }
@@ -508,10 +537,11 @@ mod tests {
     #[test]
     fn recovery_hit_signals_recovered_tool_call_with_its_dialect() {
         assert_eq!(
-            round_parse_signal(1, true, false, Some(ToolCallDialect::FunctionTag)),
+            round_parse_signal(1, true, false, Some(ToolCallDialect::FunctionTag), vec![]),
             Some(ParseSignal::RecoveredToolCall {
                 round: 1,
-                dialect: ToolCallDialect::FunctionTag
+                dialect: ToolCallDialect::FunctionTag,
+                calls: vec![],
             })
         );
     }
@@ -519,10 +549,10 @@ mod tests {
     #[test]
     fn healthy_native_call_and_empty_content_signal_nothing() {
         // A native structured call is the healthy channel — no signal.
-        assert_eq!(round_parse_signal(0, true, true, None), None);
+        assert_eq!(round_parse_signal(0, true, true, None, vec![]), None);
         // Empty content with no calls is the suspicious-empty case, not a
         // parse status (W3 territory) — no signal here either.
-        assert_eq!(round_parse_signal(0, false, false, None), None);
+        assert_eq!(round_parse_signal(0, false, false, None, vec![]), None);
     }
 
     #[test]
@@ -606,6 +636,7 @@ mod tests {
         let recovered = serde_json::to_value(ParseSignal::RecoveredToolCall {
             round: 1,
             dialect: ToolCallDialect::BareJson,
+            calls: vec![],
         })
         .unwrap();
         assert_eq!(

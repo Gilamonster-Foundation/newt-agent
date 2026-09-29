@@ -3,6 +3,9 @@ use super::*;
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn conversation_restore_replaces_memory_and_restores_persona() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect; hold the guard for the whole test.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -66,7 +69,6 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
         mode_states: &mode_states,
     };
 
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let message = handle_conversation_command(
         &format!("/conversation restore {id}"),
         &mut conversation_ctx,
@@ -246,6 +248,9 @@ async fn prompt_only_restore_rehydrates_receipt_without_replaying_it_as_input() 
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn conversation_restore_reseats_the_persona_cognition_layer() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect; hold the guard for the whole test.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -296,7 +301,6 @@ async fn conversation_restore_reseats_the_persona_cognition_layer() {
         mode_states: &mode_states,
     };
 
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     newt_core::cognition::set_persona_cognition(None);
 
     // 1. Restoring a persona that declares a dial SEATS it.

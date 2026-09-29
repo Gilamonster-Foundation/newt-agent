@@ -169,3 +169,97 @@ fn router_states_keep_loaded_and_unloaded_distinct_from_unknown() {
     );
     assert!(parse_llamacpp_model_states(&serde_json::json!({"data": [{"id":"hosted"}]})).is_none());
 }
+
+/// #2567: a router `/models` entry carries the argv it spawned the model with
+/// and its preset block. The shape is the live router's (verified 2026-09-24);
+/// the paths here are placeholders.
+#[test]
+fn launch_declaration_reads_args_and_preset_for_the_named_model() {
+    let body = serde_json::json!({"data": [
+        {"id": "other", "status": {"value": "unloaded", "args": ["llama-server", "--ctx-size", "8192"]}},
+        {"id": "m-35b", "status": {
+            "value": "loaded",
+            "args": ["/opt/llama/llama-server", "--chat-template-kwargs", "{\"enable_thinking\": false}",
+                     "--jinja", "--ctx-size", "131072", "--model", "/models/m.gguf"],
+            "preset": "[m-35b]\nctx-size = 131072\n"
+        }}
+    ]});
+    let launch = parse_llamacpp_launch(&body, "m-35b").expect("declared");
+    assert_eq!(
+        launch.args.first().map(String::as_str),
+        Some("--chat-template-kwargs"),
+        "binary dropped"
+    );
+    assert_eq!(launch.flag("--ctx-size"), Some("131072"));
+    assert_eq!(
+        launch.flag("--chat-template-kwargs"),
+        Some("{\"enable_thinking\": false}")
+    );
+    assert_eq!(
+        launch.flag("--jinja"),
+        Some("--ctx-size"),
+        "flag() is positional; callers ask for valued flags"
+    );
+    assert_eq!(
+        launch.preset.as_deref(),
+        Some("[m-35b]\nctx-size = 131072\n")
+    );
+    assert!(parse_llamacpp_launch(&body, "absent").is_none());
+    assert!(
+        parse_llamacpp_launch(&serde_json::json!({"data": [{"id": "bare"}]}), "bare").is_none()
+    );
+}
+
+/// #2572 review: a launch probe's failure modes stay distinct, each against a
+/// real HTTP exchange (wiremock), so the Inference view never calls a timeout
+/// or a refused key "not a router".
+#[tokio::test]
+async fn launch_probe_distinguishes_absent_unsupported_refused_and_timed_out() {
+    use std::time::Duration;
+    let probe = |server: &MockServer, timeout: Duration| {
+        let url = server.uri();
+        async move {
+            let client = reqwest::Client::builder().timeout(timeout).build().unwrap();
+            LaunchProbe::from_result(fetch_llamacpp_launch(&client, &url, None, "m").await)
+        }
+    };
+    let long = Duration::from_secs(5);
+    let respond = |template: ResponseTemplate| async move {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    };
+    let declared = respond(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [
+        {"id": "m", "status": {"value": "loaded", "args": ["llama-server", "--ctx-size", "8192"]}}
+    ]})))
+    .await;
+    assert!(matches!(
+        probe(&declared, long).await,
+        LaunchProbe::Declared(_)
+    ));
+    let absent = respond(
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": [{"id": "m"}]})),
+    )
+    .await;
+    assert_eq!(probe(&absent, long).await, LaunchProbe::Absent);
+    let missing = respond(ResponseTemplate::new(404)).await;
+    assert_eq!(probe(&missing, long).await, LaunchProbe::Unsupported);
+    let not_json = respond(ResponseTemplate::new(200).set_body_string("<html>")).await;
+    assert_eq!(probe(&not_json, long).await, LaunchProbe::Unsupported);
+    let refused = respond(ResponseTemplate::new(401)).await;
+    assert_eq!(probe(&refused, long).await, LaunchProbe::Refused(401));
+    let broken = respond(ResponseTemplate::new(500)).await;
+    assert_eq!(
+        probe(&broken, long).await,
+        LaunchProbe::Failed("HTTP 500".into())
+    );
+    let slow = respond(ResponseTemplate::new(200).set_delay(Duration::from_millis(500))).await;
+    assert_eq!(
+        probe(&slow, Duration::from_millis(50)).await,
+        LaunchProbe::TimedOut
+    );
+}

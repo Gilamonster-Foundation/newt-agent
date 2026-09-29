@@ -54,6 +54,18 @@ pub enum TurnEndReason {
     NarrationFinalRound,
     /// The tool-round cap ended the turn via the tools-disabled summary.
     RoundCap,
+    /// The operator-configured whole-run inference-call allowance
+    /// (`--run-allowance`, #2313) was spent before the turn finished. Unlike
+    /// [`Self::RoundCap`] there is NO model-written summary — a summary is a call
+    /// the allowance now refuses, and a summary before the round cap would break
+    /// `BHV-ROUND-002` — so the harness writes the notice itself.
+    RunAllowance,
+    /// U4b: after at least one successful workspace write, the configured number
+    /// of consecutive rounds (`[initiative.no_progress] stop_after`) changed
+    /// nothing and ran no passing build or test. A budget wall filed like
+    /// [`Self::RoundCap`], with a harness-written notice and no model summary
+    /// (BHV-ROUND-002).
+    NoProgress,
     /// The model produced no usable content (placeholder/diagnostic reply).
     Empty,
     /// #1963: the operator interrupted the turn (Esc / Ctrl-C) before it
@@ -195,6 +207,8 @@ impl TurnMetrics {
             }
             Some(TurnEndReason::AwaitingOperator) => format!("{base} · awaiting operator"),
             Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
+            Some(TurnEndReason::RunAllowance) => format!("{base} · ⚠ run allowance exhausted"),
+            Some(TurnEndReason::NoProgress) => format!("{base} · ⚠ stopped: no progress"),
             Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
             Some(TurnEndReason::Cancelled) => format!("{base} · ⊘ interrupted"),
             Some(TurnEndReason::Failed) => format!("{base} · ✗ failed"),
@@ -231,7 +245,8 @@ impl TurnMetrics {
     }
 }
 
-fn fmt_count(n: u64) -> String {
+/// `n` with thousands separators, e.g. `104,857`.
+pub fn fmt_count(n: u64) -> String {
     // Insert thousands separators for readability.
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);

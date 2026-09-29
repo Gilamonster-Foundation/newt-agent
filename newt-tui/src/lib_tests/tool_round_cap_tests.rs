@@ -124,6 +124,7 @@ fn openai_loop_recovers_from_context_window_400() {
             };
             openai_chat_complete(
                 ChatCtx {
+                    overflow_retry: Default::default(),
                     run_allowance: None,
                     verify_outcomes: false,
                     round_cap_hit: None,
@@ -155,6 +156,8 @@ fn openai_loop_recovers_from_context_window_400() {
                     persona_tools: None,
                     cognition: None,
                     chat_completions_capability: Default::default(),
+                    responses_capability: Default::default(),
+                    openai_api: Default::default(),
                     output_allowance: None,
                     attempt_ledger: None,
                     reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,

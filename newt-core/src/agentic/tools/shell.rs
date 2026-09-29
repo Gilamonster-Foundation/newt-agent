@@ -10,7 +10,7 @@ use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
-use super::{denial_recovery_hint, full_access_requested, ocap_disabled};
+use super::{denial_context, denial_recovery_hint, full_access_requested, ocap_disabled};
 use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {
@@ -96,6 +96,29 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     if let Some(config_path) = crate::Config::user_config_path() {
         map.extend(crate::shell_env::from_config_dir(&config_path));
     }
+    // The child's temp dir, matching the write fence's scratch root. The brush
+    // engine runs `do_not_inherit_env(true)`, so the ambient `TMPDIR` is not
+    // inherited: this seam entry is what the child sees. Without it the child's
+    // tools fall back to the platform temp dir, which a configured fence may not
+    // grant. `NEWT_CHILD_TMPDIR` is published by the headless confined
+    // lane from the SAME value the fence is built from (one owner, no second
+    // resolution); unset everywhere else, so other lanes are unchanged.
+    if let Ok(tmp) = std::env::var("NEWT_CHILD_TMPDIR") {
+        if !tmp.trim().is_empty() {
+            map.insert("TMPDIR".to_string(), tmp);
+        }
+    }
+    // Model-run git: no ambient config, the hardening overrides, and the
+    // agent as author (see `git_hardening::sandbox_git_env`).
+    // Resolved per dispatch, so a `/settings` change applies to the next
+    // command rather than the next session.
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    let (name, email) = identity.sandbox_author();
+    map.extend(crate::git_hardening::sandbox_git_env(
+        (&name, &email),
+        &identity.git.config,
+    ));
+
     // Identify the confined engine so `env` / scripts can tell they're in newt's
     // shell (e.g. `SHELL=safe-subset` / `brush` / `host`), not the login shell.
     map.insert("SHELL".to_string(), shell_engine().as_str().to_string());
@@ -231,6 +254,318 @@ fn parse_cd_path(s: &str) -> (String, &str) {
     }
 }
 
+/// #2558 (HANDOFF item 2): `cmd f > f` — the shell truncates `f` before the
+/// command reads it, destroying the input. Run 6 of the refactor test lost a
+/// file this way (`awk … f > f`). Per #2558 ("make the wrong mutation
+/// impossible, don't explain it afterwards"), refuse BEFORE any exec: nothing
+/// runs, nothing changes. Called once, at the top of [`exec_confined_command`]
+/// — the ONE function both the confined lane and the `--yolo` host-bypass
+/// lane route through (the branch between them happens INSIDE it), so a
+/// single call site covers both **for model-typed shell text**: `run_command`,
+/// the routed-build fallback (whose redirect would be `SHELL_META` and never
+/// route in the first place), and the justfile-missing fallback. It does
+/// NOT cover `run_confined_build_lane`'s `sh -c <joined>` lane
+/// (`build_check_argv`, used by `lifecycle action=build` / the #2541
+/// escalation): that runs RESOLVED phase commands from `[lifecycle]`/pack
+/// config, not the model's own typed text, and is reachable only if the
+/// model edits that config — accepted, not "every shell lane".
+///
+/// "Reads" = a plain operand of any command in the pipeline, or `< f` —
+/// narrowed by two rules (#2560 round 2) so a harmless first instinct is not
+/// refused: a [`NON_READING_COMMANDS`] stage (`echo`, `printf`, …) adds no
+/// reads at all, and a [`SUBCOMMAND_DISPATCHERS`] stage's FIRST operand (the
+/// verb — `build`, `diff`, `test`) is skipped, so `cargo build > build` and
+/// `git diff > diff` run. "Writes" = the target of `>`, `>|`, or `>>`
+/// (append is unsafe too, for a command that streams) — PLUS every non-flag
+/// operand of a `tee` stage, which opens each with `O_TRUNC` at startup
+/// regardless of any redirect (`sort f | tee f`). Paths are resolved against
+/// `cwd` via [`resolve_exec_cwd`] — the SAME #2551 resolution
+/// `run_command`/`lifecycle` already use, not a second one — then
+/// lexically normalized (`crate::caveats::lexically_normalize`) so `cat ./f
+/// > f` compares equal to `cat f > f`.
+///
+/// Deliberately NOT a shell parser: a single pipeline of plain tokens, with
+/// minimal single/double-quote handling so `sed 's/a/b/' f > f` still reads
+/// as `sed`, `f`, `>`, `f`. A token touched by an expansion/glob character
+/// (`$` `` ` `` `*` `?` `[` `~`) or an unterminated quote is OPAQUE: it is
+/// never treated as a read OR a write target, so an ambiguous form is left
+/// exactly as today (never refused, never silently trusted as "different
+/// file") rather than risk a false refusal. `&&` / `;` / `||` start a fresh
+/// pipeline scope (each side of `f > f.tmp && mv f.tmp f` is checked on its
+/// own, so that rewrite is never refused); `|` keeps the same scope (a later
+/// stage's write can still collide with an earlier stage's read).
+///
+/// **Stated limits (#2560 round 2 review) — miss, but no worse than today:**
+/// - **Subshells and brace groups**: `(cat f) > f` / `{ cat f; } > f` — `(cat`
+///   becomes an opaque-free but wrong "command word", and the brace form
+///   splits its own scope at `;`. Out of scope for a single-pipeline parser.
+/// - **`dd if=f of=f`**: no redirect operator at all; `of=` truncates unless
+///   `conv=notrunc`. Not special-cased — rare for this model.
+/// - **Symlinks**: `cat link > f` where `link` points at `f` is lexical-only
+///   and invisible here by design (the brief asked for no canonicalization;
+///   canonicalizing would also require the path to already exist).
+/// - **No general flag-skipping**: only `tee`'s operands and a subcommand
+///   dispatcher's first operand are narrowed. A plain `-name`-style flag
+///   elsewhere is still a "read" candidate (harmless unless it coincidentally
+///   equals the write target, which the review judged not worth chasing).
+pub(super) fn same_file_redirect_refusal(cmd: &str, cwd: &str) -> Option<String> {
+    let tokens = tokenize(cmd);
+    let mut start = 0usize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if matches!(tok, RedirectToken::Sep) {
+            if let Some(msg) = check_pipeline_redirects(&tokens[start..idx], cmd, cwd) {
+                return Some(msg);
+            }
+            start = idx + 1;
+        }
+    }
+    check_pipeline_redirects(&tokens[start..], cmd, cwd)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectOp {
+    In,
+    Out,
+    OutAppend,
+    OutClobber,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectToken {
+    /// Dequoted text, and whether it touched an expansion/glob character or
+    /// an unterminated quote (opaque — never a read or write candidate).
+    Word(String, bool),
+    Redirect(RedirectOp),
+    /// `|` — a new stage of the SAME pipeline scope.
+    Pipe,
+    /// `&&` / `;` / `||` — starts a fresh pipeline scope.
+    Sep,
+}
+
+/// Characters that mean "this word may not literally be the path it looks
+/// like" — a glob, a variable, a command substitution, or a bare `~`. Also
+/// applied to a word's DEQUOTED content, so a single-quoted `'*.rs'` (still
+/// meant as a real glob) stays opaque too.
+const AMBIGUOUS_CHARS: [char; 6] = ['$', '`', '*', '?', '[', '~'];
+
+fn tokenize(cmd: &str) -> Vec<RedirectToken> {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '&' && chars.get(i + 1) == Some(&'&') {
+            out.push(RedirectToken::Sep);
+            i += 2;
+            continue;
+        }
+        if c == '|' && chars.get(i + 1) == Some(&'|') {
+            out.push(RedirectToken::Sep);
+            i += 2;
+            continue;
+        }
+        if c == ';' {
+            out.push(RedirectToken::Sep);
+            i += 1;
+            continue;
+        }
+        if c == '|' {
+            out.push(RedirectToken::Pipe);
+            i += 1;
+            continue;
+        }
+        if c == '>' && chars.get(i + 1) == Some(&'>') {
+            out.push(RedirectToken::Redirect(RedirectOp::OutAppend));
+            i += 2;
+            continue;
+        }
+        if c == '>' && chars.get(i + 1) == Some(&'|') {
+            out.push(RedirectToken::Redirect(RedirectOp::OutClobber));
+            i += 2;
+            continue;
+        }
+        if c == '>' {
+            out.push(RedirectToken::Redirect(RedirectOp::Out));
+            i += 1;
+            continue;
+        }
+        if c == '<' {
+            out.push(RedirectToken::Redirect(RedirectOp::In));
+            i += 1;
+            continue;
+        }
+        let (word, opaque, consumed) = read_word(&chars[i..]);
+        out.push(RedirectToken::Word(word, opaque));
+        i += consumed.max(1);
+    }
+    out
+}
+
+/// Read one word starting at `chars[0]` (guaranteed to be a non-whitespace,
+/// non-operator char by [`tokenize`]'s dispatch). Stops at whitespace or an
+/// operator-starting char; single/double-quoted spans are dequoted inline
+/// (their content still checked for [`AMBIGUOUS_CHARS`]). An unterminated
+/// quote consumes the rest of the string and marks the word opaque.
+fn read_word(chars: &[char]) -> (String, bool, usize) {
+    let mut text = String::new();
+    let mut opaque = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() || matches!(c, '>' | '<' | '|' | '&' | ';') {
+            break;
+        }
+        match c {
+            '\'' | '"' => {
+                let quote = c;
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < chars.len() {
+                    if chars[j] == quote {
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if !closed {
+                    opaque = true;
+                    text.extend(&chars[i..]);
+                    i = chars.len();
+                    break;
+                }
+                text.extend(&chars[i + 1..j]);
+                i = j + 1;
+            }
+            _ if AMBIGUOUS_CHARS.contains(&c) => {
+                opaque = true;
+                text.push(c);
+                i += 1;
+            }
+            _ => {
+                text.push(c);
+                i += 1;
+            }
+        }
+    }
+    (text, opaque, i)
+}
+
+/// One pipeline scope (already split on `&&`/`;`/`||`): collect every read
+/// (a non-command-name plain operand, or an `< f` target) and every write
+/// (`>`/`>|`/`>>` target), resolve each against `cwd`, and refuse if any
+/// write path matches any read path.
+/// #2560 round 2 "smallest narrowing": commands that never read a file
+/// argument at all — refusing `echo f > f` costs the model's harmless first
+/// instinct (#2558 test 1) for zero safety, since `echo` cannot truncate
+/// anything it "reads". A stage whose command word is one of these adds NONE
+/// of its operands to `reads`.
+const NON_READING_COMMANDS: [&str; 5] = ["echo", "printf", "true", "false", ":"];
+
+/// Subcommand DISPATCHERS: their first operand is a verb (`build`, `diff`,
+/// `test`), never a path, so `cargo build > build` / `git diff > diff` must
+/// not refuse on a coincidental name match. Only the FIRST operand is
+/// skipped — a later plain operand (`git diff HEAD~1 file.rs > file.rs`)
+/// still counts normally.
+const SUBCOMMAND_DISPATCHERS: [&str; 6] = ["cargo", "git", "just", "make", "npm", "go"];
+
+fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> Option<String> {
+    let mut reads: Vec<String> = Vec::new();
+    let mut writes: Vec<String> = Vec::new();
+    let mut at_stage_start = true;
+    // The current stage's command word, and how many operands of THIS stage
+    // have been seen so far — both reset on `Pipe`, never carried across
+    // stages, so the narrowing rules below are per-command, not per-pipeline.
+    let mut stage_command: Option<&str> = None;
+    let mut operand_index = 0usize;
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            RedirectToken::Pipe => {
+                at_stage_start = true;
+                stage_command = None;
+                operand_index = 0;
+                i += 1;
+            }
+            RedirectToken::Sep => unreachable!("pipelines are pre-split on Sep"),
+            RedirectToken::Redirect(op) => {
+                at_stage_start = false;
+                if let Some(RedirectToken::Word(text, false)) = tokens.get(i + 1) {
+                    match op {
+                        RedirectOp::In => reads.push(text.clone()),
+                        RedirectOp::Out | RedirectOp::OutAppend | RedirectOp::OutClobber => {
+                            writes.push(text.clone());
+                        }
+                    }
+                    i += 2;
+                } else {
+                    // Missing or opaque target: never attributed either way.
+                    i += 1;
+                }
+            }
+            RedirectToken::Word(text, opaque) => {
+                if at_stage_start {
+                    stage_command = Some(text.as_str());
+                    at_stage_start = false;
+                } else if stage_command == Some("tee") {
+                    // #2560 round 2: `tee` opens EVERY non-flag operand with
+                    // O_TRUNC at startup — `sort f | tee f` is exactly as
+                    // destructive as `sort f > f`, so its operands are
+                    // WRITES, not reads. `-a` (append) is a flag, not a
+                    // path — skipped like any flag — and still refused,
+                    // same as `>>`: append is unsafe for a tool that streams.
+                    if !opaque && !text.starts_with('-') {
+                        writes.push(text.clone());
+                    }
+                    operand_index += 1;
+                } else {
+                    let non_reading =
+                        stage_command.is_some_and(|c| NON_READING_COMMANDS.contains(&c));
+                    let subcommand_slot = operand_index == 0
+                        && stage_command.is_some_and(|c| SUBCOMMAND_DISPATCHERS.contains(&c));
+                    if !opaque && !non_reading && !subcommand_slot {
+                        reads.push(text.clone());
+                    }
+                    operand_index += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+    // #2560 round 2: `resolve_exec_cwd` joins but does not normalize, so a
+    // lexical spelling difference (`cat ./f > f`) missed the guard entirely
+    // — `ws/./f` != `ws/f` by string equality. `lexically_normalize` (the
+    // same normalizer `caveats::permits_path` already uses for containment)
+    // collapses `.`/`..` components on BOTH sides before comparing.
+    let normalized =
+        |token: &str| crate::caveats::lexically_normalize(&resolve_exec_cwd(cwd, Some(token)));
+    // Empty operands and tokenizer placeholders do not name files. In
+    // particular, an unsupported descriptor operation must not become cwd
+    // through resolve_exec_cwd(None/empty) and collide with a real `.` operand.
+    writes
+        .iter()
+        .filter(|path| !path.is_empty())
+        .find_map(|write| {
+            let write_path = normalized(write);
+            reads
+                .iter()
+                .any(|read| !read.is_empty() && normalized(read) == write_path)
+                .then(|| {
+                    format!(
+                        "error: refusing to run this command — it reads '{write}' and \
+                     also redirects output to '{write}' in the same pipeline. The \
+                     shell truncates '{write}' before the command finishes reading \
+                     it, destroying the input. Write to a new name and move it into \
+                     place instead (e.g. `awk … f > f.tmp && mv f.tmp f`).\n\
+                     Refused command: {cmd}"
+                    )
+                })
+        })
+}
+
 pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
     serde_json::json!({
         "cmd": cmd,
@@ -253,9 +588,8 @@ pub(super) fn shell_engine() -> crate::ShellEngine {
         return engine;
     }
     // No engine was published (e.g. a non-CLI entry point that set
-    // NEWT_FULL_ACCESS directly). Honor the same auto-upgrade the CLI applies so
-    // `NEWT_FULL_ACCESS=1` alone still gets the full-grammar engine (`host` on
-    // unix, `brush` on Windows).
+    // NEWT_FULL_ACCESS directly). Honor the same supported default as the CLI:
+    // host on Linux/macOS, safe-subset where the worker is unavailable.
     if full_access_requested() {
         return crate::full_access_default_engine();
     }
@@ -295,12 +629,21 @@ fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
 fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
+    wall: std::time::Duration,
+    execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
 ) -> agent_bridle::Registry {
     use std::sync::Arc;
+    #[cfg(test)]
+    let _ = &command_broker;
     let shell: Arc<dyn agent_bridle::Tool> = match engine {
         crate::ShellEngine::SafeSubset => {
-            let mut tool =
-                agent_bridle::ShellTool::new().with_sandbox_policy(b1_run_command_sandbox_policy());
+            // F20: the wall rides on the limits — see `shell_limits`.
+            let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
+                .with_sandbox_policy(b1_run_command_sandbox_policy());
+            if let Some(lease) = execution_lease {
+                tool = tool.with_execution_lease(lease);
+            }
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
@@ -309,6 +652,9 @@ fn bridle_registry(
         crate::ShellEngine::Host => {
             let mut tool = agent_bridle::HostShellTool::new()
                 .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
+            if let Some(lease) = execution_lease {
+                tool = tool.with_execution_lease(lease);
+            }
             if let Some(observer) = live.clone() {
                 tool = tool.with_output_observer(observer);
             }
@@ -322,8 +668,11 @@ fn bridle_registry(
             // harness; the real binary path remains Brush unchanged.
             #[cfg(test)]
             let shell = {
-                let mut tool = agent_bridle::ShellTool::new()
+                let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
                     .with_sandbox_policy(b1_run_command_sandbox_policy());
+                if let Some(lease) = execution_lease {
+                    tool = tool.with_execution_lease(lease);
+                }
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
                 }
@@ -331,25 +680,20 @@ fn bridle_registry(
             };
             #[cfg(not(test))]
             let shell = {
-                // The carried brush engine (agent-bridle 0.7): in-process bash + the
-                // L2 CommandInterceptor. The cross-platform engine — and on Windows
-                // the ONLY full-grammar option, since `host` needs `/bin/sh`.
-                #[cfg(windows)]
-                {
-                    use std::sync::Once;
-                    static WARN: Once = Once::new();
-                    WARN.call_once(|| {
-                        tracing::warn!(
-                            "using the 'brush' shell engine on Windows: run_command runs a \
-                         bash-in-Rust shell for internal-tooling compatibility. Native \
-                         PowerShell/cmd code paths are a FUTURE release — not written yet \
-                         (we are opinionated Linux developers who occasionally use a \
-                         MacBook). Bash-isms work; Windows-native shell semantics do not."
-                        );
-                    });
-                }
+                // Brush runs in an authenticated worker with static command/file
+                // policies. Unsupported targets refuse rather than bypassing its
+                // private transport; startup checks that capability.
                 let mut tool = agent_bridle::BrushShellTool::new()
+                    .with_max_output_bytes(shell_limits(wall).max_output_bytes)
+                    .expect("shared shell output limit fits Brush protocol bounds")
+                    .with_timeout(wall)
                     .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()));
+                if let Some(lease) = execution_lease {
+                    tool = tool.with_execution_lease(lease);
+                }
+                if let Some(broker) = command_broker {
+                    tool = tool.with_command_broker(broker);
+                }
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
                 }
@@ -443,6 +787,37 @@ pub(super) async fn dispatch_bridled_shell(
     caveats: &crate::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
+    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None).await
+}
+
+/// A prepared build keeps the native build executor's strength floor while
+/// the same shell engine evaluates the original source and pipelines once.
+pub(super) async fn dispatch_bridled_build_shell(
+    args: serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+    sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    execution_lease: std::sync::Arc<dyn Send + Sync>,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+) -> agent_bridle::ToolResult<serde_json::Value> {
+    dispatch_bridled_shell_with_floor(
+        args,
+        caveats,
+        sink,
+        Some(agent_bridle::AxisEnforcement::Kernel),
+        Some(execution_lease),
+        command_broker,
+    )
+    .await
+}
+
+async fn dispatch_bridled_shell_with_floor(
+    args: serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+    sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    strength_floor: Option<agent_bridle::AxisEnforcement>,
+    execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+) -> agent_bridle::ToolResult<serde_json::Value> {
     let mut live = LiveOutputSession::start(sink);
     // NOTE (cross-platform review, `unconfined-fallback-on-missing-backend`):
     // run_command dispatches at the DEFAULT (Advisory) strength floor. On a
@@ -457,9 +832,54 @@ pub(super) async fn dispatch_bridled_shell(
     // blanket Kernel floor would refuse every exec-restricted command even on
     // Landlock. The correct fix is a PER-AXIS floor at the bridle boundary
     // (fs/net = Kernel, exec = Interceptor-OK); tracked as an ACTIVE deviation.
-    let result = bridle_registry(shell_engine(), live.as_ref().map(LiveOutputSession::relay))
-        .dispatch("shell", args, caveats)
-        .await;
+    // F20: a command whose leading program is a recognised build tool gets the
+    // build lane's wall here too — this IS the lane a compound build command
+    // (`cargo test …; echo …`) runs in, because #2533's routing refuses to
+    // route anything compound. `dispatch_wall` reads only `args["cmd"]`, so
+    // this changes nothing but the wall clock: `caveats` (fs/net/exec
+    // authority) passed to `.dispatch()` below is untouched.
+    let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
+    let wall = if strength_floor.is_some() {
+        LIFECYCLE_BUILD_TIMEOUT
+    } else {
+        cmd.map_or_else(
+            || std::time::Duration::from_secs(run_command_wall_secs()),
+            dispatch_wall,
+        )
+    };
+    // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
+    // read roots for a build-tool command are added ONLY to the caveats used
+    // for THIS dispatch, never folded back into the session's standing
+    // authority (`widen_caveats` deliberately does not touch `fs_read` for an
+    // exec grant — see its doc comment). Call-scoped, exactly like
+    // `build_tool_caveats` for the lifecycle build lane.
+    // A prepared build already calibrated and admitted its exact fence. Do
+    // not re-read operator environment roots after that authority decision.
+    let dispatch_caveats = if strength_floor.is_some() {
+        caveats.clone()
+    } else {
+        dispatch_caveats_for_command(cmd.unwrap_or(""), caveats)
+    };
+    let registry = bridle_registry(
+        if command_broker.is_some() {
+            crate::ShellEngine::Brush
+        } else {
+            shell_engine()
+        },
+        live.as_ref().map(LiveOutputSession::relay),
+        wall,
+        execution_lease.clone(),
+        command_broker,
+    );
+    let grant = registry.mint_grant(dispatch_caveats);
+    let result = match strength_floor {
+        Some(floor) => {
+            registry
+                .dispatch_with_strength_floor("shell", args, &grant, floor)
+                .await
+        }
+        None => registry.dispatch("shell", args, &grant).await,
+    };
     if let Some(live) = live.as_mut() {
         let ordinary_completion = result
             .as_ref()
@@ -491,7 +911,9 @@ pub(super) fn declared_filesystem_requests(
             continue;
         };
         let invalid = || {
-            format!("error: run_command {field} must be an array of nonempty absolute paths without NUL bytes")
+            format!(
+                "error: run_command {field} must be an array of nonempty absolute paths without NUL bytes"
+            )
         };
         for value in value.as_array().ok_or_else(invalid)? {
             let target = value.as_str().ok_or_else(invalid)?;
@@ -517,7 +939,7 @@ pub(super) fn declared_filesystem_requests(
     Ok(requests)
 }
 
-fn permits_filesystem_request(
+pub(super) fn permits_filesystem_request(
     caveats: &crate::caveats::Caveats,
     request: &PermissionRequest,
 ) -> bool {
@@ -535,17 +957,73 @@ pub(super) async fn exec_confined_command(
     // The directory the command runs in (#1159): the workspace root for
     // lifecycle, or a resolved workspace-confined cwd for run_command.
     cwd: &str,
+    workspace: &str,
     color: bool,
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     filesystem_requests: &[PermissionRequest],
     exec_floor: Option<&crate::caveats::Scope<String>>,
-    mut permission_gate: Option<&mut dyn PermissionGate>,
+    // F19: `&mut Option<&mut dyn PermissionGate>`, not `Option<&mut dyn
+    // PermissionGate>` — the double indirection is what lets a caller
+    // reborrow (`permission_gate` in the `lifecycle action=run` escalation)
+    // for a SECOND sequential confined call in the same turn. The plain
+    // `Option<&mut dyn Trait>` shape can't be reborrowed twice: each callee's
+    // elided signature ties the trait object's own lifetime bound to the
+    // reference's, so a second call can't be typed as "shorter-lived" than
+    // the first — see `confirm_unrestricted_fs_mutation`'s param for the
+    // same pattern already in this file.
+    permission_gate: &mut Option<&mut dyn PermissionGate>,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, ExecOutcome) {
+    exec_confined_command_with_broker(
+        cmd,
+        cwd,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        filesystem_requests,
+        exec_floor,
+        permission_gate,
+        tool_offload,
+        spill_store,
+        live_tool_output,
+        presentation,
+        None,
+    )
+    .await
+}
+
+/// Broker-bearing native commands use Brush's runtime external-command hook.
+/// They retain the complete source and grant and are never replayed after a
+/// runtime denial: an earlier stage may already have changed the repository.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exec_confined_command_with_broker(
+    cmd: &str,
+    cwd: &str,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    filesystem_requests: &[PermissionRequest],
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    permission_gate: &mut Option<&mut dyn PermissionGate>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    presentation: &mut dyn ToolPresentation,
+    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+) -> (String, ExecOutcome) {
+    // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
+    // BEFORE either lane below runs anything — this is the single choke
+    // point both the confined dispatch and the `--yolo` host-bypass share.
+    if let Some(refusal) = same_file_redirect_refusal(cmd, cwd) {
+        return with_denial_context((refusal, ExecOutcome::Denied), workspace, cwd, None);
+    }
+
     // Venv injection (#783): the confined shell carries the venv via
     // agent-bridle's structured `env` seam (see `confined_dispatch_args` /
     // `venv_env_map`), NOT by prepending `export …;` to the command — an
@@ -566,7 +1044,8 @@ pub(super) async fn exec_confined_command(
     // command's leading token; else it falls through to the confined shell,
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
-    let host_bypass = ocap_disabled() && exec_floor_permits(exec_floor, cmd);
+    let host_bypass =
+        command_broker.is_none() && ocap_disabled() && exec_floor_permits(exec_floor, cmd);
 
     // #1176: shadow-OCAP — record the authority a leash WOULD have gated on
     // whenever this command runs UNCONFINED: the yolo/disable-ocap host bypass
@@ -612,9 +1091,14 @@ pub(super) async fn exec_confined_command(
         Some(gate) => match gate.refresh_caveats(caveats) {
             PermissionDecision::Allow(current) => Some(current),
             PermissionDecision::Deny => {
-                return (
-                    "capability denied: current permission authority was refused".to_string(),
-                    ExecOutcome::Denied,
+                return with_denial_context(
+                    (
+                        "capability denied: current permission authority was refused".to_string(),
+                        ExecOutcome::Denied,
+                    ),
+                    workspace,
+                    cwd,
+                    None,
                 );
             }
         },
@@ -641,19 +1125,34 @@ pub(super) async fn exec_confined_command(
             {
                 Some(allowed)
             }
-            _ => return (
-                "capability denied: declared filesystem authority was not granted for this command"
-                    .into(),
-                ExecOutcome::Denied,
+            _ => return with_denial_context(
+                ("capability denied: declared filesystem authority was not granted for this command".into(), ExecOutcome::Denied),
+                workspace,
+                cwd,
+                Some(caveats),
             ),
         }
     };
     let caveats = admitted.as_ref().unwrap_or(caveats);
 
+    if let Some(refusal) = super::native_git::windows_appcontainer_native_git_refusal(cmd, caveats)
+    {
+        return (format!("error: {refusal}"), ExecOutcome::Unavailable);
+    }
+
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let dispatch_args = confined_dispatch_args(cmd, cwd);
-    match dispatch_bridled_shell(dispatch_args.clone(), caveats, live_tool_output.clone()).await {
+    let result = match dispatch_bridled_shell_with_floor(
+        dispatch_args.clone(),
+        caveats,
+        live_tool_output.clone(),
+        None,
+        None,
+        command_broker.clone(),
+    )
+    .await
+    {
         // The confined shell ran. Its envelope carries
         // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the leash
         // refused a capability — the STRUCTURED denial fields
@@ -675,11 +1174,32 @@ pub(super) async fn exec_confined_command(
                     crate::denial_journal::DenialStage::Initial,
                     &envelope,
                 );
+                if command_broker.is_some() {
+                    return with_denial_context(
+                        (
+                            denied_run_command_result(&envelope, color),
+                            ExecOutcome::Denied,
+                        ),
+                        workspace,
+                        cwd,
+                        Some(caveats),
+                    );
+                }
                 // #263: an interactive gate may turn this denial into a human grant.
                 // ONE consult + ONE re-execution per call: a second denial (a
                 // different target reached on the re-run) surfaces as the standard
                 // envelope — the model can retry, which prompts afresh.
-                if let Some(gate) = permission_gate {
+                //
+                // F19/#2541 round 2: REBORROW (`as_deref_mut`), never `take()`. Taking
+                // permanently empties the caller's `&mut Option<&mut dyn PermissionGate>`
+                // — the exact double indirection `lifecycle_run_with_escalation` relies on
+                // to reuse the SAME gate for its second confined call. `take()` here left
+                // that second call (`run_confined_build_lane`) with `permission_gate ==
+                // None` whenever THIS run's denial had just been allowed and the re-dispatch
+                // then timed out: the escalation refused "requires explicit … authority"
+                // without ever asking the operator who just said yes. Nothing below this
+                // block touches `permission_gate` again, so reborrowing costs nothing here.
+                if let Some(gate) = permission_gate.as_deref_mut() {
                     // #905: promptable exec denials OR net-host denials (agent-bridle
                     // #196). On Allow, the re-mint widens the matching axis (net adds
                     // the host to the allow-list), so the proxy admits it on re-run.
@@ -693,12 +1213,21 @@ pub(super) async fn exec_confined_command(
                                 .iter()
                                 .all(|request| permits_filesystem_request(&widened, request))
                             {
-                                return (
-                                    "capability denied: declared filesystem authority was not retained for this command".into(),
-                                    ExecOutcome::Denied,
+                                return with_denial_context(
+                                    ("capability denied: declared filesystem authority was not retained for this command".into(), ExecOutcome::Denied),
+                                    workspace,
+                                    cwd,
+                                    None,
                                 );
                             }
-                            return match dispatch_bridled_shell(
+                            if let Some(refusal) =
+                                super::native_git::windows_appcontainer_native_git_refusal(
+                                    cmd, &widened,
+                                )
+                            {
+                                return (format!("error: {refusal}"), ExecOutcome::Unavailable);
+                            }
+                            let retried = match dispatch_bridled_shell(
                                 dispatch_args,
                                 &widened,
                                 live_tool_output,
@@ -725,8 +1254,9 @@ pub(super) async fn exec_confined_command(
                                     ),
                                     envelope_outcome(&env2),
                                 ),
-                                Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+                                Err(e) => dispatch_error_result(e),
                             };
+                            return with_denial_context(retried, workspace, cwd, Some(&widened));
                         }
                     }
                 }
@@ -744,8 +1274,33 @@ pub(super) async fn exec_confined_command(
         }
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
-        Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+        Err(e) => dispatch_error_result(e),
+    };
+    with_denial_context(result, workspace, cwd, Some(caveats))
+}
+
+/// Preserve the dispatch error alongside the execution class returned to the
+/// tool-event funnel. Both initial dispatch and the existing grant retry use it.
+pub(super) fn dispatch_error_result(error: agent_bridle::ToolError) -> (String, ExecOutcome) {
+    let outcome = if matches!(error, agent_bridle::ToolError::Denied { .. }) {
+        ExecOutcome::Denied
+    } else {
+        ExecOutcome::Unavailable
+    };
+    (format!("error: {error}"), outcome)
+}
+
+fn with_denial_context(
+    (mut text, outcome): (String, ExecOutcome),
+    workspace: &str,
+    cwd: &str,
+    caveats: Option<&crate::caveats::Caveats>,
+) -> (String, ExecOutcome) {
+    if outcome == ExecOutcome::Denied {
+        text.push('\n');
+        text.push_str(&denial_context(workspace, Some(cwd), caveats));
     }
+    (text, outcome)
 }
 
 /// #2315: the class of a completed envelope from its own facts — structured
@@ -795,13 +1350,138 @@ pub(super) fn confined_result(
     if let Some(refusal) = absent_binary_refusal(envelope, &caveats.exec) {
         return (refusal, ExecOutcome::Unavailable);
     }
+    // A later pipeline or `;` stage sets the exit code, so a missing `rg` in
+    // `rg … | head` exits 0 and a live run showed only brush's bare
+    // `command not found: rg`. Keep the output, and name the absence too.
+    let absent = absent_program_note(envelope, &caveats.exec);
     // #2273: a 126 with no structured denial whose program sits
     // outside the fs-read grant is the KERNEL refusing, not a
     // chmod the model forgot. Same structured test, one more state.
     if let Some(refusal) = kernel_refused_binary(cmd, envelope, &caveats.fs_read) {
         return (refusal, ExecOutcome::Denied);
     }
-    (render(envelope), envelope_outcome(envelope))
+    // #2629 (revised): a child exec the sandbox refused (e.g. git's own
+    // `fatal: cannot exec 'branch': Permission denied`) is neither 126 nor 127
+    // at the TOP level — the parent ran fine, only its internal spawn of a
+    // helper failed, so it reaches the model as UNSTRUCTURED stderr with no
+    // axis or target. That refusal is invisible to the interceptor's `denials`
+    // array (only the top-level spawn is instrumented, see #2421), and the
+    // parent's own exit code is neither 126 nor 127, so there is NO trusted
+    // sandbox refusal evidence to key a structured denial off. Per the review
+    // on #2633, child-controlled stderr is not authoritative and must not be
+    // promoted to a `capability denied` assertion or used to pick an exec-
+    // grant target, so the raw stderr passes through unannotated and the
+    // honest outcome (Failed) is kept. A structured, invocation-bound refusal
+    // from the leash/interceptor seam (#2421) is what would be needed before
+    // this can be rendered as a named denial.
+    let outcome = envelope_outcome(envelope);
+    let mut text = render(envelope);
+    if let Some(note) = absent {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    if outcome == ExecOutcome::TimedOut {
+        text.push_str(&timed_out_note(dispatch_wall(cmd)));
+    }
+    (text, outcome)
+}
+
+/// How long `lifecycle action=build` may run: the sanctioned lane for work that
+/// outlives the `run_command` wall.
+pub(super) const LIFECYCLE_BUILD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// The literal call the coaching shows, so a model copies a valid shape instead
+/// of inventing `phase="build"`.
+const LIFECYCLE_BUILD_CALL: &str = r#"{"action":"build","phase":"test"}"#;
+
+/// The confined shell's per-call wall clock (agent-bridle's default; newt never
+/// overrides it, and the model has no argument to raise it).
+fn run_command_wall_secs() -> u64 {
+    agent_bridle::LimitsPolicy::default().default_timeout_secs
+}
+
+/// F20: the wall clock for THIS `cmd` — [`LIFECYCLE_BUILD_TIMEOUT`] when its
+/// leading program is a recognised build tool (reusing routing's
+/// `is_build_tool_program` table, not a second list), else the ordinary
+/// [`run_command_wall_secs`]. This is the same 60s-vs-30min split
+/// `lifecycle action=build` already gets — just applied to the shell lane a
+/// COMPOUND build command (`cargo test …; echo …`) actually runs in, since
+/// #2533's routing refuses to route anything compound. Only the wall clock
+/// changes: fs/net/exec authority is unaffected (`dispatch_bridled_shell`
+/// passes `caveats` through unchanged).
+/// `ShellTool` limits for a call whose wall is `wall`. The model's args carry
+/// no `timeout_secs`, so `ShellTool` falls back to `default_timeout_secs`:
+/// that field IS the wall. `max_timeout_secs` is raised with it or the clamp
+/// would cut a build wall back to 300s.
+pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPolicy {
+    let default = agent_bridle::LimitsPolicy::default();
+    agent_bridle::LimitsPolicy {
+        default_timeout_secs: wall.as_secs(),
+        max_timeout_secs: wall.as_secs().max(default.max_timeout_secs),
+        ..default
+    }
+}
+
+pub(super) fn dispatch_wall(cmd: &str) -> std::time::Duration {
+    match leading_program(cmd) {
+        Some(program) if crate::agentic::routing::is_build_tool_program(program) => {
+            LIFECYCLE_BUILD_TIMEOUT
+        }
+        _ => std::time::Duration::from_secs(run_command_wall_secs()),
+    }
+}
+
+/// What the `run_command` description tells the model about its wall, up front.
+/// One owner with [`timed_out_note`], so the two cannot disagree (U6).
+pub(super) fn run_command_limit_sentence() -> String {
+    format!(
+        "Each call is killed after {} seconds (wall clock), {} minutes when it starts with \
+         `cargo` or `just`; the result carries the exit code. For an offline build use \
+         `lifecycle` action=build, i.e. call the tool with {LIFECYCLE_BUILD_CALL} (`phase` is \
+         never `build`), or narrow the command (one test filter, one crate).",
+        run_command_wall_secs(),
+        LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
+    )
+}
+
+/// Appended to a timed-out confined result: the limit, that the command was
+/// killed, and the lane for long builds. `wall` is the clock that actually
+/// applied to this call (F20: a build-tool command gets the build wall, not
+/// the default) — named explicitly, so a reader can tell why a call ran for
+/// minutes instead of assuming the default 60s.
+///
+/// `pub(super)` (#2541 follow-up): `tools.rs`'s `escalation_result` strips
+/// this exact suffix from a timed-out first run's text when the escalation
+/// it recommends was just DECLINED — a result must carry ONE recommendation,
+/// never this note's "use lifecycle action=build" immediately followed by
+/// "build authority was declined".
+pub(super) fn timed_out_note(wall: std::time::Duration) -> String {
+    let default = std::time::Duration::from_secs(run_command_wall_secs());
+    let wall_note = if wall == default {
+        format!("{}s wall", wall.as_secs())
+    } else {
+        format!(
+            "{}s build-lane wall (not the default {}s)",
+            wall.as_secs(),
+            default.as_secs()
+        )
+    };
+    // A build command already had the build lane's 30 minutes: the only
+    // useful advice left is to narrow it.
+    if wall == LIFECYCLE_BUILD_TIMEOUT {
+        return format!(
+            "\n(the command hit the {wall_note} and was killed; the output above is partial. \
+             Narrow the command: one crate, one test filter.)"
+        );
+    }
+    format!(
+        "\n(the command hit the {wall_note} and was killed; the output above is partial. For a \
+         build or full test run use `lifecycle` action=build, i.e. call the tool with \
+         {LIFECYCLE_BUILD_CALL} ({}-minute limit, confined, offline; `phase` is the phase to run, not `build`), or \
+         narrow the command.)",
+        LIFECYCLE_BUILD_TIMEOUT.as_secs() / 60
+    )
 }
 
 /// The host lane's result (`--unsafe-host-exec`). Same rule as the confined
@@ -1343,7 +2023,7 @@ pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<
 /// | state | envelope | remedy |
 /// |---|---|---|
 /// | denied by a grant | `denied:true` + `denials[kind=exec]`, exit 126 | ask for the grant |
-/// | not carried, on the host | exit 127, no denials, host PATH resolves | ask for `exec:<abs path>` |
+/// | not carried, on the host | exit 127, no denials, host PATH resolves | build authority for project validation, or direct `exec:<abs path>` |
 /// | not on this host at all | exit 127, no denials, host PATH misses | no grant can help |
 ///
 /// Discrimination is STRUCTURED — the exit code plus the `denials` array — the
@@ -1378,6 +2058,15 @@ pub(crate) fn absent_binary_refusal(
     {
         return None;
     }
+    absent_program_note(envelope, exec)
+}
+
+/// The absence message for the program brush named in `command not found: X`,
+/// whatever the envelope's exit code. `None` for a structured denial.
+fn absent_program_note(
+    envelope: &serde_json::Value,
+    exec: &crate::caveats::Scope<String>,
+) -> Option<String> {
     // A structured refusal is a DENIAL, not an absence. Relabelling one as the
     // other would send the model to the wrong remedy.
     if envelope_denied(envelope)
@@ -1397,7 +2086,10 @@ pub(crate) fn absent_binary_refusal(
         Some(abs) => format!(
             "error: {prog}: {ABSENT_BINARY_MARKER}.\n  \
              granted host binaries: {granted}\n  \
-             ask the operator for exec:{abs}, or run the host lane."
+             For project compiler/test validation, if lifecycle is advertised, prefer lifecycle action=build \
+             for the appropriate project phase: it requests explicit offline build authority.\n  \
+             For direct execution, ask the operator for exec:{abs}; this does not grant compiler descendants \
+             or their filesystem access. Existing permission requirements remain binding; do not retry a declined grant."
         ),
         // Deliberately NO grant coaching here: granting exec for a binary that
         // is not installed is a no-op, and teaching the model to ask for one is
@@ -1410,11 +2102,9 @@ pub(crate) fn absent_binary_refusal(
     })
 }
 
-/// The phrase every absent-binary refusal carries. The loop guidance keys on
-/// it (`MISSING_EXECUTABLE_NEEDLES` in `agentic`) to recognise a blocker no
-/// edit can clear (#2273); one constant, so renderer and classifier cannot
-/// drift — #2277 changed this rendering once and the classifier kept grepping
-/// for brush's old `command not found`.
+/// The phrase every absent-binary refusal carries. The loop's exec-denial
+/// accounting uses this shared marker to distinguish a requestable host-binary
+/// grant from a binary that is not installed, without prescribing a repair.
 pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried userland";
 
 /// The suffix that separates "absent here but installed on the host" (a grant
@@ -1497,10 +2187,130 @@ fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'
         .filter(|name| !name.is_empty())
 }
 
+/// F32/#2537, PR #2577 round 3 (Shawn): when the confined shell is about to
+/// run a bare `git …` command in the session's OWN repository on a
+/// non-default branch, widen the caveats passed to THIS ONE dispatch with
+/// kernel WRITE on the worktree's own gitdir and the common `objects/`
+/// directory (`own_gitdir_shell_write_grant` — round 3 narrowed the grant to
+/// exactly those two directories; round 4 bound it to the identity resolved
+/// at session start rather than a live re-resolve, see that function's doc
+/// comment). This unblocks a confined-shell `git add` under the real kernel
+/// fence (a file-level Landlock rule cannot carry the
+/// `MAKE_REG`/`REFER`/`REMOVE_FILE` rights `index.lock` create+rename and
+/// object insertion need — a directory rule can).
+/// The incoming session must already permit writing the workspace root.
+/// A cached repository identity alone cannot authorize metadata writes for a
+/// read-only session or a grant limited to another path or an individual file.
+///
+/// Deliberately scoped to a SIMPLE `git` invocation, not folded into the
+/// session `fs_write` scope: `write_file`/`edit_file` on git metadata stay
+/// refused (`caveats::apply_cli_fs_grants` never grants this), and a shell
+/// `git commit` is refused outright before reaching here
+/// (`run_command_creates_shell_git_commit`), so this widening never needs to
+/// cover a ref move — `refuse_if_default_branch` in `newt-git` is what
+/// prevents that, at the one place a commit can actually land. A compound
+/// command (`git add && rm -rf /`) is not "leading program `git`" in the
+/// sense that matters here either way — it still runs through the confined
+/// engine, which gates each spawn on these SAME (possibly widened) caveats,
+/// so a second program in the pipeline gets the same widened `fs_write` too;
+/// that is the accepted trade-off Shawn signed off on (a confined-shell
+/// `rm -rf <common>/objects` becomes possible on a non-default branch — see
+/// `RESULT-dec2-own-gitdir.md`), not an oversight.
+///
+/// Mirrors the shape a sibling PR's `dispatch_caveats_for_command` (build
+/// tools) uses — a separate function, called at the same call site, so the
+/// two compose without conflict.
+pub(super) fn dispatch_caveats_for_git_shell(
+    cmd: &str,
+    workspace: &str,
+    caveats: &crate::caveats::Caveats,
+) -> crate::caveats::Caveats {
+    if leading_program(cmd) != Some("git")
+        || !crate::caveats::permits_path(&caveats.fs_write, workspace)
+    {
+        return caveats.clone();
+    }
+    // Round 4, Blocker 1: NOT `own_gitdir_grants` — that re-resolves via a
+    // live `rev-parse`, which follows model-writable pointers (the workspace
+    // `.git` gitlink, `<gitdir>/commondir`). This bounds the write grant to
+    // the identity cached at session start.
+    let write = crate::git_hardening::own_gitdir_shell_write_grant(std::path::Path::new(workspace));
+    if write.is_empty() {
+        return caveats.clone();
+    }
+    let mut widened = caveats.clone();
+    widened.fs_write = match &widened.fs_write {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => {
+            crate::caveats::Scope::only(set.iter().cloned().chain(write))
+        }
+    };
+    // Real git ALWAYS tries to read the system config (`/etc/gitconfig`),
+    // regardless of repo/branch — not just on a host that happens to have
+    // one. Landlock's base read allowlist does not include it (CI caught
+    // this: a Landlock-confined `git add` on a runner that ships
+    // `/etc/gitconfig` failed with "unknown error occurred while reading
+    // the configuration files", exit 128 — this environment's sandbox
+    // silently worked only because it has no such file). One extra,
+    // non-secret, well-known system path, granted only on this ONE widened
+    // dispatch, same as the write grant above.
+    widened.fs_read = match &widened.fs_read {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(
+            set.iter()
+                .cloned()
+                .chain(std::iter::once("/etc/gitconfig".to_string())),
+        ),
+    };
+    widened
+}
+
 /// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
 /// the program.
-fn leading_program(cmd: &str) -> Option<&str> {
+pub(super) fn leading_program(cmd: &str) -> Option<&str> {
     cmd.split_ascii_whitespace().find(|tok| !tok.contains('='))
+}
+
+/// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the caveats for
+/// ONE confined-shell dispatch — `caveats` as-is, unless `cmd`'s leading
+/// program is a build tool (`confined_exec::is_build_tool_exec`), in which
+/// case its toolchain read roots (`confined_exec::toolchain_read_roots`) are
+/// added to `fs_read`. Call-scoped and NEVER returned to the permission
+/// gate: `widen_caveats` deliberately leaves an exec grant's `fs_read`
+/// untouched, because its result feeds `recalled_caveats` — the caveats
+/// checked for every tool the model calls this session, including
+/// `read_file`. Widening the SESSION's `fs_read` from an `exec:cargo` grant
+/// would let `read_file` read `$CARGO_HOME/credentials.toml` for the rest of
+/// the session; widening only this one dispatch's caveats lets the SPAWNED
+/// cargo process resolve its own toolchain and nothing else gains the read.
+fn dispatch_caveats_for_command(
+    cmd: &str,
+    caveats: &crate::caveats::Caveats,
+) -> crate::caveats::Caveats {
+    let mut widened = caveats.clone();
+    // #2596 round 3: a host-scoped `net` grant (from `[tui.permissions] net =
+    // [...]` or a session-widened net prompt) is `Unknown` to agent-bridle
+    // 0.8's admission on every backend and refuses the WHOLE spawn (L3
+    // BOUND) — not just the network. Narrow it to `net: none`, which the
+    // shell's `DenyDirect` sandbox policy (`confined_exec::runtime_sandbox_policy`)
+    // can bind on Linux (measured). On macOS, Seatbelt still refuses a
+    // restricted `net` scope; a separate agent-bridle fix is under way. On
+    // Windows, AppContainer can bind `net:none` but restricted exec can still
+    // refuse; unvalidated here. Fail-closed posture on non-Linux backends is
+    // preserved. See
+    // `caveats::spawn_net_scope` doc comment for why narrowing loses nothing
+    // a spawned shell child could enforce anyway.
+    widened.net = crate::caveats::spawn_net_scope(&widened.net);
+    if let crate::caveats::Scope::Only(exec) = &mut widened.exec {
+        let twins = crate::confined_exec::developer_exec_twins(exec.iter());
+        exec.extend(twins);
+    }
+    if leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec) {
+        if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
+            reads.extend(crate::confined_exec::toolchain_read_roots());
+        }
+    }
+    widened
 }
 
 /// The exec grants in force, for the refusal's second line. Naming what IS
@@ -1552,6 +2362,28 @@ fn host_path_lookup(prog: &str) -> Option<String> {
 /// the #263 re-execution path shares one formatter with the first dispatch.
 pub(super) fn shell_envelope_output(
     envelope: &serde_json::Value,
+    tool_output_lines: usize,
+    color: bool,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    presentation: Option<&mut dyn ToolPresentation>,
+) -> String {
+    shell_envelope_output_with_view(
+        envelope,
+        None,
+        tool_output_lines,
+        color,
+        tool_offload,
+        spill_store,
+        presentation,
+    )
+}
+
+/// Keep the captured envelope intact when the caller selects a smaller view.
+/// Retention and model-budget capping share the normal command-output path.
+pub(super) fn shell_envelope_output_with_view(
+    envelope: &serde_json::Value,
+    view: Option<&str>,
     _tool_output_lines: usize,
     _color: bool,
     tool_offload: bool,
@@ -1566,7 +2398,31 @@ pub(super) fn shell_envelope_output(
         .get("stderr")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let out = format!("{stdout}{stderr}");
+    let truncated_streams = match (
+        envelope
+            .get("stdout_truncated")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        envelope
+            .get("stderr_truncated")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    ) {
+        (true, true) => Some("stdout and stderr"),
+        (true, false) => Some("stdout"),
+        (false, true) => Some("stderr"),
+        (false, false) => None,
+    };
+    let capture_notice = truncated_streams
+        .map(|streams| format!("[{streams} capture truncated; omitted bytes are unavailable]"));
+    let annotate_capture = |text: &str| match &capture_notice {
+        Some(notice) => format!("{notice}\n{text}"),
+        None => text.to_owned(),
+    };
+    let out = annotate_capture(&format!("{stdout}{stderr}"));
+    let selected = view.map(annotate_capture);
+    let view = selected.as_deref().unwrap_or(&out);
+    let selected_view = view != out;
     // #1969: the exit code decides success, not the shape of the output.
     //
     // This used to be consulted ONLY when the output was empty, so every
@@ -1602,10 +2458,10 @@ pub(super) fn shell_envelope_output(
         };
     }
     {
-        // The terminal follows the full output tail even when the model-facing
-        // payload below is token-capped or replaced by a spill handle.
+        // The terminal follows the selected output before the model-facing
+        // token cap or spill teaser is applied.
         if let Some(presentation) = presentation {
-            presentation.override_result(out.clone());
+            presentation.override_result(view.to_owned());
         }
         // #726/#945: the MODEL-facing payload is capped by the shared TOKEN
         // budget using head+tail. When tool_offload is on, spill the FULL
@@ -1621,13 +2477,14 @@ pub(super) fn shell_envelope_output(
         // "will the cap truncate?" and "should we spill?" from ever diverging.
         let max_tokens = max_output_tokens();
         let est = output_budget::cap_estimator();
-        let should_spill = output_budget::should_spill_full_output(
-            out.len(),
-            out.chars().count(),
-            max_tokens,
-            tool_offload,
-        );
-        let capped = if should_spill {
+        let should_spill = (tool_offload && selected_view)
+            || output_budget::should_spill_full_output(
+                out.len(),
+                out.chars().count(),
+                max_tokens,
+                tool_offload,
+            );
+        let mut capped = if should_spill {
             match spill_store {
                 Some(store) => {
                     let (id, redacted) = content_spill::store_redacted_full(
@@ -1635,6 +2492,11 @@ pub(super) fn shell_envelope_output(
                         Some("run_command".to_string()),
                         store,
                     );
+                    let redacted = if selected_view {
+                        crate::agentic::compress::redact_secrets(view)
+                    } else {
+                        redacted
+                    };
                     let teaser_tokens = est
                         .tokens_for_chars(content_spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
                     match id {
@@ -1651,17 +2513,25 @@ pub(super) fn shell_envelope_output(
                         None => cap_model_output(&redacted, max_tokens),
                     }
                 }
-                None => cap_model_output(&out, max_tokens),
+                None => cap_model_output(view, max_tokens),
             }
         } else {
-            cap_model_output(&out, max_tokens)
+            cap_model_output(view, max_tokens)
         };
+        // A tiny or tail-only presentation budget cannot erase the fact that
+        // capture itself was incomplete. The retained source also carries it.
+        if let Some(notice) = &capture_notice {
+            if !capped.contains(notice) {
+                capped.push('\n');
+                capped.push_str(notice);
+            }
+        }
         // #898: if this command's output carries a forge "open a pull/merge
         // request" URL (git prints it on push of a new branch), append an
         // explicit next-step hint so the model opens the PR instead of stalling.
         // Detected from the UNcapped output so a long push log can't truncate the
         // URL away, and appended AFTER the cap so the hint always survives.
-        mark_failure(match pr_creation_url(&out) {
+        mark_failure(match pr_creation_url(view) {
             Some(url) => format!("{capped}{}", pr_next_step_hint(url)),
             None => capped,
         })
@@ -1782,4 +2652,108 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
         });
     }
     Some(requests)
+}
+
+#[cfg(test)]
+mod dispatch_caveats_tests {
+    use super::*;
+    use crate::caveats::{Caveats, CaveatsExt as _, CountBound, Scope};
+
+    fn base(ws: &str) -> Caveats {
+        Caveats {
+            fs_read: Scope::only([ws.to_string()]),
+            fs_write: Scope::only([ws.to_string()]),
+            exec: Scope::only(["cargo".to_string()]),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    /// dec1-build-grant round 2, red test (b): the shell-lane dispatch
+    /// caveats for a build-tool command include its toolchain read root —
+    /// call-scoped, so `read_file` (which checks the SESSION's caveats, not
+    /// this dispatch's) never sees it. Would fail before the fix:
+    /// `dispatch_caveats_for_command` did not exist; `dispatch_bridled_shell`
+    /// passed the raw session `caveats` straight through, unable to read
+    /// `$RUSTUP_HOME`.
+    #[test]
+    fn a_build_tool_command_gets_its_toolchain_read_root_for_this_dispatch_only() {
+        // Pins the toolchain-home resolution so the
+        // assertion does not depend on the machine running the suite.
+        // Platform-absolute (a POSIX `/fake-home` is not absolute on Windows),
+        // and under the process-env lock like every other env-pinning test.
+        let _env = crate::process_env::lock();
+        let fake = std::env::temp_dir().join("fake-home").join(".rustup");
+        let fake = fake.to_string_lossy().into_owned();
+        let saved = std::env::var_os("RUSTUP_HOME");
+        crate::process_env::set_var("RUSTUP_HOME", &fake);
+        let widened = dispatch_caveats_for_command("cargo --version", &base("/ws"));
+        match saved.and_then(|v| v.into_string().ok()) {
+            Some(v) => crate::process_env::set_var("RUSTUP_HOME", &v),
+            None => crate::process_env::remove_var("RUSTUP_HOME"),
+        }
+        assert!(
+            widened.permits_fs_read(&fake),
+            "a build-tool dispatch must be able to read its toolchain home"
+        );
+    }
+
+    /// A non-build-tool command is passed through unchanged — no toolchain
+    /// roots leak into an ordinary `run_command` dispatch.
+    #[test]
+    fn a_non_build_tool_command_is_unchanged() {
+        let base = base("/ws");
+        let widened = dispatch_caveats_for_command("ls -la", &base);
+        assert_eq!(widened.fs_read, base.fs_read);
+    }
+
+    /// #2596 round 3: a session with a host-scoped `net` grant (e.g.
+    /// `[tui.permissions] net = ["api.example.com"]`) must not L3-BOUND-refuse
+    /// an ordinary shell dispatch under agent-bridle 0.8 — the whole spawn
+    /// used to fail closed because `Scope::Only(_)` is `Unknown` to every
+    /// backend's admission check. The dispatch caveats narrow `net` to
+    /// `none`, which the `DenyDirect` sandbox policy can bind on Linux.
+    #[test]
+    fn a_host_scoped_net_grant_is_narrowed_to_none_for_the_dispatch() {
+        let mut caveats = base("/ws");
+        caveats.net = crate::caveats::Scope::only(["api.example.com".to_string()]);
+        let widened = dispatch_caveats_for_command("cargo --version", &caveats);
+        assert_eq!(
+            widened.net,
+            crate::caveats::Scope::none(),
+            "a host-scoped net grant cannot be bound by a spawn backend and \
+             must be narrowed, not passed through as an Unknown scope"
+        );
+    }
+
+    /// `dispatch_caveats_for_command` clones the session — the caller's
+    /// original `Caveats` must never be mutated by the dispatch.
+    #[test]
+    fn dispatch_caveats_for_command_does_not_mutate_session() {
+        let mut original = base("/ws");
+        original.net = crate::caveats::Scope::only(["api.example.com".to_string()]);
+        let original_net = original.net.clone();
+        let _ = dispatch_caveats_for_command("cargo --version", &original);
+        assert_eq!(
+            original.net, original_net,
+            "session caveats must not be mutated by dispatch"
+        );
+    }
+
+    /// `Scope::All` (unrestricted) and `Scope::none()` (already bindable) must
+    /// pass through the dispatch narrowing unchanged — narrowing only ever
+    /// tightens a non-empty host list, never widens `All`.
+    #[test]
+    fn all_and_none_net_scopes_pass_through_the_dispatch_unchanged() {
+        let mut all_caveats = base("/ws");
+        all_caveats.net = crate::caveats::Scope::All;
+        let widened = dispatch_caveats_for_command("cargo --version", &all_caveats);
+        assert_eq!(widened.net, crate::caveats::Scope::All);
+
+        let mut none_caveats = base("/ws");
+        none_caveats.net = crate::caveats::Scope::none();
+        let widened = dispatch_caveats_for_command("cargo --version", &none_caveats);
+        assert_eq!(widened.net, crate::caveats::Scope::none());
+    }
 }

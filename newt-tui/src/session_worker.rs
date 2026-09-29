@@ -83,6 +83,18 @@ pub(crate) enum SurfaceRequest {
         prompt: String,
         reply: SyncSender<anyhow::Result<ReadOutcome>>,
     },
+    /// "Present this pending clarification and read the answer" (#2524 item
+    /// 7). Carries a rendered `batch`/`hint` STRING rather than the
+    /// `PromptIntake`, matching `ReadLine`'s own choice: the far side only
+    /// ever draws it, never re-derives the batch text.
+    PresentClarification {
+        batch: String,
+        hint: String,
+        prompt: String,
+        color: bool,
+        verbose: bool,
+        reply: SyncSender<anyhow::Result<ReadOutcome>>,
+    },
     /// Rebuild the editor after a `/vi` · `/emacs` switch.
     Reload {
         reply: SyncSender<anyhow::Result<()>>,
@@ -92,7 +104,7 @@ pub(crate) enum SurfaceRequest {
     SetRuntimeContext {
         model: String,
         endpoint: String,
-        gauge: Option<(u32, u32)>,
+        gauge: Option<(u32, Option<u32>)>,
         session: String,
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
@@ -173,22 +185,38 @@ pub(crate) enum SurfaceRequest {
 pub(crate) struct PanelWindow {
     /// A clone of the real terminal, NOT fd 1.
     out: std::fs::File,
-    /// First row of the lent region (0-based), and how many rows it spans.
-    /// `rows` is what the presenter could actually spare, which on a short
-    /// terminal is fewer than the panel asked for — [`Self::terminal`] fixes
-    /// the viewport to what was granted, so a panel draws what fits rather
-    /// than painting outside the region it was lent.
-    top: u16,
-    rows: u16,
-    cols: u16,
-    /// Dropped to wake the parked presenter. `None` only in tests that build a
-    /// window with nobody waiting on it.
-    _release: Option<SyncSender<()>>,
+    /// The lent region. `rows` is what the presenter could actually spare,
+    /// which on a short terminal is fewer than the panel asked for —
+    /// [`Self::terminal`] fixes the viewport to what was granted, so a panel
+    /// draws what fits rather than painting outside the region it was lent.
+    /// A `Cell` because the region follows the terminal (#2571): a resize
+    /// re-measures it through [`Self::remeasure`] while panels hold `&self`.
+    area: std::cell::Cell<ratatui::layout::Rect>,
+    /// The parked presenter's channel. Dropping it is the release; a
+    /// [`PanelSignal::Remeasure`] asks for the region again. `None` only in
+    /// tests that build a window with nobody waiting on it. Unix-only with its
+    /// one reader, the cockpit presenter — see [`Self::new`].
+    #[cfg(unix)]
+    signals: Option<SyncSender<PanelSignal>>,
+}
+
+/// What a live panel can ask of the presenter parked on its window.
+#[cfg(all(feature = "rich-tui", unix))]
+#[derive(Debug)]
+pub(crate) enum PanelSignal {
+    /// Re-plan the reservation and reply with the new region: after a terminal
+    /// resize (`rows: None`, keep the requested height), or because the
+    /// operator sized the panel (`rows: Some(n)`, Shift-↑/↓ or zoom; the
+    /// presenter clamps to the screen).
+    Remeasure {
+        rows: Option<u16>,
+        reply: SyncSender<ratatui::layout::Rect>,
+    },
 }
 
 #[cfg(feature = "rich-tui")]
 impl PanelWindow {
-    /// Build a window over `out`, releasing `release` when dropped.
+    /// Build a window over `out`, releasing `signals` when dropped.
     ///
     /// **`#[cfg(unix)]` to match its only caller**, exactly as
     /// `inline_viewport::cursor_position_or_anchor` is and for the same
@@ -206,18 +234,45 @@ impl PanelWindow {
     #[cfg(unix)]
     pub(crate) fn new(
         out: std::fs::File,
-        top: u16,
-        rows: u16,
-        cols: u16,
-        release: Option<SyncSender<()>>,
+        area: ratatui::layout::Rect,
+        signals: Option<SyncSender<PanelSignal>>,
     ) -> Self {
         Self {
             out,
-            top,
-            rows,
-            cols,
-            _release: release,
+            area: std::cell::Cell::new(area),
+            signals,
         }
+    }
+
+    /// Off unix there is no cockpit to lend a window (#1746), so nothing can
+    /// be parked on one and this is a no-op; it gains a body with the ConPTY
+    /// cockpit, exactly as [`Self::new`] does.
+    #[cfg(not(unix))]
+    pub(crate) fn remeasure(&self, _rows: Option<u16>) {}
+
+    /// Ask the presenter for the region again — after a terminal resize, or
+    /// with the operator's requested height. The presenter owns the layout, so
+    /// it measures; the window only records the answer. With nobody parked
+    /// (tests) or no answer, the region is kept.
+    #[cfg(unix)]
+    pub(crate) fn remeasure(&self, rows: Option<u16>) {
+        let Some(signals) = &self.signals else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if signals
+            .send(PanelSignal::Remeasure { rows, reply: tx })
+            .is_ok()
+        {
+            if let Ok(area) = rx.recv() {
+                self.area.set(area);
+            }
+        }
+    }
+
+    /// The region currently lent (the driver reads its granted height).
+    pub(crate) fn area(&self) -> ratatui::layout::Rect {
+        self.area.get()
     }
 
     /// A ratatui terminal fixed to exactly the lent rows.
@@ -226,10 +281,7 @@ impl PanelWindow {
     ///
     /// The tty could not be cloned, or the terminal could not be built.
     pub(crate) fn terminal(&self) -> std::io::Result<crate::inline_viewport::InlineTerm> {
-        crate::inline_viewport::cockpit_panel_terminal(
-            self.out.try_clone()?,
-            ratatui::layout::Rect::new(0, self.top, self.cols, self.rows),
-        )
+        crate::inline_viewport::cockpit_panel_terminal(self.out.try_clone()?, self.area.get())
     }
 
     /// An operator-invoked alternate-screen pager keeps this window alive but
@@ -264,6 +316,7 @@ impl SurfaceRequest {
         matches!(
             self,
             Self::ReadLine { .. }
+                | Self::PresentClarification { .. }
                 | Self::Reload { .. }
                 | Self::Interact { .. }
                 | Self::RunBang { .. }
@@ -357,6 +410,38 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.ask(|reply| SurfaceRequest::Reload { reply }, rx, tx)?
     }
 
+    /// #2524 item 7: explicit proxying rather than the trait default.
+    ///
+    /// The default body (`print_newt` + `self.read_line`) would print on the
+    /// SESSION thread and read on the SESSION thread's own `read_line`
+    /// override — i.e. straight back into `ReadLine`, never reaching the far
+    /// side's `present_clarification` at all, so RichTUI's modal chrome would
+    /// never draw. Forwarding its OWN request keeps the far side able to
+    /// choose: `pump_surface` dispatches this to `surface.present_clarification`
+    /// there, same as `ReadLine` dispatches to `surface.read_line`.
+    fn present_clarification(
+        &mut self,
+        batch: &str,
+        hint: &str,
+        prompt: &str,
+        color: bool,
+        verbose: bool,
+    ) -> anyhow::Result<ReadOutcome> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.ask(
+            |reply| SurfaceRequest::PresentClarification {
+                batch: batch.to_string(),
+                hint: hint.to_string(),
+                prompt: prompt.to_string(),
+                color,
+                verbose,
+                reply,
+            },
+            rx,
+            tx,
+        )?
+    }
+
     fn add_history(&mut self, entry: &str) {
         self.notify(SurfaceRequest::AddHistory(entry.to_string()));
     }
@@ -369,7 +454,7 @@ impl crate::chat::InputSurface for RemoteSurface {
         &mut self,
         model: &str,
         endpoint: &str,
-        gauge: Option<(u32, u32)>,
+        gauge: Option<(u32, Option<u32>)>,
         session: &str,
     ) {
         self.notify(SurfaceRequest::SetRuntimeContext {
@@ -487,6 +572,17 @@ pub(crate) fn pump_surface(
                 // next `recv` ends the loop, so there is nothing to do here.
                 let _ = reply.send(surface.read_line(&prompt));
             }
+            SurfaceRequest::PresentClarification {
+                batch,
+                hint,
+                prompt,
+                color,
+                verbose,
+                reply,
+            } => {
+                let _ = reply
+                    .send(surface.present_clarification(&batch, &hint, &prompt, color, verbose));
+            }
             SurfaceRequest::Reload { reply } => {
                 let _ = reply.send(surface.reload());
             }
@@ -558,9 +654,9 @@ pub(crate) struct TurnBinding {
 ///   resolves on a later round — while still taking effect on the next turn,
 ///   because the binding is dropped in between.
 ///
-/// Call at the turn-dispatch boundary, beside the OCAP disclosure guard which
-/// is already scoped exactly this way. Do NOT hoist it to session start: see
-/// the module docs for what each of those breaks.
+/// Call at the accepted-turn boundary, before reading any psyche-dependent
+/// wire or technique selection. Hold through setup and dispatch; the later OCAP
+/// disclosure guard shares its turn lifetime. Do NOT hoist to session start.
 ///
 /// The OCAP disclosure guard is NOT installed here — it needs the turn's
 /// resolved provider secret, which this module deliberately never sees.
@@ -633,7 +729,7 @@ mod tests {
                 let mut surface = RemoteSurface::new(to_ui);
                 in_flight.store(true, Ordering::Release);
                 // Stand in for a turn: publish status, then park for input.
-                surface.set_runtime_context("m", "http://h", Some((1, 2)), "s");
+                surface.set_runtime_context("m", "http://h", Some((1, Some(2))), "s");
                 let outcome = surface.read_line("› ");
                 release.store(true, Ordering::Release);
                 outcome
@@ -856,7 +952,7 @@ mod tests {
 
         {
             let mut surface = RemoteSurface::new(to_ui);
-            surface.set_runtime_context("m", "http://h", Some((1, 2)), "s");
+            surface.set_runtime_context("m", "http://h", Some((1, Some(2))), "s");
             surface.set_background_jobs(Vec::new());
             surface.set_tabs(vec![a_cell(1, true)]);
             #[cfg(feature = "live-spill")]
@@ -867,6 +963,9 @@ mod tests {
             surface.save_history();
             surface.reload().expect("served");
             surface.read_line("› ").expect("served");
+            surface
+                .present_clarification("1: pick a lane", "/discuss", "› ", false, false)
+                .expect("served");
             let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             surface.turn_started(flag());
             surface.turn_ended();
@@ -1029,6 +1128,7 @@ mod tests {
     #[derive(Default)]
     struct CountingSurface {
         read_line: usize,
+        present_clarification: usize,
         add_history: usize,
         save_history: usize,
         reload: usize,
@@ -1052,11 +1152,12 @@ mod tests {
         /// the smaller number for both — a rich build that dropped a
         /// forwarding impl must still fail here.
         const METHODS: usize =
-            12 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
+            13 + cfg!(feature = "rich-tui") as usize + cfg!(feature = "live-spill") as usize;
 
         fn each(&self) -> Vec<(&'static str, usize)> {
             [
                 ("read_line", self.read_line),
+                ("present_clarification", self.present_clarification),
                 ("add_history", self.add_history),
                 ("save_history", self.save_history),
                 ("reload", self.reload),
@@ -1130,6 +1231,17 @@ mod tests {
             self.read_line += 1;
             Ok(ReadOutcome::Eof)
         }
+        fn present_clarification(
+            &mut self,
+            _batch: &str,
+            _hint: &str,
+            _prompt: &str,
+            _color: bool,
+            _verbose: bool,
+        ) -> anyhow::Result<ReadOutcome> {
+            self.present_clarification += 1;
+            Ok(ReadOutcome::Eof)
+        }
         fn add_history(&mut self, _entry: &str) {
             self.add_history += 1;
         }
@@ -1140,7 +1252,13 @@ mod tests {
             self.reload += 1;
             Ok(())
         }
-        fn set_runtime_context(&mut self, _m: &str, _e: &str, _g: Option<(u32, u32)>, _s: &str) {
+        fn set_runtime_context(
+            &mut self,
+            _m: &str,
+            _e: &str,
+            _g: Option<(u32, Option<u32>)>,
+            _s: &str,
+        ) {
             self.runtime_context += 1;
         }
         fn set_background_jobs(&mut self, _jobs: Vec<BackgroundJob>) {
@@ -1509,3 +1627,53 @@ mod tests {
 }
 
 // Model: GPT-6 | Harness: Codex | Operator: S Hartsock | Time: 13:29 EDT | Date: 2026-09-15
+
+/// #2571: the window's half of the resize contract, against a fake parked
+/// presenter. The presenter's half runs on a real tty in
+/// `presenter_terminal_acceptance::panel_live_resize_case`.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod panel_window_remeasure_tests {
+    use super::*;
+    use ratatui::layout::Rect;
+    use std::os::fd::FromRawFd;
+
+    /// An in-memory pipe end stands in for the tty clone; nothing is drawn.
+    fn pipe_file() -> std::fs::File {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { libc::close(fds[0]) };
+        unsafe { std::fs::File::from_raw_fd(fds[1]) }
+    }
+
+    #[test]
+    fn a_remeasure_adopts_the_presenters_new_region() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let window = PanelWindow::new(pipe_file(), Rect::new(0, 13, 100, 18), Some(tx));
+        let presenter = std::thread::spawn(move || {
+            let PanelSignal::Remeasure { rows, reply } = rx.recv().unwrap();
+            assert_eq!(rows, Some(8), "the requested height reaches the presenter");
+            reply.send(Rect::new(0, 4, 46, 8)).unwrap();
+            // The drop is still the release once the panel is done.
+            assert!(rx.recv().is_err(), "the window's drop must release");
+        });
+        window.remeasure(Some(8));
+        assert_eq!(window.area(), Rect::new(0, 4, 46, 8));
+        drop(window);
+        presenter.join().unwrap();
+    }
+
+    #[test]
+    fn with_nobody_answering_the_region_is_kept_not_stranded() {
+        let area = Rect::new(0, 13, 100, 18);
+        let unparked = PanelWindow::new(pipe_file(), area, None);
+        unparked.remeasure(None);
+        assert_eq!(unparked.area(), area);
+        // A presenter that hangs up without replying.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let window = PanelWindow::new(pipe_file(), area, Some(tx));
+        let presenter = std::thread::spawn(move || drop(rx.recv().unwrap()));
+        window.remeasure(None);
+        assert_eq!(window.area(), area);
+        presenter.join().unwrap();
+    }
+}

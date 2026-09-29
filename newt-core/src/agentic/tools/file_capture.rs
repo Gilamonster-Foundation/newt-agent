@@ -10,10 +10,42 @@ use std::path::Path;
 use crate::caveats::Scope;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum TextSnapshot {
+pub(in crate::agentic) enum TextSnapshot {
     Absent,
     Present(String),
     Unavailable(&'static str),
+}
+
+/// True only when `path` is an absent leaf below an existing directory.
+///
+/// Windows reports both an absent leaf and an attempt to traverse through a
+/// regular-file parent as `NotFound` (`ERROR_PATH_NOT_FOUND`). The latter is
+/// not evidence that the requested file was absent: receipt capture must stay
+/// unavailable so a failed mutation cannot acquire an invented empty state.
+/// A dangling final symlink is likewise unavailable, because
+/// `symlink_metadata` observes the link rather than an absent leaf.
+fn is_absent_leaf(path: &Path) -> bool {
+    if !matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    ) {
+        return false;
+    }
+    matches!(
+        path.parent().and_then(|parent| std::fs::symlink_metadata(parent).ok()),
+        Some(metadata) if metadata.is_dir()
+    )
+}
+
+/// Whether a `Scope::Only` grant names this exact path after the same lexical
+/// normalization used by the tool gate.
+#[cfg(windows)]
+fn exact_scope_root(scope: &Scope<String>, path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    let normalized_path = crate::caveats::lexically_normalize(&path);
+    matches!(scope, Scope::Only(roots) if roots.iter().any(|root| {
+        crate::caveats::lexically_normalize(root) == normalized_path
+    }))
 }
 
 fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Result<File> {
@@ -46,6 +78,17 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
             if !roots.iter().any(|root| {
                 super::artifact_path_is_physically_within_workspace(Path::new(root), path)
             }) {
+                // A deleted exact-file grant cannot be canonicalized, but no
+                // reopen is necessary to attest its absent postimage. Keep
+                // this exception limited to Windows, nofollow observations,
+                // an exact lexical grant, and a verified missing leaf.
+                #[cfg(windows)]
+                if nofollow && exact_scope_root(scope, path) && is_absent_leaf(path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "exact granted leaf is absent",
+                    ));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "physical path is outside the read scope",
@@ -56,13 +99,15 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
     }
 }
 
-pub(super) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
+pub(in crate::agentic) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
     if !super::tui_permits_path(scope, &path.to_string_lossy()) {
         return TextSnapshot::Unavailable("fs_read was not granted");
     }
     let mut file = match open_for_scope(scope, path, true) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return TextSnapshot::Absent,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && is_absent_leaf(path) => {
+            return TextSnapshot::Absent;
+        }
         Err(_) => {
             return TextSnapshot::Unavailable(
                 "the file could not be read as an authorized regular file",
@@ -108,7 +153,7 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
     use TextSnapshot::{Absent, Present, Unavailable};
     let (old, new) = match (before, after) {
         (Unavailable(reason), _) | (_, Unavailable(reason)) => {
-            return Receipt::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
+            return Receipt::unavailable(reason);
         }
         (Absent, Absent) => {
             return Receipt::plain("\n\nNo file was present before or after the operation.".into())
@@ -124,15 +169,23 @@ pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -
                 "\n\n{}",
                 super::file_change::receipt_from_model(&model, unchanged)
             );
+            let headline = format!(
+                "\n\n{}",
+                super::file_change::receipt_headline(&model, unchanged)
+            );
             let captured = (!unchanged).then(|| CapturedChange {
                 model,
                 path: path.into(),
                 before: old.map(str::to_owned),
                 after: new.map(str::to_owned),
             });
-            Receipt { text, captured }
+            Receipt {
+                text,
+                headline,
+                captured,
+            }
         }
-        Err(error) => Receipt::plain(format!("\n\nfile-change receipt unavailable: {error}")),
+        Err(error) => Receipt::unavailable(error),
     }
 }
 
@@ -145,15 +198,45 @@ struct CapturedChange {
 
 pub(super) struct Receipt {
     text: String,
+    /// The model-facing summary used only after a successful operation.
+    headline: String,
     captured: Option<CapturedChange>,
 }
 
 impl Receipt {
+    fn unavailable(reason: impl std::fmt::Display) -> Self {
+        let mut receipt = Self::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
+        // Failed operations use `text`; only `present_success` uses this summary.
+        receipt.headline =
+            "\n\nFile operation succeeded; optional change preview unavailable".into();
+        receipt
+    }
+
     fn plain(text: String) -> Self {
         Self {
+            headline: text.clone(),
             text,
             captured: None,
         }
+    }
+
+    /// A SUCCESSFUL mutation: the model gets `prefix + headline + suffix`
+    /// ("wrote x (3 lines)\n\nModified (+1 -1)"); the operator's display
+    /// keeps the full receipt and its styled diff. The model wrote the change,
+    /// so echoing it back only costs context — a 1,497-line new file's echo
+    /// spilled and cost a round to read back (live 2026-09-23). Failures keep
+    /// [`Self::present`]: the observed state after a failed or partial
+    /// operation is information the model does not already have.
+    pub(super) fn present_success(
+        self,
+        prefix: String,
+        suffix: &str,
+        presentation: &mut dyn super::ToolPresentation,
+    ) -> String {
+        let model = format!("{prefix}{}{suffix}", self.headline);
+        let full = self.present(prefix, suffix, presentation);
+        presentation.display_source(full);
+        model
     }
 
     /// Record the receipt's exact byte range while assembling this result.
@@ -268,7 +351,7 @@ pub(super) fn read_for_edit(
             if super::is_fs_containment_denied(&error) {
                 return Err(super::denied_fs_result("fs_write", label));
             }
-            Err(format!("error reading {label}: {error}"))
+            Err(format!("error: reading {label}: {error}"))
         }
     }
 }
@@ -283,7 +366,7 @@ pub(super) fn failure(output: String, receipt: &str) -> String {
 }
 
 pub(super) fn absent(scope: &Scope<String>, path: &Path) -> bool {
-    matches!(open_for_scope(scope, path, true), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    matches!(open_for_scope(scope, path, true), Err(error) if error.kind() == io::ErrorKind::NotFound && is_absent_leaf(path))
 }
 
 /// Preserve final-link mutation policy, but refuse actual FIFO/device targets
@@ -295,6 +378,39 @@ pub(super) fn regular_target(path: &Path) -> bool {
         // open/write path's error handling instead of inventing a type claim.
         Err(_) => true,
     }
+}
+
+/// Lines `start..=end` (1-based) of `text`, byte-exact, or a refusal naming
+/// the file's length.
+fn line_range<'a>(text: &'a str, start: usize, end: usize) -> Result<(usize, usize), String> {
+    let lines: Vec<&'a str> = text.split_inclusive('\n').collect();
+    if start == 0 || start > end || end > lines.len() {
+        return Err(format!(
+            "error: lines {start}-{end} are not a range of this file ({} lines)",
+            lines.len()
+        ));
+    }
+    let from: usize = lines[..start - 1].iter().map(|l| l.len()).sum();
+    let to: usize = from + lines[start - 1..end].iter().map(|l| l.len()).sum::<usize>();
+    Ok((from, to))
+}
+
+/// `header` followed by lines `start..=end` of `source`, copied byte for byte.
+/// Moving code this way means the model never retypes it: live 2026-09-23 a
+/// retyped 1,263-line move fabricated symbols and was deleted twice.
+pub(super) fn copy_line_range(
+    header: &str,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Result<String, String> {
+    let (from, to) = line_range(source, start, end)?;
+    let mut out = header.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&source[from..to]);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -410,5 +526,38 @@ mod tests {
             matches(&scoped, &root.path().join("link"), b"inside\n"),
             !cfg!(target_os = "macos")
         );
+    }
+}
+
+/// Pure tests for moving code by line range — no filesystem.
+#[cfg(test)]
+mod line_range_tests {
+    use super::copy_line_range;
+
+    const SRC: &str = "l1\nl2\nl3\nl4\nl5\n";
+
+    #[test]
+    fn a_copied_range_is_byte_exact_and_follows_the_typed_header() {
+        assert_eq!(
+            copy_line_range("use x;\n", SRC, 2, 4).unwrap(),
+            "use x;\nl2\nl3\nl4\n"
+        );
+        assert_eq!(copy_line_range("", SRC, 5, 5).unwrap(), "l5\n");
+    }
+
+    #[test]
+    fn a_header_without_a_trailing_newline_still_starts_the_copy_on_its_own_line() {
+        assert_eq!(
+            copy_line_range("use x;", SRC, 1, 1).unwrap(),
+            "use x;\nl1\n"
+        );
+    }
+
+    #[test]
+    fn a_bad_range_is_refused_with_the_file_length() {
+        for (start, end) in [(0, 2), (3, 2), (4, 9)] {
+            let err = copy_line_range("", SRC, start, end).unwrap_err();
+            assert!(err.contains("5 lines"), "{err}");
+        }
     }
 }

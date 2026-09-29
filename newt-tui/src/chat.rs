@@ -231,34 +231,6 @@ fn decorate_round_cap_reply(
 #[path = "chat_tests/origin_upgrade.rs"]
 mod origin_upgrade_tests;
 
-/// Preserve the unit boundary between a backend's full context window and an
-/// already-derived input cap. OpenAI-compatible loops need the former so core
-/// can reserve the active generation policy; Ollama keeps using the latter as
-/// its conservative `num_ctx` KV-allocation fallback.
-fn context_window_for_core(
-    kind: newt_core::BackendKind,
-    full_context_window: Option<u32>,
-    safe_context: Option<u32>,
-) -> Option<u32> {
-    match kind {
-        // Hosted APIs (OpenAI-compatible and Anthropic) get the full declared
-        // window: core reserves the active generation policy itself.
-        newt_core::BackendKind::Openai | newt_core::BackendKind::Anthropic => full_context_window,
-        newt_core::BackendKind::Ollama | newt_core::BackendKind::Embedded => safe_context,
-    }
-}
-
-/// Resolve the selected model's full window from strongest to weakest
-/// declaration. The caller performs the exact model lookup for configured and
-/// community profiles, so switching models naturally produces a new value.
-fn selected_model_context_window(
-    live: Option<u32>,
-    configured: Option<u32>,
-    community: Option<u32>,
-) -> Option<u32> {
-    live.or(configured).or(community)
-}
-
 /// The canonical [`probe::CapKey`] for the active serving principal — the ONE
 /// place the serving-default rule lives (three-Cs: the broken "key by bare
 /// model" call is unrepresentable once every site takes this key).
@@ -283,17 +255,19 @@ fn session_cap_id(
     )
 }
 
-/// A numbered server rejection is an authoritative upper bound on later
-/// turns. It may tighten an explicit/session window but never raise a tighter
-/// operator choice. An ordinary discovered window is deliberately not passed
-/// here, so experimental raises remain possible until the server rejects one.
-fn cap_context_window_by_recovery(
-    requested: Option<u32>,
-    recovered_hard_window: Option<u32>,
-) -> Option<u32> {
-    match (requested, recovered_hard_window) {
-        (Some(requested), Some(recovered)) => Some(requested.min(recovered)),
-        (requested, recovered) => requested.or(recovered),
+/// #2466: the gauge is per-model (window or ratchet), so it must not survive
+/// a `/model`/`/backend` switch — a `cap_id` change is the one signal every
+/// such switch produces (`session_cap_id`'s doc comment). Pure so the reset
+/// rule is unit-testable apart from the turn loop's mutable state.
+fn gauge_for_cap_switch(
+    token_gauge: Option<(u32, Option<u32>)>,
+    previous_cap_id: &probe::CapKey,
+    new_cap_id: &probe::CapKey,
+) -> Option<(u32, Option<u32>)> {
+    if previous_cap_id == new_cap_id {
+        token_gauge
+    } else {
+        None
     }
 }
 
@@ -597,6 +571,17 @@ struct PendingClarification {
     intake: newt_core::agentic::PromptIntake,
 }
 
+/// The answer shape a pending clarification wants, shown beside the batch
+/// rather than folded into it (#2524 item 7). Named once so RichTUI's modal
+/// hint and the lean default's (unused) hint parameter never drift apart.
+///
+/// #2540 round 2 item 3 (measured live): `modal::frame`'s legend is ONE row
+/// with no wrap, and the longer wording clipped mid-word at the box edge
+/// ("…/discuss to talk it thr") on an ordinary terminal width. Shortened
+/// rather than taught to wrap — wrapping is a `modal::frame` change every
+/// other modal's legend would also have to accept.
+const CLARIFICATION_HINT: &str = "ordinal locks it · /discuss to talk it through";
+
 /// The disposition each accepted turn was comprehended with, before any
 /// operating-mode narrowing, keyed by its submitted prompt (#2332).
 type RecordedDispositions =
@@ -613,6 +598,23 @@ fn record_turn_disposition(
     if intake.disposition() != newt_core::agentic::PromptDisposition::Ask {
         recorded.insert(context.submitted_prompt().id(), intake.disposition());
     }
+}
+
+/// Decide whether an operator line that starts with `/` should be routed to
+/// a pending clarification batch instead of the slash registry (#2515).
+///
+/// The batch's own text advertises `/discuss <what's on your mind>` as its
+/// escape hatch, and the parser (`newt_core::agentic::discussion_request`,
+/// checked inside `resolve_with_operator_answer`) already understands it —
+/// including bare `/discuss` with no trailing text. The bug was that the
+/// chat loop sent every `/`-prefixed line to the slash registry BEFORE that
+/// parser ever saw it, so `discuss` (unregistered there) read as an unknown
+/// command. Only `/discuss` (and its `/chat` alias) diverts, and only while a
+/// batch is pending: every other `/word` — `/help`, `/new`, `/exit` — keeps
+/// going to the registry even with a batch pending, matching what the batch
+/// text promises.
+fn line_answers_pending_clarification(task: &str, has_pending: bool) -> bool {
+    has_pending && newt_core::agentic::discussion_request(task).is_some()
 }
 
 /// Comprehend an accepted prompt. A direct answer to a pending clarification
@@ -656,10 +658,10 @@ fn intake_for_accepted_prompt(
 }
 
 /// Comprehend an accepted prompt, record its disposition, then apply the
-/// turn's operating mode — in that order (#2332). The record holds what the
-/// prompt asked for; the mode is the operator's CURRENT narrowing, so a
-/// resumed task keeps its recorded disposition and current permissions still
-/// win. `mode_for` picks the turn's mode from the comprehended intake.
+/// explicitly selected authority mode — in that order (#2332). The record
+/// holds what the prompt asked for. `mode_for` returns the working style and
+/// the authority mode separately: inferred style never narrows accepted work,
+/// while an operator mode or an active model Plan phase still does.
 fn comprehend_accepted_prompt(
     origin: &ModelInputOrigin,
     task: &str,
@@ -667,16 +669,87 @@ fn comprehend_accepted_prompt(
     context: Option<&newt_core::TurnPromptContext>,
     recorded: &mut RecordedDispositions,
     lexicon: &newt_core::agentic::DispositionLexicon,
-    mode_for: impl FnOnce(&newt_core::agentic::PromptIntake) -> OperatingMode,
+    mode_for: impl FnOnce(&newt_core::agentic::PromptIntake) -> (OperatingMode, OperatingMode),
 ) -> (newt_core::agentic::PromptIntake, OperatingMode) {
     let mut intake = intake_for_accepted_prompt(origin, task, pending, recorded, lexicon);
     if let Some(context) = context {
         record_turn_disposition(recorded, context, &intake);
     }
-    let mode = mode_for(&intake);
-    apply_operating_mode_to_intake(mode, &mut intake);
+    let (mode, authority_mode) = mode_for(&intake);
+    apply_operating_mode_to_intake(authority_mode, &mut intake);
     (intake, mode)
 }
+
+/// What a clarification-reply classifier read a non-explicit reply as
+/// selecting — offered, never applied. See [`classify_clarification_reply`].
+struct ClassifiedProposal {
+    /// Displayed ordinal (1-based), matching what the batch showed.
+    ordinal: usize,
+    summary: String,
+}
+
+/// Ask a bounded, tool-less side call to read a clarification reply that
+/// carried no explicit ordinal against the pending batch, and return what it
+/// proposed, if anything (#2517, "confirm-then-lock").
+///
+/// This only classifies. Committing the proposal onto the intake is
+/// [`newt_core::agentic::PromptIntake::propose_answer`]'s job, and LOCKING it
+/// is the operator's, via their own next explicit confirmation inside
+/// [`newt_core::agentic::PromptIntake::resolve_with_operator_answer`] — never
+/// this call's output directly. A malformed, empty, or failed response is
+/// "no proposal": fail-closed, the same posture every other classifier in
+/// this harness takes (see the `#1749` adjudicator above this call site).
+///
+/// `call` is injected so this is unit-testable without a live backend;
+/// production passes the same adjudicator side-call `/discuss` uses.
+fn classify_clarification_reply(
+    intake: &newt_core::agentic::PromptIntake,
+    reply: &str,
+    call: impl FnOnce(String) -> anyhow::Result<String>,
+) -> Option<ClassifiedProposal> {
+    let batch = intake.clarification_batch();
+    let prompt = format!(
+        "The operator was asked to lock one of these pending decisions by \
+         replying with an explicit ordinal (e.g. `1: ...`). Their reply did \
+         not include one. Decide, ONLY if unambiguous, which single pending \
+         item they most likely meant — do not guess if it could be more than \
+         one, and do not use any tools.\n\n\
+         Pending batch:\n{batch}\n\n\
+         Operator's reply: {reply}\n\n\
+         Respond with EXACTLY two lines and nothing else:\n\
+         PROPOSAL: <ordinal number, or `none` if it is not clearly one item>\n\
+         SUMMARY: <a short restatement of that item, or leave blank if none>"
+    );
+    let response = call(prompt).ok()?;
+    let mut ordinal = None;
+    let mut summary = String::new();
+    for line in response.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("PROPOSAL:")
+            .or_else(|| line.strip_prefix("proposal:"))
+        {
+            let rest = rest.trim();
+            if !rest.eq_ignore_ascii_case("none") {
+                ordinal = rest.parse::<usize>().ok();
+            }
+        } else if let Some(rest) = line
+            .strip_prefix("SUMMARY:")
+            .or_else(|| line.strip_prefix("summary:"))
+        {
+            summary = rest.trim().to_string();
+        }
+    }
+    let ordinal = ordinal?;
+    if summary.is_empty() {
+        summary = format!("option {ordinal}");
+    }
+    Some(ClassifiedProposal { ordinal, summary })
+}
+
+#[cfg(test)]
+#[path = "chat_tests/clarification_classifier.rs"]
+mod clarification_classifier_tests;
 
 /// Rebuild an outstanding clarification from its durable operator-receipt
 /// lineage. A prompt that reached model work cannot be pending: `Ask` exits
@@ -993,6 +1066,13 @@ mod turn_tuning_ratchet_tests;
 #[path = "chat_tests/plan_approval.rs"]
 mod plan_approval_tests;
 
+/// #2524 item 7: the shared trait default `read_line`/`present_clarification`
+/// reproduces today's byte-for-byte, tested against a fake `InputSurface`
+/// that never overrides it.
+#[cfg(test)]
+#[path = "chat_tests/present_clarification.rs"]
+mod present_clarification_tests;
+
 /// #1963: persist a turn that did NOT reach a normal completion — cancelled
 /// by the operator (Esc/Ctrl-C) or ended in a backend/loop error — through
 /// exactly the same durable path [`save_turn_if_persistent`]'s Ok-arm caller
@@ -1205,6 +1285,33 @@ pub(crate) trait InputSurface {
     /// the rich default's timestamp is current). Returns a [`ReadOutcome`];
     /// only an *unexpected* editor error propagates as `Err`.
     fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome>;
+    /// Present a pending clarification `batch` and read the operator's
+    /// answer (#2524 item 7).
+    ///
+    /// `prompt` is the SAME per-turn prompt string `read_line` would have
+    /// received; `hint` names the answer shape (an ordinal, or `/discuss`)
+    /// for a surface that can show it beside the batch rather than folded
+    /// into it. `color`/`verbose` mirror `print_newt`'s own parameters,
+    /// since the default body below is exactly that call.
+    ///
+    /// Defaulted rather than required: every surface except RichTUI wants
+    /// the SAME body — print the batch, then read a line — and a per-surface
+    /// copy of that pair is exactly the sprawl `AGENTS.md`'s reuse
+    /// discipline warns about. RichTUI is the one override, drawing
+    /// `modal::frame` chrome around a free-text reader instead
+    /// (`clarification_modal::present`) so `/discuss` and the ordinal shape
+    /// live in the chrome's hint rather than in scrollback.
+    fn present_clarification(
+        &mut self,
+        batch: &str,
+        _hint: &str,
+        prompt: &str,
+        color: bool,
+        verbose: bool,
+    ) -> anyhow::Result<ReadOutcome> {
+        print_newt(batch, color, verbose);
+        self.read_line(prompt)
+    }
     /// Record a submitted entry in history.
     fn add_history(&mut self, entry: &str);
     /// Persist history to disk (no-op when there is no history path).
@@ -1222,7 +1329,7 @@ pub(crate) trait InputSurface {
         &mut self,
         _model: &str,
         _endpoint: &str,
-        _gauge: Option<(u32, u32)>,
+        _gauge: Option<(u32, Option<u32>)>,
         _session: &str,
     ) {
     }
@@ -1626,7 +1733,9 @@ fn session_body(
     // UNPUBLISHED resolution: process-globals land only after the typed
     // backend choice below ACCEPTS — a refused startup publishes nothing.
     // A resolution failure is visible, then the session runs on defaults.
-    let mut cfg = match newt_core::Config::resolve_runtime_unpublished() {
+    let mut cfg = match crate::migration_notices::read(|report| {
+        newt_core::Config::resolve_runtime_unpublished(report)
+    }) {
         Ok(cfg) => cfg,
         Err(e) => {
             print_newt(
@@ -1648,6 +1757,13 @@ fn session_body(
         std::env::var("NEWT_RESUME").ok(),
         cfg.conversations.clone().unwrap_or_default().resume,
     );
+    let adoption_request = std::env::var("NEWT_ADOPT_FRAME").ok();
+    if let Some(selected) = adoption_request.as_deref() {
+        anyhow::ensure!(
+            smart_sessions::adoption_selection_matches(selected, &session_start),
+            "--adopt-frame requires its explicit --resume selection; remove conflicting conversation overrides"
+        );
+    }
     let ephemeral_session = session_start == SessionStart::Ephemeral;
     // Ephemeral sessions get NO store handle at all (17.7): nothing to
     // create rows, nothing to append turns, nothing to read past
@@ -1824,6 +1940,10 @@ fn session_body(
         SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
     let smart_startup_caveats = cap.caveats().clone();
     let smart_config = cfg.smart_harness.clone().filter(|config| config.enabled);
+    anyhow::ensure!(
+        adoption_request.is_none() || smart_config.is_some(),
+        "--adopt-frame requires [smart_harness] enabled = true"
+    );
     if let Some(config) = smart_config.as_ref() {
         newt_core::agentic::smart_harness::validate_isolation_runtime()?;
         // Local MCP processes inherit this capability when the pool starts.
@@ -1894,7 +2014,7 @@ fn session_body(
     // Step 24.6 (#559): the latest context-budget gauge `(used, budget)`, set
     // after each turn from the turn's input tokens + the resolved send budget,
     // and shown in the rich header for the NEXT prompt. `None` until known.
-    let mut token_gauge: Option<(u32, u32)> = None;
+    let mut token_gauge: Option<(u32, Option<u32>)> = None;
     // `/context size <N>` session override (#588): clamps the per-turn send
     // budget (eff_safe_context / eff_max_ok_input) to a user-chosen ceiling so
     // a too-tight auto-sized window can be widened for experimentation without
@@ -1956,15 +2076,41 @@ fn session_body(
     // Unsigned/tampered approve entries are dropped loudly at load, fail-closed
     // to the prompt; deny/ask load unsigned (narrowing is fail-safe).
     if let Some(config_path) = user_permission_config_path.as_deref() {
+        // Read-only (mirrors headless's `resolve_ocap_store`, #2532): a
+        // missing/invalid root key folds to "no approves" — `load_store`'s
+        // existing rule — rather than minting an identity.pem as a side
+        // effect of merely checking for signed durable grants.
         let root_vk = key_path
             .as_deref()
-            .and_then(|p| newt_identity::load_or_generate(p).ok())
+            .and_then(|p| newt_identity::load_user_key(p).ok())
             .map(|user| user.public().as_bytes());
         let (policy, warnings) = newt_core::ocap_store::load_store(config_path, root_vk);
         for w in warnings {
             print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
         }
         permission_state.ocap_policy = policy;
+        // #2524 item 1: fold the just-verified approve-store entries into the
+        // recalled durable grants so a signed `[[fs]]`/`[[exec]]`/`[[net]]`
+        // grant reaches `recalled_caveats` (and hence `startup_caveats` below,
+        // which a spawned MCP child inherits) — not just the prompt-time
+        // pre-answer `evaluate_request` already gave it. `load_store` already
+        // dropped any unsigned/bad-signature entry loudly above, so this can
+        // never fold in anything unverified.
+        let folded = permission_state.fold_ocap_approvals();
+        if folded > 0 {
+            if let Some(path) = permission_log_path.as_deref() {
+                if let Err(e) = newt_core::permission_journal::append_record(
+                    path,
+                    ocap_store_folded_record(&active_conversation_id, folded),
+                ) {
+                    print_newt(
+                        &format!("warning: permission log write failed: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+        }
     }
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
@@ -1987,9 +2133,9 @@ fn session_body(
     if prompt_permissions_enabled {
         print_newt(
             "prompted permissions ON — capability denials will ask: allow once / session / deny / \
-             permanently deny (a net host also offers allow-permanently, which adds it to \
-             [tui.permissions] net). Decisions recorded; /permissions lists them; permanent \
-             denials persist in ~/.newt/permission-denials.jsonl",
+             permanently deny (exec/fs/net also offer allow-permanently, which signs a durable \
+             grant into ~/.newt/ocap/approve.toml). Decisions recorded; /permissions lists them; \
+             permanent denials persist in ~/.newt/permission-denials.jsonl",
             color,
             verbose,
         );
@@ -2004,7 +2150,10 @@ fn session_body(
     if newt_core::agentic::ocap_disabled() {
         print_newt(&ocap_disabled_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
-            if let Err(e) = ocap_disabled_record(&active_conversation_id).append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(
+                path,
+                ocap_disabled_record(&active_conversation_id),
+            ) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
@@ -2019,7 +2168,10 @@ fn session_body(
     if newt_core::agentic::full_access_requested() {
         print_newt(&full_access_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
-            if let Err(e) = full_access_record(&active_conversation_id).append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(
+                path,
+                full_access_record(&active_conversation_id),
+            ) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
@@ -2269,18 +2421,24 @@ fn session_body(
                 &inf_model,
                 !real_context_discovery(&cfg, &inf_model),
                 inf_kind,
+                inf_key.as_deref(),
             );
+        // The turn loop's own derivation (#2567), so the startup budget and
+        // the first turn cannot disagree about the window.
+        let declared_window = crate::context_window::resolve(crate::context_window::facts_for(
+            &cfg,
+            inf_kind,
+            &inf_model,
+            inf_context_window,
+            entry,
+            &community_tunings,
+            None,
+            None,
+        ))
+        .full_window;
         if updated {
             probe::save_cache(&cap_cache);
         }
-        let declared_window = selected_model_context_window(
-            inf_context_window,
-            cfg.find_model_tuning(&inf_model)
-                .and_then(|tuning| tuning.context_window),
-            community_tunings
-                .find(&inf_model)
-                .and_then(|profile| profile.context_window),
-        );
         probe::resolve_memory_budget(
             mem_cfg.context_tokens,
             declared_window,
@@ -2738,6 +2896,10 @@ fn session_body(
         match store.claim(&active_conversation_id) {
             Ok(newt_core::ClaimOutcome::Claimed) => {}
             Ok(newt_core::ClaimOutcome::HeldBy { host, pid }) => {
+                anyhow::ensure!(
+                    adoption_request.is_none(),
+                    "cannot adopt a conversation held by another session"
+                );
                 claim_refused = true;
                 print_newt(
                     &format!(
@@ -2777,12 +2939,27 @@ fn session_body(
                 }
                 let _ = store.claim(&active_conversation_id);
             }
+            Err(e) if adoption_request.is_some() => {
+                return Err(e.context("cannot claim the selected conversation for frame adoption"))
+            }
             Err(e) => print_newt(
                 &format!("warning: could not claim the conversation ({e})"),
                 color,
                 verbose,
             ),
         }
+    }
+
+    if adoption_request.is_some() {
+        anyhow::ensure!(
+            resumed_at_start && !claim_refused,
+            "frame adoption requires a successfully resumed conversation"
+        );
+        let store = conversation_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("frame adoption requires a durable conversation store")
+        })?;
+        smart_sessions.adopt_selected(store, &active_conversation_id, mem_budget)?;
+        print_newt("Smart Harness will admit only the selected conversation as historical context; past execution remains unaccounted.", color, verbose);
     }
 
     // #1668: apply the resumed conversation's preference pin — AFTER the claim
@@ -2895,11 +3072,14 @@ fn session_body(
             // zero; the `commit`/`amend`/`rebase` arms increment it on a
             // confirmed successful `eng.*` call, and the loop drains it below
             // to clear the ledger ONLY on a real Newt commit (not a `HEAD` diff).
-            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // #1709 family: the contributor-consumption cursor — starts at 0,
             // reset to 0 at the top of every loop iteration (below) when the
             // envelope is refreshed from the live model + ledger snapshot.
-            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+            contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            // Refreshed each turn below, so a `/settings git-signing` change
+            // applies to the next commit.
+            signer: newt_core::commit_signing::session_signer(&session_identity),
         })
     };
 
@@ -2943,11 +3123,14 @@ fn session_body(
             // active model driving THIS turn is merged in by the finalizer
             // regardless, so this snapshot + the active-model merge credits
             // every contributor on the one commit. The ledger is cleared on
-            // commit success below, and the next refresh re-snapshots the
-            // (now empty) ledger, so contributors never carry past the commit
-            // that consumed them.
+            // confirmed publication inside the tool loop. The next refresh
+            // includes only later work plus conservative active-model credit
+            // for native shell calls that may write after committing.
             ca.contributors = attribution_ledger.borrow().contributors().to_vec();
             tool.attribution = Some(ca);
+            tool.signer = newt_core::commit_signing::session_signer(
+                &newt_core::AgentIdentity::resolve().unwrap_or_default(),
+            );
             // #1709 family: reset the contributor-consumption cursor to 0. The
             // envelope above is a FRESH snapshot of the ledger taken at this
             // loop-top, so none of its contributors have been consumed yet by
@@ -3158,7 +3341,23 @@ fn session_body(
                     });
             // The human has the floor: not "blocked", just waiting.
             newt_core::lifecycle::emit(newt_core::lifecycle::LifecycleEvent::Waiting);
-            (surface.read_line(&prompt)?, origin)
+            // #2524 item 7: while a clarification is pending, the very next
+            // read IS the operator's answer to it — route through the
+            // composed surface method so RichTUI can draw it inside modal
+            // chrome instead of scrollback. Every other surface's default
+            // reproduces today's print-then-read exactly (see
+            // `InputSurface::present_clarification`'s doc).
+            let outcome = match pending_clarification.as_ref() {
+                Some(pending) => surface.present_clarification(
+                    &pending.intake.clarification_batch(),
+                    CLARIFICATION_HINT,
+                    &prompt,
+                    color,
+                    verbose,
+                )?,
+                None => surface.read_line(&prompt)?,
+            };
+            (outcome, origin)
         };
         match outcome {
             // #1669 16.3: a keyboard tab motion (`gt`/`gT`/`{count}gt`). The
@@ -3242,7 +3441,10 @@ fn session_body(
                     println!();
                     continue;
                 }
-                if model_input_origin.is_operator() && task.starts_with('/') {
+                if model_input_origin.is_operator()
+                    && task.starts_with('/')
+                    && !line_answers_pending_clarification(&task, pending_clarification.is_some())
+                {
                     // Per-command help, intercepted before ANY command runs so
                     // every command answers `--help`/`-h`/`help` (and `/help
                     // <cmd>`) uniformly — even the ones handled inline below.
@@ -3305,6 +3507,7 @@ fn session_body(
                                 state: &mut permission_state,
                                 base: operating_mode_caveats(
                                     active_operating_mode,
+                                    conversation_mode_states.plan.is_active(),
                                     effective_caveats(cap.caveats(), posture.as_ref()),
                                 ),
                                 key_path: key_path.clone(),
@@ -3312,10 +3515,14 @@ fn session_body(
                                 log_path: permission_log_path.clone(),
                                 denials_path: permission_denials_path.clone(),
                                 config_path: permission_config_path.clone(),
-                                preset_clamp: posture
-                                    .as_ref()
-                                    .and_then(ActivePosture::permission_clamp)
-                                    .cloned(),
+                                preset_clamp: operating_mode_permission_clamp(
+                                    active_operating_mode,
+                                    conversation_mode_states.plan.is_active(),
+                                    posture
+                                        .as_ref()
+                                        .and_then(ActivePosture::permission_clamp)
+                                        .cloned(),
+                                ),
                                 delegation: cap.delegation(),
                                 danger: production_danger_table(),
                                 color,
@@ -3899,12 +4106,16 @@ fn session_body(
                                             &active_conversation_id,
                                             ordinal,
                                         );
-                                        let batch = reopened.clarification_batch();
+                                        // #2524 item 7: the batch is no
+                                        // longer printed here — the very next
+                                        // read (top of loop) is the operator's
+                                        // answer to it, so it goes through
+                                        // `present_clarification` instead,
+                                        // which shows the SAME batch text.
                                         pending_clarification = Some(PendingClarification {
                                             parent: previous.parent,
                                             intake: reopened,
                                         });
-                                        print_newt(&batch, color, verbose);
                                     }
                                     None => {
                                         last_adjudicated = Some(previous);
@@ -6224,6 +6435,21 @@ fn session_body(
                             .ok()
                             .map(|c| c.display_model().to_string())
                             .unwrap_or_default();
+                        // #2567: the Inference section, resolved once with
+                        // the turn loop's own resolvers before the panel opens.
+                        let inference_rows = crate::inference_panel::gather(
+                            &cfg,
+                            &choice,
+                            &inf_model,
+                            &inf_url,
+                            inf_key.as_deref(),
+                            inf_context_window,
+                            &cap_cache.get(&cap_id).cloned().unwrap_or_default(),
+                            &community_tunings,
+                            recovered_context_windows.get(&cap_id).copied(),
+                            context_size_override,
+                            token_gauge,
+                        );
                         let mut initial_section = None;
                         loop {
                             let mut walked_to_permissions = false;
@@ -6245,6 +6471,7 @@ fn session_body(
                                 models.clone(),
                                 current_model.clone(),
                                 audit_rows,
+                                inference_rows.clone(),
                                 initial_section,
                                 window,
                             ) {
@@ -7117,12 +7344,18 @@ fn session_body(
                                         .take_for(&active_conversation_id)
                                 })
                                 .flatten();
-                            effective_operating_mode(
+                            let style = effective_operating_mode(
                                 active_operating_mode,
                                 intake,
                                 plan_mode_active,
                                 auto_selected,
-                            )
+                            );
+                            let authority_mode = if plan_mode_active {
+                                OperatingMode::Plan
+                            } else {
+                                active_operating_mode
+                            };
+                            (style, authority_mode)
                         },
                     );
 
@@ -7249,7 +7482,116 @@ fn session_body(
                             println!();
                             continue;
                         };
-                        let clarification = prompt_intake.clarification_batch();
+                        // #2517: the `/discuss` escape hatch. The operator
+                        // wants to talk the batch through, not answer it — run
+                        // one bounded, tool-less side call and show the reply,
+                        // then re-queue the SAME batch unchanged. Nothing here
+                        // locks, rejects, or loses the pending decisions; only
+                        // `/new` does that, and this is deliberately gentler.
+                        if let Some(discuss_text) = prompt_intake.take_pending_discussion() {
+                            let batch = prompt_intake.clarification_batch();
+                            let side_call = build_adjudicator(
+                                &cfg,
+                                &inf_url,
+                                &inf_model,
+                                inf_kind,
+                                &inf_key,
+                                Some(mem_budget),
+                                color,
+                            );
+                            let discuss_prompt = format!(
+                                "The operator is deciding how to answer a pending \
+                                 clarification batch and asked to talk it through before \
+                                 committing to an answer. Help them think it out loud in a \
+                                 short reply. Do not choose an answer on their behalf, do not \
+                                 use any tools, and remind them to reply with `N: value` once \
+                                 they are ready.\n\n\
+                                 Pending batch:\n{batch}\n\n\
+                                 Operator's message: {}",
+                                if discuss_text.is_empty() {
+                                    "(no specific question — please re-explain the batch)"
+                                } else {
+                                    discuss_text.as_str()
+                                }
+                            );
+                            match tokio::task::block_in_place(|| {
+                                rt.block_on(side_call(discuss_prompt))
+                            }) {
+                                Ok((reply, _usage)) => {
+                                    print_newt(&reply, color, verbose);
+                                    println!();
+                                }
+                                Err(e) => {
+                                    print_newt(
+                                        &format!("warning: discussion side call failed: {e}"),
+                                        color,
+                                        verbose,
+                                    );
+                                    println!();
+                                }
+                            }
+                            pending_clarification = Some(PendingClarification {
+                                parent: Box::new(parent),
+                                intake: prompt_intake,
+                            });
+                            // #2524 item 7: no separate batch print here —
+                            // the very next read (top of loop) goes through
+                            // `present_clarification`, which shows this SAME
+                            // batch text (`clarification_batch()` is
+                            // deterministic over the unchanged intake).
+                            println!();
+                            continue;
+                        }
+                        // #2517 "confirm-then-lock": the reply carried no
+                        // explicit ordinal and read as neither a question nor
+                        // a discussion request — the two shapes a classifier
+                        // can actually help with (`Incomplete`/`OutOfRange`
+                        // already named an explicit ordinal, so the operator
+                        // stated something concrete; a guess would second-
+                        // guess it instead of helping). One bounded, tool-
+                        // less side call OFFERS a reading; nothing locks
+                        // here — `PromptIntake::resolve_with_operator_answer`
+                        // only locks a proposal on the operator's own next
+                        // explicit confirmation, never on this call's output
+                        // directly. This is the same fail-closed shape as the
+                        // adjudicator above: the model proposes, the harness
+                        // (via the operator) is the only thing that commits.
+                        let classifiable_rejection = matches!(
+                            prompt_intake.last_rejection(),
+                            Some(
+                                newt_core::agentic::ClarificationRejection::NoOrdinals
+                                    | newt_core::agentic::ClarificationRejection::ReadsAsQuestion
+                            )
+                        );
+                        if adjudication_enabled && classifiable_rejection {
+                            if let Some(proposal) =
+                                classify_clarification_reply(&prompt_intake, &task, |prompt| {
+                                    let side_call = build_adjudicator(
+                                        &cfg,
+                                        &inf_url,
+                                        &inf_model,
+                                        inf_kind,
+                                        &inf_key,
+                                        Some(mem_budget),
+                                        color,
+                                    );
+                                    tokio::task::block_in_place(|| rt.block_on(side_call(prompt)))
+                                        .map(|(text, _usage)| text)
+                                })
+                            {
+                                prompt_intake = prompt_intake
+                                    .propose_answer(proposal.ordinal, proposal.summary);
+                                if let Some(notice) = prompt_intake.proposed_answer_notice() {
+                                    pending_clarification = Some(PendingClarification {
+                                        parent: Box::new(parent),
+                                        intake: prompt_intake,
+                                    });
+                                    print_newt(&notice, color, verbose);
+                                    println!();
+                                    continue;
+                                }
+                            }
+                        }
                         // #1689 item 1: when a reply was REFUSED, say why
                         // before repeating the batch. The gate never calls the
                         // model, so an identical re-emit is the entire response
@@ -7258,7 +7600,7 @@ fn session_body(
                         // also names `/new` as the way out, because the usual
                         // reason a reply keeps failing is that the operator
                         // disagrees that a decision was needed at all.
-                        let rejection = prompt_intake.last_rejection().map(|r| r.explain());
+                        let rejection = prompt_intake.last_rejection_explanation();
                         pending_clarification = Some(PendingClarification {
                             parent: Box::new(parent),
                             intake: prompt_intake,
@@ -7267,9 +7609,21 @@ fn session_body(
                             print_newt(&reason, color, verbose);
                             println!();
                         }
-                        print_newt(&clarification, color, verbose);
-                        println!();
+                        // #2524 item 7: the batch itself is no longer printed
+                        // here — the very next read (top of loop) goes
+                        // through `present_clarification`, which shows it.
                         continue;
+                    }
+
+                    // Addendum item 6: the one moment that changes state —
+                    // an answer locking a pending decision — printed nothing.
+                    // Every refusal explains itself; the lock should too, so
+                    // the operator can catch a wrong lock before the model
+                    // spends a round on it.
+                    if let Some(pending) = pending_clarification.as_ref() {
+                        for line in prompt_intake.newly_locked_lines(&pending.intake) {
+                            print_newt(&line, color, verbose);
+                        }
                     }
 
                     // The successor receipt and its resolved manifest are now
@@ -7279,6 +7633,16 @@ fn session_body(
                     if is_clarification_answer {
                         pending_clarification = None;
                     }
+
+                    // Pin before deriving ANY cognition value for this accepted
+                    // turn. Context/retrieval setup may block while another tab
+                    // changes a dial; wire intent and nested readers must keep
+                    // the same capture. This guard drops on every later exit.
+                    let _turn_binding =
+                        crate::session_worker::bind_turn(tabs.active().session_id());
+                    let cognition = newt_core::cognition::effective_cognition();
+                    let turn_api = choice.api;
+                    let turn_capabilities = choice.capability_decision();
 
                     // Pre-turn hardware snapshot: read the latest value the
                     // background sampler published (instant, never blocks). None
@@ -7304,7 +7668,10 @@ fn session_body(
                     // rebudget below keys the CURRENT serving principal — never the
                     // previous model's evidence, and never poisoning a sibling
                     // instance that happens to share a model name.
-                    cap_id = session_cap_id(choice.route_serving(), &choice.name, &inf_model);
+                    let new_cap_id =
+                        session_cap_id(choice.route_serving(), &choice.name, &inf_model);
+                    token_gauge = gauge_for_cap_switch(token_gauge, &cap_id, &new_cap_id);
+                    cap_id = new_cap_id;
 
                     // Per-model tuning: explicit config overrides global defaults.
                     let model_tune = cfg.find_model_tuning(&inf_model);
@@ -7345,29 +7712,17 @@ fn session_body(
                         cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens),
                     );
                     let eff_compaction_trigger_policy = compaction_trigger_policy(&cfg);
-                    let eff_input_ceiling_pct = newt_core::config::normalize_input_ceiling_pct(
-                        cfg.context
-                            .as_ref()
-                            .map(|c| c.input_ceiling_pct)
-                            .unwrap_or(80),
-                    );
+                    let eff_input_ceiling_pct = crate::context_window::input_ceiling_pct(&cfg);
 
                     // Lazy context-window discovery: /api/show is attempted at
                     // most ONCE per model per session — even when the fetch
                     // fails or the endpoint reports no context length, the
                     // `ctx_window_probed` negative cache prevents the
                     // every-turn refetch (Phase 20; `ensure_context_window`
-                    // alone only early-outs on success). Also reads the
-                    // empirically-confirmed max input (max_ok_input) used as
-                    // the pre-send budget gate (issue #223) and the learned
-                    // estimate-calibration ratio (Phase 20 §2.3).
-                    let (
-                        eff_context_window,
-                        eff_safe_context,
-                        eff_max_ok_input,
-                        eff_estimate_ratio,
-                        eff_recovered_hard_window,
-                    ) = {
+                    // alone only early-outs on success). The derivation itself
+                    // is `context_window::resolve`, shared with the startup
+                    // memory budget and the `/settings` Model section (#2567).
+                    let (context_window, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(cap_id.clone()).or_default();
                         // #1199: the server-declared window from session-start
                         // adopt (`inf_context_window`) is authoritative and
@@ -7385,67 +7740,27 @@ fn session_body(
                                 &inf_model,
                                 !real_context_discovery(&cfg, &inf_model),
                                 inf_kind,
+                                inf_key.as_deref(),
                             );
-                        let cached_sc = entry.safe_context;
-                        let cached_window = entry.context_window;
-                        let cached_hard_window = entry.hard_context_window;
-                        let moi = entry.max_ok_input;
+                        let facts = crate::context_window::facts_for(
+                            &cfg,
+                            inf_kind,
+                            &inf_model,
+                            inf_context_window,
+                            entry,
+                            &community_tunings,
+                            recovered_context_windows.get(&cap_id).copied(),
+                            context_size_override,
+                        );
                         let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        // Keep the full window separate from the derived input
-                        // cap. Chat Completions needs the former to reserve its
-                        // active maximum output; Ollama still uses the latter
-                        // as its conservative KV-allocation fallback.
-                        let requested_full_window = selected_model_context_window(
-                            inf_context_window.or(cached_window),
-                            model_tune.and_then(|t| t.context_window),
-                            community_tunings
-                                .find(&inf_model)
-                                .and_then(|profile| profile.context_window),
-                        );
-                        let recovered_hard_window = cap_context_window_by_recovery(
-                            recovered_context_windows.get(&cap_id).copied(),
-                            cached_hard_window,
-                        );
-                        let full_window = cap_context_window_by_recovery(
-                            requested_full_window,
-                            recovered_hard_window,
-                        );
-                        let sc = if inf_kind == newt_core::BackendKind::Openai {
-                            full_window
-                                .map(|window| {
-                                    newt_core::config::input_percentage_ceiling(
-                                        window,
-                                        eff_input_ceiling_pct,
-                                    )
-                                })
-                                .or(cached_sc)
-                        } else {
-                            recovered_hard_window
-                                .map(|window| {
-                                    newt_core::config::input_percentage_ceiling(
-                                        window,
-                                        eff_input_ceiling_pct,
-                                    )
-                                })
-                                .or_else(|| inf_context_window.map(|w| w * 80 / 100))
-                                .or(cached_sc)
-                                .or_else(|| model_tune.and_then(|t| t.context_window))
-                        };
-                        (full_window, sc, moi, ratio, recovered_hard_window)
+                        (crate::context_window::resolve(facts), ratio)
                     };
-
-                    // Apply the `/context size <N>` session override: it caps
-                    // both the safe-context budget and the max-ok-input guard to
-                    // the user's chosen ceiling. A raise past the probed value is
-                    // honored too — the user is explicitly opting into a larger
-                    // send window for experimentation.
-                    let (eff_safe_context, eff_max_ok_input) = match context_size_override {
-                        Some(n) => (Some(n), Some(n)),
-                        None => (eff_safe_context, eff_max_ok_input),
-                    };
+                    let eff_context_window = context_window.full_window;
+                    let eff_safe_context = context_window.safe_context;
+                    let eff_max_ok_input = context_window.max_ok_input;
 
                     // Memory providers keep their history but follow the
                     // currently selected model's budget. Rebinding every turn
@@ -7484,20 +7799,7 @@ fn session_body(
                         }
                     }
 
-                    // Context-window resolution: explicit num_ctx first. For
-                    // OpenAI, hand core the full window so its input percentage
-                    // and output reserve apply exactly once. For Ollama, retain
-                    // the safe-context fallback that caps KV allocation.
-                    let requested_num_ctx = model_tune
-                        .and_then(|t| t.num_ctx)
-                        .or_else(|| num_ctx(&cfg))
-                        .or_else(|| {
-                            context_window_for_core(inf_kind, eff_context_window, eff_safe_context)
-                        });
-                    let eff_num_ctx = cap_context_window_by_recovery(
-                        requested_num_ctx,
-                        eff_recovered_hard_window,
-                    );
+                    let eff_num_ctx = context_window.num_ctx;
 
                     // Build message list from memory manager. A fresh runtime
                     // block is prepended to the (frozen) system prompt EACH turn
@@ -7532,7 +7834,8 @@ fn session_body(
                     let recalled_caveats = permission_state
                         .recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()));
                     let turn_caveats = operating_mode_caveats(
-                        turn_operating_mode,
+                        active_operating_mode,
+                        conversation_mode_states.plan.is_active(),
                         meet_persona_caveats(
                             effective_caveats(&recalled_caveats, turn_posture.as_ref()),
                             active_persona.as_ref(),
@@ -7857,37 +8160,35 @@ fn session_body(
                     let persona_tools = active_persona
                         .as_ref()
                         .and_then(|p| p.profile.tools.as_deref());
-                    // Psyche: the turn's cognition → `reasoning.effort` (via
-                    // ChatCtx.cognition). Effective precedence: a live `/cognition`
-                    // override wins; else the active persona's declared cognition
-                    // (installed as PERSONA_COGNITION on activation); else `None`.
-                    let cognition = newt_core::cognition::effective_cognition();
                     // Cognition always rides the Responses wire and may also
                     // project to Chat Completions when the endpoint explicitly
                     // advertises that extension. Otherwise say so once — never
                     // silently accept and ignore a live dial.
                     if cognition.is_some() && !cognition_scope_noted {
-                        let responses = std::env::var("NEWT_OPENAI_API")
-                            .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
+                        let responses = choice.kind == newt_core::BackendKind::Openai
+                            && turn_api == newt_core::OpenAiApi::Responses;
                         let capable_chat = choice.kind == newt_core::BackendKind::Openai
-                            && choice.capability_decision().chat_completions().cognition
-                                == Some(true);
+                            && turn_capabilities.chat_completions().cognition == Some(true);
                         if !responses && !capable_chat {
                             print_newt(
-                                "note: the active backend does not advertise a cognition generation policy — cognition is ignored.",
+                                "note: the active backend does not advertise cognition wire controls; the semantic selection is retained.",
                                 color,
                                 verbose,
                             );
                             cognition_scope_noted = true;
                         }
                     }
-                    // The active posture's optional clamp is threaded to the
-                    // gate (re-clamps any session grant). A skill/framing-only
-                    // compatibility binding is genuinely `None` here.
-                    let preset_clamp = turn_posture
-                        .as_ref()
-                        .and_then(ActivePosture::permission_clamp)
-                        .cloned();
+                    // Explicit operating modes, model Plan, and any posture
+                    // clamp remain ceilings when the gate replays old grants
+                    // or admits new ones. An inferred style adds no ceiling.
+                    let preset_clamp = operating_mode_permission_clamp(
+                        active_operating_mode,
+                        conversation_mode_states.plan.is_active(),
+                        turn_posture
+                            .as_ref()
+                            .and_then(ActivePosture::permission_clamp)
+                            .cloned(),
+                    );
                     // #774 (P0): the exec FLOOR threaded to the bypass is the
                     // operator's `[tui.permissions]` exec clamp — a NON-OPTIONAL
                     // floor enforced even with no active `/posture`.
@@ -8145,18 +8446,6 @@ fn session_body(
                     // visible throughout.
                     let _disclosure_guard =
                         newt_core::ocap::scoped_session_disclosure(session_disclosure.clone());
-                    // #1669: bind THIS TURN to the tab that is active right
-                    // now, and pin its psyche — both dropped when the turn
-                    // ends, which is what lets the next turn see a `/tab`
-                    // switch and a moved dial.
-                    //
-                    // Scoped exactly like the disclosure guard above, and for
-                    // the same reason: all three describe THIS turn. Hoisting
-                    // any of them to session start would attribute a later
-                    // tab's work to the startup tab and freeze the dials for
-                    // the life of the process.
-                    let _turn_binding =
-                        crate::session_worker::bind_turn(tabs.active().session_id());
                     let turn_smart_harness = if let Some(config) = &smart_config {
                         let launch = newt_core::config::HarnessLaunch {
                             workspace: std::path::Path::new(workspace),
@@ -8169,7 +8458,7 @@ fn session_body(
                             (&active_conversation_id, messages.len() > 2),
                             config,
                             &launch,
-                            (&inf_url, inf_kind, choice.api),
+                            (&inf_url, inf_kind, turn_api),
                             || newt_inference::smart_harness::build(config, &inf_url, inf_kind),
                         ) {
                             Ok(harness) => Some(harness),
@@ -8274,17 +8563,17 @@ fn session_body(
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         cognition,
-                                        chat_completions_capability: choice
-                                            .capability_decision().chat_completions(),
+                                        chat_completions_capability: turn_capabilities.chat_completions(),
+                                        responses_capability: turn_capabilities.responses(),
+                                        openai_api: turn_api,
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
+                                        overflow_retry: model_tune
+                                            .and_then(|t| t.overflow_retry)
+                                            .unwrap_or_default(),
                                         attempt_ledger: Some(&turn_attempts),
-                                        reasoning_replay_scope: choice
-                                            .capability_decision()
-                                            .reasoning_replay_scope(),
-                                        emits_leading_reasoning: choice
-                                            .capability_decision()
-                                            .emits_leading_reasoning(),
+                                        reasoning_replay_scope: turn_capabilities.reasoning_replay_scope(),
+                                        emits_leading_reasoning: turn_capabilities.emits_leading_reasoning(),
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the
@@ -8453,28 +8742,18 @@ fn session_body(
                     // error; preserve that transition as unattributed evidence.
                     let artifact_head_after_turn =
                         git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
-                    // #1709 family — attribution EPOCH boundary. The contributor
-                    // ledger is now consumed AT THE COMMIT BOUNDARY (inside the
-                    // tool round, in newt-core's `ledger_consume_at_commit_epoch`
-                    // — invoked right after a confirmed-successful
-                    // `commit`/`amend`/`rebase` git call), NOT here at the
-                    // end-of-turn drain. Clearing at the epoch boundary consumes
-                    // exactly the contributors that existed BEFORE that commit
-                    // (already credited on it via the loop-top snapshot) and
-                    // resets the ledger's dedup set, so work landing AFTER a
-                    // mid-turn commit (A edits → C1 → A edits more → turn ends →
-                    // switch B → C2) re-records fresh and survives to the next
-                    // commit — C2 credits A + B. The previous end-of-turn blanket
-                    // `clear()` erased that post-commit work, so it is REMOVED
-                    // (req 5): nothing here may clear the ledger. A failed commit
-                    // consumes nothing (the epoch clear is gated on `ok`).
+                    // Core's per-call AttributionEpoch reconciles the same
+                    // host-confirmed publication counter for embedded and
+                    // native Git. It consumes earlier contributors even if a
+                    // compound shell call later fails, while retaining the
+                    // active model for possible post-commit shell effects.
+                    // Later tool calls re-record fresh contributions normally.
                     //
-                    // `drain_commit_success` is retained as the explicit
-                    // confirmed-commit telemetry signal (and resets the counter);
-                    // it no longer drives a ledger clear. A `HEAD` move from an
-                    // external/manual action (a user `git reset`, a fetch
-                    // advancing the branch, a checkout, …) is NOT a Newt commit
-                    // and never was a clear trigger.
+                    // This telemetry drain runs only AFTER the awaited agent
+                    // run above; never drain concurrently with its per-call
+                    // before/after observations. Do not clear the ledger here:
+                    // doing so would erase work after a mid-turn commit. Output
+                    // text and external/manual HEAD moves are not this signal.
                     let new_commits = session_git_tool
                         .as_ref()
                         .map_or(0, |t| t.drain_commit_success());
@@ -8599,14 +8878,14 @@ fn session_body(
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)
                                             .max(20);
-                                        print!("▸  ");
+                                        print!("{}", newt_core::agentic::REPLY_MARKER);
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
                                                 &reply,
                                                 newt_core::agentic::RenderOpts {
                                                     color: true,
-                                                    cols
+                                                    cols: newt_core::agentic::reply_cols(cols),
                                                 },
                                             )
                                         );
@@ -8636,12 +8915,15 @@ fn session_body(
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)
                                             .max(20);
-                                        print!("▸  ");
+                                        print!("{}", newt_core::agentic::REPLY_MARKER);
                                         print!(
                                             "{}",
                                             newt_core::agentic::render_markdown(
                                                 &plan.draft.markdown,
-                                                newt_core::agentic::RenderOpts { color, cols },
+                                                newt_core::agentic::RenderOpts {
+                                                    color,
+                                                    cols: newt_core::agentic::reply_cols(cols),
+                                                },
                                             )
                                         );
                                         println!();
@@ -9057,19 +9339,29 @@ fn session_body(
                                     };
                                     let gauge_budget = context_gauge_budget(
                                         inf_kind,
-                                        choice.api,
+                                        turn_api,
                                         eff_num_ctx,
                                         recovered_context_window.get(),
                                         eff_input_ceiling_pct,
                                         cognition,
                                         model_tune.and_then(|t| t.output_allowance),
-                                        choice.capability_decision().chat_completions(),
-                                        choice.capability_decision().reasoning_replay_scope(),
+                                        turn_capabilities.chat_completions(),
+                                        turn_capabilities.reasoning_replay_scope(),
                                         gauge_max_ok,
                                         gauge_safe,
                                     );
                                     if let Some(budget) = gauge_budget {
-                                        token_gauge = Some((input_tokens, budget));
+                                        // #2466: the gauge denominator is only
+                                        // a real WINDOW when the server or a
+                                        // hard-400 recovery declared one — a
+                                        // budget resolved purely from the
+                                        // learned ratchet (`gauge_max_ok`/
+                                        // `gauge_safe`) is not a window and
+                                        // must render as `used/?`.
+                                        let window_known = eff_num_ctx.is_some()
+                                            || recovered_context_window.get().is_some();
+                                        token_gauge =
+                                            Some((input_tokens, window_known.then_some(budget)));
                                     }
                                 }
                             }

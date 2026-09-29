@@ -246,3 +246,56 @@ fn malformed_calls_are_never_dispatched_invocation_count_is_zero() {
     );
     assert_eq!(dispatched_names, vec!["git", "list_dir"]);
 }
+
+#[test]
+fn withdraw_tool_calls_only_touches_an_assistant_turn() {
+    let calls = serde_json::json!([{"type": "function"}]);
+    let mut assistant =
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": calls});
+    withdraw_tool_calls(&mut assistant);
+    assert!(assistant.get("tool_calls").is_none());
+    assert!(
+        assistant["content"].is_string(),
+        "no null assistant content"
+    );
+
+    let mut other = serde_json::json!({"role": "user", "content": "hi", "tool_calls": calls});
+    let before = other.clone();
+    withdraw_tool_calls(&mut other);
+    assert_eq!(other, before, "a non-assistant message is left alone");
+}
+
+#[test]
+fn withdraw_gives_blank_string_content_the_placeholder_too() {
+    for blank in [serde_json::json!(""), serde_json::json!("  \n")] {
+        let mut turn = serde_json::json!({"role": "assistant", "content": blank, "tool_calls": []});
+        withdraw_tool_calls(&mut turn);
+        assert!(
+            turn["content"]
+                .as_str()
+                .is_some_and(|c| !c.trim().is_empty()),
+            "{turn}"
+        );
+    }
+    let mut turn =
+        serde_json::json!({"role": "assistant", "content": "Reading.", "tool_calls": []});
+    withdraw_tool_calls(&mut turn);
+    assert_eq!(turn["content"], "Reading.", "real text is kept");
+}
+
+#[test]
+fn the_re_ask_names_the_validators_reason() {
+    let mut strikes = 0;
+    let text = reask_uncorrelatable(
+        &mut strikes,
+        "tool call #2 repeats call id \"dup\" — ambiguous result routing",
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(text.contains("repeats call id"), "{text}");
+    assert!(
+        !text.contains("without call ids"),
+        "no false claim for duplicates: {text}"
+    );
+}

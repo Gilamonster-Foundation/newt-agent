@@ -4,8 +4,43 @@
 
 use super::*;
 
+/// What the MODEL got and what the OPERATOR saw, separately. Color off prints
+/// the display text verbatim (the plain-terminal fallback), so each side is
+/// asserted on its own: on success the model gets a one-line headline
+/// ("Modified (+1 -1)"), the operator keeps the full diff (pi's content vs
+/// details split; Codex's "Updated the following files"). Live 2026-09-23:
+/// echoing a 1,497-line new file back to the model spilled it, and the model
+/// spent a round reading its own write back.
+async fn model_and_display(
+    name: &str,
+    args: serde_json::Value,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+    collab: ToolCollaborators<'_, '_>,
+) -> (String, String) {
+    let mut display = ToolDisplay::new(Vec::new(), false, 4096, 0, false);
+    let model = execute_tool_with_display_cancellable(
+        &mut display,
+        name,
+        &args,
+        &ws.to_string_lossy(),
+        false,
+        20,
+        caveats,
+        &mut NoMcp,
+        collab,
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (model, String::from_utf8(display.into_inner()).unwrap())
+}
+
 #[tokio::test]
-async fn actual_file_operations_supply_rich_cells_without_changing_the_raw_receipt() {
+async fn a_successful_mutation_gives_the_model_a_headline_and_the_operator_the_diff() {
     let ws = tempfile::TempDir::new().unwrap();
     let path = "state.rs";
     for (name, args, kind) in [
@@ -40,7 +75,11 @@ async fn actual_file_operations_supply_rich_cells_without_changing_the_raw_recei
         .await
         .unwrap()
         .unwrap();
-        assert!(raw.contains("```diff"), "canonical returned patch: {raw}");
+        assert!(
+            !raw.contains("```diff"),
+            "the model gets a headline, not the patch: {raw}"
+        );
+        assert!(raw.contains(&format!("{kind} (+")), "{raw}");
         let visible = String::from_utf8(display.into_inner()).unwrap();
         assert!(
             visible.contains(&format!("{kind} \"state.rs\"")),
@@ -204,8 +243,12 @@ async fn file_receipts_keep_raw_source_but_neutralize_terminal_controls() {
             after.as_deref(),
         )
         .unwrap();
-        assert!(raw.contains(&expected_receipt), "raw {name} result changed");
-        assert!(raw.contains("\u{1b}]52;"), "raw source was lost");
+        let headline = expected_receipt.lines().next().unwrap();
+        assert!(raw.contains(headline), "{name} headline missing: {raw:?}");
+        assert!(
+            !raw.contains("\u{1b}]52;"),
+            "the model gets no file bytes on success: {raw:?}"
+        );
         let visible = String::from_utf8(display.into_inner()).unwrap();
         assert!(
             visible.chars().all(|ch| !ch.is_control() || ch == '\n'),
@@ -321,77 +364,68 @@ async fn a_write_captures_its_preimage_after_confirmation() {
         fs_write: Scope::All,
         ..caveats_rw(ws.path())
     };
-    let output = execute_tool(
+    let (model, seen) = model_and_display(
         "write_file",
-        &serde_json::json!({"path": "state.txt", "content": "written\n"}),
-        &ws.path().to_string_lossy(),
-        false,
-        20,
+        serde_json::json!({"path": "state.txt", "content": "written\n"}),
+        ws.path(),
         &caveats,
-        &mut NoMcp,
-        None,
-        None,
-        None,
-        None,
-        Some(&mut gate),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate),
+            ..ToolCollaborators::default()
+        },
     )
     .await;
-    assert!(
-        output.contains("-changed while confirming\n+written\n"),
-        "{output}"
-    );
-    assert!(!output.contains("-before confirmation"), "{output}");
+    assert!(model.contains("Modified (+1 -1)"), "{model}");
+    assert!(seen.contains("-changed while confirming"), "{seen}");
+    assert!(seen.contains("+written"), "{seen}");
+    assert!(!seen.contains("-before confirmation"), "{seen}");
 }
 
 #[tokio::test]
 async fn sequential_file_tools_show_the_immediate_change_without_an_artifact_sink() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_rw(ws.path());
-    let added = run_tool(
+    let (added, seen) = model_and_display(
         "write_file",
         serde_json::json!({"path": "state.txt", "content": "one\n"}),
         ws.path(),
         &caveats,
-        None,
+        ToolCollaborators::default(),
     )
     .await;
     assert!(added.starts_with("wrote state.txt"), "{added}");
     assert!(added.contains("Added (+1 -0)"), "{added}");
-    assert!(added.contains("--- /dev/null\n"), "{added}");
-    assert!(added.contains("+one\n"), "{added}");
+    assert!(
+        !added.contains("--- /dev/null"),
+        "no patch to the model: {added}"
+    );
+    assert!(seen.contains("--- /dev/null"), "{seen}");
+    assert!(seen.contains("+one"), "{seen}");
 
-    let edited = run_tool(
+    let (edited, seen) = model_and_display(
         "edit_file",
         serde_json::json!({"path": "state.txt", "old_string": "one", "new_string": "two"}),
         ws.path(),
         &caveats,
-        None,
+        ToolCollaborators::default(),
     )
     .await;
     assert!(edited.starts_with("edited state.txt"), "{edited}");
     assert!(edited.contains("Modified (+1 -1)"), "{edited}");
-    assert!(edited.contains("-one\n+two\n"), "{edited}");
-    assert!(!edited.contains("--- /dev/null\n"), "{edited}");
+    assert!(seen.contains("-one") && seen.contains("+two"), "{seen}");
+    assert!(!seen.contains("--- /dev/null"), "{seen}");
 
-    let deleted = run_tool(
+    let (deleted, seen) = model_and_display(
         "delete_file",
         serde_json::json!({"path": "state.txt"}),
         ws.path(),
         &caveats,
-        None,
+        ToolCollaborators::default(),
     )
     .await;
     assert!(deleted.starts_with("deleted state.txt"), "{deleted}");
     assert!(deleted.contains("Deleted (+0 -1)"), "{deleted}");
-    assert!(deleted.contains("-two\n"), "{deleted}");
+    assert!(seen.contains("-two"), "{seen}");
     assert!(!ws.path().join("state.txt").exists());
 }
 
@@ -400,18 +434,30 @@ async fn sequential_file_tools_show_the_immediate_change_without_an_artifact_sin
 async fn a_failed_build_check_keeps_the_verified_tool_change() {
     let ws = tempfile::TempDir::new().unwrap();
     std::fs::write(ws.path().join("state.txt"), "old\n").unwrap();
-    let output = run_tool(
+    let caveats = Caveats {
+        // This tests the write receipt; macOS cannot admit restricted networking.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let (output, seen) = model_and_display(
         "write_file",
         serde_json::json!({"path": "state.txt", "content": "tool bytes\n"}),
         ws.path(),
-        &caveats_rw(ws.path()),
-        Some("printf 'build bytes\\n' > state.txt; exit 1"),
+        &caveats,
+        ToolCollaborators {
+            build_check_cmd: Some("printf 'build bytes\\n' > state.txt; exit 1"),
+            ..ToolCollaborators::default()
+        },
     )
     .await;
     assert!(output.contains("Modified (+1 -1)"), "{output}");
-    assert!(output.contains("-old\n+tool bytes\n"), "{output}");
-    assert!(!output.contains("+build bytes\n"), "{output}");
     assert!(output.contains("build check failed"), "{output}");
+    assert!(
+        seen.contains("-old") && seen.contains("+tool bytes"),
+        "{seen}"
+    );
+    assert!(!seen.contains("+build bytes"), "{seen}");
     assert_eq!(
         std::fs::read_to_string(ws.path().join("state.txt")).unwrap(),
         "build bytes\n"
@@ -436,7 +482,7 @@ async fn unavailable_preimages_do_not_become_added_file_receipts() {
     .await;
     assert!(output.starts_with("wrote state.txt"), "{output}");
     assert!(
-        output.contains("file-change receipt unavailable"),
+        output.contains("File operation succeeded; optional change preview unavailable"),
         "{output}"
     );
     assert!(!output.contains("private old bytes"), "{output}");
@@ -452,10 +498,141 @@ async fn unavailable_preimages_do_not_become_added_file_receipts() {
     )
     .await;
     assert!(
-        binary.contains("file-change receipt unavailable"),
+        binary.contains("File operation succeeded; optional change preview unavailable"),
         "{binary}"
     );
     assert!(!binary.contains("Added (+"), "{binary}");
+}
+
+#[tokio::test]
+async fn unavailable_receipt_preview_preserves_mutation_outcome() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let content = "x".repeat(crate::agentic::tools::file_change::MAX_VERSION_BYTES + 1);
+    let (model, display) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "large.txt", "content": content}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("large.txt")).unwrap(),
+        content
+    );
+    assert!(tool_result_ok(&model), "{model}");
+    assert!(model.starts_with("wrote large.txt"), "{model}");
+    assert!(
+        model.contains("File operation succeeded; optional change preview unavailable"),
+        "{model}"
+    );
+    assert!(!model.contains("receipt capture limit"), "{model}");
+    assert!(
+        display.contains(
+            "file-change receipt unavailable: receipt capture limit exceeded (256 KiB per version)"
+        ),
+        "{display}"
+    );
+
+    // The parent is a regular file, so the actual authorized write fails.
+    // Its unavailable receipt must not acquire success wording or hide failure.
+    std::fs::write(ws.path().join("blocked"), "keep these bytes").unwrap();
+    let (failed, display) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "blocked/child.txt", "content": "not written"}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(!tool_result_ok(&failed), "{failed}");
+    assert!(!failed.contains("File operation succeeded"), "{failed}");
+    assert!(
+        failed.contains("file-change receipt unavailable"),
+        "{failed}"
+    );
+    assert!(
+        display.contains("file-change receipt unavailable"),
+        "{display}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("blocked")).unwrap(),
+        "keep these bytes"
+    );
+}
+
+/// A precise file grant remains sufficient to verify its own deletion after
+/// the path cannot be canonicalized any more. This is a Windows-only witness:
+/// the fallback physical-containment probe must not turn a successful,
+/// authorized delete into an unverified mutation merely because its exact
+/// scope root has disappeared.
+#[cfg(windows)]
+#[tokio::test]
+async fn exact_file_grant_verifies_its_deleted_leaf() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let file = ws.path().join("state.txt");
+    std::fs::write(&file, "before\n").unwrap();
+    let granted = file.to_string_lossy().into_owned();
+    let caveats = Caveats {
+        fs_read: Scope::only([granted.clone()]),
+        fs_write: Scope::only([granted]),
+        ..Caveats::top()
+    };
+
+    let output = run_tool(
+        "delete_file",
+        serde_json::json!({"path": "state.txt"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(output.starts_with("deleted state.txt"), "{output}");
+    assert!(output.contains("Deleted (+0 -1)"), "{output}");
+    assert!(!file.exists());
+}
+
+/// Windows maps both a missing leaf and a regular-file-parent traversal to
+/// `NotFound`; only the former may prove an absent postimage. An existing
+/// directory is likewise unreadable as a regular file, not absent.
+#[cfg(windows)]
+#[test]
+fn windows_not_found_receipts_require_a_missing_leaf_below_a_directory() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let blocked = ws.path().join("blocked");
+    std::fs::write(&blocked, "regular file").unwrap();
+    let workspace_scope = Scope::only([ws.path().to_string_lossy().into_owned()]);
+    let through_regular_file = blocked.join("child.txt");
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&workspace_scope, &through_regular_file),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &workspace_scope,
+        &through_regular_file
+    ));
+
+    let through_missing_parent = ws.path().join("missing-parent/child.txt");
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&workspace_scope, &through_missing_parent),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &workspace_scope,
+        &through_missing_parent
+    ));
+
+    let directory = ws.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let exact_directory_scope = Scope::only([directory.to_string_lossy().into_owned()]);
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&exact_directory_scope, &directory),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &exact_directory_scope,
+        &directory
+    ));
 }
 
 #[cfg(unix)]
@@ -474,7 +651,7 @@ async fn deleting_a_final_symlink_does_not_report_its_target_contents_as_deleted
     .await;
     assert!(output.starts_with("deleted link.txt"), "{output}");
     assert!(
-        output.contains("file-change receipt unavailable"),
+        output.contains("File operation succeeded; optional change preview unavailable"),
         "{output}"
     );
     assert!(!output.contains("-target remains"), "{output}");
@@ -483,4 +660,256 @@ async fn deleting_a_final_symlink_does_not_report_its_target_contents_as_deleted
         std::fs::read_to_string(ws.path().join("target.txt")).unwrap(),
         "target remains\n"
     );
+}
+
+// -- moving code by line range: no retyping, no shell dialect -------------
+//
+// Live 2026-09-23: a retyped 1,263-line move fabricated symbols; a shell sed
+// range copy then failed on BSD-vs-GNU syntax and left `mod.rs-e` behind.
+
+#[tokio::test]
+async fn copy_from_moves_a_line_range_byte_exact_after_a_typed_header() {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        ws.path().join("src.rs"),
+        "l1\nfn moved() {\n    body();\n}\nl5\n",
+    )
+    .unwrap();
+    let (model, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "dst.rs", "content": "use x;\n",
+            "copy_from": {"path": "src.rs", "start_line": 2, "end_line": 4}}),
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(model.contains("Added (+4 -0)"), "{model}");
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("dst.rs")).unwrap(),
+        "use x;\nfn moved() {\n    body();\n}\n"
+    );
+}
+
+/// `copy_from` reads through read_file's own fence: a source outside the
+/// fs_read scope is refused, and nothing is written.
+#[tokio::test]
+async fn copy_from_a_source_outside_the_read_scope_is_denied_and_writes_nothing() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "private\n").unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+        ..caveats_rw(ws.path())
+    };
+    let (model, _) = model_and_display(
+        "write_file",
+        serde_json::json!({"path": "dst.txt", "content": "",
+            "copy_from": {"path": secret.to_string_lossy(), "start_line": 1, "end_line": 1}}),
+        ws.path(),
+        &caveats,
+        ToolCollaborators::default(),
+    )
+    .await;
+    assert!(
+        model.contains("fs_read"),
+        "refusal names the denied axis: {model}"
+    );
+    assert!(!model.contains("private"), "{model}");
+    assert!(!ws.path().join("dst.txt").exists(), "nothing written");
+}
+
+// -- an incomplete edit must never become a deletion ------------------------
+//
+// `new_string` was read with `unwrap_or("")` since Step 9.7 (#253): an edit
+// that arrived WITHOUT it silently deleted its target. Under context pressure
+// a weak model does drop keys (live, 2026-09-23: nine `edit_file` calls
+// carrying only {path, new_string} in one run), and the line-range mode added
+// in #2553 made the failure easy to hit — `{path, start_line, end_line}` alone
+// deleted those lines. The harness now validates the call before touching the
+// file: `new_string` must be present and a string; an explicit "" still
+// deletes on purpose. The range mode is removed (it was also unbound to the
+// version the model observed, so a stale range hit the wrong lines).
+
+const EDIT_FIXTURE: &str = "line a\nline b\nline c\nline d\nline e\n";
+
+async fn edit_outcome(args: serde_json::Value) -> (String, String) {
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+    let (model, _) = model_and_display(
+        "edit_file",
+        args,
+        ws.path(),
+        &caveats_rw(ws.path()),
+        ToolCollaborators::default(),
+    )
+    .await;
+    let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+    (model, after)
+}
+
+#[tokio::test]
+async fn an_edit_without_a_string_new_string_fails_and_changes_nothing() {
+    for args in [
+        // The review's exact reproduction: a valid range, no new_string.
+        serde_json::json!({"path": "fixture.rs", "start_line": 2, "end_line": 4}),
+        // The older path: a matching old_string, no new_string.
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b"}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": null}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": 7}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": false}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": ["x"]}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "new_string": {"x": 1}}),
+    ] {
+        let (model, after) = edit_outcome(args.clone()).await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("new_string"),
+            "names the missing field: {model}"
+        );
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+    }
+}
+
+#[tokio::test]
+async fn a_line_range_selector_is_refused_and_changes_nothing() {
+    for args in [
+        serde_json::json!({"path": "fixture.rs", "start_line": 2, "end_line": 4, "new_string": "x"}),
+        serde_json::json!({"path": "fixture.rs", "start_line": 2, "new_string": ""}),
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b", "end_line": 4, "new_string": "x"}),
+    ] {
+        let (model, after) = edit_outcome(args.clone()).await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("line range"),
+            "says ranges are not supported: {model}"
+        );
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_empty_new_string_still_deletes_on_purpose() {
+    let (model, after) = edit_outcome(
+        serde_json::json!({"path": "fixture.rs", "old_string": "line b\n", "new_string": ""}),
+    )
+    .await;
+    assert!(tool_result_ok(&model), "{model}");
+    assert_eq!(after, "line a\nline c\nline d\nline e\n");
+}
+
+// -- write_file: the same dropped-key bug ----------------------------------
+//
+// `content` was read with `unwrap_or("")`, so a write that dropped it emptied
+// the file and reported success. The shrink guard only fires past 30 lines
+// and 30%, so a small file was wiped silently and a new path created empty.
+
+#[tokio::test]
+async fn a_write_without_a_string_content_fails_and_changes_nothing() {
+    for args in [
+        serde_json::json!({"path": "fixture.rs"}),
+        serde_json::json!({"path": "fixture.rs", "content": null}),
+        serde_json::json!({"path": "fixture.rs", "content": 7}),
+        serde_json::json!({"path": "new.rs"}),
+    ] {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+        let (model, _) = model_and_display(
+            "write_file",
+            args.clone(),
+            ws.path(),
+            &caveats_rw(ws.path()),
+            ToolCollaborators::default(),
+        )
+        .await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {args} -> {model}"
+        );
+        assert!(
+            model.contains("content"),
+            "names the missing field: {model}"
+        );
+        let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {args}");
+        assert!(
+            !ws.path().join("new.rs").exists(),
+            "no empty file created for {args}"
+        );
+    }
+}
+
+/// A malformed call is refused before the operator is asked to approve it:
+/// approving an edit that is then refused anyway wastes the human's consent.
+struct NeverAsked;
+
+impl PermissionGate for NeverAsked {
+    fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        panic!("a malformed call reached the permission gate: {requests:?}")
+    }
+
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
+        panic!("a malformed call reached the confirm prompt: {question}")
+    }
+}
+
+#[tokio::test]
+async fn malformed_mutations_are_refused_before_the_permission_gate() {
+    for (tool, args, names) in [
+        (
+            "edit_file",
+            serde_json::json!({"path": "fixture.rs", "old_string": "", "new_string": "x"}),
+            "old_string",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"path": "fixture.rs", "new_string": "x"}),
+            "old_string",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"old_string": "line b", "new_string": "x"}),
+            "path",
+        ),
+        ("write_file", serde_json::json!({"content": "x"}), "path"),
+        (
+            "write_file",
+            serde_json::json!({"path": "fixture.rs"}),
+            "content",
+        ),
+    ] {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("fixture.rs"), EDIT_FIXTURE).unwrap();
+        // Writes are outside scope, so a well-formed call WOULD ask the gate.
+        let caveats = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = NeverAsked;
+        let (model, _) = model_and_display(
+            tool,
+            args.clone(),
+            ws.path(),
+            &caveats,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate),
+                ..ToolCollaborators::default()
+            },
+        )
+        .await;
+        assert!(
+            !tool_result_ok(&model),
+            "must be a FAILED call: {tool} {args} -> {model}"
+        );
+        assert!(model.contains(names), "names `{names}`: {model}");
+        let after = std::fs::read_to_string(ws.path().join("fixture.rs")).unwrap();
+        assert_eq!(after, EDIT_FIXTURE, "bytes unchanged for {tool} {args}");
+    }
 }

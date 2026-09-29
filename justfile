@@ -327,11 +327,15 @@ bench-publish:
 # Offline eval-ingestion self-tests (#2316): fixture Harbor runs through
 # parse_run and cross-tab.py. Stdlib Python, well under a second. The ratchet
 # row consumers (#2317) run their own offline self-tests: no gh, no models.
+# The container adapter's lane tests (test_lanes.py) import `harbor`, which is not
+# installed here or in CI: the test-only stub under
+# scripts/eval/harbor/tests/stubs stands in for it.
 # HOOK PARITY: runs inside `just check`; mirrors the "eval self-tests
 # (eval-selftest)" step in .github/workflows/ci.yml. Add a line to both.
 eval-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test
     PYTHONPATH=scripts/eval/harbor python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_tb_campaign.py'
+    PYTHONPATH=scripts/eval/harbor:scripts/eval/harbor/tests/stubs python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_lanes.py'
     bash scripts/eval/sweep.sh --self-test
     bash scripts/eval/file-regressions.sh --self-test
 
@@ -368,24 +372,26 @@ audit:
 # --- MSRV (A2) ---
 
 # MSRV gate: the workspace — lib, bin AND test targets — must compile on the
-# declared rust-version (1.88, [workspace.package] in Cargo.toml). PIPELINE
-# PARITY: mirrors the "MSRV (Rust 1.88)" job in .github/workflows/ci.yml and
+# declared rust-version ([workspace.package] in Cargo.toml — the ONE place the
+# number lives; this recipe and CI read it). PIPELINE
+# PARITY: mirrors the MSRV job in .github/workflows/ci.yml and
 # the .githooks/pre-push hook. `--all-targets` is what makes dev-dependencies
 # count (#2161): without it they resolve but never build, so their
 # rust-version is never enforced and the floor can drift under the tests.
 # The feature flags match `just test` and the CI test/lint jobs: a kernel- or
 # schema-gated dependency is otherwise never resolved here at all.
-# Local best-effort: needs rustup + the 1.88 toolchain; skips (with a note)
+# Local best-effort: needs rustup + the declared toolchain; skips (with a note)
 # otherwise — CI is the hard gate.
 msrv:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! rustup toolchain list 2>/dev/null | grep -q '^1\.88'; then
-        echo "[msrv] rust 1.88 toolchain not installed — skipping locally (CI enforces it)."
-        echo "        install: rustup toolchain install 1.88"
+    msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    if ! rustup toolchain list 2>/dev/null | grep -q "^${msrv}"; then
+        echo "[msrv] rust ${msrv} toolchain not installed — skipping locally (CI enforces it)."
+        echo "        install: rustup toolchain install ${msrv}"
         exit 0
     fi
-    cargo +1.88 check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
+    cargo +"${msrv}" check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
 
 # --- Coverage ---
 #

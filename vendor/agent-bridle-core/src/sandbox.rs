@@ -1,0 +1,4704 @@
+//! OS-level sandbox plumbing.
+//!
+//! The L3 boundary is the only layer that can confine a *permitted external
+//! program's own syscalls* once it has spawned — what neither the static
+//! decomposition (L1) nor the in-process interceptor (L2) can see. It is
+//! OS-specific, so each operating system gets its own backend behind one
+//! [`Sandbox`] trait, selected in code by [`best_available_sandbox`] (one
+//! `cfg(target_os, feature)` arm per backend, with a runtime capability probe),
+//! never overclaiming: a build either compiles a real backend for its host or
+//! falls back to the advisory [`NoopSandbox`] reporting [`SandboxKind::None`]
+//! (DESIGN §6, ADR 0001 L3, **ADR 0006** per-OS backends, **ADR 0009** the
+//! cross-platform strategy).
+//!
+//! - **Linux** — [`LandlockSandbox`] (`linux-landlock`): a real Landlock ruleset
+//!   confining the `fs_write` axis, and `fs_read` when restricted. `restrict_self`
+//!   confines the calling thread (inherited across `fork`/`execve`). Direct
+//!   execute rules narrow `execve` but do not close the loader trampoline, so
+//!   `exec` remains honestly `Interceptor`; ABI-v4 kernels can kernel-deny all
+//!   TCP egress for an empty `net` scope.
+//! - **macOS** — [`SeatbeltSandbox`] (`macos-seatbelt`): an SBPL profile derived
+//!   from the effective [`Caveats`], applied by wrapping the spawned program in
+//!   `sandbox-exec(1)` (no FFI — core forbids `unsafe`). Confines both filesystem
+//!   axes, restricted `exec`, and empty or loopback-only `net` scopes. General
+//!   remote-host allowlists use the separately fenced proxy path and remain
+//!   conservatively reported at their userspace strength.
+//! - **Windows** — [`SandboxKind::AppContainer`] (`windows-appcontainer`): a
+//!   process-creation wrapper applies filesystem DACLs, deny-all or loopback-only
+//!   network policy, and the kernel child-process block for `exec: Only([])`.
+//!   Non-empty exec allowlists cannot be expressed without WDAC and stay
+//!   `Interceptor`.
+//!
+//! A backend confines either by restricting the calling thread in [`Sandbox::apply`]
+//! (Landlock) **or** by wrapping the spawned command via
+//! [`Sandbox::command_prefix`] (Seatbelt/AppContainer); a spawn site honors both,
+//! so the mechanism is uniform at the call site.
+
+use crate::{Caveats, SandboxPolicy, ToolResult};
+use std::sync::Arc;
+
+/// Which OS-level sandbox actually backs an authorization.
+///
+/// Recorded in every [`crate::ToolContext`] and surfaced in every result
+/// envelope so callers can tell whether the leash is kernel-enforced or merely
+/// advisory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxKind {
+    /// A real Landlock ruleset is active (Linux). Kernel-enforced.
+    Landlock,
+    /// A real Seatbelt (`sandbox-exec` SBPL) profile is active (macOS).
+    /// Kernel-enforced against the spawned program's interior.
+    Seatbelt,
+    /// A real AppContainer token is active (Windows). Kernel-enforced.
+    AppContainer,
+    /// A Linux **minimal-rootfs mount-namespace jail** is active (ADR 0013 D3/D4,
+    /// agent-bridle#109/#108). The process runs in a `pivot_root` jail that
+    /// physically contains only the granted program files, so `exec` is
+    /// kernel-confined by **identity** — no un-granted binary *exists* to run or to
+    /// `ld.so`-trampoline into (ADR 0011 D7's precondition is now physically true,
+    /// not asserted) — and the filesystem axes are kernel-confined by the
+    /// read-only/read-write bind-mounts. Network is not namespaced at this tier, so
+    /// `net` stays advisory (never overclaimed). Reserved for the minimal-rootfs
+    /// mode: a Landlock-only boundary run stays [`SandboxKind::Landlock`] (its exec
+    /// axis is held — ADR 0011).
+    MinimalRootfs,
+    /// A Linux **Tier-2 micro-VM** is active (ADR 0013 D3, ADR 0009 D2,
+    /// agent-bridle#111): the same minimal rootfs booted as a qemu guest under a
+    /// separate kernel. Identity is closed as in [`SandboxKind::MinimalRootfs`]
+    /// (only the granted program exists in the guest) and the filesystem is confined
+    /// by the guest boundary; with no guest network device, egress is impossible —
+    /// so `exec`, the fs axes, **and** `net` are all kernel-confined, and a
+    /// guest-kernel compromise is still contained. The strongest tier.
+    MicroVm,
+    /// No OS-level sandbox — the leash is in-process/advisory only. This is the
+    /// honest default on a host with no compiled-and-capable backend.
+    #[default]
+    None,
+}
+
+/// An OS-level confinement that can be applied from a set of [`Caveats`].
+///
+/// Implementations translate the lattice's `fs_read`/`fs_write`/`exec`/`net`
+/// axes into the kernel rules their native backend can honestly express.
+pub trait Sandbox: Send + Sync {
+    /// The kind of confinement this sandbox provides.
+    fn kind(&self) -> SandboxKind;
+
+    /// The executable-identity proof domain actually installed by this backend.
+    fn exec_boundary(&self) -> crate::ExecBoundary {
+        crate::ExecBoundary::ProcessTree
+    }
+
+    /// Apply the confinement for the given effective caveats. Called by a tool
+    /// *before* it does any privileged work, on the thread/process that will do
+    /// it. A `Noop` implementation succeeds without restricting anything.
+    ///
+    /// This is the confinement mechanism for *thread-confining* backends
+    /// (Landlock's `restrict_self`). *Wrapper-based* backends (macOS Seatbelt)
+    /// confine via [`Sandbox::command_prefix`] instead and make this a no-op.
+    fn apply(&self, effective: &Caveats) -> ToolResult<()>;
+
+    /// The argv prefix that wraps a child so a *wrapper-based* L3 backend
+    /// confines it (macOS `sandbox-exec`). The returned vector, prepended to a
+    /// `(program, args…)`, is the argv that must actually be spawned.
+    ///
+    /// Backends that confine the spawning thread in [`Sandbox::apply`]
+    /// (Landlock) or that do not confine ([`NoopSandbox`]) return an **empty**
+    /// prefix. A spawn site applies *both* `apply()` and this prefix, so either
+    /// mechanism is honored without the caller knowing which backend is active.
+    ///
+    /// **Fail-closed:** a backend that is selected but cannot build its wrapper
+    /// (e.g. the wrapper binary is missing) returns `Err` — never an empty
+    /// (silently unconfined) prefix. The default is the empty prefix.
+    fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+        let _ = effective;
+        Ok(Vec::new())
+    }
+
+    /// A **conservative upper bound** on the authority this backend/mechanism
+    /// stack can actually deliver to a *hostile* child, per axis — NOT a
+    /// projection of the rules we intend to install (I15 / INV-BOUND, the grain
+    /// corollary). A known mechanism bypass — `io_uring` egress under `net:none`,
+    /// an ambient Mach network deputy, an executable process image outside the
+    /// exec grant, a symlinked grant root, a DACL that necessarily confers read
+    /// on a write grant — MUST be reflected here as [`ResolvedScope::Unknown`] (or
+    /// a `Superset`/`Unbounded` scope) on the affected axis, so mesh admission
+    /// (`resolved ⊑ delegated ∪ closure`) fails closed. This is the operand the
+    /// spawn-path scope check consumes; it is never `ResolvedAuthority::from_delegated`
+    /// (which merely lifts the caveats verbatim and re-asserts the fidelity the
+    /// audit disputed).
+    ///
+    /// **Fail-closed default:** every axis is `Unknown` (honest ignorance ⇒
+    /// refuse). A backend that has not yet implemented a faithful bound therefore
+    /// refuses any restricted grant rather than silently admitting it — the
+    /// conservative rule applied to the trait itself. Each concrete backend
+    /// overrides this with the authority it can actually be shown to enforce.
+    fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        let _ = effective;
+        crate::ResolvedAuthority {
+            fs_read: crate::ResolvedScope::Unknown,
+            fs_write: crate::ResolvedScope::Unknown,
+            exec: crate::ResolvedScope::Unknown,
+            net: crate::ResolvedScope::Unknown,
+        }
+    }
+
+    /// The explicit, minimal, **harness-disjoint** runtime closure this backend
+    /// legitimately adds beyond the delegated grant — the `closure` operand of
+    /// mesh admission (`resolved ⊑ delegated ∪ closure`). It may declare system
+    /// runtime substrate (the loader, library/system-data read base, the resolved
+    /// image of a granted program, device sinks) but MUST be disjoint from
+    /// harness-private authority (secrets, keys, control sockets, the authority/
+    /// provenance store) — see [`crate::admitted::closure_is_harness_disjoint`],
+    /// the one canonical guard `AdmittedFence::admit` applies. The default
+    /// declares nothing (`empty_closure`); each backend overrides with the
+    /// substrate it actually adds, so a *legitimate* grant admits as `Subset`
+    /// while an undeclared widening still refuses.
+    fn runtime_closure(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+        let _ = effective;
+        crate::empty_closure()
+    }
+}
+
+/// The no-backend sandbox: applies nothing and reports [`SandboxKind::None`].
+///
+/// This is the honest fallback when no compiled native backend is capable or
+/// when the effective caveats engage no axis that the available backend governs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopSandbox;
+
+impl Sandbox for NoopSandbox {
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::None
+    }
+
+    fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+        // Intentionally a no-op: the advisory default. Real kernel enforcement
+        // lives in `LandlockSandbox` (Linux + `linux-landlock`).
+        Ok(())
+    }
+
+    fn resolved_authority(&self, _effective: &Caveats) -> crate::ResolvedAuthority {
+        // Noop confines nothing, so it can deliver EVERYTHING on every axis:
+        // the conservative upper bound is `Unbounded`. Any restricted (`Only(_)`)
+        // grant is then a `Superset` of what was delegated ⇒ admission refuses —
+        // a Noop backend can never satisfy a CONFINED contract.
+        crate::ResolvedAuthority {
+            fs_read: crate::ResolvedScope::Unbounded,
+            fs_write: crate::ResolvedScope::Unbounded,
+            exec: crate::ResolvedScope::Unbounded,
+            net: crate::ResolvedScope::Unbounded,
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolved_authority_foundation_tests {
+    //! PR-0 foundation: the conservative-upper-bound contract at the trait level
+    //! (I15 / INV-BOUND). Per-backend faithful bounds land in follow-up slices;
+    //! here we pin that the *defaults* fail closed, so no backend can silently
+    //! admit a restricted grant it has not been shown to enforce.
+    use super::{NoopSandbox, Sandbox, SandboxKind};
+    use crate::{
+        admit, empty_closure, AdmissionDecision, Caveats, ResolvedScope, Scope, ToolResult,
+    };
+
+    fn exec_only(program: &str) -> Caveats {
+        Caveats {
+            exec: Scope::only([program.to_string()]),
+            ..Caveats::top()
+        }
+    }
+
+    #[test]
+    fn unimplemented_backend_default_is_unknown_and_fails_closed() {
+        // A Sandbox that does NOT override resolved_authority inherits the
+        // all-Unknown default, so admission refuses any restricted grant.
+        struct Bare;
+        impl Sandbox for Bare {
+            fn kind(&self) -> SandboxKind {
+                SandboxKind::None
+            }
+            fn apply(&self, _e: &Caveats) -> ToolResult<()> {
+                Ok(())
+            }
+        }
+        let effective = exec_only("git");
+        let resolved = Bare.resolved_authority(&effective);
+        assert_eq!(resolved.exec, ResolvedScope::Unknown);
+        assert!(matches!(
+            admit(&resolved, &effective, &empty_closure()),
+            AdmissionDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn noop_backend_is_unbounded_and_refuses_restricted_grants() {
+        let effective = exec_only("git");
+        let resolved = NoopSandbox.resolved_authority(&effective);
+        assert_eq!(resolved.exec, ResolvedScope::Unbounded);
+        assert!(matches!(
+            admit(&resolved, &effective, &empty_closure()),
+            AdmissionDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn an_unrestricted_grant_admits_even_against_an_unbounded_backend() {
+        // top() is All on every axis; nothing is restricted, so an Unbounded
+        // resolved authority is Subset/Equal of the (unbounded) delegated bound
+        // ⇒ admit. The conservative rule only bites RESTRICTED axes.
+        let effective = Caveats::top();
+        let resolved = NoopSandbox.resolved_authority(&effective);
+        assert!(matches!(
+            admit(&resolved, &effective, &empty_closure()),
+            AdmissionDecision::Admit
+        ));
+    }
+}
+
+/// `true` if either filesystem axis is actually restricted (`Only(_)`) — the
+/// condition under which the fs-confining backends (Landlock, Seatbelt) have
+/// something to enforce. When **no** fs axis is restricted, an fs-only backend
+/// governs nothing, so honest reporting downgrades the [`SandboxKind`] to
+/// [`SandboxKind::None`] rather than overclaiming a boundary that confines
+/// nothing (I9 / ADR 0006 D3). Used by every spawn site that reports a kind.
+#[must_use]
+pub(crate) fn restricts_fs(caveats: &Caveats) -> bool {
+    matches!(caveats.fs_write, crate::Scope::Only(_))
+        || matches!(caveats.fs_read, crate::Scope::Only(_))
+}
+
+/// `true` if the `exec` axis is actually restricted (`Only(_)`). Seatbelt acts on
+/// every such scope via `process-exec*`, including the spawned program's
+/// interior execs (ADR 0014), so `exec: Only(_)` engages it by itself.
+/// AppContainer separately handles the deny-all subset via
+/// [`exec_fully_denied`]. Landlock narrows direct `execve` when another governed
+/// axis engages it, but its loader-trampoline residual keeps the reported exec
+/// strength at `Interceptor`, so exec restriction alone does not engage it.
+#[must_use]
+pub(crate) fn restricts_exec(caveats: &Caveats) -> bool {
+    matches!(caveats.exec, crate::Scope::Only(_))
+}
+
+/// `true` if the `net` axis is restricted to the **empty** set — i.e. *all*
+/// network egress is denied. Seatbelt and AppContainer enforce this scope, and a
+/// Landlock ABI-v4 kernel can deny all TCP egress. A general non-empty hostname
+/// allowlist is not directly expressible by those native rules and follows the
+/// separately documented proxy/advisory path.
+#[must_use]
+pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
+}
+
+/// An explicit `unix:<path>` token names a path-anchored Unix-domain socket
+/// endpoint, distinct from a DNS host. It participates in the ordinary net
+/// scope like any other grant, but filesystem grants never imply permission
+/// to connect one — only Seatbelt projects this endpoint authority
+/// ([`seatbelt_impl`]'s `unix_socket_paths`/profile emission).
+#[must_use]
+pub(crate) fn has_unix_socket_grants(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if s.iter().any(|h| h.starts_with("unix:")))
+}
+
+/// `true` when the `exec` axis is a deny-all empty allow-list (`Scope::Only([])`).
+///
+/// An empty allow-list means *no program may be spawned* — any `exec` call is
+/// refused. On Windows AppContainer this maps to the
+/// `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` kernel mitigation, so the
+/// sandboxed process cannot create child processes at the kernel level.
+#[must_use]
+pub(crate) fn exec_fully_denied(caveats: &Caveats) -> bool {
+    matches!(&caveats.exec, crate::Scope::Only(s) if s.is_empty())
+}
+
+/// Whether a restricted `exec` grant pulls an **implementation-variant**
+/// executable that the Caveat does not literally name — so the Seatbelt
+/// `process-exec*` profile must permit a program beyond the requested identities
+/// and is therefore NOT an exact Kernel witness of the exec authority.
+///
+/// Today the sole such variant is Apple's `/bin/sh`, a launcher that re-execs
+/// `/bin/bash` at startup (a kernel-checked `process-exec`); a granted `sh`
+/// (bare or `/bin/sh`) forces `/bin/bash` into the allow-list too (see the
+/// macOS `resolve_exec_targets`). Pure and cross-platform (a function of the
+/// Caveat data), so the report classification and the profile builder stay
+/// coupled to the same rule regardless of which platform compiles the profile.
+#[must_use]
+pub(crate) fn exec_grant_pulls_launcher_variant(caveats: &Caveats) -> bool {
+    matches!(&caveats.exec, crate::Scope::Only(s)
+        if s.iter().any(|p| p == "sh" || p == "/bin/sh"))
+}
+
+/// `true` if this kernel supports Landlock TCP network rules (ABI V4, kernel ≥ 6.7).
+/// Always `false` on non-Linux or builds without `linux-landlock`.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+pub(crate) fn landlock_net_capable() -> bool {
+    landlock_impl::landlock_net_is_supported()
+}
+#[cfg(not(all(target_os = "linux", feature = "linux-landlock")))]
+pub(crate) fn landlock_net_capable() -> bool {
+    false
+}
+
+/// The host tokens that name the machine's own **loopback interface**. SBPL's
+/// `(remote ip "localhost:*")` filter matches exactly these destinations
+/// (`127.0.0.1` and `::1`) — empirically the *only* remote a non-empty SBPL net
+/// rule can name (an arbitrary IP is rejected: "host must be * or localhost").
+pub(crate) const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// `true` if the `net` axis is restricted to a **non-empty** allow-list whose
+/// every host is a [loopback identifier](LOOPBACK_HOSTS) — the one non-deny-all
+/// net policy SBPL *can* kernel-enforce (`(deny network*)` + `(allow network*
+/// (remote ip "localhost:*"))`), confining egress to the loopback interface so the
+/// process's **own off-box socket egress is kernel-denied** (ADR 0015; the
+/// system-resolver DNS residual is shared with the empty-net case). A general remote
+/// host cannot be named in SBPL (only `*`/`localhost` + ports), so a mixed or
+/// non-loopback allow-list is **not** loopback-only and stays advisory — never
+/// silently dropped. Mutually exclusive with [`net_fully_denied`] (empty set).
+///
+/// The kernel rule confines egress to the loopback *interface* — `localhost` =
+/// `127.0.0.1` **and** `::1`, the finest grain SBPL can name. For a **spawned
+/// child** (governed only by the kernel rule, not the in-process leash) that
+/// interface *is* the boundary, so a grant naming a single loopback address
+/// (e.g. `127.0.0.1`) still permits the other (`::1`) — a widening strictly
+/// *within* loopback, never off-box. Admission (`ToolContext::check_net`,
+/// exact-match) narrows to the granted host for the engine's *own* operations.
+/// Unlike the fs `(subpath root)` case — where the kernel subtree and the granted
+/// root denote the same set — the loopback interface can exceed a single-address
+/// grant; see ADR 0015 D2.
+#[must_use]
+pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s)
+        if s.iter().any(|h| LOOPBACK_HOSTS.contains(&h.as_str()))
+            && s.iter().all(|h| h.starts_with("unix:") || LOOPBACK_HOSTS.contains(&h.as_str())))
+}
+
+/// `true` iff a loopback-only net scope denotes the **entire** kernel-enforced
+/// loopback interface, so the Seatbelt/AppContainer loopback fence — which always
+/// allows the whole `localhost` interface (`127.0.0.1` **and** `::1`) — is an
+/// **exact** witness of the requested authority rather than a widening.
+///
+/// This is the OCAP scope-fidelity gate (Kernel *strength* ≠ least *authority*):
+/// a single-address grant such as `net = Only({"127.0.0.1"})` asks for v4
+/// loopback ONLY, but the kernel fence also permits `::1` — strictly MORE
+/// authority than the Caveat. Such a scope is NOT an exact Kernel witness and is
+/// reported below Kernel (so a `CONFINED` floor refuses; the coarser fence is
+/// documented BOUNDED, never pretended exact). The full interface is denoted by
+/// `localhost` (the interface token) or by naming BOTH `127.0.0.1` and `::1`;
+/// the egress-proxy fence ([`loopback_fenced_caveats`]) grants the full
+/// [`LOOPBACK_HOSTS`] set and so remains exact.
+#[must_use]
+pub(crate) fn net_loopback_full_interface(caveats: &Caveats) -> bool {
+    // A `unix:` endpoint riding alongside the loopback interface is real
+    // additional authority AppContainer cannot express or enforce at all (it
+    // rejects such a grant outright, see `appcontainer_impl::command_prefix`)
+    // — never let its presence read as "still exactly the loopback interface".
+    if has_unix_socket_grants(caveats) {
+        return false;
+    }
+    matches!(&caveats.net, crate::Scope::Only(s) if
+        net_loopback_only(caveats)
+            && (s.iter().any(|h| h == "localhost")
+                || (s.iter().any(|h| h == "127.0.0.1") && s.iter().any(|h| h == "::1"))))
+}
+
+/// The granted host set of a **general remote-host** `net` allow-list — the case
+/// SBPL cannot express and [`net_loopback_only`] therefore leaves advisory
+/// (ADR 0015 D3). `Some(hosts)` iff `net` is `Only(set)`, non-empty, with **at
+/// least one non-loopback host**; `None` for `All`, the empty set (deny-all), and
+/// a loopback-only allow-list — those three keep their existing owners
+/// ([`net_fully_denied`] / [`net_loopback_only`]).
+///
+/// This is the trigger for the macOS **egress-proxy** mechanism (#124, ADR 0016):
+/// a caller confines a spawned child's egress to the loopback interface
+/// ([`loopback_fenced_caveats`], reusing the ADR 0015 kernel fence) and runs a
+/// loopback forward proxy that enforces this host set. Pure; no IO. The returned
+/// set is the **full** grant (loopback members included — the proxy admits them
+/// too), matching `ToolContext::check_net`'s exact-name membership.
+/// `unix:` endpoints are not DNS hosts and never appear in the returned set —
+/// they stay exclusively in the child's kernel Seatbelt profile, never handed
+/// to the loopback-proxy host list.
+#[must_use]
+pub fn net_egress_proxy_hosts(caveats: &Caveats) -> Option<Vec<String>> {
+    match &caveats.net {
+        crate::Scope::Only(s)
+            if s.iter()
+                .any(|h| !h.starts_with("unix:") && !LOOPBACK_HOSTS.contains(&h.as_str())) =>
+        {
+            Some(
+                s.iter()
+                    .filter(|h| !h.starts_with("unix:"))
+                    .cloned()
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The confinement caveats for a spawned child paired with a loopback **egress
+/// proxy** (#124, ADR 0016): identical to `caveats` except the `net` axis is
+/// replaced by the loopback set, so its [`seatbelt_profile`] emits the ADR 0015
+/// kernel fence — `(deny network*)` + `(allow network* (remote ip
+/// "localhost:*"))` — while the `fs`/`exec` rules are preserved verbatim. The
+/// child can then reach *nothing* off-box directly; its only path off the
+/// loopback interface is the proxy it is pointed at via `*_PROXY` env. Pure; no
+/// IO. Only meaningful for a grant where [`net_egress_proxy_hosts`] is `Some`.
+/// Explicit `unix:` endpoints in `caveats` survive the fence: they are
+/// separate exact outbound exceptions under Seatbelt, never additional IP
+/// authority, so they are carried into the fenced net set alongside loopback.
+#[must_use]
+pub fn loopback_fenced_caveats(caveats: &Caveats) -> Caveats {
+    let mut endpoints: std::collections::BTreeSet<String> =
+        LOOPBACK_HOSTS.iter().map(|h| (*h).to_string()).collect();
+    if let crate::Scope::Only(names) = &caveats.net {
+        endpoints.extend(names.iter().filter(|h| h.starts_with("unix:")).cloned());
+    }
+    Caveats {
+        net: crate::Scope::Only(endpoints),
+        ..caveats.clone()
+    }
+}
+
+/// The egress-proxy plan for `caveats` (#124/#257, ADR 0016), or `None` to fall
+/// through to the ordinary confinement paths. `Some((allow_hosts, fenced))`
+/// **iff** the grant is a general remote-host `net` allow-list
+/// ([`net_egress_proxy_hosts`]) *and* the available backend can kernel-fence the
+/// child's egress **to the loopback interface** ([`loopback_net_enforceable`]) —
+/// the precondition for the proxy to be real confinement instead of a
+/// walk-around-able advisory. A proxy a rogue child can dial around is not
+/// confinement, so backends that cannot address-fence stay inert (the ADR 0015
+/// honest posture); their `net` remains honestly advisory.
+///
+/// The ONE decision both consumers route through — the shell engine's
+/// proxied-pipeline path and `ConfinedCommand::spawn_tokio` (#257) — so the
+/// check and the spawn routing cannot disagree.
+#[must_use]
+pub fn egress_proxy_plan(
+    caveats: &Caveats,
+    policy: &Arc<SandboxPolicy>,
+) -> Option<(Vec<String>, Caveats)> {
+    egress_proxy_plan_for(best_available_sandbox(policy).kind(), caveats)
+}
+
+/// The egress-proxy plan given an **already-resolved** available backend
+/// `kind` — the pure, host-independent core of [`egress_proxy_plan`], split out
+/// so the enforceability decision can be unit-tested against each backend
+/// deterministically (the fail-open at #257/#275 hid behind a host-only path).
+pub(crate) fn egress_proxy_plan_for(
+    available: SandboxKind,
+    caveats: &Caveats,
+) -> Option<(Vec<String>, Caveats)> {
+    if has_unix_socket_grants(caveats) && available != SandboxKind::Seatbelt {
+        // No other backend projects exact Unix endpoint authority; the proxy
+        // would silently drop the Unix grant instead of confining it.
+        return None;
+    }
+    let allow_hosts = net_egress_proxy_hosts(caveats)?;
+    // Engage the proxy ONLY where the child's egress can be kernel-fenced to
+    // loopback. Checking merely that the sandbox confines *something* (as the
+    // pre-fix gate did via `effective_sandbox_kind != None`) is a fail-open:
+    // Landlock engages on the *fs* axis (`restricts_fs`) while its `net` fence is
+    // port-based and cannot confine a loopback-only host set (`apply` sets
+    // `confine_net = net_fully_denied` only) — so under a general remote-host
+    // grant with restricted fs on Linux, the proxy would start, the child would
+    // be handed `*_PROXY`, yet the child could ignore it and dial any host
+    // directly (exfil unblocked AND unrecorded). That is the exact "proxy a rogue
+    // child can walk around" this must never engage. See [`loopback_net_enforceable`].
+    if !loopback_net_enforceable(available) {
+        return None; // net-loopback fence unenforceable → advisory, no proxy
+    }
+    Some((allow_hosts, loopback_fenced_caveats(caveats)))
+}
+
+/// Whether `available` can kernel-fence a spawned child's egress to the
+/// **loopback interface** — the precondition for the egress-proxy pattern
+/// (ADR 0016) to be real confinement rather than an advisory a child can dial
+/// around. True only for the address-fenceable backends:
+/// - [`SandboxKind::Seatbelt`] — SBPL `(allow network* (remote ip "localhost:*"))`.
+/// - [`SandboxKind::AppContainer`] — `NetworkIsolation` loopback exemption (#133).
+///
+/// False for the rest, each honestly advisory on `net` for a loopback-only set:
+/// - [`SandboxKind::Landlock`] — TCP rules are **port-based**, not address-based
+///   (ADR 0014/0015); it can deny *all* egress (`net: none`) but cannot admit
+///   only loopback. **The Linux enabler is the network-namespace egress fence**
+///   (netns + veth-to-parent proxy) tracked separately — until it lands, a
+///   remote-host `net` grant on Linux is advisory, not proxy-fenced.
+/// - [`SandboxKind::MinimalRootfs`] — net is not namespaced at this tier.
+/// - [`SandboxKind::MicroVm`] — no guest network device: egress is impossible, so
+///   the loopback proxy has no path anyway (net is confined by absence, not proxy).
+/// - [`SandboxKind::None`] — no backend.
+#[must_use]
+const fn loopback_net_enforceable(available: SandboxKind) -> bool {
+    matches!(available, SandboxKind::Seatbelt | SandboxKind::AppContainer)
+}
+
+/// The [`SandboxKind`] honestly in force for `caveats` given the strongest
+/// `available` backend: the backend's own kind when it will actually confine
+/// *something*, else [`SandboxKind::None`]. The single honesty rule shared by the
+/// subprocess primitive ([`crate::ConfinedCommand`]) and the shell engine, so
+/// neither overclaims.
+///
+/// Capabilities differ per backend, so the engaging condition does too: Landlock
+/// governs the filesystem axes; Seatbelt governs those, kernel-denies all egress
+/// when `net` is empty ([`net_fully_denied`]) or confines it to the loopback
+/// interface for a loopback-only allow-list ([`net_loopback_only`], ADR 0015),
+/// **and** confines the `exec` axis via `process-exec*` ([`restricts_exec`]) — a
+/// confinement Landlock cannot supply (ADR 0014). Landlock's exec axis stays held
+/// (agent-bridle#31/#57), so a Landlock host does not engage on `exec` alone.
+/// AppContainer (Windows, #51 / #123 / #133) engages when: `net` is fully denied
+/// (deny-all capability model), `net` is loopback-only (egress-proxy fence, ADR 0016),
+/// `exec` is fully denied (`PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, ADR 0013 D7),
+/// or `fs` is restricted (per-path DACL grants, ADR 0009).
+#[must_use]
+pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> SandboxKind {
+    match available {
+        SandboxKind::Landlock
+            if restricts_fs(caveats) || (net_fully_denied(caveats) && landlock_net_capable()) =>
+        {
+            SandboxKind::Landlock
+        }
+        SandboxKind::Seatbelt
+            if restricts_fs(caveats)
+                || net_fully_denied(caveats)
+                || net_loopback_only(caveats)
+                || has_unix_socket_grants(caveats)
+                || restricts_exec(caveats) =>
+        {
+            SandboxKind::Seatbelt
+        }
+        SandboxKind::AppContainer
+            if net_fully_denied(caveats)
+                || net_loopback_only(caveats)
+                || exec_fully_denied(caveats)
+                || restricts_fs(caveats) =>
+        {
+            SandboxKind::AppContainer
+        }
+        _ => SandboxKind::None,
+    }
+}
+
+/// Return the strongest [`Sandbox`] available in this build on this host.
+///
+/// One `cfg(target_os, feature)` arm per backend (ADR 0006 D2): Landlock probes
+/// kernel support at runtime; Seatbelt probes for `sandbox-exec`; AppContainer
+/// uses its process-launch wrapper on Windows. Otherwise the advisory
+/// [`NoopSandbox`] is selected, so callers get a real native boundary where one
+/// is available and an honest [`SandboxKind::None`] where it is not. Enabling a
+/// backend feature off its target OS compiles and selects no target-specific
+/// implementation.
+pub fn best_available_sandbox(policy: &Arc<SandboxPolicy>) -> Box<dyn Sandbox> {
+    #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+    {
+        Box::new(appcontainer_impl::AppContainerSandbox::new(
+            policy.appcontainer_launcher_path.clone(),
+        ))
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "windows-appcontainer")))]
+    {
+        #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+        {
+            if landlock_impl::landlock_is_supported() {
+                return Box::new(landlock_impl::LandlockSandbox::with_policy(policy.clone()));
+            }
+        }
+        #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+        {
+            if seatbelt_impl::seatbelt_is_supported() {
+                return Box::new(seatbelt_impl::SeatbeltSandbox::with_policy(policy.clone()));
+            }
+        }
+        let _ = policy; // NoopSandbox is unconfigurable (advisory).
+        Box::new(NoopSandbox)
+    }
+}
+
+/// Explicitly select the reviewed native root operation. Other backends refuse;
+/// in particular Seatbelt's legacy fs projection is not a ruleset-grain proof.
+pub(crate) fn named_root_sandbox(policy: &Arc<SandboxPolicy>) -> ToolResult<Box<dyn Sandbox>> {
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    if landlock_impl::landlock_is_supported() {
+        return Ok(Box::new(landlock_impl::LandlockSandbox::for_named_root(
+            policy.clone(),
+        )));
+    }
+    let _ = policy;
+    Err(crate::ToolError::denied("named-root execution requires the supported Landlock backend; other backend projections are not established"))
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+pub use landlock_impl::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
+
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+pub use seatbelt_impl::{seatbelt_is_supported, SeatbeltSandbox};
+
+// Prefix construction is portable; unit tests exercise its admission decisions
+// on every host. Native Windows enforcement remains in the Windows proof lane.
+#[cfg(any(test, all(target_os = "windows", feature = "windows-appcontainer")))]
+pub(crate) mod appcontainer_impl {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        exec_fully_denied, net_fully_denied, net_loopback_only, restricts_fs, Sandbox, SandboxKind,
+    };
+    use crate::{Caveats, Scope, ToolError, ToolResult};
+
+    /// Monotonic counter for unique container names (PID + counter → no clock).
+    static SPAWN_N: AtomicU64 = AtomicU64::new(0);
+
+    /// A Windows AppContainer process sandbox.
+    ///
+    /// AppContainer is attached when creating a new process via
+    /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`; it cannot be installed on
+    /// the current thread and inherited across a later spawn the way Landlock
+    /// can. The spawn path must therefore use the `agent-bridle-aclaunch`
+    /// wrapper binary returned by [`command_prefix`] rather than the thread
+    /// `apply` path (ADR 0006 / agent-bridle#51).
+    ///
+    /// Calling [`Sandbox::apply`] directly fails closed: it is never correct to
+    /// call `apply` expecting AppContainer confinement on the current thread.
+    #[derive(Debug, Default, Clone)]
+    pub struct AppContainerSandbox {
+        launcher_path: Option<String>,
+    }
+
+    impl AppContainerSandbox {
+        /// Construct the sandbox. Confinement is per-process; the optional path
+        /// pins the trusted launcher when it is not shipped beside the binary.
+        pub fn new(launcher_path: Option<String>) -> Self {
+            Self { launcher_path }
+        }
+    }
+
+    /// Return the trusted path of `agent-bridle-aclaunch.exe`: an explicitly
+    /// configured absolute path, or the helper shipped next to the current
+    /// executable. Ambient `PATH` is not a provenance source for AppContainer.
+    fn find_launcher(configured: Option<&str>) -> ToolResult<String> {
+        const LAUNCHER: &str = "agent-bridle-aclaunch.exe";
+        let canonical_launcher_path = |path: &Path, source: &str| -> ToolResult<String> {
+            if !path.is_absolute() {
+                return Err(ToolError::denied(format!(
+                    "windows-appcontainer: {source} launcher path {path:?} is not absolute; \
+                     cannot confine"
+                )));
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !file_name.eq_ignore_ascii_case(LAUNCHER) {
+                return Err(ToolError::denied(format!(
+                    "windows-appcontainer: {source} launcher path {path:?} is not named \
+                     {LAUNCHER}; cannot confine"
+                )));
+            }
+            if !path.is_file() {
+                return Err(ToolError::denied(format!(
+                    "windows-appcontainer: {source} launcher {path:?} is not an existing file; \
+                     cannot confine"
+                )));
+            }
+            std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|error| {
+                    ToolError::denied(format!(
+                        "windows-appcontainer: could not canonicalize {source} launcher \
+                         {path:?}: {error}; cannot confine"
+                    ))
+                })
+        };
+
+        if let Some(raw) = configured {
+            if raw.is_empty() {
+                return Err(ToolError::denied(
+                    "windows-appcontainer: configured launcher path is empty; cannot confine",
+                ));
+            }
+            return canonical_launcher_path(Path::new(raw), "configured");
+        }
+
+        // Same directory as the current exe — the normal install layout.
+        if let Ok(mut p) = std::env::current_exe() {
+            p.set_file_name(LAUNCHER);
+            if p.is_file() {
+                return canonical_launcher_path(&p, "shipped sibling");
+            }
+        }
+        Err(ToolError::denied(
+            "windows-appcontainer: agent-bridle-aclaunch.exe not found next to the \
+             current executable and no configured absolute launcher path was supplied; \
+             PATH is not searched; cannot confine",
+        ))
+    }
+
+    impl Sandbox for AppContainerSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::AppContainer
+        }
+
+        /// Faithful ruleset-grain projection of the AppContainer + DACL fence
+        /// (#317 INV-BOUND / E2). Derived from the SAME grants `command_prefix`
+        /// emits and the `agent-bridle-aclaunch` DACL actually installs — NEVER
+        /// `from_delegated`, which would merely re-assert the requested caveats the
+        /// #317 audit disputed. DECLARED ≠ RESOLVED ≠ APPLIED: this is the RESOLVED
+        /// bound, and it must never claim narrower authority than the ACL applies.
+        ///
+        /// **fs — E2 (write ⇒ read):** `agent-bridle-aclaunch` grants every
+        /// `--fs-write` path `FILE_GENERIC_READ_WRITE` (`main.rs`: `READ | WRITE`,
+        /// "a superset of read") with subtree inherit and no DENY ACE — there is no
+        /// write-only ACE — so a write-granted path is kernel-**readable**. The
+        /// faithful resolved READ authority is therefore `fs_read ∪ fs_write`, never
+        /// the requested read scope alone. When `fs_write ⊄ fs_read` this union is a
+        /// `Superset` of the delegated read bound, so `admit` refuses fail-closed —
+        /// the leak becomes a refusal, not a silent widening. (Native-proven on real
+        /// Windows: a write-only-granted dir is readable by the AppContainer child;
+        /// an ungranted neighbour is `Access is denied`.)
+        ///
+        /// **exec:** AppContainer bounds exec ONLY via the deny-all child-process
+        /// block (`--no-child-process`, engaged iff exec is fully denied) → `∅`. A
+        /// NON-empty allowlist is not kernel-bounded — the child may `CreateProcess`
+        /// any image; enforcing the allowlist is the harness leash's Interceptor
+        /// job, not the container's — so it is `Unknown` ⇒ `admit` refuses a
+        /// restricted-exec-as-Kernel contract. `All` → `Unbounded` (honest: no exec
+        /// bound). Never let a non-empty allowlist masquerade as kernel-enforced.
+        ///
+        /// **net:** deny-by-default (no `INTERNET_CLIENT` capability) → `∅`;
+        /// `--net-allow` (full client capability) → `Unbounded`; the loopback
+        /// exemption is all-or-nothing (it grants the WHOLE loopback interface —
+        /// `127.0.0.0/8` + `::1`, every port — not a requested subset), so union a
+        /// `loopback-exemption` class to REVEAL that widening; a specific remote-host
+        /// allowlist AppContainer cannot faithfully bound → `Unknown` ⇒ refuse.
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            use crate::ResolvedScope as Rs;
+            // fs: mirror the aclaunch DACL — a write ACE (FILE_GENERIC_READ_WRITE)
+            // confers read, so the resolved read scope unions the write scope.
+            let fs_read =
+                Rs::from_scope(&effective.fs_read).union(&Rs::from_scope(&effective.fs_write));
+            let fs_write = Rs::from_scope(&effective.fs_write);
+            // exec: bounded ONLY by the deny-all child-process block; any non-empty
+            // allowlist is Unknown (Interceptor, not a kernel bound).
+            let exec = if exec_fully_denied(effective) {
+                Rs::from_scope(&effective.exec) // ∅ — no child process may be created
+            } else {
+                match &effective.exec {
+                    Scope::All => Rs::Unbounded,
+                    Scope::Only(_) => Rs::Unknown,
+                }
+            };
+            // net: deny-by-default ⇒ ∅; loopback exemption widens to the whole
+            // interface (reveal via a class); remote-host allowlist ⇒ Unknown.
+            let net = if net_fully_denied(effective) {
+                Rs::from_scope(&effective.net) // ∅ — no INTERNET_CLIENT capability
+            } else if net_loopback_only(effective) {
+                Rs::from_scope(&effective.net).union(&Rs::class("appcontainer-loopback-exemption"))
+            } else {
+                match &effective.net {
+                    Scope::All => Rs::Unbounded,
+                    Scope::Only(_) => Rs::Unknown,
+                }
+            };
+            crate::ResolvedAuthority {
+                fs_read,
+                fs_write,
+                exec,
+                net,
+            }
+        }
+
+        /// No-op: AppContainer confinement is applied at process creation via the
+        /// `command_prefix` launcher wrapper (`agent-bridle-aclaunch`), not via
+        /// this thread. `apply` is reached only when `command_prefix` returned an
+        /// empty prefix (nothing to confine), so a no-op is correct here.
+        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+            Ok(())
+        }
+
+        /// Build the `["agent-bridle-aclaunch.exe", ...]` prefix that wraps the
+        /// child inside a fresh AppContainer profile.
+        ///
+        /// Returns an empty prefix when nothing on a governed axis is restricted
+        /// (so the spawn runs unwrapped — the backend engages only when it
+        /// actually confines something). Fails closed if the launcher binary is
+        /// not found.
+        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            if super::has_unix_socket_grants(effective) {
+                return Err(ToolError::denied(
+                    "windows-appcontainer: exact Unix endpoint grants require Seatbelt",
+                ));
+            }
+            // The launcher engages when:
+            //  - net is fully denied (deny-by-default network policy)
+            //  - net is loopback-only (egress proxy path, #133)
+            //  - exec is fully denied (kernel child-process-creation block)
+            //  - fs is restricted (ACL grants let the container reach its workspace)
+            if !net_fully_denied(effective)
+                && !net_loopback_only(effective)
+                && !exec_fully_denied(effective)
+                && !restricts_fs(effective)
+            {
+                return Ok(Vec::new());
+            }
+
+            // Fail-closed: without the launcher we cannot enforce.
+            let launcher = find_launcher(self.launcher_path.as_deref())?;
+
+            // Unique container name: PID + monotonic counter (no wall clock).
+            let n = SPAWN_N.fetch_add(1, Ordering::Relaxed);
+            let container_name = format!("ab{}{}", std::process::id(), n);
+
+            let mut prefix = vec![launcher, "--name".to_string(), container_name];
+
+            // Grant network capabilities only when net is fully unrestricted
+            // (Scope::All). Any non-All net scope denies egress by default via
+            // the AppContainer's deny-by-default network policy.
+            if matches!(effective.net, Scope::All) {
+                prefix.push("--net-allow".to_string());
+            }
+
+            // Loopback-only fence (#133, ADR 0016): AppContainers block loopback
+            // by default. For the egress-proxy pattern the child must reach the
+            // parent's loopback proxy, so grant the loopback exemption via the
+            // NetworkIsolationSetAppContainerConfig API.
+            if net_loopback_only(effective) {
+                prefix.push("--loopback-exemption".to_string());
+            }
+
+            // Kernel-block child process creation when exec is fully denied.
+            // The `--no-child-process` flag sets PROCESS_CREATION_CHILD_PROCESS_RESTRICTED
+            // on the spawned process — the kernel refuses any CreateProcess call
+            // it makes, closing the exec axis by OS enforcement (#123).
+            if exec_fully_denied(effective) {
+                prefix.push("--no-child-process".to_string());
+            }
+
+            // FS ACL narrowing (#51): grant the AppContainer SID access to the
+            // allowed paths so the container can read/write its workspace.
+            // AppContainers are denied user directories by default; without this
+            // grant the child cannot access its working directory.
+            if let Scope::Only(paths) = &effective.fs_write {
+                for p in paths {
+                    prefix.push("--fs-write".to_string());
+                    prefix.push(p.clone());
+                }
+            }
+            // Read-only paths that are not already covered by fs_write.
+            let write_set: std::collections::HashSet<&str> =
+                if let Scope::Only(paths) = &effective.fs_write {
+                    paths.iter().map(String::as_str).collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            if let Scope::Only(paths) = &effective.fs_read {
+                for p in paths {
+                    if !write_set.contains(p.as_str()) {
+                        prefix.push("--fs-read".to_string());
+                        prefix.push(p.clone());
+                    }
+                }
+            }
+
+            Ok(prefix)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn missing_launcher_is_a_denial() {
+            let err = find_launcher(Some("")).expect_err("empty launcher must deny");
+            assert!(
+                matches!(err, ToolError::Denied { ref reason } if reason.contains("configured launcher path is empty")),
+                "missing AppContainer launcher must be a denial, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn configured_launcher_must_be_absolute() {
+            let err = find_launcher(Some("agent-bridle-aclaunch.exe"))
+                .expect_err("relative configured launcher must deny");
+            assert!(
+                matches!(err, ToolError::Denied { ref reason } if reason.contains("is not absolute")),
+                "relative AppContainer launcher must be a denial, got {err:?}"
+            );
+        }
+
+        fn assert_appcontainer_rejects_unix(names: &[&str]) {
+            let caveats = Caveats {
+                net: Scope::only(names.iter().map(|name| (*name).to_owned())),
+                ..Caveats::top()
+            };
+            let result = AppContainerSandbox::new(None).command_prefix(&caveats);
+            assert!(
+                matches!(&result, Err(ToolError::Denied { reason }) if reason.contains("Unix")),
+                "unsupported Unix authority must refuse before launcher lookup: {result:?}"
+            );
+        }
+
+        #[test]
+        fn appcontainer_command_prefix_rejects_unix_only() {
+            assert_appcontainer_rejects_unix(&["unix:/private/tmp/service.sock"]);
+        }
+
+        #[test]
+        fn appcontainer_command_prefix_rejects_unix_with_loopback() {
+            assert_appcontainer_rejects_unix(&["unix:/private/tmp/service.sock", "localhost"]);
+        }
+    }
+}
+
+/// E2 adversarial regression: the AppContainer faithful projection + mesh
+/// admission fail CLOSED on unrepresentable narrowing (`fs_write ⇒ read`, exec/net
+/// honesty). Proves DECLARED ≠ RESOLVED — the resolved authority reveals the DACL
+/// widening and admission refuses it, rather than re-asserting the delegated grant.
+#[cfg(all(test, target_os = "windows", feature = "windows-appcontainer"))]
+mod appcontainer_resolved_authority_tests {
+    use super::appcontainer_impl::AppContainerSandbox;
+    use super::Sandbox;
+    use crate::{
+        admit, empty_closure, AdmissionDecision, Caveats, ConfinedAxis, ResolvedScope, Scope,
+        ScopeRelation,
+    };
+
+    /// exec + net fully denied so those axes admit (`∅ ⊆ ∅`); the fs axes are the
+    /// variable under test.
+    fn fs_probe(read: &[&str], write: &[&str]) -> Caveats {
+        Caveats {
+            fs_read: Scope::only(read.iter().map(|s| (*s).to_string())),
+            fs_write: Scope::only(write.iter().map(|s| (*s).to_string())),
+            exec: Scope::only(std::iter::empty::<String>()),
+            net: Scope::only(std::iter::empty::<String>()),
+            ..Caveats::top()
+        }
+    }
+
+    fn decide(caveats: &Caveats) -> AdmissionDecision {
+        let resolved = AppContainerSandbox::new(None).resolved_authority(caveats);
+        admit(&resolved, caveats, &empty_closure())
+    }
+
+    /// THE E2 fail-closed case: a write-granted path NOT in the read scope is
+    /// kernel-readable (the aclaunch DACL grants `FILE_GENERIC_READ_WRITE`), so the
+    /// resolved read authority is a Superset of the requested read → REFUSE.
+    #[test]
+    fn write_only_path_widens_read_and_refuses() {
+        let c = fs_probe(&["C:/repo"], &["C:/dropbox"]); // fs_write ⊄ fs_read
+        match decide(&c) {
+            AdmissionDecision::Reject(r) => {
+                assert_eq!(r.axis, ConfinedAxis::FsRead, "the read axis is the widened one");
+                assert_eq!(
+                    r.relation,
+                    ScopeRelation::Superset,
+                    "read is widened by the write grant, not incomparable/unknown"
+                );
+            }
+            AdmissionDecision::Admit => panic!(
+                "fs_write ⊄ fs_read must refuse: the write ACE confers read the grant did not authorize"
+            ),
+        }
+        // The projection itself must reveal the widening (never == the delegated read).
+        let resolved = AppContainerSandbox::new(None).resolved_authority(&c);
+        assert_ne!(
+            resolved.fs_read,
+            ResolvedScope::from_scope(&c.fs_read),
+            "resolved read must fold in the write scope, not re-assert the requested read"
+        );
+    }
+
+    /// Positive control: `fs_write ⊆ fs_read` → resolved read == requested read → ADMIT.
+    #[test]
+    fn write_subset_of_read_admits() {
+        let c = fs_probe(&["C:/repo", "C:/work"], &["C:/work"]); // fs_write ⊆ fs_read
+        assert_eq!(
+            decide(&c),
+            AdmissionDecision::Admit,
+            "a write scope inside the read scope adds no new read authority"
+        );
+    }
+
+    /// exec: a NON-empty allowlist is not kernel-bounded by AppContainer → `Unknown`
+    /// → REFUSE (never let a restricted-exec config read as kernel-enforced).
+    #[test]
+    fn nonempty_exec_allowlist_refuses_as_unknown() {
+        let c = Caveats {
+            exec: Scope::only(["cmd".to_string()]),
+            ..Caveats::top() // other axes unrestricted ⇒ admit; exec is the refuser
+        };
+        match decide(&c) {
+            AdmissionDecision::Reject(r) => {
+                assert_eq!(r.axis, ConfinedAxis::Exec);
+                assert_eq!(r.relation, ScopeRelation::Unknown);
+            }
+            AdmissionDecision::Admit => {
+                panic!("a restricted exec allowlist must not admit as AppContainer-enforced")
+            }
+        }
+    }
+
+    /// exec fully denied (`--no-child-process`) IS kernel-bounded → ADMIT.
+    #[test]
+    fn exec_deny_all_admits() {
+        let c = Caveats {
+            exec: Scope::only(std::iter::empty::<String>()),
+            ..Caveats::top()
+        };
+        assert_eq!(decide(&c), AdmissionDecision::Admit);
+    }
+
+    /// net: a remote-host allowlist AppContainer cannot bound → `Unknown` → REFUSE.
+    #[test]
+    fn remote_host_net_allowlist_refuses_as_unknown() {
+        let c = Caveats {
+            net: Scope::only(["api.example.com:443".to_string()]),
+            ..Caveats::top()
+        };
+        match decide(&c) {
+            AdmissionDecision::Reject(r) => {
+                assert_eq!(r.axis, ConfinedAxis::Net);
+                assert_eq!(r.relation, ScopeRelation::Unknown);
+            }
+            AdmissionDecision::Admit => {
+                panic!("a remote-host net allowlist must not admit as AppContainer-bounded")
+            }
+        }
+    }
+
+    /// net fully denied (deny-by-default, no `INTERNET_CLIENT` capability) → ADMIT.
+    #[test]
+    fn net_deny_all_admits() {
+        let c = Caveats {
+            net: Scope::only(std::iter::empty::<String>()),
+            ..Caveats::top()
+        };
+        assert_eq!(decide(&c), AdmissionDecision::Admit);
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+pub(crate) mod landlock_impl {
+    use super::{Sandbox, SandboxKind};
+    use crate::{Caveats, ChildNetworkPolicy, SandboxPolicy, Scope, ToolError, ToolResult};
+    use landlock::{
+        path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, Ruleset,
+        RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+    };
+    use std::sync::Arc;
+
+    /// Map a configured ABI floor to the landlock `ABI` enum. `apply` runs
+    /// `BestEffort`, so a floor above the running kernel still degrades
+    /// gracefully; unknown/too-high values clamp to the highest ABI this crate
+    /// (landlock 0.4.5) models — V7 — so raising a floor to reach a newer axis
+    /// (e.g. `IoctlDev` at V5) is honored, not silently dropped to V4. The
+    /// default floors (fs 3 / net 4) reproduce the previous `ABI::V3` / `ABI::V4`
+    /// constants.
+    ///
+    /// The *lower* bound is deliberately NOT enforced here: it is axis-specific
+    /// and applied at the call site via [`fs_abi_floor`] / [`net_abi_floor`],
+    /// because fs and net have different safe minimums below which the honesty
+    /// report would overclaim.
+    fn abi_from_u32(v: u32) -> ABI {
+        match v {
+            0 | 1 => ABI::V1,
+            2 => ABI::V2,
+            3 => ABI::V3,
+            4 => ABI::V4,
+            5 => ABI::V5,
+            6 => ABI::V6,
+            _ => ABI::V7,
+        }
+    }
+
+    /// The fs-axis ABI floor actually installed — never below V3 (the default).
+    ///
+    /// Security-critical clamp: a configured `landlock_abi_floor` below 3 would
+    /// drop `Refer` (V2) / `Truncate` (V3) from the governed write set, letting a
+    /// confined child `truncate`/`rename` files OUTSIDE its `fs_write` scope while
+    /// [`crate::enforcement_report`] still reports `fs_write = Kernel` — a silent
+    /// weakening *and* an overclaim. Lowering a floor has no legitimate use
+    /// (`BestEffort` already degrades on genuinely older kernels), so we clamp up
+    /// to the claimed baseline rather than honor a weakening. Raising above the
+    /// default stays allowed (explicit opt-in hardening).
+    fn fs_abi_floor(policy: &SandboxPolicy) -> ABI {
+        abi_from_u32(policy.landlock_abi_floor.max(3))
+    }
+
+    /// The net-axis ABI floor actually installed — never below V4 (the default).
+    ///
+    /// TCP net rights first exist at V4, so a configured `landlock_net_abi_floor`
+    /// below 4 makes `AccessNet::from_all` EMPTY; under `BestEffort`,
+    /// `handle_access` of an empty set governs nothing, silently dropping a
+    /// requested deny-all-egress even on a capable (≥ 6.7) kernel while the report
+    /// claims `net = Kernel`. Clamp up to V4 for the same reason as
+    /// [`fs_abi_floor`].
+    fn net_abi_floor(policy: &SandboxPolicy) -> ABI {
+        abi_from_u32(policy.landlock_net_abi_floor.max(4))
+    }
+
+    /// `true` if this kernel can enforce a Landlock ruleset.
+    ///
+    /// Non-destructive: it creates (but never `restrict_self`s) a throwaway
+    /// ruleset under `HardRequirement`, so an unsupported kernel surfaces as
+    /// `Err` rather than being silently swallowed by best-effort.
+    pub fn landlock_is_supported() -> bool {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|r| r.create())
+            .is_ok()
+    }
+
+    /// `true` if this kernel supports Landlock TCP network rules (ABI V4,
+    /// kernel ≥ 6.7). Probed non-destructively — creates but never
+    /// `restrict_self`s a throwaway ruleset. This is the *capability* threshold
+    /// (TCP rules first appear at V4), distinct from the configurable request
+    /// floor in [`abi_from_u32`].
+    pub fn landlock_net_is_supported() -> bool {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessNet::from_all(ABI::V4))
+            .and_then(|r| r.create())
+            .is_ok()
+    }
+
+    // The Landlock read/exec allow-lists now live in `SandboxPolicy`
+    // (config.rs) and are read from `self.policy` in `apply`. Their security
+    // rationale is unchanged (ADR 0011 D3/D7):
+    //
+    // - `base_read_paths`: the loader/library trees + system DATA a permitted,
+    //   dynamically-linked program needs to start — but NOT the executable dirs
+    //   (`/usr/bin`, `/bin`, `/sbin`). Keeping bin dirs out of the read set
+    //   shrinks the loader-trampoline corpus: `/usr/bin/curl` is unreadable and
+    //   so cannot be `mmap`-exec'd via `ld.so`. This shrinks, but does not close,
+    //   the trampoline (`/usr/lib` still hides interpreters), so `exec` stays
+    //   `interceptor`, never `kernel`. `/etc` is never granted wholesale.
+    // - `bin_read_paths`: executable dirs, read-allowed ONLY when `exec` is
+    //   ambient (`All`); when `exec` is confined the granted binaries are added
+    //   by resolved path instead, narrowing the corpus to exactly them.
+    // - `loader_paths`: the dynamic linker(s) only — specific FILES, never
+    //   directories (a `path_beneath` dir grant would expose every ELF beneath
+    //   `/usr/lib` via the merged-usr symlink, defeating the exec axis).
+    //
+    // The `PathList` shrink-guard (config) means an operator can *widen* these
+    // (disclosed) but can only *remove* an entry with an explicit `replace=true`.
+
+    /// A real, kernel-enforced Landlock sandbox (Linux).
+    ///
+    /// **The `fs_write`, `fs_read`, and `exec` axes.** Writes are always governed
+    /// (from `fs_write`); reads are governed only when `fs_read` is *restricted*
+    /// (`Only(_)`), in which case the granted read roots plus the configured
+    /// `base_read_paths` are read-allowed and everything else is denied — so a
+    /// permitted external program cannot read user data outside `fs_read` (closing
+    /// `grep -f /etc/shadow`-style reads) yet can still load its libraries.
+    ///
+    /// `Execute` is governed only when `exec` is restricted: the *resolved*
+    /// granted program files plus the configured `loader_paths` (the dynamic linker only — never
+    /// library directories, which `path_beneath` would make recursively executable
+    /// and expose `/usr/lib`'s interpreters) are execute-allowed and all else
+    /// denied. This kernel-denies a **direct** `execve` of a different, un-granted
+    /// tool (`find -exec curl`, a written/symlinked payload, a shebang to an
+    /// un-granted interpreter) — the ADR 0011 boundary increment.
+    ///
+    /// It does **not** close the loader/interpreter *trampoline*: with reads
+    /// allow-listed, `ld.so` can `mmap`-exec any readable ELF, and a granted
+    /// interpreter runs arbitrary in-process code — neither is an `execve` the
+    /// `Execute` rule sees (ADR 0011 D2; Landlock has no `mmap` hook). So this is
+    /// the filesystem **boundary** + direct-execve denial, **not** program
+    /// identity — the per-axis report therefore keeps `exec → interceptor`, never
+    /// `kernel` (ADR 0011 D7); a strong principal still fails closed on a
+    /// restricted `exec` (ADR 0012 D4, already wired). The trampoline-tight close
+    /// (narrowed read base + W^X + seccomp `execve`/namespace deny, or a
+    /// micro-VM rootfs) is the Tier-2 follow-up (#57 / ADR 0009). When an axis is
+    /// `All` it stays ambient. On ABI-v4 kernels an empty `net` scope additionally
+    /// installs a deny-all TCP ruleset; hostname allowlists remain inexpressible.
+    ///
+    /// `restrict_self` is per-thread and irreversible, and is inherited across
+    /// `fork`/`execve`. Callers must therefore call [`Sandbox::apply`] on the
+    /// very thread that will spawn the confined work, immediately before the
+    /// spawn.
+    #[derive(Debug, Default, Clone)]
+    pub struct LandlockSandbox {
+        /// The read/exec allow-lists + ABI floors this backend enforces (I5-B).
+        policy: Arc<SandboxPolicy>,
+        exec_boundary: crate::ExecBoundary,
+    }
+
+    impl LandlockSandbox {
+        /// Construct with the built-in defaults (today's allow-lists).
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Construct configured with an operator-supplied [`SandboxPolicy`].
+        pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
+            Self {
+                policy,
+                exec_boundary: crate::ExecBoundary::ProcessTree,
+            }
+        }
+
+        pub(super) fn for_named_root(policy: Arc<SandboxPolicy>) -> Self {
+            Self {
+                policy,
+                exec_boundary: crate::ExecBoundary::NamedRoot,
+            }
+        }
+
+        fn handles_execute(&self, effective: &Caveats) -> bool {
+            self.exec_boundary == crate::ExecBoundary::ProcessTree
+                && matches!(effective.exec, Scope::Only(_))
+        }
+
+        // ── Shared root computation (ONE routine for both the applied ruleset and
+        // the resolved-authority projection — Q2 anti-drift). The precise claim:
+        // the ROOT-SET DERIVATION cannot independently drift, because both the
+        // fence and the projection call this same code on the same caveats. It is
+        // NOT a claim that the projection equals the kernel's actual authority:
+        // native access masks, `BestEffort` compat behaviour, OS path/symlink
+        // interpretation, aliases and deputies still require the later
+        // CompiledFence + AppliedFenceEvidence / native-hostile-test layer to
+        // establish empirical fidelity. ─────────────────────────────────────────
+
+        /// The write roots the ruleset anchors on: the granted write scope plus
+        /// the always-write-openable device sinks (#1220), existing paths only.
+        fn write_roots(&self, effective: &Caveats) -> Vec<String> {
+            let mut roots = scope_roots(&effective.fs_write);
+            roots.extend(self.policy.device_sink_paths.resolve());
+            roots.retain(|p| std::path::Path::new(p).exists());
+            roots
+        }
+
+        /// The read roots the ruleset anchors on when `fs_read` is restricted: the
+        /// granted read scope plus the base-read list plus, per exec-confinement,
+        /// either the resolved granted programs or the bin dirs, existing only.
+        fn read_roots(&self, effective: &Caveats, confine_exec: bool) -> Vec<String> {
+            let mut roots = scope_roots(&effective.fs_read);
+            roots.extend(self.policy.base_read_paths.resolve());
+            if confine_exec {
+                roots.extend(resolve_exec_paths(&effective.exec));
+            } else {
+                roots.extend(self.policy.bin_read_paths.resolve());
+            }
+            roots.retain(|p| std::path::Path::new(p).exists());
+            roots
+        }
+
+        /// The execute roots the ruleset anchors on when `exec` is restricted: the
+        /// resolved granted program files plus the dynamic linker(s), existing only.
+        fn exec_roots(&self, effective: &Caveats) -> Vec<String> {
+            let mut roots = resolve_exec_paths(&effective.exec);
+            roots.extend(self.policy.loader_paths.resolve());
+            roots.retain(|p| std::path::Path::new(p).exists());
+            roots
+        }
+    }
+
+    /// Whether every *grant-derived* root is an already-canonical, non-symlink
+    /// absolute path, so the Landlock rule (whose `PathFd` opens `O_PATH` and
+    /// FOLLOWS a final-component symlink — landlock-0.4.x) anchors on exactly the
+    /// named path and not a wider symlink target. A symlinked or non-canonical
+    /// grant root is NOT object-stable: for 0.8 the resolved authority on that axis
+    /// is `Unknown` ⇒ admission refuses (the E1 fail-closed posture; the same-object
+    /// FD bind that would let us honestly bound an aliased root is the PR-5 follow-up).
+    /// Policy-declared closures (base-read/loader/bin/device) are NOT checked here —
+    /// they are trusted, explicitly-declared runtime closure, not model-named roots.
+    fn grant_roots_are_object_stable(grant_roots: &[String]) -> bool {
+        grant_roots.iter().all(|p| match std::fs::canonicalize(p) {
+            Ok(canon) => canon.to_str() == Some(p.as_str()),
+            Err(_) => false,
+        })
+    }
+
+    impl Sandbox for LandlockSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::Landlock
+        }
+
+        fn exec_boundary(&self) -> crate::ExecBoundary {
+            self.exec_boundary
+        }
+
+        fn apply(&self, effective: &Caveats) -> ToolResult<()> {
+            let write = AccessFs::from_write(fs_abi_floor(&self.policy));
+            // Pure read rights — `from_read` also bundles `Execute`, which we
+            // govern separately (only when `exec` is restricted), never via the
+            // read axis.
+            let read = AccessFs::ReadFile | AccessFs::ReadDir;
+
+            // Govern writes always; govern reads / execute only when their axis is
+            // actually restricted (`Only`). `All` means no confinement was asked
+            // for, so that axis stays ambient and needs no base allow-list.
+            let confine_read = matches!(effective.fs_read, Scope::Only(_));
+            let confine_exec = matches!(effective.exec, Scope::Only(_));
+            // `net: Scope::Only([])` (empty) = deny ALL TCP bind + connect.
+            // Non-empty host allow-lists are not expressible in Landlock (port-
+            // based, not hostname-based) and stay advisory — only the empty-set
+            // case maps cleanly to a deny-all TCP rule.
+            let confine_net = super::net_fully_denied(effective);
+            let mut handled = write;
+            if confine_read {
+                handled |= read;
+            }
+            if self.handles_execute(effective) {
+                handled |= AccessFs::Execute;
+            }
+
+            // #1220: the device sinks are always write-openable — a confined
+            // git opening `/dev/null` O_RDWR must not be what the jail breaks.
+            // (O_RDWR also needs the read right: ambient when `fs_read` is
+            // `All`; granted via `base_read_paths` — which lists the same
+            // devices — when confined.) Built via the shared routine so the
+            // resolved-authority projection anchors on the identical set.
+            let write_roots = self.write_roots(effective);
+            // Build the ruleset: fs axes first (V3 floor), then optionally the
+            // net axis (V4+). BestEffort means handle_access silently skips
+            // access types the kernel doesn't know — so on pre-6.7 kernels the
+            // TCP handle is a no-op and only fs rules apply.
+            let ruleset = Ruleset::default()
+                .set_compatibility(CompatLevel::BestEffort)
+                .handle_access(handled)
+                .map_err(landlock_denied)?;
+            // When net is fully denied: declare AccessNet without adding any
+            // NetPort rules → deny-by-default for all TCP bind + connect.
+            let ruleset = if confine_net {
+                ruleset
+                    .handle_access(AccessNet::from_all(net_abi_floor(&self.policy)))
+                    .map_err(landlock_denied)?
+            } else {
+                ruleset
+            };
+            let ruleset = ruleset
+                .create()
+                .map_err(landlock_denied)?
+                .add_rules(path_beneath_rules(&write_roots, write))
+                .map_err(landlock_denied)?;
+
+            let ruleset = if confine_read {
+                // Granted read roots + the loader/library/data base list, so a
+                // permitted binary loads while out-of-scope reads stay denied.
+                // Granted read roots + the base list + (per exec-confinement) the
+                // resolved granted programs or the bin dirs — via the shared
+                // routine so the resolved-authority projection anchors on the
+                // identical set (ADR 0011 D3: confined-exec keeps bin dirs OUT of
+                // the trampoline corpus).
+                let read_roots = self.read_roots(effective, confine_exec);
+                ruleset
+                    .add_rules(path_beneath_rules(&read_roots, read))
+                    .map_err(landlock_denied)?
+            } else {
+                ruleset
+            };
+
+            let ruleset = if self.handles_execute(effective) {
+                // Execute-allow ONLY the resolved granted program files plus the
+                // dynamic linker(s) — never library directories (recursive +
+                // expose `/usr/lib`'s interpreters). A permitted binary still runs
+                // (its own execve + the loader + .so reads), but cannot DIRECTLY
+                // execve a different, un-granted program.
+                let exec_roots = self.exec_roots(effective);
+                ruleset
+                    .add_rules(path_beneath_rules(&exec_roots, AccessFs::Execute))
+                    .map_err(landlock_denied)?
+            } else {
+                ruleset
+            };
+
+            let status = ruleset.restrict_self().map_err(landlock_denied)?;
+
+            // Fail closed: if the kernel did not actually enforce the ruleset,
+            // do not let the caller believe it is confined.
+            if status.ruleset == RulesetStatus::NotEnforced {
+                return Err(ToolError::denied(
+                    "landlock ruleset was not enforced by this kernel",
+                ));
+            }
+
+            // ChildNetworkPolicy::DenyDirect — the seccomp socket()-family egress
+            // deny, on THIS confining thread (same thread as `restrict_self`,
+            // inherited across the imminent `fork`/`execve`). Only when net is
+            // already fully denied (a granted net scope leaves it inert), and
+            // fail-closed: a failed install refuses the spawn rather than let the
+            // caller believe UDP/DNS/raw egress is denied when it is not.
+            if self.policy.child_network == ChildNetworkPolicy::DenyDirect && confine_net {
+                install_seccomp_egress_deny()?;
+            }
+            Ok(())
+        }
+
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            use crate::ResolvedScope;
+            use std::collections::BTreeSet;
+
+            let confine_read = matches!(effective.fs_read, Scope::Only(_));
+            let confine_write = matches!(effective.fs_write, Scope::Only(_));
+            let confine_exec = matches!(effective.exec, Scope::Only(_));
+
+            let bounded = |roots: Vec<String>| ResolvedScope::Bounded {
+                concrete: roots.into_iter().collect::<BTreeSet<String>>(),
+                classes: BTreeSet::new(),
+            };
+
+            // fs_read: `All` is ambient (Unbounded). Restricted ⇒ the read roots
+            // the ruleset ACTUALLY anchors on (shared routine) — UNLESS a
+            // grant-derived root is symlinked/non-canonical, in which case the
+            // kernel rule can anchor on a wider target (E1) and we cannot honestly
+            // bound it ⇒ Unknown (refuse; the same-object bind is PR-5).
+            let fs_read = if !confine_read {
+                ResolvedScope::Unbounded
+            } else if !grant_roots_are_object_stable(&scope_roots(&effective.fs_read)) {
+                ResolvedScope::Unknown
+            } else {
+                bounded(self.read_roots(effective, confine_exec))
+            };
+
+            // fs_write is always governed; the grant portion must be object-stable
+            // (same E1 concern) — writable symlink roots are the more dangerous case.
+            let fs_write = if confine_write
+                && !grant_roots_are_object_stable(&scope_roots(&effective.fs_write))
+            {
+                ResolvedScope::Unknown
+            } else if !confine_write {
+                ResolvedScope::Unbounded
+            } else {
+                bounded(self.write_roots(effective))
+            };
+
+            // exec: `resolve_exec_paths` canonicalizes (no grant-symlink issue).
+            // The bound is process-image identity — the resolved programs + the
+            // loader (the direct-execve corpus). The ld.so mmap-exec trampoline is
+            // out of scope for the exec axis by definition (arbitrary-code, not a
+            // process image; a separate future concern), so it is NOT a widening here.
+            let exec = if self.handles_execute(effective) {
+                bounded(self.exec_roots(effective))
+            } else {
+                ResolvedScope::Unbounded
+            };
+
+            // net: `All` is ambient (Unbounded). A RESTRICTED net axis is honestly
+            // BOUNDED only where the child cannot egress at all — `net: none`
+            // (fully denied) under `DenyDirect`, where the seccomp socket()+
+            // io_uring deny (PR-1) closes the io_uring bypass (E3) on top of
+            // Landlock's TCP deny. There the resolved authority is exactly the
+            // empty host set (`from_scope(net:none)` = the bound the grant names,
+            // so admission is Equal). Every other restricted net — a hostname
+            // allow-list Landlock cannot express, or `net: none` under the default
+            // `LandlockOnly` where io_uring stays open — cannot be bounded ⇒
+            // Unknown ⇒ refuse.
+            let net = if matches!(effective.net, Scope::All) {
+                ResolvedScope::Unbounded
+            } else if super::net_fully_denied(effective)
+                && self.policy.child_network == ChildNetworkPolicy::DenyDirect
+            {
+                ResolvedScope::from_scope(&effective.net)
+            } else {
+                ResolvedScope::Unknown
+            };
+
+            crate::ResolvedAuthority {
+                fs_read,
+                fs_write,
+                exec,
+                net,
+            }
+        }
+
+        fn runtime_closure(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            use crate::ResolvedScope;
+            use std::collections::BTreeSet;
+
+            let confine_exec = matches!(effective.exec, Scope::Only(_));
+            let existing = |mut v: Vec<String>| -> BTreeSet<String> {
+                v.retain(|p| std::path::Path::new(p).exists());
+                v.into_iter().collect()
+            };
+            let bounded = |s: BTreeSet<String>| ResolvedScope::Bounded {
+                concrete: s,
+                classes: BTreeSet::new(),
+            };
+
+            // OBJECT-IDENTITY harness-disjointness (review #3): a benign-looking
+            // closure pathname can itself SYMLINK/alias into a harness-private
+            // store, so we check each root's RESOLVED (canonical) object identity —
+            // not only its lexical form — against the harness-private markers. Any
+            // root whose canonical identity reaches harness-private authority
+            // compromises the whole axis ⇒ `Unknown` ⇒ admission fails closed
+            // (`closure_is_harness_disjoint` rejects `Unknown`, L3/L7). Benign
+            // system aliases (`/lib`→`/usr/lib`, the loader) pass: their canonical
+            // identity is not harness-private. (The blanket "any non-canonical
+            // closure root refuses" posture is deferred to the same-object-FD
+            // binding, PR-5; here we refuse only closure roots that actually
+            // resolve INTO harness-private state.)
+            let harness_safe_bounded = |s: BTreeSet<String>| -> ResolvedScope {
+                if self.exec_boundary == crate::ExecBoundary::NamedRoot {
+                    // Retain the REAL substrate entries for the NamedRoot
+                    // additions-only inventory check. It checks canonical
+                    // recorded protected-root overlap against explicit delegation;
+                    // poisoning an already read-granted image here would hide
+                    // the evidence that no extra authority was added.
+                    return bounded(s);
+                }
+                let reaches_private = s.iter().any(|entry| {
+                    crate::admitted::entry_reaches_harness_private(entry)
+                        || std::fs::canonicalize(entry)
+                            .ok()
+                            .and_then(|canon| {
+                                canon
+                                    .to_str()
+                                    .map(crate::admitted::entry_reaches_harness_private)
+                            })
+                            .unwrap_or(false)
+                });
+                if reaches_private {
+                    ResolvedScope::Unknown
+                } else {
+                    bounded(s)
+                }
+            };
+
+            // fs_read additions the ruleset makes BEYOND the granted read scope:
+            // the base-read list (loader/lib/system-data) + (confined-exec ? the
+            // resolved granted program images : the bin dirs). System runtime
+            // substrate + the granted program's own image — harness-disjoint.
+            let mut read_add = self.policy.base_read_paths.resolve();
+            if confine_exec {
+                read_add.extend(resolve_exec_paths(&effective.exec));
+            } else {
+                read_add.extend(self.policy.bin_read_paths.resolve());
+            }
+
+            // exec additions: the resolved granted program image (reconciling the
+            // grant TOKEN with its canonical path) + the dynamic linker(s).
+            let exec_add = if self.handles_execute(effective) {
+                let mut e = resolve_exec_paths(&effective.exec);
+                e.extend(self.policy.loader_paths.resolve());
+                existing(e)
+            } else {
+                BTreeSet::new()
+            };
+
+            crate::ResolvedAuthority {
+                fs_read: harness_safe_bounded(existing(read_add)),
+                fs_write: harness_safe_bounded(existing(self.policy.device_sink_paths.resolve())),
+                exec: harness_safe_bounded(exec_add),
+                net: ResolvedScope::empty(),
+            }
+        }
+    }
+
+    /// Install the seccomp `socket()`-family egress deny on the CURRENT thread —
+    /// the [`ChildNetworkPolicy::DenyDirect`] leg (`crate::ChildNetworkPolicy`).
+    ///
+    /// Denies `socket()` for the off-box address families (`AF_INET` /
+    /// `AF_INET6` / `AF_PACKET`) with `EACCES`; `AF_UNIX` and every other syscall
+    /// stay allowed. This closes the UDP/DNS/raw/packet egress leg that Landlock's
+    /// TCP-only net rule cannot filter — a child under `net: none` can otherwise
+    /// still create those sockets.
+    ///
+    /// It ALSO denies the `io_uring` family (`io_uring_setup`/`enter`/`register`)
+    /// with `EACCES` (E3, the io_uring egress floor / PR-1): `IORING_OP_SOCKET` +
+    /// `IORING_OP_CONNECT`/`SEND` create and use a socket **without** the
+    /// `socket()` syscall, so a socket()-only filter is bypassable. seccomp
+    /// cannot inspect an io_uring SQE opcode, so the honest close is to deny the
+    /// io_uring setup/enter primitive entirely while net is confined — a child
+    /// that asked for `net: none` does not get an un-mediated async-I/O channel.
+    /// (A child needing io_uring for file I/O under `net: none` falls back to the
+    /// ordinary syscalls; net confidentiality wins the trade.)
+    ///
+    /// `apply_filter` sets `PR_SET_NO_NEW_PRIVS`, so it needs no privilege, is
+    /// irreversible, and is inherited by every `fork`/`execve` descendant.
+    /// `apply_filter` is a safe fn, so core keeps `unsafe_code = forbid`. Must run
+    /// on the confining thread, after `restrict_self`, immediately before the spawn.
+    fn install_seccomp_egress_deny() -> ToolResult<()> {
+        use seccompiler::{
+            apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+            SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
+        };
+        use std::collections::BTreeMap;
+
+        let denied =
+            |e: String| ToolError::denied(format!("seccomp egress deny not installed: {e}"));
+
+        // One rule per off-box family, matched on socket()'s `domain` arg (arg 0).
+        let families: [u64; 3] = [
+            libc::AF_INET as u64,
+            libc::AF_INET6 as u64,
+            libc::AF_PACKET as u64,
+        ];
+        let rules: Vec<SeccompRule> = families
+            .into_iter()
+            .map(|fam| {
+                let cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, fam)
+                    .map_err(|e| denied(e.to_string()))?;
+                SeccompRule::new(vec![cond]).map_err(|e| denied(e.to_string()))
+            })
+            .collect::<ToolResult<_>>()?;
+
+        let mut per_syscall: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        per_syscall.insert(libc::SYS_socket, rules);
+        // Empty rule vec ⇒ the syscall is denied UNCONDITIONALLY (the filter's
+        // match action, EACCES). Closes the io_uring egress bypass of `net: none`.
+        per_syscall.insert(libc::SYS_io_uring_setup, Vec::new());
+        per_syscall.insert(libc::SYS_io_uring_enter, Vec::new());
+        per_syscall.insert(libc::SYS_io_uring_register, Vec::new());
+
+        let filter = SeccompFilter::new(
+            per_syscall,
+            // Default for every other syscall — and for `socket()` with a
+            // non-matched family (e.g. AF_UNIX): allow.
+            SeccompAction::Allow,
+            // A matched off-box `socket()`: fail with EACCES (a clean, catchable
+            // "permission denied" the child sees as an unreachable network).
+            SeccompAction::Errno(libc::EACCES as u32),
+            TargetArch::try_from(std::env::consts::ARCH).map_err(|e| denied(e.to_string()))?,
+        )
+        .map_err(|e| denied(e.to_string()))?;
+
+        let prog: BpfProgram = BpfProgram::try_from(filter).map_err(|e| denied(e.to_string()))?;
+        apply_filter(&prog).map_err(|e| denied(e.to_string()))
+    }
+
+    /// Resolve the granted `exec` scope to absolute, existing program **files**
+    /// for the `Execute` allow-list: a path-bearing entry is taken as-is (if it
+    /// exists); a bare name is resolved against the exec search dirs. Canonicalized
+    /// so the rule anchors the real inode. `All` => empty (exec stays ambient).
+    fn resolve_exec_paths(scope: &Scope<String>) -> Vec<String> {
+        let set = match scope {
+            Scope::All => return Vec::new(),
+            Scope::Only(set) => set,
+        };
+        let dirs = exec_search_dirs();
+        let mut out = Vec::new();
+        for entry in set {
+            let candidate = if entry.contains('/') {
+                let p = std::path::PathBuf::from(entry);
+                p.exists().then_some(p)
+            } else {
+                dirs.iter()
+                    .map(|d| std::path::Path::new(d).join(entry))
+                    .find(|c| c.is_file())
+            };
+            if let Some(p) = candidate {
+                if let Ok(canon) = p.canonicalize() {
+                    out.push(canon.to_string_lossy().into_owned());
+                }
+            }
+        }
+        out
+    }
+
+    /// The directories a bare program name is resolved against: `$PATH` if set,
+    /// else a conventional fallback. Used only to anchor the `Execute` allow-list
+    /// (the spawn itself still resolves the program normally).
+    fn exec_search_dirs() -> Vec<String> {
+        if let Ok(path) = std::env::var("PATH") {
+            let dirs: Vec<String> = path
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            if !dirs.is_empty() {
+                return dirs;
+            }
+        }
+        [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/local/sbin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+    }
+
+    /// The existing path roots a [`Scope`] grants: `All` => the whole tree
+    /// (`/`); `Only(set)` => exactly those paths that exist (a non-existent path
+    /// cannot anchor a Landlock rule and is skipped — safe, since its parent is
+    /// ungranted, so access beneath it stays denied).
+    fn scope_roots(scope: &Scope<String>) -> Vec<String> {
+        match scope {
+            Scope::All => vec!["/".to_string()],
+            Scope::Only(set) => set
+                .iter()
+                .filter(|p| std::path::Path::new(p).exists())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn landlock_denied(e: impl std::fmt::Display) -> ToolError {
+        ToolError::denied(format!("landlock: {e}"))
+    }
+
+    #[cfg(test)]
+    mod resolved_authority_tests {
+        //! Adversarial tests for the Landlock conservative-bound projection: the
+        //! confirmed escapes (E1 symlink root, E3 net:none io_uring) must resolve
+        //! to `Unknown`/`Superset` and refuse through mesh admission — the honest
+        //! upper bound, computed from the SAME routines `apply` uses.
+        use super::*;
+        use crate::{admit, empty_closure, AdmissionDecision, ResolvedScope};
+        use std::os::unix::fs::symlink;
+
+        fn fs_read_only(path: &str) -> Caveats {
+            Caveats {
+                fs_read: Scope::only([path.to_string()]),
+                ..Caveats::top()
+            }
+        }
+
+        /// E1, grounded: `grant_roots_are_object_stable` rejects a symlinked root
+        /// (canonical target ≠ literal) and accepts a real canonical directory.
+        #[test]
+        fn object_stability_flags_symlinked_grant_roots() {
+            let base = std::env::temp_dir().join(format!("ab-e1a-{}", std::process::id()));
+            let real = base.join("real");
+            let link = base.join("link");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&real).unwrap();
+            symlink("/", &link).unwrap();
+            let real_canon = std::fs::canonicalize(&real)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(grant_roots_are_object_stable(&[real_canon]));
+            assert!(!grant_roots_are_object_stable(&[link
+                .to_str()
+                .unwrap()
+                .to_string()]));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// #3 object-identity: a benign-LOOKING closure root that SYMLINKS into a
+        /// harness-private store (`.newt`) poisons the axis → `Unknown` → admission
+        /// refuses (`closure_is_harness_disjoint` rejects `Unknown`). A benign
+        /// system alias whose canonical identity is NOT harness-private stays
+        /// admissible — the default policy's merged-`/usr` loader/lib symlinks
+        /// (e.g. `/lib`→`/usr/lib` on this host) must remain disjoint, proving we
+        /// refuse on resolved OBJECT IDENTITY, not on the mere presence of a symlink.
+        #[test]
+        fn a_closure_root_resolving_into_harness_private_poisons_the_axis() {
+            use std::sync::Arc;
+            let dir = std::env::temp_dir().join(format!("ab-obj-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".newt/ocap")).unwrap();
+            let link = dir.join("innocent-substrate");
+            symlink(dir.join(".newt/ocap"), &link).unwrap();
+            let policy = crate::SandboxPolicy {
+                base_read_paths: crate::PathList::from_defaults(&[link.to_str().unwrap()]),
+                ..crate::SandboxPolicy::default()
+            };
+            let closure = LandlockSandbox::with_policy(Arc::new(policy))
+                .runtime_closure(&fs_read_only("/tmp"));
+            assert_eq!(
+                closure.fs_read,
+                ResolvedScope::Unknown,
+                "a closure root whose canonical identity reaches .newt must poison the axis"
+            );
+            assert!(!crate::admitted::closure_is_harness_disjoint(&closure));
+            // The default policy (benign merged-/usr symlinks) stays disjoint.
+            let benign = LandlockSandbox::new().runtime_closure(&fs_read_only("/tmp"));
+            assert!(
+                crate::admitted::closure_is_harness_disjoint(&benign),
+                "benign system aliases (loader/lib) must remain harness-disjoint"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// E1 end-to-end: a symlinked read grant (`sub -> /`) resolves `fs_read`
+        /// to `Unknown`, so mesh admission refuses — the whole-tree-read escape
+        /// can never admit.
+        #[test]
+        fn e1_symlinked_read_grant_resolves_unknown_and_refuses() {
+            let base = std::env::temp_dir().join(format!("ab-e1b-{}", std::process::id()));
+            let link = base.join("sub");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            symlink("/", &link).unwrap();
+            let delegated = fs_read_only(link.to_str().unwrap());
+            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            assert_eq!(resolved.fs_read, ResolvedScope::Unknown);
+            assert!(matches!(
+                admit(&resolved, &delegated, &empty_closure()),
+                AdmissionDecision::Reject(_)
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// E3: under the DEFAULT `LandlockOnly` policy, `net:none` cannot be
+        /// honestly bounded — io_uring UDP bypasses the `SYS_socket` seccomp deny
+        /// and no io_uring floor is installed — so `resolved.net = Unknown` ⇒
+        /// refuse. (The enforced case is `net:none` under `DenyDirect`, below.)
+        #[test]
+        fn e3_net_none_under_landlock_only_resolves_unknown_and_refuses() {
+            let delegated = Caveats {
+                net: Scope::only(Vec::<String>::new()),
+                ..Caveats::top()
+            };
+            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            assert_eq!(resolved.net, ResolvedScope::Unknown);
+            assert!(matches!(
+                admit(&resolved, &delegated, &empty_closure()),
+                AdmissionDecision::Reject(_)
+            ));
+        }
+
+        /// PR-1: `net:none` under `DenyDirect` IS honestly bounded — the seccomp
+        /// socket()+io_uring deny closes the E3 io_uring bypass on top of
+        /// Landlock's TCP deny — so `resolved.net` is the empty host set the grant
+        /// names and admission ADMITS (enforced no-egress). This is what re-enables
+        /// restricted-`net:none` confined operation faithfully.
+        #[test]
+        fn net_none_under_deny_direct_resolves_bounded_and_admits() {
+            use std::sync::Arc;
+            let delegated = Caveats {
+                net: Scope::only(Vec::<String>::new()),
+                ..Caveats::top()
+            };
+            let policy = crate::SandboxPolicy {
+                child_network: crate::ChildNetworkPolicy::DenyDirect,
+                ..crate::SandboxPolicy::default()
+            };
+            let resolved =
+                LandlockSandbox::with_policy(Arc::new(policy)).resolved_authority(&delegated);
+            assert_ne!(
+                resolved.net,
+                ResolvedScope::Unknown,
+                "DenyDirect net:none must be BOUNDED (io_uring closed), not Unknown"
+            );
+            assert!(
+                matches!(
+                    admit(&resolved, &delegated, &empty_closure()),
+                    AdmissionDecision::Admit
+                ),
+                "enforced net:none (DenyDirect) must admit"
+            );
+        }
+
+        /// The conservative rule only bites RESTRICTED axes: an unrestricted grant
+        /// (`All` everywhere) resolves `Unbounded` and admits.
+        #[test]
+        fn unrestricted_grant_admits() {
+            let delegated = Caveats::top();
+            let resolved = LandlockSandbox::new().resolved_authority(&delegated);
+            assert_eq!(resolved.net, ResolvedScope::Unbounded);
+            assert_eq!(resolved.fs_read, ResolvedScope::Unbounded);
+            assert!(matches!(
+                admit(&resolved, &delegated, &empty_closure()),
+                AdmissionDecision::Admit
+            ));
+        }
+
+        /// A legit fs_read grant ADMITS: the base-read/bin substrate the ruleset
+        /// adds is DECLARED by the runtime closure, so `resolved ⊑ delegated ∪
+        /// closure`. WITHOUT the closure the same substrate is an undeclared
+        /// widening and refuses — proving the closure is load-bearing, not cosmetic.
+        #[test]
+        fn a_legit_fs_read_grant_admits_via_the_declared_closure() {
+            let dir = std::env::temp_dir().join(format!("ab-c-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let delegated = fs_read_only(dir.to_str().unwrap());
+            let sb = LandlockSandbox::new();
+            let resolved = sb.resolved_authority(&delegated);
+            let closure = sb.runtime_closure(&delegated);
+            assert!(
+                matches!(
+                    admit(&resolved, &delegated, &closure),
+                    AdmissionDecision::Admit
+                ),
+                "a legit grant must admit once the substrate is declared; resolved={resolved:?}"
+            );
+            assert!(
+                matches!(
+                    admit(&resolved, &delegated, &empty_closure()),
+                    AdmissionDecision::Reject(_)
+                ),
+                "without the closure the base-read additions are an undeclared widening"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The Landlock runtime closure declares only system substrate — disjoint
+        /// from harness-private authority; a closure reaching the OCAP store fails.
+        #[test]
+        fn runtime_closure_is_harness_disjoint() {
+            let delegated = fs_read_only("/tmp");
+            let closure = LandlockSandbox::new().runtime_closure(&delegated);
+            assert!(crate::admitted::closure_is_harness_disjoint(&closure));
+            let mut bad = closure;
+            if let ResolvedScope::Bounded { concrete, .. } = &mut bad.fs_read {
+                concrete.insert("/home/agent/.newt/ocap/state".to_string());
+            }
+            assert!(!crate::admitted::closure_is_harness_disjoint(&bad));
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+mod seatbelt_impl {
+    use super::{Sandbox, SandboxKind};
+    use crate::{Caveats, SandboxPolicy, Scope, ToolError, ToolResult};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// `true` iff every host in a non-empty `net` allow-list is a `unix:`
+    /// endpoint (no IP/DNS host at all) — the shape Seatbelt can kernel-deny
+    /// direct network entirely (`(deny network*)`) and then re-allow exactly
+    /// the named sockets. Seatbelt-only: no other backend projects exact Unix
+    /// endpoint authority, so this predicate has no cross-backend caller.
+    fn net_unix_only(caveats: &Caveats) -> bool {
+        matches!(&caveats.net, Scope::Only(s)
+            if !s.is_empty() && s.iter().all(|h| h.starts_with("unix:")))
+    }
+
+    /// The macOS sandbox wrapper. We invoke it by **absolute path** (never via
+    /// `PATH`) so the boundary cannot be shadowed by a `sandbox-exec` planted
+    /// earlier in a caller's `PATH`. `sandbox-exec(1)` is deprecated-but-present
+    /// on stock macOS; using it keeps the boundary FFI-free, which core requires
+    /// (`unsafe_code = "forbid"`).
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+    // Read-side base allow-list (subpaths): the system/loader paths a
+    // dynamically-linked Mach-O binary must read to *start and run* — the dynamic
+    // linker and dyld shared cache (under `/System`, incl. the Cryptex volume),
+    // system dylibs/frameworks, the binaries themselves, the name-service and
+    // locale config (`/private/etc`, the real target of `/etc`), the dyld closure
+    // db, and the `/dev` essentials. Added whenever `fs_read` is confined,
+    // alongside the literal root entry, so a *permitted* program still loads while
+    // user data outside scope stays unreadable. Non-existent entries are dropped
+    // during canonicalization, so extra entries are harmless across macOS layouts
+    // (verified on Apple Silicon: `grep`/`cat`/`cp` load read-confined). The list
+    // now lives in `SandboxPolicy::base_read_paths` (config.rs), whose default is
+    // macOS-specific on this platform (I5-B, #144).
+
+    /// `true` if this host can enforce a Seatbelt profile — i.e. the
+    /// `sandbox-exec` wrapper is present. The wrapper itself is the boundary, so
+    /// its presence is the capability (the analog of `landlock_is_supported`).
+    #[must_use]
+    pub fn seatbelt_is_supported() -> bool {
+        Path::new(SANDBOX_EXEC).exists()
+    }
+
+    /// A real, kernel-enforced Seatbelt sandbox (macOS).
+    ///
+    /// **The `fs_write` and `fs_read` axes** — the same *axes* the Linux Landlock
+    /// backend governs (not necessarily the same path-level strictness; see
+    /// below). Confinement is applied by wrapping the spawned program in
+    /// `sandbox-exec -p <profile>`, where the SBPL profile is generated from the
+    /// effective [`Caveats`] (see [`seatbelt_profile`]): writes are denied
+    /// outside the granted `fs_write` roots, and — when `fs_read` is restricted —
+    /// reads are denied outside the granted roots plus the loader/system base
+    /// list. When `net` is empty it kernel-denies the child's direct socket
+    /// operations and installs a conservative Mach-lookup floor as
+    /// defense-in-depth. That floor is not proof that every ambient deputy is
+    /// closed, so restricted network authority remains held at admission. A
+    /// non-empty `net` host allowlist is not expressible in SBPL (it filters by
+    /// socket, not hostname) and stays advisory.
+    ///
+    /// **The `exec` axis** — when restricted, the profile emits
+    /// `(deny process-exec*)` and re-allows exactly the granted programs (resolved
+    /// to absolute paths). Because `process-exec*` is a kernel-checked operation
+    /// applied to the confined process *and everything it spawns*, this confines
+    /// the program's **interior** execs — the L3 gap a path allow-list alone
+    /// cannot reach. Unlike Landlock, no seccomp backstop is needed: the loader
+    /// trampoline (`dyld TARGET`) is itself a governed `process-exec`, and the
+    /// `mmap(PROT_EXEC)` read-as-code path is closed by Apple-Silicon hardware
+    /// W^X + code signing — so "the readable set equals the runnable set" (the
+    /// fact that forces the Linux seccomp filter) does **not** hold here. The axis
+    /// is therefore honestly reported `Kernel` (ADR 0014; agent-bridle#31/#57).
+    ///
+    /// Read confinement here is **content-level**: file *metadata* (stat,
+    /// existence, directory traversal) stays ambient so binaries can load through
+    /// symlink ancestors, and the system read base (the configured `base_read_paths`, incl.
+    /// `/private/etc`) is broadly readable — looser than Landlock's file-level
+    /// `/etc` allow-list, but the protected resource (out-of-scope file
+    /// *contents*, the exfil threat) is denied identically. macOS keeps user
+    /// secrets in the Keychain and `$HOME`, not `/etc`.
+    ///
+    /// Unlike Landlock's per-thread `restrict_self`, Seatbelt confinement is
+    /// carried by the wrapper process and inherited by the child, so
+    /// [`Sandbox::apply`] is a no-op and the boundary lives entirely in
+    /// [`Sandbox::command_prefix`].
+    #[derive(Debug, Default, Clone)]
+    pub struct SeatbeltSandbox {
+        /// The read base this backend's SBPL profile allows (I5-B).
+        policy: Arc<SandboxPolicy>,
+    }
+
+    /// The Mach-lookup leg paired with Seatbelt's direct-network deny for
+    /// `net:none`. Production always uses `Closed`; the test-only ambient mode
+    /// exists solely to characterize the incremental effect of the Mach floor.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NetNoneMachFloor {
+        Closed,
+        #[cfg(test)]
+        AmbientCharacterization,
+    }
+
+    impl SeatbeltSandbox {
+        /// Construct with the built-in defaults (today's read base).
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Construct configured with an operator-supplied [`SandboxPolicy`].
+        #[must_use]
+        pub fn with_policy(policy: Arc<SandboxPolicy>) -> Self {
+            Self { policy }
+        }
+
+        fn wrapper_prefix(
+            &self,
+            effective: &Caveats,
+            mach_floor: NetNoneMachFloor,
+        ) -> ToolResult<Vec<String>> {
+            if !seatbelt_is_supported() {
+                return Err(ToolError::denied(
+                    "macOS seatbelt: /usr/bin/sandbox-exec is unavailable; cannot confine",
+                ));
+            }
+            Ok(vec![
+                SANDBOX_EXEC.to_string(),
+                "-p".to_string(),
+                seatbelt_profile_with(
+                    effective,
+                    &self.policy.base_read_paths.resolve(),
+                    &self.policy.device_sink_paths.resolve(),
+                    &unix_socket_paths(effective)?,
+                    mach_floor,
+                    self.policy.macos_private_ptys,
+                ),
+            ])
+        }
+
+        /// Test-only typed seam for the E4 differential. It accepts exactly
+        /// `net:none` with every other caveat unrestricted and emits the same
+        /// direct-network deny as production while deliberately leaving Mach
+        /// lookup ambient. No profile text is parsed or rewritten.
+        #[cfg(test)]
+        pub(super) fn net_none_ambient_mach_prefix(
+            &self,
+            effective: &Caveats,
+        ) -> ToolResult<Vec<String>> {
+            let expected = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            if effective != &expected {
+                return Err(ToolError::denied(
+                    "the ambient-Mach characterization requires exactly net:none and otherwise-top caveats",
+                ));
+            }
+            self.wrapper_prefix(effective, NetNoneMachFloor::AmbientCharacterization)
+        }
+    }
+
+    impl Sandbox for SeatbeltSandbox {
+        fn kind(&self) -> SandboxKind {
+            SandboxKind::Seatbelt
+        }
+
+        /// Deliberately partial Seatbelt projection. The filesystem and exec axes
+        /// retain the legacy caveats-grain/verbatim projection so this change does
+        /// not claim ruleset-grain fidelity that has not been established. Network
+        /// is stricter: unrestricted authority is honestly ambient, while every
+        /// restricted network scope remains `Unknown` and is refused before spawn.
+        /// The Mach floor in the generated profile is defense-in-depth only and is
+        /// not used to promote restricted network authority to a bounded claim.
+        fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
+            resolved.net = match &effective.net {
+                Scope::All => crate::ResolvedScope::Unbounded,
+                Scope::Only(_) => crate::ResolvedScope::Unknown,
+            };
+            resolved
+        }
+
+        fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
+            // Deliberate no-op: Seatbelt confines via the `sandbox-exec` wrapper
+            // (see `command_prefix`), not by restricting the calling thread. The
+            // boundary is the wrapped spawn.
+            Ok(())
+        }
+
+        fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
+            let unix_sockets = unix_socket_paths(effective)?;
+            if !unix_sockets.is_empty()
+                && !net_unix_only(effective)
+                && !super::net_loopback_only(effective)
+            {
+                return Err(ToolError::denied(
+                    "Unix socket grants with remote hosts require the managed egress proxy",
+                ));
+            }
+            // Nothing on a governed axis (fs, a direct-network floor, exact Unix
+            // endpoints, or a restricted exec allow-list) => nothing to confine;
+            // run unwrapped (coarse honesty falls to `None` upstream, and the
+            // per-axis report omits unrestricted axes).
+            if !super::restricts_fs(effective)
+                && !super::net_fully_denied(effective)
+                && !super::net_loopback_only(effective)
+                && unix_sockets.is_empty()
+                && !super::restricts_exec(effective)
+            {
+                return Ok(Vec::new());
+            }
+            // Production always installs the closed Mach floor. The network
+            // projection remains Unknown for every restricted scope regardless.
+            self.wrapper_prefix(effective, NetNoneMachFloor::Closed)
+        }
+    }
+
+    /// Generate the SBPL profile for `effective`. **Pure** (modulo path
+    /// canonicalization against the real filesystem); no spawning.
+    ///
+    /// Model (the macOS analog of Landlock handling only the write/read access
+    /// rights and leaving the rest ambient): start from `(allow default)` so
+    /// unhandled operations — `exec`, `network`, mach lookups a normal process
+    /// needs — stay ambient, then `(deny file-write*)` / `(deny file-read*)` for
+    /// a restricted axis and re-allow exactly the granted roots (canonicalized,
+    /// so `/tmp` → `/private/tmp` matches). An empty `fs_write` scope emits the
+    /// deny with no re-allow — every write denied. SBPL evaluates last-match-wins,
+    /// so the trailing allow-roots override the deny.
+    // Convenience over the built-in read base — **tests only** (production uses
+    // `command_prefix` → `seatbelt_profile_with` with the configured
+    // `SandboxPolicy::base_read_paths`, I5-B #144).
+    #[cfg(test)]
+    #[must_use]
+    pub fn seatbelt_profile(effective: &Caveats) -> String {
+        let policy = SandboxPolicy::default();
+        seatbelt_profile_with(
+            effective,
+            &policy.base_read_paths.resolve(),
+            &policy.device_sink_paths.resolve(),
+            &unix_socket_paths(effective).expect("valid Unix socket grants in profile fixture"),
+            NetNoneMachFloor::Closed,
+            policy.macos_private_ptys,
+        )
+    }
+
+    /// SBPL profile builder, parameterized on the read base (`base_read`), the
+    /// always-writable device sinks (`sinks`, #1220), and the exact Unix
+    /// endpoint paths (`unix_sockets`) already validated by
+    /// [`unix_socket_paths`].
+    #[must_use]
+    fn seatbelt_profile_with(
+        effective: &Caveats,
+        base_read: &[String],
+        sinks: &[String],
+        unix_sockets: &[String],
+        mach_floor: NetNoneMachFloor,
+        private_ptys: bool,
+    ) -> String {
+        let mut p = String::from("(version 1)\n(allow default)\n");
+
+        // fs_write: deny writes, then re-allow the granted roots.
+        if let Scope::Only(_) = &effective.fs_write {
+            p.push_str("(deny file-write*)\n");
+            let roots = confined_roots(&effective.fs_write);
+            if !roots.is_empty() {
+                p.push_str("(allow file-write*");
+                for r in &roots {
+                    p.push_str(&format!(" (subpath {})", sbpl_string(r)));
+                }
+                p.push_str(")\n");
+            }
+            // #1220: device sinks stay write-openable under confinement —
+            // `literal` (not `subpath`): each is a single character device.
+            if !sinks.is_empty() {
+                p.push_str("(allow file-write*");
+                for s in sinks {
+                    p.push_str(&format!(" (literal {})", sbpl_string(s)));
+                }
+                p.push_str(")\n");
+            }
+        }
+
+        // fs_read: deny reads, then re-allow. `(allow file-read-metadata)`
+        // permits path *traversal* and `stat` everywhere — without it, reaching
+        // an in-scope file through a symlink ancestor (`/tmp`, `/var`, `/etc` →
+        // `/private/…`) is denied at the symlink lookup. Metadata reveals only
+        // existence/size, never **content**; the data axis stays confined to the
+        // loader/system base, the root directory *entry* (dyld reads `/` itself),
+        // and the granted roots — so a permitted program loads and reads in-scope
+        // files while out-of-scope file *contents* (the exfil threat) stay denied.
+        if let Scope::Only(_) = &effective.fs_read {
+            p.push_str("(deny file-read*)\n");
+            p.push_str("(allow file-read-metadata)\n");
+            p.push_str("(allow file-read* (literal \"/\")");
+            for base in base_read {
+                if let Some(c) = canonical_path(base) {
+                    p.push_str(&format!(" (subpath {})", sbpl_string(&c)));
+                }
+            }
+            p.push_str(")\n");
+            if private_ptys {
+                // The default read base includes /dev. Override that ambient
+                // base for slave terminals, then reapply explicit user roots.
+                p.push_str("(deny file-read* (regex #\"^/dev/ttys[0-9]+$\"))\n");
+            }
+            let roots = confined_roots(&effective.fs_read);
+            if !roots.is_empty() {
+                p.push_str("(allow file-read*");
+                for r in roots {
+                    p.push_str(&format!(" (subpath {})", sbpl_string(&r)));
+                }
+                p.push_str(")\n");
+            }
+        }
+
+        if private_ptys {
+            // Fresh devices are a declared runtime exception. The kernel
+            // extension binds slave access to PTYs allocated in this sandbox;
+            // an unrelated host terminal receives no read/write grant here.
+            // Inherited descriptors and /dev/tty are separate existing surfaces.
+            p.push_str("(allow pseudo-tty)\n");
+            p.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
+            p.push_str("(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n");
+        }
+
+        // net: SBPL can name only `*`/`localhost` + ports as a remote (an
+        // arbitrary IP is rejected: "host must be * or localhost"; ADR 0015), so a
+        // general host allowlist is inexpressible and left ambient (reported
+        // advisory, never silently dropped). The two policies it *can* enforce:
+        //   • empty scope  → `(deny network*)`: the child's direct socket
+        //     operations are kernel-denied. Production also installs the typed
+        //     Mach-lookup floor below as defense-in-depth; this is not an exhaustive
+        //     deputy proof and restricted network admission remains held.
+        //   • loopback-only allowlist → deny all, then re-allow the loopback
+        //     interface (`localhost` = 127.0.0.1 + ::1). The process's own off-box
+        //     socket egress stays kernel-denied; the exact loopback host is narrowed
+        //     by admission. Last-match-wins, so the allow overrides.
+        if super::net_fully_denied(effective) || net_unix_only(effective) {
+            p.push_str("(deny network*)\n");
+            match mach_floor {
+                NetNoneMachFloor::Closed => {
+                    // Defense-in-depth: default-deny named Mach lookup, then restore
+                    // the compatibility floor below. This characterizes one known
+                    // incremental barrier; it does not prove that all Mach/XPC,
+                    // AppleEvent, or other ambient deputies are closed.
+                    p.push_str("(deny mach-lookup)\n");
+                    p.push_str("(allow mach-lookup");
+                    for name in MACH_LOOKUP_ALLOWLIST {
+                        p.push_str(&format!(" (global-name {})", sbpl_string(name)));
+                    }
+                    p.push_str(")\n");
+                }
+                #[cfg(test)]
+                NetNoneMachFloor::AmbientCharacterization => {}
+            }
+        } else if super::net_loopback_only(effective) {
+            p.push_str("(deny network*)\n");
+            p.push_str("(allow network* (remote ip \"localhost:*\"))\n");
+        }
+        // Exact Unix endpoints (#385 upstream, forward-ported): each granted
+        // socket path is an exact outbound exception, never an `(allow
+        // network*)` widening — `unix_socket_paths` already validated each
+        // path is an existing, canonical, symlink-free socket.
+        for path in unix_sockets {
+            p.push_str(&format!(
+                "(allow network-outbound (literal {}))\n",
+                sbpl_string(path)
+            ));
+        }
+
+        // exec: deny *all* further execs, then re-allow exactly the granted
+        // programs (resolved to absolute, canonical paths). `process-exec*` is
+        // kernel-checked on the confined process AND everything it spawns, so this
+        // is the `exec` axis at interior grain — no seccomp backstop needed (the
+        // dyld trampoline is itself a governed `process-exec`, and `mmap(PROT_EXEC)`
+        // read-as-code is closed by hardware W^X + code signing; ADR 0014). An
+        // empty/unresolvable grant emits the deny with no re-allow — every exec
+        // (including the wrapped program's own launch) denied: fail-closed, never
+        // ambient. SBPL is last-match-wins, so the trailing allow overrides.
+        if let Scope::Only(_) = &effective.exec {
+            p.push_str("(deny process-exec*)\n");
+            let targets = resolve_exec_targets(&effective.exec);
+            if !targets.is_empty() {
+                p.push_str("(allow process-exec*");
+                for t in &targets {
+                    p.push_str(&format!(" (literal {})", sbpl_string(t)));
+                }
+                p.push_str(")\n");
+            }
+        }
+
+        p
+    }
+
+    /// Validate and resolve every `unix:<path>` token in `effective.net` to its
+    /// exact canonical path, for an `(allow network-outbound (literal …))`
+    /// exception. No lexical aliases, symlinks, missing endpoints, or patterns
+    /// — matching is to this exact existing pathname, never its parent or a
+    /// socket subtree: a granted `unix:/tmp/svc.sock` must equal its own
+    /// canonicalization (rejecting a symlinked or relative name) and must
+    /// already exist as a socket (rejecting a missing or ordinary file).
+    fn unix_socket_paths(effective: &Caveats) -> ToolResult<Vec<String>> {
+        use std::os::unix::fs::FileTypeExt;
+        let Scope::Only(names) = &effective.net else {
+            return Ok(Vec::new());
+        };
+        names
+            .iter()
+            .filter_map(|name| name.strip_prefix("unix:"))
+            .map(|name| {
+                let path = Path::new(name);
+                let valid = path.is_absolute()
+                    && !name
+                        .chars()
+                        .any(|c| c.is_control() || matches!(c, '*' | '?' | '[' | ']'))
+                    && std::fs::canonicalize(path)
+                        .ok()
+                        .and_then(|p| p.to_str().map(str::to_owned))
+                        .as_deref()
+                        == Some(name)
+                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
+                if valid {
+                    Ok(name.to_owned())
+                } else {
+                    Err(ToolError::denied(
+                        "Unix endpoint grant must name an existing canonical absolute socket \
+                         without symlinks or patterns",
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    /// The canonicalized, existing roots a restricted [`Scope`] grants. A path
+    /// that cannot be resolved to any existing ancestor is dropped (it cannot
+    /// anchor a rule — safe, since its parent is ungranted, so access beneath it
+    /// stays denied). `All` yields nothing (callers only pass a restricted axis).
+    fn confined_roots(scope: &Scope<String>) -> Vec<String> {
+        let Scope::Only(set) = scope else {
+            return Vec::new();
+        };
+        let mut roots: Vec<String> = set.iter().filter_map(|p| canonical_path(p)).collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Operational compatibility floor re-allowed after the production
+    /// `net:none` Mach-lookup deny. It has been exercised with common build tools,
+    /// but it is not an exhaustive deputy audit and does not justify bounded
+    /// network authority. Restricted network scopes remain `Unknown` at admission.
+    const MACH_LOOKUP_ALLOWLIST: &[&str] = &[
+        "com.apple.system.opendirectoryd.libinfo",
+        "com.apple.system.opendirectoryd.membership",
+        "com.apple.system.DirectoryService.libinfo_v1",
+        "com.apple.system.notification_center",
+        "com.apple.CoreServices.coreservicesd",
+        "com.apple.coreservices.launchservicesd",
+        "com.apple.dyld.closured",
+        "com.apple.logd",
+        "com.apple.logd.events",
+        "com.apple.diagnosticd",
+        "com.apple.SecurityServer",
+        "com.apple.trustd.agent",
+    ];
+
+    /// System binary directories searched to resolve a **bare-name** `exec` grant
+    /// (e.g. `["git"]`) to absolute path(s) for the `process-exec*` allow-list.
+    /// SIP-protected, read-only system locations — a trustworthy pin. Bare names
+    /// resolve through this *fixed* list, never the ambient `$PATH` (ADR 0014 /
+    /// ADR 0011 D5), so a binary planted earlier on a caller's `$PATH` cannot
+    /// widen the kernel allow-list. An absolute-path grant is honored verbatim
+    /// (then canonicalized); a basename collision outside these dirs is not.
+    const TRUSTED_EXEC_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+    /// Resolve a restricted `exec` [`Scope`] to the absolute, canonical program
+    /// paths that anchor the SBPL `(allow process-exec* (literal …))` rules. The
+    /// kernel matches `process-exec` against the *resolved* path of the exec
+    /// target, so each grant must become a realpath: an absolute grant is
+    /// canonicalized; a bare name is resolved against [`TRUSTED_EXEC_DIRS`] (each
+    /// existing hit included, mirroring admission's basename semantics in
+    /// [`crate::context`] but pinned to trusted dirs). A relative-path or
+    /// unresolvable grant is dropped — it cannot anchor a rule, so the program
+    /// stays denied (fail-closed). `All` yields nothing (callers pass a restricted
+    /// axis). Results are sorted+deduped so the emitted profile is deterministic.
+    fn resolve_exec_targets(scope: &Scope<String>) -> Vec<String> {
+        let Scope::Only(set) = scope else {
+            return Vec::new();
+        };
+        let canon_file = |path: &Path, out: &mut Vec<String>| {
+            if let Ok(c) = std::fs::canonicalize(path) {
+                if c.is_file() {
+                    out.push(c.to_string_lossy().into_owned());
+                }
+            }
+        };
+        let mut out: Vec<String> = Vec::new();
+        for token in set {
+            if token.starts_with('/') {
+                // Absolute grant: honored verbatim (canonicalized, must exist).
+                canon_file(Path::new(token), &mut out);
+            } else if !token.contains('/') {
+                // Bare name: resolve against the fixed trusted system dirs only.
+                for dir in TRUSTED_EXEC_DIRS {
+                    canon_file(&Path::new(dir).join(token), &mut out);
+                }
+            }
+            // else: a relative path grant cannot anchor a kernel rule safely — drop.
+        }
+        // Apple's `/bin/sh` is a small launcher (a distinct binary from
+        // `/bin/bash`) that re-execs `/bin/bash` as its interpreter *variant* at
+        // startup. That re-exec is itself a kernel-checked `process-exec`, so a
+        // granted `/bin/sh` is UNRUNNABLE under a restricted exec axis unless its
+        // variant `/bin/bash` is also on the allow-list — the child dies at its own
+        // startup re-exec ("Failed to exec /bin/bash as variant for /bin/sh") before
+        // running a single line, so a confined `sh -c '…'` returns immediately
+        // (agent-bridle#318). Granting the variant is faithful to the grant (macOS's
+        // `sh` *is* `bash`), never a widening: it only makes a granted shell run.
+        if out.iter().any(|p| p == "/bin/sh") {
+            canon_file(Path::new("/bin/bash"), &mut out);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Resolve `p` to an absolute, symlink-free path suitable for `(subpath …)`
+    /// matching, which the kernel performs against the *resolved* path (so a
+    /// granted `/tmp/x` must become `/private/tmp/x` or it never matches). If the
+    /// leaf does not yet exist, canonicalize the longest existing ancestor and
+    /// re-append the remainder. `None` if not even an ancestor resolves.
+    fn canonical_path(p: &str) -> Option<String> {
+        let path = Path::new(p);
+        if let Ok(c) = std::fs::canonicalize(path) {
+            return Some(c.to_string_lossy().into_owned());
+        }
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = path;
+        while let Some(parent) = cur.parent() {
+            if let Some(name) = cur.file_name() {
+                tail.push(name.to_owned());
+            }
+            if let Ok(c) = std::fs::canonicalize(parent) {
+                let mut resolved = c;
+                for seg in tail.iter().rev() {
+                    resolved.push(seg);
+                }
+                return Some(resolved.to_string_lossy().into_owned());
+            }
+            cur = parent;
+        }
+        None
+    }
+
+    /// Quote `s` as an SBPL string literal, escaping `\` and `"` so a crafted
+    /// path can never break out of the quotes and inject profile syntax.
+    fn sbpl_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '\\' || ch == '"' {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+        out
+    }
+
+    #[cfg(test)]
+    mod unit {
+        use super::*;
+        use crate::{ResolvedScope, Scope};
+
+        /// The production `net:none` profile carries the configured Mach-lookup
+        /// defense-in-depth floor. This pins the selected policy shape only; it is
+        /// not evidence that all ambient deputies are closed.
+        #[test]
+        fn net_none_profile_installs_the_mach_defense_floor() {
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            let profile = seatbelt_profile(&cav);
+            assert!(profile.contains("(deny network*)"), "{profile}");
+            assert!(
+                profile.contains("(deny mach-lookup)"),
+                "net:none production profile must install the Mach defense floor: {profile}"
+            );
+            assert!(
+                profile.contains("com.apple.system.opendirectoryd.libinfo"),
+                "the compatibility allow-list must be re-allowed: {profile}"
+            );
+            assert!(
+                !profile.contains("nsurlsessiond"),
+                "the selected background-session service is outside this compatibility floor: {profile}"
+            );
+        }
+
+        /// A granted (non-empty) net axis, or an unrestricted one, does not add the
+        /// mach-lookup deny — the deputy close is only for the no-egress claim.
+        #[test]
+        fn granted_net_does_not_deny_mach_lookup() {
+            let profile = seatbelt_profile(&Caveats::top());
+            assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
+        }
+
+        /// Support remains held: every restricted network scope is Unknown even
+        /// when the profile installs direct-network and Mach defense-in-depth.
+        #[test]
+        fn every_restricted_network_scope_resolves_unknown() {
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new().resolved_authority(&cav).net,
+                ResolvedScope::Unknown,
+                "net:none support must remain held at admission"
+            );
+            let cav = Caveats {
+                net: Scope::only(["127.0.0.1".to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                SeatbeltSandbox::new().resolved_authority(&cav).net,
+                ResolvedScope::Unknown
+            );
+        }
+
+        /// #1220: a write-confined profile must re-allow the device sinks as
+        /// literals — git's O_RDWR open of /dev/null dies otherwise.
+        #[test]
+        fn write_confined_profile_allows_the_device_sinks() {
+            let confined = Caveats {
+                fs_write: Scope::only(["/tmp/x".to_string()]),
+                ..Caveats::top()
+            };
+            let profile = seatbelt_profile(&confined);
+            assert!(profile.contains("(deny file-write*)"), "{profile}");
+            assert!(
+                profile.contains("(literal \"/dev/null\")"),
+                "the null sink must stay write-openable: {profile}"
+            );
+        }
+
+        #[test]
+        fn unrestricted_caveats_make_no_wrapper() {
+            assert!(SeatbeltSandbox::new()
+                .command_prefix(&Caveats::top())
+                .unwrap()
+                .is_empty());
+        }
+
+        /// #144 (I5-B) regression guard: the Seatbelt backend must read its base
+        /// allow-list from `self.policy` on the PRODUCTION path (`command_prefix`
+        /// → `seatbelt_profile_with`), not a hardcoded const. A widened
+        /// `base_read_paths` must appear in the generated SBPL profile; the
+        /// default policy must not admit it. Mirrors the Landlock proof
+        /// `landlock_config_widens_base_read`, so a revert of the const path is
+        /// caught on macOS too (previously only Landlock had this coverage).
+        #[test]
+        fn command_prefix_widens_the_read_base_from_policy() {
+            if !seatbelt_is_supported() {
+                eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+                return;
+            }
+            let extra = std::env::temp_dir().join("abridle-seatbelt-cfg-widen");
+            std::fs::create_dir_all(&extra).unwrap();
+            let extra_str = extra.to_string_lossy().into_owned();
+            // The profile carries the canonicalized path (e.g. /tmp → /private/tmp).
+            let want = canonical_path(&extra_str).expect("temp dir canonicalizes");
+
+            // fs_read must be restricted for the read base to be emitted at all.
+            let cav = Caveats {
+                fs_read: Scope::only(["/usr".to_string()]),
+                ..Caveats::top()
+            };
+
+            // Control: the default read base does NOT admit the extra dir.
+            let default_prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            assert!(
+                !default_prefix.iter().any(|a| a.contains(&want)),
+                "default read base must not include the extra dir: {default_prefix:?}"
+            );
+
+            // Widened policy: add `extra` to base_read_paths → it appears.
+            let mut base = SandboxPolicy::default().base_read_paths;
+            base.extra.push(extra_str);
+            let policy = Arc::new(SandboxPolicy {
+                base_read_paths: base,
+                ..SandboxPolicy::default()
+            });
+            let widened_prefix = SeatbeltSandbox::with_policy(policy)
+                .command_prefix(&cav)
+                .unwrap();
+            assert!(
+                widened_prefix.iter().any(|a| a.contains(&want)),
+                "config-widened base_read_paths must reach the SBPL profile: {widened_prefix:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&extra);
+        }
+
+        #[test]
+        fn empty_net_denies_direct_socket_egress_and_engages_the_wrapper() {
+            // net:none with fs unrestricted still confines (network), so the
+            // wrapper must engage and the profile must deny direct socket egress.
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny network*)"), "{prof}");
+            assert!(
+                !SeatbeltSandbox::new()
+                    .command_prefix(&cav)
+                    .unwrap()
+                    .is_empty(),
+                "net:none must engage the sandbox-exec wrapper"
+            );
+        }
+
+        #[test]
+        fn nonempty_net_allowlist_is_not_denied() {
+            // A general (non-loopback) host allowlist is not expressible in SBPL —
+            // it can name only `*`/`localhost` + ports as a remote — so no network
+            // rule is emitted; left ambient (advisory), never silently dropped.
+            let cav = Caveats {
+                net: Scope::only(["example.com".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(
+                !prof.contains("network"),
+                "non-loopback net must stay ambient: {prof}"
+            );
+        }
+
+        #[test]
+        fn loopback_only_net_confines_to_loopback_and_engages() {
+            // A loopback-only allowlist IS expressible: deny all egress, then
+            // re-allow the loopback interface (ADR 0015). Off-box egress stays
+            // kernel-denied; the wrapper engages even with fs/exec unrestricted.
+            for host in ["localhost", "127.0.0.1", "::1"] {
+                let cav = Caveats {
+                    net: Scope::only([host.to_string()]),
+                    ..Caveats::top()
+                };
+                let prof = seatbelt_profile(&cav);
+                assert!(prof.contains("(deny network*)"), "{host}: {prof}");
+                assert!(
+                    prof.contains("(allow network* (remote ip \"localhost:*\"))"),
+                    "{host}: loopback re-allow missing: {prof}"
+                );
+                assert!(
+                    !SeatbeltSandbox::new()
+                        .command_prefix(&cav)
+                        .unwrap()
+                        .is_empty(),
+                    "{host}: a loopback-only net grant must engage the wrapper"
+                );
+            }
+        }
+
+        #[test]
+        fn mixed_loopback_and_remote_host_stays_ambient() {
+            // A single non-loopback host taints the set: SBPL cannot express the
+            // remote, so the whole allowlist stays ambient (advisory) rather than
+            // emit a rule that would silently drop `example.com`.
+            let cav = Caveats {
+                net: Scope::only(["localhost".to_string(), "example.com".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(
+                !prof.contains("network"),
+                "a mixed loopback+remote allowlist must stay ambient: {prof}"
+            );
+        }
+
+        #[test]
+        fn loopback_fenced_caveats_emit_the_egress_proxy_fence() {
+            // The egress-proxy mechanism (#124, ADR 0016) fences a remote-host
+            // grant to loopback via `loopback_fenced_caveats`: the resulting
+            // profile must carry the ADR 0015 loopback fence AND preserve fs/exec.
+            let granted = Caveats {
+                net: Scope::only(["example.com".to_string()]),
+                fs_write: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            // The remote grant alone emits NO net rule (advisory) …
+            assert!(!seatbelt_profile(&granted).contains("network"));
+            // … but its loopback-fenced form emits the kernel egress fence.
+            let prof = seatbelt_profile(&super::super::loopback_fenced_caveats(&granted));
+            assert!(prof.contains("(deny network*)"), "{prof}");
+            assert!(
+                prof.contains("(allow network* (remote ip \"localhost:*\"))"),
+                "fence must re-allow loopback: {prof}"
+            );
+            assert!(
+                prof.contains("(deny file-write*)"),
+                "fs_write rule must survive the fence: {prof}"
+            );
+        }
+
+        #[test]
+        fn restricted_write_yields_sandbox_exec_wrapper() {
+            let cav = Caveats {
+                fs_write: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            assert_eq!(prefix[0], SANDBOX_EXEC);
+            assert_eq!(prefix[1], "-p");
+            assert!(prefix[2].contains("(deny file-write*)"));
+        }
+
+        #[test]
+        fn profile_denies_then_reallows_write_roots() {
+            let cav = Caveats {
+                fs_write: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(allow default)"));
+            assert!(prof.contains("(deny file-write*)"));
+            // `/tmp` must be canonicalized to its real target for subpath match.
+            assert!(prof.contains("(subpath \"/private/tmp\")"), "{prof}");
+            // No read axis restricted => no read deny.
+            assert!(!prof.contains("(deny file-read*)"));
+        }
+
+        #[test]
+        fn empty_write_scope_denies_all_writes_no_allow() {
+            let cav = Caveats {
+                fs_write: Scope::none(),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny file-write*)"));
+            assert!(
+                !prof.contains("(subpath"),
+                "an empty scope must grant no write roots: {prof}"
+            );
+            // #1220: the device sinks stay write-openable even with an empty
+            // write scope — that re-allow is a `literal`, not a `subpath` root.
+            assert!(
+                prof.contains("(literal \"/dev/null\")"),
+                "device sinks must still be re-allowed: {prof}"
+            );
+        }
+
+        #[test]
+        fn restricted_read_includes_loader_base_and_root_entry() {
+            let cav = Caveats {
+                fs_read: Scope::only(["/tmp".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny file-read*)"));
+            assert!(prof.contains("(literal \"/\")"), "{prof}");
+            assert!(prof.contains("(subpath \"/usr\")"), "{prof}");
+            assert!(prof.contains("(subpath \"/System\")"), "{prof}");
+        }
+
+        #[test]
+        fn sbpl_string_escapes_quotes_and_backslashes() {
+            assert_eq!(sbpl_string("/a/b"), "\"/a/b\"");
+            assert_eq!(sbpl_string("/a\"b"), "\"/a\\\"b\"");
+            assert_eq!(sbpl_string("/a\\b"), "\"/a\\\\b\"");
+        }
+
+        /// Count double-quotes that are *not* backslash-escaped — the structural
+        /// quotes SBPL actually sees. Each `(subpath "…")` term I emit
+        /// contributes exactly two; any extra would mean a path broke out of its
+        /// literal.
+        fn unescaped_quotes(s: &str) -> usize {
+            let b = s.as_bytes();
+            (0..b.len())
+                .filter(|&i| b[i] == b'"' && (i == 0 || b[i - 1] != b'\\'))
+                .count()
+        }
+
+        #[test]
+        fn crafted_path_cannot_inject_profile_syntax() {
+            // A path crafted to close the string and add its own allow rule must
+            // stay inside one escaped literal — its quotes get backslash-escaped,
+            // so SBPL sees exactly the two structural quotes of the single term.
+            let cav = Caveats {
+                fs_write: Scope::only(["/tmp/x\") (allow file-write* (subpath \"/".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            // Every other structural term is a plain, non-crafted literal (the
+            // #1220 device sinks); the crafted root contributes exactly one
+            // structural (subpath "…") term — 2 unescaped quotes — on top of
+            // those.
+            let sinks = SandboxPolicy::default().device_sink_paths.resolve();
+            assert_eq!(
+                unescaped_quotes(&prof),
+                2 + 2 * sinks.len(),
+                "exactly one structural (subpath \"…\") term — no breakout: {prof}"
+            );
+            assert!(
+                prof.contains("\\\""),
+                "the crafted quotes must be backslash-escaped: {prof}"
+            );
+        }
+
+        #[test]
+        fn restricted_exec_emits_deny_and_allowlist() {
+            let cav = Caveats {
+                exec: Scope::only(["/bin/echo".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny process-exec*)"), "{prof}");
+            assert!(
+                prof.contains("(allow process-exec* (literal \"/bin/echo\")"),
+                "{prof}"
+            );
+        }
+
+        #[test]
+        fn bare_name_exec_resolves_through_trusted_dirs() {
+            // A bare name is pinned to the fixed trusted system dirs, never $PATH.
+            let cav = Caveats {
+                exec: Scope::only(["true".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            // `/usr/bin/true` exists on every macOS host and canonicalizes to
+            // itself, so the literal must name the absolute resolved path.
+            assert!(
+                prof.contains("(literal \"/usr/bin/true\")"),
+                "bare name must resolve to its trusted-dir absolute path: {prof}"
+            );
+        }
+
+        #[test]
+        fn granting_sh_also_allows_its_bash_variant() {
+            // agent-bridle#318: Apple's `/bin/sh` re-execs `/bin/bash` at startup,
+            // a kernel-checked `process-exec`. A restricted exec grant of `sh`
+            // must therefore also anchor `/bin/bash`, or the confined shell dies
+            // at its own variant re-exec and never runs its body.
+            let cav = Caveats {
+                exec: Scope::only(["sh".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(
+                prof.contains("(literal \"/bin/sh\")"),
+                "the granted shell itself must be allowed: {prof}"
+            );
+            assert!(
+                prof.contains("(literal \"/bin/bash\")"),
+                "sh's /bin/bash interpreter variant must be allowed too (#318): {prof}"
+            );
+            // Control: a non-sh grant does NOT pull in bash.
+            let echo = Caveats {
+                exec: Scope::only(["echo".to_string()]),
+                ..Caveats::top()
+            };
+            assert!(
+                !seatbelt_profile(&echo).contains("/bin/bash"),
+                "granting echo must not add bash",
+            );
+        }
+
+        #[test]
+        fn restricted_exec_engages_the_wrapper() {
+            // exec-only (no fs/net restriction) must still engage sandbox-exec.
+            let cav = Caveats {
+                exec: Scope::only(["/bin/echo".to_string()]),
+                ..Caveats::top()
+            };
+            let prefix = SeatbeltSandbox::new().command_prefix(&cav).unwrap();
+            assert_eq!(prefix.first().map(String::as_str), Some(SANDBOX_EXEC));
+        }
+
+        #[test]
+        fn empty_exec_scope_denies_all_exec_with_no_allow() {
+            // exec:none — the program may exec nothing. The deny is emitted with no
+            // re-allow, so even the wrapped program's launch is denied: fail-closed,
+            // never silently ambient.
+            let cav = Caveats {
+                exec: Scope::none(),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny process-exec*)"), "{prof}");
+            assert!(
+                !prof.contains("(allow process-exec*"),
+                "an empty exec scope must grant no exec targets: {prof}"
+            );
+        }
+
+        #[test]
+        fn relative_and_unresolvable_exec_grants_are_dropped() {
+            // A relative-path grant cannot anchor a kernel rule; a bare name with no
+            // trusted-dir hit resolves to nothing. Either way: deny with no allow.
+            let cav = Caveats {
+                exec: Scope::only(["./payload".to_string(), "no-such-binary-xyzzy".to_string()]),
+                ..Caveats::top()
+            };
+            let prof = seatbelt_profile(&cav);
+            assert!(prof.contains("(deny process-exec*)"), "{prof}");
+            assert!(
+                !prof.contains("(allow process-exec*"),
+                "unresolvable/relative grants must not anchor an allow: {prof}"
+            );
+        }
+
+        #[test]
+        fn unrestricted_exec_emits_no_exec_rules() {
+            // exec:All (the default) is ambient on the exec axis — no rules.
+            let prof = seatbelt_profile(&Caveats::top());
+            assert!(!prof.contains("process-exec"), "{prof}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Scope;
+
+    #[test]
+    fn noop_reports_none_and_never_fails() {
+        let s = NoopSandbox;
+        assert_eq!(s.kind(), SandboxKind::None);
+        assert!(s.apply(&Caveats::top()).is_ok());
+    }
+
+    #[test]
+    fn net_egress_proxy_hosts_triggers_only_on_a_general_remote_allowlist() {
+        let with_net = |net| {
+            net_egress_proxy_hosts(&Caveats {
+                net,
+                ..Caveats::top()
+            })
+        };
+        // No trigger: unrestricted, deny-all, or loopback-only — owned elsewhere.
+        assert_eq!(with_net(Scope::All), None);
+        assert_eq!(with_net(Scope::none()), None); // empty = deny-all (net_fully_denied)
+        for lo in ["localhost", "127.0.0.1", "::1"] {
+            assert_eq!(
+                with_net(Scope::only([lo.to_string()])),
+                None,
+                "{lo} is loopback-only"
+            );
+        }
+        // Trigger: a remote host, alone or mixed with loopback (full set returned).
+        assert_eq!(
+            with_net(Scope::only(["example.com".to_string()])),
+            Some(vec!["example.com".to_string()])
+        );
+        let mixed = with_net(Scope::only([
+            "example.com".to_string(),
+            "localhost".to_string(),
+        ]))
+        .expect("mixed set triggers");
+        assert_eq!(
+            mixed.len(),
+            2,
+            "the FULL grant is returned, loopback included: {mixed:?}"
+        );
+        assert!(
+            mixed.contains(&"example.com".to_string()) && mixed.contains(&"localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn loopback_fenced_caveats_swaps_net_to_loopback_preserving_other_axes() {
+        let granted = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            fs_write: Scope::only(["/tmp/x".to_string()]),
+            exec: Scope::only(["git".to_string()]),
+            ..Caveats::top()
+        };
+        let fenced = loopback_fenced_caveats(&granted);
+        // net is now loopback-only, so it engages the ADR 0015 kernel fence …
+        assert!(
+            net_loopback_only(&fenced),
+            "fenced net must be loopback-only"
+        );
+        assert!(
+            net_egress_proxy_hosts(&fenced).is_none(),
+            "fenced caveats no longer trigger the proxy"
+        );
+        // … while fs/exec are preserved verbatim (the fence keeps their rules).
+        assert_eq!(fenced.fs_write, granted.fs_write);
+        assert_eq!(fenced.exec, granted.exec);
+    }
+
+    /// Regression (#257/#275 fail-open): the egress proxy must engage ONLY where
+    /// the backend can address-fence the child's egress to loopback. The prior
+    /// gate (`effective_sandbox_kind != None`) let Landlock through whenever the
+    /// *fs* axis engaged — but Landlock's `net` fence is port-based and cannot
+    /// confine a loopback-only host set, so the child could dial around the proxy
+    /// while the system reported it fenced. This asserts the net-axis-specific gate.
+    #[test]
+    fn egress_proxy_plan_engages_only_where_loopback_net_is_enforceable() {
+        // The Leg-4 config that triggered the fail-open: a remote-host `net`
+        // allow-list AND a restricted fs axis (so Landlock engages on fs).
+        let leg4 = Caveats {
+            net: Scope::only(["api.github.com".to_string()]),
+            fs_write: Scope::only(["/work".to_string()]),
+            ..Caveats::top()
+        };
+        // Address-fenceable backends engage the proxy (real confinement).
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Seatbelt, &leg4).is_some(),
+            "Seatbelt fences net to loopback (SBPL) → proxy is real confinement"
+        );
+        assert!(
+            egress_proxy_plan_for(SandboxKind::AppContainer, &leg4).is_some(),
+            "AppContainer loopback-exemption → proxy is real confinement"
+        );
+        // THE FIX: Landlock engages on fs but CANNOT address-fence net, so the
+        // proxy must NOT engage — otherwise it is walk-around-able false
+        // confinement. This assertion fails against the pre-fix gate.
+        assert_eq!(
+            egress_proxy_plan_for(SandboxKind::Landlock, &leg4),
+            None,
+            "Landlock is port-based; loopback-only net is unenforceable → advisory, no walk-around proxy"
+        );
+        // Tiers that don't namespace net at their level, and 'no backend', are
+        // advisory too — never a walk-around proxy.
+        for k in [
+            SandboxKind::MinimalRootfs,
+            SandboxKind::MicroVm,
+            SandboxKind::None,
+        ] {
+            assert_eq!(
+                egress_proxy_plan_for(k, &leg4),
+                None,
+                "{k:?} does not address-fence net → advisory"
+            );
+        }
+        // A non-proxy grant (net: All) never engages, even on a fenceable backend.
+        assert_eq!(
+            egress_proxy_plan_for(
+                SandboxKind::Seatbelt,
+                &Caveats {
+                    net: Scope::All,
+                    ..Caveats::top()
+                }
+            ),
+            None,
+            "net: All needs no fence"
+        );
+    }
+
+    #[test]
+    fn sandbox_kind_serde_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::Landlock).unwrap(),
+            "\"landlock\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::Seatbelt).unwrap(),
+            "\"seatbelt\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::AppContainer).unwrap(),
+            "\"app_container\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::MinimalRootfs).unwrap(),
+            "\"minimal_rootfs\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::MicroVm).unwrap(),
+            "\"micro_vm\""
+        );
+    }
+
+    #[test]
+    fn effective_kind_downgrades_to_none_when_no_axis_is_restricted() {
+        // The honesty rule (I9): a backend that confines nothing must not be
+        // reported. With every axis `All`, even a real backend reports None.
+        for available in [
+            SandboxKind::Landlock,
+            SandboxKind::Seatbelt,
+            SandboxKind::AppContainer,
+            SandboxKind::None,
+        ] {
+            assert_eq!(
+                effective_sandbox_kind(available, &Caveats::top()),
+                SandboxKind::None,
+                "unrestricted fs must report None for {available:?}"
+            );
+        }
+        // With a restricted fs axis, the backend's own kind is reported …
+        let restricted = Caveats {
+            fs_write: Scope::only(["/w".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Landlock, &restricted),
+            SandboxKind::Landlock
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &restricted),
+            SandboxKind::Seatbelt
+        );
+        // … except a None host is always None (nothing to enforce with).
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::None, &restricted),
+            SandboxKind::None
+        );
+        // A restricted *read* axis also engages (Landlock/Seatbelt govern reads).
+        let read_only = Caveats {
+            fs_read: Scope::only(["/r".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &read_only),
+            SandboxKind::Seatbelt
+        );
+        // An empty net scope (all egress denied), even with fs unrestricted,
+        // engages Seatbelt. Landlock engages only on V4+ kernels (≥ 6.7) where
+        // TCP deny-all is expressible; on older kernels it falls back to None.
+        let net_denied = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &net_denied),
+            SandboxKind::Seatbelt,
+            "Seatbelt kernel-denies egress, so net:none engages it"
+        );
+        let expected_landlock_net = if landlock_net_capable() {
+            SandboxKind::Landlock
+        } else {
+            SandboxKind::None
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Landlock, &net_denied),
+            expected_landlock_net,
+            "Landlock engages for net:none only when V4 TCP-deny support is present"
+        );
+    }
+
+    /// AppContainer engages for a loopback-only net scope (#133, ADR 0016).
+    /// This enables the egress-proxy pattern: `loopback_fenced_caveats` produces
+    /// a net=loopback grant, and with AppContainer that fence is kernel-expressed
+    /// (off-box egress is denied; loopback exemption lets the child reach the proxy).
+    #[test]
+    fn appcontainer_engages_for_loopback_only_net() {
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            let loopback_only = Caveats {
+                net: Scope::only([host.to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                effective_sandbox_kind(SandboxKind::AppContainer, &loopback_only),
+                SandboxKind::AppContainer,
+                "AppContainer must engage for loopback host {host}"
+            );
+        }
+        // A general remote host is NOT loopback-only → falls through to None
+        // (net advisory; handled by egress-proxy when the sandbox is AppContainer).
+        let remote = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &remote),
+            SandboxKind::None,
+            "general remote host must not directly engage AppContainer"
+        );
+    }
+
+    /// `loopback_fenced_caveats` + AppContainer engages the backend, enabling
+    /// `egress_proxy_plan` to route through the loopback proxy on Windows (#133).
+    #[test]
+    fn loopback_fenced_caveats_engages_appcontainer() {
+        let remote = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+        let fenced = loopback_fenced_caveats(&remote);
+        assert!(
+            net_loopback_only(&fenced),
+            "loopback_fenced_caveats must produce a loopback-only net scope"
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &fenced),
+            SandboxKind::AppContainer,
+            "loopback-fenced caveats must engage AppContainer"
+        );
+    }
+
+    #[test]
+    fn best_available_sandbox_is_a_sandbox() {
+        // Always returns *some* sandbox; on a non-landlock build/kernel it is the
+        // advisory Noop. Just exercise the trait object.
+        // AppContainer's `apply` is a deliberate no-op (confinement is applied at
+        // process creation via `command_prefix`, not to the current thread).
+        let sb = best_available_sandbox(&Arc::new(SandboxPolicy::default()));
+        assert!(sb.apply(&Caveats::top()).is_ok());
+    }
+
+    #[cfg(all(target_os = "windows", feature = "windows-appcontainer"))]
+    #[test]
+    fn windows_appcontainer_feature_selects_appcontainer_backend() {
+        assert_eq!(
+            best_available_sandbox(&Arc::new(SandboxPolicy::default())).kind(),
+            SandboxKind::AppContainer
+        );
+    }
+}
+
+// Real kernel enforcement test. Only meaningful with the feature on Linux; it
+// asserts the leash is the *kernel's*, not ours — the regression proof that
+// `fs_write` confines a process even outside the in-process L2 interceptor.
+#[cfg(all(target_os = "linux", feature = "linux-landlock", test))]
+mod landlock_kernel_tests {
+    use super::*;
+    use crate::Scope;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        // No rand dep: derive a unique path from pid + a per-call atomic counter.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "agent-bridle-ll-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Whether a kernel-enforcement proof should run, skip, or hard-**FAIL** — a
+    /// pure decision over (Landlock supported?, enforcement required?). Required
+    /// but unsupported is a FAILURE: a security library must not ship a green
+    /// build in which its kernel boundary was never exercised (#74).
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProofGate {
+        Run,
+        Skip,
+        Fail,
+    }
+
+    fn proof_gate(supported: bool, required: bool) -> ProofGate {
+        match (supported, required) {
+            (true, _) => ProofGate::Run,
+            (false, true) => ProofGate::Fail,
+            (false, false) => ProofGate::Skip,
+        }
+    }
+
+    /// `true` if the caller should `return` (skip the proof). **Panics** when
+    /// Landlock is *required* (`BRIDLE_REQUIRE_LANDLOCK` set, as CI does) but the
+    /// kernel lacks it — so a flagged run cannot pass without actually exercising
+    /// the boundary. A local run without the flag legitimately skips (#74).
+    fn skip_proof_unless_landlock() -> bool {
+        let required = std::env::var("BRIDLE_REQUIRE_LANDLOCK")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        match proof_gate(landlock_is_supported(), required) {
+            ProofGate::Run => false,
+            ProofGate::Skip => {
+                eprintln!(
+                    "skipping Landlock proof: kernel lacks Landlock \
+                     (set BRIDLE_REQUIRE_LANDLOCK=1 to require it, as CI does)"
+                );
+                true
+            }
+            ProofGate::Fail => panic!(
+                "BRIDLE_REQUIRE_LANDLOCK is set but this kernel lacks Landlock — the \
+                 fs_write/fs_read kernel-enforcement proofs cannot be verified (#74)"
+            ),
+        }
+    }
+
+    #[test]
+    fn proof_gate_required_but_unsupported_is_a_failure() {
+        assert_eq!(proof_gate(true, false), ProofGate::Run);
+        assert_eq!(proof_gate(true, true), ProofGate::Run);
+        assert_eq!(proof_gate(false, false), ProofGate::Skip);
+        // The crux (#74): required + unsupported must FAIL, never silently skip,
+        // so CI cannot pass without exercising the kernel boundary.
+        assert_eq!(proof_gate(false, true), ProofGate::Fail);
+    }
+
+    #[test]
+    fn fs_write_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+
+        let allowed = unique_dir("allowed");
+        let forbidden = unique_dir("forbidden");
+        let allowed_t = allowed.clone();
+        let forbidden_t = forbidden.clone();
+
+        // `restrict_self` is per-thread and irreversible, so confine a throwaway
+        // thread rather than poisoning the test runner's threads.
+        let (inside_ok, outside) = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_write: Scope::only([allowed_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+
+            let inside = fs::write(allowed_t.join("ok.txt"), b"hi");
+            let outside = fs::write(forbidden_t.join("escape.txt"), b"nope");
+            (inside.is_ok(), outside)
+        })
+        .join()
+        .unwrap();
+
+        assert!(inside_ok, "writing within fs_write scope must succeed");
+        let err = outside.expect_err("writing outside fs_write scope must be denied by Landlock");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the denial must come from the kernel (EACCES)"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    /// #144 (I5-B): the Landlock read base is config-driven. Widening
+    /// `base_read_paths` lets a confined thread read a path that is otherwise
+    /// outside `fs_read` scope — proving `apply` reads `self.policy`, not the old
+    /// module const. The control (default policy) denies the same read.
+    #[test]
+    fn landlock_config_widens_base_read() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let allowed = unique_dir("cfg-allowed");
+        let extra = unique_dir("cfg-extra");
+        fs::write(extra.join("data.txt"), b"configured").unwrap();
+
+        let cav = Caveats {
+            fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+
+        // Control: with the DEFAULT policy the out-of-scope `extra` dir is denied.
+        let (extra_c, cav_c) = (extra.clone(), cav.clone());
+        let denied = std::thread::spawn(move || {
+            LandlockSandbox::new().apply(&cav_c).expect("apply");
+            fs::read(extra_c.join("data.txt"))
+        })
+        .join()
+        .unwrap();
+        assert!(
+            denied.is_err(),
+            "default base read must NOT include the out-of-scope extra dir"
+        );
+
+        // Widened policy: add `extra` to base_read_paths → the same read succeeds.
+        let mut base = SandboxPolicy::default().base_read_paths;
+        base.extra.push(extra.to_string_lossy().into_owned());
+        let policy = Arc::new(SandboxPolicy {
+            base_read_paths: base,
+            ..SandboxPolicy::default()
+        });
+        let extra_w = extra.clone();
+        let allowed_read = std::thread::spawn(move || {
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply");
+            fs::read(extra_w.join("data.txt"))
+        })
+        .join()
+        .unwrap();
+        assert!(
+            allowed_read.is_ok(),
+            "config-widened base_read_paths must allow the extra dir: {allowed_read:?}"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&extra);
+    }
+
+    #[test]
+    fn empty_fs_write_scope_denies_all_writes() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let dir = unique_dir("none");
+        let dir_t = dir.clone();
+        let outside = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_write: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            fs::write(dir_t.join("x.txt"), b"nope")
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            outside
+                .expect_err("empty fs_write must deny all writes")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let allowed = unique_dir("read-allowed");
+        let forbidden = unique_dir("read-forbidden");
+        // Create both files BEFORE confining (afterwards the forbidden dir is
+        // unreadable, but it must already hold a file to attempt the read).
+        fs::write(allowed.join("ok.txt"), b"in-scope").unwrap();
+        fs::write(forbidden.join("secret.txt"), b"out-of-scope").unwrap();
+        let allowed_t = allowed.clone();
+        let forbidden_t = forbidden.clone();
+
+        let (inside, outside) = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let inside = fs::read(allowed_t.join("ok.txt"));
+            let outside = fs::read(forbidden_t.join("secret.txt"));
+            (inside, outside)
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(inside.expect("in-scope read must succeed"), b"in-scope");
+        assert_eq!(
+            outside
+                .expect_err("reading outside fs_read scope must be denied by Landlock")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the denial must come from the kernel (EACCES)"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn read_confined_binary_still_loads_via_base_allowlist() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let allowed = unique_dir("rc-allowed");
+        let forbidden = unique_dir("rc-forbidden");
+        fs::write(allowed.join("ok.txt"), b"hello\n").unwrap();
+        fs::write(forbidden.join("secret.txt"), b"nope\n").unwrap();
+        let allowed_t = allowed.clone();
+        let forbidden_t = forbidden.clone();
+
+        // Confine reads, then run a *real* dynamically-linked binary (`cat`):
+        // it must still load (proving the base allow-list covers the loader and
+        // libc) and read the in-scope file, but be denied the out-of-scope one.
+        let (inside, outside) = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_read: Scope::only([allowed_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let inside = std::process::Command::new("cat")
+                .arg(allowed_t.join("ok.txt"))
+                .output();
+            let outside = std::process::Command::new("cat")
+                .arg(forbidden_t.join("secret.txt"))
+                .output();
+            (inside, outside)
+        })
+        .join()
+        .unwrap();
+
+        let inside = inside.expect("cat must still load+run under read confinement");
+        assert!(
+            inside.status.success(),
+            "in-scope cat must succeed: {inside:?}"
+        );
+        assert_eq!(inside.stdout, b"hello\n");
+
+        let outside = outside.expect("cat launches (loader is allowed) even for a denied target");
+        assert!(
+            !outside.status.success(),
+            "cat of an out-of-scope file must fail (read denied): {outside:?}"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn fs_read_all_leaves_reads_ambient() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        // With fs_read: All (only fs_write restricted), reads are NOT governed —
+        // a path outside the write scope is still readable.
+        let outside_dir = unique_dir("ambient-read");
+        fs::write(outside_dir.join("readable.txt"), b"still readable").unwrap();
+        let write_scope = unique_dir("ambient-write");
+        let outside_t = outside_dir.clone();
+        let write_t = write_scope.clone();
+
+        let read = std::thread::spawn(move || {
+            let cav = Caveats {
+                fs_write: Scope::only([write_t.to_string_lossy().into_owned()]),
+                ..Caveats::top() // fs_read stays All
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            fs::read(outside_t.join("readable.txt"))
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            read.expect("fs_read: All must leave reads ambient"),
+            b"still readable"
+        );
+        let _ = fs::remove_dir_all(&outside_dir);
+        let _ = fs::remove_dir_all(&write_scope);
+    }
+
+    /// #57 boundary: with `exec` confined to `cat`, the granted program (and its
+    /// libraries) still runs, but a DIRECT `execve` of an un-granted tool (`head`)
+    /// — the `find -exec curl` escape in miniature — is kernel-denied by the
+    /// `Execute` allow-list. (This is the boundary/direct-execve close, NOT the
+    /// trampoline; `exec` stays reported `interceptor`, ADR 0011 D7.)
+    #[test]
+    fn exec_direct_execve_of_ungranted_tool_is_kernel_denied() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let dir = unique_dir("exec");
+        fs::write(dir.join("data.txt"), b"payload\n").unwrap();
+        let dir_t = dir.clone();
+
+        let (granted, ungranted) = std::thread::spawn(move || {
+            let cav = Caveats {
+                exec: Scope::only(["cat".to_string()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            let granted = std::process::Command::new("cat")
+                .arg(dir_t.join("data.txt"))
+                .output();
+            let ungranted = std::process::Command::new("head")
+                .arg(dir_t.join("data.txt"))
+                .output();
+            (granted, ungranted)
+        })
+        .join()
+        .unwrap();
+
+        let granted = granted.expect("granted `cat` must still load and run");
+        assert!(
+            granted.status.success(),
+            "granted cat must succeed: {granted:?}"
+        );
+        assert_eq!(granted.stdout, b"payload\n");
+
+        // execve of the un-granted binary is kernel-denied: std surfaces the
+        // post-fork exec failure as a PermissionDenied spawn error.
+        let err = ungranted.expect_err("un-granted `head` must be exec-denied by Landlock");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the denial must come from the kernel (EACCES on execve)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #57 adversarial sweep: with `exec` confined to `cat` and writes confined to
+    /// a scratch dir, EVERY classic "make the permitted program launch something
+    /// else" DIRECT-execve escape must be kernel-denied — an un-granted tool, a
+    /// payload the context could write+run, a shebang script (un-granted
+    /// interpreter), a symlink to an un-granted tool, and the real
+    /// shells/interpreters that live under `/usr/lib*` (which a recursive lib-dir
+    /// Execute grant — the narrowing this avoids — would have exposed). The
+    /// granted program still works (control). (Direct-execve boundary only; the
+    /// ld.so/interpreter trampoline is out of scope — `exec` stays `interceptor`.)
+    #[test]
+    fn exec_escape_attempts_are_all_denied() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let scratch = unique_dir("exec-escape"); // in fs_write scope
+        fs::write(scratch.join("data.txt"), b"ok\n").unwrap();
+
+        // A real ELF the confined context could try to run from the scratch dir (a
+        // "written payload"); copy an existing binary to avoid needing a compiler.
+        let payload = scratch.join("payload");
+        if let Ok(src) = std::fs::read("/bin/cat").or_else(|_| std::fs::read("/usr/bin/cat")) {
+            fs::write(&payload, src).unwrap();
+            fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A shebang script + a symlink to an un-granted interpreter.
+        let script = scratch.join("script.sh");
+        fs::write(&script, b"#!/bin/sh\necho pwned\n").unwrap();
+        fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = scratch.join("sh-link");
+        let _ = symlink("/bin/sh", &link);
+
+        // Real shells/interpreters that live UNDER the library tree (/usr/lib*):
+        // loader-only Execute must deny them. Tested only where present.
+        let lib_execs: Vec<PathBuf> = [
+            "/usr/lib/klibc/bin/sh",
+            "/usr/lib/initramfs-tools/bin/busybox",
+            "/usr/lib/git-core/git",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+
+        let scratch_t = scratch.clone();
+        let (attempts, control) = std::thread::spawn(move || {
+            let cav = Caveats {
+                exec: Scope::only(["cat".to_string()]),
+                fs_write: Scope::only([scratch_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+
+            let mut attempts = vec![
+                (
+                    "ungranted-tool".to_string(),
+                    std::process::Command::new("head")
+                        .arg("/etc/hostname")
+                        .output(),
+                ),
+                (
+                    "written-payload".to_string(),
+                    std::process::Command::new(scratch_t.join("payload")).output(),
+                ),
+                (
+                    "shebang-script".to_string(),
+                    std::process::Command::new(scratch_t.join("script.sh")).output(),
+                ),
+                (
+                    "symlink-to-sh".to_string(),
+                    std::process::Command::new(scratch_t.join("sh-link"))
+                        .arg("-c")
+                        .arg("echo pwned")
+                        .output(),
+                ),
+            ];
+            for p in &lib_execs {
+                attempts.push((
+                    format!("under-usr-lib:{}", p.display()),
+                    std::process::Command::new(p).arg("--version").output(),
+                ));
+            }
+            // Control: the granted program still runs.
+            let control = std::process::Command::new("cat")
+                .arg(scratch_t.join("data.txt"))
+                .output();
+            (attempts, control)
+        })
+        .join()
+        .unwrap();
+
+        for (label, res) in attempts {
+            match res {
+                Err(e) => assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "escape `{label}` failed for the wrong reason: {e:?}"
+                ),
+                Ok(out) => panic!(
+                    "escape `{label}` was NOT denied — it ran (status {:?}, stdout {:?})",
+                    out.status, out.stdout
+                ),
+            }
+        }
+        let control = control.expect("granted `cat` must still run");
+        assert!(
+            control.status.success() && control.stdout == b"ok\n",
+            "control: {control:?}"
+        );
+
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// #57 / ADR 0011 D3: when BOTH `exec` and `fs_read` are confined, the read
+    /// base excludes the bin dirs — the granted program (and its libs) still
+    /// loads, but an un-granted system binary is NOT readable, so it cannot be
+    /// `ld.so`-trampolined (the trampoline corpus is shrunk to the granted set).
+    #[test]
+    fn read_base_excludes_bin_dirs_when_exec_confined() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let dir = unique_dir("read-narrow");
+        fs::write(dir.join("data.txt"), b"payload\n").unwrap();
+        let dir_t = dir.clone();
+
+        let (granted, head_bytes) = std::thread::spawn(move || {
+            let cav = Caveats {
+                exec: Scope::only(["cat".to_string()]),
+                fs_read: Scope::only([dir_t.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            // Granted `cat` loads (its binary + libs are read-allowed) and reads
+            // the in-scope file.
+            let granted = std::process::Command::new("cat")
+                .arg(dir_t.join("data.txt"))
+                .output();
+            // Reading an un-granted bin-dir binary's bytes (a would-be trampoline
+            // payload) is denied — the bin dirs are not in the read set.
+            let head_bytes = std::fs::read("/usr/bin/head").or_else(|_| std::fs::read("/bin/head"));
+            (granted, head_bytes)
+        })
+        .join()
+        .unwrap();
+
+        let granted = granted.expect("granted `cat` must load + run under narrowed reads");
+        assert!(
+            granted.status.success() && granted.stdout == b"payload\n",
+            "granted cat under narrowed reads: {granted:?}"
+        );
+        assert!(
+            head_bytes.is_err(),
+            "an un-granted bin-dir binary must be unreadable (trampoline corpus shrunk): {head_bytes:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── ChildNetworkPolicy::DenyDirect — the seccomp socket()-family egress
+    //    floor. These use safe `std::net` / `std::os::unix::net` (core forbids
+    //    `unsafe`): socket *creation* itself is what the seccomp filter EACCES-
+    //    fails, so a failed `bind`/`connect` at the socket step is the proof.
+    //    They run on throwaway threads (seccomp, like Landlock, is per-thread and
+    //    irreversible). The floor is inherited across fork/exec by kernel
+    //    guarantee — descendant inheritance for the identical filter is proved
+    //    end-to-end on the newt side (net_guard_executor.rs).
+
+    /// DenyDirect under `net: none` denies AF_INET / AF_INET6 socket creation
+    /// (TCP *and* UDP — the UDP/DNS leg Landlock's TCP-only rule misses) while
+    /// AF_UNIX stays creatable (a path-named unix socket is fs-fenced, not a
+    /// seccomp concern).
+    #[test]
+    fn deny_direct_seccomp_blocks_off_box_sockets_allows_af_unix() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let policy = std::sync::Arc::new(crate::SandboxPolicy {
+            child_network: crate::ChildNetworkPolicy::DenyDirect,
+            ..crate::SandboxPolicy::default()
+        });
+        let (udp4, udp6, tcp4, unix_ok) = std::thread::spawn(move || {
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply landlock + seccomp");
+            let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").is_err();
+            let udp6 = std::net::UdpSocket::bind("[::1]:0").is_err();
+            let tcp4 = std::net::TcpStream::connect("127.0.0.1:9").is_err();
+            let unix_ok = std::os::unix::net::UnixDatagram::unbound().is_ok();
+            (udp4, udp6, tcp4, unix_ok)
+        })
+        .join()
+        .unwrap();
+        assert!(udp4, "DenyDirect must deny AF_INET (UDP) socket creation");
+        assert!(udp6, "DenyDirect must deny AF_INET6 (UDP) socket creation");
+        assert!(tcp4, "DenyDirect must deny AF_INET (TCP) socket creation");
+        assert!(
+            unix_ok,
+            "DenyDirect must still allow AF_UNIX socket creation"
+        );
+    }
+
+    /// The control + backward-compat guard: the DEFAULT `LandlockOnly` policy
+    /// leaves AF_INET UDP socket creation OPEN under `net: none` — Landlock's
+    /// TCP-only net rule doesn't cover it. This is exactly the leak DenyDirect
+    /// closes, and proves the default behavior is unchanged.
+    #[test]
+    fn landlock_only_default_leaves_udp_socket_creation_open() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        // Default policy == LandlockOnly.
+        let policy = std::sync::Arc::new(crate::SandboxPolicy::default());
+        let udp_created = std::thread::spawn(move || {
+            let cav = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply landlock");
+            std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            udp_created,
+            "LandlockOnly (default) must leave UDP socket creation open — the leak DenyDirect closes"
+        );
+    }
+
+    /// DenyDirect is inert when the caller GRANTED a net scope (they asked for
+    /// egress): `net_fully_denied` is false, so no seccomp floor is installed and
+    /// socket creation still works.
+    #[test]
+    fn deny_direct_is_inert_when_net_is_granted() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let policy = std::sync::Arc::new(crate::SandboxPolicy {
+            child_network: crate::ChildNetworkPolicy::DenyDirect,
+            ..crate::SandboxPolicy::default()
+        });
+        let udp_created = std::thread::spawn(move || {
+            // net = All (ambient) → a granted net scope; DenyDirect must NOT fire.
+            let cav = Caveats::top();
+            LandlockSandbox::with_policy(policy)
+                .apply(&cav)
+                .expect("apply landlock");
+            std::net::UdpSocket::bind("127.0.0.1:0").is_ok()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            udp_created,
+            "DenyDirect must be inert when net is granted (caller asked for egress)"
+        );
+    }
+}
+
+// Real kernel-enforcement proof for macOS Seatbelt. Only meaningful on macOS
+// with the feature; it asserts the leash is the *kernel's* (sandbox-exec's),
+// not ours — the spawned child's own out-of-scope writes/reads are denied even
+// though L2 cannot see its syscalls. Mirrors the Landlock proofs above.
+#[cfg(all(target_os = "macos", feature = "macos-seatbelt", test))]
+mod seatbelt_kernel_tests {
+    use super::*;
+    use crate::Scope;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Whether a proof should run, skip, or hard-**FAIL** — the same gate as the
+    /// Landlock proofs (#74): *required but unsupported is a FAILURE*, so a
+    /// macOS CI job that sets `BRIDLE_REQUIRE_SEATBELT` can never go green with
+    /// the kernel boundary unexercised.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProofGate {
+        Run,
+        Skip,
+        Fail,
+    }
+
+    fn proof_gate(supported: bool, required: bool) -> ProofGate {
+        match (supported, required) {
+            (true, _) => ProofGate::Run,
+            (false, true) => ProofGate::Fail,
+            (false, false) => ProofGate::Skip,
+        }
+    }
+
+    /// `true` if the caller should skip the proof. **Panics** when Seatbelt is
+    /// *required* (`BRIDLE_REQUIRE_SEATBELT` set, as a macOS CI job does) but the
+    /// host lacks `sandbox-exec`. A local run without the flag legitimately skips.
+    fn skip_proof_unless_seatbelt() -> bool {
+        let required = seatbelt_required();
+        match proof_gate(seatbelt_is_supported(), required) {
+            ProofGate::Run => false,
+            ProofGate::Skip => {
+                eprintln!(
+                    "skipping Seatbelt proof: /usr/bin/sandbox-exec unavailable \
+                     (set BRIDLE_REQUIRE_SEATBELT=1 to require it, as macOS CI does)"
+                );
+                true
+            }
+            ProofGate::Fail => panic!(
+                "BRIDLE_REQUIRE_SEATBELT is set but /usr/bin/sandbox-exec is unavailable — \
+                 the fs_write/fs_read kernel-enforcement proofs cannot be verified"
+            ),
+        }
+    }
+
+    fn seatbelt_required() -> bool {
+        std::env::var("BRIDLE_REQUIRE_SEATBELT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    }
+
+    fn fail_required_or_skip(reason: &str) {
+        if seatbelt_required() {
+            panic!("required Seatbelt proof unavailable: {reason}");
+        }
+        eprintln!("skipping optional Seatbelt proof: {reason}");
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "agent-bridle-sb-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Spawn `program args` through the real `sandbox-exec` wrapper that
+    /// [`SeatbeltSandbox::command_prefix`] builds for `cav`, and return its exit
+    /// status. This exercises the *production* profile path end to end.
+    fn run_wrapped(cav: &Caveats, program: &str, args: &[&str]) -> std::process::ExitStatus {
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(cav)
+            .expect("a restricted axis must yield a wrapper prefix");
+        assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
+        std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg(program)
+            .args(args)
+            .status()
+            .expect("spawn sandbox-exec")
+    }
+
+    #[test]
+    fn proof_gate_required_but_unsupported_is_a_failure() {
+        assert_eq!(proof_gate(true, false), ProofGate::Run);
+        assert_eq!(proof_gate(true, true), ProofGate::Run);
+        assert_eq!(proof_gate(false, false), ProofGate::Skip);
+        assert_eq!(proof_gate(false, true), ProofGate::Fail);
+    }
+
+    #[test]
+    fn fs_write_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let allowed = unique_dir("w-allowed");
+        let forbidden = unique_dir("w-forbidden");
+        let cav = Caveats {
+            fs_write: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+
+        let inside = run_wrapped(
+            &cav,
+            "/usr/bin/touch",
+            &[allowed.join("ok.txt").to_str().unwrap()],
+        );
+        assert!(
+            inside.success(),
+            "writing within fs_write scope must succeed"
+        );
+        assert!(
+            allowed.join("ok.txt").exists(),
+            "the in-scope file must exist"
+        );
+
+        let outside = run_wrapped(
+            &cav,
+            "/usr/bin/touch",
+            &[forbidden.join("escape.txt").to_str().unwrap()],
+        );
+        assert!(
+            !outside.success(),
+            "the kernel must deny a write outside fs_write scope"
+        );
+        assert!(
+            !forbidden.join("escape.txt").exists(),
+            "the out-of-scope file must NOT have been created"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn empty_fs_write_scope_denies_all_writes() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let dir = unique_dir("w-none");
+        let cav = Caveats {
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        let target = dir.join("x.txt");
+        let prefix = SeatbeltSandbox::new().command_prefix(&cav).expect("prefix");
+        let out = std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg("/usr/bin/touch")
+            .arg(&target)
+            .output()
+            .expect("spawn sandbox-exec");
+        assert!(!out.status.success(), "empty fs_write must deny all writes");
+        // Positive control: the failure is the *kernel* denying the write (EPERM),
+        // not a spurious touch error — so this assertion cannot pass vacuously.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "denial must be a sandbox EPERM, got: {stderr:?}"
+        );
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_read_is_kernel_enforced_outside_scope_denied_inside_allowed() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let allowed = unique_dir("r-allowed");
+        let forbidden = unique_dir("r-forbidden");
+        fs::write(allowed.join("ok.txt"), b"in-scope").unwrap();
+        fs::write(forbidden.join("secret.txt"), b"out-of-scope").unwrap();
+        let cav = Caveats {
+            fs_read: Scope::only([allowed.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+
+        // A real dynamically-linked binary (`cat`) must still load (the base
+        // allow-list covers dyld) and read the in-scope file …
+        let inside = run_wrapped(
+            &cav,
+            "/bin/cat",
+            &[allowed.join("ok.txt").to_str().unwrap()],
+        );
+        assert!(
+            inside.success(),
+            "in-scope cat must load and read under read-confinement"
+        );
+        // … but be denied the out-of-scope one.
+        let outside = run_wrapped(
+            &cav,
+            "/bin/cat",
+            &[forbidden.join("secret.txt").to_str().unwrap()],
+        );
+        assert!(
+            !outside.success(),
+            "reading outside fs_read scope must be kernel-denied"
+        );
+
+        let _ = fs::remove_dir_all(&allowed);
+        let _ = fs::remove_dir_all(&forbidden);
+    }
+
+    #[test]
+    fn net_fully_denied_kernel_blocks_direct_socket_egress() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        // Positive control: a benign NON-network command under the SAME net:none
+        // profile must succeed — proving the profile parsed and only egress is
+        // denied. Without this, a malformed `(deny network*)` (sandbox-exec exit
+        // 65, child never launches) would let the denial assertion pass vacuously.
+        let benign = run_wrapped(&cav, "/bin/echo", &["ok"]);
+        assert!(
+            benign.success(),
+            "net:none must still allow non-network commands (profile must parse)"
+        );
+        // Egress denied: curl to a literal IP (no DNS) exits **7** ("couldn't
+        // connect") because the socket is kernel-denied immediately. Asserting
+        // exactly 7 — not merely non-zero — rules out the vacuous passes: a
+        // no-egress host times out (28), a broken profile never launches the child
+        // (65). `--max-time` bounds it regardless.
+        let confined = run_wrapped(&cav, curl, &["-sS", "--max-time", "5", "http://1.1.1.1/"]);
+        assert_eq!(
+            confined.code(),
+            Some(7),
+            "egress under net:none must be kernel-denied at the socket (curl exit 7)"
+        );
+    }
+
+    /// Direct-wrapper inheritance proof independent of admission: a live loopback
+    /// listener makes the destination reachable, yet a generation-2 descendant
+    /// under the production `net:none` profile receives curl's exact socket-denied
+    /// exit 7. This proves inheritance of the direct-network floor only; restricted
+    /// network admission remains held.
+    #[test]
+    fn net_none_direct_floor_is_inherited_by_a_grandchild() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        if !std::path::Path::new("/usr/bin/curl").exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let benign = run_wrapped(&cav, "/bin/sh", &["-c", "/bin/sh -c /usr/bin/true"]);
+        assert!(
+            benign.success(),
+            "a benign generation-2 descendant must run under the profile"
+        );
+
+        let listener = spawn_loopback_http("127.0.0.1:0").expect("bind live loopback listener");
+        let url = format!("http://127.0.0.1:{}/", listener.port());
+        let script = format!("/bin/sh -c '/usr/bin/curl -sS --max-time 5 {url}'");
+        let denied = run_wrapped(&cav, "/bin/sh", &["-c", &script]);
+        assert_eq!(
+            denied.code(),
+            Some(7),
+            "the generation-2 curl must inherit the direct-network deny (exact exit 7)"
+        );
+    }
+
+    /// The Mach-lookup compatibility floor keeps a representative build shell
+    /// runnable. This is operational evidence, not a bounded-authority claim.
+    #[test]
+    fn net_none_mach_deny_still_runs_a_build_tool() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let sh = run_wrapped(&cav, "/bin/sh", &["-c", "exit 0"]);
+        assert!(
+            sh.success(),
+            "the net:none Mach-lookup allow-list must keep /bin/sh runnable"
+        );
+    }
+
+    struct DeputyProbe {
+        dir: PathBuf,
+        binary: PathBuf,
+    }
+
+    /// Compile the background-URLSession characterization probe with the exact
+    /// compiler path returned by xcrun.
+    fn build_deputy_probe() -> Result<DeputyProbe, String> {
+        let found = std::process::Command::new("/usr/bin/xcrun")
+            .args(["--find", "swiftc"])
+            .output()
+            .map_err(|e| format!("launch xcrun --find swiftc: {e}"))?;
+        if !found.status.success() {
+            return Err(format!(
+                "xcrun could not find swiftc: {}",
+                String::from_utf8_lossy(&found.stderr)
+            ));
+        }
+        let swiftc = String::from_utf8(found.stdout)
+            .map_err(|e| format!("xcrun returned non-UTF-8 swiftc path: {e}"))?;
+        let swiftc = swiftc.trim();
+        if swiftc.is_empty() {
+            return Err("xcrun returned an empty swiftc path".to_string());
+        }
+        let sdk = std::process::Command::new("/usr/bin/xcrun")
+            .args(["--sdk", "macosx", "--show-sdk-path"])
+            .output()
+            .map_err(|e| format!("launch xcrun --show-sdk-path: {e}"))?;
+        if !sdk.status.success() {
+            return Err(format!(
+                "xcrun could not find the macOS SDK: {}",
+                String::from_utf8_lossy(&sdk.stderr)
+            ));
+        }
+        let sdk = String::from_utf8(sdk.stdout)
+            .map_err(|e| format!("xcrun returned a non-UTF-8 SDK path: {e}"))?;
+        let sdk = sdk.trim();
+        if sdk.is_empty() {
+            return Err("xcrun returned an empty macOS SDK path".to_string());
+        }
+        let dir = unique_dir("deputy");
+        let src = dir.join("deputy.swift");
+        let bin = dir.join("deputy");
+        fs::write(
+            &src,
+            r#"import Darwin
+import Foundation
+final class D: NSObject, URLSessionDownloadDelegate {
+  let done = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var outcome = "callback_timeout"
+  private var finished = false
+  private func finish(_ value: String) {
+    lock.lock(); defer { lock.unlock() }
+    if !finished { finished = true; outcome = value; done.signal() }
+  }
+  func value() -> String { lock.lock(); defer { lock.unlock() }; return outcome }
+  func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didFinishDownloadingTo l: URL) { finish("callback_success") }
+  func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError e: Error?) {
+    if let e = e { finish("callback_error:\(e.localizedDescription)") }
+  }
+}
+guard CommandLine.arguments.count == 2, let url = URL(string: CommandLine.arguments[1]) else {
+  print("launch_error:expected one URL"); exit(2)
+}
+let d = D()
+let cfg = URLSessionConfiguration.background(withIdentifier: "probe.deputy.\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString)")
+cfg.isDiscretionary = false
+cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+let session = URLSession(configuration: cfg, delegate: d, delegateQueue: nil)
+let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 20)
+session.downloadTask(with: request).resume()
+if d.done.wait(timeout: .now() + 25) == .timedOut {
+  print("callback_timeout"); exit(3)
+}
+print(d.value())
+"#,
+        )
+        .map_err(|e| format!("write deputy source: {e}"))?;
+        let src_str = src
+            .to_str()
+            .ok_or_else(|| "deputy source path is not UTF-8".to_string())?;
+        let bin_str = bin
+            .to_str()
+            .ok_or_else(|| "deputy binary path is not UTF-8".to_string())?;
+        let module_cache = dir.join("module-cache");
+        fs::create_dir_all(&module_cache).map_err(|e| format!("create Swift module cache: {e}"))?;
+        let built = std::process::Command::new(swiftc)
+            .env("CLANG_MODULE_CACHE_PATH", &module_cache)
+            .env("SWIFT_MODULE_CACHE_PATH", &module_cache)
+            .args(["-sdk", sdk, "-O", src_str, "-o", bin_str])
+            .output()
+            .map_err(|e| format!("launch xcrun-selected swiftc: {e}"))?;
+        if !built.status.success() || !bin.exists() {
+            return Err(format!(
+                "swiftc failed: {}",
+                String::from_utf8_lossy(&built.stderr)
+            ));
+        }
+        Ok(DeputyProbe { dir, binary: bin })
+    }
+
+    fn run_deputy(
+        prefix: &[String],
+        deputy: &Path,
+        url: &str,
+    ) -> Result<std::process::Output, String> {
+        let (program, args) = prefix
+            .split_first()
+            .ok_or_else(|| "empty Seatbelt prefix".to_string())?;
+        std::process::Command::new(program)
+            .args(args)
+            .arg(deputy)
+            .arg(url)
+            .output()
+            .map_err(|e| format!("launch deputy through sandbox-exec: {e}"))
+    }
+
+    fn callback_output(output: &std::process::Output) -> String {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn unique_probe_url(phase: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "https://captive.apple.com/hotspot-detect.html?agent_bridle_e4={}-{}-{phase}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn sha256(path: &Path) -> String {
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .expect("launch shasum");
+        assert!(output.status.success(), "shasum must succeed");
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .expect("shasum digest")
+            .to_string()
+    }
+
+    fn system_text(program: &str, args: &[&str]) -> String {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().replace(' ', "_"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unavailable".to_string())
+    }
+
+    fn evidence_env(names: &[&str]) -> String {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| "unset".to_string())
+    }
+
+    /// Strict A/B/A characterization of the selected Mach floor. Both A legs use
+    /// the typed network-deny-only/Mach-ambient profile and must complete a unique,
+    /// uncached HTTPS background transfer. The production B leg must launch and
+    /// exit successfully through an explicit callback_error. This proves the
+    /// incremental behavior of this floor, not global deputy closure; support stays
+    /// held because restricted network projection is Unknown.
+    #[test]
+    fn net_none_mach_floor_has_strict_ambient_closed_ambient_differential() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let probe = match build_deputy_probe() {
+            Ok(probe) => probe,
+            Err(reason) => {
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let cav = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let sandbox = SeatbeltSandbox::new();
+        let ambient = sandbox
+            .net_none_ambient_mach_prefix(&cav)
+            .expect("typed ambient-Mach characterization prefix");
+        let production = sandbox
+            .command_prefix(&cav)
+            .expect("production net:none prefix");
+
+        let before = match run_deputy(&ambient, &probe.binary, &unique_probe_url("before")) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = fs::remove_dir_all(&probe.dir);
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let before_marker = callback_output(&before);
+        if !before.status.success() || !before_marker.contains("callback_success") {
+            let reason = format!(
+                "ambient-before baseline did not succeed: status={:?} stdout={before_marker:?} stderr={:?}",
+                before.status.code(),
+                String::from_utf8_lossy(&before.stderr)
+            );
+            let _ = fs::remove_dir_all(&probe.dir);
+            fail_required_or_skip(&reason);
+            return;
+        }
+
+        let closed = match run_deputy(
+            &production,
+            &probe.binary,
+            &unique_probe_url("production-closed"),
+        ) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = fs::remove_dir_all(&probe.dir);
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let closed_marker = callback_output(&closed);
+        assert!(
+            !closed_marker.contains("callback_success"),
+            "production Mach floor unexpectedly permitted the characterized transfer"
+        );
+        if !closed.status.success() || closed_marker.contains("callback_timeout") {
+            let reason = format!(
+                "production leg did not exit via callback: status={:?} stdout={closed_marker:?} stderr={:?}",
+                closed.status.code(),
+                String::from_utf8_lossy(&closed.stderr)
+            );
+            let _ = fs::remove_dir_all(&probe.dir);
+            fail_required_or_skip(&reason);
+            return;
+        }
+        assert!(
+            closed_marker.contains("callback_error"),
+            "production leg must report an explicit callback_error: {closed_marker:?}"
+        );
+
+        let after = match run_deputy(&ambient, &probe.binary, &unique_probe_url("after")) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = fs::remove_dir_all(&probe.dir);
+                fail_required_or_skip(&reason);
+                return;
+            }
+        };
+        let after_marker = callback_output(&after);
+        if !after.status.success() || !after_marker.contains("callback_success") {
+            let reason = format!(
+                "ambient-after baseline did not succeed: status={:?} stdout={after_marker:?} stderr={:?}",
+                after.status.code(),
+                String::from_utf8_lossy(&after.stderr)
+            );
+            let _ = fs::remove_dir_all(&probe.dir);
+            fail_required_or_skip(&reason);
+            return;
+        }
+
+        let profile_path = probe.dir.join("production.sb");
+        fs::write(
+            &profile_path,
+            production.get(2).expect("production profile argument"),
+        )
+        .expect("write profile evidence");
+        eprintln!(
+            "SEATBELT_E4_EVIDENCE head_sha={} merge_sha={} sw_vers={} kernel={} arch={} profile_sha256={} probe_sha256={} phases=ambient_before:callback_success,production_closed:callback_error,ambient_after:callback_success",
+            evidence_env(&[
+                "BRIDLE_E4_HEAD_SHA",
+                "BRIDLE_HEAD_SHA",
+                "PR_HEAD_SHA",
+                "GITHUB_HEAD_SHA",
+            ]),
+            evidence_env(&["BRIDLE_MERGE_SHA", "MERGE_SHA", "GITHUB_SHA"]),
+            system_text("/usr/bin/sw_vers", &["-productVersion"]),
+            system_text("/usr/bin/uname", &["-r"]),
+            system_text("/usr/bin/uname", &["-m"]),
+            sha256(&profile_path),
+            sha256(&probe.binary),
+        );
+        let _ = fs::remove_dir_all(&probe.dir);
+    }
+
+    /// A one-shot loopback listener answering a single HTTP request, so an ALLOW
+    /// assertion tests a *reachable* socket (curl 0) — not "connection refused"
+    /// (also 7). Detached, so an unexpected deny can't hang the test on a
+    /// never-accepted connection. Returns the bound `SocketAddr`, or `None` if the
+    /// family is unavailable on this host (e.g. no `::1`), so a caller can skip.
+    fn spawn_loopback_http(bind: &str) -> Option<std::net::SocketAddr> {
+        let listener = std::net::TcpListener::bind(bind).ok()?;
+        let addr = listener.local_addr().ok()?;
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        Some(addr)
+    }
+
+    /// A loopback-only `net` grant kernel-confines egress to the loopback
+    /// *interface* (ADR 0015): the process reaches loopback (v4 **and** v6, since
+    /// SBPL's `localhost` denotes both) and is kernel-DENIED any off-box host. The
+    /// grant here names a **single** v4 address (`127.0.0.1`) yet `::1` is still
+    /// reachable — the documented interface-granular widening (D2): a spawned child
+    /// is governed only by the kernel rule, not the exact-host admission leash.
+    #[test]
+    fn net_loopback_only_permits_loopback_interface_denies_offbox() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let v4 = spawn_loopback_http("127.0.0.1:0").expect("bind v4 loopback");
+
+        // A single v4 loopback address — the case that widens to the interface.
+        let cav = Caveats {
+            net: Scope::only(["127.0.0.1".to_string()]),
+            ..Caveats::top()
+        };
+        // Positive control: a benign non-network command runs — the loopback
+        // profile parsed (a malformed one exits 65 and never launches the child).
+        assert!(
+            run_wrapped(&cav, "/bin/echo", &["ok"]).success(),
+            "loopback-only profile must still run non-network commands (must parse)"
+        );
+        // ALLOW (v4): egress to the loopback listener succeeds (curl exit 0). A
+        // deny-all or malformed rule would fail this — so it cannot pass vacuously.
+        let v4_url = format!("http://127.0.0.1:{}/", v4.port());
+        assert!(
+            run_wrapped(&cav, curl, &["-sS", "--max-time", "5", &v4_url]).success(),
+            "net:Only([127.0.0.1]) must kernel-PERMIT v4 loopback egress"
+        );
+        // ALLOW (v6): `::1` is reachable too — locking the interface-granular
+        // widening documented in ADR 0015 D2 (kernel `localhost` = 127.0.0.1 + ::1,
+        // broader than the single-address grant). Skipped only if v6 loopback is
+        // unavailable on the host (never on stock macOS).
+        if let Some(v6) = spawn_loopback_http("[::1]:0") {
+            let v6_url = format!("http://[::1]:{}/", v6.port());
+            assert!(
+                run_wrapped(&cav, curl, &["-sS", "--max-time", "5", &v6_url]).success(),
+                "net:Only([127.0.0.1]) kernel-permits the whole loopback interface, incl. ::1 (ADR 0015 D2)"
+            );
+        }
+        // DENY: off-box egress to a literal IP (no DNS) is kernel-denied at the
+        // socket. Assert both curl exit 7 AND the EPERM signal ("Operation not
+        // permitted") in stderr — so a no-internet runner (ENETUNREACH, also exit
+        // 7) cannot make this pass vacuously; it must be a *permission* denial.
+        let offbox = run_wrapped_output(
+            &cav,
+            curl,
+            &["-sS", "-v", "--max-time", "5", "http://1.1.1.1/"],
+        );
+        assert_eq!(
+            offbox.status.code(),
+            Some(7),
+            "net:Only([127.0.0.1]) must kernel-DENY off-box egress (curl exit 7)"
+        );
+        let stderr = String::from_utf8_lossy(&offbox.stderr);
+        assert!(
+            stderr.contains("Operation not permitted"),
+            "off-box denial must be a kernel EPERM, not a routing failure: {stderr}"
+        );
+    }
+
+    /// Like [`run_wrapped`] but captures stdout/stderr, so a proof can assert on
+    /// the *interior* exec behavior (a granted program's child exec statuses) the
+    /// kernel produced — the L3-grain the `exec` axis claims.
+    fn run_wrapped_output(cav: &Caveats, program: &str, args: &[&str]) -> std::process::Output {
+        let prefix = SeatbeltSandbox::new()
+            .command_prefix(cav)
+            .expect("a restricted axis must yield a wrapper prefix");
+        assert!(!prefix.is_empty(), "expected a sandbox-exec wrapper");
+        std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg(program)
+            .args(args)
+            .output()
+            .expect("spawn sandbox-exec")
+    }
+
+    /// The exec allow-list is kernel-enforced at the **interior**: a granted shell
+    /// runs, may exec a *listed* binary, but is kernel-denied an *unlisted* one —
+    /// the L3 gap a path allow-list alone cannot reach (ADR 0014). The discriminator
+    /// is exact: the unlisted `/usr/bin/false` must fail at **exec** (status 127),
+    /// not run-and-return-1 — so this cannot pass vacuously.
+    #[test]
+    fn exec_allowlist_permits_listed_denies_unlisted_child() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only(["/bin/zsh".to_string(), "/usr/bin/true".to_string()]),
+            ..Caveats::top()
+        };
+        let out = run_wrapped_output(
+            &cav,
+            "/bin/zsh",
+            &["-c", "/usr/bin/true; echo T=$?; /usr/bin/false; echo F=$?"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("T=0"),
+            "a listed binary must exec and run (T=0): {stdout:?}"
+        );
+        assert!(
+            stdout.contains("F=127"),
+            "an unlisted binary must be kernel-denied at EXEC (status 127), not run: {stdout:?}"
+        );
+    }
+
+    /// The `exec:none`-style floor: when the granted set is just the entry shell,
+    /// the shell launches but may exec **nothing** further — every child exec is
+    /// kernel-denied. This is the interior "no further exec" guarantee.
+    #[test]
+    fn granted_shell_cannot_exec_any_unlisted_child() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only(["/bin/zsh".to_string()]),
+            ..Caveats::top()
+        };
+        let out = run_wrapped_output(&cav, "/bin/zsh", &["-c", "/usr/bin/true; echo S=$?"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("S=127"),
+            "a shell granted only itself must be denied every child exec (S=127): {stdout:?}"
+        );
+    }
+
+    /// The ADR 0011 loader trampoline — the bypass that has **no Landlock hook**
+    /// and forces the Linux seccomp backstop — is *closed by the platform* on
+    /// macOS. A granted interpreter (`perl`) cannot reach an unlisted binary by:
+    /// (a) directly `exec`ing it, nor (b) trampolining through `dyld`. Both are
+    /// governed `process-exec`s; `dyld` is not allow-listed, so both are denied.
+    #[test]
+    fn granted_interpreter_cannot_trampoline_to_unlisted_binary() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only(["/usr/bin/perl".to_string()]),
+            ..Caveats::top()
+        };
+        // Each `exec` returns (and perl continues) only when the exec was DENIED.
+        let script = "print \"PERL-RAN\\n\"; \
+                      exec(\"/usr/bin/true\"); print \"DIRECT-DENIED\\n\"; \
+                      exec(\"/usr/lib/dyld\", \"/usr/bin/true\"); print \"TRAMPOLINE-DENIED\\n\";";
+        let out = run_wrapped_output(&cav, "/usr/bin/perl", &["-e", script]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("PERL-RAN"),
+            "the granted interpreter must run: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("DIRECT-DENIED"),
+            "direct exec of an unlisted binary must be denied: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("TRAMPOLINE-DENIED"),
+            "the dyld loader trampoline must be denied (no standing loader entry): {stdout:?}"
+        );
+    }
+
+    /// Positive control / no deny-of-function: an allow-listed **dynamically
+    /// linked** binary still loads its dylibs (via the kernel-trusted dyld path,
+    /// which the exec allow-list does not gate) and runs normally under exec
+    /// confinement — proving the axis confines *spawning*, not legitimate linking.
+    #[test]
+    fn exec_confinement_does_not_break_dynamic_linking() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let curl = "/usr/bin/curl";
+        if !std::path::Path::new(curl).exists() {
+            eprintln!("skipping: no curl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            exec: Scope::only([curl.to_string()]),
+            ..Caveats::top()
+        };
+        let status = run_wrapped(&cav, curl, &["--version"]);
+        assert!(
+            status.success(),
+            "an allow-listed dynamic binary must load + run under exec confinement"
+        );
+    }
+}
+
+// Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12

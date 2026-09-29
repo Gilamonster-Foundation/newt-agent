@@ -1,0 +1,30 @@
+[package]
+name = "agent-bridle-fdguard"
+description = "Close ambient file descriptors on confined spawn (agent-bridle#319). The one unsafe-permitting seam that keeps agent-bridle-core `forbid(unsafe_code)`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# crates.io metadata — this crate is a published dependency of agent-bridle-core
+# (ADR 0008), so it is NOT `publish = false`. It exists solely to encapsulate the
+# one `unsafe` call the fd-hygiene fix needs, so core can keep `unsafe_code =
+# forbid` (see docs/adr/0026 slice-1 decision).
+keywords = ["capability", "sandbox", "file-descriptor", "cloexec", "agent"]
+categories = ["development-tools", "os::unix-apis"]
+
+# This crate deliberately ALLOWS `unsafe` — it is the encapsulation boundary for
+# the async-signal-safe `close_range` pre-exec that core cannot host. Unsafe is
+# kept to the single documented block in `src/lib.rs`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = { version = "0.2" }
+
+# The hostile-inheritance suite (tests/hostile_fds.rs) builds ambient descriptors
+# of every shape (file / socket / pipe / dup / high-numbered) and clears
+# FD_CLOEXEC on them, which needs the same libc the guard uses. Integration tests
+# do not inherit a crate's ordinary dependencies, hence the explicit dev-dep.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+libc = { version = "0.2" }

@@ -479,7 +479,7 @@ fn context_stats_text_composes_budget_compression_and_features() {
 
     // With a gauge → budget line shows the fraction + percent.
     let s = context_stats_text(
-        Some((899_000, 1_024_000)),
+        Some((899_000, Some(1_024_000))),
         &counters,
         CompactionTriggerPolicy::MessageCount,
         "session",
@@ -551,7 +551,7 @@ fn context_stats_text_composes_budget_compression_and_features() {
 
     // A zero budget renders the unmeasured line (no divide-by-zero).
     assert!(context_stats_text(
-        Some((10, 0)),
+        Some((10, Some(0))),
         &counters,
         CompactionTriggerPolicy::HeadroomAware,
         "default",
@@ -564,6 +564,24 @@ fn context_stats_text_composes_budget_compression_and_features() {
     )
     .iter()
     .any(|l| l.contains("not yet measured")));
+
+    // #2466: usage known but no context window known → `used/?`, not the
+    // ratchet passed off as a window, and not "not yet measured" either
+    // (a turn DID complete — it just resolved no window).
+    let unknown_window = context_stats_text(
+        Some((31_000, None)),
+        &counters,
+        CompactionTriggerPolicy::HeadroomAware,
+        "default",
+        features,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .join("\n");
+    assert!(unknown_window.contains("31k/?"), "{unknown_window}");
 }
 
 #[test]

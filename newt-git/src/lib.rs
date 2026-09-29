@@ -18,14 +18,18 @@ use newt_core::git_caveats::GitCaveats;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry, DiffStatus};
-use grit_lib::index::{entry_from_stat, IndexEntry, MODE_REGULAR};
+use grit_lib::diff::{
+    count_changes, diff_index_to_tree, diff_index_to_worktree_with_options, diff_tree_to_worktree,
+    diff_trees, DiffEntry, DiffIndexToWorktreeOptions, DiffStatus,
+};
+use grit_lib::index::{entry_from_stat, Index, IndexEntry, MODE_REGULAR};
 use grit_lib::merge_base::resolve_commit_specs;
 use grit_lib::merge_file::MergeFavor;
 use grit_lib::merge_trees::{
     merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
+use grit_lib::pathspec::matches_pathspec_list;
 use grit_lib::porcelain::checkout::checkout_between_trees;
 use grit_lib::porcelain::stash::apply_stash;
 use grit_lib::porcelain::status::{collect_untracked_and_ignored, IgnoredMode};
@@ -35,6 +39,10 @@ use grit_lib::refs::{
     write_symbolic_ref,
 };
 use grit_lib::repo::Repository;
+use grit_lib::rev_list::{rev_list, RevListOptions};
+use grit_lib::rev_parse::{
+    split_double_dot_range, split_triple_dot_range, try_parse_double_dot_log_range,
+};
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::write_tree::write_tree_from_index;
 
@@ -175,20 +183,123 @@ pub struct CommitInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffReport {
     pub files: Vec<FileChange>,
+    /// Present only when the caller asked for `--stat`: added/removed line
+    /// counts per changed file, in the same order as `files`.
+    pub stat: Option<Vec<FileStat>>,
+}
+
+/// One file's `--stat` line-change counts. Binary files are counted as 0/0,
+/// matching git's "Bin" case rather than fabricating a text line count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStat {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
 }
 
 /// Which diff to compute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffSpec {
     /// Unstaged: worktree vs index.
     Worktree,
     /// Staged: index vs HEAD tree.
     Staged,
+    /// One revision vs the worktree (`git diff <rev>`). May itself be an
+    /// `A..B` range spec, which is equivalent to `RevRange(A, B)`.
+    Rev(String),
+    /// Two revisions (`git diff A B` / `git diff A..B`).
+    RevRange(String, String),
 }
 
 /// An embedded git engine bound to one repository.
 pub struct GitEngine {
     repo: Repository,
+    /// Signs every commit, amend and rebase commit this engine writes
+    /// ([`GitEngine::write_commit`]); `None` writes them unsigned.
+    signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
+}
+
+/// Refuse a ref-move onto the repository's default branch (F32/#2537: newt may
+/// never move `main`/`master`/the remote's default, whatever a caller's
+/// filesystem grants are). The ONE checkpoint every mutating op that advances a
+/// branch ref (`commit`, `amend`, `rebase`) routes through, so the guard cannot
+/// be bypassed by reaching one of them through a different path.
+///
+/// `branch_ref` is the target ref a caller is about to rewrite (`refs/heads/…`,
+/// as returned by [`read_head`]). Anything other than `refs/heads/main` or
+/// `refs/heads/master` also checks the shared repo's `refs/remotes/origin/HEAD`
+/// symbolic target (best-effort — an offline or remote-less repo just falls
+/// back to the hardcoded names, same as `newt_core::git_hardening::own_gitdir_grants`).
+///
+/// `ref_already_exists` is `false` only for the ONE case the exemption exists
+/// for: a truly fresh repository with NO refs anywhere at all (see
+/// [`repository_has_no_refs`]) — the `git` tool's own `init` op always names
+/// the new branch `main`, #461's advertised "commit in a fresh,
+/// not-yet-a-repo workspace" flow. F32 protects an EXISTING default branch's
+/// history from being retargeted, not the act of creating one in a repo that
+/// has nothing yet.
+///
+/// PR #2577 round 4, Blocker 2: this used to be sourced from `HEAD`'s own
+/// `head_oid().is_some()` — "is THIS branch unborn" — which an (until this
+/// round unguarded) `branch-delete main` could flip back to `false` by
+/// deleting `main`'s only ref, reopening the exemption for a commit that
+/// creates a brand-new `main` as a root commit, discarding the deleted
+/// branch's history with the guard never firing. Every call site now derives
+/// `ref_already_exists` from `repository_has_no_refs`, which asks "does
+/// ANYTHING in this repo have a ref" rather than "does this ONE ref" — a
+/// `branch-delete main` next to a surviving `task` branch cannot reopen the
+/// exemption, because `task` still has a ref.
+fn refuse_if_default_branch(
+    git_dir: &Path,
+    branch_ref: &str,
+    ref_already_exists: bool,
+) -> Result<(), GitError> {
+    use agent_toolchain::git_caveats::check_default_branch_move;
+    check_default_branch_move(branch_ref, ref_already_exists, None).map_err(GitError::Refused)?;
+    if !ref_already_exists {
+        return Ok(());
+    }
+    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    let raw = std::fs::read_to_string(common.join("refs/remotes/origin/HEAD")).ok();
+    let default = raw
+        .as_deref()
+        .and_then(|raw| raw.trim().strip_prefix("ref: refs/remotes/origin/"));
+    check_default_branch_move(branch_ref, ref_already_exists, default).map_err(GitError::Refused)
+}
+
+/// Does this repository have NO refs anywhere — no loose ref under
+/// `refs/heads` (recursively, since a branch name may contain `/`) and no
+/// `refs/heads/…` line in `packed-refs`? The narrow "creating the default
+/// branch is fine" exemption in [`refuse_if_default_branch`] is meant for
+/// exactly this state (a fresh `git init`), not for "this ONE branch happens
+/// to be unborn" — the latter is reachable by deleting an existing default
+/// branch's ref while sibling branches survive (Blocker 2).
+fn repository_has_no_refs(git_dir: &Path) -> bool {
+    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
+    if directory_has_any_file(&common.join("refs/heads")) {
+        return false;
+    }
+    match std::fs::read_to_string(common.join("packed-refs")) {
+        Ok(contents) => !contents.lines().any(|line| line.contains("refs/heads/")),
+        Err(_) => true, // no packed-refs file at all
+    }
+}
+
+fn directory_has_any_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if directory_has_any_file(&path) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
 }
 
 impl GitEngine {
@@ -199,7 +310,7 @@ impl GitEngine {
         newt_core::agentic::check_git_read_scope("open", read_scope)
             .map_err(GitError::Unsupported)?;
         let repo = Repository::discover(Some(root))?;
-        Ok(Self { repo })
+        Ok(Self { repo, signer: None })
     }
 
     fn head_oid(&self) -> Result<Option<ObjectId>, GitError> {
@@ -208,6 +319,33 @@ impl GitEngine {
             HeadState::Detached { oid } => Some(oid),
             HeadState::Invalid => None,
         })
+    }
+
+    /// Index vs worktree, hashing "racily clean" entries (mtime not older
+    /// than the index file's) instead of trusting their cached stat, as git
+    /// does. Without it a same-size edit made in the index write's timestamp
+    /// tick reads as clean, and `rebase`/`checkout` would overwrite it. (An edit
+    /// landing between this check and their reset is still lost, as in git.)
+    fn worktree_changes(&self, index: &Index, wt: &Path) -> Result<Vec<DiffEntry>, GitError> {
+        // The same resolver `load_index` uses, so `GIT_INDEX_FILE` is honoured.
+        let index_mtime = self
+            .repo
+            .index_path_for_env()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as u32, d.subsec_nanos()));
+        let options = DiffIndexToWorktreeOptions {
+            index_mtime,
+            ..DiffIndexToWorktreeOptions::default()
+        };
+        Ok(diff_index_to_worktree_with_options(
+            &self.repo.odb,
+            index,
+            wt,
+            options,
+        )?)
     }
 
     fn head_tree(&self) -> Result<Option<ObjectId>, GitError> {
@@ -273,7 +411,7 @@ impl GitEngine {
         let staged = diff_index_to_tree(&self.repo.odb, &index, tree.as_ref(), false)?;
         let (unstaged, untracked) = match self.repo.work_tree.clone() {
             Some(wt) => {
-                let unstaged = diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?;
+                let unstaged = self.worktree_changes(&index, &wt)?;
                 let untracked = collect_untracked_and_ignored(
                     &self.repo,
                     &index,
@@ -300,44 +438,159 @@ impl GitEngine {
         })
     }
 
-    /// `git log` — a first-parent walk from HEAD, up to `limit` commits. Requires `read`.
-    pub fn log(&self, caps: &GitCaveats, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+    /// `git log`, up to `limit` commits. Requires `read`.
+    ///
+    /// `revision` selects the walk: `None` starts at HEAD; a single rev starts
+    /// there instead; an `A..B` range walks from `B`, excluding everything
+    /// reachable from `A` — real reachability, via grit-lib's `rev_list`, not
+    /// a first-parent-chain scan (a branch cut from `main` and then advanced
+    /// past its fork point is walked correctly; the left side need not be a
+    /// first-parent ancestor of the right). `paths` (when non-empty) keeps
+    /// only commits whose tree differs from all their parents' at a matching
+    /// path (grit-lib's own history simplification, matching real `git log
+    /// -- <path>` — not limited to the first-parent diff).
+    pub fn log(
+        &self,
+        caps: &GitCaveats,
+        limit: usize,
+        revision: Option<&str>,
+        paths: &[String],
+    ) -> Result<Vec<CommitInfo>, GitError> {
         if !caps.permits_read() {
             return Err(GitError::Denied("read"));
         }
-        let mut out = Vec::new();
-        let mut next = self.head_oid()?;
-        while let Some(oid) = next {
-            if out.len() >= limit {
-                break;
-            }
-            let obj = self.repo.odb.read(&oid)?;
-            let commit = parse_commit(&obj.data)?;
-            out.push(commit_info(&oid, &commit));
-            next = commit.parents.first().cloned();
-        }
-        Ok(out)
+        let (positive, negative) = match revision {
+            None => (vec!["HEAD".to_string()], Vec::new()),
+            Some(rev) => match split_double_dot_range(rev) {
+                Some((left, right)) => {
+                    let left = if left.is_empty() { "HEAD" } else { left };
+                    let right = if right.is_empty() { "HEAD" } else { right };
+                    (vec![right.to_string()], vec![left.to_string()])
+                }
+                None => {
+                    self.reject_symmetric_or_ambiguous(rev)?;
+                    (vec![rev.to_string()], Vec::new())
+                }
+            },
+        };
+        let options = RevListOptions {
+            max_count: Some(limit),
+            paths: paths.to_vec(),
+            ..Default::default()
+        };
+        let result = rev_list(&self.repo, &positive, &negative, &options)?;
+        result
+            .commits
+            .iter()
+            .map(|oid| {
+                let obj = self.repo.odb.read(oid)?;
+                let commit = parse_commit(&obj.data)?;
+                Ok(commit_info(oid, &commit))
+            })
+            .collect()
     }
 
-    /// `git diff` for the given `spec`. Requires `read`.
-    pub fn diff(&self, caps: &GitCaveats, spec: DiffSpec) -> Result<DiffReport, GitError> {
+    /// `git diff` for the given `spec`. Requires `read`. `paths` (when
+    /// non-empty) filters the result to matching pathspecs; `stat` computes
+    /// per-file `--stat` insertion/deletion counts.
+    pub fn diff(
+        &self,
+        caps: &GitCaveats,
+        spec: DiffSpec,
+        paths: &[String],
+        stat: bool,
+    ) -> Result<DiffReport, GitError> {
         if !caps.permits_read() {
             return Err(GitError::Denied("read"));
         }
         let index = self.repo.load_index()?;
-        let entries = match spec {
+        let mut entries = match spec {
             DiffSpec::Worktree => match self.repo.work_tree.clone() {
-                Some(wt) => diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?,
+                Some(wt) => self.worktree_changes(&index, &wt)?,
                 None => Vec::new(),
             },
             DiffSpec::Staged => {
                 let tree = self.head_tree()?;
                 diff_index_to_tree(&self.repo.odb, &index, tree.as_ref(), false)?
             }
+            DiffSpec::Rev(rev) => match try_parse_double_dot_log_range(&self.repo, &rev)? {
+                Some((a, b)) => self.diff_rev_range(&a.to_hex(), &b.to_hex())?,
+                None => {
+                    self.reject_symmetric_or_ambiguous(&rev)?;
+                    let oid = self.resolve_one(&rev)?;
+                    let tree = self.commit_tree(&oid)?;
+                    match self.repo.work_tree.clone() {
+                        Some(wt) => {
+                            diff_tree_to_worktree(&self.repo.odb, Some(&tree), &wt, &index)?
+                        }
+                        None => Vec::new(),
+                    }
+                }
+            },
+            DiffSpec::RevRange(a, b) => self.diff_rev_range(&a, &b)?,
+        };
+        if !paths.is_empty() {
+            entries.retain(|e| matches_pathspec_list(e.path(), paths));
+        }
+        let stat = if stat {
+            Some(self.diff_stat(&entries)?)
+        } else {
+            None
         };
         Ok(DiffReport {
             files: entries.iter().map(file_change).collect(),
+            stat,
         })
+    }
+
+    /// Tree-vs-tree diff between two revision specs.
+    fn diff_rev_range(&self, a: &str, b: &str) -> Result<Vec<DiffEntry>, GitError> {
+        let oid_a = self.resolve_one(a)?;
+        let oid_b = self.resolve_one(b)?;
+        let tree_a = self.commit_tree(&oid_a)?;
+        let tree_b = self.commit_tree(&oid_b)?;
+        Ok(diff_trees(
+            &self.repo.odb,
+            Some(&tree_a),
+            Some(&tree_b),
+            "",
+        )?)
+    }
+
+    /// `--stat` counts per changed file. Reads both blob sides (missing side
+    /// treated as empty, matching Added/Deleted); binary files count 0/0.
+    fn diff_stat(&self, entries: &[DiffEntry]) -> Result<Vec<FileStat>, GitError> {
+        let zero = grit_lib::diff::zero_oid();
+        entries
+            .iter()
+            .map(|e| {
+                let old = if e.old_oid == zero {
+                    Vec::new()
+                } else {
+                    self.repo.odb.read(&e.old_oid)?.data
+                };
+                let new = if e.new_oid == zero {
+                    Vec::new()
+                } else {
+                    self.repo.odb.read(&e.new_oid)?.data
+                };
+                let (insertions, deletions) = if grit_lib::merge_file::is_binary(&old)
+                    || grit_lib::merge_file::is_binary(&new)
+                {
+                    (0, 0)
+                } else {
+                    count_changes(
+                        &String::from_utf8_lossy(&old),
+                        &String::from_utf8_lossy(&new),
+                    )
+                };
+                Ok(FileStat {
+                    path: e.path().to_string(),
+                    insertions,
+                    deletions,
+                })
+            })
+            .collect()
     }
 
     /// `git add` — stage worktree files into the index. Requires `stage`.
@@ -396,9 +649,18 @@ impl GitEngine {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
         }
+        let branch_ref = read_head(&self.repo.git_dir)?;
+        let head_oid = self.head_oid()?;
+        if let Some(branch_ref) = &branch_ref {
+            refuse_if_default_branch(
+                &self.repo.git_dir,
+                branch_ref,
+                !repository_has_no_refs(&self.repo.git_dir),
+            )?;
+        }
         let index = self.repo.load_index()?;
         let tree = write_tree_from_index(&self.repo.odb, &index, "")?;
-        let parents: Vec<ObjectId> = self.head_oid()?.into_iter().collect();
+        let parents: Vec<ObjectId> = head_oid.into_iter().collect();
         let ident = author.ident_now();
         let commit = CommitData {
             tree,
@@ -411,11 +673,8 @@ impl GitEngine {
             message: message.to_string(),
             raw_message: None,
         };
-        let oid = self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-        match read_head(&self.repo.git_dir)? {
+        let oid = self.write_commit(&commit)?;
+        match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot commit on a detached HEAD")),
         }
@@ -434,6 +693,17 @@ impl GitEngine {
     ) -> Result<CommitInfo, GitError> {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
+        }
+        let branch_ref = read_head(&self.repo.git_dir)?;
+        // Amend always rewrites an existing commit, so `repository_has_no_refs`
+        // is unconditionally false here — computed via the shared helper
+        // anyway, for one source of truth (round 4).
+        if let Some(branch_ref) = &branch_ref {
+            refuse_if_default_branch(
+                &self.repo.git_dir,
+                branch_ref,
+                !repository_has_no_refs(&self.repo.git_dir),
+            )?;
         }
         let head = self
             .head_oid()?
@@ -455,15 +725,38 @@ impl GitEngine {
             message: message.map(str::to_string).unwrap_or(head_commit.message),
             raw_message: None,
         };
-        let oid = self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
-        match read_head(&self.repo.git_dir)? {
+        let oid = self.write_commit(&commit)?;
+        match branch_ref {
             Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
             None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
         }
         Ok(commit_info(&oid, &commit))
+    }
+
+    /// Refuse a `log`/`diff` operand this engine cannot answer honestly: an
+    /// `A...B` symmetric-diff (no merge-base support here — real git resolves
+    /// it to a merge base, which this engine does not compute for this path)
+    /// or a bare `spec` that is simultaneously a resolvable revision AND an
+    /// existing worktree path (the same shape real git refuses without an
+    /// explicit `--` to disambiguate; answering the revision silently would
+    /// hide that the caller may have meant the path).
+    fn reject_symmetric_or_ambiguous(&self, spec: &str) -> Result<(), GitError> {
+        if split_triple_dot_range(spec).is_some() {
+            return Err(GitError::Refused(
+                "symmetric ranges are not supported — put -- before paths, or use A..B".to_string(),
+            ));
+        }
+        let is_path = self
+            .repo
+            .work_tree
+            .as_ref()
+            .is_some_and(|wt| wt.join(spec).exists());
+        if is_path && self.resolve_one(spec).is_ok() {
+            return Err(GitError::Refused(format!(
+                "ambiguous argument '{spec}': both revision and filename — put -- before paths"
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve a commit spec (short oid / ref / id) to an `ObjectId`.
@@ -476,6 +769,21 @@ impl GitEngine {
 
     fn commit_tree(&self, oid: &ObjectId) -> Result<ObjectId, GitError> {
         Ok(parse_commit(&self.repo.odb.read(oid)?.data)?.tree)
+    }
+
+    /// Write `commit` to the object database, signed when this engine has a
+    /// signer. The one write path for `commit`, `amend` and rebase, so no
+    /// commit from them can go out unsigned once the operator asked for
+    /// signatures. A signing failure writes nothing.
+    fn write_commit(&self, commit: &CommitData) -> Result<ObjectId, GitError> {
+        let mut bytes = serialize_commit(commit);
+        if let Some(signer) = &self.signer {
+            let signature = signer
+                .sign(&bytes)
+                .map_err(|e| GitError::Refused(format!("commit signing failed: {e}")))?;
+            bytes = newt_core::commit_signing::with_signature(&bytes, &signature);
+        }
+        Ok(self.repo.odb.write(ObjectKind::Commit, &bytes)?)
     }
 
     /// Write a single-parent commit with the agent's identity; returns its oid.
@@ -498,10 +806,7 @@ impl GitEngine {
             message: message.to_string(),
             raw_message: None,
         };
-        Ok(self
-            .repo
-            .odb
-            .write(ObjectKind::Commit, &serialize_commit(&commit))?)
+        self.write_commit(&commit)
     }
 
     /// Structured-plan rebase: replay `steps` (in order) onto `onto`, applying
@@ -533,8 +838,30 @@ impl GitEngine {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
         }
+        // #2485: a ref-moving op must leave the working tree == HEAD, or
+        // refuse. Require a clean tree up front so the `checkout_between_trees`
+        // reset below (old HEAD tree → new tip tree) never discards
+        // uncommitted work — the same clean-tree precondition `stash` relies
+        // on for its own tree reset.
+        let pre_status = self.status(caps)?;
+        if !pre_status.clean {
+            return Err(GitError::Refused(format!(
+                "rebase needs a clean working tree ({} staged, {} unstaged, {} untracked); commit or stash first",
+                pre_status.staged.len(),
+                pre_status.unstaged.len(),
+                pre_status.untracked.len()
+            )));
+        }
         let head_ref = read_head(&self.repo.git_dir)?
             .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
+        // Rebase always replays onto existing history — same shared helper
+        // as `commit`/`amend` (round 4), one source of truth.
+        refuse_if_default_branch(
+            &self.repo.git_dir,
+            &head_ref,
+            !repository_has_no_refs(&self.repo.git_dir),
+        )?;
+        let old_head_tree = self.head_tree()?;
         let onto_oid = self.resolve_one(onto)?;
 
         // The commit currently being assembled (a `pick`/`reword` opens it;
@@ -632,15 +959,64 @@ impl GitEngine {
                 None => msg,
             };
             tip = self.write_commit_on(cur_parent, cur_tree, &msg, author)?;
+            tip_tree = cur_tree;
             produced += 1;
         }
-        // The single mutating step: advance the branch ref to the new tip.
-        write_ref(&self.repo.git_dir, &head_ref, &tip)?;
+        self.guard_move_ref_and_sync_tree(
+            old_head_tree,
+            tip_tree,
+            "rebase",
+            short_oid(&tip),
+            || Ok(write_ref(&self.repo.git_dir, &head_ref, &tip)?),
+        )?;
         Ok(RebaseReport {
             new_head: short_oid(&tip),
             produced,
             dropped,
         })
+    }
+
+    /// Shared ref-moving tail for `rebase` and `checkout`: refuse if the new
+    /// tree would overwrite an ignored file the `clean` precondition can't
+    /// see (#2518), then move the ref via `move_ref`, then reset the
+    /// worktree + index to `new_tree` LAST so tree == HEAD after the ref
+    /// moves. `op`/`new_head` label the error text if that final reset fails
+    /// partway (ref already moved; `GitError::Refused` is used anyway — a
+    /// moved ref plus a half-updated tree is the least-bad state to report
+    /// through the same variant as an outright refusal).
+    fn guard_move_ref_and_sync_tree(
+        &self,
+        old_tree: Option<ObjectId>,
+        new_tree: ObjectId,
+        op: &str,
+        new_head: String,
+        move_ref: impl FnOnce() -> Result<(), GitError>,
+    ) -> Result<(), GitError> {
+        if let Some(wt) = self.repo.work_tree.clone() {
+            let changes = diff_trees(&self.repo.odb, old_tree.as_ref(), Some(&new_tree), "")?;
+            for change in &changes {
+                if change.status != DiffStatus::Added {
+                    continue;
+                }
+                let Some(path) = &change.new_path else {
+                    continue;
+                };
+                if wt.join(path).symlink_metadata().is_ok() {
+                    return Err(GitError::Refused(format!(
+                        "{op}: refusing — {path} already exists on disk and would be overwritten by the checked-out tree"
+                    )));
+                }
+            }
+        }
+        move_ref()?;
+        // `None` (an unborn HEAD) is the empty tree to grit, so every path in
+        // `new_tree` is written; skipping the reset here would leave tree != HEAD.
+        checkout_between_trees(&self.repo, old_tree.as_ref(), &new_tree).map_err(|e| {
+            GitError::Refused(format!(
+                "{op}: HEAD moved to {new_head} but the working tree may be partially updated and the index still reflects the previous HEAD; run status before continuing: {e}"
+            ))
+        })?;
+        Ok(())
     }
 
     /// `git branch <name>` — create `refs/heads/<name>` at the current HEAD commit.
@@ -650,6 +1026,14 @@ impl GitEngine {
         if !caps.permits_ref(&refname) {
             return Err(GitError::Denied("refs"));
         }
+        // `write_ref` below has no existence check — this is an implicit
+        // force-move if `refname` already points elsewhere. Round 4, Blocker
+        // 2's audit: gate it the same way `commit`/`amend`/`rebase` are.
+        refuse_if_default_branch(
+            &self.repo.git_dir,
+            &refname,
+            !repository_has_no_refs(&self.repo.git_dir),
+        )?;
         let oid = self
             .head_oid()?
             .ok_or(GitError::Unsupported("cannot branch from an unborn HEAD"))?;
@@ -663,9 +1047,10 @@ impl GitEngine {
     ///
     /// newt is local-only and has no working-tree updater, so this only moves
     /// HEAD when the target branch is at the SAME commit as the current HEAD
-    /// (always true for a freshly-created branch). Switching to a branch at a
-    /// different commit is *refused* rather than silently leaving the worktree
-    /// stale — no side effects on refusal.
+    /// (always true for a freshly-created branch), or resets the worktree +
+    /// index to the target commit's tree (#2485, same guarded tail as
+    /// `rebase`) when the tree is clean. A dirty tree, or an ignored file in
+    /// the way, refuses with no side effects.
     pub fn checkout(
         &self,
         caps: &GitCaveats,
@@ -681,6 +1066,15 @@ impl GitEngine {
         let (target, created) = match (existing, create) {
             (Some(oid), _) => (Some(oid), false),
             (None, true) => {
+                // Round 4, Blocker 2's audit: `checkout -b main` creating a
+                // FRESH `refs/heads/main` while the repository already has
+                // other refs is the same "retarget the default branch"
+                // shape the exemption exists to NOT cover.
+                refuse_if_default_branch(
+                    &self.repo.git_dir,
+                    &refname,
+                    !repository_has_no_refs(&self.repo.git_dir),
+                )?;
                 let oid = head.ok_or(GitError::Unsupported(
                     "cannot create a branch from an unborn HEAD",
                 ))?;
@@ -694,11 +1088,29 @@ impl GitEngine {
             }
         };
         if target != head {
-            return Err(GitError::Refused(format!(
-                "refusing to switch to '{name}': it points at a different commit \
-                 than HEAD and newt cannot update the working tree (local-only). \
-                 Commit or stash first, or create a new branch at HEAD."
-            )));
+            // #2485: same ref-moving invariant as `rebase` — only switch if
+            // the tree can be synced to the target commit without side
+            // effects, via the same guarded tail.
+            let pre_status = self.status(caps)?;
+            if !pre_status.clean {
+                return Err(GitError::Refused(format!(
+                    "refusing to switch to '{name}': working tree is not clean \
+                     ({} staged, {} unstaged, {} untracked); commit or stash first",
+                    pre_status.staged.len(),
+                    pre_status.unstaged.len(),
+                    pre_status.untracked.len()
+                )));
+            }
+            let old_tree = self.head_tree()?;
+            let new_tree = self.commit_tree(&target.expect("target set above"))?;
+            self.guard_move_ref_and_sync_tree(
+                old_tree,
+                new_tree,
+                "checkout",
+                name.to_string(),
+                || Ok(write_symbolic_ref(&self.repo.git_dir, "HEAD", &refname)?),
+            )?;
+            return Ok(format!("switched to branch '{name}'"));
         }
         write_symbolic_ref(&self.repo.git_dir, "HEAD", &refname)?;
         Ok(if created {
@@ -726,6 +1138,13 @@ impl GitEngine {
         if resolve_ref(&self.repo.git_dir, &refname).is_err() {
             return Err(GitError::Refused(format!("branch '{name}' does not exist")));
         }
+        // Round 4, Blocker 2: deleting `refname` here means it just resolved
+        // above, so it unconditionally exists — `true`, always. This closes
+        // the bypass where `branch-delete main` (previously unguarded) made
+        // `main` unborn, reopening the OLD (per-ref) exemption for a commit
+        // that created a brand-new `main` as a root commit with the guard
+        // never firing.
+        refuse_if_default_branch(&self.repo.git_dir, &refname, true)?;
         delete_ref(&self.repo.git_dir, &refname)?;
         Ok(format!("deleted branch '{name}'"))
     }
@@ -753,7 +1172,7 @@ impl GitEngine {
 
         let index = self.repo.load_index()?;
         let staged = diff_index_to_tree(&self.repo.odb, &index, Some(&head_tree), false)?;
-        let unstaged = diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?;
+        let unstaged = self.worktree_changes(&index, &wt)?;
         if staged.is_empty() && unstaged.is_empty() {
             return Ok("No local changes to save".into());
         }
@@ -1003,16 +1422,12 @@ pub struct LocalGitTool {
     /// the commit arms then leave the message unchanged.
     pub attribution: Option<newt_core::attribution::CommitAttribution>,
     /// #1709 family — the EXPLICIT commit-success signal. Incremented in the
-    /// `commit` / `amend` / `rebase` arms ONLY on a confirmed successful
-    /// `eng.*` call (the actual commit creation), never on a `HEAD` change.
-    /// The session loop drains this ([`LocalGitTool::drain_commit_success`])
-    /// after a turn and clears the contributor ledger ONLY when a real Newt
-    /// commit landed — so a `HEAD` move from an external/manual action (a
-    /// user `git reset`, a fetch advancing the branch, …) does NOT discard
-    /// pending contributors, and a commit whose `HEAD`-diff proxy was
-    /// unreliable still clears. Atomic for cross-thread visibility (the
-    /// session runs on its own thread; the drain runs on the loop thread).
-    pub commit_succeeded: std::sync::atomic::AtomicUsize,
+    /// embedded commit-producing arms on actual creation, or by the native
+    /// broker after verifying publication. The per-call session guard observes
+    /// this without draining to update attribution, including failed compound
+    /// tails and cancellation. TUI telemetry drains only after the session
+    /// turn has completed. A manual `HEAD` move is never a success signal.
+    pub commit_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// #1709 family — the per-lifecycle contributor-consumption cursor. The
     /// envelope's `contributors` snapshot is FROZEN for the turn (the field
     /// is owned, and [`GitTool::dispatch`] takes `&self`, so it cannot be
@@ -1027,7 +1442,10 @@ pub struct LocalGitTool {
     /// the end-of-turn drain. Reset to 0 by the session loop when it
     /// refreshes the envelope at the top of each iteration. Atomic for the
     /// same cross-thread reason as `commit_succeeded`.
-    pub contributors_consumed: std::sync::atomic::AtomicUsize,
+    pub contributors_consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Signs the commits this tool writes, per the operator's
+    /// `[agent-identity.git] signing` (`newt_core::commit_signing::signer_for`).
+    pub signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
 }
 
 impl LocalGitTool {
@@ -1052,30 +1470,7 @@ impl LocalGitTool {
     ///
     /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     fn finalize_commit_message(&self, message: &str) -> String {
-        match &self.attribution {
-            // Semantic B: the envelope's `contributors` snapshot (the
-            // accumulated ledger, captured at the latest refresh) is merged
-            // with the active model by `finalize_message` →
-            // `finalize_message_with`, so every contributing model is
-            // credited. An empty snapshot yields the single active-model
-            // floor (semantic A).
-            //
-            // #1709 family: the snapshot is CONSUMED at the commit boundary,
-            // not the end-of-turn boundary. `contributors_consumed` is a
-            // cursor into the frozen `contributors` Vec — render only the
-            // UNCONSUMED tail `contributors[cursor..]`. A prior successful
-            // commit in this same lifecycle advanced the cursor past the
-            // contributors it already credited, so this commit re-credits
-            // none of them (C1 → more work → C2: C2's slice is empty).
-            Some(a) => {
-                let cursor = self
-                    .contributors_consumed
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let start = cursor.min(a.contributors.len());
-                a.finalize_message_with(message, &a.contributors[start..])
-            }
-            None => message.to_string(),
-        }
+        finalize_commit_message(&self.attribution, &self.contributors_consumed, message)
     }
 
     /// Consume the contributor snapshot at the confirmed-successful commit
@@ -1091,14 +1486,98 @@ impl LocalGitTool {
 
     /// Drain the explicit commit-success counter — returns the number of
     /// Newt commits that ACTUALLY landed since the last drain, and resets it
-    /// to zero. The session loop calls this after a turn and clears the
-    /// contributor ledger ONLY when it is non-zero (a confirmed successful
-    /// commit), never merely because `HEAD` moved (the historical
-    /// stale-attribution class). See [`LocalGitTool::commit_succeeded`].
+    /// to zero for telemetry after the turn. Per-call attribution uses the
+    /// nondraining [`GitTool::confirmed_commit_count`] observer.
     #[must_use]
     pub fn drain_commit_success(&self) -> usize {
         self.commit_succeeded
             .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn finalize_commit_message(
+    attribution: &Option<newt_core::attribution::CommitAttribution>,
+    consumed: &std::sync::atomic::AtomicUsize,
+    message: &str,
+) -> String {
+    match attribution {
+        // Semantic B: the envelope's `contributors` snapshot (the
+        // accumulated ledger, captured at the latest refresh) is merged
+        // with the active model by `finalize_message` →
+        // `finalize_message_with`, so every contributing model is
+        // credited. An empty snapshot yields the single active-model
+        // floor (semantic A).
+        //
+        // #1709 family: the snapshot is CONSUMED at the commit boundary,
+        // not the end-of-turn boundary. `contributors_consumed` is a
+        // cursor into the frozen `contributors` Vec — render only the
+        // UNCONSUMED tail `contributors[cursor..]`. A prior successful
+        // commit in this same lifecycle advanced the cursor past the
+        // contributors it already credited, so this commit re-credits
+        // none of them (C1 → more work → C2: C2's slice is empty).
+        Some(a) => {
+            let cursor = consumed.load(std::sync::atomic::Ordering::Relaxed);
+            let start = cursor.min(a.contributors.len());
+            a.finalize_message_with(message, &a.contributors[start..])
+        }
+        None => message.to_string(),
+    }
+}
+
+/// An owned snapshot remains in the host supervisor while native Git runs.
+/// Shared counters retain the existing explicit-success ledger lifecycle.
+struct NativeCommitPolicy {
+    attribution: Option<newt_core::attribution::CommitAttribution>,
+    signer: Option<std::sync::Arc<dyn newt_core::commit_signing::CommitSigner>>,
+    commit_succeeded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    contributors_consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    frozen_cursor: Option<usize>,
+}
+
+impl agent_toolchain::native_git::CommitPolicy for NativeCommitPolicy {
+    fn snapshot_for_commit(
+        &self,
+    ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
+        Some(std::sync::Arc::new(Self {
+            attribution: self.attribution.clone(),
+            signer: self.signer.clone(),
+            commit_succeeded: self.commit_succeeded.clone(),
+            contributors_consumed: self.contributors_consumed.clone(),
+            frozen_cursor: Some(
+                self.contributors_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }))
+    }
+
+    fn finalize_message(&self, message: &str) -> Result<String, String> {
+        let cursor = std::sync::atomic::AtomicUsize::new(self.frozen_cursor.unwrap_or_else(|| {
+            self.contributors_consumed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }));
+        Ok(finalize_commit_message(&self.attribution, &cursor, message))
+    }
+
+    fn signing_required(&self) -> bool {
+        self.signer.is_some()
+    }
+
+    fn sign_commit(&self, payload: &[u8]) -> Result<String, String> {
+        self.signer
+            .as_ref()
+            .ok_or("native commit signing is not configured")?
+            .sign(payload)
+    }
+
+    fn committed(&self) {
+        if let Some(attribution) = &self.attribution {
+            self.contributors_consumed.fetch_max(
+                attribution.contributors.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        self.commit_succeeded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1113,6 +1592,23 @@ impl LocalGitTool {
 // [`CommitAttribution`]: newt_core::attribution::CommitAttribution
 
 impl newt_core::agentic::GitTool for LocalGitTool {
+    fn confirmed_commit_count(&self) -> usize {
+        self.commit_succeeded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn native_commit_policy(
+        &self,
+    ) -> Option<std::sync::Arc<dyn agent_toolchain::native_git::CommitPolicy>> {
+        Some(std::sync::Arc::new(NativeCommitPolicy {
+            attribution: self.attribution.clone(),
+            signer: self.signer.clone(),
+            commit_succeeded: self.commit_succeeded.clone(),
+            contributors_consumed: self.contributors_consumed.clone(),
+            frozen_cursor: None,
+        }))
+    }
+
     fn dispatch(
         &self,
         op: &str,
@@ -1172,13 +1668,37 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         }
         let (git_dir, common_dir, worktree) =
             scoped_repository_paths(&root, &read_scope).map_err(|e| e.to_string())?;
+        // PR #2577 round 2 removed a whole-directory `permits_path(write_scope,
+        // git_dir/common_dir)` check here on the theory that `cwd` resolving
+        // *inside* `self.root` (proved by `checked_dispatch_root`) means `cwd`
+        // is always the session's own repository. Round 3 correction: that is
+        // FALSE — a NESTED repository (#2552 `InsideRepo`) is supported, and a
+        // nested LINKED worktree's `git_dir`/`common_dir` can point anywhere on
+        // disk via its `commondir` file, regardless of where the worktree
+        // directory itself sits. So the gate is restored, widened by exactly
+        // one case: mutation through `cwd` is permitted when the resolved
+        // `git_dir`/`common_dir` are EITHER an explicit `fs_write` grant, OR
+        // are the session workspace's OWN repository — the same
+        // `git_dir`/`common_dir` `self.root` itself resolves to (the case
+        // `refuse_if_default_branch` protects at the engine layer). Anything
+        // else — a foreign nested repo `cwd` merely happens to point at — falls
+        // back to needing the ordinary explicit `fs_write` grant.
         if explicit_cwd
             && mutates
-            && [&git_dir, &common_dir].iter().any(|path| {
-                !newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy())
-            })
+            && ![&git_dir, &common_dir]
+                .iter()
+                .all(|path| newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy()))
         {
-            return Err("capability denied: fs_write for selected worktree Git metadata".into());
+            let is_own_repo = scoped_repository_paths(&self.root, &read_scope)
+                .ok()
+                .is_some_and(|(own_git_dir, own_common_dir, _)| {
+                    git_dir == own_git_dir && common_dir == own_common_dir
+                });
+            if !is_own_repo {
+                return Err(
+                    "capability denied: fs_write for selected worktree Git metadata".into(),
+                );
+            }
         }
         if op == "branch-list" {
             validate_branch_ref_inputs(&git_dir, &common_dir, &read_scope)
@@ -1189,20 +1709,29 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         // ambient GIT_DIR / GIT_WORK_TREE after the filesystem scope check.
         let eng = GitEngine {
             repo: Repository::open(&git_dir, worktree.as_deref()).map_err(|e| e.to_string())?,
+            signer: self.signer.clone(),
         };
         let s = |e: GitError| e.to_string();
         match op {
             "status" => Ok(render_status(&eng.status(caps).map_err(s)?)),
             "log" => {
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-                Ok(render_log(&eng.log(caps, limit).map_err(s)?))
+                let revision = args.get("revision").and_then(|v| v.as_str());
+                let paths = str_array(args, "paths");
+                Ok(render_log(&eng.log(caps, limit, revision, &paths).map_err(s)?))
             }
             "diff" => {
-                let spec = match args.get("spec").and_then(|v| v.as_str()) {
-                    Some("staged") => DiffSpec::Staged,
+                let rev = args.get("rev").and_then(|v| v.as_str());
+                let rev2 = args.get("rev2").and_then(|v| v.as_str());
+                let spec = match (args.get("spec").and_then(|v| v.as_str()), rev, rev2) {
+                    (Some("staged"), ..) => DiffSpec::Staged,
+                    (_, Some(a), Some(b)) => DiffSpec::RevRange(a.to_string(), b.to_string()),
+                    (_, Some(a), None) => DiffSpec::Rev(a.to_string()),
                     _ => DiffSpec::Worktree,
                 };
-                Ok(render_diff(&eng.diff(caps, spec).map_err(s)?))
+                let paths = str_array(args, "paths");
+                let stat = args.get("stat").and_then(|v| v.as_bool()).unwrap_or(false);
+                Ok(render_diff(&eng.diff(caps, spec, &paths, stat).map_err(s)?))
             }
             "add" => {
                 let paths = str_array(args, "paths");
@@ -1767,11 +2296,23 @@ fn render_diff(d: &DiffReport) -> String {
     if d.files.is_empty() {
         return "no changes".to_string();
     }
-    d.files
+    let files = d
+        .files
         .iter()
         .map(|f| format!("{} {}", f.status, f.path))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    match &d.stat {
+        Some(stat) => {
+            let lines = stat
+                .iter()
+                .map(|s| format!("{} | +{} -{}", s.path, s.insertions, s.deletions))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{files}\n\n{lines}")
+        }
+        None => files,
+    }
 }
 
 #[cfg(test)]

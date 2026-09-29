@@ -1,0 +1,131 @@
+[package]
+name = "agent-bridle-tool-shell"
+# Complementary shell engines behind one construction-time seam: the lean
+# argv + safe-subset exec funnel, a carried Brush worker, and the L3-dependent
+# host shell. Each reports its effective enforcement honestly.
+description = "Capability-confined safe-subset, Brush, and host-shell engines for agent-bridle."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The live egress-audit monitor (#124, ADR 0016). Needs the `shell` feature (for
+# the `NetAuditEvent` type it renders), so it is not built in a `shell`-less build.
+[[bin]]
+name = "bridle-netmon"
+required-features = ["shell"]
+
+[[test]]
+name = "brush_real"
+path = "tests/brush_real.rs"
+harness = false
+required-features = ["brush"]
+
+[[test]]
+name = "named_host_root_real"
+path = "tests/named_host_root_real.rs"
+harness = false
+required-features = ["brush"]
+
+[[test]]
+name = "carried_coreutils"
+path = "tests/carried_coreutils.rs"
+harness = false
+required-features = ["carried-coreutils"]
+
+[features]
+# `shell` is on by default so agent-bridle's registry() includes the tool.
+# It pulls tokio (spawn_blocking + timeout) for confined execution.
+default = ["shell"]
+shell = ["dep:tokio"]
+# The sandboxed-host engine (ADR 0019 / #194): a second, complementary engine
+# that runs `/bin/sh -c` with the whole tree inside the L3 jail (no L2 parsing).
+# Opt-in; the embedder registers it instead of the safe-subset ShellTool. Pulls
+# tokio (spawn_blocking) like `shell`; independent of the safe-subset modules.
+host-shell = ["dep:tokio"]
+# The carried **brush** engine (agent-bridle#20 / Track 2): a bash-in-Rust shell
+# run in a dedicated sandboxed worker, with the `CommandInterceptor` L2 leash
+# inside the inherited L3 boundary. Uses the
+# temporary `brush-ocap-*` fork, published to crates.io (reubeno/brush#1184 not
+# yet upstream). Off by default in this leaf crate; the facade enables it by
+# default through `carried-coreutils`.
+brush = [
+    "dep:tokio",
+    "dep:brush-ocap-core",
+    "dep:brush-ocap-builtins",
+    "dep:brush-parser",
+    "dep:getrandom",
+    "dep:libproc",
+    "dep:nix",
+]
+# Carried coreutils (agent-bridle#20 / issue #206): the brush engine registers
+# bundled uu_* coreutils shims that re-exec `<self> --invoke-bundled <name>`, so
+# an embedded shell runs `ls`/`cat`/… with NO host tools — IF the host binary is
+# dispatch-capable (calls `maybe_dispatch()` at the top of `main`). Off by
+# default; carries the fork's published coreutils crate.
+carried-coreutils = ["brush", "dep:brush-ocap-coreutils-builtins"]
+# Kernel-enforced L3 backstop (Linux): confines both filesystem axes, narrows
+# direct execve (reported Interceptor because the loader trampoline remains),
+# and denies all TCP for an empty net scope on ABI-v4 kernels. Off this build/OS,
+# another native backend may apply or the run honestly reports None.
+linux-landlock = ["agent-bridle-core/linux-landlock"]
+# Kernel-enforced L3 backstop (macOS): wraps the worker/stage in `sandbox-exec`
+# with an SBPL profile derived from the caveats. Confines both filesystem axes,
+# restricted exec, and empty/loopback-only net scopes.
+macos-seatbelt = ["agent-bridle-core/macos-seatbelt"]
+# Windows AppContainer process boundary: the wired launcher confines filesystem
+# paths, empty/loopback-only net, and exec deny-all at process creation.
+windows-appcontainer = ["agent-bridle-core/windows-appcontainer"]
+os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
+
+[dependencies]
+agent-bridle-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, optional = true }
+getrandom = { version = "0.2", optional = true }
+rustix = { version = "1", features = ["process"] }
+
+# The `brush-ocap-*` fork on crates.io (github.com/hartsock/brush @ brush-ocap):
+# upstream brush + the CommandInterceptor hook (reubeno/brush#1184), renamed +
+# published so this crate is crates.io-publishable with `brush` on. Temporary —
+# retire once #1184 merges upstream and a hooked `brush-*` release ships
+# (agent-bridle#20).
+# MIN-VERSION MATTERS: the interceptor code here uses the
+# `brush_core::extensions::CommandDecision` / `before_command` /
+# `Error::is_terminating` API that first shipped in brush-ocap-core 0.5.1. A
+# bare "0.5" lets a downstream resolver satisfy us with 0.5.0 (cargo's
+# conservative update does exactly that from an old lock) → unresolved imports
+# in a published crate (broke newt-agent's mesh contract job, newt-agent#1327).
+# The requirement must name the API floor we compile against.
+brush-ocap-core = { version = "0.5.1", optional = true }
+brush-ocap-builtins = { version = "0.2", optional = true }
+brush-parser = { version = "0.4.0", optional = true }
+# A focused carried coreutils set — enough for common inspection pipelines
+# without the ~100-crate `coreutils.all` build.
+brush-ocap-coreutils-builtins = { version = "0.1", features = [
+    "coreutils.ls",
+    "coreutils.cat",
+    "coreutils.echo",
+    "coreutils.head",
+    "coreutils.sort",
+    "coreutils.wc",
+], optional = true }
+
+# #319 fd-hygiene seam applied at every confined-spawn site in this crate
+# (OsSpawner stages + carried-coreutils). Unix-only; no-op off-Linux today.
+[target.'cfg(unix)'.dependencies]
+agent-bridle-fdguard = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { version = "0.31.3", features = ["fs", "process", "socket", "uio", "user"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = { version = "0.14.11", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+serde_json = { workspace = true }

@@ -27,6 +27,7 @@ pub mod help_suite;
 mod identity_cmd;
 mod mcp_cmd;
 mod mcp_probe_cmd;
+mod migration_notices;
 mod models_cmd;
 mod new_project;
 mod ocap_cmd;
@@ -49,11 +50,13 @@ use std::path::PathBuf;
 
 /// clap value parser for `--shell-engine`. Delegates to [`newt_core::ShellEngine`]'s
 /// `FromStr` (canonical names plus aliases like `landlock`→`host`); a bad value
-/// is rejected at parse time with the list of accepted engines.
+/// is rejected at parse time, as is an unavailable worker transport.
 fn parse_shell_engine(
     s: &str,
 ) -> Result<newt_core::ShellEngine, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    Ok(s.parse::<newt_core::ShellEngine>()?)
+    let engine = s.parse::<newt_core::ShellEngine>()?;
+    engine.validate_available()?;
+    Ok(engine)
 }
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
@@ -166,8 +169,9 @@ pub struct Cli {
 
     /// Tenacity (#psyche): how long the agent pursues the task — `normal` |
     /// `relentless`. Default `normal`. In interactive code sessions and
-    /// `headless`, `relentless` makes the default tool-round budget effectively
-    /// unlimited; an explicit round limit wins. The pre-split levels
+    /// `headless`, `relentless` makes the initial tool-round allowance effectively
+    /// unlimited; an explicit initial allowance wins. Fresh progress can renew
+    /// either allowance; set `workflow_grace_rounds = 0` for a hard cap. The pre-split levels
     /// (`relaxed` / `standard` / `insistent`) are refused with their
     /// `--initiative` replacement.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_tenacity)]
@@ -225,6 +229,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME", conflicts_with = "ephemeral")]
     pub resume: Option<String>,
 
+    /// Admit only the explicitly resumed conversation into Smart Harness as
+    /// historical context, without reconstructing past execution evidence.
+    /// Requires [smart_harness] enabled = true. Interactive TUI only.
+    #[arg(long, global = true, requires = "resume", conflicts_with = "ephemeral")]
+    pub adopt_frame: bool,
+
     /// When a tool call is denied by the session's permission caveats, ask
     /// interactively — allow once / allow for this session / deny — instead
     /// of failing the call outright (issue #263). Decisions are recorded to
@@ -251,9 +261,9 @@ pub struct Cli {
     /// handling, same output shape). fs tools keep the workspace fence and
     /// web_fetch keeps its leash: this is unconfined exec, not authority-off.
     /// Equivalent to NEWT_DISABLE_OCAP=1; deliberately NO config-file key, so
-    /// the bypass must be asserted per invocation. Removed (or demoted to a
-    /// debug flag) once brush upstreams CommandInterceptor and agent-bridle's
-    /// real confined shell works everywhere (agent-bridle#20).
+    /// the bypass must be asserted per invocation. Static Brush filters are
+    /// integrated; native confinement and authenticated worker transport still
+    /// need platform parity before this interim switch can be retired.
     #[arg(long, visible_alias = "yolo", global = true, default_value_t = false)]
     pub disable_ocap: bool,
 
@@ -270,22 +280,31 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub full_access: bool,
 
+    /// Full access inside the workspace for this interactive session: run
+    /// commands and create, change, rename, or delete files below `code <DIR>`.
+    /// Native filesystem confinement remains active; network access follows
+    /// the independently configured permissions. This startup choice overrides
+    /// the configured preset and inherited global-access/host-bypass switches.
+    #[arg(long, global = true, default_value_t = false, conflicts_with_all = ["full_access", "disable_ocap"])]
+    pub workspace_access: bool,
+
     /// Select the shell **engine** `run_command` uses for THIS invocation (the
     /// ADR 0005 D2 seam): `safe-subset` (portable default — refuses
     /// `$(...)`/dynamic constructs), `host` (real `/bin/sh -c` inside the L3
-    /// kernel jail — full grammar; what `--full-access` auto-selects), or
-    /// `brush` (the carried bash-in-Rust engine + L2 interceptor; falls back to
-    /// `host` until the brush build ships, agent-bridle#20). Overrides the
+    /// kernel jail — full grammar on hosts with /bin/sh), or `brush` (carried
+    /// bash-in-Rust in an authenticated worker, currently Linux/macOS only).
+    /// Unsupported Brush choices fail at startup. Full access defaults to host
+    /// on Linux/macOS and safe-subset elsewhere. Overrides the
     /// `[shell] engine` config key. The L3 backend (Landlock/Seatbelt) is a
     /// separate, auto-selected axis.
     #[arg(long, global = true, value_parser = parse_shell_engine)]
     pub shell_engine: Option<newt_core::ShellEngine>,
 
     /// facade P4 (#780): turn OFF the convenience tool-call ROUTING for THIS
-    /// invocation. By default a model's `run_command("cat X")` / `ls` / `find` /
-    /// read-only `git` is silently rewritten to the governed built-in
-    /// (`read_file`/`list_dir`/`find`/the git read path); `--no-route` runs the
-    /// command on the normal exec path as-is instead. This is the L2
+    /// invocation. By default supported `run_command` calls such as `cat X`,
+    /// `ls`, and `find` use the governed built-in; `--no-route` runs the
+    /// original command on the normal exec path instead. Git commands always
+    /// use native exec, with or without this switch. This is the L2
     /// convenience-OFF switch and is DELIBERATELY DISTINCT from `--disable-ocap`
     /// /`--yolo`: it NEVER disables the L3 boundary — the confined shell still
     /// gates exec and the fs fence still governs reads. Equivalent to
@@ -843,7 +862,9 @@ pub enum Command {
         /// Private frame directory (default: user config/frame/<workspace CID>).
         #[arg(long, value_name = "DIR")]
         frame_dir: Option<PathBuf>,
-        /// Override the max tool-call rounds for this headless.
+        /// Initial tool-call round allowance for this headless run. Concrete
+        /// progress may renew it; `[tui] workflow_grace_rounds = 0` makes it a
+        /// hard cap. Inference budgets and cancellation remain binding.
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
         /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`,
@@ -1104,7 +1125,20 @@ fn abs_grant_paths(paths: &[PathBuf]) -> Result<std::ffi::OsString, std::env::Jo
     std::env::join_paths(paths.iter().map(|p| abs_grant_path(p)))
 }
 
+fn validate_launch_options(cli: &Cli) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cli.workspace_access || matches!(cli.command.as_ref(), None | Some(Command::Code { .. })),
+        "--workspace-access is available for the interactive TUI: newt --workspace-access code <directory>"
+    );
+    anyhow::ensure!(
+        !cli.adopt_frame || matches!(cli.command.as_ref(), None | Some(Command::Code { .. })),
+        "--adopt-frame is available only for the interactive TUI with --resume"
+    );
+    Ok(())
+}
+
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    validate_launch_options(&cli)?;
     // #1303 clause B: install the one-time mouse-capture panic-release hook at
     // binary entry, before any turn can enable capture. It emits
     // `DisableMouseCapture` ONLY when capture is currently active, so the
@@ -1352,7 +1386,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .or_else(|| std::env::var("NEWT_LOADOUT").ok())
                     .filter(|s| !s.is_empty());
                 if let Some(name) = name {
-                    let cfg = newt_core::Config::resolve()?;
+                    let cfg = crate::migration_notices::read(|report| {
+                        newt_core::Config::resolve(report)
+                    })?;
                     let loadout = cfg.loadouts.get(&name).ok_or_else(|| {
                         let known = if cfg.loadouts.is_empty() {
                             "none defined".to_string()
@@ -1428,9 +1464,15 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // (env) or a --loadout axis (set just above) always wins, and a
             // provider naming a since-removed [[backends]] entry is ignored.
             {
+                // Key on the session workspace, not the launch directory.
+                if let Some(dir) = &path {
+                    newt_core::settings::set_workspace(dir);
+                }
                 let session = newt_core::settings::load();
                 if !session.is_empty() {
-                    let cfg = newt_core::Config::resolve().ok();
+                    let cfg =
+                        crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+                            .ok();
                     let current_provider = std::env::var("NEWT_PROVIDER")
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -1463,6 +1505,18 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // fails hard on a miss. clap already refuses --resume + --ephemeral.
             if let Some(name) = cli.resume.as_deref() {
                 unsafe { std::env::set_var("NEWT_RESUME", name) };
+            }
+            // A launch-scoped selected name, never a persisted blanket opt-in.
+            // Clear inherited consent when this invocation did not request it.
+            unsafe {
+                if cli.adopt_frame {
+                    std::env::set_var(
+                        "NEWT_ADOPT_FRAME",
+                        cli.resume.as_deref().expect("clap requires resume"),
+                    );
+                } else {
+                    std::env::remove_var("NEWT_ADOPT_FRAME");
+                }
             }
             // --prompt-for-permissions threads the same way (issue #263);
             // only the interactive TUI reads it — worker/eval never prompt.
@@ -1498,9 +1552,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // twins. Deep libraries read this frozen value (never the live env),
             // so a `NEWT_DISABLE_OCAP` / `NEWT_FULL_ACCESS` that appears LATER
             // cannot widen authority mid-process (noninteractive-launch-policy).
-            newt_core::launch_authority::freeze(
-                newt_core::launch_authority::LaunchAuthority::from_env(),
-            );
+            newt_core::launch_authority::freeze(if cli.workspace_access {
+                newt_core::launch_authority::LaunchAuthority::WORKSPACE_ACCESS
+            } else {
+                newt_core::launch_authority::LaunchAuthority::from_env()
+            });
             // #1176: arm the shadow-OCAP flight recorder whenever the session
             // runs UNCONFINED (--full-access or --yolo/--disable-ocap). Every
             // unconfined command then records the authority a leash would have
@@ -1533,10 +1589,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // legacy backend drop-in) logged the same warning repeatedly on
             // a single command, paying the disk read + drop-in merge again
             // for an answer already in hand.
-            let session_cfg = newt_core::Config::resolve().ok();
+            let session_cfg =
+                crate::migration_notices::read(|report| newt_core::Config::resolve(report)).ok();
             // --shell-engine selects which agent-bridle engine run_command uses
             // (ADR 0005 D2 seam). Precedence: `--shell-engine` > `[shell] engine`
-            // > `--full-access`→`host` > `safe-subset` — published via
+            // > `--full-access` platform default > `safe-subset` — published via
             // NEWT_SHELL_ENGINE for newt-core's dispatch to read (same env
             // pattern as NEWT_FULL_ACCESS).
             {
@@ -1547,11 +1604,20 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 // dispatch resolves it per-command against the live L3 fence
                 // (confined_default_engine) — never caching the startup fence
                 // state (the agent-bridle #239 TOCTOU obligation).
-                if let Some(engine) = newt_core::resolve_shell_engine_choice(
+                let selected = newt_core::resolve_shell_engine_choice(
                     cli.shell_engine,
                     shell_cfg.as_ref().and_then(|s| s.engine),
                     cli.full_access,
-                ) {
+                );
+                let effective = selected.or_else(|| {
+                    std::env::var("NEWT_SHELL_ENGINE")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                });
+                if let Some(engine) = effective {
+                    engine.validate_available().map_err(anyhow::Error::msg)?;
+                }
+                if let Some(engine) = selected {
                     unsafe { std::env::set_var("NEWT_SHELL_ENGINE", engine.as_str()) };
                 }
                 // Confined-shell env passthrough (so `~` expands — brush needs
@@ -2165,6 +2231,24 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn shell_engine_flag_preserves_host_and_validates_brush_transport() {
+        let host = Cli::try_parse_from(["newt", "--shell-engine", "host"]).unwrap();
+        assert_eq!(host.shell_engine, Some(newt_core::ShellEngine::Host));
+        let brush = Cli::try_parse_from(["newt", "--shell-engine", "brush"]);
+        if newt_core::ShellEngine::Brush.validate_available().is_ok() {
+            assert_eq!(
+                brush.unwrap().shell_engine,
+                Some(newt_core::ShellEngine::Brush)
+            );
+        } else {
+            assert!(brush
+                .unwrap_err()
+                .to_string()
+                .contains("authenticated worker transport"));
+        }
+    }
+
+    #[test]
     fn backend_flags_parse_and_build_an_exclusive_override() {
         let cli = Cli::try_parse_from([
             "newt",
@@ -2424,6 +2508,32 @@ mod tests {
         assert!(Cli::try_parse_from(["newt", "--resume", "x", "--ephemeral"]).is_err());
     }
 
+    #[test]
+    fn frame_adoption_requires_explicit_selected_resume() {
+        assert!(Cli::try_parse_from(["newt", "--adopt-frame"]).is_err());
+        assert!(
+            Cli::try_parse_from(["newt", "--resume", "saved", "--adopt-frame", "--ephemeral"])
+                .is_err()
+        );
+        assert!(!Cli::try_parse_from(["newt"]).unwrap().adopt_frame);
+        for args in [
+            vec!["newt", "--resume", "saved", "--adopt-frame"],
+            vec!["newt", "code", "--resume", "saved", "--adopt-frame"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.adopt_frame);
+            assert_eq!(cli.resume.as_deref(), Some("saved"));
+            assert!(validate_launch_options(&cli).is_ok());
+        }
+    }
+
+    #[test]
+    fn frame_adoption_rejects_noninteractive_commands_before_dispatch() {
+        let cli =
+            Cli::try_parse_from(["newt", "--resume", "saved", "--adopt-frame", "doctor"]).unwrap();
+        assert!(validate_launch_options(&cli).is_err());
+    }
+
     /// The continuity flags share the ONE global `--resume`; `headless` must not
     /// redeclare that id. A second definition under a different type does not
     /// fail to compile — it panics at parse time with "Mismatch between
@@ -2673,6 +2783,18 @@ mod tests {
         assert!(cli.disable_ocap && !cli.full_access);
         let cli = Cli::try_parse_from(["newt", "--yolo", "--full-access"]).unwrap();
         assert!(cli.disable_ocap && cli.full_access);
+    }
+
+    #[test]
+    fn workspace_access_is_a_confined_startup_choice() {
+        let cli = Cli::try_parse_from(["newt", "--workspace-access", "code", "project"]).unwrap();
+        assert!(cli.workspace_access && !cli.full_access && !cli.disable_ocap);
+        assert!(
+            matches!(cli.command, Some(Command::Code { path: Some(path) }) if path == std::path::Path::new("project"))
+        );
+        for incompatible in ["--full-access", "--yolo", "--disable-ocap"] {
+            assert!(Cli::try_parse_from(["newt", "--workspace-access", incompatible]).is_err());
+        }
     }
 
     #[test]

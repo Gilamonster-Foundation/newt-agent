@@ -59,6 +59,12 @@ pub struct ContractInputs<'a> {
     /// Effective cognition label (`default` when Newt sends no selection, or
     /// one of the explicit cognition levels).
     pub cognition: &'a str,
+    /// Semantic selection captured by the instantiated core turn, even when
+    /// the backend has no supported cognition projection. Absent without a turn.
+    pub semantic_cognition: Option<Option<newt_core::role_profile::Cognition>>,
+    /// The declaration and effort the Responses loop actually admitted.
+    pub responses_capability: Option<&'a newt_core::model_card::ResponsesCapability>,
+    pub reasoning_effort: Option<newt_core::model_card::ReasoningEffort>,
     /// `on` / `off` — whether a real crew runner was installed for the turn.
     pub crew: &'static str,
     /// `"on"` / `"off"` — whether OCAP enforcement was live for the run.
@@ -81,6 +87,12 @@ pub struct ContractInputs<'a> {
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
+    /// The signed OCAP `approve.toml` durable grants admitted into this run's
+    /// caveats (#2524 item 1), as `"<axis>:<target>"` labels (e.g.
+    /// `"fs_read:/opt/canvas-token"`) — empty when none were configured or
+    /// none applied. Observability requirement: every folded-in grant must be
+    /// visible on the contract record, not just effective silently.
+    pub durable_grants: &'a [String],
     /// The self-verify gate's receipt entry (#2315); `None` omits it, and so
     /// does a record with no turn outcome (`features` is `None`), whose gate
     /// never ran.
@@ -140,6 +152,8 @@ pub fn terminal(
         Some(TurnEndReason::NarrationFinalRound) if !smart_harness => Terminal::Completed,
         Some(
             reason @ (TurnEndReason::RoundCap
+            | TurnEndReason::RunAllowance
+            | TurnEndReason::NoProgress
             | TurnEndReason::Empty
             | TurnEndReason::Cancelled
             | TurnEndReason::AwaitingOperator
@@ -186,7 +200,14 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // `newt-tui/src/chat.rs` on an operator interrupt — but an abandoned
         // run did not finish either, so it files the same way rather than
         // falling through to a wildcard.
-        Terminal::StoppedShort(TurnEndReason::RoundCap | TurnEndReason::Cancelled) => "timeout",
+        // `RunAllowance` (#2313, `--run-allowance`) is a budget wall just like the
+        // round cap: same bucket, no new vocabulary value.
+        Terminal::StoppedShort(
+            TurnEndReason::RoundCap
+            | TurnEndReason::RunAllowance
+            | TurnEndReason::NoProgress
+            | TurnEndReason::Cancelled,
+        ) => "timeout",
         // #2315: the model delivered an answer the harness's own verification
         // did not confirm. That is a real attempt at a terminal state; whether
         // it passes is the suite verifier's call (A13), so it is never `timeout`,
@@ -251,6 +272,260 @@ pub fn calls_after_last_write(events: &[newt_core::ToolEvent]) -> Option<usize> 
         .iter()
         .rposition(|e| e.ok && newt_core::agentic::is_workspace_write_call(&e.tool))?;
     Some(events.len() - 1 - last)
+}
+
+/// Most paths `handback` names; the rest are counted by the truncation flag.
+pub(crate) const HANDBACK_MAX_FILES: usize = 200;
+
+/// [`handback`]'s `files_changed` AND `uncommitted_files` inputs share this
+/// shape — both are "a list of paths, sourced either from the workspace
+/// root's own git status or from probing nested repos" — one type, not two
+/// near-identical enums (multi-repo recon PR2).
+pub enum RepoFileList {
+    /// The workspace root's own probe (today's single-repo case, unchanged):
+    /// a status DELTA for `files_changed` (source `"git_status_delta"`), or
+    /// the CURRENT dirty set for `uncommitted_files` (source `"git_status"`).
+    Root(Vec<String>),
+    /// A non-repo workspace root, probed per first-level nested repo
+    /// (`claim_check::nested_files_changed_between` for the delta,
+    /// `claim_check::nested_current_paths` for the current set): the union
+    /// of every probed repo's paths (already prefixed `<repo>/` by the
+    /// caller), the same union broken out per repo, and the repos that could
+    /// not be probed. Source renders `"nested-repos"` either way.
+    Nested {
+        files: Vec<String>,
+        by_repo: Vec<(String, Vec<String>)>,
+        unprobed: Vec<String>,
+    },
+    /// #2552 round 3: `workspace` is a SUBDIRECTORY of a larger repo
+    /// (`WorkspaceRepoLocation::InsideRepo`) — `claim_check::
+    /// snapshot_workspace_subtree`'s scoped-and-prefix-stripped status,
+    /// workspace-relative, UNION'd with any first-level nested repos the
+    /// subdirectory itself contains (`<repo>/`-prefixed, same as
+    /// [`RepoFileList::Nested`]). `files` is the flat union of both;
+    /// `by_repo`/`unprobed` cover ONLY the nested repos (the subtree's own
+    /// loose files have no "repo" to attribute them to). A DISTINCT source,
+    /// `"git_status_subtree"`, so a consumer can tell the list is scoped to
+    /// a subdirectory rather than a genuine repo root — round 2 dropped this
+    /// case entirely, which round 2's review named a regression: at the
+    /// everyday `--cwd repo/crate` invocation (no nested repos to fall back
+    /// on), everything rendered `"unavailable"` — the exact "nothing
+    /// changed" answer this PR exists to stop.
+    Subtree {
+        files: Vec<String>,
+        by_repo: Vec<(String, Vec<String>)>,
+        unprobed: Vec<String>,
+    },
+}
+
+/// One conversion, shared by `handback`'s `files_changed` and
+/// `uncommitted_files` stanzas — the ONE place that knows how a
+/// [`RepoFileList`] renders, so the two fields cannot drift in how they cap,
+/// truncate, or name a source.
+struct RepoFileListStanza {
+    value: serde_json::Value,
+    source: &'static str,
+    truncated: bool,
+    by_repo: Option<Vec<(String, Vec<String>)>>,
+    unprobed: Vec<String>,
+}
+
+fn repo_file_list_stanza(
+    list: Option<RepoFileList>,
+    root_source: &'static str,
+) -> RepoFileListStanza {
+    match list {
+        Some(RepoFileList::Root(mut files)) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            RepoFileListStanza {
+                value: serde_json::json!(files),
+                source: root_source,
+                truncated,
+                by_repo: None,
+                unprobed: Vec::new(),
+            }
+        }
+        Some(RepoFileList::Nested {
+            mut files,
+            by_repo,
+            unprobed,
+        }) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            RepoFileListStanza {
+                value: serde_json::json!(files),
+                source: "nested-repos",
+                truncated,
+                by_repo: Some(by_repo),
+                unprobed,
+            }
+        }
+        Some(RepoFileList::Subtree {
+            mut files,
+            by_repo,
+            unprobed,
+        }) => {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            RepoFileListStanza {
+                value: serde_json::json!(files),
+                source: "git_status_subtree",
+                truncated,
+                by_repo: Some(by_repo),
+                unprobed,
+            }
+        }
+        None => RepoFileListStanza {
+            value: serde_json::Value::Null,
+            source: "unavailable",
+            truncated: false,
+            by_repo: None,
+            unprobed: Vec::new(),
+        },
+    }
+}
+
+/// #2552 round 2 should-fix: the flat union in [`repo_file_list_stanza`] is
+/// capped at `HANDBACK_MAX_FILES`, but `by_repo` carried every repo's FULL
+/// list uncapped — one nested repo with an un-ignored `node_modules/` could
+/// put tens of thousands of paths on a single JSON line. Cap PER REPO, with
+/// a per-repo `truncated` flag, same convention as the flat union.
+fn by_repo_json(by_repo: Vec<(String, Vec<String>)>) -> serde_json::Value {
+    serde_json::json!(by_repo
+        .into_iter()
+        .map(|(repo, mut files)| {
+            let truncated = files.len() > HANDBACK_MAX_FILES;
+            files.truncate(HANDBACK_MAX_FILES);
+            serde_json::json!({"repo": repo, "files": files, "truncated": truncated})
+        })
+        .collect::<Vec<_>>())
+}
+
+/// U7: the harness-written account of how a run ended, on the solve_result line
+/// only (never the contract record). Everything here is the harness's own
+/// knowledge — none of it is the model's claim, and it holds no hash or id:
+/// - `files_changed`: the git status DELTA between run start and exit, or `null`
+///   with `files_changed_source: "unavailable"` when there is no repo — never an
+///   empty list that would read as "nothing changed";
+/// - `last_exec_outcome`: the exec CLASS of the last shell call (no command text —
+///   `ToolEvent` deliberately retains none);
+/// - `model_reply_present`: whether the model said anything at all.
+///
+/// `end_reason` deliberately repeats the top-level field so the object is
+/// self-contained for a dispatcher; both come from the same value. This is U7
+/// part 1 (what changed); "what was verified" and "what it is unsure of" are not
+/// covered here.
+///
+/// Blind spots of a status DELTA, which a reader must not mistake for "nothing
+/// else changed": (a) a file dirty before AND after in the same status is
+/// invisible; (b) paths git ignores (a stray under `target/`, a written `.env`)
+/// are invisible; (c) a file that was dirty at start and was reverted to clean
+/// is absent from the exit snapshot and so is not reported.
+///
+/// #2537: two more fields answer "was it committed, or just left dirty",
+/// which `files_changed` alone cannot — it is a status DELTA, not a
+/// commit-truth check, so it reads the same whether a change landed as a
+/// commit or is still sitting in the working tree.
+/// - `uncommitted_files`: the workspace's CURRENT staged+unstaged+untracked
+///   paths at hand-back time, bounded the same way as `files_changed`
+///   (`null` and `"unavailable"` off-repo, never a fake `[]`; capped at
+///   `HANDBACK_MAX_FILES` with a truncated flag).
+/// - `commits`: the commit id(s) created on the task branch during this run,
+///   from newt-git's own `status`/`log` (never a shelled-out `git`). Present
+///   only when at least one commit landed — nothing to commit (a clean repo,
+///   or no repo at all) omits the field rather than writing an empty list or
+///   inventing an id.
+///
+/// Multi-repo recon PR2: at a workspace root that is NOT itself a git repo,
+/// `files_changed` used to fall straight to `"unavailable"` — read by an
+/// operator as "nothing changed" even when a nested checkout (a bare folder
+/// holding several repos) has a real uncommitted edit. [`RepoFileList::
+/// Nested`] carries that case instead: the union of every probed nested
+/// repo's changed files, prefixed `<repo>/`, source `"nested-repos"`, plus a
+/// per-repo breakdown (`files_changed_by_repo`) and the repos that could not
+/// be probed (`files_changed_unprobed`, present only when non-empty) — named
+/// rather than silently folded into the union or dropped. This does NOT
+/// touch the pinned contract record (`contract_version`, #2218's
+/// unknown-field question) — `handback` is solely on the free-form
+/// `solve_result` line, so these are new OPTIONAL fields on an
+/// already-free-form object, not a versioned shape change.
+#[must_use]
+pub fn handback(
+    delta: Option<RepoFileList>,
+    events: &[newt_core::ToolEvent],
+    end_reason: &str,
+    reply_present: bool,
+    uncommitted: Option<RepoFileList>,
+    commits: Option<Vec<String>>,
+) -> serde_json::Value {
+    let stanza = repo_file_list_stanza(delta, "git_status_delta");
+    let (files, source, truncated, by_repo, unprobed) = (
+        stanza.value,
+        stanza.source,
+        stanza.truncated,
+        stanza.by_repo,
+        stanza.unprobed,
+    );
+    let uncommitted_stanza = repo_file_list_stanza(uncommitted, "git_status");
+    let (
+        uncommitted_files,
+        uncommitted_source,
+        uncommitted_truncated,
+        uncommitted_by_repo,
+        uncommitted_unprobed,
+    ) = (
+        uncommitted_stanza.value,
+        uncommitted_stanza.source,
+        uncommitted_stanza.truncated,
+        uncommitted_stanza.by_repo,
+        uncommitted_stanza.unprobed,
+    );
+    let last_exec = events
+        .iter()
+        .rev()
+        .find_map(|e| e.execution.as_ref())
+        .and_then(|x| serde_json::to_value(x).ok());
+    let mut record = serde_json::json!({
+        "files_changed": files,
+        "files_changed_source": source,
+        "files_changed_truncated": truncated,
+        "uncommitted_files": uncommitted_files,
+        "uncommitted_files_source": uncommitted_source,
+        "uncommitted_files_truncated": uncommitted_truncated,
+        "last_exec_outcome": last_exec,
+        "end_reason": end_reason,
+        "model_reply_present": reply_present,
+    });
+    conditional_stanza(
+        &mut record,
+        "files_changed_by_repo",
+        by_repo.map(by_repo_json),
+    );
+    conditional_stanza(
+        &mut record,
+        "files_changed_unprobed",
+        (!unprobed.is_empty()).then_some(unprobed),
+    );
+    conditional_stanza(
+        &mut record,
+        "uncommitted_files_by_repo",
+        uncommitted_by_repo.map(by_repo_json),
+    );
+    conditional_stanza(
+        &mut record,
+        "uncommitted_files_unprobed",
+        (!uncommitted_unprobed.is_empty()).then_some(uncommitted_unprobed),
+    );
+    conditional_stanza(
+        &mut record,
+        "commits",
+        commits.filter(|c| !c.is_empty()).map(|mut c| {
+            c.truncate(HANDBACK_MAX_FILES);
+            serde_json::json!(c)
+        }),
+    );
+    record
 }
 
 /// One JSONL trace line per parse signal (the ADR §5 events
@@ -440,6 +715,23 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "ocap": i.ocap,
         "max_rounds": i.max_rounds,
     });
+    conditional_stanza(
+        &mut effective_config,
+        "semantic_cognition",
+        i.semantic_cognition.map(|value| serde_json::json!(value)),
+    );
+    if let Some(capability) = i.responses_capability {
+        conditional_stanza(
+            &mut effective_config,
+            "responses_capability",
+            Some(serde_json::json!(capability)),
+        );
+        conditional_stanza(
+            &mut effective_config,
+            "reasoning_effort",
+            Some(serde_json::json!(i.reasoning_effort)),
+        );
+    }
     conditional_stanza(&mut effective_config, "context_window", i.context_window);
     let output_allowance = i
         .output_allowance
@@ -451,6 +743,11 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "smart_harness",
         i.smart_harness.cloned(),
     );
+    conditional_stanza(
+        &mut effective_config,
+        "durable_grants",
+        (!i.durable_grants.is_empty()).then(|| serde_json::json!(i.durable_grants)),
+    );
     let mut record = serde_json::json!({
         "contract_version": CONTRACT_VERSION,
         "requested_model": i.requested_model,
@@ -458,7 +755,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "outcome": i.outcome,
         "backend": { "name": i.backend_name, "kind": i.backend_kind },
         "agent": AGENT,
-        "agent_version": env!("CARGO_PKG_VERSION"),
+        "agent_version": newt_core::build_info::VERSION_WITH_COMMIT,
         "effective_config": effective_config,
         "timing": timing,
     });
@@ -496,7 +793,205 @@ fn permitted_outcomes() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    include!("headless_contract_cognition_tests.rs");
     use super::*;
+
+    #[test]
+    fn handback_reports_delta_caps_it_and_never_fakes_an_empty_list() {
+        let h = handback(
+            Some(RepoFileList::Root(vec!["a.rs".into()])),
+            &[],
+            "None",
+            false,
+            None,
+            None,
+        );
+        assert_eq!(h["files_changed"], serde_json::json!(["a.rs"]));
+        assert_eq!(h["files_changed_source"], "git_status_delta");
+        assert_eq!(h["model_reply_present"], false);
+        assert!(h["last_exec_outcome"].is_null());
+
+        let mut shell =
+            newt_core::ToolEvent::from_call("run_command", &serde_json::json!({}), false, None);
+        shell.execution = Some(newt_core::ExecOutcome::TimedOut);
+        let later =
+            newt_core::ToolEvent::from_call("read_file", &serde_json::json!({}), true, None);
+        let h = handback(None, &[shell, later], "None", true, None, None);
+        assert_eq!(
+            h["last_exec_outcome"], "timed_out",
+            "class only, from the last SHELL call"
+        );
+
+        let many: Vec<String> = (0..201).map(|i| format!("f{i}")).collect();
+        let h = handback(
+            Some(RepoFileList::Root(many)),
+            &[],
+            "RoundCap",
+            true,
+            None,
+            None,
+        );
+        assert_eq!(h["files_changed"].as_array().unwrap().len(), 200);
+        assert_eq!(h["files_changed_truncated"], true);
+
+        // No repo: null + "unavailable", never [] (which reads as "nothing changed").
+        let h = handback(None, &[], "None", false, None, None);
+        assert!(h["files_changed"].is_null());
+        assert_eq!(h["files_changed_source"], "unavailable");
+        // A clean repo IS an empty list, distinguishable from unavailable.
+        let h = handback(
+            Some(RepoFileList::Root(vec![])),
+            &[],
+            "None",
+            false,
+            None,
+            None,
+        );
+        assert_eq!(h["files_changed"], serde_json::json!([]));
+    }
+
+    /// #2537 item 2: a run that ends with modified-but-uncommitted files must
+    /// NAME them, bounded the same way `files_changed` already is (null +
+    /// "unavailable" off-repo, never a fake empty list; capped at 200 with a
+    /// truncated flag). Red before the field existed: this assertion could
+    /// not even compile against the old 4-arg `handback`.
+    #[test]
+    fn handback_names_uncommitted_files_bounded_like_files_changed() {
+        let h = handback(
+            None,
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Root(vec!["dirty.rs".into()])),
+            None,
+        );
+        assert_eq!(h["uncommitted_files"], serde_json::json!(["dirty.rs"]));
+        assert_eq!(h["uncommitted_files_source"], "git_status");
+        assert_eq!(h["uncommitted_files_truncated"], false);
+
+        // Off-repo: null + "unavailable", never [] read as "nothing dirty".
+        let h = handback(None, &[], "None", false, None, None);
+        assert!(h["uncommitted_files"].is_null());
+        assert_eq!(h["uncommitted_files_source"], "unavailable");
+
+        // A clean repo IS an empty list, distinguishable from unavailable.
+        let h = handback(
+            None,
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Root(vec![])),
+            None,
+        );
+        assert_eq!(h["uncommitted_files"], serde_json::json!([]));
+
+        let many: Vec<String> = (0..201).map(|i| format!("d{i}")).collect();
+        let h = handback(
+            None,
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Root(many)),
+            None,
+        );
+        assert_eq!(h["uncommitted_files"].as_array().unwrap().len(), 200);
+        assert_eq!(h["uncommitted_files_truncated"], true);
+    }
+
+    /// #2537 item 3: when the run committed on the task branch, the hand-back
+    /// carries the commit id(s) it produced, so "the work landed" is
+    /// verifiable. Nothing to commit (repo with no new commits, or no repo at
+    /// all) omits the `commits` field entirely rather than an empty list or a
+    /// lie.
+    #[test]
+    fn handback_carries_commit_ids_or_omits_the_field() {
+        let h = handback(None, &[], "None", false, None, Some(vec!["abc123".into()]));
+        assert_eq!(h["commits"], serde_json::json!(["abc123"]));
+
+        // Nothing committed: field is ABSENT, not an empty array.
+        let h = handback(None, &[], "None", false, None, Some(vec![]));
+        assert!(h.get("commits").is_none());
+
+        // No repo at all: also absent.
+        let h = handback(None, &[], "None", false, None, None);
+        assert!(h.get("commits").is_none());
+    }
+
+    /// Multi-repo recon PR2 (red first): `RepoFileList::Nested` renders the
+    /// new `"nested-repos"` source for BOTH `files_changed` and
+    /// `uncommitted_files`, the union prefixed `<repo>/`, a per-repo
+    /// breakdown, and the unprobed list — present only when non-empty.
+    #[test]
+    fn handback_renders_the_nested_repos_source_and_per_repo_breakdown() {
+        let h = handback(
+            Some(RepoFileList::Nested {
+                files: vec!["repoA/a.txt".into()],
+                by_repo: vec![
+                    ("repoA".into(), vec!["a.txt".into()]),
+                    ("repoB".into(), vec![]),
+                ],
+                unprobed: vec!["repoC".into()],
+            }),
+            &[],
+            "None",
+            false,
+            Some(RepoFileList::Nested {
+                files: vec!["repoA/a.txt".into()],
+                by_repo: vec![("repoA".into(), vec!["a.txt".into()])],
+                unprobed: vec![],
+            }),
+            None,
+        );
+        assert_eq!(h["files_changed"], serde_json::json!(["repoA/a.txt"]));
+        assert_eq!(h["files_changed_source"], "nested-repos");
+        assert_eq!(
+            h["files_changed_by_repo"],
+            serde_json::json!([
+                {"repo": "repoA", "files": ["a.txt"], "truncated": false},
+                {"repo": "repoB", "files": [], "truncated": false},
+            ])
+        );
+        assert_eq!(h["files_changed_unprobed"], serde_json::json!(["repoC"]));
+
+        assert_eq!(h["uncommitted_files"], serde_json::json!(["repoA/a.txt"]));
+        assert_eq!(h["uncommitted_files_source"], "nested-repos");
+        assert_eq!(
+            h["uncommitted_files_by_repo"],
+            serde_json::json!([{"repo": "repoA", "files": ["a.txt"], "truncated": false}])
+        );
+        // Empty unprobed list is ABSENT, not a fake `[]` — same convention
+        // as `commits`.
+        assert!(h.get("uncommitted_files_unprobed").is_none(), "{h}");
+    }
+
+    /// #2552 round 2 should-fix (red first): one nested repo with a huge
+    /// dirty set (a stand-in for an un-ignored `node_modules/`) must not put
+    /// its whole uncapped list on the wire via `*_by_repo` — only the flat
+    /// union was capped before this fix.
+    #[test]
+    fn handback_caps_each_repos_by_repo_file_list_independently() {
+        let huge: Vec<String> = (0..HANDBACK_MAX_FILES + 5)
+            .map(|n| format!("f{n}.txt"))
+            .collect();
+        let h = handback(
+            Some(RepoFileList::Nested {
+                files: vec!["big/f0.txt".into()],
+                by_repo: vec![("big".into(), huge.clone())],
+                unprobed: vec![],
+            }),
+            &[],
+            "None",
+            false,
+            None,
+            None,
+        );
+        let by_repo = h["files_changed_by_repo"].as_array().expect("array");
+        assert_eq!(by_repo.len(), 1);
+        let files = by_repo[0]["files"].as_array().expect("files array");
+        assert_eq!(files.len(), HANDBACK_MAX_FILES, "{files:?}");
+        assert_eq!(by_repo[0]["truncated"], true, "{h}");
+    }
+
     use newt_core::{BehaviorSignal, ToolCallDialect};
 
     /// Every `TurnEndReason`, and a compile-time guard that this list stays
@@ -521,6 +1016,8 @@ mod tests {
         TurnEndReason::AwaitingOperator,
         TurnEndReason::RepairExhausted,
         TurnEndReason::VerificationIncomplete,
+        TurnEndReason::RunAllowance,
+        TurnEndReason::NoProgress,
     ];
 
     fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
@@ -581,6 +1078,8 @@ mod tests {
             TurnEndReason::AwaitingOperator => 7,
             TurnEndReason::RepairExhausted => 8,
             TurnEndReason::VerificationIncomplete => 9,
+            TurnEndReason::RunAllowance => 10,
+            TurnEndReason::NoProgress => 11,
         }
     }
 
@@ -849,6 +1348,9 @@ mod tests {
             tenacity: "normal",
             initiative: "measured",
             cognition: "default",
+            semantic_cognition: None,
+            responses_capability: None,
+            reasoning_effort: None,
             crew: "off",
             ocap: "off",
             max_rounds: 40,
@@ -864,6 +1366,7 @@ mod tests {
             verification: None,
             scratchpad_seed: None,
             required: &[],
+            durable_grants: &[],
         }
     }
 
@@ -884,6 +1387,19 @@ mod tests {
              Completed|ModelError. #2215 emitted `round_cap`, which the bench's \
              closed enum cannot parse, so the row vanished instead."
         );
+    }
+
+    /// U4a: an exhausted `--run-allowance` is filed like the round cap — a
+    /// budget wall (`timeout`, `incomplete`), never `harness_error`, and no new
+    /// value in the pinned outcome vocabulary.
+    #[test]
+    fn a_run_allowance_exit_files_like_a_round_cap() {
+        for reason in [TurnEndReason::RunAllowance, TurnEndReason::NoProgress] {
+            let t = terminal(true, None, Some(reason), false);
+            assert_eq!(outcome_label(t), "timeout", "{reason:?}");
+            assert_eq!(status_label(t), "incomplete", "{reason:?}");
+            assert!(permitted_outcomes().contains(&outcome_label(t)));
+        }
     }
 
     #[test]
@@ -970,6 +1486,7 @@ mod tests {
             parse_signal_line(&ParseSignal::RecoveredToolCall {
                 round: 1,
                 dialect: ToolCallDialect::FunctionTag,
+                calls: vec![],
             }),
             serde_json::json!({
                 "kind": "recovered_tool_call", "round": 1, "dialect": "function_tag"
@@ -1050,7 +1567,10 @@ mod tests {
         );
         assert_eq!(parsed["contract_version"], "2");
         assert_eq!(parsed["agent"], "newt-agent");
-        assert_eq!(parsed["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            parsed["agent_version"],
+            newt_core::build_info::VERSION_WITH_COMMIT
+        );
         assert_eq!(
             parsed["backend"],
             serde_json::json!({"name": "dgx", "kind": "openai"})
@@ -1161,6 +1681,27 @@ mod tests {
         assert_eq!(record["effective_config"]["smart_harness"], manifest);
         assert_eq!(record["contract_version"], "2");
         assert!(permitted_outcomes().contains(&record["outcome"].as_str().unwrap()));
+    }
+
+    /// #2524 item 1 observability requirement: every OCAP durable grant
+    /// admitted into the run's caveats must be visible on the contract
+    /// record, and an empty admission list must not fabricate a stanza.
+    #[test]
+    fn durable_grants_are_listed_when_admitted_and_omitted_when_none() {
+        let i = inputs();
+        assert!(
+            contract_record(&i)["effective_config"]
+                .get("durable_grants")
+                .is_none(),
+            "no admitted grants must mean no stanza, not an empty array"
+        );
+        let mut with_grants = inputs();
+        let admitted = vec!["fs_read:/opt/canvas-token".to_string()];
+        with_grants.durable_grants = &admitted;
+        assert_eq!(
+            contract_record(&with_grants)["effective_config"]["durable_grants"],
+            serde_json::json!(["fs_read:/opt/canvas-token"])
+        );
     }
 
     /// `model_digest` appears ONLY when operator-supplied — never fabricated.

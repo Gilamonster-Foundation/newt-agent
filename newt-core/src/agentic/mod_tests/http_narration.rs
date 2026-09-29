@@ -347,9 +347,10 @@ async fn completed_check_report_after_tool_reads_keeps_completed_end_reason() {
 }
 
 #[tokio::test]
-async fn readonly_completion_retries_an_unfinished_promise_without_action_authority() {
+async fn explanation_completion_retries_a_promise_without_restricting_session_authority() {
     // The branch-count incident ended after eighteen reads with only "Let me
-    // check...". A read-only boundary must not turn that promise into an answer.
+    // check...". A response style must not turn that promise into an answer or
+    // remove the operator's existing tool authority.
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -405,7 +406,7 @@ async fn readonly_completion_retries_an_unfinished_promise_without_action_author
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
         assert!(
-            !names.contains(&"write_file") && !names.contains(&"run_command"),
+            names.contains(&"write_file") && names.contains(&"run_command"),
             "{names:?}"
         );
     }
@@ -515,7 +516,7 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
         false,
         workspace.path().to_str().unwrap(),
         &crate::Scope::All,
-        None,
+        &capability_check::Evidence::default(),
         Some(&filter),
     );
     assert!(reply.contains("Let me check the current implementation"));
@@ -905,4 +906,34 @@ fn looks_like_intent_to_act_separates_narration_from_final_answers() {
     // boundary) must not panic the slice — and still classify as intent.
     let multibyte = format!("{}let me edit", "…".repeat(200));
     assert!(looks_like_intent_to_act(&multibyte));
+}
+
+/// #2625: when the model follows the post-render nudge and prefixes a corrected
+/// table with the prescribed "Correction: … — supersedes the report above" form,
+/// the harness returns that reply unchanged — the correction statement is not
+/// stripped or collapsed. The companion unit test (in report.rs) asserts the nudge
+/// text carries the instruction; this test asserts the reply path honours it.
+#[tokio::test]
+async fn explicit_correction_statement_passes_through_to_caller() {
+    let correction_reply = "Correction: I listed files shortest to longest, not longest \
+        to shortest — supersedes the report above\n\n\
+        | File | Lines |\n|------|-------|\n| gamma.rs | 300 |\n| beta.rs | 200 |\n| alpha.rs | 100 |";
+    let (reply, _rounds) = run_openai_script(vec![
+        // Round 1: render_report with a table
+        serde_json::json!({"tool_calls": [{"id": "rpt", "function": {
+            "name": "render_report",
+            "arguments": "{\"title\":\"Top files\",\"body\":\"| File | Lines |\\n|------|-------|\\n| alpha.rs | 100 |\\n| beta.rs | 200 |\\n| gamma.rs | 300 |\"}"
+        }}]}),
+        // Round 2: final reply uses the correction format
+        serde_json::json!({ "content": correction_reply }),
+    ])
+    .await;
+    assert!(
+        reply.contains("supersedes the report above"),
+        "correction statement must reach the caller: {reply}"
+    );
+    assert!(
+        reply.contains("Correction:"),
+        "correction prefix must be present in the returned reply: {reply}"
+    );
 }

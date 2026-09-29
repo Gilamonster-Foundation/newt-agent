@@ -11,25 +11,17 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Run a shell command in the workspace directory and return its output. \
-                                Runs in a CONFINED shell: stream redirects to a target outside your \
-                                fs_write scope are DENIED (e.g. `2>/dev/null`, `> /dev/null`) — drop \
-                                the redirect and read stdout/stderr from the result instead. Prefer the \
-                                dedicated tools over shelling out: `find`/`read_file`/`list_dir` over \
-                                `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` over raw \
-                                build/test/lint commands (use lifecycle action=build for explicitly \
-                                authorized offline compiler/test subprocesses). Do NOT pass `git` (or another tool's name) as \
-                                the command here — `git` is a separate tool; invoke it directly. Shelling \
-                                out to a name that has a dedicated tool is rejected. Declare needed \
-                                filesystem additions with fs_read/fs_write absolute-path arrays; \
-                                missing authority is approved before this invocation starts. After \
-                                request_permissions grants filesystem access, retry the same command \
-                                with those paths declared so matching allow-once grants can be used.",
+                "description": format!("{} {}", "Run a command in the workspace shell and return its output and exit status. \
+                                Use ordinary commands, including git, with their normal arguments. \
+                                File access, execution, and networking are governed by the session's \
+                                OCAP grants. Needed authority is approved before execution. \
+                                Optional fs_read/fs_write arrays declare additional absolute paths \
+                                needed by this invocation.", super::shell::run_command_limit_sentence()),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to run" },
-                        "cwd": { "type": "string", "description": "Optional working directory for this command, relative to the workspace root (e.g. \"crates/foo\") or an absolute path inside it. Confined to the workspace. Prefer this over `cd` (which the confined shell rejects)." },
+                        "cwd": { "type": "string", "description": "Optional working directory, relative to the workspace root or absolute. Access follows the session filesystem grants. A leading `cd <path> && ...` also selects this command's working directory." },
                         "fs_read": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for reading by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." },
                         "fs_write": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute paths to request for writing by this invocation. Reuses matching pending allow-once grants without granting later calls access; existing authority is retained." }
                     },
@@ -61,17 +53,15 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write or overwrite a file within granted file access. \
-                                WARNING: use edit_file instead when modifying an existing file — \
-                                write_file replaces the entire contents and will fail if the new \
-                                content is significantly shorter than the original (shrink guard). \
-                                Only use write_file for new files or full rewrites you have \
-                                explicitly generated in their entirety.",
+                "description": "Create a file, or replace one entirely. To change an \
+                                existing file use edit_file (a large shrink is refused). To \
+                                move existing code, use copy_from — never retype it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "content": { "type": "string", "description": "The complete new file contents" }
+                        "content": { "type": "string", "description": "The file contents; with copy_from, a header placed before the copied lines (may be empty)" },
+                        "copy_from": { "type": "object", "description": "Append lines start_line..end_line of another file, copied exactly", "properties": { "path": { "type": "string" }, "start_line": { "type": "integer" }, "end_line": { "type": "integer" } } }
                     },
                     "required": ["path", "content"]
                 }
@@ -81,17 +71,15 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Make a targeted edit to an existing file by replacing one exact \
-                                string with another. Safer than write_file for modifying existing \
-                                files — you only generate the change, not the whole file. \
-                                Fails with a clear error if old_string is not found or matches \
-                                multiple times (add more surrounding context to make it unique).",
+                "description": "Replace one exact string in an existing file. Fails if \
+                                old_string is missing or matches more than once (add context). \
+                                An empty new_string deletes the match.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": FILE_PATH_DESCRIPTION },
-                        "old_string": { "type": "string", "description": "Exact string to find and replace (must match exactly once)" },
-                        "new_string": { "type": "string", "description": "Replacement string" }
+                        "old_string": { "type": "string", "description": "Exact string to replace (must match exactly once)" },
+                        "new_string": { "type": "string", "description": "Replacement (\"\" deletes the match)" }
                     },
                     "required": ["path", "old_string", "new_string"]
                 }
@@ -270,7 +258,8 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "lifecycle",
-            "description": "Run a named project lifecycle phase using THIS repo's \
+            "description": "Run project phases: action=build requests explicit offline build authority; \
+                run uses current grants; list previews commands. Use THIS repo's \
                 configured command instead of guessing a raw shell command. \
                 Phases: setup (resolve deps / prepare a checkout), format \
                 (auto-format the tree), lint (static analysis), test (run the \
@@ -284,7 +273,8 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
                 action=list to see the resolved command without running it. \
                 If Cargo or its compiler is blocked by a narrow exec grant, use \
                 action=build: explicitly request confined build authority, with \
-                toolchain/cache reads, workspace writes and network denied. \
+                toolchain/cache reads, workspace writes, and network denied \
+                unless covered by an existing operator grant. \
                 In a polyglot/monorepo workspace, pass `dir` to target a \
                 nested project directly — if you omit it and nothing is \
                 configured at the workspace root, the response names any \
@@ -444,26 +434,14 @@ pub fn filter_advertised_tools(
     serde_json::Value::Array(arr)
 }
 
-/// Whether `name` is available under the prompt's validated disposition.
-///
-/// `Act` retains the complete catalog. `Explain`, `Research`, and `Plan` are
-/// a small, explicit read/recovery set (`Plan` additionally gets the
-/// harness-owned ledger writer). Explain/Research may discover remote MCP
-/// schemas: dispatch separately requires a connected server and an explicit
-/// permission grant. Neither a name nor a server's hints confer authority.
-/// `Ask` is terminal
-/// at the harness layer, so no model tool invocation is admitted as defense in
-/// depth.
-///
-/// This predicate is shared by advertisement and dispatch. The latter remains
-/// the security boundary: a model can always fabricate an omitted tool name.
+/// Tool discovery follows the operator's authority, not inferred response style.
+/// Explain and Research affect narration only. Explicit Plan keeps its existing
+/// restricted surface; Ask is terminal. Every invocation still passes the
+/// actual OCAP caveats and permission gate at dispatch.
 pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
     match disposition {
-        PromptDisposition::Act => true,
+        PromptDisposition::Act | PromptDisposition::Explain | PromptDisposition::Research => true,
         PromptDisposition::Ask => false,
-        PromptDisposition::Explain | PromptDisposition::Research => {
-            common_read_only_tool_allowed(name) || is_mcp_tool_name(name)
-        }
         PromptDisposition::Plan => {
             // Human/model Plan mode is deliberately offline. Do not advertise
             // `web_fetch` when the matching plan caveat always denies network.
@@ -484,10 +462,11 @@ pub(super) fn is_mcp_tool_name(name: &str) -> bool {
 }
 
 fn common_read_only_tool_allowed(name: &str) -> bool {
-    matches!(
-        name,
-        // Workspace / prompt / artifact recovery.
-        "read_file"
+    crate::navigator::NAV_TOOL_NAMES.contains(&name)
+        || matches!(
+            name,
+            // Workspace / prompt / artifact recovery.
+            "read_file"
                 // Only argument-checked, filesystem-scoped read ops survive
                 // advertisement and dispatch; never the full Git surface.
                 | "git"
@@ -527,7 +506,7 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
                 // widen the accepted turn; an absent interactive gate still
                 // returns a recoverable no-human message without hanging.
                 | "request_user_input"
-    )
+        )
 }
 
 /// Restrict an advertised tool catalog to the current prompt disposition.
@@ -539,7 +518,10 @@ pub fn filter_tools_for_disposition(
     defs: serde_json::Value,
     disposition: PromptDisposition,
 ) -> serde_json::Value {
-    if disposition == PromptDisposition::Act {
+    if matches!(
+        disposition,
+        PromptDisposition::Act | PromptDisposition::Explain | PromptDisposition::Research
+    ) {
         return defs;
     }
     let serde_json::Value::Array(arr) = defs else {
@@ -594,23 +576,7 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     // #496: `find …` typed at run_command redirects to the embedded `find`
     // tool — which works even when the shell is unavailable in this build.
     "find",
-    // PR4: `git …` typed at run_command redirects to the embedded `git` tool —
-    // but ONLY its built-in-served local ops; passthrough ops fall through (see
-    // [`GIT_PASSTHROUGH_SUBCOMMANDS`] / [`run_command_redirect`], #898/#1022).
-    "git",
 ];
-
-/// #898/#1022: git subcommands that must pass through to the shell. The embedded `git` tool
-/// (newt-git) is LOCAL-ONLY — `clone`/`fetch`/`push` are deferred — so if
-/// run_command bounced *every* `git …` back to that pushless tool, a model
-/// could never push a branch (and then never see the "Create a pull request …
-/// by visiting: <URL>" line git prints, and never open a PR — issue #898). `rm`
-/// also passes through because `git rm` has index semantics that plain
-/// `delete_file` cannot reproduce (#1022). These ops are therefore allowed to
-/// fall through to the confined shell, where the `exec` / `net` / fs leashes
-/// still apply. Local read/edit ops (`status`/`log`/`diff`/`add`/`commit`/…)
-/// keep redirecting to the embedded tool when it can serve them.
-const GIT_PASSTHROUGH_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone", "rm"];
 
 /// Shell composition/metacharacter markers (#1262): a command containing any of
 /// these is a real SHELL program — pipes, redirects, sequencing, substitution —
@@ -626,37 +592,13 @@ fn uses_shell_composition(command: &str) -> bool {
         .any(|m| command.contains(m))
 }
 
-/// Decide whether a `run_command` invocation is really a misdirected call to a
-/// direct tool (`list_dir`/`read_file`/…/`git`), and if so which one — so the
-/// executor can bounce it with a correction and [`is_hallucination`] can count
-/// it. Returns `None` when the command should run in the shell as-is.
-///
-/// #1262: a command with shell COMPOSITION (`find … | xargs du | sort`,
-/// `git status && git diff`, `find … > out.txt`) is never a misdirected tool
-/// call — the embedded tools cannot serve pipes/redirects/sequencing, and
-/// bouncing it produced false "hallucination corrected" counts for commands
-/// that were exactly right (the diagnosed ornith:35b pipeline). Only a BARE
-/// invocation redirects. Generalizes the [`GIT_PASSTHROUGH_SUBCOMMANDS`]
-/// judgment ("the embedded tool can't serve this — fall through") to command
-/// shape.
-///
-/// `git` is special (#898/#1022): only its built-in-served LOCAL ops redirect
-/// to the embedded git tool; its passthrough ops
-/// ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) fall through so the model can actually
-/// push a branch, run `git rm`, and read any PR-creation URL git prints.
+/// Catch tool names mistakenly entered as shell binaries. Installed commands,
+/// including Git, remain commands and run through the confined executor.
 pub(super) fn run_command_redirect(command: &str) -> Option<&'static str> {
     if uses_shell_composition(command) {
         return None;
     }
-    let mut tokens = command.split_ascii_whitespace();
-    let first = tokens.next().unwrap_or("");
-    if first == "git" {
-        let sub = tokens.next().unwrap_or("");
-        if GIT_PASSTHROUGH_SUBCOMMANDS.contains(&sub) {
-            return None;
-        }
-        return Some("git");
-    }
+    let first = command.split_ascii_whitespace().next().unwrap_or("");
     DIRECT_TOOL_NAMES.iter().copied().find(|&t| t == first)
 }
 
@@ -713,14 +655,10 @@ fn git_subcommand_after_binary<'a>(tail: &'a [&'a str]) -> Option<&'a str> {
     None
 }
 
-/// Shell `git` subcommands that CREATE a commit and therefore bypass
-/// harness-managed attribution when run through `run_command` (the audit
-/// set: `commit`, `merge`, `cherry-pick`, `revert`, `rebase`). Each can land
-/// an unattributed Newt commit; the routable forms (`commit`, `amend`,
-/// `rebase`) have a first-class embedded `git` tool op, and
-/// `merge`/`cherry-pick`/`revert` have NO first-class Newt route and are
-/// DENIED (the operator must run them directly, not via the agent's
-/// `run_command`). See [`run_command_creates_shell_git_commit`].
+/// Shell `git` subcommands that may CREATE a commit and require the native
+/// attribution/signing broker. Ordinary `commit` is supported; the other
+/// operations still require lifecycle integration. The caller uses this guard
+/// when no broker is attached. See [`run_command_creates_shell_git_commit`].
 const SHELL_GIT_COMMIT_SUBCOMMANDS: &[&str] =
     &["commit", "merge", "cherry-pick", "revert", "rebase"];
 
@@ -735,36 +673,30 @@ const SHELL_GIT_COMMIT_SUBCOMMANDS: &[&str] =
 /// but is rare and out of this narrow fix.)
 const SHELL_GIT_ABORT_FLAGS: &[&str] = &["--abort", "--quit"];
 
-/// Decide whether a `run_command` invocation would create a git COMMIT via the
-/// shell `git` CLI — bypassing `LocalGitTool::finalize_commit_message` and
-/// landing an unattributed commit. [`run_command_redirect`] already bounces a
-/// BARE `git commit` to the embedded tool; this catches the COMPOSED cases that
-/// fall through to the confined shell (`git add . && git commit -m x`,
+/// Detect a potentially commit-producing `run_command` invocation for the
+/// caller's no-broker refusal. This checks both bare and composed commands
+/// before confined execution (`git add . && git commit -m x`,
 /// `echo msg | git commit -F -`, `git -c user.email=… commit`,
-/// `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`), and now
-/// ALSO the other audit-identified commit-producing forms: `git merge`,
-/// `git cherry-pick`, `git revert`, and `git rebase` (composed or bare).
+/// `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`). It does
+/// not translate commands into the optional legacy Git adapter.
 ///
 /// Scope is deliberately narrow and fail-closed:
-/// - Detects the [`SHELL_GIT_COMMIT_SUBCOMMANDS`] set. `commit`/`amend`/
-///   `rebase` have a first-class embedded route (the `git` tool's
-///   `commit`/`amend`/`rebase` ops, which the attribution finalizer owns); the
-///   model is directed there. `merge`/`cherry-pick`/`revert` have NO first-class
-///   Newt route and are DENIED (the operator must run them directly).
+/// - Detects the [`SHELL_GIT_COMMIT_SUBCOMMANDS`] set so a caller without the
+///   native broker can refuse commit creation.
 /// - ABORT/QUIT forms ([`SHELL_GIT_ABORT_FLAGS`]) of `merge`/`cherry-pick`/
 ///   `revert`/`rebase` create NO commit and pass through. `--skip`/`--continue`
 ///   DO create commits and stay blocked.
 /// - Read-only git (`status`/`log`/`diff`/…) and git NETWORK ops
-///   ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) are NOT commit creation and pass through.
+///   (`push`, `fetch`, `clone`) are NOT commit creation and pass through.
 ///
 /// This is a bounded lexical gate, NOT a general shell parser: it splits only
 /// on sequencing/pipeline/redirect separators and recognizes a fixed set of git
 /// global options to locate the subcommand. It over-splits on quoted
 /// metacharacters by design (fail-closed).
 pub(super) fn run_command_creates_shell_git_commit(command: &str) -> bool {
-    // Normalize command substitution `$(…)` to a separator (a real command is
-    // single-line, so `\n` cannot occur) so a sub-command inside it is examined
-    // independently — the same fail-closed over-split as the other separators.
+    // Normalize command substitution `$(…)` to a separator so a sub-command
+    // inside it is examined independently — the same fail-closed over-split
+    // as the other separators.
     let normalized = command.replace("$(", "\n");
     for segment in normalized.split(SHELL_SEGMENT_SEPARATORS) {
         let toks: Vec<&str> = segment.split_whitespace().collect();
@@ -1434,11 +1366,11 @@ pub(super) fn unknown_tool_message(name: &str) -> String {
     match nearest_tool_name(name) {
         Some(sugg) => format!(
             "unknown tool: {name}. Did you mean '{sugg}'? Available tools include: \
-             {base} (plus git and any memory/plan tools enabled this session)."
+             {base} (plus any optional tools enabled this session)."
         ),
         None => format!(
-            "unknown tool: {name}. Available tools include: {base} (plus git and \
-             any memory/plan tools enabled this session)."
+            "unknown tool: {name}. Available tools include: {base} (plus any \
+             optional tools enabled this session)."
         ),
     }
 }

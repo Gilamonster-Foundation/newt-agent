@@ -237,14 +237,14 @@ fn repair_ordinals(run: &Run) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Grounds verification eligibility in real files and the existing shell:
-/// an external report does not change the code workspace, while a local source
-/// change still requires its checks. Both ordinary gates and all smart wires
-/// must make the same decision in attempted and result-aware modes.
+/// Grounds verification scope in real files and the existing shell: neither an
+/// external report nor a local source edit makes every discovered runner a
+/// requested check. Both ordinary gates and all smart wires must complete
+/// without unrelated check rounds in attempted and result-aware modes.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
-async fn unchanged_workspace_does_not_turn_an_external_report_into_a_coding_task() {
+async fn workspace_discovery_does_not_make_unrequested_checks_mandatory() {
     for (wire, smart) in [
         ("openai", false),
         ("anthropic", false),
@@ -295,11 +295,9 @@ async fn unchanged_workspace_does_not_turn_an_external_report_into_a_coding_task
                     .bodies
                     .iter()
                     .any(|body| body.contains("Before you finish"));
-                assert_eq!(nudged, source_change, "{label}");
-                if !source_change {
-                    assert_eq!(run.reason, "completed", "{label}");
-                    assert_eq!(run.bodies.len(), 2, "{label}: no unrelated test rounds");
-                }
+                assert!(!nudged, "{label}: discovery alone cannot mandate checks");
+                assert_eq!(run.reason, "completed", "{label}");
+                assert_eq!(run.bodies.len(), 2, "{label}: no unrelated test rounds");
             }
         }
     }

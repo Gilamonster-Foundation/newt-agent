@@ -8,6 +8,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -37,6 +38,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -1128,6 +1131,78 @@ async fn openai_content_invalid_tool_batch_emits_no_accepted() {
     );
 }
 
+/// #2558/F39: a tool call whose `arguments` string is TRUNCATED/INVALID JSON
+/// (e.g. a large embedded script cut off mid-generation) must not poison the
+/// replayed history. FAILS on the pre-fix code, which pushed the raw invalid
+/// string into `messages` before validating the batch — so every later
+/// request (including a token-count preflight) carried unparseable JSON.
+struct OpenAiTruncatedArgsThenText;
+impl Respond for OpenAiTruncatedArgsThenText {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let has_tool_result = body_json(req)["messages"]
+            .as_array()
+            .map(|m| m.iter().any(|x| x["role"] == "tool"))
+            .unwrap_or(false);
+        if has_tool_result {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "recovered answer"}}],
+                "usage": {"prompt_tokens": 5_200, "completion_tokens": 4},
+            }))
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": "{\"cmd\": \"python -c 'a huge script"
+                        }
+                    }]
+                }}],
+                "usage": {"prompt_tokens": 6_000, "completion_tokens": 5},
+            }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_truncated_tool_args_never_reach_a_later_request_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(OpenAiTruncatedArgsThenText)
+        .mount(&server)
+        .await;
+
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the rejected batch re-dispatches to a valid answer");
+
+    assert_eq!(reply, "recovered answer");
+    let received = server.received_requests().await.expect("journal");
+    assert_eq!(received.len(), 2, "one generation per round");
+    let second_body = body_json(&received[1]);
+    let raw = second_body.to_string();
+    assert!(
+        !raw.contains("a huge script"),
+        "the truncated raw arguments must not survive into a later request body: {raw}"
+    );
+    assert!(
+        raw.contains("not valid JSON"),
+        "the model must be told its arguments were rejected: {raw}"
+    );
+}
+
 /// OpenAI RR2: a CORRELATION-IMPOSSIBLE batch (duplicate `tool_call_id`)
 /// aborts the turn with an error and emits NO `Accepted` — a mis-routable
 /// batch is never provider-accept evidence. FAILS on the pre-fix code, which
@@ -1311,5 +1386,431 @@ async fn an_interrupted_ollama_probe_is_a_cancelled_attempt() {
     assert_eq!(
         (records[0].state, records[0].usage),
         (crate::attempts::AttemptState::Cancelled, None)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A tool-call batch with no call id is re-asked, not fatal (P0 U3).
+// ---------------------------------------------------------------------------
+
+/// Serves `script` in order (last entry repeats) and records every request body.
+struct ScriptedChat {
+    script: Vec<serde_json::Value>,
+    bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for ScriptedChat {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let i = bodies.len().min(self.script.len() - 1);
+        bodies.push(serde_json::from_slice(&req.body).expect("JSON request"));
+        ResponseTemplate::new(200).set_body_json(self.script[i].clone())
+    }
+}
+
+fn idless_call() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": null, "tool_calls": [{
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"no/such/file\"}"}
+        }]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+fn call_with_id() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": null, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"no/such/file\"}"}
+        }]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+fn final_answer() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": "all done"}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+/// Runs the chat-completions loop against `script`; returns the result, the
+/// recorded request bodies, and how many `read_file` tool events ran.
+async fn run_scripted(
+    script: Vec<serde_json::Value>,
+) -> (anyhow::Result<String>, Vec<serde_json::Value>, usize, usize) {
+    let server = MockServer::start().await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedChat {
+            script,
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    c.tool_events = Some(&mut events);
+    let result = chat_complete(c, &mut NoMcp).await.map(|(reply, ..)| reply);
+    let ran = events.iter().filter(|e| e.tool == "read_file").count();
+    let rejected = events
+        .iter()
+        .filter(|e| e.tool == "(rejected tool-call batch)" && !e.ok)
+        .count();
+    let bodies = bodies.lock().unwrap().clone();
+    (result, bodies, ran, rejected)
+}
+
+/// The id-less batch dispatches nothing and is re-asked; the next, well-formed
+/// batch runs once and the turn completes.
+#[tokio::test]
+async fn idless_tool_call_is_re_asked_and_the_turn_completes() {
+    let (result, bodies, ran, rejected) =
+        run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
+    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    assert_eq!(ran, 1, "only the well-formed batch ran a tool");
+    assert_eq!(
+        rejected, 1,
+        "the trace records why the re-ask round produced nothing"
+    );
+}
+
+/// Three id-less batches in a row abort exactly as before.
+#[tokio::test]
+async fn three_idless_batches_in_a_row_abort_with_todays_error() {
+    let (result, bodies, ran, _) = run_scripted(vec![idless_call()]).await;
+    let err = result.expect_err("the budget is spent");
+    assert!(
+        err.to_string().contains("malformed provider output")
+            && err.to_string().contains("missing a call id"),
+        "{err}"
+    );
+    assert_eq!(bodies.len(), 3, "the third id-less batch aborts");
+    assert_eq!(ran, 0, "nothing was dispatched");
+}
+
+/// A well-formed batch resets the budget: two id-less, one good, two more
+/// id-less, then an answer completes.
+#[tokio::test]
+async fn a_well_formed_batch_resets_the_idless_budget() {
+    let (result, _, ran, _) = run_scripted(vec![
+        idless_call(),
+        idless_call(),
+        call_with_id(),
+        idless_call(),
+        idless_call(),
+        final_answer(),
+    ])
+    .await;
+    assert_eq!(result.expect("completes"), "all done");
+    assert_eq!(ran, 1);
+}
+
+/// The re-ask text reaches the next request as a plain user message, and the
+/// id-less calls are not replayed on the assistant turn.
+#[tokio::test]
+async fn the_re_ask_reaches_the_next_request_body() {
+    let (_, bodies, _, _) = run_scripted(vec![idless_call(), call_with_id(), final_answer()]).await;
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user", "a user message, not a tool result");
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .contains("could not be correlated"),
+        "{last}"
+    );
+    assert!(
+        second
+            .iter()
+            .all(|m| m["role"] != "assistant" || m.get("tool_calls").is_none()),
+        "id-less calls must not be replayed: {second:?}"
+    );
+    assert!(second.iter().all(|m| m["role"] != "tool"));
+    // The default replay sends a tool-only assistant turn as `content: ""`;
+    // strict gateways reject that, so the withdrawn turn must carry text.
+    let withdrawn = second
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .expect("the withdrawn assistant turn is still replayed");
+    assert!(
+        withdrawn["content"]
+            .as_str()
+            .is_some_and(|c| !c.trim().is_empty()),
+        "empty assistant content on the wire: {withdrawn}"
+    );
+}
+
+/// The measured run-2483-b failure: the model wrote its tool call as bare JSON
+/// in the reply, the harness RECOVERED it, and a recovered call had no id, so it
+/// reached the batch validator and was re-asked (trace: `recovered_tool_call`,
+/// dialect `bare_json`). The harness now derives the id, so the recovered batch
+/// never enters the re-ask path (see the derived-id tests below).
+#[tokio::test]
+async fn a_recovered_content_call_is_not_re_asked() {
+    let (result, bodies, _, rejected) =
+        run_scripted(vec![bare_reply(BARE), call_with_id(), final_answer()]).await;
+    assert_eq!(result.expect("completes"), "all done");
+    assert_eq!(rejected, 0, "no re-ask round: the id was derived");
+    assert_eq!(bodies.len(), 3);
+    assert!(
+        bodies[1]["messages"].to_string().contains("nwt-rc-"),
+        "the recovered call rode the transcript with a derived id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P0: a call the harness RECOVERED from reply text gets a harness-derived id.
+// ---------------------------------------------------------------------------
+
+const BARE: &str = r#"{"name": "read_file", "arguments": {"path": "no/such/file"}}"#;
+
+fn bare_reply(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": content}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+/// Like `run_scripted`, but with an attempt ledger (the causal parent of a
+/// derived id) and the solve observation (the trace's parse signals).
+async fn run_recovery(
+    script: Vec<serde_json::Value>,
+) -> (
+    anyhow::Result<String>,
+    Vec<serde_json::Value>,
+    Vec<crate::ToolEvent>,
+    Vec<crate::ParseSignal>,
+) {
+    let server = MockServer::start().await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedChat {
+            script,
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut obs = crate::agentic::observability::SolveObservation::default();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    c.tool_events = Some(&mut events);
+    c.attempt_ledger = Some(&ledger);
+    c.solve_obs = Some(&mut obs);
+    let result = chat_complete(c, &mut NoMcp).await.map(|(reply, ..)| reply);
+    let bodies = bodies.lock().unwrap().clone();
+    (result, bodies, events, obs.parse_signals)
+}
+
+/// The recovered-call ids the replayed assistant turns carry, in request order.
+fn replayed_ids(request: &serde_json::Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .flat_map(|m| m["tool_calls"].as_array().cloned().unwrap_or_default())
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_recovered_call_completes_with_a_derived_id_and_a_reshaped_turn() {
+    let (result, bodies, events, _) = run_recovery(vec![bare_reply(BARE), final_answer()]).await;
+    assert_eq!(result.expect("the turn completes"), "all done");
+    assert_eq!(bodies.len(), 2, "recovered call, then the final answer");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+    let messages = bodies[1]["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .expect("the replayed assistant turn");
+    let call = &assistant["tool_calls"][0];
+    let id = call["id"].as_str().expect("a derived id");
+    assert!(id.starts_with("nwt-rc-") && id.len() == 39, "{id}");
+    assert_eq!(call["type"], "function");
+    assert!(
+        call["function"]["arguments"].is_string(),
+        "stringified: {call}"
+    );
+    assert_eq!(
+        assistant["content"], BARE,
+        "the original text stays as evidence"
+    );
+    // A real ENOENT read now renders `"error: reading ..."` (the one
+    // `"error:"` convention, #2553 finding-1 follow-up), so it also matches
+    // the workflow-progress error fingerprint and a repair nudge follows the
+    // tool turn — find the tool message by role rather than assuming it is
+    // last; that nudge is not what this test is about.
+    let tool = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .expect("the recovered call's tool result");
+    assert_eq!(
+        tool["tool_call_id"], id,
+        "the result answers the derived id"
+    );
+}
+
+#[tokio::test]
+async fn identical_reply_text_in_two_rounds_derives_different_ids() {
+    let (result, bodies, _, _) =
+        run_recovery(vec![bare_reply(BARE), bare_reply(BARE), final_answer()]).await;
+    result.expect("completes");
+    let ids = replayed_ids(&bodies[2]);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "the causal parent differs per round");
+}
+
+#[tokio::test]
+async fn two_identical_calls_in_one_reply_get_distinct_ids() {
+    let one = "<function=read_file><parameter=path>no/such/file</parameter></function>";
+    let (result, bodies, events, _) =
+        run_recovery(vec![bare_reply(&format!("{one}{one}")), final_answer()]).await;
+    result.expect("completes");
+    let ids = replayed_ids(&bodies[1]);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "the ordinal separates identical calls");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 2);
+}
+
+/// A NATIVE id-less call keeps #2500's bounded re-ask: no id is ever derived
+/// for a provider call.
+#[tokio::test]
+async fn a_native_idless_call_never_gets_a_derived_id() {
+    let (result, bodies, _, _) =
+        run_recovery(vec![idless_call(), call_with_id(), final_answer()]).await;
+    result.expect("re-asked, then completes");
+    assert!(
+        bodies.iter().all(|b| !b.to_string().contains("nwt-rc-")),
+        "no derived id may appear for a provider call"
+    );
+}
+
+#[tokio::test]
+async fn the_trace_signal_carries_the_full_cid_and_the_locator() {
+    let (_, bodies, _, signals) = run_recovery(vec![bare_reply(BARE), final_answer()]).await;
+    let id = replayed_ids(&bodies[1]).remove(0);
+    let recovered = signals
+        .iter()
+        .find_map(|s| match s {
+            crate::ParseSignal::RecoveredToolCall { calls, .. } => Some(calls.clone()),
+            _ => None,
+        })
+        .expect("a recovered_tool_call signal");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].locator, id);
+    assert!(recovered[0].cid.starts_with("bafy"), "{}", recovered[0].cid);
+}
+
+// ---------------------------------------------------------------------------
+// #2482 item 6 / owed from the #2521 review: the missing-gate MCP refusal
+// must ledger `ok = false` on the chat-completions wire too, not only the
+// Anthropic loop (`mod_tests/anthropic_loop.rs`). Adapted from
+// `run_scripted` above.
+// ---------------------------------------------------------------------------
+
+/// MCP stub that records every call it receives; local because
+/// `anthropic_loop_tests::RecordingMcp` is module-private.
+struct RecordingMcpStub {
+    name: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+#[async_trait::async_trait]
+impl McpTools for RecordingMcpStub {
+    fn handles(&self, name: &str) -> bool {
+        name == self.name
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn call(&mut self, leased: &LeasedMcpCall<'_>) -> String {
+        self.seen.lock().unwrap().push(leased.args().clone());
+        "tool-result-text".to_string()
+    }
+}
+
+fn mcp_tool_call() -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{"message": {"content": null, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "my_server__get_thing", "arguments": "{}"}
+        }]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+    })
+}
+
+#[tokio::test]
+async fn missing_permission_gate_mcp_refusal_records_not_ok_on_the_chat_wire() {
+    let server = MockServer::start().await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedChat {
+            script: vec![mcp_tool_call(), final_answer()],
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.api_key = Some("sk-test");
+    c.tool_events = Some(&mut events);
+    // No permission gate installed at all — the missing-gate refusal path.
+    c.permission_gate = None;
+    let mut mcp = RecordingMcpStub {
+        name: "my_server__get_thing",
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (reply, ..) = chat_complete(c, &mut mcp)
+        .await
+        .expect("the loop must still complete after the refusal");
+
+    assert_eq!(reply, "all done");
+    assert_eq!(
+        mcp.seen.lock().unwrap().len(),
+        0,
+        "the connector must receive zero calls when no gate is available"
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "the refused call is still one ledgered event"
+    );
+    assert!(
+        !events[0].ok,
+        "a refusal the host never dispatched must not ledger ok=true: {:?}",
+        events[0]
     );
 }

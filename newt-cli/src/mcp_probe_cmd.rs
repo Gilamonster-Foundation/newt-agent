@@ -507,8 +507,8 @@ pub async fn run(args: ProbeArgs, config_path: Option<&Path>) -> anyhow::Result<
 
     let env = crate::mcp_cmd::parse_env_pairs(&args.env)?;
     let cfg = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => crate::migration_notices::read(|report| Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| Config::resolve(report))?,
     };
     let workspace = std::env::current_dir().context("cannot resolve the current directory")?;
     // The shared probe leash (#1292 hard rule): exactly doctor's policy —
@@ -646,6 +646,7 @@ async fn probe_stdio(
             request_timeout_secs: args.timeout_secs,
             // Operator-typed on the CLI — newt-owned, trusted config.
             trust: McpTrust::Trusted,
+            origin: None,
         };
         let cmdline = render_cmdline(command, &candidate);
         eprintln!("probing `{cmdline}` …");
@@ -712,6 +713,7 @@ async fn probe_url(
         request_timeout_secs: args.timeout_secs,
         // Operator-typed on the CLI — newt-owned, trusted config.
         trust: McpTrust::Trusted,
+        origin: None,
     };
     eprintln!("probing {url} …");
     // step-1.1: admission gate (operator-typed entry is trusted → admits).
@@ -1082,6 +1084,7 @@ mod tests {
                 login_argv: Vec::new(),
                 request_timeout_secs: None,
                 trust: McpTrust::Trusted,
+                origin: None,
             },
             description: "Scrybe Markdown editor".into(),
             tools: vec!["open".into(), "edit".into()],

@@ -31,6 +31,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -61,6 +62,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -452,6 +455,10 @@ mod reasoning_replay;
 #[path = "http_reasoning_overflow.rs"]
 mod reasoning_overflow;
 
+#[cfg(test)]
+#[path = "http_overflow_cognition_retry.rs"]
+mod overflow_cognition_retry;
+
 #[path = "http_context_exceeded.rs"]
 mod context_exceeded;
 
@@ -474,6 +481,10 @@ mod narration;
 mod plan_handoff;
 
 #[cfg(test)]
+#[path = "http_plan_exit.rs"]
+mod plan_exit;
+
+#[cfg(test)]
 #[path = "http_verification.rs"]
 mod verification;
 
@@ -494,3 +505,9 @@ mod exposure_promotion;
 #[cfg(test)]
 #[path = "http_smart_harness.rs"]
 mod smart_harness;
+
+#[path = "http_capability_grounding.rs"]
+mod capability_grounding;
+
+#[path = "http_ollama_initiative.rs"]
+mod ollama_initiative;

@@ -224,11 +224,22 @@ impl std::ops::DerefMut for Newt {
     }
 }
 
-/// The `newt` binary, isolated. **The only way these tests should build one.**
+/// The `newt` binary, isolated at a caller-owned root.
+///
+/// The caller must keep `root` alive until the child exits. A test which needs
+/// a distinct workspace must make it a child of `root` before changing the
+/// command's current directory, so config discovery stops at the fake home
+/// rather than walking into the developer's real profile.
+pub fn newt_at(root: &Path) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::cargo_bin("newt").expect("built newt binary");
+    isolate(&mut cmd, root);
+    cmd
+}
+
+/// The `newt` binary, isolated. **The default way these tests should build one.**
 pub fn newt() -> Newt {
     let root = tempfile::tempdir().expect("isolated test root");
-    let mut cmd = assert_cmd::Command::cargo_bin("newt").expect("built newt binary");
-    isolate(&mut cmd, root.path());
+    let cmd = newt_at(root.path());
     Newt { root, cmd }
 }
 

@@ -1,5 +1,54 @@
 use super::*;
 
+#[test]
+fn native_commit_snapshot_survives_an_interleaved_real_commit() {
+    let dir = repo_with_commit_on_task_branch();
+    let mut tool = tool(dir.path());
+    tool.attribution
+        .as_mut()
+        .unwrap()
+        .contributors
+        .push(newt_core::attribution::Attribution::new(
+            "earlier-model",
+            "newt-agent",
+            "fixture-version",
+            "earlier@example.invalid",
+        ));
+    let policy = tool.native_commit_policy().unwrap();
+    let snapshot = policy
+        .snapshot_for_commit()
+        .unwrap_or_else(|| policy.clone());
+    let expected = snapshot
+        .finalize_message("native command in flight")
+        .unwrap();
+    assert!(expected.contains("earlier-model"));
+
+    std::fs::write(dir.path().join("a.txt"), "interleaved change\n").unwrap();
+    tool.dispatch(
+        "add",
+        &serde_json::json!({"paths": ["a.txt"]}),
+        &GitCaveats::top(),
+        &Caveats::top(),
+    )
+    .unwrap();
+    tool.dispatch(
+        "commit",
+        &serde_json::json!({"message": "other command published"}),
+        &GitCaveats::top(),
+        &Caveats::top(),
+    )
+    .unwrap();
+    assert!(head_message(dir.path()).contains("earlier-model"));
+    assert_eq!(snapshot.finalize_message("native command in flight").unwrap(), expected, "an admitted native transaction must retain its canonical message across hook/sign/ref checks");
+    let next = policy
+        .snapshot_for_commit()
+        .unwrap_or_else(|| policy.clone());
+    assert!(!next
+        .finalize_message("later command")
+        .unwrap()
+        .contains("earlier-model"));
+}
+
 // --- LocalGitTool (the injected GitTool seam) ---------------------------
 #[test]
 fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
@@ -69,6 +118,10 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
     // No commit yet → drain is zero (a bare `HEAD` move from init does NOT
     // count as a contributor-consuming commit).
     assert_eq!(t.drain_commit_success(), 0);
+    // Off `main` before the second mutation (`amend`): the first commit on
+    // an unborn branch is exempt from `refuse_if_default_branch` (F32/#2537),
+    // but a subsequent amend on that now-existing ref is not.
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
     std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
     t.dispatch(
         "add",
@@ -152,6 +205,9 @@ fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
         &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
+    // Off `main` before C2/C3: only the very first commit on an unborn
+    // branch is exempt from `refuse_if_default_branch` (F32/#2537).
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
 
     // C1: credits model-a (contributor) + qwen3:30b (active).
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();

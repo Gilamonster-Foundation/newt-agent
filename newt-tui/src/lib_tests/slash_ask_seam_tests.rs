@@ -189,7 +189,10 @@ fn a_panel_asks_the_surface_for_rows_before_it_draws() {
     let driver = include_str!("../panel.rs").replace([' ', '\n'], "");
     assert!(
         driver.contains("Some(window)=>window.terminal()?,")
-            && driver.contains("None=>make_terminal(height)?,"),
+            // The fallback leases the modal's requested height, which starts
+            // at the panel's own `height` (`ModalSize::new(height)`).
+            && driver.contains("None=>make_terminal(size.requested())?,")
+            && driver.contains("letmutsize=ModalSize::new(height);"),
         "a lent window wins over the stdout path, and only its absence falls back"
     );
 }

@@ -341,6 +341,14 @@ fn store_list_message_shows_none_when_all_personas_empty() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn handle_persona_command_show_and_clear() {
+    // Acquired BEFORE the first `rebuild_system_prompt` below, which
+    // re-resolves config and republishes process-global runtime settings
+    // (`Config::resolve().publish_runtime_settings()`, patient=12 default) as
+    // a side effect — that write raced newt-tui's
+    // `prompt::reads_do_not_publish::prompt_readers_do_not_republish_runtime_settings`
+    // on a parallel run because this guard used to be acquired only after it.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().to_str().unwrap();
     let store = PersonaStore::new(tmp.path().join("personas"));
@@ -362,8 +370,6 @@ async fn handle_persona_command_show_and_clear() {
     let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
-
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     // show: reports the active persona, does not reset anything.
     let msg = {
         let mut ctx = ConversationResetContext {
@@ -485,6 +491,12 @@ fn persona_caveats_are_guidance_without_authority_changes() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn persona_set_keep_context_preserves_history() {
+    // See the same guard-ordering note in
+    // `handle_persona_command_show_and_clear` above: `rebuild_system_prompt`
+    // below republishes process-global runtime settings, so the guard must
+    // be held before it, not just before the assertions.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().to_str().unwrap();
     let dir = tmp.path().join("personas");
@@ -506,7 +518,6 @@ async fn persona_set_keep_context_preserves_history() {
     let mut active_conversation_id = String::from("test-session");
     let mode_states = ConversationModeStates::default();
 
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let msg = {
         let mut ctx = ConversationResetContext {
             memory: &mut memory,

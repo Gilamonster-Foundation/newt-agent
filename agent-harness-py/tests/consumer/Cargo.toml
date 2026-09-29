@@ -2,7 +2,9 @@
 name = "smart-harness-consumer"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.88"
+# A standalone [workspace]: it cannot inherit the root's rust-version, so this
+# one copy must be kept equal to [workspace.package] in the root Cargo.toml.
+rust-version = "1.90"
 publish = false
 readme = "README.md"
 license = "Apache-2.0"

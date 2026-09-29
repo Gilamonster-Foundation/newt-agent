@@ -20,4 +20,11 @@ origin and depth. The host separately resolves root and payload bytes, verifies
 elision units, and enforces authority. A generated reply verdict proves its
 schema and provenance; it does not establish factual truth or task correctness.
 
+`EventOrigin::Historical` identifies imported transcript data whose original
+execution was not accounted by this Frame. It is a source observation for
+catalogs, elision, and retrieval, which preserve that origin. It cannot stand in
+for a current operator anchor, an observed tool output, or a model-verdict
+target. Quoted historical claims remain claims even when their stored bytes
+have been verified.
+
 Licensed under the workspace Apache-2.0 license.

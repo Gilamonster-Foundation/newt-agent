@@ -85,6 +85,7 @@ async fn a_set_cancel_flag_abandons_the_turn_before_any_network_call() {
     let flag = std::sync::atomic::AtomicBool::new(true);
     let (reply, streamed, usage, hallu) = chat_complete(
         ChatCtx {
+            overflow_retry: Default::default(),
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -114,6 +115,8 @@ async fn a_set_cancel_flag_abandons_the_turn_before_any_network_call() {
             persona_tools: None,
             cognition: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: Default::default(),
             output_allowance: None,
             attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -406,6 +409,12 @@ impl Respond for ReadOnlyNudgeResponder {
 
 #[tokio::test]
 async fn read_only_nudge_injected_after_three_rounds() {
+    // This fixture asserts the Measured/default thresholds. Other loop tests
+    // deliberately install a two-round no-progress stop, so reading globals
+    // without the shared guard can stop this turn before its action nudge.
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(Default::default());
+    crate::initiative::set_cli_initiative(crate::initiative::Initiative::Measured);
     let server = MockServer::start().await;
     let nudge_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -421,6 +430,7 @@ async fn read_only_nudge_injected_after_three_rounds() {
     let caveats = Caveats::top();
     let (reply, _streamed, _usage, _hallu) = chat_complete(
         ChatCtx {
+            overflow_retry: Default::default(),
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -450,6 +460,8 @@ async fn read_only_nudge_injected_after_three_rounds() {
             persona_tools: None,
             cognition: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: Default::default(),
             output_allowance: None,
             attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -511,10 +523,132 @@ async fn read_only_nudge_injected_after_three_rounds() {
 
     assert!(
         nudge_seen.load(std::sync::atomic::Ordering::SeqCst),
-        "nudge was never injected after 3 consecutive read-only rounds"
+        "nudge was never injected after 3 consecutive read-only rounds; reply: {reply}"
     );
     assert_eq!(
         reply, "nudge received, writing file now",
         "model should have responded to the nudge with a final answer"
+    );
+}
+
+// ---- U4b: operator steering and the no-progress brake ----------------------
+
+/// One `write_file` (arms the brake), then `list_dir` forever. Submits `steer`
+/// into the inbox while serving request number `steer_at`, i.e. while that round
+/// is on the wire, so the drain at the NEXT round start delivers it.
+struct WriteThenListSteersAt {
+    inbox: std::sync::Arc<SessionSteeringInbox>,
+    seen: Arc<AtomicUsize>,
+    steer_at: Option<usize>,
+    steer: String,
+}
+
+impl Respond for WriteThenListSteersAt {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if self.steer_at == Some(n) {
+            self.inbox.submit(self.steer.clone());
+        }
+        let call = if n == 0 {
+            serde_json::json!({"name": "write_file",
+                "arguments": {"path": "out.txt", "content": "x\n"}})
+        } else {
+            serde_json::json!({"name": "list_dir", "arguments": {"path": "."}})
+        };
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": "", "tool_calls": [{"function": call}]}
+        }))
+    }
+}
+
+/// Runs the write-then-grind loop with `stop_after = 2`; returns how many
+/// requests were made, the end reason, and every user-role text of the last one.
+async fn run_brake_loop(
+    steer_at: Option<usize>,
+    steer: &str,
+) -> (usize, Option<crate::TurnEndReason>, Vec<String>) {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 2,
+        },
+        ..Default::default()
+    });
+    let server = MockServer::start().await;
+    let inbox = std::sync::Arc::new(SessionSteeringInbox::new());
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(WriteThenListSteersAt {
+            inbox: inbox.clone(),
+            seen: Arc::new(AtomicUsize::new(0)),
+            steer_at,
+            steer: steer.into(),
+        })
+        .mount(&server)
+        .await;
+    let ws = tempfile::TempDir::new().unwrap();
+    let ws_path = ws.path().to_string_lossy().into_owned();
+    let messages = msgs();
+    // The fixture authorizes its write explicitly; unrestricted writes require
+    // an operator confirmation and stdin EOF is correctly a denial.
+    let caveats = crate::confined_exec::workspace_confined_caveats(ws.path());
+    let uri = server.uri();
+    let mut ctx = hard_budget_ctx(
+        &uri,
+        &messages,
+        &caveats,
+        "write out.txt",
+        BackendKind::Ollama,
+    );
+    ctx.model = "test-model";
+    ctx.safe_context = None;
+    ctx.max_tool_rounds = 20;
+    ctx.workspace = &ws_path;
+    ctx.steering = Some(inbox.as_ref() as &dyn SteeringInbox);
+    let mut end = None;
+    ctx.end_reason = Some(&mut end);
+    chat_complete(ctx, &mut NoMcp)
+        .await
+        .expect("turn completes");
+    let reqs = server.received_requests().await.expect("journal");
+    let last = user_contents(reqs.last().expect("a request"));
+    (reqs.len(), end, last)
+}
+
+/// Review round 3: operator steering is drained just BEFORE the brake's gate, so
+/// a person who types a steer on the round that would have stopped the turn used
+/// to have it appended and then thrown away by the stop. A human steer is new
+/// information: it resets the count, so the model reads it. Without steering the
+/// same loop still stops after the first novel read and two repetitions.
+#[tokio::test]
+async fn operator_steering_on_the_round_that_would_stop_resets_the_brake() {
+    const STEER: &str = "look at the failing test, not the directory";
+    let (requests, end, _) = run_brake_loop(None, STEER).await;
+    assert_eq!(
+        requests, 4,
+        "no steering: write, new directory evidence, two idle rounds, then the stop"
+    );
+    assert_eq!(end, Some(crate::TurnEndReason::NoProgress));
+
+    // Typed while round 3 (the last idle round) is on the wire: it is drained at
+    // the start of round 4 — the round that would have stopped.
+    let (requests, end, last) = run_brake_loop(Some(3), STEER).await;
+    assert!(
+        requests > 4,
+        "the steered turn must not stop on the spot: {requests}"
+    );
+    assert!(
+        last.iter().any(|c| c.contains(STEER)),
+        "the operator's text stays in context: {last:?}"
+    );
+    assert_eq!(
+        end,
+        Some(crate::TurnEndReason::NoProgress),
+        "it still stops later"
+    );
+    assert_eq!(
+        requests, 6,
+        "the count restarts after the steer: rounds 4 and 5, then the stop"
     );
 }

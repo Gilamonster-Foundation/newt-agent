@@ -126,6 +126,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -156,6 +157,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         persona_tools: Some(preferred_mcp_tools()),
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -524,6 +527,135 @@ async fn tool_use_round_trip_replays_blocks_verbatim() {
         mcp.seen.lock().unwrap().as_slice(),
         &[serde_json::json!({"key": "value"})],
         "the executed call carried the decoded object arguments"
+    );
+}
+
+// -----------------------------------------------------------------------
+// #2419: a pre-dispatch MCP permission refusal — no interactive gate at all
+// — must record `ok = false` in the turn's ToolEvent ledger, and the
+// connector must receive zero calls. This is the loop-level twin of the
+// unit-level `execute_mcp_authority` tests: it proves shared event
+// construction in the ACTUAL provider loop, not just the classifier.
+// -----------------------------------------------------------------------
+
+struct TwoRoundToolThenTextResponder {
+    calls: Arc<AtomicUsize>,
+}
+impl Respond for TwoRoundToolThenTextResponder {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            json_reply(
+                "tool_use",
+                serde_json::json!([{"type": "tool_use", "id": "toolu_1",
+                    "name": "my_server__get_thing", "input": {}}]),
+                40,
+                9,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "acknowledged the refusal"}]),
+                60,
+                4,
+            )
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn missing_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(TwoRoundToolThenTextResponder {
+            calls: calls.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "tool-result-text",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    // No permission gate installed at all — the missing-gate refusal path.
+    context.permission_gate = None;
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    context.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
+        .await
+        .expect("the loop must still complete after the refusal");
+
+    assert_eq!(reply, "acknowledged the refusal");
+    assert_eq!(
+        mcp.seen.lock().unwrap().len(),
+        0,
+        "the connector must receive zero calls when no gate is available"
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "the refused call is still one ledgered event"
+    );
+    assert!(
+        !events[0].ok,
+        "a refusal the host never dispatched must not ledger ok=true: {:?}",
+        events[0]
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn denied_permission_gate_mcp_refusal_records_not_ok_in_the_loop() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(TwoRoundToolThenTextResponder {
+            calls: calls.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut mcp = RecordingMcp {
+        name: "my_server__get_thing",
+        result: "tool-result-text",
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let uri = server.uri();
+    // Fixture permission that targets a DIFFERENT tool name, so the request
+    // for `my_server__get_thing` always falls through to `Deny`.
+    let mut permission = FixtureMcpPermission::new("not_this_tool", &caveats);
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.permission_gate = Some(&mut permission);
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    context.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(context, &mut mcp)
+        .await
+        .expect("the loop must still complete after the refusal");
+
+    assert_eq!(reply, "acknowledged the refusal");
+    assert_eq!(
+        mcp.seen.lock().unwrap().len(),
+        0,
+        "a denied gate must never reach the connector"
+    );
+    assert_eq!(events.len(), 1);
+    assert!(
+        !events[0].ok,
+        "a denied grant must not ledger ok=true: {:?}",
+        events[0]
     );
 }
 
@@ -2225,4 +2357,183 @@ async fn an_anthropic_no_output_reissue_storm_is_one_attempt_per_try() {
         assert_eq!(record.key.request, records[0].key.request, "the same bytes");
         assert_eq!(record.state, crate::attempts::AttemptState::Failed);
     }
+}
+
+// -----------------------------------------------------------------------
+// P0 U3: a tool_use with no id is re-asked; the withdrawn call must not be
+// replayed as a tool_use block (that would be a provider 400 one round later).
+// -----------------------------------------------------------------------
+
+struct IdlessThenGood {
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for IdlessThenGood {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let n = bodies.len();
+        bodies.push(body_json(req));
+        match n {
+            0 => json_reply(
+                "tool_use",
+                serde_json::json!([
+                    {"type": "text", "text": "Reading."},
+                    {"type": "tool_use", "name": "read_file",
+                     "input": {"path": "no/such/file"}},
+                ]),
+                40,
+                9,
+            ),
+            1 => json_reply(
+                "tool_use",
+                serde_json::json!([{"type": "tool_use", "id": "toolu_1",
+                    "name": "read_file", "input": {"path": "no/such/file"}}]),
+                40,
+                9,
+            ),
+            _ => json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+                60,
+                4,
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn idless_tool_use_is_re_asked_without_replaying_the_withdrawn_block() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(IdlessThenGood {
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.tool_events = Some(&mut events);
+    let (reply, ..) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("the turn completes after the re-ask");
+    assert_eq!(reply, "done");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3, "re-ask, tool result, final");
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let has_tool_use = |msgs: &[serde_json::Value]| {
+        msgs.iter().any(|m| {
+            m["content"]
+                .as_array()
+                .is_some_and(|b| b.iter().any(|b| b["type"] == "tool_use"))
+        })
+    };
+    assert!(
+        !has_tool_use(second),
+        "the id-less tool_use must not be replayed: {second:?}"
+    );
+    let last = second.last().unwrap();
+    assert_eq!(last["role"], "user");
+    assert!(
+        last.to_string().contains("could not be correlated"),
+        "{last}"
+    );
+    assert!(
+        second.iter().any(|m| m.to_string().contains("Reading.")),
+        "the assistant's text survives the withdrawal"
+    );
+    // The good batch pairs its tool_use with a tool_result.
+    let third = bodies[2]["messages"].as_array().expect("messages");
+    assert!(has_tool_use(third));
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+    assert!(events
+        .iter()
+        .any(|e| e.tool == "(rejected tool-call batch)" && !e.ok));
+}
+
+// A call the harness RECOVERED from reply text on the Anthropic-shaped wire:
+// the internal turn already replays recovered calls as `tool_use`, so it needs
+// only the derived id and a matching `tool_result`.
+struct BareThenAnswer {
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+impl Respond for BareThenAnswer {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let mut bodies = self.bodies.lock().unwrap();
+        let n = bodies.len();
+        bodies.push(body_json(req));
+        if n == 0 {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text":
+                    "{\"name\": \"read_file\", \"arguments\": {\"path\": \"no/such/file\"}}"}]),
+                40,
+                9,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+                60,
+                4,
+            )
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_recovered_call_replays_as_tool_use_with_a_derived_id() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(BareThenAnswer {
+            bodies: bodies.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.tool_events = Some(&mut events);
+    let (reply, ..) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("a recovered call completes");
+    assert_eq!(reply, "done");
+    assert_eq!(events.iter().filter(|e| e.tool == "read_file").count(), 1);
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let second = bodies[1]["messages"].as_array().expect("messages");
+    let use_id = second
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_use")
+        .and_then(|b| b["id"].as_str())
+        .expect("a tool_use block");
+    assert!(
+        use_id.starts_with("nwt-rc-") && use_id.len() == 39,
+        "{use_id}"
+    );
+    let result_id = second
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .and_then(|b| b["tool_use_id"].as_str())
+        .expect("a tool_result block");
+    assert_eq!(result_id, use_id, "the result answers the derived id");
 }

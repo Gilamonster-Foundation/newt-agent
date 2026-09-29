@@ -129,7 +129,7 @@ pub async fn run_target(
             Config::user_config_path().unwrap_or_else(|| PathBuf::from("newt.toml"))
         });
     let discovery = if config_path.is_file() {
-        Config::load(&config_path)?.discovery
+        crate::migration_notices::read(|report| Config::load(&config_path, report))?.discovery
     } else {
         Discovery::default()
     };
@@ -706,7 +706,28 @@ async fn run_with_flow(
 
     op.say("Edit those files (or re-run `newt setup`) to change anything.");
     offer_identity(op);
+    offer_sandbox_git(op);
     Ok(())
+}
+
+/// Offer the sandbox git profile: who authors a commit made inside the
+/// sandbox, and whether to copy the operator's own git settings. Asked and
+/// written through `/settings`' own fields, so the two cannot drift.
+fn offer_sandbox_git(op: &Operator<'_>) {
+    op.say(
+        "Sandbox git: git the model runs never reads your ~/.gitconfig. \
+         Choose what it uses instead, and how newt signs its own commits \
+         (/settings changes these later).",
+    );
+    for field in [
+        crate::settings_form::Field::GitAuthor,
+        crate::settings_form::Field::GitConfig,
+        crate::settings_form::Field::GitSigning,
+    ] {
+        for line in crate::settings_form::ask_and_apply(op.ask_seam(), field, "/setup") {
+            op.say(&format!("  {line}"));
+        }
+    }
 }
 
 fn persist_default_backend(config_path: &Path, chosen: &str) -> anyhow::Result<()> {
@@ -971,7 +992,7 @@ async fn configure_custom_host(
             continue;
         }
         let discovery = if config_path.is_file() {
-            Config::load(config_path)
+            crate::migration_notices::read(|report| Config::load(config_path, report))
                 .map(|c| c.discovery)
                 .unwrap_or_default()
         } else {

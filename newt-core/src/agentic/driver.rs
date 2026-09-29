@@ -110,6 +110,10 @@ pub struct TurnDriverConfig {
     pub api_key: Option<String>,
     /// Chat Completions extensions explicitly accepted by the endpoint.
     pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
+    /// Responses declarations captured from the same active capability decision.
+    pub responses_capability: crate::model_card::ResponsesCapability,
+    /// The typed wire choice captured with this context, never reread mid-turn.
+    pub openai_api: crate::OpenAiApi,
     /// Whether the active backend accepts replayed assistant reasoning.
     pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Whether the active model streams a lone leading `</think>` closer, so
@@ -123,14 +127,15 @@ pub struct TurnDriverConfig {
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
     pub caveats: crate::caveats::Caveats,
-    /// Maximum tool-call rounds before a forced final completion.
+    /// Initial tool-call round allowance; recent concrete progress may renew it.
+    /// Explicit inference budgets and cancellation remain binding.
     pub max_tool_rounds: usize,
     /// Max narrate-then-stop rescue nudges per turn (see
     /// `[tui] narration_nudge_cap`); cowork default 1 keeps the historical
     /// one-shot rescue.
     pub narration_nudge_cap: usize,
-    /// Additional progress-aware rounds after `max_tool_rounds`; `0` makes the
-    /// normal cap hard.
+    /// Rounds added per renewal backed by fresh progress; `0` makes
+    /// `max_tool_rounds` a hard cap.
     pub workflow_grace_rounds: usize,
     /// Legacy line limit for pre-execution tool previews.
     pub tool_output_lines: usize,
@@ -176,6 +181,8 @@ pub struct TurnDriverConfig {
     /// #2312: explicit output-token allowance for driven turns. `None` keeps
     /// the cognition table and wire defaults.
     pub output_allowance: Option<u32>,
+    /// `[[model_tuning]] overflow_retry` for driven turns.
+    pub overflow_retry: crate::config::OverflowRetry,
     /// #2313: explicit run-level call-count allowance for driven turns.
     /// `None` keeps dispatch unbudgeted (today's default behavior).
     pub run_allowance: Option<u32>,
@@ -199,6 +206,12 @@ impl TurnDriverConfig {
             kind,
             api_key: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: if super::responses_api_selected() {
+                crate::OpenAiApi::Responses
+            } else {
+                crate::OpenAiApi::ChatCompletions
+            },
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             workspace: workspace.into(),
@@ -223,6 +236,7 @@ impl TurnDriverConfig {
             context_manager: crate::ContextManager::default(),
             code_search: None,
             output_allowance: None,
+            overflow_retry: Default::default(),
             run_allowance: None,
         }
     }
@@ -314,6 +328,11 @@ pub struct TurnOutcome {
     pub was_streamed: bool,
     /// `reply` is harness-written text, not the model's claim (#2372).
     pub harness_reply: bool,
+    /// Semantic intent captured by this turn, independent of supported wire fields.
+    pub semantic_cognition: Option<crate::role_profile::Cognition>,
+    /// Captured admitted Responses declaration and actual wire effort.
+    pub responses_capability: Option<crate::model_card::ResponsesCapability>,
+    pub reasoning_effort: Option<crate::model_card::ReasoningEffort>,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
     /// What this turn sent and generated, summed per inference attempt, with
@@ -336,7 +355,7 @@ pub enum TurnStatus {
     Running,
     /// A turn finished successfully. Returned **once**; the reply has already
     /// been appended to the transcript as an assistant message.
-    Completed(TurnOutcome),
+    Completed(Box<TurnOutcome>),
     /// A turn failed (transport error, dispatch error, …). Returned **once**.
     Failed(String),
 }
@@ -424,7 +443,7 @@ impl TurnDriver {
         self.in_flight.is_some()
     }
 
-    /// Pin the cognition projection used by every turn this driver submits.
+    /// Pin the semantic cognition used by every turn this driver submits.
     /// The default is captured from the process posture when the driver is
     /// constructed, before its dedicated turn thread is spawned.
     #[must_use]
@@ -565,7 +584,7 @@ impl TurnDriver {
                 self.transcript
                     .push(MemMessage::assistant(outcome.reply.clone()));
                 self.in_flight = None;
-                TurnStatus::Completed(outcome)
+                TurnStatus::Completed(Box::new(outcome))
             }
             Ok(Err(err)) => {
                 self.in_flight = None;
@@ -608,10 +627,11 @@ async fn run_one_turn(
     messages: &[MemMessage],
     task: &str,
 ) -> Result<TurnOutcome, String> {
-    // Freeze every lazy `effective_tenacity()` / `effective_initiative()` read
+    // Freeze every lazy cognition, tenacity, and initiative read
     // beneath `chat_complete` (workflow state and exit_plan_mode included) to
     // the posture captured by this driver. The current-thread runtime keeps
     // these RAII TLS guards on the dedicated turn thread for the entire future.
+    let _cognition = crate::cognition::scoped_effective_cognition(runtime.cognition);
     let _tenacity = crate::tenacity::scoped_effective_tenacity(runtime.tenacity);
     let _initiative = crate::initiative::scoped_effective_initiative(runtime.initiative);
     // Capture the per-tool trajectory + end reason for the outcome. The ChatCtx
@@ -715,11 +735,19 @@ async fn run_one_turn(
         caveats: &config.caveats,
         // Headless cowork carries no persona surface (FR-1 part 2, #997). The
         // driver captured the effective cognition before spawning this thread,
-        // keeping the wire posture and contract observation identical.
+        // preserving semantic intent independently of supported wire controls.
         persona_tools: None,
-        cognition: runtime.cognition,
+        cognition: super::projected_cognition(
+            runtime.cognition,
+            config.kind,
+            config.openai_api,
+            config.chat_completions_capability,
+        ),
         chat_completions_capability: config.chat_completions_capability,
+        responses_capability: config.responses_capability.clone(),
+        openai_api: config.openai_api,
         output_allowance: config.output_allowance,
+        overflow_retry: config.overflow_retry,
         attempt_ledger: Some(&attempt_ledger),
         reasoning_replay_scope: config.reasoning_replay_scope,
         emits_leading_reasoning: config.emits_leading_reasoning,
@@ -783,8 +811,7 @@ async fn run_one_turn(
     // that wants live MCP tools assembles its own ChatCtx.
     let mut mcp = NoMcp;
     // ONE dispatch owner. `chat_complete` routes openai-vs-ollama AND, for an
-    // openai backend, responses-vs-chat (`api = "responses"`, surfaced via
-    // NEWT_OPENAI_API). The headless driver goes through the SAME entry the
+    // openai backend, responses-vs-chat from the captured typed API. The headless driver goes through the SAME entry the
     // interactive TUI does, so the wire-format decision lives in exactly one
     // place and cannot drift. (This path used to fork its own `if kind==Openai`
     // branch that called `openai_chat_complete` directly, bypassing the
@@ -816,37 +843,72 @@ async fn run_one_turn(
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
             features,
+            semantic_cognition: runtime.cognition,
+            responses_capability: solve_obs.responses_capability,
+            reasoning_effort: solve_obs.reasoning_effort,
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
             attempts,
             attempt_lines,
         }),
-        Err(e) => Ok(TurnOutcome {
-            reply: String::new(),
-            was_streamed: false,
-            usage: None,
-            hallucinations: 0,
-            tool_events,
-            end_reason,
-            // W0 (#1511): the class is read from the TYPED chain; an error
-            // with no dispatch classification is OURS — harness_error,
-            // fail-closed, never a guess from the message text.
-            error_class: Some(
-                crate::agentic::observability::error_class(&e)
-                    .unwrap_or(crate::agentic::observability::ErrorClass::Harness),
-            ),
-            error: Some(e.to_string()),
-            served_model: solve_obs.served_model,
-            parse_signals: solve_obs.parse_signals,
-            behavior_signals: solve_obs.behavior_signals,
-            features,
-            output_allowance: solve_obs.output_allowance,
-            harness_reply: solve_obs.harness_reply,
-            attempts,
-            attempt_lines,
-        }),
+        Err(e) => {
+            // #2313 / U4a: an exhausted `--run-allowance` is a budget WALL, not a
+            // failure. Type it like the round cap (a clean stop, `RunAllowance`),
+            // and let the HARNESS write the notice: a model summary is a call the
+            // allowance now refuses, and a summary before the round cap would break
+            // BHV-ROUND-002.
+            let exhausted = e.chain().any(|c| {
+                c.downcast_ref::<super::run_allowance::RunAllowanceExhausted>()
+                    .is_some()
+            });
+            Ok(TurnOutcome {
+                reply: if exhausted {
+                    RUN_ALLOWANCE_NOTICE.to_string()
+                } else {
+                    String::new()
+                },
+                was_streamed: false,
+                usage: None,
+                hallucinations: 0,
+                tool_events,
+                // F14: a loop that errored without typing its end (e.g. an
+                // exhausted context-overflow recovery) ended in a backend/loop
+                // error — `Failed`, never an untyped `None`. A reason the loop
+                // did write (e.g. `Cancelled`) wins.
+                end_reason: if exhausted {
+                    Some(crate::TurnEndReason::RunAllowance)
+                } else {
+                    end_reason.or(Some(crate::TurnEndReason::Failed))
+                },
+                // W0 (#1511): the class is read from the TYPED chain; an error
+                // with no dispatch classification is OURS — harness_error,
+                // fail-closed, never a guess from the message text.
+                error_class: (!exhausted).then(|| {
+                    crate::agentic::observability::error_class(&e)
+                        .unwrap_or(crate::agentic::observability::ErrorClass::Harness)
+                }),
+                error: (!exhausted).then(|| e.to_string()),
+                served_model: solve_obs.served_model,
+                parse_signals: solve_obs.parse_signals,
+                behavior_signals: solve_obs.behavior_signals,
+                features,
+                semantic_cognition: runtime.cognition,
+                responses_capability: solve_obs.responses_capability,
+                reasoning_effort: solve_obs.reasoning_effort,
+                output_allowance: solve_obs.output_allowance,
+                harness_reply: solve_obs.harness_reply || exhausted,
+                attempts,
+                attempt_lines,
+            })
+        }
     }
 }
+
+/// The harness-written reply when `--run-allowance` runs out (no model call is
+/// possible). Points the dispatcher at the state the run left behind.
+const RUN_ALLOWANCE_NOTICE: &str = "The run allowance is exhausted: the whole-run inference-call \
+budget was spent before the task finished. Work done so far is left in the workspace; the \
+hand-back names what changed. Re-run with a larger --run-allowance to continue.";
 
 /// Errors from driving a turn.
 #[derive(Debug, thiserror::Error)]
@@ -862,6 +924,8 @@ mod calibration_tests;
 
 #[cfg(test)]
 mod tests {
+    include!("driver_cognition_tests.rs");
+    include!("driver_cognition_wire_tests.rs");
     use super::*;
     use crate::agentic::SessionSemanticIndex;
     use crate::caveats::{Caveats, CountBound, Scope};
@@ -1116,12 +1180,14 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let config = TurnDriverConfig::new(
+        // Pin the wire: `new` follows NEWT_OPENAI_API, which parallel tests set.
+        let mut config = TurnDriverConfig::new(
             server.uri(),
             "test-model",
             BackendKind::Openai,
             "newt-core-test-workspace-that-does-not-exist",
         );
+        config.openai_api = crate::OpenAiApi::ChatCompletions;
         let mut driver = TurnDriver::new(config);
         driver.submit("what is two plus two").expect("submit");
         let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
@@ -1171,7 +1237,7 @@ mod tests {
             panic!("the captured turn did not complete");
         };
         let out = bodies.lock().unwrap().clone();
-        (out, outcome)
+        (out, *outcome)
     }
 
     /// #1280: the headless driver advertises `code_search` **iff** the config
@@ -1342,7 +1408,7 @@ mod tests {
                 "the head is ephemeral: it never enters the driver transcript"
             );
             let bodies = bodies.lock().unwrap().clone();
-            (bodies, outcome)
+            (bodies, *outcome)
         }
 
         let store = Arc::new(SessionScratchpadStore::default());
@@ -1612,6 +1678,8 @@ mod tests {
 
         let mut config =
             TurnDriverConfig::new(server.uri(), "test-model", BackendKind::Openai, ".");
+        // Pin the wire: `new` follows NEWT_OPENAI_API, which parallel tests set.
+        config.openai_api = crate::OpenAiApi::ChatCompletions;
         config.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
             cognition: Some(true),
             ..Default::default()
@@ -1770,6 +1838,41 @@ mod tests {
         );
     }
 
+    /// U4a: a run allowance smaller than the work ends the turn as a TYPED,
+    /// clean stop (like the round cap), not an untyped `harness_error`: the
+    /// reason is `RunAllowance`, there is no error, and the harness — not a
+    /// model call the allowance now refuses — writes the reply. The partial
+    /// trajectory survives.
+    #[tokio::test]
+    async fn an_exhausted_run_allowance_ends_the_turn_typed_with_a_harness_notice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "message": {
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "list_dir", "arguments": {"path": "."}}}]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = cfg(&server.uri());
+        config.run_allowance = Some(2);
+        let mut driver = TurnDriver::new(config);
+        driver.submit("keep listing").expect("submit");
+        let TurnStatus::Completed(o) = pump_to_done(&mut driver).await else {
+            panic!("an exhausted allowance is a completed turn, not a failure");
+        };
+        assert_eq!(o.error, None, "typed stop, not an error");
+        assert_eq!(o.error_class, None);
+        assert_eq!(o.end_reason, Some(crate::TurnEndReason::RunAllowance));
+        assert!(o.harness_reply, "the notice is harness-written");
+        assert!(o.reply.contains("run allowance"), "notice: {}", o.reply);
+        assert!(!o.tool_events.is_empty(), "the partial trajectory is kept");
+    }
+
     /// W0 (#1511): a non-success HTTP status is a `model_error` STRUCTURALLY —
     /// the class rides the typed `DispatchError` through the anyhow chain to
     /// the outcome; nothing string-matches the message. (404 is non-retryable,
@@ -1802,31 +1905,46 @@ mod tests {
     /// strict decoding of a stream (a `DispatchError` attached as context, which
     /// the outcome used to miss and file as `harness_error`), or the batch
     /// validator's `CorrelationImpossible` arm for a complete JSON reply (the
-    /// arm Anthropic and Responses share). Nothing runs, and nothing is retried.
+    /// arm Anthropic and Responses share). Nothing runs. An id-less batch, streamed
+    /// or complete, is re-asked twice (P0 U3) before the third ends the turn; only a
+    /// stream whose id is not a string is undecodable and is not retried.
     #[tokio::test]
     async fn a_tool_call_without_an_id_classifies_as_model_error() {
         use crate::agentic::observability::ErrorClass;
-        let stream = [
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
-            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-            "[DONE]",
-        ]
-        .iter()
-        .map(|frame| format!("data: {frame}\n\n"))
-        .collect::<String>();
+        let stream_with = |id: &str| {
+            [
+                format!(r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,{id}"type":"function","function":{{"name":"read_file","arguments":"{{}}"}}}}]}}}}]}}"#),
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+                "[DONE]".to_string(),
+            ]
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>()
+        };
+        let stream = stream_with("");
+        let unreadable = stream_with(r#""id":7,"#);
         let json = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": null,
             "tool_calls": [{"type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
             "finish_reason": "tool_calls"}]});
-        for (name, reply, message) in [
+        for (name, reply, message, expected_posts) in [
             (
-                "strict stream",
+                "strict stream, id absent (re-asked, then aborted)",
                 ResponseTemplate::new(200).set_body_raw(stream.into_bytes(), "text/event-stream"),
-                "has no ID",
+                "malformed provider output",
+                3,
+            ),
+            (
+                "strict stream, non-string id (undecodable, one POST)",
+                ResponseTemplate::new(200)
+                    .set_body_raw(unreadable.into_bytes(), "text/event-stream"),
+                "invalid tool-call ID",
+                1,
             ),
             (
                 "complete JSON",
                 ResponseTemplate::new(200).set_body_json(json),
                 "malformed provider output",
+                3,
             ),
         ] {
             let server = MockServer::start().await;
@@ -1838,6 +1956,9 @@ mod tests {
 
             let mut config = cfg(&server.uri());
             config.kind = BackendKind::Openai;
+            // Pin the wire: the constructor default reads `NEWT_OPENAI_API`,
+            // which a concurrent test may hold at `responses` (a 404 here).
+            config.openai_api = crate::OpenAiApi::ChatCompletions;
             let mut driver = TurnDriver::new(config);
             driver.submit("do a thing").expect("submit");
             let status = pump_to_done(&mut driver).await;
@@ -1847,10 +1968,20 @@ mod tests {
             let err = o.error.expect("the rejection is carried on the outcome");
             assert!(err.contains(message), "{name}: {err}");
             assert_eq!(o.error_class, Some(ErrorClass::Model), "{name}");
-            assert_eq!(o.end_reason, None, "{name}");
-            assert!(o.tool_events.is_empty(), "{name}: nothing ran");
+            assert_eq!(o.end_reason, Some(crate::TurnEndReason::Failed), "{name}");
+            // Nothing ran; the re-asked rounds leave only not-ok markers (P0 U3).
+            assert!(
+                o.tool_events
+                    .iter()
+                    .all(|e| e.tool == "(rejected tool-call batch)" && !e.ok),
+                "{name}: nothing ran"
+            );
             let posts = server.received_requests().await.expect("journal");
-            assert_eq!(posts.len(), 1, "{name}: exactly one POST, no retry");
+            assert_eq!(
+                posts.len(),
+                expected_posts,
+                "{name}: POSTs before the abort"
+            );
         }
     }
 

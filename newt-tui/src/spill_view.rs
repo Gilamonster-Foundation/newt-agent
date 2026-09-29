@@ -32,10 +32,10 @@ impl Gutter {
         match self {
             Self::Expand => '⧉',
             Self::Collapse => '▣',
-            Self::HiddenAbove(_) => '▲',
-            Self::HiddenBelow(_) => '▼',
-            Self::Track => '▒',
-            Self::Thumb => '▓',
+            Self::HiddenAbove(_) => crate::scrollbar::SCROLL_ABOVE,
+            Self::HiddenBelow(_) => crate::scrollbar::SCROLL_BELOW,
+            Self::Track => crate::scrollbar::SCROLL_TRACK,
+            Self::Thumb => crate::scrollbar::SCROLL_THUMB,
             Self::CompletedTop => '⎵',
             Self::CompletedBottom => '⎶',
             Self::CompletedTrack => '⎴',
@@ -668,15 +668,8 @@ impl SpillView {
     }
 
     fn thumb_row(&self, start: usize, shown: usize) -> Option<usize> {
-        if shown == 0 {
-            return None;
-        }
         let max_offset = self.max_start().saturating_sub(self.dropped_lines);
-        if max_offset == 0 {
-            return None;
-        }
-        let offset = start.saturating_sub(self.dropped_lines).min(max_offset);
-        Some((offset * (shown - 1) + max_offset / 2) / max_offset)
+        crate::scrollbar::thumb_row(start.saturating_sub(self.dropped_lines), max_offset, shown)
     }
 }
 

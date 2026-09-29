@@ -3,7 +3,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use assert_cmd::Command;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -269,8 +268,7 @@ nemotron = "relentless"
     std::fs::write(workspace.path().join("tool-ground-truth.txt"), "present\n")
         .expect("write list_dir ground-truth marker");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -384,8 +382,7 @@ nemotron = "eager"
     .expect("write explicit headless config");
     std::fs::write(&instruction_path, "Complete the task.\n").expect("write instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -476,7 +473,7 @@ bounded_reasoning_continuation = true
         let workspace = fixture.path().join(format!("ws-{name}"));
         std::fs::create_dir(&workspace).expect("create headless workspace");
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command.env_remove("NEWT_TEAM");
         if obsessive {
             command.arg("--obsessive");
@@ -570,8 +567,7 @@ async fn headless_refuses_an_invalid_output_allowance_before_inference() {
             "output_allowance 40000 leaves no input room in the declared 32768-token context window",
         ),
     ] {
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
@@ -654,7 +650,7 @@ output_allowance = 12000
         let config_path = fixture.path().join(format!("{name}.toml"));
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
         std::fs::write(&config_path, config).expect("write headless config");
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command
             .env_remove("NEWT_TEAM")
             .arg("--config")
@@ -709,8 +705,7 @@ async fn headless_with_an_exhausted_run_allowance_refuses_dispatch_before_any_re
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
@@ -722,14 +717,33 @@ async fn headless_with_an_exhausted_run_allowance_refuses_dispatch_before_any_re
         .arg("--events")
         .arg(&events_path)
         .args(["--run-allowance", "0"])
+        // Changed ON PURPOSE (was `.failure()`): exhaustion is now a TYPED, clean
+        // stop filed like the round cap (exit 0, `timeout`/`incomplete`), with a
+        // harness-written notice — not an untyped `harness_error`.
         .assert()
-        .failure()
+        .success()
         .stdout(predicates::str::contains("run allowance is exhausted"));
 
     assert!(
         requests.lock().expect("request capture lock").is_empty(),
         "an exhausted run allowance must not reach the model"
     );
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
+        .expect("events")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    let result = lines
+        .iter()
+        .find(|r| r["kind"] == "solve_result")
+        .expect("solve_result");
+    assert_eq!(result["end_reason"], "Some(RunAllowance)", "{result}");
+    assert_eq!(result["status"], "incomplete");
+    let contract = lines
+        .iter()
+        .find(|r| r.get("contract_version").is_some())
+        .expect("contract");
+    assert_eq!(contract["outcome"], "timeout");
 }
 
 /// #2313: a configured, non-exhausted run allowance is reported in the
@@ -761,8 +775,7 @@ async fn headless_run_allowance_is_reported_when_set_and_absent_when_not() {
         ("unconfigured", vec![], false),
     ] {
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
             .args(["--backend-model", NEMOTRON_MODEL])
@@ -824,7 +837,7 @@ async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
         .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
     let headless = |extra: &[&std::ffi::OsStr]| {
-        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        let mut command = common::newt();
         command
             .env_remove("NEWT_TEAM")
             .args(["--backend-endpoint", &server.uri()])
@@ -902,8 +915,7 @@ async fn headless_scratchpad_state_reaches_wire_and_receipt() {
         .expect("write headless instruction");
     std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", NEMOTRON_MODEL])
@@ -992,8 +1004,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
     for kind in ["openai", "anthropic"] {
-        let output = Command::cargo_bin("newt")
-            .expect("newt binary")
+        let output = common::newt()
             .env_remove("NEWT_TEAM")
             .env_remove("NEWT_ANTHROPIC_STREAM")
             .args(["--backend-endpoint", &server.uri()])
@@ -1017,8 +1028,7 @@ async fn headless_prints_the_final_answer_exactly_once_on_every_wire() {
 
     // The answer is shown before anything that can fail: an unwritable
     // --events path (a directory) fails the run, and the claim is still there.
-    let output = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let output = common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
@@ -1068,8 +1078,7 @@ async fn headless_prints_a_harness_written_reply_as_a_notice_not_a_claim() {
     let instruction_path = fixture.path().join("instruction.md");
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
-    let output = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let output = common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "m"])
@@ -1139,8 +1148,7 @@ kind = "openai"
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--backend-endpoint", &server.uri()])
         .args(["--backend-model", "operator-model"])
@@ -1218,8 +1226,7 @@ api = "chat_completions"
     std::fs::write(&instruction_path, "Finish without calling a tool.\n")
         .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .args(["--cognition", "meticulous"])
         .arg("--config")
@@ -1283,7 +1290,10 @@ api = "chat_completions"
 // read-only round a DISTINCT path, so the rounds are burned the way the
 // captured run burned them — by legitimate, succeeding, redundant work — and
 // not by a mechanism that already has its own guard.
-const CAP_ROUNDS: usize = 8;
+// Three writes + one fresh read + seven duplicate observations exceed the
+// bundled workflows' six-round recent-progress horizon without hitting the
+// twelve-round no-progress brake. This tests the renewable allowance expiring.
+const CAP_ROUNDS: usize = 11;
 const EARLY_WRITES: usize = 3;
 
 /// Reads the ONE `solve_result` line. Sibling of [`contract_from`], which
@@ -1367,6 +1377,16 @@ impl Respond for WritesEarlyThenGrindsReadOnly {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn round_cap_exit_is_not_reported_as_a_completed_run() {
+    assert_round_cap_exit(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_zero_grace_stops_fresh_evidence_at_the_round_cap() {
+    assert_round_cap_exit(true).await;
+}
+
+async fn assert_round_cap_exit(hard_cap: bool) {
+    let cap_rounds = if hard_cap { 8 } else { CAP_ROUNDS };
     let server = MockServer::start().await;
     let rounds_served = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -1381,17 +1401,27 @@ async fn round_cap_exit_is_not_reported_as_a_completed_run() {
     let workspace = tempfile::tempdir().expect("temporary headless workspace");
     let src = workspace.path().join("src");
     std::fs::create_dir_all(&src).expect("workspace src dir");
-    // One readable seed per grinding round, so every read SUCCEEDS. A grind
-    // made of failures would be a different defect (thrash), already covered by
-    // `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit`.
-    for n in 0..(CAP_ROUNDS + 4) {
+    // Distinct paths ensure every read executes. Identical bytes provide no new
+    // evidence after the first read, giving the default cap a controlled stall.
+    // The explicit hard-cap case instead supplies fresh evidence every round:
+    // zero grace must stop even useful work at the operator's chosen bound.
+    for n in 0..(cap_rounds + 4) {
         std::fs::write(
             src.join(format!("seed_{n}.rs")),
-            format!("pub const SEED_{n}: u32 = {n};\n"),
+            if hard_cap {
+                format!("pub const SEED_{n}: u32 = {n};\n")
+            } else {
+                "pub const OBSERVED: u32 = 0;\n".to_string()
+            },
         )
         .expect("write seed file");
     }
 
+    let round_policy = if hard_cap {
+        "\n[tui]\nworkflow_grace_rounds = 0\n"
+    } else {
+        ""
+    };
     let config_path = workspace.path().join("headless.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
@@ -1405,6 +1435,7 @@ name = "capped"
 endpoint = "{}"
 model = "{NEMOTRON_MODEL}"
 kind = "openai"
+{round_policy}
 "#,
             server.uri()
         ),
@@ -1416,8 +1447,7 @@ kind = "openai"
     )
     .expect("write headless instruction");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -1427,7 +1457,7 @@ kind = "openai"
         .arg(&instruction_path)
         .arg("--events")
         .arg(&events_path)
-        .args(["--max-rounds", &CAP_ROUNDS.to_string()])
+        .args(["--max-rounds", &cap_rounds.to_string()])
         .assert()
         .success();
 
@@ -1440,12 +1470,12 @@ kind = "openai"
     // rather than any capped run.
     let served = rounds_served.load(Ordering::SeqCst);
     assert_eq!(
-        served, CAP_ROUNDS,
-        "the scripted model must have served exactly {CAP_ROUNDS} tool rounds; \
+        served, cap_rounds,
+        "the scripted model must have served exactly {cap_rounds} tool rounds; \
          served {served} — the replay did not run the trajectory it claims to"
     );
     assert_eq!(
-        result["tool_calls"], CAP_ROUNDS as u64,
+        result["tool_calls"], cap_rounds as u64,
         "the harness must have dispatched every scripted round: {result}"
     );
     assert_eq!(
@@ -1467,6 +1497,17 @@ kind = "openai"
         writes_ok, EARLY_WRITES,
         "the early writes must have SUCCEEDED, not merely been attempted: {result}"
     );
+    let reads_ok = result["trajectory"]
+        .as_array()
+        .expect("trajectory is an array")
+        .iter()
+        .filter(|e| e["tool"] == "read_file" && e["ok"] == true)
+        .count();
+    assert_eq!(
+        reads_ok,
+        cap_rounds - EARLY_WRITES,
+        "every distinct-path tail read must execute successfully: {result}"
+    );
 
     // ── the typed grind measurement (#2214) ───────────────────────────────
     // RED against e3f42a36: the record has no such key, so this reads `null`.
@@ -1476,14 +1517,14 @@ kind = "openai"
     // from a genuinely-too-small cap, all three of which say `RoundCap` today.
     //
     // The expected value is in CALLS, not rounds. It equals
-    // `CAP_ROUNDS - EARLY_WRITES` only because this scripted model issues
+    // `cap_rounds - EARLY_WRITES` only because this scripted model issues
     // exactly one call per round; a fixture that ever batches two calls into a
     // round must recompute it from the trajectory rather than from the round
-    // counts. 5 is neither 0 nor `tool_calls` (8), so neither a constant-zero
-    // implementation nor an off-by-the-whole-length one passes.
+    // counts. The tail is neither zero nor the whole trajectory, so neither
+    // a constant-zero implementation nor an off-by-the-whole-length one passes.
     assert_eq!(
         result["calls_after_last_write"],
-        (CAP_ROUNDS - EARLY_WRITES) as u64,
+        (cap_rounds - EARLY_WRITES) as u64,
         "the run spent its whole tail after the work was done; that must be a \
          value a gate can assert, not prose in the reply: {result}"
     );
@@ -1537,21 +1578,10 @@ kind = "openai"
     );
 }
 
-/// #2318: a 2xx OpenAI stream that strict decoding rejects (a tool call without
-/// an id) is the model's answer, so the headless contract files it `model_error`.
-/// Its class used to be lost and the run filed as `harness_error`, which the
-/// bench excludes from capability scoring as the harness's fault.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_strictly_rejected_stream_files_as_model_error() {
+/// Drive `newt headless` against one fixed SSE reply on every POST; returns the
+/// POST count, the `solve_result` line and the contract record.
+async fn headless_against_stream(stream: String) -> (usize, serde_json::Value, serde_json::Value) {
     let server = MockServer::start().await;
-    let stream = [
-        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
-        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-        "[DONE]",
-    ]
-    .iter()
-    .map(|frame| format!("data: {frame}\n\n"))
-    .collect::<String>();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
@@ -1579,8 +1609,7 @@ kind = "openai"
     .expect("write headless config");
     std::fs::write(&instruction_path, "Read the seed file.\n").expect("write headless instruction");
 
-    let _ = Command::cargo_bin("newt")
-        .expect("newt binary")
+    let _ = common::newt()
         .env_remove("NEWT_TEAM")
         .arg("--config")
         .arg(&config_path)
@@ -1592,22 +1621,213 @@ kind = "openai"
         .arg(&events_path)
         .assert();
 
-    let posts: Vec<_> = server
+    let posts = server
         .received_requests()
         .await
         .expect("journal")
         .into_iter()
         .filter(|request| request.method.as_str() == "POST")
-        .collect();
-    assert_eq!(
-        posts.len(),
-        1,
-        "exactly one POST: the rejection is not retried"
-    );
+        .count();
+    (
+        posts,
+        solve_result_from(&events_path),
+        contract_from(&events_path),
+    )
+}
+
+/// A streamed `read_file` call; `id` is the raw JSON fragment for the id member
+/// (empty = the key is absent).
+fn streamed_read_file_call(id: &str) -> String {
+    [
+        format!(
+            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,{id}"type":"function","function":{{"name":"read_file","arguments":"{{}}"}}}}]}}}}]}}"#
+        ),
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "[DONE]".to_string(),
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect()
+}
+
+/// A streamed `lifecycle` call with the given raw (already-JSON) arguments.
+fn streamed_lifecycle_call(args_json: &str) -> String {
+    let escaped = args_json.replace('\\', "\\\\").replace('"', "\\\"");
+    [
+        format!(
+            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"lifecycle","arguments":"{escaped}"}}}}]}}}}]}}"#
+        ),
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "[DONE]".to_string(),
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect()
+}
+
+async fn headless_lifecycle_build_attempt(
+    scratch_field: Option<&str>,
+) -> (tempfile::TempDir, serde_json::Value) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed_lifecycle_call(r#"{"phase":"test","action":"build"}"#),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let fixture = tempfile::tempdir().expect("temporary headless fixture");
+    let workspace = fixture.path().join("workspace");
+    let ordinary_temp = fixture.path().join("ordinary-temp");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&ordinary_temp).expect("ordinary temp");
+    // An empty `Cargo.toml` is enough for the Rust language pack's `detect`
+    // marker (tooling.rs), so `phase=test` resolves to a real command
+    // instead of the "no command configured" no-op.
+    std::fs::write(workspace.as_path().join("Cargo.toml"), "").expect("write Cargo.toml marker");
+    let config_path = workspace.as_path().join("headless.toml");
+    let instruction_path = workspace.as_path().join("instruction.md");
+    let events_path = workspace.as_path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "strict"
+
+[[backends]]
+name = "strict"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write headless config");
+    if let Some(field) = scratch_field {
+        let configured = fixture.path().join("configured-scratch");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let value = toml::Value::String(configured.to_string_lossy().into_owned());
+        std::fs::write(
+            &config_path,
+            format!("{config}\n[scratch]\n{field} = {value}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(&instruction_path, "Verify the change builds.\n")
+        .expect("write headless instruction");
+
+    let _ = common::newt()
+        .env_remove("NEWT_TEAM")
+        .env_remove("NEWT_SCRATCH_DIR")
+        .env_remove("NEWT_BUILD_SCRATCH_DIR")
+        .env("TMPDIR", &ordinary_temp)
+        .env("TEMP", &ordinary_temp)
+        .env("TMP", &ordinary_temp)
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.as_path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert();
+
     let result = solve_result_from(&events_path);
+    (fixture, result)
+}
+
+/// F12 review item 2 (verify-lane-steering round 2): MEASURE what
+/// `lifecycle action=build` does headless, where `permission_gate` is
+/// `None`. Measured here: it is NOT denied. `headless`'s default caveats
+/// (`confined_bench_caveats` — fs_read/exec/net = `Scope::All`, only
+/// fs_write fenced to the workspace/scratch) already dominate what
+/// `build_tool_request` calibrates for the build (fenced reads, a
+/// workspace-scoped write root, caller-authorized network), so `build.leq(caveats)`
+/// is true and the `permission_gate.is_some_and(...)` check — the only
+/// place a `None` gate could matter — is never reached at all. The
+/// absent-gate case this review item worried about does not occur in
+/// practice under headless's actual default caveats.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_lifecycle_action_build_runs_ungated_by_default_caveats() {
+    let (_fixture, result) = headless_lifecycle_build_attempt(None).await;
+    let trajectory = result["trajectory"].as_array().expect("trajectory");
+    assert!(
+        !trajectory.is_empty(),
+        "at least one dispatched call: {result}"
+    );
+    for entry in trajectory {
+        assert_eq!(entry["tool"], "lifecycle", "{entry}");
+        assert_eq!(entry["ok"], false, "{entry}");
+    }
+    // MEASURED (not the brief's assumption): with headless's default caveats
+    // (`confined_bench_caveats` — fs_read/exec/net = Scope::All, only
+    // fs_write fenced to the workspace/scratch), `build.leq(caveats)` is
+    // already TRUE — the calibrated build caveats (fenced reads,
+    // workspace-scoped writes, caller-authorized network) are a subset of what headless
+    // already grants. So the `!build.leq(caveats)` gate check never fires and
+    // `permission_gate` is never consulted: the command actually RUNS.
+    // "denied" never appears; the FIRST call's real execution classifies as
+    // "failed" (this workspace's empty `Cargo.toml` makes the real `cargo
+    // test` fail to compile) — a genuine command outcome, not a capability
+    // refusal. Later identical retries are deduplicated and carry no
+    // `execution` (not re-run), which is why only entry 0 is checked here.
+    // The pinned property is "never denied for want of a gate"; whether the
+    // confined lane can run at all is per platform (Windows reports
+    // `unavailable`), so the concrete "failed" is asserted on Linux only.
+    assert_ne!(trajectory[0]["execution"], "denied", "{}", trajectory[0]);
+    #[cfg(target_os = "linux")]
+    assert_eq!(trajectory[0]["execution"], "failed", "{}", trajectory[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_scratch_overrides_do_not_authorize_external_build_partitions() {
+    for field in ["dir", "build_dir"] {
+        let (fixture, result) = headless_lifecycle_build_attempt(Some(field)).await;
+        let trajectory = result["trajectory"].as_array().expect("trajectory");
+        assert!(!trajectory.is_empty(), "{field}: {result}");
+        assert_eq!(trajectory[0]["tool"], "lifecycle", "{field}: {result}");
+        assert_eq!(trajectory[0]["execution"], "denied", "{field}: {result}");
+        assert!(!fixture.path().join("configured-scratch").exists());
+        assert!(!fixture.path().join("workspace/target").exists());
+    }
+}
+
+/// #2318: a 2xx OpenAI stream that strict decoding rejects (here a tool call
+/// whose id is not a string, which cannot be read at all) is the model's answer,
+/// so the headless contract files it `model_error`. Its class used to be lost
+/// and the run filed as `harness_error`, which the bench excludes from
+/// capability scoring as the harness's fault. (A MISSING id used to be the
+/// example; it is now the batch validator's, re-asked — see the next test.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strictly_rejected_stream_files_as_model_error() {
+    let (posts, result, contract) =
+        headless_against_stream(streamed_read_file_call(r#""id":7,"#)).await;
+    assert_eq!(posts, 1, "exactly one POST: the rejection is not retried");
     assert_eq!(result["tool_calls"], 0, "nothing ran: {result}");
-    assert_eq!(result["end_reason"], "None", "{result}");
-    let contract = contract_from(&events_path);
+    assert_eq!(result["end_reason"], "Some(Failed)", "{result}");
+    assert_eq!(contract["outcome"], "model_error", "{contract}");
+}
+
+/// U3: a streamed tool call with NO id reaches the shared batch validator and is
+/// re-asked within its bounded budget; the third id-less batch ends the turn as
+/// the model's error, with nothing dispatched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_idless_call_is_re_asked_then_files_as_model_error() {
+    let (posts, result, contract) = headless_against_stream(streamed_read_file_call("")).await;
+    assert_eq!(posts, 3, "two re-asks, then the third id-less batch aborts");
+    // The re-asked rounds leave only not-ok rejection markers: nothing ran.
+    let trajectory = result["trajectory"].as_array().expect("trajectory");
+    assert_eq!(trajectory.len(), 2, "one marker per re-ask: {result}");
+    assert!(
+        trajectory
+            .iter()
+            .all(|e| e["tool"] == "(rejected tool-call batch)" && e["ok"] == false),
+        "nothing was dispatched: {result}"
+    );
     assert_eq!(contract["outcome"], "model_error", "{contract}");
 }
 
@@ -1641,8 +1861,7 @@ async fn headless_reports_verification_off_where_the_loop_has_no_gate() {
         let events_path = fixture.path().join("events.jsonl");
         std::fs::write(&instruction_path, "Finish without calling a tool.\n")
             .expect("write headless instruction");
-        Command::cargo_bin("newt")
-            .expect("newt binary")
+        common::newt()
             .env_remove("NEWT_TEAM")
             .env("NEWT_SELF_VERIFY", "1")
             .env("NEWT_VERIFY_OUTCOMES", "1")
@@ -1713,7 +1932,7 @@ kind = "openai"
     }
     std::fs::write(&config_path, config).expect("write headless config");
     std::fs::write(&instruction_path, "Say done.\n").expect("write headless instruction");
-    let mut command = Command::cargo_bin("newt").expect("newt binary");
+    let mut command = common::newt();
     command
         .env_remove("NEWT_TEAM")
         .arg("--config")
@@ -1828,4 +2047,1004 @@ async fn headless_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
         .expect("a solve_result line on stdout");
     assert!(result["usage"]["attempts"].as_u64() > Some(0), "{result}");
     assert!(result["usage"].get("ledger_head").is_none(), "{result}");
+}
+
+#[path = "headless_cli/cognition.rs"]
+mod cognition;
+
+/// Answers the first chat request with a `write_file` tool call and every later
+/// one with a 500, so the run fails part-way AFTER one real write.
+struct WriteThenFail {
+    sequence: AtomicUsize,
+}
+
+impl Respond for WriteThenFail {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.sequence.fetch_add(1, Ordering::SeqCst) > 0 {
+            return ResponseTemplate::new(500).set_body_string("upstream exploded");
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "w0",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"out.txt\",\"content\":\"partial\\n\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+}
+
+/// U7: a run that dies part-way must still tell the dispatcher what it left
+/// behind. The harness (not the model) writes `handback` on the solve_result
+/// line: the workspace delta from the git probe, the end reason, and whether the
+/// model said anything at all. Grounds the mocked `handback` unit tests with a
+/// real git workspace and a real `write_file`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_fails_after_a_write_hands_back_what_it_changed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenFail {
+            sequence: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let control = tempfile::tempdir().expect("control dir outside the workspace");
+    let workspace = tempfile::tempdir().expect("temporary headless workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    std::fs::write(workspace.path().join("dirty-before.txt"), "x\n").expect("pre-existing dirt");
+    let config_path = control.path().join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = control.path().join("task.md");
+    std::fs::write(&instruction, "Write out.txt.\n").expect("write instruction");
+    let events_path = control.path().join("events.jsonl");
+
+    common::newt()
+        .env_remove("NEWT_TEAM")
+        .env("NEWT_HTTP_MAX_RETRIES", "0")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "4"])
+        .assert()
+        .failure();
+
+    let result: serde_json::Value = std::fs::read_to_string(&events_path)
+        .expect("read headless events")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("event line is JSON"))
+        .find(|r| r["kind"] == "solve_result")
+        .expect("a solve_result line");
+    assert_eq!(result["status"], "failed", "{result}");
+    let handback = &result["handback"];
+    assert_eq!(
+        handback["files_changed"],
+        serde_json::json!(["out.txt"]),
+        "{result}"
+    );
+    assert_eq!(handback["files_changed_source"], "git_status_delta");
+    assert_eq!(handback["files_changed_truncated"], false);
+    assert_eq!(handback["model_reply_present"], false);
+    assert!(handback["end_reason"].is_string(), "{handback}");
+    // #2537: `uncommitted_files` is the CURRENT dirty set at exit, unlike
+    // `files_changed` (a delta from run start) — so it also names the dirt
+    // that existed before the run started, since none of it was committed.
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["dirty-before.txt", "out.txt"]),
+        "{result}"
+    );
+    assert_eq!(handback["uncommitted_files_source"], "git_status");
+    // No commit ever landed (repo has no HEAD at all) — the field is absent.
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// A `solve_result.handback` line for a no-tool-call reply against `workspace`
+/// (fixture must contain the config+instruction the caller already wrote).
+async fn handback_from_a_no_op_run(
+    server: &MockServer,
+    workspace: &std::path::Path,
+    control: &std::path::Path,
+) -> serde_json::Value {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "done, nothing to change"}, "finish_reason": "stop"}]
+        })))
+        .mount(server)
+        .await;
+    let config_path = control.join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = control.join("task.md");
+    std::fs::write(&instruction, "Just answer, don't touch anything.\n")
+        .expect("write instruction");
+    let events_path = control.join("events.jsonl");
+    common::newt()
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+    std::fs::read_to_string(&events_path)
+        .expect("read headless events")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("event line is JSON"))
+        .find(|r| r["kind"] == "solve_result")
+        .expect("a solve_result line")["handback"]
+        .clone()
+}
+
+/// #2537 item 4, edge case 1: a workspace that is not a git repository at all
+/// must hand back a sensible "unavailable" — never an error, and never a
+/// fabricated empty list that would read as "nothing changed".
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_unavailable_off_a_non_git_workspace() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("non-git workspace");
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert!(handback["uncommitted_files"].is_null(), "{handback}");
+    assert_eq!(handback["uncommitted_files_source"], "unavailable");
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// #2537 item 4, edge case 2: a run that touches nothing in a clean repo
+/// reports an empty uncommitted list (distinguishable from "unavailable")
+/// and no `commits` field, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_a_clean_repo_when_the_run_touched_nothing() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!([]),
+        "{handback}"
+    );
+    assert_eq!(handback["uncommitted_files_source"], "git_status");
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// Multi-repo recon PR2 (red first, end to end): a bare folder holding two
+/// git repos, one with a real uncommitted edit — the hand-back must name
+/// that repo and file, never a bare "unavailable" (RECON.md row 5's
+/// measured gap).
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_reports_nested_repos_at_a_bare_multi_repo_root() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("bare multi-repo root");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    let repo_a = workspace.path().join("repoA");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    git(&repo_a, &["init", "-q"]);
+    git(&repo_a, &["config", "user.email", "t@example.com"]);
+    git(&repo_a, &["config", "user.name", "t"]);
+    std::fs::write(repo_a.join("a.txt"), "one\n").unwrap();
+    git(&repo_a, &["add", "a.txt"]);
+    git(&repo_a, &["commit", "-q", "-m", "init"]);
+    std::fs::write(repo_a.join("a.txt"), "one\ntwo\n").unwrap(); // uncommitted edit
+    let repo_b = workspace.path().join("repoB");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    git(&repo_b, &["init", "-q"]);
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files_source"], "nested-repos",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["repoA/a.txt"]),
+        "{handback}"
+    );
+    let by_repo = handback["uncommitted_files_by_repo"]
+        .as_array()
+        .expect("per-repo breakdown present");
+    assert!(
+        by_repo
+            .iter()
+            .any(|r| r["repo"] == "repoA" && r["files"] == serde_json::json!(["a.txt"])),
+        "{handback}"
+    );
+    assert!(
+        by_repo
+            .iter()
+            .any(|r| r["repo"] == "repoB" && r["files"] == serde_json::json!([])),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_unprobed").is_none(),
+        "both repos probed cleanly: {handback}"
+    );
+}
+
+/// A root that IS itself a git repo is byte-identical to today: the nested
+/// path is never reached, `files_changed_source`/`uncommitted_files_source`
+/// stay `"git_status_delta"`/`"git_status"`, and no per-repo/unprobed field
+/// appears at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_real_repo_root_is_unaffected_by_nested_repo_support() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["files_changed_source"], "git_status_delta",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status",
+        "{handback}"
+    );
+    assert!(
+        handback.get("files_changed_by_repo").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("files_changed_unprobed").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_by_repo").is_none(),
+        "{handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_unprobed").is_none(),
+        "{handback}"
+    );
+}
+
+/// #2552 round 2 (red first, end to end): the exact blocker scenario. An
+/// outer repo with an edit, and a `workspace/` subfolder (itself no `.git`)
+/// holding nested repo `inner/` with its own edit. The hand-back must name
+/// `inner`'s edit in BOTH `files_changed` and `uncommitted_files`, and
+/// `outer.txt` must appear in NEITHER field, NOR any `*_by_repo` breakdown —
+/// before round 2's fix, `uncommitted_files` (sourced from `GitEngine::open`,
+/// which discovers upward same as the shelled `git`) reported the outer
+/// repo's whole dirty set, and `files_changed`'s nested probe never ran at
+/// all (gated on `snapshot_workspace`'s `None`, which the F26 v2 scoped
+/// branch no longer returned for this case).
+///
+/// Round 3 update: `workspace` genuinely IS a subdirectory of the outer
+/// repo (`WorkspaceRepoLocation::InsideRepo`, not `NotARepo` — it only
+/// LOOKED like the bare-multi-repo-root case because it has no `.git` of
+/// its own; `outer/` does), so the source is now the more accurate
+/// `"git_status_subtree"`, not `"nested-repos"` (reserved for a workspace
+/// that is not inside ANY repo at all). `inner`'s edit still surfaces via
+/// the SAME `by_repo` mechanism the round-2 fix added, now folded into the
+/// `InsideRepo` case per round 3's review table ("if first-level nested
+/// repos also exist, report both").
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_repo_subdirectory_reports_only_its_nested_repo_never_the_enclosing_one() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let outer = tempfile::tempdir().expect("outer repo");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(outer.path(), &["init", "-q"]);
+    git(outer.path(), &["config", "user.email", "t@example.com"]);
+    git(outer.path(), &["config", "user.name", "t"]);
+    std::fs::write(outer.path().join("outer.txt"), "one\n").unwrap();
+    git(outer.path(), &["add", "outer.txt"]);
+    git(outer.path(), &["commit", "-q", "-m", "outer init"]);
+    std::fs::write(outer.path().join("outer.txt"), "one\ntwo\n").unwrap(); // outer edit
+
+    let workspace = outer.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let inner = workspace.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    git(&inner, &["init", "-q"]);
+    git(&inner, &["config", "user.email", "t@example.com"]);
+    git(&inner, &["config", "user.name", "t"]);
+    std::fs::write(inner.join("i.txt"), "one\n").unwrap();
+    git(&inner, &["add", "i.txt"]);
+    git(&inner, &["commit", "-q", "-m", "inner init"]);
+    std::fs::write(inner.join("i.txt"), "one\ntwo\n").unwrap(); // inner edit
+
+    let handback = handback_from_a_no_op_run(&server, &workspace, control.path()).await;
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("outer.txt"),
+        "outer.txt must appear in no field: {handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status_subtree",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["inner/i.txt"]),
+        "{handback}"
+    );
+    assert_eq!(
+        handback["files_changed_source"], "git_status_subtree",
+        "{handback}"
+    );
+    // The delta needs a matching before/after probe of the SAME repo; a
+    // no-op run's `files_changed` delta legitimately stays empty since
+    // `inner`'s edit predates the run start — `uncommitted_files` (the
+    // CURRENT set, needing no "before") is the field that must carry it,
+    // asserted above. `files_changed_source` alone pins that the subtree
+    // path was reached at all, not the enclosing repo's unscoped
+    // `"git_status_delta"`.
+}
+
+/// #2552 round 2 should-fix (red first, end to end): a first-level entry
+/// that is a SYMLINK to a repo OUTSIDE the workspace must never be probed —
+/// its files must not reach the hand-back at all.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn handback_never_probes_a_symlinked_first_level_dir_pointing_outside() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("bare workspace root");
+    let outside = tempfile::tempdir().expect("outside repo");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(outside.path(), &["init", "-q"]);
+    git(outside.path(), &["config", "user.email", "t@example.com"]);
+    git(outside.path(), &["config", "user.name", "t"]);
+    std::fs::write(outside.path().join("secret.txt"), "leak\n").unwrap();
+    git(outside.path(), &["add", "secret.txt"]);
+    git(outside.path(), &["commit", "-q", "-m", "init"]);
+    std::fs::write(outside.path().join("secret.txt"), "leak\nmore\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join("ext")).expect("symlink");
+
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("secret.txt"),
+        "a symlinked first-level dir must never be probed: {handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files_source"], "unavailable",
+        "no real nested repo exists (the symlink is skipped), so this stays \
+         unavailable exactly like an empty bare folder: {handback}"
+    );
+}
+
+/// #2552 round 2 (red first, end to end): a symlinked SPELLING of the
+/// workspace root that IS itself a real repo root must take the root
+/// branch, not be mistaken for "a subdirectory of the real path" by a
+/// lexical (rather than canonicalized) toplevel comparison.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn handback_at_a_symlinked_repo_root_takes_the_root_branch() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let real = tempfile::tempdir().expect("real repo root");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(real.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(real.path().join("a.txt"), "one\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(real.path().join("a.txt"), "one\ntwo\n").unwrap();
+
+    let link = real
+        .path()
+        .parent()
+        .expect("tempdir has a parent")
+        .join(format!(
+            "symlink-{}",
+            real.path().file_name().unwrap().to_string_lossy()
+        ));
+    std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+
+    let handback = handback_from_a_no_op_run(&server, &link, control.path()).await;
+    std::fs::remove_file(&link).ok();
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status",
+        "a symlinked spelling of a real repo root must still take the root \
+         branch, not the nested-repos path: {handback}"
+    );
+    assert!(
+        handback.get("uncommitted_files_by_repo").is_none(),
+        "{handback}"
+    );
+}
+
+/// #2552 round 3 (red first, end to end): the review's ruling scenario —
+/// `--cwd repo/crate` with an edit inside `crate/` and one outside it at the
+/// repo root. Round 2 made this render `"unavailable"` for every field
+/// (dropping F26 v2's subtree scoping entirely); round 3 restores it as a
+/// real third case with a DISTINCT source, `"git_status_subtree"`, so a
+/// consumer can tell the list is scoped to a subdirectory. Only the inside
+/// edit must appear, workspace-relative (no `crate/` prefix).
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_at_a_repo_subdirectory_reports_only_the_subtree_edit_with_a_distinct_source() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let repo = tempfile::tempdir().expect("repo root");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    let crate_dir = repo.path().join("crate");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+    std::fs::write(repo.path().join("root.txt"), "one\n").unwrap();
+    std::fs::write(crate_dir.join("lib.rs"), "one\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "init"]);
+    // Edit one file outside the workspace (repo root), one inside it (crate/).
+    std::fs::write(repo.path().join("root.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(crate_dir.join("lib.rs"), "one\ntwo\n").unwrap();
+
+    let handback = handback_from_a_no_op_run(&server, &crate_dir, control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files_source"], "git_status_subtree",
+        "{handback}"
+    );
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!(["lib.rs"]),
+        "workspace-relative, no crate/ prefix, and never root.txt: {handback}"
+    );
+    let dump = handback.to_string();
+    assert!(
+        !dump.contains("root.txt"),
+        "the outside-the-workspace edit must appear in no field: {handback}"
+    );
+}
+
+/// #2537 item 4, edge case 3: a detached HEAD must not crash or misreport —
+/// the same clean/no-commits result as a normal branch checkout.
+#[tokio::test(flavor = "multi_thread")]
+async fn handback_stays_sane_under_a_detached_head() {
+    let server = MockServer::start().await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("git workspace");
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git")
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").expect("seed file");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("rev-parse");
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    git(&["checkout", "-q", "--detach", &head]);
+    let handback = handback_from_a_no_op_run(&server, workspace.path(), control.path()).await;
+    assert_eq!(
+        handback["uncommitted_files"],
+        serde_json::json!([]),
+        "{handback}"
+    );
+    assert_eq!(handback["uncommitted_files_source"], "git_status");
+    assert!(handback.get("commits").is_none(), "{handback}");
+}
+
+/// One `write_file`, then `list_dir` forever: after a real write every further
+/// round changes nothing and verifies nothing. Records each request body.
+struct WriteThenGrind {
+    sequence: AtomicUsize,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Respond for WriteThenGrind {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("chat body");
+        self.requests.lock().expect("capture").push(body);
+        let n = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let (name, arguments) = if n == 0 {
+            ("write_file", "{\"path\":\"out.txt\",\"content\":\"x\\n\"}")
+        } else {
+            ("list_dir", "{\"path\":\".\"}")
+        };
+        if request.url.path() == "/v1/responses" {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": format!("resp_{n}"), "status": "completed", "model": "m",
+                "output": [{"type": "function_call", "id": format!("fc_{n}"),
+                    "call_id": format!("c{n}"), "name": name, "arguments": arguments,
+                    "status": "completed"}]
+            }));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": format!("c{n}"), "type": "function",
+                        "function": {"name": name, "arguments": arguments}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+}
+
+/// U4b: a successful write followed by N rounds that change and verify nothing
+/// is steered at `steer_after` and ends, typed, at `stop_after` — filed like the
+/// round cap (`timeout` / `incomplete`), with a harness-written notice and NO
+/// model summary call. The thresholds are configuration (`[initiative.no_progress]`).
+async fn assert_write_then_no_progress_stops(api: &str) {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenGrind {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(WriteThenGrind {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config_path = control.path().join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n\n[initiative.no_progress]\nsteer_after = 2\nstop_after = 3\n",
+            server.uri()
+        ),
+    )
+    .expect("config");
+    let instruction = control.path().join("task.md");
+    std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
+    let events_path = control.path().join("events.jsonl");
+
+    common::newt()
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["--backend-api", api])
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "40"])
+        .assert()
+        .success();
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
+        .expect("events")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    let result = lines
+        .iter()
+        .find(|r| r["kind"] == "solve_result")
+        .expect("solve_result");
+    assert_eq!(result["end_reason"], "Some(NoProgress)", "{result}");
+    assert_eq!(result["status"], "incomplete");
+    assert!(
+        result["reply_chars"].as_u64().unwrap() > 0,
+        "harness notice: {result}"
+    );
+    let contract = lines
+        .iter()
+        .find(|r| r.get("contract_version").is_some())
+        .expect("contract");
+    assert_eq!(contract["outcome"], "timeout");
+
+    let requests = requests.lock().expect("capture");
+    assert_eq!(
+        requests.len(),
+        5,
+        "write, new directory evidence, then three grinding rounds; no summary call"
+    );
+    assert!(
+        requests.iter().all(|r| r.get("tools").is_some()),
+        "no tools-disabled summary"
+    );
+    // Chat bodies carry `messages`; Responses bodies carry `input`.
+    let last_messages = requests[4]
+        .get("messages")
+        .or_else(|| requests[4].get("input"))
+        .expect("messages or input")
+        .to_string();
+    assert!(
+        last_messages.contains("rounds produced no new evidence"),
+        "the steer must precede the final round: {last_messages}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_then_no_progress_is_steered_then_stopped_like_a_cap() {
+    assert_write_then_no_progress_stops("chat").await;
+}
+
+/// Review fix 5 (RED first): the Responses loop had no brake at all, so the same
+/// stall ran to the round cap on that wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_then_no_progress_is_stopped_on_the_responses_wire_too() {
+    assert_write_then_no_progress_stops("responses").await;
+}
+
+/// A `write_file` (with an id), then only tool calls that carry NO id: each such
+/// batch is re-asked (not run, not recorded as a round outcome), and a third in
+/// a row would abort the run.
+struct WriteThenIdless {
+    sequence: AtomicUsize,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Respond for WriteThenIdless {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("chat body");
+        self.requests.lock().expect("capture").push(body);
+        let n = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let call = if n == 0 {
+            serde_json::json!({"id": "c0", "type": "function", "function": {
+                "name": "write_file", "arguments": "{\"path\":\"out.txt\",\"content\":\"x\\n\"}"}})
+        } else {
+            serde_json::json!({"type": "function", "function": {
+                "name": "list_dir", "arguments": "{\"path\":\".\"}"}})
+        };
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": "m",
+            "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                "finish_reason": "tool_calls"}]
+        }))
+    }
+}
+
+/// The interaction of the brake with #2500's id-less re-ask: a re-ask round
+/// `continue`s past `record_round_outcome`, but it is a completed model round that
+/// changed nothing. The gate counts it, and it does not reset the brake, so the
+/// brake (`stop_after = 2`) ends the run BEFORE the third id-less batch would
+/// abort it. Were re-asks uncounted, the run would fail with the correlation
+/// error instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idless_reask_round_is_counted_by_the_brake_and_does_not_reset_it() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WriteThenIdless {
+            sequence: AtomicUsize::new(0),
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let control = tempfile::tempdir().expect("control dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config_path = control.path().join("cfg.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n\n[initiative.no_progress]\nsteer_after = 0\nstop_after = 2\n",
+            server.uri()
+        ),
+    )
+    .expect("config");
+    let instruction = control.path().join("task.md");
+    std::fs::write(&instruction, "Write out.txt, then stop.\n").expect("instruction");
+    let events_path = control.path().join("events.jsonl");
+
+    common::newt()
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "40"])
+        .assert()
+        .success();
+
+    let result = solve_result_from(&events_path);
+    assert_eq!(result["end_reason"], "Some(NoProgress)", "{result}");
+    assert_eq!(result["status"], "incomplete");
+    assert!(
+        result["error"].is_null(),
+        "not the correlation abort: {result}"
+    );
+    assert_eq!(
+        requests.lock().expect("capture").len(),
+        3,
+        "the write, then two re-asked rounds; the stop precedes a third"
+    );
+}
+
+/// #2524 item 1, end-to-end: a signed `~/.newt/ocap/approve.toml` `[[fs]]`
+/// read grant for a path OUTSIDE the workspace is admitted into a real
+/// `newt headless` run's caveats and is visible on the contract record's
+/// `effective_config.durable_grants` (the observability requirement).
+/// Isolated via `common::newt()` (a throwaway `$HOME`); the signing key and
+/// store live ONLY under that throwaway `.newt/`, never the real one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_contract() {
+    const CLAIM: &str = "FINAL-CLAIM-2524-ocap-grant";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": CLAIM}, "finish_reason": "stop"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = common::newt();
+    let home = cmd.home().to_path_buf();
+    common::isolate_loopback_chat(&mut *cmd, &home);
+    let config_dir = cmd.config_dir();
+
+    // The disposable ROOT identity + a signed approve entry for a path
+    // outside the workspace — never the real `~/.newt/identity.pem`.
+    let key = newt_identity::UserKey::generate();
+    let identity_path = config_dir.join("identity.pem");
+    key.save(&identity_path).expect("save disposable root key");
+    let ocap_dir = config_dir.join("ocap");
+    std::fs::create_dir_all(&ocap_dir).expect("ocap dir");
+    let granted_path = home.join("outside-canvas-token");
+    std::fs::write(&granted_path, "token\n").expect("write outside file");
+    let mut file = newt_core::ocap_store::PolicyFile::parse(&format!(
+        // A TOML literal string: a Windows path's `\U…` is not an escape.
+        "[[fs]]\npath = '{}'\n",
+        granted_path.display()
+    ))
+    .expect("parse approve.toml");
+    let (signed, refused) = newt_core::ocap_store::sign_approves(
+        &mut file,
+        |_, _| false,
+        |payload| key.sign(payload).to_bytes(),
+    );
+    assert_eq!(signed, 1);
+    assert!(refused.is_empty());
+    std::fs::write(
+        ocap_dir.join("approve.toml"),
+        file.to_toml().expect("serialize approve.toml"),
+    )
+    .expect("write approve.toml");
+
+    let workspace = home.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let config_path = home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = home.join("task.md");
+    std::fs::write(&instruction, "Finish without calling a tool.\n").expect("instruction");
+    let events_path = home.join("events.jsonl");
+
+    // The default `--confined` lane (no `--smart-harness`, which needs an
+    // auxiliary model this test has no business provisioning): `fs_read`
+    // starts `Scope::All` there, so this proves the OBSERVABILITY half (the
+    // admitted grant is on the contract record) with a real binary; the
+    // fenced-widening half is proved by the mocked unit test
+    // `fold_ocap_grants_widens_a_fenced_axis_but_never_touches_an_open_one`
+    // (`newt-cli/src/headless.rs`), which exercises the same fenced axis the
+    // smart lane narrows to, without needing a live auxiliary.
+    cmd.arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(&workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+
+    let contract = contract_from(&events_path);
+    let durable_grants = contract["effective_config"]["durable_grants"]
+        .as_array()
+        .expect("durable_grants stanza present when a grant was admitted");
+    // #2532 review, item 3: this grant folds into fs_read's already-`All`
+    // confined-lane axis, so it changed nothing — the contract labels it a
+    // no-op rather than implying the signature is why the read worked.
+    assert_eq!(
+        durable_grants,
+        &vec![serde_json::json!(format!(
+            "fs_read:{} (no-op: already permitted)",
+            granted_path.display()
+        ))],
+        "{contract}"
+    );
+}
+
+/// #2532 review, should-fix 1, RED FIRST: a headless run with NO existing
+/// `identity.pem` in its config dir must leave none behind — reading the OCAP
+/// store must never mint the operator's root key as a side effect. Before the
+/// fix, `resolve_ocap_store` called `newt_identity::load_or_generate`, which
+/// writes a fresh key on first read; a headless run on a bare host/CI/scratch
+/// `--config-dir` would silently root every later `sign-ocap` on that host in
+/// a key nobody chose.
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_reading_the_ocap_store_never_mints_an_identity_key() {
+    const CLAIM: &str = "FINAL-CLAIM-2532-no-mint";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": CLAIM}, "finish_reason": "stop"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = common::newt();
+    let home = cmd.home().to_path_buf();
+    common::isolate_loopback_chat(&mut *cmd, &home);
+    let config_dir = cmd.config_dir();
+    let identity_path = config_dir.join("identity.pem");
+    assert!(!identity_path.exists(), "no key before the run");
+
+    let workspace = home.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let config_path = home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "default_backend = \"b\"\n\n[[backends]]\nname = \"b\"\nendpoint = \"{}\"\nmodel = \"m\"\nkind = \"openai\"\n",
+            server.uri()
+        ),
+    )
+    .expect("write config");
+    let instruction = home.join("task.md");
+    std::fs::write(&instruction, "Finish without calling a tool.\n").expect("instruction");
+    let events_path = home.join("events.jsonl");
+
+    cmd.arg("--config")
+        .arg(&config_path)
+        .args(["headless", "--cwd"])
+        .arg(&workspace)
+        .arg("--instruction-file")
+        .arg(&instruction)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+
+    assert!(
+        !identity_path.exists(),
+        "reading the OCAP store must never mint identity.pem"
+    );
+    let contract = contract_from(&events_path);
+    assert!(
+        contract["effective_config"]["durable_grants"].is_null(),
+        "no key on disk means no approves, not a freshly-minted empty store: {contract}"
+    );
 }

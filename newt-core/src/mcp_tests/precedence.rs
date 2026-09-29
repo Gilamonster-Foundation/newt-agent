@@ -15,6 +15,7 @@ fn invalid_entries_are_dropped() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Trusted,
+        origin: None,
     };
     let sse_no_url = McpServerEntry {
         transport: TransportKind::Sse,
@@ -48,6 +49,7 @@ fn newt_entry_wins_on_name_clash_and_dedups() {
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
+            origin: None,
         },
         McpServerEntry {
             enabled: true,
@@ -61,6 +63,7 @@ fn newt_entry_wins_on_name_clash_and_dedups() {
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
+            origin: None,
         },
     ];
     let got = discover(&newt, None, None, Path::new("/nonexistent"));

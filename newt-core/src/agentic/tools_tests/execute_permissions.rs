@@ -1,6 +1,176 @@
 use super::*;
 use crate::ExecOutcome;
 
+/// Brush rejects this cwd before starting its worker, so the unit harness can
+/// exercise the actual out-of-band ToolError even though normal unit dispatch
+/// substitutes the safe-subset engine for Brush's worker re-exec.
+#[tokio::test]
+async fn brush_cwd_error_preserves_denied_execution_class() {
+    let parent = tempfile::tempdir().unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let workspace = parent.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let registry = agent_bridle::Registry::builder()
+        .tool(std::sync::Arc::new(agent_bridle::BrushShellTool::new()))
+        .build();
+    let caveats = Caveats {
+        fs_read: Scope::only([workspace.to_string_lossy().into_owned()]),
+        fs_write: Scope::only([workspace.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let grant = registry.mint_grant(caveats);
+    let error = registry
+        .dispatch(
+            "shell",
+            serde_json::json!({"cmd": "printf forbidden > marker", "cwd": parent}),
+            &grant,
+        )
+        .await
+        .expect_err("Brush must refuse the parent before worker creation");
+    assert!(matches!(error, agent_bridle::ToolError::Denied { .. }));
+    let (text, outcome) = shell::dispatch_error_result(error);
+    assert_eq!(outcome, ExecOutcome::Denied, "{text}");
+    assert!(!parent.join("marker").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn denied_cwd_reports_workspace_and_retains_empty_write_scope() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let parent = tempfile::tempdir().unwrap();
+    let parent = parent.path().canonicalize().unwrap();
+    let workspace = parent.join("child \"quoted\"\nline");
+    std::fs::create_dir(&workspace).unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([workspace.to_string_lossy().into_owned()]),
+        fs_write: Scope::none(),
+        ..Caveats::top()
+    };
+    let before = serde_json::to_value(&caveats).unwrap();
+    let execution = std::sync::OnceLock::new();
+    let result = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "printf CWD_MUST_NOT_RUN", "cwd": parent}),
+        &workspace.to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        ToolCollaborators {
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(execution.get(), Some(&ExecOutcome::Denied), "{result}");
+    assert!(
+        result.contains(&format!("Workspace root: {}", serde_json::json!(workspace))),
+        "{result}"
+    );
+    assert!(
+        result.contains(&format!(
+            "Requested command directory: {}",
+            serde_json::json!(parent)
+        )),
+        "{result}"
+    );
+    assert!(
+        result.contains(&format!("fs_read={}", serde_json::json!([workspace]))),
+        "{result}"
+    );
+    assert!(result.contains("fs_write=[]"), "{result}");
+    assert!(!result.contains("CWD_MUST_NOT_RUN"), "{result}");
+    assert_eq!(serde_json::to_value(&caveats).unwrap(), before);
+}
+
+#[test]
+fn denial_context_quotes_paths_and_bounds_scope_details() {
+    let caveats = Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::only((0..6).map(|i| format!("/scope/{i}\"\n"))),
+        ..Caveats::top()
+    };
+    let text = denial_context("/workspace/\"\n", Some("/requested/\"\n"), Some(&caveats));
+    assert!(
+        text.contains(r#"Workspace root: "/workspace/\"\n""#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"Requested command directory: "/requested/\"\n""#),
+        "{text}"
+    );
+    assert!(text.contains("fs_read=all"), "{text}");
+    assert!(text.contains("(2 more roots)"), "{text}");
+    assert_eq!(
+        text.lines().count(),
+        4,
+        "paths must not inject context lines"
+    );
+}
+
+#[test]
+fn declined_permissions_report_defaults_without_refreshing_authority() {
+    struct NoDiagnosticRefresh;
+    impl PermissionGate for NoDiagnosticRefresh {
+        fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
+            panic!("permission diagnostics must not refresh or remint authority")
+        }
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            assert_eq!(requests.len(), 1);
+            PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+    for capability in ["fs_read", "fs_write"] {
+        let target = "/parent/\"\n";
+        let args = serde_json::json!({"capability": capability, "target": target});
+        for has_gate in [false, true] {
+            let mut gate = NoDiagnosticRefresh;
+            let out = execute_request_permissions(
+                &args,
+                has_gate.then_some(&mut gate as &mut dyn PermissionGate),
+                false,
+                20,
+                "/parent/child",
+            );
+            // The tool trims requested targets; diagnostics must reflect the
+            // actual target asked of the gate and escape it as data.
+            assert!(
+                out.contains(&serde_json::json!(target.trim()).to_string()),
+                "{out}"
+            );
+            assert!(out.contains("Workspace root: \"/parent/child\""), "{out}");
+            assert!(!out.contains("fs_read="), "{out}");
+            assert!(!out.contains("fs_write="), "{out}");
+        }
+    }
+}
+
+#[test]
+fn denial_like_child_text_does_not_become_host_authority_evidence() {
+    let stderr = "denied: read of /somewhere is not within the granted fs_read scope";
+    let envelope = serde_json::json!({"exit_code": 1, "stdout": "", "stderr": stderr});
+    let (text, outcome) =
+        shell::confined_result("check", &envelope, &Caveats::top(), false, |_| {
+            stderr.into()
+        });
+    assert_eq!(outcome, ExecOutcome::Failed);
+    assert_eq!(text, stderr);
+    let (text, outcome) =
+        shell::dispatch_error_result(agent_bridle::ToolError::Other(anyhow::anyhow!(stderr)));
+    assert_eq!(outcome, ExecOutcome::Unavailable);
+    assert_eq!(text, format!("error: {stderr}"));
+}
+
 // -- #721 recoverable denials + request_permissions ---------------------
 
 #[test]
@@ -156,6 +326,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         Some(&mut gate),
         false,
         20,
+        "/workspace",
     );
     assert!(out.starts_with("granted:"), "got: {out}");
     assert!(out.contains("Retry the original operation"), "got: {out}");
@@ -172,6 +343,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         Some(&mut gate),
         false,
         20,
+        "/workspace",
     );
     assert!(out.starts_with("denied:"), "got: {out}");
     assert!(out.contains("different approach"), "got: {out}");
@@ -183,6 +355,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         None,
         false,
         20,
+        "/workspace",
     );
     assert!(out.contains("no operator available"), "got: {out}");
 }
@@ -193,8 +366,8 @@ fn permission_grant_releases_only_cached_authority_failures() {
 
     let args = serde_json::json!({"path": "report.txt"});
     let permission = serde_json::json!({"capability": "fs_read", "target": "report.txt"});
-    for result_aware in [false, true] {
-        let mut guard = RepeatCallGuard::for_verification(result_aware);
+    {
+        let mut guard = RepeatCallGuard::default();
         guard.record(
             "read_file",
             &args,
@@ -229,22 +402,29 @@ fn permission_grant_releases_only_cached_authority_failures() {
 
         let mut allow = MockGate::new(true, &Caveats::top());
         let mut deny = MockGate::new(false, &Caveats::top());
-        let granted = execute_request_permissions(&permission, Some(&mut allow), false, 20);
+        let granted =
+            execute_request_permissions(&permission, Some(&mut allow), false, 20, "/workspace");
         for (name, request, result) in [
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, Some(&mut deny), false, 20),
+                execute_request_permissions(&permission, Some(&mut deny), false, 20, "/workspace"),
             ),
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, None, false, 20),
+                execute_request_permissions(&permission, None, false, 20, "/workspace"),
             ),
             (
                 "request_permissions",
                 serde_json::json!({}),
-                execute_request_permissions(&serde_json::json!({}), Some(&mut allow), false, 20),
+                execute_request_permissions(
+                    &serde_json::json!({}),
+                    Some(&mut allow),
+                    false,
+                    20,
+                    "/workspace",
+                ),
             ),
             ("read_file", args.clone(), granted.clone()),
             (
@@ -312,7 +492,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
     let unrelated = serde_json::json!({"path": "/other/report"});
     // This is the real confined-child result shape grounded by the native
     // session-grant test below; it carries no structured capability refusal.
-    for result_aware in [false, true] {
+    {
         for (name, outcome, released) in [
             ("run_command", Some(ExecOutcome::Failed), true),
             ("lifecycle", Some(ExecOutcome::Failed), true),
@@ -327,7 +507,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 "error: command exited 1\nhead: /approved/config: Operation not permitted",
                 "error: command exited 101\ncompilation failed",
             ] {
-                let mut guard = RepeatCallGuard::for_verification(result_aware);
+                let mut guard = RepeatCallGuard::default();
                 guard.record(name, &command, tool_result_ok(failed), failed, outcome);
                 guard.record(
                     "read_file",
@@ -337,7 +517,8 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     None,
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
-                let declined = execute_request_permissions(&permission, None, false, 20);
+                let declined =
+                    execute_request_permissions(&permission, None, false, 20, "/workspace");
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -348,7 +529,13 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 assert!(guard.repeat_steer(name, &command).is_some());
 
                 let mut gate = MockGate::new(true, &Caveats::top());
-                let granted = execute_request_permissions(&permission, Some(&mut gate), false, 20);
+                let granted = execute_request_permissions(
+                    &permission,
+                    Some(&mut gate),
+                    false,
+                    20,
+                    "/workspace",
+                );
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -401,7 +588,8 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
 
     let mut gate = MockGate::new(true, &base);
     let permission = serde_json::json!({"capability": "fs_read", "target": file});
-    let granted = execute_request_permissions(&permission, Some(&mut gate), false, 20);
+    let granted =
+        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace");
     assert!(granted.starts_with("granted:"), "{granted}");
     guard.record(
         "request_permissions",
@@ -453,6 +641,7 @@ fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
         None,
         false,
         20,
+        "/workspace",
     );
     // Preserves the recoverable "no operator" signal.
     assert!(out.contains("no operator available"), "got: {out}");
@@ -486,6 +675,7 @@ fn request_permissions_coaches_bad_inputs() {
         None,
         false,
         20,
+        "/workspace",
     );
     assert!(out.contains("unknown capability"), "got: {out}");
     assert!(out.contains("fs_read"), "got: {out}");
@@ -495,6 +685,7 @@ fn request_permissions_coaches_bad_inputs() {
         None,
         false,
         20,
+        "/workspace",
     );
     assert!(out.contains("'target' is required"), "got: {out}");
 }
@@ -633,6 +824,9 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
     let ws = tempfile::TempDir::new().unwrap();
     let denied = Caveats {
         exec: Scope::none(),
+        // Isolate exec retry lifecycle from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
         ..caveats_rw(ws.path())
     };
     let mut gate = MockGate::new(true, &denied);
@@ -643,12 +837,13 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
         // Brush builtin and therefore correctly needs no exec grant.
         "/bin/echo retry-visible",
         &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
         false,
         20,
         &denied,
         &[],
         None,
-        Some(&mut gate),
+        &mut Some(&mut gate),
         false,
         None,
         Some(sink.clone()),
@@ -689,6 +884,82 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
     assert_eq!(events.last(), Some(&expected_finish), "events: {events:?}");
 }
 
+/// #2541 round 2 item 2 (red first): the double-indirection signature
+/// (`&mut Option<&mut dyn PermissionGate>`, see the doc comment on
+/// `exec_confined_command`'s `permission_gate` param) exists so a caller can
+/// reborrow the SAME gate for a second sequential confined call — F19's
+/// `lifecycle action=run` escalation into `action=build` does exactly that.
+/// `exec_confined_command`'s denial-retry used to `permission_gate.take()`
+/// the Option permanently empty on ANY allowed denial-recovery, so a second
+/// call through the same `Option` saw `None` and silently refused instead of
+/// asking — the operator who had just said yes to the first prompt got a
+/// denial for the second with no prompt at all. Prove the Option survives: a
+/// second `exec_confined_command` call through the SAME
+/// `&mut Option<&mut dyn PermissionGate>` still has a live gate to ask.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
+    let _l = super::disable_ocap_tests::env_lock().await;
+    let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let denied = Caveats {
+        exec: Scope::none(),
+        // Isolate gate reuse from macOS's unsupported network floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_rw(ws.path())
+    };
+    let mut gate = MockGate::new(true, &denied);
+    let mut permission_gate: Option<&mut dyn super::PermissionGate> = Some(&mut gate);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+
+    let first = exec_confined_command(
+        "/bin/echo first-call",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut permission_gate,
+        false,
+        None,
+        None,
+        &mut display,
+    )
+    .await;
+    assert!(first.0.contains("first-call"), "{}", first.0);
+    assert!(
+        permission_gate.is_some(),
+        "the gate must survive a denial-allow so a second confined call can reuse it"
+    );
+
+    let second = exec_confined_command(
+        "/bin/echo second-call",
+        &ws.path().to_string_lossy(),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &denied,
+        &[],
+        None,
+        &mut permission_gate,
+        false,
+        None,
+        None,
+        &mut display,
+    )
+    .await;
+    assert!(second.0.contains("second-call"), "{}", second.0);
+    assert_eq!(
+        gate.asks.len(),
+        2,
+        "the same gate must be asked for BOTH confined calls, never silently \
+         refused because it was consumed by the first"
+    );
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.
@@ -726,6 +997,8 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
             image.to_string_lossy().into_owned(),
         ]),
         fs_write: Scope::none(),
+        // This tests exact exec authority, not unsupported macOS network rules.
+        net: Scope::All,
         ..caveats_rw(&root)
     };
     let mut gate = MockGate::new(true, &base);
@@ -833,7 +1106,8 @@ fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
             {
                 let args = serde_json::json!({"capability": capability, "target": target});
                 let mut gate = MockGate::new(true, &Caveats::top());
-                let result = execute_request_permissions(&args, Some(&mut gate), false, 20);
+                let result =
+                    execute_request_permissions(&args, Some(&mut gate), false, 20, "/workspace");
                 assert!(permission_grant_succeeded(
                     "request_permissions",
                     &args,
@@ -969,6 +1243,9 @@ async fn native_once_filesystem_declarations_reach_only_the_admitted_child() {
     std::fs::write(&sibling, "SIBLING_UNCHANGED\n").unwrap();
     let baseline = Caveats {
         exec: Scope::only(["/bin/cp".into()]),
+        // This fixture tests filesystem admission. Restricted network authority
+        // is unsupported by the macOS backend and would fail before the copy.
+        net: Scope::All,
         ..crate::confined_exec::workspace_confined_caveats(&root)
     };
     let command = format!("/bin/cp '{}' '{}'", input.display(), output.display());
@@ -1096,6 +1373,8 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
     }
     let baseline = Caveats {
         exec: Scope::only(["/usr/bin/head".into()]),
+        // Reach the filesystem denial; macOS cannot admit restricted networking.
+        net: Scope::All,
         ..crate::confined_exec::workspace_confined_caveats(&root)
     };
     let mut gate = SessionGate {

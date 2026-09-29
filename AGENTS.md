@@ -96,7 +96,7 @@ Codex session working in this repo is a guest and signs as itself.
 
 | Harness | Attribution email |
 |---|---|
-| `newt-agent`, `newt-agent crew` — this repo's embedded `git` tool | `309460085+newt-agent@users.noreply.github.com` (`agent_identity::DEFAULT_AGENT_EMAIL`) |
+| `newt-agent`, `newt-agent crew` — this repo's commit attribution | `309460085+newt-agent@users.noreply.github.com` (`agent_identity::DEFAULT_AGENT_EMAIL`) |
 | `Claude Code` | `noreply@anthropic.com` |
 | `Codex CLI` | `codex@openai.com` |
 | anything else | that harness's own documented trailer — if it documents none, ask rather than invent one |
@@ -173,12 +173,14 @@ Rules:
   not produce. `newt identity` prints the same preview for the configured
   identity. Read it off one of those instead of assembling a trailer from
   this section by hand.
-- **This is mechanical, not a model instruction.** The embedded `git` tool
-  stamps the ledger's accumulated trailers itself; do not hand-write
-  `Co-authored-by` lines yourself when using it — see the per-turn "Git
-  commit identity" guidance the harness already gives you. If you must shell
-  out to `git` directly (bypassing the embedded tool), you get no automatic
-  multi-contributor credit at all — prefer the embedded tool.
+- **This is mechanical, not a model instruction.** Newt's native commit
+  broker and optional embedded Git adapter stamp the accumulated trailers.
+  Use ordinary `git` commands through `run_command` for supported native
+  commits; do not hand-write their `Co-authored-by` lines. The broker preserves
+  the harness's attribution and signing policy. Git run outside Newt has no
+  automatic Newt attribution; a foreign harness uses its own byline, as below.
+  See `docs/design/agent-toolchain.md` for current native commit scope and
+  platform support.
 - **If you are not the newt harness, this section is not yours to imitate.**
   It documents what newt stamps about itself. A Claude Code, Codex, or other
   foreign session commits with the trailer ITS OWN harness prescribes and the
@@ -282,6 +284,36 @@ RAII, and required parameters so the broken call does not compile.
 
 If a second implementation is truly warranted, say so in the PR and explain
 what the existing abstraction could not be widened to cover.
+
+## Harness design — dependable over elaborate
+
+> The strongest version of Newt is not one that teaches a small model to
+> operate an increasingly elaborate harness. It is one that makes the harness
+> dependable enough that the model has fewer things to remember, fewer
+> protocols to negotiate, and fewer opportunities to turn an incomplete
+> intention into the wrong mutation. — the operator, 2026-09-24
+
+This is the test for any change to what the model sees or calls:
+
+1. **Make the model's first instinct work.** A weak model reaches for the
+   familiar tool. Widen that tool instead of teaching a new one. For example,
+   `read_file` accepts the `spill:` handle the model was already passing it
+   (#2553).
+2. **Make the wrong mutation impossible or harmless.** Prevent it rather than
+   explaining it afterwards. For example, `awk … f > f` truncates `f` before
+   `awk` reads it; it destroyed a 9,254-line file in a live run (#2555).
+3. **Make a redundant action cheap and silent rather than refusing it.** A
+   refusal is a protocol the model has to negotiate.
+4. **New model-facing surface has to earn its place with evidence from a live
+   run.** That covers a tool, a parameter, and any refusal the model must
+   interpret. Measured in weak-model refactor runs: the new `copy_from`
+   parameter went unused in three consecutive runs, because the model used
+   the shell instead. A refusal naming the exact missing keys did not stop the
+   model from resending the identical call (#2553, #2555).
+
+This is the reuse discipline turned on the model's side of the harness. There,
+the burden is on code that adds lines. Here, the burden is on anything that
+adds something the model must remember.
 
 ## Content-addressable data structures — the base rule
 

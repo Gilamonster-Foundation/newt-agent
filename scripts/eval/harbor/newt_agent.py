@@ -111,6 +111,12 @@ _VERIFY_OUTCOMES = os.environ.get("NEWT_BENCH_VERIFY_OUTCOMES", "")
 # workspace tool grant AND survives the container for the cross-tab. The
 # profile must carry a `[smart_harness]` block; the adapter only adds the flag.
 _SMART = os.environ.get("NEWT_BENCH_SMART", "")
+
+
+def _smart_on() -> bool:
+    """Whether the smart-harness arm is selected (one predicate for the flag and
+    for the write-root request below)."""
+    return _SMART.strip() in ("1", "on", "true")
 # Operator-declared model digest (#2318): newt records NEWT_MODEL_DIGEST in its
 # contract's `model_digest`. Declared, not verified — the server exposes none.
 _MODEL_DIGEST = os.environ.get("NEWT_BENCH_MODEL_DIGEST", "")
@@ -138,6 +144,14 @@ def _container_env_prefix() -> str:
         parts.append("NEWT_SELF_VERIFY=0")
     if _VERIFY_OUTCOMES.strip().lower() in ("1", "true", "on", "yes"):
         parts.append("NEWT_VERIFY_OUTCOMES=1")
+    if _OCAP.strip().lower() == "on" and not _smart_on():
+        # The confined lane's fence is workspace + /tmp by default (a default must
+        # be safe on a developer host). This container is disposable and tasks
+        # install packages (#1487), so ASK for the broad roots the fence used to
+        # list built in. Not for the smart-harness arm: its isolation refuses a
+        # grant with a model-writable ancestor (/usr above /usr/local), so the
+        # roots would stop it launching. Not granted for any other lane.
+        parts.append("NEWT_WRITE_PATHS=/usr:/usr/local:/var:/etc:/opt:/root:/home")
     if _MODEL_DIGEST.strip():
         parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
     return (" ".join(parts) + " ") if parts else ""
@@ -148,7 +162,7 @@ def _solve_command(workdir: str) -> str:
     tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
     tenacity += f" --initiative {shlex.quote(_INITIATIVE)}" if _INITIATIVE else ""
     ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
-    smart = " --smart-harness --frame-dir /logs/agent/frame" if _SMART.strip() in ("1", "on", "true") else ""
+    smart = " --smart-harness --frame-dir /logs/agent/frame" if _smart_on() else ""
     required = "".join(
         f" --require-feature {shlex.quote(f.strip())}" for f in _REQUIRE_FEATURES.split(",") if f.strip()
     )

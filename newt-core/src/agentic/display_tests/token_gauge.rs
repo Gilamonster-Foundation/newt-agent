@@ -21,7 +21,10 @@ fn gauge_formatting_k_compact_fraction_and_level() {
     assert_eq!(fmt_tokens_compact(2_048_000), "2M");
     assert_eq!(fmt_tokens_compact(1_536_000), "1.5M");
     // fraction
-    assert_eq!(fmt_token_gauge(899_000, 1_024_000), "899k/1024k");
+    assert_eq!(fmt_token_gauge(899_000, Some(1_024_000)), "899k/1024k");
+    // #2466: no context window known → `used/?`, not the ratchet presented as
+    // a window.
+    assert_eq!(fmt_token_gauge(899_000, None), "899k/?");
     // level bands: <75 Ok, 75–90 Warn, ≥90 Critical
     assert_eq!(gauge_level(100, 1000), GaugeLevel::Ok);
     assert_eq!(gauge_level(740, 1000), GaugeLevel::Ok);
@@ -54,7 +57,7 @@ fn gauge_visual_preview() {
     println!("\n  context-budget gauge — fraction form (live header):");
     for used in [102_000u32, 512_000, 800_000, 972_000, 1_010_000] {
         let lvl = gauge_level(used, budget);
-        let g = fmt_token_gauge(used, budget);
+        let g = fmt_token_gauge(used, Some(budget));
         println!("    {:<14} {:?}", paint(color(lvl), &g), lvl);
     }
     println!("\n  compact budget form (1M = 1024k):");
@@ -65,7 +68,7 @@ fn gauge_visual_preview() {
         "\n  mock header:\n    [2026-06-22 14:32:01] vi --INSERT-- nemotron @ REDACTED-HOST   {}\n",
         paint(
             color(gauge_level(972_000, budget)),
-            &fmt_token_gauge(972_000, budget)
+            &fmt_token_gauge(972_000, Some(budget))
         ),
     );
 }

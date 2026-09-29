@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "cmd": {
+      "type": "string",
+      "description": "A command line interpreted by the carried Brush shell in a dedicated worker. Brush mediates external program names through the exec caveat and paths opened by the shell through fs_read/fs_write. Builtins run inside the worker; carried utilities and delegated descendants inherit the worker's native L3 boundary but do not re-enter every Brush hook. Full shell grammar is available. Inspect the result's enforcement report and sandbox_kind: a native L3 boundary is reported only when it actually engaged."
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Explicit environment imported into the worker. Ambient variables are not inherited, apart from the minimal operating-system variables required to start children on Windows."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory. The directory must be admitted by fs_read and any active native L3 boundary."
+    }
+  },
+  "required": ["cmd"]
+}

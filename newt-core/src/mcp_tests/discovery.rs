@@ -160,3 +160,31 @@ fn discover_reads_mcp_toml_as_a_newt_owned_source() {
     )
     .is_empty());
 }
+
+/// #2484: discovery stamps each borrowed entry with the file it came from, so a
+/// refusal can name the exact import command.
+#[test]
+fn discovery_stamps_the_origin_of_borrowed_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let workspace = dir.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"mcpServers":{"user-srv":{"command":"u"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join(".mcp.json"),
+        r#"{"mcpServers":{"proj-srv":{"command":"p"}}}"#,
+    )
+    .unwrap();
+    let got = discover(&[], None, Some(&home), &workspace);
+    let origin = |name: &str| got.iter().find(|e| e.name == name).unwrap().origin.clone();
+    assert_eq!(origin("user-srv"), Some(McpOrigin::ClaudeUser));
+    assert_eq!(
+        origin("proj-srv"),
+        Some(McpOrigin::File(workspace.join(".mcp.json")))
+    );
+}

@@ -101,16 +101,18 @@ async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
     );
 }
 
-/// Closure-proof: the run_command route's FD hygiene is CLOEXEC-based (std's
-/// default + agent-bridle `set_cloexec`), NOT the explicit `close_range(3,~0)`
-/// the `NetGrant::DenyAll` `newt-net-guard` route performs. This pins that a
-/// deliberately-NON-CLOEXEC descriptor IS inherited by the run_command child
-/// — so the guarantee "a pre-opened network descriptor cannot bypass the
-/// socket() filter" holds ONLY because newt opens its real fds via std
-/// (CLOEXEC); a non-CLOEXEC fd would cross. Documents the asymmetry honestly.
+/// Closure-proof: as of agent-bridle 0.8 (`agent-bridle-fdguard`,
+/// `deny_inherited_fds`), the run_command route's safe-subset spawner now
+/// `CLOSE_RANGE_CLOEXEC`-marks ambient descriptors before exec, closing the
+/// asymmetry this test used to document against the CLOEXEC-only `set_cloexec`
+/// hygiene of 0.7.x. A deliberately-NON-CLOEXEC descriptor is now closed, the
+/// same guarantee the `NetGrant::DenyAll` `newt-net-guard` route's explicit
+/// `close_range(3,~0)` already gave. This is bridle getting better, not newt
+/// getting worse — see `docs/security/ocap-deviations.md`'s `local-deputy-egress`
+/// entry, updated to match.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close() {
+async fn run_command_route_fd_hygiene_is_cloexec_based_via_fdguard() {
     use std::os::fd::AsRawFd;
     if !crate::confined_exec::kernel_fs_fence_available() {
         return;
@@ -144,17 +146,15 @@ async fn run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close() {
     .expect("dispatch");
     drop(marker);
     let stdout = envelope["stdout"].as_str().unwrap_or_default().to_string();
-    // Ground truth: a non-CLOEXEC fd crosses into the run_command child (the
-    // route does not explicitly close fds ≥ 3). If this ever flips to
-    // fd-closed, the route gained explicit fd-closing — a strict improvement;
-    // update the doc/register. Skipped-outcome tolerated where the confined
-    // spawn could not run.
+    // Ground truth (agent-bridle 0.8+): `agent-bridle-fdguard` CLOSE_RANGE_CLOEXEC-
+    // marks ambient descriptors before exec, so even a deliberately-NON-CLOEXEC
+    // fd is closed in the run_command child. Skipped-outcome tolerated where the
+    // confined spawn could not run.
     if envelope["sandbox_kind"] == "landlock" {
         assert!(
-            stdout.contains("FD-INHERITED"),
-            "expected a non-CLOEXEC fd to be inherited (run_command FD hygiene is CLOEXEC-based, \
-                 not explicit close). If now fd-closed, the route added explicit closing — update \
-                 docs + register: {envelope}"
+            stdout.contains("fd-closed"),
+            "expected fdguard to close a non-CLOEXEC fd in the run_command child \
+                 (agent-bridle 0.8 `deny_inherited_fds`): {envelope}"
         );
     }
 }

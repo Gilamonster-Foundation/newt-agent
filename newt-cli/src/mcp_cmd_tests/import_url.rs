@@ -15,6 +15,7 @@ fn exact_http_hosts_are_normalized_and_deduplicated() {
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
+            origin: None,
         },
         McpServerEntry {
             name: "two".into(),
@@ -33,6 +34,7 @@ fn exact_http_hosts_are_normalized_and_deduplicated() {
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Trusted,
+            origin: None,
         },
     ];
     let mut entries = entries;
@@ -57,6 +59,7 @@ fn http_url_is_canonicalized_once_for_persistence_and_grants() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: McpTrust::Trusted,
+        origin: None,
     };
     let host = canonicalize_import_http_url(&mut entry).unwrap().unwrap();
     assert_eq!(host, "xn--bcher-kva.example");
@@ -87,6 +90,7 @@ fn import_url_validation_is_independent_of_network_grants_and_rejects_fragments(
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: McpTrust::Untrusted,
+            origin: None,
         };
         let mut entry = entry;
         let error = canonicalize_import_http_url(&mut entry).unwrap_err();

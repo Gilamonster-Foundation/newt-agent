@@ -194,7 +194,7 @@ pub fn load_denials(path: &Path) -> Vec<(DenialKind, String)> {
 }
 
 /// Append one permanent-deny entry as a JSON line, creating parent dirs as
-/// needed. Mirrors [`PermissionRecord::append_jsonl`].
+/// needed.
 pub fn append_denial(path: &Path, kind: DenialKind, target: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -360,9 +360,9 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
 }
 
 /// One prompted permission decision, recorded with the session for later
-/// review (issue #263). Serialized as one JSON line of
-/// `~/.newt/permission-log.jsonl` until the Phase 17 store grows a
-/// first-class events home for it.
+/// review (issue #263). Chained onto `~/.newt/permission-log.jsonl` via
+/// [`crate::permission_journal`] (issue #2524 item 3) — see that module for
+/// the append/read machinery; this type is only the payload.
 ///
 /// This file is a record, NOT config: nothing reads it back into authority.
 /// Promoting an `allow` to a durable grant is a human editing
@@ -406,19 +406,6 @@ impl PermissionRecord {
             decision: decision.to_string(),
             scope: scope.to_string(),
         }
-    }
-
-    /// Append this record as one JSON line, creating parent dirs as needed.
-    pub fn append_jsonl(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let line = serde_json::to_string(self).map_err(std::io::Error::other)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(file, "{line}")
     }
 }
 
@@ -499,6 +486,34 @@ mod tests {
         assert_eq!(widened.max_calls, CountBound::AtMost(7));
     }
 
+    /// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579, BLOCKER): an
+    /// earlier version of this widen ALSO added a build tool's toolchain read
+    /// roots to `fs_read` here. That was a real leak: `widen_caveats`'s
+    /// result feeds `recalled_caveats`/`fold_ocap_approvals`, which is the
+    /// caveats checked for EVERY tool the model calls this session —
+    /// including `read_file`. Widening `fs_read` here would have let the
+    /// model's own `read_file` tool read `$CARGO_HOME/credentials.toml` (or
+    /// any other file under the toolchain roots) for the rest of the
+    /// session, armed by nothing more than a session `exec:cargo` grant meant
+    /// only to let the confined build's OWN subprocess resolve its
+    /// toolchain. The toolchain reads now live ONLY on the confined shell
+    /// dispatch's call-scoped caveats
+    /// (`agentic::tools::shell::dispatch_caveats_for_command`), never here.
+    /// This test pins the negative: an exec grant, build tool or not, widens
+    /// `exec` alone.
+    #[test]
+    fn widen_of_an_exec_grant_never_touches_fs_read_even_for_a_build_tool() {
+        let widened = widen_caveats(&base(), &[(DenialKind::Exec, "cargo".to_string())]);
+        assert!(widened.permits_exec("cargo"));
+        assert_eq!(
+            widened.fs_read,
+            base().fs_read,
+            "an exec grant — build tool or not — must never widen fs_read; \
+             that axis feeds every tool the model can call this session, \
+             not just the confined child this grant was asked for"
+        );
+    }
+
     #[test]
     fn widen_leaves_base_unchanged_and_all_stays_all() {
         let b = base();
@@ -541,36 +556,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_jsonl_appends_one_line_per_record_and_creates_dirs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nested").join("permission-log.jsonl");
-        let a = PermissionRecord::new(
-            "conv-1",
-            "read_file",
-            DenialKind::FsRead,
-            "/etc/hosts",
-            "deny",
-            "once",
-        );
-        let b = PermissionRecord::new(
-            "conv-1",
-            "web_fetch",
-            DenialKind::Net,
-            "docs.rs",
-            "allow",
-            "once",
-        );
-        a.append_jsonl(&path).unwrap();
-        b.append_jsonl(&path).unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2);
-        let parsed: PermissionRecord = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(parsed, a, "round-trips losslessly");
-        let parsed: PermissionRecord = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(parsed.kind, "net");
-    }
+    // Chained append/round-trip for `PermissionRecord` is covered in
+    // `crate::permission_journal`'s tests (issue #2524 item 3) — this type
+    // is now only the chain's payload, not its own flat writer.
 
     // ---- #904: persistent "permanently deny" store ----
 

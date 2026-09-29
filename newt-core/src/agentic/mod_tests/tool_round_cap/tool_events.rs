@@ -40,6 +40,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     let mut reaches = Vec::new();
     chat_complete(
         ChatCtx {
+            overflow_retry: Default::default(),
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -69,6 +70,8 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
             persona_tools: None,
             cognition: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: Default::default(),
             output_allowance: None,
             attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -196,6 +199,7 @@ async fn openai_loop_records_tool_events_with_digested_args() {
     let mut events: Vec<crate::ToolEvent> = Vec::new();
     openai_chat_complete(
         ChatCtx {
+            overflow_retry: Default::default(),
             run_allowance: None,
             verify_outcomes: false,
             round_cap_hit: None,
@@ -225,6 +229,8 @@ async fn openai_loop_records_tool_events_with_digested_args() {
             persona_tools: None,
             cognition: None,
             chat_completions_capability: Default::default(),
+            responses_capability: Default::default(),
+            openai_api: Default::default(),
             output_allowance: None,
             attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,

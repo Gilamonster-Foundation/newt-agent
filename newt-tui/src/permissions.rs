@@ -132,17 +132,38 @@ fn permission_policy(
         key: "a",
         label: "allow once",
     }];
-    if tier == danger::DangerTier::Low {
+    // dec1-build-grant (F30): `Build` stays High tier — the blast-radius
+    // banner below still fires — but IS session-allowable. It is not an
+    // open-ended interpreter/broad-root grant; it is bounded by the
+    // calibrated `build_tool_caveats` fence (workspace + toolchain reads,
+    // workspace-only writes, network denied), the same confinement an
+    // allow-once already grants. Refusing the session scope bought no extra
+    // safety, only a prompt on every build/test/check in a session (up to 7
+    // times observed in one run — NOTES-2483 F30).
+    // #2595: the harness's own dependency fetch (`lifecycle` + net) is a
+    // one-shot `cargo fetch`. A recorded session/permanent grant would flow
+    // into `recalled_caveats` and widen the shell worker's net to crates.io,
+    // which the prompt does not say. Offer allow-once/deny only.
+    let one_shot = req.tool == "lifecycle" && req.kind == DenialKind::Net;
+    if !one_shot && (tier == danger::DangerTier::Low || req.kind == DenialKind::Build) {
         actions.push(OfferedAction {
             action: PromptChoice::AllowSession,
             key: "s",
             label: "session allow",
         });
-        if req.kind == DenialKind::Net && terminal {
+        // #2535/#2524 PR1: every durable-store kind offers permanent allow
+        // now, not just net — `persist_approve` signs whichever of
+        // exec/fs/net the answer names into `approve.toml`.
+        if terminal
+            && matches!(
+                req.kind,
+                DenialKind::Exec | DenialKind::FsRead | DenialKind::FsWrite | DenialKind::Net
+            )
+        {
             actions.push(OfferedAction {
                 action: PromptChoice::AllowPermanent,
                 key: "A",
-                label: "Allow permanently (adds host to config)",
+                label: "Allow permanently (signs a durable grant)",
             });
         }
     }
@@ -170,6 +191,12 @@ fn permission_policy(
     // where the enum is DEFINED —
     // `newt_interaction::binding::model_fidelity` (#1837).
     let note = match (tier, audience) {
+        (danger::DangerTier::High, Audience::Terminal) if req.kind == DenialKind::Build => Some(
+            format!("confined build authority: session allow covers build/test/check for this workspace this session\n{MODAL_CONTROL_HINT}"),
+        ),
+        (danger::DangerTier::High, Audience::Web) if req.kind == DenialKind::Build => Some(
+            format!("Confined build authority: session authorization is available.\n{MODAL_CONTROL_HINT}"),
+        ),
         (danger::DangerTier::High, Audience::Terminal) => Some(format!(
             "high-danger: session allow refused; key allow / step-up is the future path, P3\n{MODAL_CONTROL_HINT}"
         )),
@@ -390,7 +417,9 @@ pub(crate) fn production_danger_table() -> danger::DangerTable {
 /// predicate, so the blessing ceremony can never launder an interpreter or a
 /// broad fs root into `approve.toml`. Fs classifies as a WRITE — the
 /// conservative reading of a durable fs grant, and the table's High tier is
-/// about broad roots on either axis.
+/// about broad roots on either axis. So this write-time fence is a SUPERSET of
+/// the recall-time check (`recalled_grants` classifies by the grant's own
+/// kind): anything recall would refuse, the writer already refused.
 pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::CapabilityClass, &str) -> bool
 {
     let table = production_danger_table();
@@ -507,6 +536,97 @@ fn lost_to_web_message(mine: PromptChoice, winner: PromptChoice) -> String {
         winner.as_str(),
         mine.as_str()
     )
+}
+
+/// The durable `approve.toml` entry a `[A]llow permanently` answer for
+/// `(kind, target)` would write, or the refusal reason for a shape the store
+/// must never accept (#2535/#2524 PR1).
+///
+/// `None` for a kind the durable store has no vocabulary for (`RemoteTool`,
+/// `GitWrite`, `Build`) — those keep the session-only fallback. `Some(Err)`
+/// for an exec target that names a path (contains a separator) without being
+/// absolute: `agent-bridle-core`'s `ExecEntry.target` matches verbatim, so a
+/// relative path like `./build.sh` would silently mean "whatever `./` is at
+/// match time", never what the operator approved.
+fn approve_entry_for(
+    kind: newt_core::DenialKind,
+    target: &str,
+) -> Option<Result<newt_core::ocap_store::ApproveEntry, String>> {
+    use newt_core::ocap_store::ApproveEntry;
+    match kind {
+        newt_core::DenialKind::Exec => {
+            let is_path = target.contains('/') || target.contains('\\');
+            if is_path && !std::path::Path::new(target).is_absolute() {
+                return Some(Err(format!(
+                    "permanent allow refused: `{target}` is a relative path — grant a \
+                     bare command name or an absolute path instead"
+                )));
+            }
+            Some(Ok(ApproveEntry::Exec {
+                target: target.to_string(),
+            }))
+        }
+        newt_core::DenialKind::FsRead => Some(Ok(ApproveEntry::Fs {
+            path: target.to_string(),
+            write: false,
+        })),
+        newt_core::DenialKind::FsWrite => Some(Ok(ApproveEntry::Fs {
+            path: target.to_string(),
+            write: true,
+        })),
+        newt_core::DenialKind::Net => Some(Ok(ApproveEntry::Net {
+            host: target.to_string(),
+        })),
+        newt_core::DenialKind::RemoteTool
+        | newt_core::DenialKind::GitWrite
+        | newt_core::DenialKind::Build => None,
+    }
+}
+
+/// The target `AllowPermanent`'s danger check and refusal notice should use:
+/// for `FsRead`/`FsWrite`, the target [`newt_core::ocap_store::persist_approve`]
+/// would actually normalize and write (#2524 follow-up item 2) — `/ws/..`
+/// classified and named as `/`, never the raw string that hides how
+/// dangerous the request is. Reuses `ocap_store`'s own normalizer (never a
+/// second copy); falls back to the raw target when normalization itself
+/// fails (a relative or climbing path) — that case is refused downstream by
+/// `persist_approve`'s own check, with its own message. Exec/net targets are
+/// not paths and pass through unchanged.
+fn normalized_danger_target(kind: newt_core::DenialKind, target: &str) -> String {
+    match kind {
+        newt_core::DenialKind::FsRead | newt_core::DenialKind::FsWrite => {
+            newt_core::ocap_store::normalize_fs_path(target).unwrap_or_else(|_| target.to_string())
+        }
+        _ => target.to_string(),
+    }
+}
+
+/// The notice for `AllowPermanent`'s "no root key resolves" fallback (#2524
+/// follow-up item 1): names the ACTUAL configured path — or that none is
+/// configured at all — rather than printing the literal word `key_path`,
+/// which told the operator nothing about what to go check.
+fn no_key_notice(key_path: Option<&std::path::Path>) -> String {
+    let key_path_desc = key_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "no key_path configured".to_string());
+    format!(
+        "permanent allow unavailable (no root key at `{key_path_desc}` in this \
+         session): granted for this session only — run `newt doctor` or restore \
+         ~/.newt/identity.pem"
+    )
+}
+
+/// Operator-facing axis name for the "permanently allowed" notice.
+fn axis_label(kind: newt_core::DenialKind) -> &'static str {
+    match kind {
+        newt_core::DenialKind::Exec => "exec",
+        newt_core::DenialKind::FsRead => "fs (read)",
+        newt_core::DenialKind::FsWrite => "fs (write)",
+        newt_core::DenialKind::Net => "net",
+        newt_core::DenialKind::RemoteTool => "remote tool",
+        newt_core::DenialKind::GitWrite => "git write",
+        newt_core::DenialKind::Build => "build",
+    }
 }
 
 fn decision_scope(choice: PromptChoice) -> &'static str {
@@ -636,6 +756,10 @@ fn is_slash_command_at_prompt(answer: &str) -> bool {
 #[path = "permissions_tests/slash_prompt_tests.rs"]
 mod slash_prompt_tests;
 
+#[cfg(test)]
+#[path = "permissions_tests/build_grant_tests.rs"]
+mod build_grant_tests;
+
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
@@ -709,11 +833,61 @@ fn ceiling_permits(
 }
 
 /// Match the exact approved target, without treating a basename as a path grant.
+///
+/// One exception (dec1-build-grant, F30): a session `Build` grant — the
+/// fully-fenced confined-build authority, `build_tool_caveats` — also covers a
+/// later `Exec` request for a build-tool binary (`cargo`/`just`/`make`, see
+/// [`newt_core::confined_exec::is_build_tool_exec`]). This is one-directional
+/// on purpose: `lifecycle_build_request`'s doc comment is explicit that no
+/// `Exec` grant (including `exec:cargo`) may silently acquire `Build`
+/// authority. The reverse is safe — `Build` is the STRONGER, calibrated fence,
+/// so a prior `Build` session grant already covers running that same tool
+/// through the `run_command` / routed-`build_exec` lane. One session grant,
+/// not three.
 pub(crate) fn session_grant_covers(
     grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     req: &newt_core::PermissionRequest,
 ) -> bool {
     grants.contains(&(req.kind, req.target.clone()))
+        || (req.kind == newt_core::DenialKind::Exec
+            && newt_core::confined_exec::is_build_tool_exec(&req.target)
+            && grants
+                .iter()
+                .any(|(kind, _)| *kind == newt_core::DenialKind::Build))
+}
+
+/// dec1-build-grant round 2 (Reviewer, item 3): which session `Build` grant
+/// covers a request running under `baseline` — the grant whose workspace
+/// CONTAINS the call's cwd, not just the first `Build` grant found. A
+/// multi-root session can hold more than one; clamping to the wrong
+/// workspace's fence would deny (or, worse, over-grant) an otherwise-lawful
+/// call. `baseline.fs_write` is the caller's own write scope for THIS call —
+/// it is anchored to the effective cwd (`workspace_confined_caveats`,
+/// `build_tool_caveats`), so a `Build` grant is a match when its workspace is
+/// an ancestor of (or equal to) one of those write roots. Falls back to the
+/// first `Build` grant found when nothing matches (the prior behavior) —
+/// better an approximate clamp than none.
+fn covering_build_grant_workspace<'a>(
+    grants: &'a std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    baseline: &newt_core::Caveats,
+) -> Option<&'a str> {
+    let cwd_roots: Vec<&str> = match &baseline.fs_write {
+        newt_core::Scope::Only(set) => set.iter().map(String::as_str).collect(),
+        newt_core::Scope::All => Vec::new(),
+    };
+    let build_workspaces = || {
+        grants
+            .iter()
+            .filter(|(kind, _)| *kind == newt_core::DenialKind::Build)
+            .map(|(_, ws)| ws.as_str())
+    };
+    build_workspaces()
+        .find(|ws| {
+            cwd_roots
+                .iter()
+                .any(|root| std::path::Path::new(root).starts_with(ws))
+        })
+        .or_else(|| build_workspaces().next())
 }
 
 /// Consume only the exact pending target; other requests leave it available.
@@ -784,6 +958,48 @@ impl PermissionPromptState {
                 !self.recall_conflicts_with_denial(*kind, target)
                     && danger.classify(*kind, target) != danger::DangerTier::High
             })
+    }
+
+    /// Fold this session's VERIFIED OCAP approve-store entries (#2524 item 1:
+    /// `~/.newt/ocap/approve.toml`, signed by the operator's root key) into
+    /// the recalled durable grants — the same `durable_grants` set the v1
+    /// `/permissions` promotion writes, so a signed store entry reaches
+    /// [`Self::recalled_caveats`] (and hence a spawned MCP child's caveats,
+    /// `chat.rs`'s `startup_caveats`) exactly like a promoted durable grant.
+    ///
+    /// `self.ocap_policy` must already be the output of
+    /// [`newt_core::ocap_store::load_store`], which drops any unsigned or
+    /// bad-signature `approve.toml` entry loudly at load (fail-closed); this
+    /// only re-shapes whatever survived that check
+    /// ([`newt_core::ocap_store::approved_grants`] is a pure re-listing), so
+    /// it can never itself widen past what the signature covers. Called at
+    /// session start, and again after every mid-session `AllowPermanent`
+    /// reload ([`newt_core::ocap_store::persist_approve`]'s caller).
+    /// Returns the number of grants folded in, for the session-start
+    /// permission-log line (#2532 review, item 3).
+    ///
+    /// **Deliberately monotonic** (#2524 follow-up item 4): this only ever
+    /// `extend`s `durable_grants`, never rebuilds it from the current fold.
+    /// If a later reload drops an entry that an earlier one admitted (the
+    /// operator hand-edited or truncated `approve.toml` mid-session, or a
+    /// previously-valid signature somehow stopped verifying), that entry's
+    /// grant is kept for the rest of THIS session rather than revoked live.
+    /// This is the same posture as a promoted durable grant or a session
+    /// grant: authority admitted once under verification is not silently
+    /// clawed back mid-turn. It is also the only option available here
+    /// without a wider change — `durable_grants` is a flat
+    /// `(DenialKind, String)` set shared with the legacy `/permissions`
+    /// promotion path (`recalled_grants`), so nothing at this call site can
+    /// tell an ocap-sourced entry apart from one promoted another way in
+    /// order to rebuild just its own contribution; a full rebuild here would
+    /// risk dropping grants this function never added. Revocation of a
+    /// dropped `approve.toml` entry takes effect on the NEXT session start,
+    /// where `ocap_policy`/`durable_grants` are rebuilt fresh from `load_store`.
+    pub(crate) fn fold_ocap_approvals(&mut self) -> usize {
+        let grants = newt_core::ocap_store::approved_grants(&self.ocap_policy);
+        let count = grants.len();
+        self.durable_grants.extend(grants);
+        count
     }
 
     pub(crate) fn recalled_caveats(
@@ -942,7 +1158,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             scope,
         );
         if let Some(path) = self.log_path.as_deref() {
-            if let Err(e) = rec.append_jsonl(path) {
+            if let Err(e) = newt_core::permission_journal::append_record(path, rec.clone()) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     self.color,
@@ -1646,6 +1862,15 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
             return Deny;
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
+        // dec1-build-grant round 2: a request covered by the Build-grant
+        // fallback in `session_grant_covers` (an Exec of a build tool, e.g.
+        // `cargo`, covered by a session Build grant rather than an exact
+        // stored Exec grant) must retain the calibrated build filesystem
+        // fence and the invocation's existing network scope. Build approval
+        // adds no networking, and replayed session grants cannot restore a
+        // host the invocation attenuated away. Clamp after minting because
+        // `widen_caveats` only adds grants; it cannot enforce these ceilings.
+        let mut build_covered_clamp: Option<newt_core::Caveats> = None;
         let web = self.state.web_store.clone();
         for req in requests {
             // Build grants are non-axis but still bounded by an explicit
@@ -1669,6 +1894,36 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
             if session_grant_covers(&self.state.session_grants, req) {
+                // An exact match needs no further widening — it is already
+                // reachable through `recalled_grants` in `mint`. The
+                // build-tool fallback in `session_grant_covers` is NOT itself
+                // a stored grant, so fold it into this call's `once_grants`
+                // or the returned caveats would never widen `exec`/`fs_read`
+                // for it (dec1-build-grant, F30/F35).
+                if !self
+                    .state
+                    .session_grants
+                    .contains(&(req.kind, req.target.clone()))
+                {
+                    once_grants.push((req.kind, req.target.clone()));
+                    // This IS the build-tool fallback (an exact match took
+                    // the branch above), so pin the clamp to the covering
+                    // Build grant's workspace fence — the grant whose
+                    // workspace contains this call's cwd, when more than one
+                    // is held.
+                    if let Some(workspace) =
+                        covering_build_grant_workspace(&self.state.session_grants, baseline)
+                    {
+                        let mut fence = newt_core::confined_exec::build_tool_caveats(
+                            std::path::Path::new(workspace),
+                        );
+                        fence.net = baseline.net.clone();
+                        build_covered_clamp = Some(match build_covered_clamp.take() {
+                            Some(existing) => existing.meet(&fence),
+                            None => fence,
+                        });
+                    }
+                }
                 continue;
             }
             if self
@@ -1775,8 +2030,13 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                     }
                 }
                 PromptChoice::AllowSession => {
-                    // The form omits this action for high danger; enforce it too.
-                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                    // The form omits this action for high danger; enforce it
+                    // too — except `Build` (dec1-build-grant, F30), which the
+                    // form DOES offer for session scope: it is bounded by the
+                    // calibrated `build_tool_caveats` fence, not open-ended.
+                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High
+                        && req.kind != newt_core::DenialKind::Build
+                    {
                         self.record(req, "deny", "session-allow-refused-high-danger");
                         self.notice(
                             window.as_ref(),
@@ -1794,58 +2054,152 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                         .insert((req.kind, req.target.clone()));
                 }
                 PromptChoice::AllowPermanent => {
-                    // Only net has a durable per-target config allowlist.
-                    if req.kind != newt_core::DenialKind::Net {
-                        self.record(req, "allow", scope);
-                        self.state
-                            .session_grants
-                            .insert((req.kind, req.target.clone()));
-                        continue;
-                    }
-                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                    // The danger refusal must run BEFORE any write attempt for
+                    // ALL FOUR durable-store kinds — a real bug fix (#2535):
+                    // this used to run only for net.
+                    //
+                    // #2524 follow-up item 2: classify (and name, below) the
+                    // NORMALIZED target, not the raw one — `/ws/..` must be
+                    // judged and reported as `/`, the path the writer would
+                    // actually persist, not a raw string that hides it.
+                    let danger_target = normalized_danger_target(req.kind, &req.target);
+                    if self.danger.classify(req.kind, &danger_target) == danger::DangerTier::High {
                         self.record(req, "deny", "permanent-allow-refused-high-danger");
                         self.notice(
                             window.as_ref(),
-                            &format!("permanent allow refused for high-danger `{}`", req.target),
+                            &format!("permanent allow refused for high-danger `{danger_target}`"),
                         );
                         return Deny;
                     }
-                    let persistent_scope = match self.config_path.as_deref() {
-                        Some(path) => {
-                            match newt_core::Config::append_permission_net_host(path, &req.target) {
-                                Ok(()) => "permanent",
-                                Err(e) => {
-                                    self.notice(
-                                        window.as_ref(),
-                                        &format!(
-                                            "warning: could not persist net grant to config: {e} \
+                    let entry = match approve_entry_for(req.kind, &req.target) {
+                        None => {
+                            // Kinds outside the durable store's vocabulary
+                            // (RemoteTool/GitWrite/Build) keep the prior
+                            // session-only behavior.
+                            self.record(req, "allow", scope);
+                            self.state
+                                .session_grants
+                                .insert((req.kind, req.target.clone()));
+                            continue;
+                        }
+                        Some(Err(reason)) => {
+                            self.record(req, "deny", "permanent-allow-refused-relative-exec-path");
+                            self.notice(window.as_ref(), &reason);
+                            return Deny;
+                        }
+                        Some(Ok(entry)) => entry,
+                    };
+                    // #2524 round 2 item 3: three distinct causes collapsed into
+                    // one message used to leave the operator guessing which one
+                    // applied and what to do about it. Checked in this order so
+                    // each gets its own notice.
+                    let persistent_scope = if self.delegation.is_some() {
+                        // #2535 item 6: a delegated session never establishes
+                        // its own root — reading `key_path` under one anyway
+                        // would be the dangerous shape this repo's OCAP
+                        // doctrine calls out (a key visible on disk,
+                        // deliberately not rooted in).
+                        self.notice(
+                            window.as_ref(),
+                            "permanent allow unavailable (a delegated session never \
+                             establishes its own root key): granted for this session only",
+                        );
+                        "session"
+                    } else if self.config_path.is_none() {
+                        self.notice(
+                            window.as_ref(),
+                            "permanent allow unavailable (no trusted config path for this \
+                             session): granted for this session only",
+                        );
+                        "session-no-config"
+                    } else {
+                        let root = self
+                            .key_path
+                            .as_deref()
+                            .and_then(|p| newt_identity::load_user_key(p).ok());
+                        match (root, self.config_path.as_deref()) {
+                            (Some(root), Some(config_path)) => {
+                                match newt_core::ocap_store::persist_approve(
+                                    config_path,
+                                    entry,
+                                    ocap_high_danger_predicate(),
+                                    |payload| root.sign(payload).to_bytes(),
+                                ) {
+                                    Ok(had_comments) => {
+                                        // BLOCKER (#2524 round 2 item 1): the
+                                        // write just appended ONE freshly-signed
+                                        // entry beside whatever else already sat
+                                        // in `approve.toml` — including, in the
+                                        // adversary's case, a pre-existing
+                                        // unsigned or tampered entry nothing on
+                                        // this path has verified. Folding the
+                                        // written `PolicyFile` straight in would
+                                        // launder that entry into live authority
+                                        // the moment ANY grant is persisted.
+                                        // Reload through the SAME verifying path
+                                        // startup uses instead — an unsigned/
+                                        // bad-signature entry drops loudly here,
+                                        // never reaching `fold_ocap_approvals`.
+                                        let root_vk = Some(root.public().as_bytes());
+                                        let (policy, warnings) =
+                                            newt_core::ocap_store::load_store(config_path, root_vk);
+                                        self.state.ocap_policy = policy;
+                                        for w in &warnings {
+                                            self.notice(
+                                                window.as_ref(),
+                                                &format!("warning: OCAP policy: {w}"),
+                                            );
+                                        }
+                                        self.state.fold_ocap_approvals();
+                                        let approve_path = config_path.with_file_name("ocap").join(
+                                            newt_core::ocap_store::Verdict::Approve.filename(),
+                                        );
+                                        self.notice(
+                                            window.as_ref(),
+                                            &format!(
+                                                "permanently allowed: {} `{}` (signed → {})",
+                                                axis_label(req.kind),
+                                                req.target,
+                                                approve_path.display()
+                                            ),
+                                        );
+                                        // #2524 follow-up item 3: `to_toml`
+                                        // re-serialises the whole file, which
+                                        // drops any hand-written TOML comment
+                                        // — `newt doctor --sign-ocap` already
+                                        // says so; this path did not.
+                                        if had_comments {
+                                            self.notice(
+                                                window.as_ref(),
+                                                "note: re-saving approve.toml dropped any \
+                                                 hand-written comments it had (TOML \
+                                                 comments are not preserved across a write)",
+                                            );
+                                        }
+                                        "permanent"
+                                    }
+                                    Err(e) => {
+                                        self.notice(
+                                            window.as_ref(),
+                                            &format!(
+                                                "warning: could not persist permanent grant: {e} \
                                              (granted for this session only)"
-                                        ),
-                                    );
-                                    "permanent-persist-failed"
+                                            ),
+                                        );
+                                        "permanent-persist-failed"
+                                    }
                                 }
                             }
-                        }
-                        None => {
-                            self.notice(
-                                window.as_ref(),
-                                "no effective writable config target — net grant is session-only; \
-                                 select a trusted config with --config to save permanent grants",
-                            );
-                            "session"
+                            _ => {
+                                self.notice(
+                                    window.as_ref(),
+                                    &no_key_notice(self.key_path.as_deref()),
+                                );
+                                "session-no-key"
+                            }
                         }
                     };
                     self.record(req, "allow", persistent_scope);
-                    if persistent_scope == "permanent" {
-                        self.notice(
-                            window.as_ref(),
-                            &format!(
-                                "added `{}` to [tui.permissions] net — future sessions \
-                                 will not prompt for it",
-                                req.target
-                            ),
-                        );
-                    }
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
@@ -1883,7 +2237,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
                 }
             }
         }
-        Allow(self.mint(baseline, &once_grants))
+        let minted = self.mint(baseline, &once_grants);
+        Allow(match build_covered_clamp {
+            Some(fence) => minted.meet(&fence),
+            None => minted,
+        })
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
@@ -1934,6 +2292,14 @@ mod permission_prompt_tests;
 #[cfg(test)]
 #[path = "permissions_tests/session_promotion.rs"]
 mod session_promotion;
+
+#[cfg(test)]
+#[path = "permissions_tests/ocap_grant_fold.rs"]
+mod ocap_grant_fold;
+
+#[cfg(test)]
+#[path = "permissions_tests/permanent_grant_writer.rs"]
+mod permanent_grant_writer;
 
 /// **A0 byte goldens (#1823, epic #1803): the plain permission-prompt
 /// rendering, frozen verbatim.** These strings ARE the current contract —

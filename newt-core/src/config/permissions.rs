@@ -63,6 +63,9 @@ pub enum PermissionPreset {
     /// See [`ToolPermissions::to_caveats`] for the exact allowlist.
     #[default]
     WorkspaceDev,
+    /// Full access inside the workspace: read/write its descendants and run
+    /// commands under native filesystem confinement. Networking is independent.
+    WorkspaceFullAccess,
     /// Unrestricted — `Caveats::top()`. `write_file` still prompts y/N.
     FullAccess,
     /// User has added commands beyond a canned preset; carries `WorkspaceDev`
@@ -71,10 +74,11 @@ pub enum PermissionPreset {
 }
 
 impl PermissionPreset {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ReadOnly,
         Self::WorkspaceEdit,
         Self::WorkspaceDev,
+        Self::WorkspaceFullAccess,
         Self::FullAccess,
     ];
 
@@ -83,12 +87,13 @@ impl PermissionPreset {
             Self::ReadOnly => "read_only",
             Self::WorkspaceEdit => "workspace_edit",
             Self::WorkspaceDev => "workspace_dev",
+            Self::WorkspaceFullAccess => "workspace_full_access",
             Self::FullAccess => "full_access",
             Self::Custom => "custom",
         }
     }
 
-    /// Cycle through the four user-visible presets (skips `Custom`).
+    /// Cycle through the user-visible presets (skips `Custom`).
     pub fn toggle(&self) -> Self {
         let idx = Self::ALL.iter().position(|p| p == self).unwrap_or(2);
         Self::ALL[(idx + 1) % Self::ALL.len()].clone()
@@ -99,6 +104,7 @@ impl PermissionPreset {
             Self::ReadOnly => "read files + list dirs; no writes, no commands",
             Self::WorkspaceEdit => "read + write workspace; no shell commands",
             Self::WorkspaceDev => "read, write workspace, run: cargo just git grep rg fd ...",
+            Self::WorkspaceFullAccess => "full access inside workspace: commands + create/change/rename/delete; network separate",
             Self::FullAccess => "unrestricted (prompts y/N before each write)",
             Self::Custom => "workspace-dev tools plus your extra commands",
         }
@@ -312,6 +318,12 @@ impl ToolPermissions {
                 }
             }
 
+            PermissionPreset::WorkspaceFullAccess => {
+                let mut caveats = crate::confined_exec::workspace_confined_caveats(Path::new(&ws));
+                caveats.net = net;
+                caveats
+            }
+
             PermissionPreset::FullAccess => Caveats::top(),
         }
     }
@@ -410,7 +422,17 @@ impl Config {
     /// Durably grant a net host by appending it to `[tui.permissions] net` in the
     /// config file at `path`, comment-preserving (see [`Config::with_net_host`]).
     /// A missing file is treated as empty (the table is created). Creates parent
-    /// dirs as needed. Used by the interactive gate's "allow permanently" choice.
+    /// dirs as needed.
+    ///
+    /// **P-1 (#2535/#2524 PR1): retired as a durable WRITER.** The interactive
+    /// gate's "allow permanently" now signs every kind (including net) into
+    /// `~/.newt/ocap/approve.toml` via [`crate::ocap_store::persist_approve`]
+    /// instead — see `newt-tui`'s `PromptChoice::AllowPermanent` arm.
+    /// `[tui.permissions] net` is still READ as legacy input (an already
+    /// hand-edited or previously-written config keeps working), so this
+    /// method stays for that migration path and its own regression test; it
+    /// is no longer called from the permanent-allow flow. A ratchet candidate
+    /// for full removal once no config in the wild still relies on the read.
     pub fn append_permission_net_host(path: &Path, host: &str) -> Result<()> {
         Self::update_permissions_file(path, |text| Self::with_net_host(text, host))
     }

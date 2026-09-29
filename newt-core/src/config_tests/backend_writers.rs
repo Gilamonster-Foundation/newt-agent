@@ -135,3 +135,34 @@ fn with_default_backend_rejects_empty_name() {
 fn with_default_backend_rejects_invalid_toml() {
     assert!(Config::with_default_backend("this = = not toml", "local").is_err());
 }
+
+/// `/settings prefix` persists through this. The trap it must survive is
+/// #2569's: a config with a `[tui.permissions]` subtable and no `[tui]` keys.
+/// The new key lands in `[tui]`, the subtable and the comments survive, and a
+/// second write replaces rather than duplicates.
+#[test]
+fn with_tui_key_sets_one_scalar_and_keeps_subtables_and_comments() {
+    let text = "# my config\ndefault_backend = \"b\"\n\n[tui.permissions]\nnet = [\"example.org\"] # keep me\n";
+    let once = Config::with_tui_key(text, "prefix_key", "ctrl+a").unwrap();
+    let parsed: toml::Value = toml::from_str(&once).unwrap();
+    assert_eq!(parsed["tui"]["prefix_key"].as_str(), Some("ctrl+a"));
+    assert_eq!(
+        parsed["tui"]["permissions"]["net"][0].as_str(),
+        Some("example.org")
+    );
+    assert!(
+        once.contains("# my config") && once.contains("# keep me"),
+        "{once}"
+    );
+    let twice = Config::with_tui_key(&once, "prefix_key", "ctrl+space").unwrap();
+    assert_eq!(twice.matches("prefix_key").count(), 1, "{twice}");
+    let parsed: toml::Value = toml::from_str(&twice).unwrap();
+    assert_eq!(parsed["tui"]["prefix_key"].as_str(), Some("ctrl+space"));
+    // A fresh config gains a [tui] table.
+    let fresh = Config::with_tui_key("", "prefix_key", "ctrl+n").unwrap();
+    assert!(
+        fresh.contains("[tui]") && fresh.contains("prefix_key = \"ctrl+n\""),
+        "{fresh}"
+    );
+    assert!(Config::with_tui_key("tui = 3\n", "prefix_key", "x").is_err());
+}

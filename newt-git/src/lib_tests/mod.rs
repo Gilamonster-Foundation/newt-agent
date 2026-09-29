@@ -72,6 +72,54 @@ fn repo_with_commit() -> tempfile::TempDir {
     dir
 }
 
+/// [`repo_with_commit`], checked out onto a non-default branch. For tests
+/// that go on to commit/amend/rebase THROUGH the `git` tool or `GitEngine`
+/// (not raw `git`) — those are refused on `main` by
+/// `refuse_if_default_branch` (F32/#2537), and a test exercising ordinary
+/// mutation isn't exercising that guard.
+fn repo_with_commit_on_task_branch() -> tempfile::TempDir {
+    let dir = repo_with_commit();
+    git(dir.path(), &["checkout", "-q", "-b", "task"]);
+    dir
+}
+
+/// A temp repo with three commits: `c1` adds `a.txt`, `c2` adds `b.txt`, `c3`
+/// modifies `a.txt`. Returns the dir plus each commit's real `git rev-parse`
+/// oid, oldest first, so revision/range/pathspec tests can assert against
+/// real git's own idea of the history shape.
+fn rev_parse(dir: &Path, rev: &str) -> String {
+    String::from_utf8(
+        git_cmd(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+fn repo_with_history() -> (tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut ids = Vec::new();
+    git(p, &["init", "-q", "-b", "main"]);
+    std::fs::write(p.join("a.txt"), "hello\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c1: add a.txt"]);
+    ids.push(rev_parse(p, "HEAD"));
+    std::fs::write(p.join("b.txt"), "world\n").unwrap();
+    git(p, &["add", "b.txt"]);
+    git(p, &["commit", "-q", "-m", "c2: add b.txt"]);
+    ids.push(rev_parse(p, "HEAD"));
+    std::fs::write(p.join("a.txt"), "hello again\n").unwrap();
+    git(p, &["add", "a.txt"]);
+    git(p, &["commit", "-q", "-m", "c3: modify a.txt"]);
+    ids.push(rev_parse(p, "HEAD"));
+    (dir, ids)
+}
+
 use newt_core::agentic::GitTool as _;
 
 fn tool(dir: &Path) -> LocalGitTool {
@@ -89,8 +137,9 @@ fn tool(dir: &Path) -> LocalGitTool {
             None,
             "noreply@newt-agent.com",
         )),
-        commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
-        contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
+        commit_succeeded: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        contributors_consumed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        signer: None,
     }
 }
 
@@ -105,6 +154,16 @@ fn commit_count(dir: &Path) -> usize {
 fn head_message(dir: &Path) -> String {
     let out = git_cmd(dir)
         .args(["log", "-1", "--pretty=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Real `git status --porcelain` — ground truth for "the working tree ==
+/// HEAD" (#2485), independent of the embedded engine's own status scan.
+fn git_status_porcelain(dir: &Path) -> String {
+    let out = git_cmd(dir)
+        .args(["status", "--porcelain"])
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).to_string()
@@ -147,6 +206,10 @@ mod ambient_environment {
 
         // Unscrubbed, that config changes what `git tag` builds: it either
         // refuses for want of an editor, or writes an annotated tag object.
+        // All three stdio streams are closed because there is a third outcome
+        // (#2483): with no editor configured git falls back to `vi`, which
+        // waits forever on an inherited terminal. Closing stdin alone is not
+        // enough — vim then reads its keys from a terminal on stderr.
         let unscrubbed = Command::new("git")
             .current_dir(p)
             .env("GIT_CONFIG_GLOBAL", &poison)
@@ -154,6 +217,9 @@ mod ambient_environment {
             .env_remove("GIT_EDITOR")
             .env_remove("VISUAL")
             .args(["tag", "poisoned"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .expect("git runs");
         if unscrubbed.success() {
@@ -233,11 +299,17 @@ mod checkout_branch;
 #[path = "engine_read.rs"]
 mod engine_read;
 #[cfg(test)]
+#[path = "signing.rs"]
+mod signing;
+
 #[path = "engine_write.rs"]
 mod engine_write;
 #[cfg(test)]
 #[path = "git_scope.rs"]
 mod git_scope;
+#[cfg(test)]
+#[path = "log_diff_operands.rs"]
+mod log_diff_operands;
 #[cfg(test)]
 #[path = "rebase.rs"]
 mod rebase;

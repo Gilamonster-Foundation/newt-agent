@@ -57,6 +57,7 @@ fn hard_budget_ctx<'a>(
     kind: BackendKind,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        overflow_retry: Default::default(),
         run_allowance: None,
         verify_outcomes: false,
         round_cap_hit: None,
@@ -86,6 +87,8 @@ fn hard_budget_ctx<'a>(
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        responses_capability: Default::default(),
+        openai_api: Default::default(),
         output_allowance: None,
         attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
@@ -190,6 +193,9 @@ mod authentication;
 #[cfg(test)]
 #[path = "tool_round_cap/loop_controls.rs"]
 mod loop_controls;
+
+#[path = "tool_round_cap/progress_continuation.rs"]
+mod progress_continuation;
 
 #[cfg(test)]
 #[path = "tool_round_cap/responses_protocol.rs"]

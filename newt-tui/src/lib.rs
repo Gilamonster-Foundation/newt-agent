@@ -12,8 +12,12 @@ mod brand;
 mod chat;
 mod codex_env;
 mod color;
+mod context_window;
 mod crew_form;
 mod help;
+#[cfg(feature = "rich-tui")]
+mod inference_panel;
+mod migration_notices;
 mod navigator_cmds;
 mod session_capability;
 // `chat.rs` establishes and reapplies the session capability, and
@@ -75,6 +79,11 @@ mod inline_viewport;
 // not a dependency, so "no renderer in the model" is a compile error.
 #[cfg(feature = "rich-tui")]
 mod interaction_view;
+// #2524 item 7: the RichTUI free-text modal for a pending clarification
+// batch — a small purpose-built reader beside `interaction_view`'s
+// choice-list modal, for the reason its own module doc gives.
+#[cfg(feature = "rich-tui")]
+mod clarification_modal;
 /// C2 (#1876) — the PTY acceptance proof that the inline INTERACTION frame
 /// hands the terminal back on every exit path: clean close, panic, and error
 /// return. Same tier and same reasoning as the pager's, and it additionally
@@ -105,6 +114,8 @@ mod prompt_visibility_test;
 // assertion is structural ("on screen while still running"), not a stopwatch.
 #[cfg(all(test, unix))]
 mod interrupt_ack_pty_test;
+#[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+mod scrollbar;
 /// #1981: the ONE list of top-level slash commands. Three lists knew this
 /// before and none agreed; see the module doc.
 /// #1981: `/settings` — the typed form the knob verbs are absorbed into.
@@ -197,7 +208,13 @@ mod theme;
 // every panel, so a third panel cannot inherit a third copy of the event loop
 // `/psyche` and `/backends` were each carrying.
 #[cfg(feature = "rich-tui")]
+mod modal_size;
+#[cfg(feature = "rich-tui")]
 mod panel;
+#[cfg(feature = "rich-tui")]
+mod panel_controls;
+#[cfg(feature = "rich-tui")]
+mod prefix;
 // `/settings` as a chooser (slash_registry's `Disposition::Panel`), over the
 // same driver and the same chrome as /psyche and /backends. The typed form
 // stays for every surface that has no region to draw in.
@@ -649,7 +666,8 @@ pub fn run_code(
     // Color: NEWT_COLOR (--color/--mono) > NO_COLOR/TERM=dumb > [tui] color > auto
     // (issue #527). Config is folded in here, where a session reads it; the
     // `color_supported_with` shim (used pre-config, e.g. the wizard) stays Auto.
-    let cfg_color = newt_core::Config::resolve()
+    let mut migration_notices = crate::migration_notices::Pending::default();
+    let cfg_color = newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
         .ok()
         .and_then(|c| c.tui)
         .map(|t| t.color)
@@ -659,6 +677,9 @@ pub fn run_code(
         io::stdout().is_terminal(),
     );
 
+    if let Some(p) = path {
+        newt_core::settings::set_workspace(p);
+    }
     let workspace = resolve_workspace(path);
 
     // `no_splash` is already resolved by the caller (CLI flags + config).
@@ -674,12 +695,13 @@ pub fn run_code(
         // Background work starts AT splash entry: a configured box pre-warms
         // its backend probe while the logo shows; run_chat consumes the result
         // when (and only when) the resolved choice still matches.
-        let prewarm = spawn_backend_prewarm();
+        let prewarm = spawn_backend_prewarm(&mut |notice| migration_notices.report(notice));
         // The unboxed state names the splash context ("initial setup") —
         // computed before `setup` is consumed below.
-        let unconfigured = newt_core::Config::resolve()
-            .map(|c| c.is_unconfigured())
-            .unwrap_or(true);
+        let unconfigured =
+            newt_core::Config::resolve(&mut |notice| migration_notices.report(notice))
+                .map(|c| c.is_unconfigured())
+                .unwrap_or(true);
         let context = if unconfigured || setup.is_some() {
             "initial setup"
         } else {
@@ -700,6 +722,7 @@ pub fn run_code(
         // inside the alternate screen. Explicit rather than implicit at the end
         // of the block so the ordering stays visible to a reader.
         drop(screen);
+        migration_notices.flush();
         if !cont {
             if let Some(pw) = prewarm {
                 pw.handle.abort();
@@ -717,6 +740,9 @@ pub fn run_code(
         return run_chat(&workspace, color, persona, altitude, crew_runner, prewarm);
     }
 
+    // No splash owns the terminal on this branch. Deliver before the wizard
+    // or either run_chat path, including inline setup's early return.
+    migration_notices.flush();
     // No-splash paths keep the pre-splash order exactly (wizard first): CI,
     // piped, and --no-splash launches see no behavior change.
     wizard::maybe_run(color)?;
@@ -765,9 +791,11 @@ pub(crate) fn probe_timeout_secs(url: &str) -> u64 {
 /// Start the pre-warm probe for the resolved backend choice, if this box is
 /// configured (an unconfigured box has nothing real to probe — the wizard is
 /// about to change everything) and a tokio runtime is available.
-fn spawn_backend_prewarm() -> Option<Prewarm> {
+fn spawn_backend_prewarm(
+    report: &mut dyn FnMut(newt_core::tty::Notice<'static>),
+) -> Option<Prewarm> {
     let runtime = tokio::runtime::Handle::try_current().ok()?;
-    let cfg = newt_core::Config::resolve_runtime_unpublished().ok()?;
+    let cfg = newt_core::Config::resolve_runtime_unpublished(report).ok()?;
     if cfg.is_unconfigured() {
         return None;
     }
@@ -1118,7 +1146,6 @@ fn runtime_context_block(
     };
     let author_email = identity.email.as_str();
     let author_name = identity.name.as_str();
-    let harness = newt_core::build_info::harness_name();
     let runtime_authority = runtime_authority_note(disposition)
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
@@ -1135,21 +1162,11 @@ fn runtime_context_block(
          never invent or guess an identity.\n\
          {runtime_authority}\
          # Git commit identity\n\
-         Prefer the `git` tool: it commits as `{author_name} <{author_email}>` and \
-         auto-signs `Co-authored-by: {model} ({harness} v<version> <build>) <{author_email}>` for \
-         every model/harness that materially contributed since the last commit \
-         (not just this one) — do NOT add that trailer yourself, just write the \
-         plain message; for the last commit use op=amend (don't claim to amend \
-         without calling it).\n\
-         If you instead commit with the SHELL `git` command (run_command), you \
-         MUST set the same identity explicitly — the email is what attributes the \
-         commit to the harness account on GitHub. Use:\n\
-         `git -c user.name='{author_name}' -c user.email='{author_email}' commit -m \"…\"`\n\
-         (the author name may be `{author_name}` or this model's name, but the \
-         email must always be `{author_email}`). Never commit with a guessed or \
-         personal email. The shell path bypasses the harness entirely, so it \
-         gets NO automatic Co-authored-by credit — prefer the `git` tool \
-         whenever multi-contributor attribution matters.\n\
+         Configured Git identity: `{author_name} <{author_email}>`. \
+         Use ordinary Git commands for repository work. Harness-managed commits \
+         record every contributing model/harness pair from the attribution ledger. \
+         Never invent an author identity or claim a commit or signature without \
+         a successful tool result.\n\
          {filesystem_authority}"
     )
 }
@@ -1184,6 +1201,14 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
 /// `--read <path>` adds a read path; `--write <path>` adds a read+write path
 /// (write implies read) and is also widened into the already-fenced `fs_write`.
 fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
+    policy_for_launch(tui, workspace, newt_core::launch_authority::current())
+}
+
+fn policy_for_launch(
+    tui: Option<newt_core::TuiConfig>,
+    workspace: &str,
+    authority: newt_core::launch_authority::LaunchAuthority,
+) -> newt_core::caveats::Caveats {
     use newt_core::caveats::Scope;
     // --full-access / NEWT_FULL_ACCESS=1: per-invocation preset override —
     // build the policy from `full_access` (`Caveats::top()`, the exact value
@@ -1192,8 +1217,12 @@ fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::
     // + no mode ⇒ `exec_floor_from` → None), so combined with --yolo the
     // host-shell bypass covers every command. Surfaced loudly at session
     // start by `full_access_banner`.
-    let mut caveats = if newt_core::agentic::full_access_requested() {
+    let mut caveats = if authority.full_access() {
         newt_core::caveats::Caveats::top()
+    } else if authority.workspace_access() {
+        let mut permissions = tui.map(|t| t.permissions).unwrap_or_default();
+        permissions.preset = newt_core::PermissionPreset::WorkspaceFullAccess;
+        permissions.to_caveats(workspace)
     } else {
         tui.map(|t| t.permissions.to_caveats(workspace))
             .unwrap_or_else(|| read_only_caveats(workspace))
@@ -1351,6 +1380,11 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
     fn take_exit_requested(&self) -> bool {
         self.exit_requested
             .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn exit_requested(&self) -> bool {
+        self.exit_requested
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1727,14 +1761,39 @@ fn apply_operating_mode_to_intake(
     }
 }
 
-/// Defense in depth for modes that promise no mutation. This is a meet with
-/// the existing plan-phase clamp, so it can only attenuate ambient authority.
-fn operating_mode_caveats(mode: OperatingMode, caveats: newt_core::Caveats) -> newt_core::Caveats {
+/// Only an operator-selected mode or an active model Plan phase may clamp
+/// authority. Inferred working styles guide the response; they cannot remove
+/// existing grants. Every clamp is a meet, so it cannot add authority either.
+fn operating_mode_caveats(
+    configured: OperatingMode,
+    model_plan_phase: bool,
+    caveats: newt_core::Caveats,
+) -> newt_core::Caveats {
+    let mode = if model_plan_phase {
+        OperatingMode::Plan
+    } else {
+        configured
+    };
     match mode {
         OperatingMode::Plan => caveats.meet(&newt_core::agentic::plan_phase_clamp()),
         OperatingMode::Diagnose => caveats.meet(&diagnose_mode_clamp()),
         _ => caveats,
     }
+}
+
+/// The ceiling re-applied by the permission gate after recalled or new grants.
+fn operating_mode_permission_clamp(
+    configured: OperatingMode,
+    model_plan_phase: bool,
+    posture_clamp: Option<newt_core::Caveats>,
+) -> Option<newt_core::Caveats> {
+    let has_posture_clamp = posture_clamp.is_some();
+    let ceiling = operating_mode_caveats(
+        configured,
+        model_plan_phase,
+        posture_clamp.unwrap_or_else(newt_core::Caveats::top),
+    );
+    (has_posture_clamp || ceiling != newt_core::Caveats::top()).then_some(ceiling)
 }
 
 /// Diagnose may gather remote read-only evidence, while still denying every
@@ -1753,18 +1812,29 @@ fn diagnose_mode_clamp() -> newt_core::Caveats {
 }
 
 fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) -> String {
+    let (description, instructions) = match (configured != effective, effective) {
+        (true, OperatingMode::Diagnose) => (
+            "Gather evidence and identify the cause.",
+            "Gather evidence using the tools needed for the assignment under the session grants. \
+             Report supported findings and continue any already requested follow-through. Ask \
+             when a consequential decision or required permission remains unresolved.",
+        ),
+        (true, OperatingMode::Plan) => (
+            "Organize the requested work into a concrete, sequenced plan.",
+            "Build a concrete plan using necessary evidence and tools under the session grants. \
+             Follow the requested scope and any active Plan-phase restrictions. Ask about \
+             unresolved decisions or required permissions.",
+        ),
+        _ => (effective.description(), effective.instructions()),
+    };
     let identity = if configured == effective {
-        format!(
-            "Operating mode: {} — {}",
-            effective.as_str(),
-            effective.description()
-        )
+        format!("Operating mode: {} — {}", effective.as_str(), description)
     } else {
         format!(
             "Configured session mode: {}. Effective working style for this turn: {} — {}.",
             configured.as_str(),
             effective.as_str(),
-            effective.description(),
+            description,
         )
     };
     let auto_control = if configured == OperatingMode::Auto {
@@ -1783,13 +1853,14 @@ fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) ->
     format!(
         "<operating_mode configured=\"{}\" effective=\"{}\">\n{}\n\
          Effective instructions:\n{}{}{}\n\
-         This mode controls working style only. It grants no authority, bypasses no \
-         permission or safety boundary, and cannot turn a read-only prompt into an \
-         action prompt.\n</operating_mode>",
+         Inferred styles guide the response; they do not change session grants or \
+         bypass permission gates. Explicit operator Plan or Diagnose modes and an \
+         active model Plan phase retain their permission ceilings. Stay within the \
+         requested task.\n</operating_mode>",
         configured.as_str(),
         effective.as_str(),
         identity,
-        effective.instructions(),
+        instructions,
         auto_control,
         configured_invariants,
     )
@@ -2008,11 +2079,83 @@ pub(crate) fn permission_panel_lines(
     rows
 }
 
+/// Parse the flat, pre-chain `PermissionRecord` lines out of a JSONL body
+/// (one JSON object per line, no [`newt_core::event_journal::JournalLine`]
+/// envelope). Unparseable lines are dropped — they are not part of a chain
+/// to report a break against, since this body predates the chain entirely.
+fn flat_permission_records(body: &str) -> Vec<newt_core::PermissionRecord> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// One `/permissions audit` row; chained and unchained history share it.
+fn audit_row(rec: &newt_core::PermissionRecord) -> String {
+    format!(
+        "  {:<7} {:<9} {:<8} {} via {}",
+        rec.decision, rec.scope, rec.kind, rec.target, rec.tool
+    )
+}
+
+/// Render up to `limit` flat records as unchained-history rows, newest last
+/// (append order) — matches the labelling the chained rows below it use.
+fn push_unchained(out: &mut Vec<String>, records: &[newt_core::PermissionRecord], limit: usize) {
+    let show = if limit == 0 { records.len() } else { limit };
+    for rec in records.iter().take(show) {
+        out.push(format!("{} (unchained)", audit_row(rec)));
+    }
+}
+
+/// Report what the chain proves before anything it contains is presented as
+/// evidence — one header row per [`newt_core::permission_journal::ChainBreak`],
+/// mirroring `newt ocap denials`' `render_integrity`
+/// (`newt-cli/src/ocap_cmd.rs`).
+fn push_chain_breaks(
+    out: &mut Vec<String>,
+    breaks: &[newt_core::permission_journal::ChainBreak],
+    anchored: bool,
+) {
+    use newt_core::permission_journal::ChainBreak;
+    if breaks.is_empty() {
+        return;
+    }
+    let anchor = if anchored {
+        "anchored to the stored head"
+    } else {
+        "no stored head ref, so removal from the END was NOT checked"
+    };
+    out.push(format!(
+        "!! CHAIN BROKEN — this permission log does not verify ({} problem(s); {anchor}).",
+        breaks.len()
+    ));
+    for br in breaks {
+        out.push(match br {
+            ChainBreak::Edited { index } => {
+                format!("!!   record {index}: edited — its bytes no longer match its own address")
+            }
+            ChainBreak::Unreadable { index } => {
+                format!("!!   record {index}: its address does not parse")
+            }
+            ChainBreak::BrokenLink { index } => format!(
+                "!!   record {index}: broken link — a record before it was deleted or reordered"
+            ),
+            ChainBreak::NotAChain { index } => {
+                format!("!!   record {index}: not a single-parent chain link")
+            }
+            ChainBreak::Truncated { expected_head } => format!(
+                "!!   truncated — the chain no longer reaches the stored head {expected_head}"
+            ),
+        });
+    }
+}
+
 /// Parse the permission log into human-readable audit rows (newest-first).
 ///
-/// Malformed lines are skipped so a corrupt log never blocks the `/permissions
-/// audit` path. An empty or unreadable log returns a one-line user-facing
-/// message instead.
+/// #2529 round 2 (items 1–4): a tampered chain never renders like genuine
+/// history, and a pre-chain body — whether rotated aside to `.pre-chain` or
+/// still sitting unrotated in the log itself — is shown as unchained history
+/// rather than silently vanishing.
 pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -> Vec<String> {
     let body = match std::fs::read_to_string(log_path) {
         Ok(body) => body,
@@ -2024,28 +2167,69 @@ pub(crate) fn permission_audit_lines(log_path: &std::path::Path, limit: usize) -
         }
     };
 
-    let records: Vec<newt_core::PermissionRecord> = body
-        .lines()
-        .filter_map(|line| serde_json::from_str::<newt_core::PermissionRecord>(line).ok())
-        .collect();
+    let mut out = Vec::new();
+    let chained = newt_core::permission_journal::read_jsonl(&body);
 
+    // Item 4: not yet rotated — the whole file is still a flat pre-chain
+    // body. Detected on read, not by a write-time flag.
+    if chained.is_empty() && !body.trim().is_empty() {
+        let unchained = flat_permission_records(&body);
+        if !unchained.is_empty() {
+            out.push(
+                "pre-chain migration: this log has not been rotated onto the chain yet — \
+                 the lines below carry no integrity guarantee"
+                    .to_string(),
+            );
+            push_unchained(&mut out, &unchained, limit);
+            return out;
+        }
+    }
+
+    // Item 3: an unparseable line is a chain break, not a silent skip.
+    let raw_lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+    let unparseable = raw_lines.saturating_sub(chained.len());
+    let head = newt_core::permission_journal::read_head(log_path);
+    let mut breaks = newt_core::permission_journal::verify_chain(&chained, head.as_deref());
+    breaks.extend((0..unparseable).map(|_| {
+        newt_core::permission_journal::ChainBreak::Unreadable {
+            index: chained.len(),
+        }
+    }));
+    // Item 2: a header row per break, before any record renders.
+    push_chain_breaks(&mut out, &breaks, head.is_some());
+
+    // Item 1: a rotated pre-chain sibling exists — say so, and render its
+    // lines (within `limit`) as unchained history.
+    let pre_chain_path = newt_core::permission_journal::pre_chain_path(log_path);
+    if let Ok(pre_body) = std::fs::read_to_string(&pre_chain_path) {
+        let unchained = flat_permission_records(&pre_body);
+        if !unchained.is_empty() {
+            out.push(format!(
+                "pre-chain migration: {} holds the earlier lines",
+                pre_chain_path.display()
+            ));
+            push_unchained(&mut out, &unchained, limit);
+        }
+    }
+
+    let records = newt_core::permission_journal::records(&chained);
     if records.is_empty() {
-        return vec!["no permission log entries yet".to_string()];
+        if out.is_empty() {
+            out.push("no permission log entries yet".to_string());
+        }
+        return out;
     }
 
     let show = if limit == 0 { records.len() } else { limit };
     let shown = records.len().min(show);
-    let mut lines = vec![format!(
+    out.push(format!(
         "permission audit: {shown} of {} (newest first)",
         records.len()
-    )];
+    ));
     for rec in records.iter().rev().take(show) {
-        lines.push(format!(
-            "  {:<7} {:<9} {:<8} {} via {}",
-            rec.decision, rec.scope, rec.kind, rec.target, rec.tool
-        ));
+        out.push(audit_row(rec));
     }
-    lines
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,6 +2298,30 @@ fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
         "*",
         "full-access",
         "session",
+    )
+}
+
+/// Contract honesty (#2532 review, item 3): the ONE `ocap-store-folded` line
+/// written to the #263 permission log at session start when
+/// `fold_ocap_approvals` actually widened something — so `/permissions` (and
+/// the audit trail) can show provenance for a caveat the operator did not
+/// grant THIS session, matching headless's contract-record receipt for the
+/// same fold. `target` carries the count rather than a single axis/target,
+/// since the fold is many grants folded in one step; `scope: "durable-store"`
+/// distinguishes it from a `session`/`durable` (`/permissions`-promoted)
+/// grant. Only called when `folded_count > 0` — a log line for zero folds is
+/// noise, not audit.
+fn ocap_store_folded_record(
+    conversation_id: &str,
+    folded_count: usize,
+) -> newt_core::PermissionRecord {
+    newt_core::PermissionRecord::new(
+        conversation_id,
+        "session",
+        newt_core::DenialKind::Exec,
+        &format!("{folded_count} durable grant(s)"),
+        "allow",
+        "durable-store",
     )
 }
 
@@ -4330,10 +4538,11 @@ pub(crate) fn resolve_backend_choice(
 /// falls back to the AS-IS default config so command surfaces still
 /// render; the chat startup path prints its own visible line.
 pub(crate) fn resolve_runtime_or_default() -> newt_core::ResolvedConfig {
-    newt_core::Config::resolve_runtime_unpublished().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "config resolution failed — running on built-in defaults");
-        newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
-    })
+    crate::migration_notices::read(|report| newt_core::Config::resolve_runtime_unpublished(report))
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "config resolution failed — running on built-in defaults");
+            newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
+        })
 }
 
 /// Surface the resolved OpenAI API surface to the agent loop via
@@ -4694,65 +4903,70 @@ impl PersonaStore {
     }
 
     fn load(&self, name: &str) -> anyhow::Result<Persona> {
-        self.ensure_defaults()?;
-        let name = normalize_persona_name(name)?;
-        let path = self.dir.join(format!("{name}.md"));
-        let raw = match newt_core::psyche_import::read_persona_file(&path) {
-            Ok(raw) => raw,
-            Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
-        };
-        // Parse optional `+++` front-matter into a role profile. A plain `.md`
-        // with no front-matter yields a prompt-only profile (backward
-        // compatible). The injected `prompt` is the markdown BODY, so
-        // front-matter never leaks into the system prompt.
-        let profile = newt_core::RoleProfile::parse(&raw)
-            .map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
-        if profile.prompt.is_empty() {
-            anyhow::bail!("persona `{name}` is empty: {}", path.display());
-        }
-        Ok(Persona {
-            name,
-            prompt: profile.prompt.clone(),
-            path,
-            profile,
+        crate::migration_notices::read(|report| {
+            self.ensure_defaults()?;
+            let name = normalize_persona_name(name)?;
+            let path = self.dir.join(format!("{name}.md"));
+            let raw = match newt_core::psyche_import::read_persona_file(&path, report) {
+                Ok(raw) => raw,
+                Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
+            };
+            // Parse optional `+++` front-matter into a role profile. A plain `.md`
+            // with no front-matter yields a prompt-only profile (backward
+            // compatible). The injected `prompt` is the markdown BODY, so
+            // front-matter never leaks into the system prompt.
+            let profile = newt_core::RoleProfile::parse(&raw)
+                .map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
+            if profile.prompt.is_empty() {
+                anyhow::bail!("persona `{name}` is empty: {}", path.display());
+            }
+            Ok(Persona {
+                name,
+                prompt: profile.prompt.clone(),
+                path,
+                profile,
+            })
         })
     }
 
     fn list(&self) -> anyhow::Result<Vec<PersonaSummary>> {
-        self.ensure_defaults()?;
-        let mut personas = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
+        crate::migration_notices::read(|report| {
+            self.ensure_defaults()?;
+            let mut personas = Vec::new();
+            for entry in std::fs::read_dir(&self.dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let raw =
+                    newt_core::psyche_import::read_persona_file(&path, report).unwrap_or_default();
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                // Skip files whose front-matter is malformed in the listing rather
+                // than failing the whole list; `load` surfaces the error on use.
+                let Ok(profile) = newt_core::RoleProfile::parse(&raw) else {
+                    continue;
+                };
+                let persona = Persona {
+                    name: name.to_string(),
+                    prompt: profile.prompt.clone(),
+                    path: path.clone(),
+                    profile,
+                };
+                let description = persona.description();
+                personas.push(PersonaSummary {
+                    name: persona.name,
+                    description,
+                });
             }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let raw = newt_core::psyche_import::read_persona_file(&path).unwrap_or_default();
-            if raw.trim().is_empty() {
-                continue;
-            }
-            // Skip files whose front-matter is malformed in the listing rather
-            // than failing the whole list; `load` surfaces the error on use.
-            let Ok(profile) = newt_core::RoleProfile::parse(&raw) else {
-                continue;
-            };
-            let persona = Persona {
-                name: name.to_string(),
-                prompt: profile.prompt.clone(),
-                path: path.clone(),
-                profile,
-            };
-            let description = persona.description();
-            personas.push(PersonaSummary {
-                name: persona.name,
-                description,
-            });
-        }
-        personas.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(personas)
+            personas.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(personas)
+        })
     }
 
     fn list_message(&self) -> anyhow::Result<String> {
@@ -5249,7 +5463,13 @@ fn build_system_prompt_with_persona(
         newt_core::Altitude::Coach => newt_core::COACH_SOUL,
         newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
     };
-    let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
+    let mut ctx = format!(
+        "{identity}\n\nWorkspace: {workspace}\n\
+         This is the current runtime root. Relative tool paths resolve here; \
+         run_command starts here unless its cwd or command selects another directory. \
+         Other requested paths remain governed by the session's permissions. \
+         Historical notes do not redefine this root.\n"
+    );
     if let Some(persona) = persona {
         ctx.push_str(&format!(
             "\nActive persona: {}\n{}\n",
@@ -5283,7 +5503,7 @@ fn build_system_prompt_with_persona(
     // tool. Skills come from the one resolver `use_skill` also reads (#2331):
     // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
     // missing dir contributes nothing.
-    let skills_dirs = newt_core::Config::resolve()
+    let skills_dirs = crate::migration_notices::read(|report| newt_core::Config::resolve(report))
         .map(|c| c.skill_search_dirs())
         .unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
@@ -7707,7 +7927,7 @@ fn mouse_capable_for(
         )
 }
 
-/// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
+/// Initial allowance of tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Uses the canonical core default when there's no `[tui]` table or config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui
@@ -7716,7 +7936,7 @@ fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
         .unwrap_or_else(|| newt_core::TuiConfig::default().max_tool_rounds)
 }
 
-/// Additional progress-aware tool-call rounds after `[tui].max_tool_rounds`.
+/// Renewable progress-aware round increments after `[tui].max_tool_rounds`.
 /// Defaults to 5; set to 0 to keep the normal round cap hard.
 fn workflow_grace_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui
@@ -7896,21 +8116,22 @@ fn tool_round_limit_status(
     let explicit_relentless = explicit_tenacity == Some(newt_core::Tenacity::Relentless);
     match session_override {
         Some(rounds) if explicit_relentless => format!(
-            "tool-call round limit: {} this session (explicit relentless tenacity default {}; config/model default {})",
+            "initial tool-call round allowance: {} this session (explicit relentless tenacity default {}; config/model default {})",
             describe_tool_round_limit(rounds),
             describe_tool_round_limit(posture_default),
             describe_tool_round_limit(configured),
         ),
         Some(rounds) => format!(
-            "tool-call round limit: {} this session (config/model default {})",
-            describe_tool_round_limit(rounds), describe_tool_round_limit(configured),
+            "initial tool-call round allowance: {} this session (config/model default {})",
+            describe_tool_round_limit(rounds),
+            describe_tool_round_limit(configured),
         ),
         None if explicit_relentless => format!(
-            "tool-call round limit: {posture_default} (effectively unlimited; explicit relentless tenacity; config/model default {})",
+            "initial tool-call round allowance: {posture_default} (effectively unlimited; explicit relentless tenacity; config/model default {})",
             describe_tool_round_limit(configured),
         ),
         None => format!(
-            "tool-call round limit: {} (config/model default)",
+            "initial tool-call round allowance: {} (config/model default)",
             describe_tool_round_limit(configured)
         ),
     }
@@ -8294,7 +8515,7 @@ pub(crate) fn build_adjudicator(
 /// resolver falls back to `Config::resolve()` only when nobody has.
 fn markdown_enabled(cfg: &newt_core::Config, color: bool) -> bool {
     let mode = if newt_core::config::markdown_is_session_pinned() {
-        newt_core::config::session_markdown_mode()
+        crate::migration_notices::read(newt_core::config::session_markdown_mode)
     } else {
         cfg.tui.as_ref().map(|t| t.markdown).unwrap_or_default()
     };
@@ -8326,7 +8547,9 @@ fn context_manager(
 /// owns the precedence now, so this asks rather than being told.
 fn compaction_trigger_policy(cfg: &newt_core::Config) -> newt_core::CompactionTriggerPolicy {
     if newt_core::config::compaction_trigger_is_session_pinned() {
-        return newt_core::config::session_compaction_trigger_policy();
+        return crate::migration_notices::read(
+            newt_core::config::session_compaction_trigger_policy,
+        );
     }
     configured_compaction_trigger_policy(cfg)
 }
@@ -8640,7 +8863,7 @@ fn handle_context_command(
 /// store (Step 26.3); other features instrument as they land (26.4+).
 #[allow(clippy::too_many_arguments)] // gauge + counters + policy + features + one impact tuple per feature
 fn context_stats_text(
-    gauge: Option<(u32, u32)>,
+    gauge: Option<(u32, Option<u32>)>,
     counters: &newt_core::CompressCounters,
     compaction_policy: newt_core::CompactionTriggerPolicy,
     compaction_policy_source: &str,
@@ -8652,15 +8875,21 @@ fn context_stats_text(
     scheduled_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
-    // Live send-budget fill (None until a turn has reported usage).
+    // Live send-budget fill (None until a turn has reported usage). #2466:
+    // `budget: None` means no context window is known — no percentage to
+    // report, just `used/?`.
     match gauge {
-        Some((used, budget)) if budget > 0 => {
+        Some((used, Some(budget))) if budget > 0 => {
             let pct = (u64::from(used) * 100 / u64::from(budget)) as u32;
             lines.push(format!(
                 "  budget: {} ({pct}% of the send window)",
-                newt_core::agentic::fmt_token_gauge(used, budget)
+                newt_core::agentic::fmt_token_gauge(used, Some(budget))
             ));
         }
+        Some((used, None)) => lines.push(format!(
+            "  budget: {} (no context window known)",
+            newt_core::agentic::fmt_token_gauge(used, None)
+        )),
         _ => lines.push("  budget: not yet measured (no completed turn)".to_string()),
     }
     lines.push(format!(
@@ -9077,6 +9306,19 @@ fn dispatch_slash_with_ask(
             commands::crew::dispatch(arg1, arg2, color, verbose, ask.unwrap_or(&fallback))
         }
         "setup" => commands::setup::dispatch(arg1, color, verbose),
+        // #2515: `/discuss` (and its `/chat` alias) is normally intercepted
+        // in the chat loop and routed to the pending clarification before
+        // dispatch ever sees it. Reaching here means there is no batch to
+        // discuss, so this is the answer for that case — never "unknown
+        // command" again.
+        "discuss" | "chat" => {
+            print_newt(
+                "there is no pending decision to discuss right now",
+                color,
+                verbose,
+            );
+            Ok(true)
+        }
         other => {
             print_newt(&slash_registry::fallthrough_message(other), color, verbose);
             Ok(true)

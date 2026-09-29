@@ -39,7 +39,7 @@ pub(crate) use layering::{
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
 pub use memory::{MemoryConfig, MemoryDisclosure, MemoryProviderKind};
-pub use newt_tuner::ModelTuning;
+pub use newt_tuner::{ModelTuning, OverflowRetry};
 pub use permissions::{ModeConfig, PermissionPreset, ToolPermissions};
 pub use presentation::{
     markdown_is_session_pinned, session_markdown_mode, session_spill_lines,
@@ -77,6 +77,8 @@ mod tool_exposure;
 mod tools;
 use backend::{cli_backend_override, validate_backend_names, BackendAssembly, RecordTag};
 #[cfg(test)]
+use backend::{first_emission_this_process, reset_emitted_warnings_for_test};
+#[cfg(test)]
 use context::default_input_ceiling_pct;
 use layering::{array_merge_strategy, base_is_ambient_newt_toml, mark_project_mcp_untrusted};
 use presentation::{default_spill_lines, default_time_marker_secs, default_tool_output_lines};
@@ -105,6 +107,12 @@ pub struct ScratchConfig {
     /// (`/tmp`, a PVC mount) for a read-only checkout. `NEWT_SCRATCH_DIR` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// The build lane's scratch base (#2604): an absolute dir under which each
+    /// workspace gets its build `TMPDIR`. Unset uses a private managed base
+    /// outside Git worktrees. `NEWT_BUILD_SCRATCH_DIR` wins. The Build grant
+    /// covers scratch; see [`crate::scratch::build_scratch_override`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_dir: Option<String>,
 }
 
 /// Top-level Newt-Agent configuration.
@@ -531,6 +539,13 @@ pub struct TuiConfig {
     #[serde(default)]
     pub edit_mode: EditMode,
 
+    /// The meta prefix chord (e.g. `"ctrl+space"`, `"ctrl+a"`): pressed before
+    /// a key, it reaches newt's own operations — zoom, resize, redraw — the
+    /// way tmux and herdr use `ctrl+b`. Unset means the shipped default,
+    /// `ctrl+space`. Set from `/settings prefix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_key: Option<String>,
+
     /// Rich-tui (issue #416) input gutter width, in columns. Unset = `auto`
     /// (the responsive default: a prompt gutter when it fits under ~1/3 of the
     /// width, else a stacked prompt row). `0` turns the gutter off (prompt on
@@ -588,23 +603,19 @@ pub struct TuiConfig {
     #[serde(default = "default_time_marker_secs")]
     pub time_marker_secs: u64,
 
-    /// Maximum number of tool-call rounds the model may take within a single
-    /// turn before the agent forces a final, tools-disabled completion. Each
-    /// round is one model response that may emit tool calls; once this many
-    /// rounds have run without a tool-free answer, newt asks the model once
-    /// more with tools disabled so the user still gets a real (partial)
-    /// answer instead of a placeholder. Default: 40 (raised from 25 — a
-    /// modest safety margin alongside `workflow_grace_rounds` and the
-    /// workflow-classifier delegate hint; genuinely open-ended diagnostic work
-    /// should reach for `crew`/`team` delegation rather than depend on an
-    /// unbounded cap here).
+    /// Initial tool-call round allowance per turn. Default: 40. With nonzero
+    /// `workflow_grace_rounds`, fresh evidence or actual workspace changes
+    /// renew this allowance automatically. Explicit call/cost budgets and
+    /// cancellation still apply. Without recent progress, Newt requests one
+    /// final tools-disabled answer; set grace to zero for a hard round cap.
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
 
-    /// Additional progress-aware rounds available after `max_tool_rounds` when
-    /// an active workflow still has incomplete steps and the recent rounds show
-    /// repair progress or actionable evidence. Default: 5. Set to 0 to make the
-    /// normal round cap hard again.
+    /// Rounds granted at each progress-backed renewal of `max_tool_rounds`.
+    /// Default: 5. Each renewal requires fresh evidence since the last; repeated
+    /// reads, passing checks on unchanged work, and plan updates do not renew.
+    /// Set to 0 for a hard round cap. Applies equally to every provider and to
+    /// Smart Harness, without model-facing continuation prompts.
     #[serde(default = "default_workflow_grace_rounds")]
     pub workflow_grace_rounds: usize,
 
@@ -881,6 +892,7 @@ impl Default for TuiConfig {
             no_splash: false,
             mouse_viewport: false,
             edit_mode: EditMode::Nano,
+            prefix_key: None,
             gutter: None,
             footer: FooterMode::Auto,
             color: ColorMode::Auto,
@@ -1367,8 +1379,8 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from an explicit file path.
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = Self::read_text(path)?;
+    pub fn load(path: &Path, report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
+        let text = Self::read_text(path, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
@@ -1379,9 +1391,12 @@ impl Config {
     /// (under [`Self::user_config_dir`]) is rewritten on disk; a project,
     /// ambient, `/etc` or explicitly named file is shared or untrusted, so it
     /// is translated in memory with a warning.
-    fn read_text(path: &Path) -> Result<String> {
+    fn read_text(
+        path: &Path,
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<String> {
         let own = Self::user_config_dir().is_some_and(|dir| path.starts_with(dir));
-        Ok(crate::psyche_import::read_config_file(path, own)?)
+        Ok(crate::psyche_import::read_config_file(path, own, report)?)
     }
 
     /// Resolve configuration by searching well-known locations, then layering a
@@ -1419,8 +1434,21 @@ impl Config {
         self.backend_fallback
     }
 
-    pub fn resolve() -> Result<Self> {
-        Self::resolve_runtime().map(ResolvedConfig::into_config)
+    pub fn resolve(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> Result<Self> {
+        Self::resolve_runtime(report).map(ResolvedConfig::into_config)
+    }
+
+    /// [`Config::resolve`] WITHOUT the process-global publication. For code
+    /// that only needs a config VALUE (a tool, a memory window): resolving is
+    /// a read, and a read must not rewrite the runtime settings a running turn
+    /// has already captured, nor race with whoever owns them.
+    ///
+    /// # Errors
+    /// Any config-load error `resolve` itself would surface.
+    pub fn resolve_unpublished(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<Self> {
+        Self::resolve_runtime_unpublished(report).map(ResolvedConfig::into_config)
     }
 
     /// [`Config::resolve_runtime_unpublished`] plus the process-global
@@ -1428,8 +1456,10 @@ impl Config {
     ///
     /// # Errors
     /// Any config-load error `resolve` itself would surface.
-    pub fn resolve_runtime() -> Result<ResolvedConfig> {
-        let resolved = Self::resolve_runtime_unpublished()?;
+    pub fn resolve_runtime(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<ResolvedConfig> {
+        let resolved = Self::resolve_runtime_unpublished(report)?;
         resolved.publish_runtime_settings();
         Ok(resolved)
     }
@@ -1444,7 +1474,9 @@ impl Config {
     ///
     /// # Errors
     /// Any config-load error `resolve` itself would surface.
-    pub fn resolve_runtime_unpublished() -> Result<ResolvedConfig> {
+    pub fn resolve_runtime_unpublished(
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<ResolvedConfig> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
@@ -1471,13 +1503,13 @@ impl Config {
                     // the base vector the convergence audit surfaced. A
                     // `$NEWT_CONFIG`-pinned / user-home / `/etc` base is
                     // operator-explicit (Trusted) and loaded verbatim.
-                    let mut base_val = Self::load_value(p)?;
+                    let mut base_val = Self::load_value(p, report)?;
                     strip_control_plane(&mut base_val);
                     base_val
                         .try_into()
                         .map_err(|e| NewtError::Config(e.to_string()))?
                 } else {
-                    Self::load(p)?
+                    Self::load(p, report)?
                 }
             }
             (None, None) => Self::default(),
@@ -1485,7 +1517,7 @@ impl Config {
             // config when there is no base file).
             (base, Some(proj)) => {
                 let mut merged = match base {
-                    Some(p) => Self::load_value(p)?,
+                    Some(p) => Self::load_value(p, report)?,
                     None => toml::Value::try_from(Self::default())
                         .map_err(|e| NewtError::Config(e.to_string()))?,
                 };
@@ -1495,7 +1527,7 @@ impl Config {
                 if base_ambient {
                     strip_control_plane(&mut merged);
                 }
-                let project_val = Self::load_value(proj)?;
+                let project_val = Self::load_value(proj, report)?;
                 // The merge strategy is itself config: the project declares how
                 // it wants to be merged (`[merge] arrays = ...`), else the global
                 // config's setting, else the built-in default (Replace).
@@ -1707,6 +1739,10 @@ impl Config {
         if let Some(dir) = self.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
             crate::scratch::set_scratch_dir(dir);
         }
+        // #2604: the build lane's scratch base; `NEWT_BUILD_SCRATCH_DIR` wins.
+        if let Some(dir) = self.scratch.as_ref().and_then(|s| s.build_dir.as_deref()) {
+            crate::scratch::set_build_scratch_dir(dir);
+        }
         // #1789: publish `[network] owned_suffixes` so retry policy can treat
         // operator-owned inference hosts as patiently as loopback ones.
         if !self.network.owned_suffixes.is_empty() {
@@ -1817,8 +1853,11 @@ impl Config {
     }
 
     /// Load a config file as a raw `toml::Value` (for layered merging).
-    fn load_value(path: &Path) -> Result<toml::Value> {
-        let text = Self::read_text(path)?;
+    fn load_value(
+        path: &Path,
+        report: &mut dyn FnMut(crate::tty::Notice<'static>),
+    ) -> Result<toml::Value> {
+        let text = Self::read_text(path, report)?;
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
@@ -2081,6 +2120,28 @@ impl Config {
         } else {
             root.insert("default_backend", toml_edit::value(name));
         }
+        Ok(doc.to_string())
+    }
+
+    /// Set one scalar `key` in the `[tui]` table, creating the table if it is
+    /// absent and preserving the rest of the document — comments, formatting,
+    /// and any `[tui.*]` subtables (#2569 is what happens when a subtable is
+    /// treated as the table). PURE: the caller owns the filesystem write.
+    pub fn with_tui_key(text: &str, key: &str, value: &str) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let tui = doc
+            .as_table_mut()
+            .entry("tui")
+            .or_insert_with(|| {
+                let mut table = toml_edit::Table::new();
+                table.set_implicit(false);
+                toml_edit::Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("`tui` is not a table".to_string()))?;
+        tui.insert(key, toml_edit::value(value));
         Ok(doc.to_string())
     }
 

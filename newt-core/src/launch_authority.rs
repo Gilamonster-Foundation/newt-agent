@@ -1,5 +1,6 @@
 //! Typed, immutable **launch authority** — the OCAP-off / full-access switches
-//! resolved **once** near startup and then FROZEN for the process.
+//! resolved **once** near startup and then FROZEN for the process. The typed
+//! `--workspace-access` choice has no environment twin and retains confinement.
 //!
 //! # Why this exists (`noninteractive-launch-policy` closure)
 //!
@@ -25,13 +26,15 @@
 //!   `std::env::var`, so a later-appearing env var cannot change authority.
 //! - The switches are private bits with getters only; the sole combinator
 //!   ([`LaunchAuthority::meet`]) can *attenuate* (clear bits), never widen.
+//! - [`LaunchAuthority::WORKSPACE_ACCESS`] is an explicit CLI startup choice:
+//!   commands are admitted inside the workspace, with no host bypass.
 //!
 //! The ratchet that keeps it honest is a source-inventory gate (`ocap_check.py`):
 //! `std::env::var("NEWT_DISABLE_OCAP" | "NEWT_FULL_ACCESS" | "NEWT_UNSAFE_HOST_EXEC")`
 //! may appear **only** in this file. Any other deep ambient authority read
 //! re-opens the deviation.
 
-/// The three ambient authority switches, as one immutable value. `Copy` so it
+/// The ambient authority switches and typed workspace choice, as one immutable value. `Copy` so it
 /// is returned and threaded freely; the bits are private and there is
 /// deliberately no setter that *widens* — construction is via [`from_env`] (the
 /// startup resolver), the [`CONFINED`] default, or an attenuating [`meet`].
@@ -50,6 +53,8 @@ pub struct LaunchAuthority {
     /// `--unsafe-host-exec` (`NEWT_UNSAFE_HOST_EXEC=1`): the explicit opt-in that
     /// lets a headless lane select the OCAP-off host-exec path.
     unsafe_host_exec: bool,
+    /// Explicit directory-scoped startup choice; never inferred from the env.
+    workspace_access: bool,
 }
 
 impl LaunchAuthority {
@@ -60,6 +65,15 @@ impl LaunchAuthority {
         ocap_disabled: false,
         full_access: false,
         unsafe_host_exec: false,
+        workspace_access: false,
+    };
+
+    /// Run commands with filesystem access confined to the selected workspace.
+    /// The configured network scope remains independent. This explicit startup
+    /// choice clears inherited global-access and unconfined-execution switches.
+    pub const WORKSPACE_ACCESS: Self = Self {
+        workspace_access: true,
+        ..Self::CONFINED
     };
 
     /// Read exactly `"1"` from the env twin — a widening switch is fail-closed,
@@ -78,6 +92,7 @@ impl LaunchAuthority {
             ocap_disabled: Self::env_switch("NEWT_DISABLE_OCAP"),
             full_access: Self::env_switch("NEWT_FULL_ACCESS"),
             unsafe_host_exec: Self::env_switch("NEWT_UNSAFE_HOST_EXEC"),
+            workspace_access: false,
         }
     }
 
@@ -99,6 +114,13 @@ impl LaunchAuthority {
         self.unsafe_host_exec
     }
 
+    /// Full command and file authority inside the selected workspace, while
+    /// retaining the native filesystem fence and independent network scope.
+    #[must_use]
+    pub const fn workspace_access(self) -> bool {
+        self.workspace_access
+    }
+
     /// Attenuate: the per-bit `meet` (logical AND) of two authorities. A switch
     /// is on in the result only if it was on in BOTH — so `meet` can drop
     /// authority but never add it. This is how a later context lowers authority
@@ -109,6 +131,7 @@ impl LaunchAuthority {
             ocap_disabled: self.ocap_disabled && other.ocap_disabled,
             full_access: self.full_access && other.full_access,
             unsafe_host_exec: self.unsafe_host_exec && other.unsafe_host_exec,
+            workspace_access: self.workspace_access && other.workspace_access,
         }
     }
 }
@@ -241,6 +264,7 @@ mod tests {
             ocap_disabled: true,
             full_access: true,
             unsafe_host_exec: true,
+            workspace_access: true,
         };
         // meeting with CONFINED clears everything…
         assert_eq!(
@@ -252,6 +276,31 @@ mod tests {
             LaunchAuthority::CONFINED.meet(full),
             LaunchAuthority::CONFINED
         );
+    }
+
+    #[test]
+    fn workspace_choice_retains_confinement_and_freezes_once() {
+        let _g = serial();
+        reset_for_test();
+        let choice = LaunchAuthority::WORKSPACE_ACCESS;
+        assert!(choice.workspace_access());
+        assert!(!choice.full_access());
+        assert!(!choice.ocap_disabled());
+        assert!(!choice.unsafe_host_exec());
+        assert_eq!(
+            choice.meet(LaunchAuthority::CONFINED),
+            LaunchAuthority::CONFINED
+        );
+        freeze(choice);
+        let _global = EnvVar::set("NEWT_FULL_ACCESS", "1");
+        let _bypass = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        freeze(LaunchAuthority::from_env());
+        assert_eq!(
+            current(),
+            choice,
+            "later global authority cannot replace the directory choice"
+        );
+        reset_for_test();
     }
 
     /// THE adversarial invariant: construct a confined authority, FREEZE it,
@@ -294,6 +343,7 @@ mod tests {
             ocap_disabled: true,
             full_access: true,
             unsafe_host_exec: true,
+            workspace_access: true,
         });
         assert_eq!(
             current(),

@@ -432,7 +432,20 @@ impl PyConfig {
     /// Load configuration from an explicit TOML file.
     #[classmethod]
     fn load(_cls: &Bound<'_, PyType>, path: PathBuf) -> PyResult<Self> {
-        let inner = Config::load(&path).map_err(newt_err_to_py)?;
+        let mut notices = Vec::new();
+        let result = Config::load(&path, &mut |notice| notices.push(notice));
+        // Diagnostics are best effort and must not replace the read result,
+        // including a later typed decode error, when Python's sink fails.
+        if let Ok(stderr) = _cls
+            .py()
+            .import("sys")
+            .and_then(|sys| sys.getattr("stderr"))
+        {
+            for notice in notices {
+                let _ = stderr.call_method1("write", (format!("{}\n", notice.line()),));
+            }
+        }
+        let inner = result.map_err(newt_err_to_py)?;
         Ok(Self { inner })
     }
 
@@ -441,7 +454,20 @@ impl PyConfig {
     /// `/etc/newt/config.toml`. Falls back to defaults if none exist.
     #[classmethod]
     fn resolve(_cls: &Bound<'_, PyType>) -> PyResult<Self> {
-        let inner = Config::resolve().map_err(newt_err_to_py)?;
+        let mut notices = Vec::new();
+        let result = Config::resolve(&mut |notice| notices.push(notice));
+        // Diagnostics are best effort and must not replace the read result,
+        // including a later typed decode error, when Python's sink fails.
+        if let Ok(stderr) = _cls
+            .py()
+            .import("sys")
+            .and_then(|sys| sys.getattr("stderr"))
+        {
+            for notice in notices {
+                let _ = stderr.call_method1("write", (format!("{}\n", notice.line()),));
+            }
+        }
+        let inner = result.map_err(newt_err_to_py)?;
         Ok(Self { inner })
     }
 

@@ -62,9 +62,24 @@ pub fn read_prompt_window_line(
         return Ok(classify_headless_prompt_line(&line));
     }
 
+    // Check the existing question capability before any config migration;
+    // a refused/protocol window must not consume and silence its report.
+    window.ensure_can_ask()?;
     let result = {
+        let mut notices = Vec::new();
+        let accent = modal_accent_enabled(&mut |notice| notices.push(notice));
+        for notice in notices {
+            if std::io::stderr().is_terminal() {
+                // The window already owns the line. Do not re-enter the
+                // arbiter through Notice::emit while this owner is active.
+                window.notice(&notice.line())?;
+            } else {
+                notice.diagnostic(crate::tty::LineCaps::None, false, std::io::stderr())?;
+            }
+        }
+        // Keep normal newline translation while delivering permanent notices;
+        // the prompt's raw editor begins only once those lines are complete.
         let _guard = take_modal_ownership(window)?;
-        let accent = modal_accent_enabled();
         window.ask(&render(prompt, "", true, accent)?)?;
         let mut value = String::new();
         loop {
@@ -243,11 +258,11 @@ fn answer_row_accent(row: &str, accent: bool) -> Option<crossterm::style::Color>
 /// explicit `NEWT_COLOR` wins; otherwise either `NO_COLOR` or `TERM=dumb`
 /// disables the accent. The caller is already in the TTY-only branch, so
 /// `auto` means color is available here.
-fn modal_accent_enabled() -> bool {
+fn modal_accent_enabled(report: &mut dyn FnMut(crate::tty::Notice<'static>)) -> bool {
     // Opening a visual prompt must not republish scratch/tool/tenacity/etc.
     // globals. Runtime startup owns publication; this path only reads one
     // resolved TUI field.
-    let cfg_color = crate::Config::resolve_runtime_unpublished()
+    let cfg_color = crate::Config::resolve_runtime_unpublished(report)
         .ok()
         .and_then(|config| config.tui.as_ref().map(|tui| tui.color))
         .unwrap_or_default();
@@ -410,16 +425,16 @@ mod visual_style {
             .next()
             .expect("production source");
         let body = production
-            .split("fn modal_accent_enabled()")
+            .split("fn modal_accent_enabled(")
             .nth(1)
             .and_then(|tail| tail.split("\n}\n").next())
             .expect("modal_accent_enabled body");
         assert!(
-            body.contains("Config::resolve_runtime_unpublished()"),
+            body.contains("Config::resolve_runtime_unpublished(report)"),
             "opening a visual prompt must not publish process-global runtime settings: {body}"
         );
         assert!(
-            !body.contains("Config::resolve()"),
+            !body.contains("Config::resolve("),
             "the publishing compatibility resolver returned to the visual path: {body}"
         );
     }

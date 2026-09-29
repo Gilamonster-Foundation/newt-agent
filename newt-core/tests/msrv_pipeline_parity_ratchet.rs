@@ -1,7 +1,9 @@
 //! **The three MSRV sites must keep agreeing with each other.**
 //!
-//! The floor is declared once, in `[workspace.package] rust-version`, and
-//! enforced in three places that all claim in prose to mirror one another:
+//! The floor is declared once, in `[workspace.package] rust-version`, and the
+//! gates READ it from there (CI and the justfile both run the same `sed`
+//! reader; see `every_msrv_gate_reads_the_declared_floor_instead_of_restating_it`).
+//! It is enforced in three places that all claim in prose to mirror one another:
 //! the `msrv` job in `.github/workflows/ci.yml`, the `msrv` recipe in the
 //! `justfile`, and `.githooks/pre-push`. Nothing asserted it. They agree today
 //! only because a human edited all three by hand.
@@ -122,39 +124,16 @@ fn declared_rust_version() -> Option<&'static str> {
         .and_then(|r| r.split('"').next())
 }
 
-fn ci_toolchain_version() -> Option<&'static str> {
-    ci_msrv_job()?
-        .lines()
-        .find_map(|l| {
-            // A workflow step is a YAML list item: `- uses: …`.
-            let t = l.trim();
-            let t = t.strip_prefix("- ").unwrap_or(t);
-            t.strip_prefix("uses: dtolnay/rust-toolchain@")
-        })
-        .map(str::trim)
-}
-
-/// The `+1.88` in the recipe's cargo line.
-fn justfile_selector_version() -> Option<String> {
-    let recipe = justfile_msrv_recipe()?;
-    sole_cargo_command(recipe, "justfile msrv recipe")
-        .split_whitespace()
-        .find_map(|w| w.strip_prefix('+').map(str::to_string))
-}
-
-/// The version inside the recipe's `rustup toolchain list | grep -q '^1\.88'`
-/// installation guard.
+/// The `sed -n '<program>' Cargo.toml` expression a gate reads the floor with.
 ///
-/// This one earns its own assertion because it fails SILENTLY: if it drifts
-/// out of step with the selector, the guard stops matching an installed
-/// toolchain, the recipe prints its skip note and **exits 0**, and the hook
-/// reports success having compiled nothing at the floor.
-fn justfile_guard_version() -> Option<String> {
-    let recipe = justfile_msrv_recipe()?;
-    let line = recipe.lines().find(|l| l.contains("grep -q '^"))?;
-    let after = line.split("grep -q '^").nth(1)?;
-    let literal = after.split('\'').next()?;
-    Some(literal.replace("\\.", "."))
+/// `None` if the gate has no such reader — the gate then either restates a
+/// literal or reads nothing, and the test names which gate moved.
+fn floor_reader(block: &'static str) -> Option<&'static str> {
+    let after = block.split("sed -n '").nth(1)?;
+    let (program, rest) = after.split_once('\'')?;
+    rest.trim_start()
+        .starts_with("Cargo.toml")
+        .then_some(program)
 }
 
 /// **The scanners read the real files.** A guard whose source is empty passes
@@ -206,36 +185,56 @@ fn the_ci_msrv_command_equals_the_justfile_msrv_command() {
     );
 }
 
-/// **Every version in the MSRV pipeline is the declared floor.**
+/// **Every gate READS the declared floor; none restates it.**
 ///
-/// Four sites, not two: the manifest declares it, the workflow pins a
-/// toolchain, and the recipe names it TWICE — once to select the toolchain and
-/// once in the installation guard.
+/// The floor used to be copied into four sites, and this test compared the
+/// copies. The gates now read `[workspace.package] rust-version` themselves,
+/// so the parity to hold is: they read it THE SAME WAY, that way finds the
+/// manifest's declared line, each gate USES what it read, and no copy creeps
+/// back. The justfile's installation guard earns its own assertion because it
+/// fails SILENTLY: if it stops matching the installed toolchain the recipe
+/// prints its skip note and exits 0, having compiled nothing at the floor.
 #[test]
-fn every_msrv_version_in_the_pipeline_equals_the_declared_floor() {
+fn every_msrv_gate_reads_the_declared_floor_instead_of_restating_it() {
     let declared = declared_rust_version()
         .expect("`rust-version = \"...\"` at column 0 in the workspace Cargo.toml");
+    let job = ci_msrv_job().expect("the msrv job exists");
+    let recipe = justfile_msrv_recipe().expect("the msrv recipe exists");
 
-    let ci = ci_toolchain_version()
-        .expect("`uses: dtolnay/rust-toolchain@<version>` inside the msrv job");
-    let selector =
-        justfile_selector_version().expect("`cargo +<version>` in the justfile msrv recipe");
-    let guard = justfile_guard_version()
-        .expect("`grep -q '^<version>'` toolchain guard in the justfile msrv recipe");
+    let ci_reader =
+        floor_reader(job).expect("ci.yml msrv job: a `sed -n '…' Cargo.toml` step reads the floor");
+    let just_reader = floor_reader(recipe)
+        .expect("justfile msrv recipe: `sed -n '…' Cargo.toml` reads the floor");
+    assert_eq!(
+        ci_reader, just_reader,
+        "PIPELINE PARITY BROKEN: CI and the justfile read the floor differently.\n  \
+         ci.yml   : {ci_reader}\n  justfile : {just_reader}"
+    );
+    assert!(
+        ci_reader.starts_with("s/^rust-version = "),
+        "the reader must anchor on the manifest's declared line \
+         (`rust-version = \"…\"` at column 0): {ci_reader}"
+    );
 
-    for (site, found) in [
-        (
-            ".github/workflows/ci.yml (dtolnay/rust-toolchain@)",
-            ci.to_string(),
-        ),
-        ("justfile msrv recipe (cargo +<version>)", selector),
-        ("justfile msrv recipe (rustup toolchain guard)", guard),
-    ] {
-        assert_eq!(
-            found, declared,
-            "MSRV DRIFT: {site} says {found}, but [workspace.package] \
-             rust-version says {declared}. The floor is declared in Cargo.toml; \
-             every gate must select that toolchain."
+    assert!(
+        job.contains("toolchain: ${{ steps.msrv.outputs.version }}"),
+        "ci.yml msrv job: the toolchain must be the read step's output"
+    );
+    assert!(
+        recipe.contains("cargo +\"${msrv}\""),
+        "justfile msrv recipe: the cargo selector must use the version it read"
+    );
+    assert!(
+        recipe.contains("grep -q \"^${msrv}\""),
+        "justfile msrv recipe: the installation guard must use the version it \
+         read — a drifted guard skips silently and exits 0"
+    );
+
+    for (site, text) in [("ci.yml msrv job", job), ("justfile msrv recipe", recipe)] {
+        assert!(
+            !text.contains(declared),
+            "{site} restates the floor {declared} — a second copy is the thing \
+             that drifts; read it from Cargo.toml instead"
         );
     }
 }

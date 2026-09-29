@@ -1136,11 +1136,10 @@ async fn yolo_keeps_the_tool_name_corrective_guard() {
 
 // --- facade P4 (#780): hidden tool-call routing dispatch ---------------
 
-/// A git stub that proves *which path served the call*: a routed
-/// `git status` lands here as op `status`; a routed write op would surface
-/// the unexpected-op error (so a test can assert it was NOT routed).
-struct RoutingStubGit;
-impl crate::agentic::GitTool for RoutingStubGit {
+/// Even when a legacy Git collaborator is installed, native shell commands
+/// must not dispatch through its narrower operation interface.
+struct UnexpectedEmbeddedGit;
+impl crate::agentic::GitTool for UnexpectedEmbeddedGit {
     fn dispatch(
         &self,
         op: &str,
@@ -1148,14 +1147,15 @@ impl crate::agentic::GitTool for RoutingStubGit {
         _caps: &crate::git_caveats::GitCaveats,
         _session: &Caveats,
     ) -> Result<String, String> {
-        match op {
-            "status" => Ok("on branch main (routed via git built-in)".to_string()),
-            other => Err(format!("unexpected routed git op '{other}'")),
-        }
+        panic!("native command reached the embedded Git operation {op}");
     }
 }
 
-async fn run_routed_with_git(command: &str, ws: &std::path::Path, caveats: &Caveats) -> String {
+async fn run_command_with_legacy_git(
+    command: &str,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+) -> String {
     execute_tool(
         "run_command",
         &serde_json::json!({ "command": command }),
@@ -1170,7 +1170,39 @@ async fn run_routed_with_git(command: &str, ws: &std::path::Path, caveats: &Cave
         None, // memory_source
         None, // permission_gate
         None, // exec_floor
-        Some(&RoutingStubGit as &dyn crate::agentic::GitTool),
+        Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await
+}
+
+#[cfg(target_os = "windows")]
+async fn run_command_with_legacy_git_and_gate(
+    command: &str,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+    permission_gate: &mut dyn super::PermissionGate,
+) -> String {
+    execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": command }),
+        &ws.to_string_lossy(),
+        false,
+        20,
+        caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        Some(permission_gate),
+        None, // exec_floor
+        Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
         None, // crew_runner
         None, // scratchpad_store
         None, // code_search
@@ -1212,6 +1244,83 @@ fn routing_disabled_requires_exactly_1_and_is_independent_of_ocap() {
     );
 }
 
+/// F11 (verify-routing-f11b): the fix for the model that never calls
+/// `lifecycle` and instead runs `run_command "cargo test …"`, which times
+/// out under the 60s exec wall (2485-r5/r6 measured 6 headless replays never
+/// reaching `lifecycle`, even after the fix landed). A recognised build
+/// invocation now routes to the confined build lane's own
+/// gate/`leq`-authority path — proven here by a gate that DENIES and records
+/// the request, so the test stays in the fully-mocked unit tier (no real
+/// `cargo` subprocess): the denial message alone proves the call reached the
+/// build lane (not the 60s `run_command` exec path) and that it carries the
+/// model's LITERAL argv, never a resolved phase command.
+#[tokio::test]
+async fn routed_cargo_test_reaches_the_confined_build_lane() {
+    struct RecordingDenyGate {
+        seen: Option<super::PermissionRequest>,
+    }
+    impl super::PermissionGate for RecordingDenyGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.seen = requests.first().cloned();
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Cancelled
+        }
+    }
+
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = caveats_no_exec(ws.path());
+    let mut gate = RecordingDenyGate { seen: None };
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo test -p newt-core" }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        Some(&mut gate),
+        None,
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo test -p newt-core` to the confined build lane")
+            && out.contains("30 min limit")
+            && out.contains("network denied"),
+        "rendered result must say it ran in the build lane with its limit; got: {out}"
+    );
+    assert!(
+        out.contains("capability denied") && out.contains("build authority"),
+        "denied gate must refuse via the same build-authority path lifecycle action=build \
+         uses, not silently run; got: {out}"
+    );
+    let reason = gate
+        .seen
+        .expect("the build-lane gate/leq path must be consulted")
+        .reason;
+    assert!(
+        reason.contains("cargo test -p newt-core"),
+        "the permission reason must show the model's LITERAL argv, not a resolved \
+         phase command; got: {reason}"
+    );
+}
+
 /// TDD: a routed read goes through the SAME fs floor — routing is NOT a
 /// bypass. An out-of-scope `cat /etc/shadow` routes to `read_file` and is
 /// denied by `fs_read` exactly as a direct `read_file` would be (the denial
@@ -1240,24 +1349,79 @@ async fn routed_cat_goes_through_the_fs_floor_not_a_bypass() {
     );
 }
 
-/// Routing does not authorize the legacy engine's unbounded transitive reads.
-/// With unrestricted read authority it still needs no shell exec grant.
+/// Grounds the routing table's native-Git decision with a real repository:
+/// status observes an untracked file through the exec gate with scoped reads,
+/// no write grant, and explicitly granted network/exec authority.
 #[tokio::test]
-async fn routed_git_status_dispatches_through_the_git_builtin() {
+async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("native-only.txt"), "native evidence\n").unwrap();
     let mut caveats = caveats_no_exec(ws.path());
-    let denied = run_routed_with_git("git status", ws.path(), &caveats).await;
-    assert!(denied.contains("Git operation unavailable with scoped fs_read"));
-    caveats.fs_read = Scope::All;
-    assert_eq!(caveats.exec, Scope::none());
-    let out = run_routed_with_git("git status", ws.path(), &caveats).await;
+    caveats.fs_write = Scope::none();
+    caveats.net = Scope::All;
+    let denied = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
+    assert!(denied.contains("capability denied"), "{denied}");
     assert!(
-        out.contains("routed via git built-in"),
-        "git status must route to the governed git built-in; got: {out}"
+        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
     );
+    caveats.exec = Scope::All;
+    let out = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
+    #[cfg(target_os = "windows")]
+    {
+        assert!(
+            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+            "restricted AppContainer must refuse before native Git runs: {out}"
+        );
+        assert!(!out.contains("routed:"), "{out}");
+        assert!(!ws.path().join(".git/index").exists());
+    }
+    #[cfg(not(target_os = "windows"))]
+    assert!(
+        out.contains("native-only.txt"),
+        "native Git must report the actual untracked file: {out}"
+    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert!(!out.contains("routed:"), "{out}");
+        assert!(!ws.path().join(".git/index").exists());
+    }
+}
+
+/// The documented operator-controlled host route is intentionally distinct
+/// from the restricted AppContainer path: it preserves ordinary native Git
+/// behavior rather than silently widening a confined invocation.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn windows_disable_ocap_keeps_native_git_available() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("native-only.txt"), "host route evidence\n").unwrap();
+    let out =
+        run_command_with_legacy_git("git status", ws.path(), &caveats_no_exec(ws.path())).await;
+    assert!(out.contains("native-only.txt"), "{out}");
+    assert!(
+        !out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the explicit host route must not take the AppContainer refusal: {out}"
+    );
+    assert!(!out.contains("routed:"), "{out}");
 }
 
 /// #1022: `run_command("rm file")` routes to the governed delete_file arm,
@@ -1284,24 +1448,121 @@ async fn routed_rm_dispatches_through_delete_file() {
     );
 }
 
-/// TDD: state-modifying `git add` is GATED as exec — NOT silently routed
-/// (owner decision 2). It never reaches the git built-in (no unexpected-op
-/// error from the stub); it falls through to the normal run_command path.
+/// The same exec boundary governs mutations: denial creates no index. On
+/// Windows, restricted AppContainer reports the documented pre-spawn native
+/// Git incompatibility; other platforms stage the real file.
 #[tokio::test]
 async fn state_modifying_git_add_is_not_routed() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = caveats_no_exec(ws.path());
-    let out = run_routed_with_git("git add a.txt", ws.path(), &caveats).await;
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("stage-me.txt"), "stage this file\n").unwrap();
+    let mut caveats = caveats_no_exec(ws.path());
+    caveats.net = Scope::All;
+    let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
+    assert!(denied.contains("capability denied"), "{denied}");
+    assert!(
+        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
+    );
+    assert!(!ws.path().join(".git/index").exists());
+    caveats.exec = Scope::All;
+    let out = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
     assert!(
         !out.contains("routed"),
         "git add must NOT route to the git built-in; got: {out}"
     );
-    // It falls through to the run_command path (git ∈ DIRECT_TOOL_NAMES ⇒
-    // the existing corrective guard), never silently routed.
-    assert!(out.contains("is a tool, not a shell command"), "got: {out}");
+    let staged =
+        crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .output()
+            .unwrap();
+    assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
+    #[cfg(target_os = "windows")]
+    {
+        assert!(
+            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+            "restricted AppContainer must refuse before native Git runs: {out}"
+        );
+        assert!(!ws.path().join(".git/index").exists());
+        assert_eq!(
+            String::from_utf8(staged.stdout).unwrap().trim(),
+            "",
+            "the unavailable command must not stage the file: {out}"
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    assert_eq!(
+        String::from_utf8(staged.stdout).unwrap().trim(),
+        "stage-me.txt",
+        "native dispatch must actually stage the file: {out}"
+    );
+}
+
+/// An interactive exec grant retries once with the freshly minted caveats. On
+/// Windows that retry must still fail before native Git reaches AppContainer.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn native_git_exec_grant_retry_is_refused_before_spawn() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("retry-me.txt"), "retry evidence\n").unwrap();
+
+    struct GrantExecGate {
+        requests: Vec<super::PermissionRequest>,
+        granted: Caveats,
+    }
+    impl super::PermissionGate for GrantExecGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.requests.extend_from_slice(requests);
+            super::PermissionDecision::Allow(self.granted.clone())
+        }
+        fn ask_question(&mut self, _: &str) -> super::HumanQuestionOutcome {
+            super::HumanQuestionOutcome::Unavailable
+        }
+    }
+
+    let mut caveats = caveats_no_exec(ws.path());
+    caveats.net = Scope::All;
+    let mut granted = caveats.clone();
+    granted.exec = Scope::All;
+    let mut gate = GrantExecGate {
+        requests: vec![],
+        granted,
+    };
+    let out = run_command_with_legacy_git_and_gate(
+        "git add retry-me.txt",
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert!(
+        out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the post-grant retry must be refused before native Git runs: {out}"
+    );
+    assert_eq!(gate.requests.len(), 1, "{out}");
+    assert_eq!(gate.requests[0].kind, super::DenialKind::Exec, "{out}");
+    assert_eq!(gate.requests[0].target, "git", "{out}");
+    assert!(
+        !ws.path().join(".git/index").exists(),
+        "the refused retry must not stage a file: {out}"
+    );
 }
 
 /// F5 (§7-F5): `--no-route` bypasses routing but NEVER disables L3. With
@@ -1338,4 +1599,947 @@ async fn no_route_bypasses_routing_but_keeps_l3() {
         out.contains("capability denied"),
         "the L3 confined dispatch must still gate the command; got: {out}"
     );
+}
+
+/// The confined brush child does not inherit newt's env (`do_not_inherit_env`;
+/// the `env` seam is the only import), so the temp dir its tools use must be
+/// handed over EXPLICITLY, matching the write fence's scratch root — else a
+/// configured scratch/`TMPDIR` is granted while the child defaults to `/tmp`,
+/// which the fence denies. `NEWT_CHILD_TMPDIR` is published by the headless
+/// confined lane from the same value the fence was built from.
+#[tokio::test]
+async fn confined_shell_env_carries_the_fence_scratch_root_as_tmpdir() {
+    let _lock = env_lock().await;
+    let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", "/nonexistent-newt-tmpdir-test");
+    // newt's own TMPDIR is never passed through by accident.
+    let _parent = EnvVar::set("TMPDIR", "/parent-only-tmpdir");
+    {
+        let _child = EnvVar::unset("NEWT_CHILD_TMPDIR");
+        assert!(
+            !venv_env_map().contains_key("TMPDIR"),
+            "no root published, none passed"
+        );
+    }
+    let _child = EnvVar::set("NEWT_CHILD_TMPDIR", "/srv/scratch");
+    assert_eq!(
+        venv_env_map().get("TMPDIR").map(String::as_str),
+        Some("/srv/scratch")
+    );
+}
+
+/// #2533 round 2 (verify-routing-f11b item 1): the #2516 round-1 bug class
+/// (a prepended routed note shifts an `error:`/failure prefix off the front
+/// of the string, so the tool-result classifier reads a failure as success)
+/// reappeared for the build route. RED before the fix: `run_confined_build_lane`
+/// renders a failing command as `error: command exited N\n<output>`; the build
+/// route PREPENDED `[routed …]` in front of that, so `tool_result_ok` saw the
+/// note text first and returned `true` for a build that failed. Calling
+/// `build_exec` directly (bypassing the `cargo`/`just` routing table, which
+/// this test does not need) with a command that fails proves the ledgered
+/// `ok` bit follows the exit code even through the routed note.
+#[tokio::test]
+async fn failed_routed_build_ledgers_not_ok() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "build_exec",
+        &serde_json::json!({ "argv": ["false"] }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        None, // permission_gate
+        None,
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await;
+
+    if crate::confined_exec::kernel_fs_fence_available() {
+        assert!(
+            !super::tool_result_ok(&out),
+            "a routed build whose command failed must not read ok:true; got: {out}"
+        );
+        assert!(
+            out.contains("routed `false` to the confined build lane"),
+            "the routed note must still be present, appended after the failure \
+             text, not prepended in front of it; got: {out}"
+        );
+    }
+
+    // The passing case must still read ok:true — the fix must not flip both.
+    let out_ok = execute_tool(
+        "build_exec",
+        &serde_json::json!({ "argv": ["true"] }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    if crate::confined_exec::kernel_fs_fence_available() {
+        assert!(
+            super::tool_result_ok(&out_ok),
+            "a routed build that PASSED must still read ok:true; got: {out_ok}"
+        );
+    }
+}
+
+/// #2533 round 2 (item 2): a quoted, `~`-relative, or globbed operand cannot
+/// be routed faithfully — there is no shell downstream of the build lane to
+/// expand it — so the classifier must gate the whole call to exec rather than
+/// run a silently mangled argv. `cargo test -p newt-core` (no such token)
+/// must still route.
+#[test]
+fn build_route_refuses_unsafe_argv_shapes() {
+    use super::super::routing::{RouteDecision, RouteTable};
+    let table = RouteTable::builtin();
+    let cwd = std::path::Path::new("/never-matches-a-test-cwd");
+
+    for cmd in [
+        r#"cargo test "a b""#,
+        "cargo test --manifest-path ~/x",
+        "cargo build --bin *",
+        r#"cargo test 'a b'"#,
+        r"cargo test a\ b",
+    ] {
+        assert_eq!(
+            table.classify(cmd, cwd, &crate::caveats::Scope::All),
+            RouteDecision::Exec,
+            "{cmd:?} carries a token the shell would transform; it must gate to exec"
+        );
+    }
+
+    assert!(
+        matches!(
+            table.classify("cargo test -p newt-core", cwd, &crate::caveats::Scope::All),
+            RouteDecision::Route {
+                tool: "build_exec",
+                ..
+            }
+        ),
+        "a bare, unquoted argv must still route"
+    );
+}
+
+/// #2533 round 2 (item 3): `just` itself searches the cwd AND every parent
+/// directory for a justfile, so a workspace whose justfile sits one level up
+/// must still route-and-run through the build lane's exec fallback — not
+/// error — exactly as the shell path would have found it.
+#[tokio::test]
+async fn just_with_justfile_one_level_up_falls_back_to_exec_not_error() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("justfile"),
+        "check:\n\techo up-one-level\n",
+    )
+    .unwrap();
+    let sub = root.path().join("crates/foo");
+    std::fs::create_dir_all(&sub).unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "build_exec",
+        &serde_json::json!({ "argv": ["just", "check"] }),
+        &sub.to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !out.starts_with("error: no justfile"),
+        "a justfile one level up must be found, not reported missing; got: {out}"
+    );
+}
+
+/// PR-F28 review, Blocker 2 (red first, real dispatch, offload on): a routed
+/// `timeout 2 …` wrapper must leave the build lane at THAT 2-second wall, not
+/// the lane's own 30-minute one — round 1 threw the model's own bound away.
+/// A scratch justfile recipe that sleeps 10s proves it: the call must die at
+/// ~2s (`ExecOutcome::TimedOut`), and the note must name the 2-second wall
+/// actually applied, never "30 min".
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_routed_short_timeout_wrapper_honours_its_own_wall_not_the_lane_wall() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join("justfile"), "slow:\n\tsleep 10\n").unwrap();
+    let caveats = Caveats::top();
+
+    let started = std::time::Instant::now();
+    let out = execute_tool_with_offload(
+        "build_exec",
+        &serde_json::json!({
+            "argv": ["just", "slow"],
+            "timeout_secs": 2,
+        }),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        None, // permission_gate
+        None, // exec_floor
+        None, // git_tool
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+        true, // tool_offload
+        None, // spill_store
+        None, // persona_tools
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    if crate::confined_exec::kernel_fs_fence_available() {
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "a `timeout 2` routed call must die at ~2s, not the 30 min lane wall; \
+             elapsed {elapsed:?}, out: {out}"
+        );
+        assert!(
+            !super::tool_result_ok(&out),
+            "a call killed by its own 2-second wall must not read ok:true; got: {out}"
+        );
+        assert!(
+            out.contains("`timeout 2` honoured as this lane's wall (2s)"),
+            "the note must name the 2-second wall actually applied, not the 30 min \
+             lane wall; got: {out}"
+        );
+    }
+}
+
+/// A scratch crate whose `cargo check` genuinely FAILS: 20 distinct
+/// undefined-identifier references, each its own compile error, so the
+/// output comfortably exceeds any trim window this test uses. Offline, no
+/// deps — `cargo check` never touches the network for a dependency-free
+/// crate.
+#[cfg(not(windows))]
+fn write_failing_scratch_crate(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let body: String = (1..=20)
+        .map(|i| format!("    let _ = UNDEFINED_VAR_{i};\n"))
+        .collect();
+    std::fs::write(dir.join("src/main.rs"), format!("fn main() {{\n{body}}}\n")).unwrap();
+}
+
+/// A scratch crate whose `cargo check` genuinely PASSES but still emits
+/// substantial output: 10 unused-variable warnings (compiles clean, exit 0
+/// — a warning is not a failure), each its own diagnostic block.
+#[cfg(not(windows))]
+fn write_passing_scratch_crate(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let body: String = (1..=10)
+        .map(|i| format!("    let unused_var_{i} = {i};\n"))
+        .collect();
+    std::fs::write(dir.join("src/main.rs"), format!("fn main() {{\n{body}}}\n")).unwrap();
+}
+
+/// F23 / #2524 "tail-pipe-routes" (red first): the EXACT masking bug measured
+/// in 2488-r9 — piping a build ONLY to cut output must never let `tail`'s own
+/// (successful) exit code stand in for the build's. A FAILING build piped to
+/// `tail` must still render as a failure, not `(exit 0)`.
+///
+/// Uses `cargo check`, not `just` — CI runners are not guaranteed to have
+/// `just` on `PATH` (measured: PR #2549 CI failed both `just`-based
+/// predecessors of these two tests with `exec "just" failed: No such file
+/// or directory` on every runner). `cargo` is what CI always has; the
+/// scratch-crate approach mirrors `routed_cargo_plus_stable_resolves_the_
+/// toolchain_in_the_confined_lane` below. Verified with `just` absent from
+/// `PATH` entirely (not merely unused), so neither test can secretly
+/// depend on it.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_failing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo check 2>&1 | tail -10" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("error: command exited 1"),
+        "the build's real failure must survive the pipe, never masked by \
+         tail's own exit code: {out}"
+    );
+    assert!(
+        out.contains("routed") && out.contains("confined build lane"),
+        "the failing build must still have been ROUTED (not run in the \
+         confined shell, where the pipe WOULD mask the exit code): {out}"
+    );
+    assert!(
+        out.contains("output trimmed to the last 10 lines"),
+        "must say the output was trimmed: {out}"
+    );
+    // Only the last 10 lines survive — rustc reports errors in source
+    // order, so the LAST error (UNDEFINED_VAR_20) must survive the cut and
+    // an early one (UNDEFINED_VAR_1) must not.
+    assert!(out.contains("UNDEFINED_VAR_20"), "{out}");
+    assert!(
+        !out.contains("UNDEFINED_VAR_1`"),
+        "only the last 10 lines should remain: {out}"
+    );
+}
+
+/// A requested tail is a view of the captured build, not permission to discard
+/// earlier diagnostics. Recover an omitted error through the normal spill API.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_trimmed_build_retains_full_diagnostics_for_retrieval() {
+    use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
+    use crate::agentic::memory_fetch::{execute_memory_fetch, StoreMemorySource};
+
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_failing_scratch_crate(root.path());
+    let spill = SessionSpillStore::new([19u8; 16]);
+    let out = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({"command": "cargo check 2>&1 | tail -10; echo \"EXIT: $?\""}),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &Caveats::top(),
+        &mut NoMcp,
+        ToolCollaborators {
+            spill_store: Some(&spill),
+            ..Default::default()
+        },
+        true,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(out.contains("error: command exited 1"), "{out}");
+    assert!(out.contains("output trimmed to the last 10 lines"), "{out}");
+    assert!(out.contains("UNDEFINED_VAR_20"), "{out}");
+    assert!(
+        !out.contains("UNDEFINED_VAR_1`"),
+        "tail must stay selected: {out}"
+    );
+    let handle = out
+        .split("spill:")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("trimmed build must expose the existing full-output retrieval handle");
+    let cid = SpillCid::parse(handle).unwrap();
+    let full = spill
+        .fetch(&cid)
+        .expect("retained build output")
+        .redacted_text;
+    assert!(
+        full.contains("UNDEFINED_VAR_1`"),
+        "first error was lost: {full}"
+    );
+    assert!(
+        full.contains("UNDEFINED_VAR_20"),
+        "last error was lost: {full}"
+    );
+
+    let source = StoreMemorySource::from_stores(None, None).with_spill_store(&spill);
+    let recovered = execute_memory_fetch(
+        &serde_json::json!({"address": format!("spill:{handle}"), "grep": "UNDEFINED_VAR_1`"}),
+        &source,
+        false,
+        20,
+    );
+    assert!(recovered.contains("UNDEFINED_VAR_1`"), "{recovered}");
+}
+
+/// F27 (r14a evidence): the twin hazard to the `| tail` case above — a
+/// trailing `; echo "EXIT: $?"` used to keep the whole command compound
+/// (SHELL_META), so it ran un-routed in the confined shell, where `$?`
+/// after `cargo check; echo "EXIT: $?"` is ALWAYS the shell's own exit
+/// code (0), never cargo's. Stripping the echo (routing.rs) lets the
+/// command route to the build lane instead, which reports cargo's REAL
+/// exit code — a failure must still render as a failure, never masked by
+/// the echo's synthetic success.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_failing_build_with_a_trailing_exit_echo_still_reports_the_real_failure() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_failing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo check 2>&1; echo \"EXIT: $?\"" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("error: command exited 1"),
+        "the build's real failure must survive, never masked by the shell's \
+         own $? (always 0 after `cmd; echo …$?…`): {out}"
+    );
+    assert!(
+        out.contains("routed") && out.contains("confined build lane"),
+        "must have been ROUTED (not run in the confined shell, where the \
+         trailing echo WOULD have kept it compound and masked the exit \
+         code): {out}"
+    );
+    // #2554 round 2: the model asked for an `EXIT: N` line and will not
+    // find one — the note must say the echo was dropped and that the
+    // lane's own exit code (above) is the real one, so a model grepping
+    // its own output for `EXIT` does not re-run the call believing it
+    // never answered.
+    assert!(
+        out.contains("a trailing exit-code `echo` was dropped"),
+        "the routed note must say the echo was dropped: {out}"
+    );
+}
+
+/// The passing twin: a build that genuinely passes, piped to `head`, keeps
+/// its `Passed` outcome and the first N lines. See the failing test's doc
+/// comment for why `cargo`, not `just`.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_passing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo check 2>&1 | head -5" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !out.contains("error: command exited"),
+        "a genuinely passing build (warnings only, exit 0) must not be \
+         reported as failed: {out}"
+    );
+    assert!(
+        out.contains("output trimmed to the first 5 lines"),
+        "must say the output was trimmed: {out}"
+    );
+    // rustc emits warnings in source order — the first (unused_var_1) must
+    // survive the cut, the last (unused_var_10) must not.
+    assert!(out.contains("unused_var_1`"), "{out}");
+    assert!(
+        !out.contains("unused_var_10"),
+        "only the first 5 lines should remain: {out}"
+    );
+}
+
+/// #2524 follow-up (F23 evidence): 2488-r9's own build-verifying command
+/// carried `+stable`. Confirms EMPIRICALLY, not just by code inspection,
+/// that rustup resolves it inside the confined build lane —
+/// `build_tool_request` forwards `RUSTUP_HOME`/`CARGO_HOME` from the
+/// OPERATOR's real environment (never the confined child's redirected
+/// `HOME`), so a routed `cargo +stable check` must behave exactly as it
+/// would from an ordinary shell, never report the toolchain missing.
+// The build lane fail-closes on Windows: a network-denied build needs a kernel
+// egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"scratch\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let caveats = Caveats::top();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cargo +stable check 2>&1 | tail -20" }),
+        &root.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo +stable check`") && out.contains("confined build lane"),
+        "must have been routed with the toolchain selector kept in the argv: {out}"
+    );
+    assert!(
+        !out.contains("toolchain") || !out.contains("is not installed"),
+        "rustup must resolve +stable inside the confined lane's forwarded \
+         RUSTUP_HOME/CARGO_HOME, not report it missing: {out}"
+    );
+    assert!(
+        !out.contains("error: command exited"),
+        "cargo +stable check on a trivial offline crate must actually \
+         succeed in this environment: {out}"
+    );
+}
+
+/// F24/PR1 (r10-r12 evidence, red first): almost every `run_command` began
+/// with `cd <dir> && …` — the session's OWN workspace root, or a real
+/// subdirectory (see `a_cd_prefixed_subdirectory_routes_and_says_so` below)
+/// — which made every command compound and never routed at all. A routed
+/// `cd <root> && cargo check` must run through the SAME build lane as a
+/// bare `cargo check`; the workspace root resolves to `cwd="."`, so PR1's
+/// routed-note clause (which names the folded directory) stays empty for
+/// this case — nothing to say beyond the routed note itself.
+// `write_passing_scratch_crate` (a real build-lane dispatch) is
+// `#[cfg(not(windows))]`; see its own doc for why.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_noop_cd_to_the_workspace_root_still_routes_and_says_so() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    write_passing_scratch_crate(root.path());
+    let caveats = Caveats::top();
+    let root_str = root.path().to_string_lossy();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": format!("cd {root_str} && cargo check") }),
+        &root_str,
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo check`") && out.contains("confined build lane"),
+        "the cd-prefixed call must still route, with the cd stripped from \
+         the displayed argv: {out}"
+    );
+    assert!(
+        !out.contains("cwd="),
+        "the workspace root resolves to cwd=\".\" — nothing to name: {out}"
+    );
+    assert!(
+        !out.contains("error: command exited"),
+        "a genuinely passing build must not be reported as failed: {out}"
+    );
+}
+
+/// PR1 (red first): a `cd <subdir> && cargo check` — not just the
+/// workspace root — now routes too, and the routed note names WHICH
+/// directory it actually ran in.
+// `write_passing_scratch_crate` (a real build-lane dispatch) is
+// `#[cfg(not(windows))]`; see its own doc for why.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_cd_prefixed_subdirectory_routes_and_says_so() {
+    let _l = env_lock().await;
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let root = tempfile::TempDir::new().unwrap();
+    let sub = root.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    write_passing_scratch_crate(&sub);
+    let caveats = Caveats::top();
+    let root_str = root.path().to_string_lossy();
+
+    let out = execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": "cd sub && cargo check" }),
+        &root_str,
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.contains("routed `cargo check`") && out.contains("confined build lane"),
+        "the cd-prefixed subdirectory call must route too: {out}"
+    );
+    assert!(
+        out.contains("cwd=sub"),
+        "the routed note must name the folded directory: {out}"
+    );
+    assert!(
+        !out.contains("error: command exited"),
+        "a genuinely passing build must not be reported as failed: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F38 — lifecycle run of a build-tool command routes to the build lane
+// ---------------------------------------------------------------------------
+
+/// F38 (a): `lifecycle {"phase":"check"}` (no action, defaults to run) when
+/// the resolved command starts with a build tool (cargo) must route to the
+/// build lane and request Build authority — not fail in the run lane.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn lifecycle_run_of_build_tool_requests_build_authority() {
+    struct RecordingDenyGate {
+        seen: Option<super::PermissionRequest>,
+    }
+    impl super::PermissionGate for RecordingDenyGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.seen = requests.first().cloned();
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Cancelled
+        }
+    }
+
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    // Cargo.toml triggers the `rust` pack: check = "cargo fmt -- --check && cargo test"
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"dummy\"\n",
+    )
+    .unwrap();
+    let caveats = caveats_no_exec(ws.path());
+    let mut gate = RecordingDenyGate { seen: None };
+    let out = execute_tool(
+        "lifecycle",
+        &serde_json::json!({"phase": "check"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut gate),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let request = gate
+        .seen
+        .expect("lifecycle run of a build-tool command must consult the build-authority gate");
+    assert_eq!(
+        request.kind,
+        super::DenialKind::Build,
+        "must request Build authority, not exec/fs; got: {:?}",
+        request.kind
+    );
+    assert!(
+        out.contains("build authority") || out.contains("capability denied"),
+        "result must name build authority, not 'just isn't available'; got: {out}"
+    );
+    assert!(
+        !out.contains("isn't available") && !out.contains("Unavailable"),
+        "must not fail in the run lane; got: {out}"
+    );
+}
+
+/// F38 (c): `lifecycle {"phase":"check"}` when the resolved command is NOT a
+/// build tool (e.g. pytest) must NOT route to the build lane — it stays on
+/// the run-lane path with escalation.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn lifecycle_run_of_non_build_tool_does_not_request_build_authority() {
+    struct RecordingDenyGate {
+        seen: Option<super::PermissionRequest>,
+    }
+    impl super::PermissionGate for RecordingDenyGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.seen = requests.first().cloned();
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Cancelled
+        }
+    }
+
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::TempDir::new().unwrap();
+    // pyproject.toml triggers the `python` pack: check = "pytest -x"
+    std::fs::write(
+        ws.path().join("pyproject.toml"),
+        "[project]\nname = \"dummy\"\n",
+    )
+    .unwrap();
+    let caveats = caveats_no_exec(ws.path());
+    let mut gate = RecordingDenyGate { seen: None };
+    let _out = execute_tool(
+        "lifecycle",
+        &serde_json::json!({"phase": "check"}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut gate),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let has_build_request = gate
+        .seen
+        .as_ref()
+        .is_some_and(|r| r.kind == super::DenialKind::Build);
+    assert!(
+        !has_build_request,
+        "a non-build-tool lifecycle run must NOT route to the build lane; \
+         gate saw: {:?}",
+        gate.seen
+    );
+}
+
+/// Grounds `confined_exec::developer_exec_twins` against a REAL confined
+/// `python3` under a restricted exec grant. A live ornith-1.5-35b refactor run
+/// had `python3` granted by name, yet the shell resolved the `/usr/bin` xcrun
+/// shim (Seatbelt denied the Xcode binary its PATH put first), and the shim
+/// failed with `You can set the path to the Xcode folder using
+/// /usr/bin/xcode-select -switch`. Library tests run the safe-subset engine
+/// (see `bridle_registry`), so this covers the exec fence, not brush's lookup.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial_test::serial]
+async fn confined_python3_runs_on_macos() {
+    let _l = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats {
+        exec: Scope::only(["python3".to_string()]),
+        // Exercise the executable fence; macOS cannot admit restricted networking.
+        net: Scope::All,
+        ..caveats_no_exec(ws.path())
+    };
+    let out = run_tool(
+        "run_command",
+        serde_json::json!({"command": "python3 -c 'print(40 + 2)'"}),
+        ws.path(),
+        &caveats,
+    )
+    .await;
+    assert!(out.contains("42"), "{out}");
+}
+
+/// Grounds `git_hardening::sandbox_git_env` against a REAL confined `git`. A
+/// live ornith-1.5-35b run's `git status` died with `unable to access
+/// '~/.gitconfig': Operation not permitted`, because git read the operator's
+/// global config and the fence refused it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn confined_git_ignores_ambient_config_and_carries_the_agent_identity() {
+    let _l = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats {
+        exec: Scope::only(["git".to_string()]),
+        // Exercise Git identity/config isolation without an unsupported net floor.
+        #[cfg(target_os = "macos")]
+        net: Scope::All,
+        ..caveats_no_exec(ws.path())
+    };
+    let out = run_tool(
+        "run_command",
+        serde_json::json!({"command": "git init -q && git status --short && git config user.email"}),
+        ws.path(),
+        &caveats,
+    )
+    .await;
+    assert!(!out.contains("unable to access"), "{out}");
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    assert!(out.contains(&identity.email), "{out}");
 }

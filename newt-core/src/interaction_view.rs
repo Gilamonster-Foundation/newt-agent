@@ -339,6 +339,22 @@ mod c2 {
     }
 
     #[test]
+    fn a_multi_line_question_keeps_one_row_per_line() {
+        // A live ornith-35b `request_user_input` offered A/B/C/D on separate
+        // lines; the modal ran them into one paragraph.
+        let mut d = choice(&[("deny", "d", "deny")]);
+        d.markdown = "Which direction?\nA) tests\nB) loop body".into();
+        let view = InteractionView::of_definition(&d);
+        let body: Vec<String> = view
+            .rows()
+            .iter()
+            .filter(|r| r.kind == RowKind::Body)
+            .map(ViewRow::text)
+            .collect();
+        assert_eq!(body, ["Which direction?", "A) tests", "B) loop body"]);
+    }
+
+    #[test]
     fn the_note_is_verbatim_not_markdown() {
         // A `*` in a danger warning must not become emphasis.
         let mut d = choice(&[("deny", "d", "deny")]);

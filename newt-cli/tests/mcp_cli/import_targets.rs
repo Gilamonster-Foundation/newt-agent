@@ -503,3 +503,27 @@ fn uat_import_updates_once_resolved_windows_symlinked_config_target() {
 }
 
 // Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 01:27 EDT | Date: 2026-09-18
+
+#[test]
+#[ignore = "real subprocess/filesystem acceptance; run in mcp-import-real workflow"]
+#[serial_test::serial(real_fs)]
+fn import_warns_but_succeeds_for_a_missing_stdio_command() {
+    let sb = sandbox();
+    let claude = sb.cwd.join("claude.json");
+    std::fs::write(
+        &claude,
+        r#"{ "mcpServers": { "ghost": { "command": "definitely-not-installed-mcp" } } }"#,
+    )
+    .unwrap();
+
+    newt(&sb)
+        .args(["mcp", "import", claude.to_str().unwrap(), "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("`ghost`"))
+        .stdout(predicate::str::contains("was not found"));
+
+    let mcp_toml = sb.config_dir.join("mcp.toml");
+    let servers = newt_core::mcp::parse_newt_mcp_toml(&std::fs::read_to_string(&mcp_toml).unwrap());
+    assert_eq!(servers[0].name, "ghost");
+}

@@ -1,5 +1,6 @@
 //! #2315: the result-aware decision (`conclude`), the bounded tree state, and
-//! the mutation-chain fallback. Pure: no filesystem, no process.
+//! the mutation-chain fallback. Decision fixtures are pure; scanner boundary
+//! fixtures use isolated temporary files. No fixture executes a test runner.
 
 use super::*;
 use crate::ExecOutcome::{Denied, Failed, Passed, TimedOut, Unavailable};
@@ -8,6 +9,79 @@ use content_addressable::ContentId;
 
 const CHECK: &str = "sh -c true";
 const OTHER: &str = "git status";
+
+#[tokio::test]
+async fn rust_edit_does_not_require_unselected_python_or_just_checks() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(root.path().join("Justfile"), "test:\n    cargo test\n").unwrap();
+    std::fs::write(root.path().join("test_python.py"), "assert True\n").unwrap();
+    std::fs::write(root.path().join("source.rs"), "before\n").unwrap();
+    let workspace = root.path().to_str().unwrap();
+    let mut ledger = VerificationLedger::for_turn("Refactor the Rust guard.", true);
+    let before = workspace_tree_state(root.path());
+    std::fs::write(root.path().join("source.rs"), "after\n").unwrap();
+    ledger.record_write();
+    let current = workspace_tree_state(root.path());
+    assert_ne!(current, before, "the fixture includes a real Rust edit");
+    ledger.record_exec("cargo test --lib guard", Passed, current);
+    let requested = vec!["cargo test --lib guard".to_string()];
+    let relevant = ledger
+        .applicable_checks(workspace, "Refactor the Rust guard.", &requested)
+        .await
+        .unwrap();
+    assert_eq!(relevant, cargo_checks(), "discovery is not a requirement");
+    assert_eq!(verify_gate_nudge(&relevant, &requested), None);
+    assert_eq!(
+        conclude(&Conclusion {
+            checks: &relevant,
+            requested: &requested,
+            ledger: &ledger,
+            tree_now: current,
+            repairs_used: 0,
+            rounds_left: true,
+        })
+        .0,
+        Decision::Accept
+    );
+
+    let python_task = "Refactor the Rust guard, then run `python3 -m pytest` to verify.";
+    let explicit = ledger
+        .applicable_checks(workspace, python_task, &requested)
+        .await
+        .unwrap();
+    let pending = verify_gate_nudge(&explicit, &requested).unwrap();
+    assert!(pending.contains("python3 -m pytest"), "{pending}");
+    let (_, pending_report) = conclude(&Conclusion {
+        checks: &explicit,
+        requested: &requested,
+        ledger: &ledger,
+        tree_now: current,
+        repairs_used: 0,
+        rounds_left: true,
+    });
+    assert!(pending_report.checks.iter().any(|check| {
+        check.label.contains("python3 -m pytest") && check.status == CheckStatus::NeverRun
+    }));
+
+    ledger.record_exec("python3 -m pytest", Failed, current);
+    let attempted = ledger
+        .applicable_checks(workspace, "Refactor the Rust guard.", &requested)
+        .await
+        .unwrap();
+    let (decision, report) = conclude(&Conclusion {
+        checks: &attempted,
+        requested: &requested,
+        ledger: &ledger,
+        tree_now: current,
+        repairs_used: 0,
+        rounds_left: true,
+    });
+    assert!(matches!(decision, Decision::Nudge(_)));
+    assert!(report.checks.iter().any(|check| {
+        check.label.contains("Python tests") && check.status == CheckStatus::Failed
+    }));
+}
 
 /// Grounds the shared scanner boundary in real files: isolated checkouts and
 /// their builds are not this workspace; its instructions and source still are.
@@ -29,13 +103,12 @@ fn workspace_state_ignores_isolated_worktrees_but_keeps_source_and_instructions(
 }
 
 #[tokio::test]
-async fn unchanged_workspace_retains_explicit_and_attempted_checks_and_unknown_is_conservative() {
+async fn workspace_scope_retains_explicit_and_attempted_checks() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
     std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
     let workspace = root.path().to_str().unwrap();
     let mut ledger = VerificationLedger::for_turn("", true);
-    ledger.initial_tree = workspace_tree_state(root.path());
     assert!(ledger
         .applicable_checks(workspace, "Report status.", &[])
         .await
@@ -70,16 +143,6 @@ async fn unchanged_workspace_retains_explicit_and_attempted_checks_and_unknown_i
     assert!(
         matches!(decide_with(&failed, &ledger, None), Decision::Nudge(_)),
         "an observed failure still requires repair"
-    );
-    ledger.initial_tree = None;
-    assert_eq!(
-        ledger
-            .applicable_checks(workspace, "Report status.", &[])
-            .await
-            .unwrap()
-            .len(),
-        2,
-        "unknown state cannot prove the workspace unchanged"
     );
 }
 

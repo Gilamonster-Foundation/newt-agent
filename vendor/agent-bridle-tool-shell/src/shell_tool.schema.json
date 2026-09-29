@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "program": {
+      "type": "string",
+      "description": "Argv form: the command to run (argv[0]). Gated by the `exec` caveat. Mutually exclusive with `cmd`."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Argv form: arguments passed to `program` (argv[1..]). Taken literally — no globbing/quoting interpretation."
+    },
+    "cmd": {
+      "type": "string",
+      "description": "Free-form command line run by the confined safe-subset engine: pipelines (a | b) joined by &&/||/;, with quoted arguments, redirections (> out, >> out, < in, 2> err, 2>&1; file targets gated by fs_write/fs_read), filename globbing (*, ?, [..]; gated by fs_read on the listed directory), and $VAR/${VAR} expansion (incl. mixed words like $HOME/config and inside double quotes) for an allowlisted, secret-free set (HOME, PWD, USER, TMPDIR, ...). Dynamic constructs ($(...), $((...)), backticks, subshells) are refused by design; a $VAR outside the allowlist, a $VAR in a redirect target or combined with a glob, and fd redirections other than 1>/2>/0</2>&1, are refused. Mutually exclusive with `program`."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory for the command (must be within fs_read scope)."
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Host/operator-supplied environment variables (string values) set on the spawned child process(es), additive over the inherited ambient environment. Pass real env vars here instead of prepending `export VAR=…;` statements to `cmd` — an `export` builtin is not a program and the confined engine refuses it. These values are host input, not model-authored command text, and do NOT widen the leash: the exec/fs check is on the real program, never on env."
+    },
+    "timeout_secs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Wall-clock timeout bound (not a coordination primitive). The `maximum` is the tool's configured LimitsPolicy ceiling, injected at runtime."
+    }
+  },
+  "additionalProperties": false
+}

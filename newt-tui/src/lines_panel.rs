@@ -40,9 +40,20 @@ use crate::panel::{Flow, Key, Screen};
 /// Rows visible at once. The panel leases this many plus chrome.
 const VISIBLE: usize = 12;
 
+/// One row: a label, a value, and where the value came from. Columns are laid
+/// out by `render_panel` — the panels' one column owner — so no caller pads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LineRow {
+    pub(crate) label: &'static str,
+    pub(crate) value: String,
+    pub(crate) from: String,
+}
+
 pub(crate) struct LinesPanel {
     title: &'static str,
-    lines: Vec<String>,
+    rows: Vec<LineRow>,
+    /// Label and value column widths; `(0, 72)` for plain sentence lines.
+    widths: (usize, usize),
     cursor: ListCursor,
 }
 
@@ -55,10 +66,28 @@ impl LinesPanel {
     /// rendering of the same state is how a panel and its command come to
     /// disagree about what is true.
     pub(crate) fn new(title: &'static str, lines: Vec<String>) -> Self {
-        let len = lines.len();
+        let rows = lines
+            .into_iter()
+            .map(|value| LineRow {
+                label: "",
+                value,
+                from: String::new(),
+            })
+            .collect();
+        Self::with_columns(title, rows, (0, 72))
+    }
+
+    /// Build from label/value/provenance rows, laid out in `widths` columns.
+    pub(crate) fn with_columns(
+        title: &'static str,
+        rows: Vec<LineRow>,
+        widths: (usize, usize),
+    ) -> Self {
+        let len = rows.len();
         Self {
             title,
-            lines,
+            rows,
+            widths,
             cursor: ListCursor::new(len, VISIBLE, 0),
         }
     }
@@ -70,33 +99,29 @@ impl LinesPanel {
 
     #[cfg(test)]
     fn visible_rows(&self) -> Vec<&str> {
-        self.lines
+        self.rows
             .iter()
             .skip(self.cursor.top())
             .take(VISIBLE)
-            .map(String::as_str)
+            .map(|row| row.value.as_str())
             .collect()
     }
 }
 
 impl Screen for LinesPanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let top = self.cursor.top();
         let rows: Vec<crate::config_panel::RowView> = self
-            .lines
+            .rows
             .iter()
-            .skip(top)
-            .take(VISIBLE)
             .enumerate()
-            .map(|(offset, line)| crate::config_panel::RowView {
-                // The label column carries the whole line: these are sentences
-                // and audit records, not `name: value` pairs, and splitting
-                // them into columns would wrap them at a place they do not
-                // mean anything.
-                label: "",
-                value: line.clone(),
-                provenance: String::new(),
-                selected: top + offset == self.cursor.at(),
+            .map(|(index, row)| crate::config_panel::RowView {
+                // Sentence lines (audit records, permission prose) keep an
+                // empty label: splitting them into columns would wrap them at
+                // a place they do not mean anything.
+                label: row.label,
+                value: row.value.clone(),
+                provenance: row.from.clone(),
+                selected: index == self.cursor.at(),
                 editable: false,
             })
             .collect();
@@ -105,8 +130,8 @@ impl Screen for LinesPanel {
             self.title,
             &rows,
             crate::config_panel::hint_line("↑↓ scroll · ^u/^d page · Esc leave"),
-            0,
-            72,
+            self.widths.0,
+            self.widths.1,
         );
     }
 
@@ -387,5 +412,46 @@ mod tests {
         let rows = receipt_audit_lines(&r.render_line().expect("render"));
         assert!(rows[0].contains("all verify"), "{:?}", rows[0]);
         assert!(rows[1].starts_with('✓'));
+    }
+
+    /// #2567/#2571: the box is the container. Rows fill it, the hint sits on
+    /// the last line above the border, and overflow shows the left scrollbar.
+    #[test]
+    fn overflowing_rows_fill_the_box_pin_the_hint_and_show_a_scrollbar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let panel = LinesPanel::new("inference", (0..30).map(|n| format!("row {n}")).collect());
+        let (w, h) = (40u16, 10u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| panel.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let line =
+            |y: u16| -> String { (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect() };
+        // Border on rows 0 and h-1; the hint directly above the bottom border.
+        assert!(
+            line(h - 2).contains("Esc leave"),
+            "hint not on the last line:\n{}",
+            (0..h).map(line).collect::<Vec<_>>().join("\n")
+        );
+        // Every body row between the border and the hint is a content row.
+        for y in 1..h - 2 {
+            assert!(
+                line(y).contains("row "),
+                "row {y} is not content: {:?}",
+                line(y)
+            );
+        }
+        let gutter: String = (1..h - 2)
+            .map(|y| buf.cell((1, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            gutter.contains(crate::scrollbar::SCROLL_BELOW),
+            "no ▼ in {gutter:?}"
+        );
+        assert!(
+            gutter.contains(crate::scrollbar::SCROLL_THUMB),
+            "no thumb in {gutter:?}"
+        );
     }
 }

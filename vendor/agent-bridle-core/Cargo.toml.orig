@@ -1,0 +1,149 @@
+[package]
+name = "agent-bridle-core"
+description = "Capability-enforcement core for agent-bridle: the Tool trait, Gate (mint-token enforcement), Registry, and Caveats leash."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# crates.io front-page metadata (ADR 0008 — the externally-consumed crate).
+# `readme` defaults to the crate-root README.md (present).
+keywords = ["capability", "ocap", "security", "sandbox", "agent"]
+categories = ["development-tools"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[features]
+default = []
+# Real, kernel-enforced Landlock ruleset (Linux only). Enables the `landlock`
+# dependency and the `LandlockSandbox` (see src/sandbox.rs). Confines both
+# filesystem axes, narrows direct execve (reported Interceptor because the
+# loader trampoline remains), and kernel-denies empty-scope TCP on ABI-v4
+# kernels. Without this feature/off-Linux, another native backend may apply or
+# the honest NoopSandbox reports SandboxKind::None. ADR 0001/0011 (L3).
+# Also pulls `seccompiler` — the safe-API install path for the
+# `ChildNetworkPolicy::DenyDirect` seccomp `socket()`-family egress deny
+# (UDP/DNS/raw — the leg Landlock's TCP-only net rule cannot filter). Installed
+# on the SAME confining thread as the Landlock ruleset, immediately before the
+# spawn, so the child inherits both. `seccompiler::apply_filter` is a safe fn
+# (it internally sets PR_SET_NO_NEW_PRIVS), so core keeps `unsafe_code = forbid`.
+linux-landlock = ["dep:landlock", "dep:seccompiler", "dep:libc"]
+# Real, kernel-enforced Seatbelt profile (macOS only). Enables the
+# `SeatbeltSandbox` (see src/sandbox.rs), which confines a spawned program via
+# the `sandbox-exec(1)` wrapper — no extra dependency and no FFI (core forbids
+# `unsafe`), so the feature is empty here. It confines both filesystem axes and
+# restricted exec. Expressible restricted-net profiles add direct-network rules;
+# `net:none` additionally adds the E4 Mach-lookup floor. Every restricted macOS
+# net scope still resolves Unknown and admission refuses it until ambient and
+# allow-listed IPC deputies have a deputy-complete native proof. The demonstrated
+# nsurlsessiond close is defense in depth, not a net:none/loopback/proxy support
+# promotion. Without this feature/off-macOS, another native backend may apply or
+# the honest NoopSandbox reports SandboxKind::None. ADR 0006/0009/0014/0015/0016.
+macos-seatbelt = []
+# Windows AppContainer process sandbox (Windows only). AppContainer is applied
+# by `agent-bridle-aclaunch` at process creation via SECURITY_CAPABILITIES.
+# Confines filesystem paths, empty/loopback-only net, and exec deny-all; a
+# non-empty exec allowlist remains Interceptor. See src/sandbox.rs and #51/#123.
+windows-appcontainer = []
+# One-knob convenience (ADR 0006 D2): every OS L3 backend (each inert off its
+# target OS, so a CI matrix can turn them all on).
+os-sandbox = ["linux-landlock", "macos-seatbelt", "windows-appcontainer"]
+# Production Ed25519 `DischargeVerifier` (`Ed25519Verifier`) for the step-up
+# surface. Off by default to keep core lean; enable it for the software /
+# OpenSSH `ed25519-sk`-style passkey verification path (raw Ed25519 assertions
+# over the step-up challenge). Pulls `ed25519-dalek`. ADR 0007.
+verifier-ed25519 = ["dep:ed25519-dalek"]
+# Production WebAuthn/CTAP2 `DischargeVerifier` (`WebAuthnVerifier`) for the
+# Passkey step-up tier. Parses a WebAuthn assertion (clientDataJSON +
+# authenticatorData + EdDSA signature), checks the UP/UV flag bits and binds the
+# assertion to the gate-recomputed challenge. Off by default; pulls
+# `ed25519-dalek` (EdDSA assertions) + `sha2` (SHA-256 over clientDataJSON).
+# ADR 0007. agent-bridle#72.
+verifier-webauthn = ["dep:ed25519-dalek", "dep:sha2"]
+# ES256 (COSE alg -7) passkey verifier — most platform passkeys sign ECDSA-P256,
+# not EdDSA, so this is what makes real phone/laptop hardware work. Shares the
+# `verifier-webauthn` gating; adds `p256` (ECDSA verify) + `sha2`. Off by default.
+# agent-bridle#295.
+verifier-webauthn-es256 = ["dep:p256", "dep:sha2"]
+# `spawn-tokio` exposes `ConfinedCommand::spawn_tokio` (Unix): the SAME confined
+# spawn as `spawn` (identical admission-check / OS-sandbox / env-scrub), but the
+# child's stdio is returned as tokio-native pipe handles wrapped in a
+# kill-on-drop guard — for an async host such as an MCP-server stdio transport
+# (newt Leg 3, #1180). Pulls an optional tokio dep; off by default so a
+# non-async embedder builds core with no tokio in the graph.
+spawn-tokio = ["dep:tokio"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+async-trait = { workspace = true }
+agent-mesh-protocol = { workspace = true }
+# Runtime authority/evidence provenance (ASM-CID): the typed content-addressed
+# identity of the admitted fence, verified at the admit→apply handoff. This is the
+# SAME machinery agent-mesh-protocol uses for AuthorityId/GrantId — not a parallel
+# hash format. Already in the lockfile (transitive via agent-mesh-protocol).
+content-addressable = "0.1.0"
+
+# Optional: the production `Ed25519Verifier`, gated by `verifier-ed25519`. NOT in
+# the default build — core stays lean (`cargo build` with no features does not
+# compile it). Already in the lockfile (transitive via agent-mesh-protocol). The
+# step-up tests sign discharges with it too, so the step-up crypto tests compile
+# only under `--features verifier-ed25519` (CI's `--all-features` matrix runs them).
+ed25519-dalek = { version = "2", optional = true }
+
+# Optional: SHA-256 over `clientDataJSON` for the WebAuthn verifier, gated by
+# `verifier-webauthn`. Already in the lockfile (transitive via ed25519-dalek), so
+# enabling the feature pulls nothing new.
+sha2 = { version = "0.10", optional = true }
+
+# Optional: P-256 ECDSA verification for the ES256 WebAuthn verifier, gated by
+# `verifier-webauthn-es256`. `default-features = false` + `ecdsa` keeps it lean
+# (verification + deterministic RFC6979 signing for tests; no PEM/PKCS8).
+p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdsa"] }
+
+# Optional: tokio-native pipe ends for `ConfinedCommand::spawn_tokio`, gated by
+# `spawn-tokio`. Inherits the workspace tokio features (rt/macros/…) and adds
+# `net` (`tokio::net::unix::pipe`, the std-fd → async-pipe bridge) + `io-util`
+# (the async read/write ext traits the tests exercise). Unix-only in use (the
+# API is `cfg(unix)`); on other targets the dep is inert. NOT in the default
+# build — core stays tokio-free unless the feature asks for it.
+tokio = { workspace = true, optional = true, features = ["net", "io-util"] }
+
+# Landlock is Linux-only; gate the dep on the target so enabling the feature on
+# macOS/Windows does not try to build it. Used only under
+# cfg(all(target_os = "linux", feature = "linux-landlock")).
+# The confined-spawn fd-hygiene seam (#319). Encapsulates the one `unsafe`
+# `close_range` pre-exec so core stays `forbid(unsafe_code)` (ADR 0026 slice 1).
+# Unix-only: it is a no-op off-Linux today, so Windows core stays clean.
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for the POSIX process-group signal used by the managed
+# execution owner's bounded tree termination (`src/execution/tree.rs`). Core is
+# `forbid(unsafe_code)`, so the signal cannot be a raw `libc` FFI call; rustix
+# provides it as a safe fn. Same primitive `agent-bridle-tool-shell` already
+# uses to reap a Brush worker tree, and already in the lockfile.
+rustix = { version = "1", features = ["process"] }
+agent-bridle-fdguard = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4", optional = true }
+# The seccomp `socket()`-family egress deny for `ChildNetworkPolicy::DenyDirect`,
+# gated by `linux-landlock`. `apply_filter` is a SAFE fn (sets no_new_privs +
+# installs the BPF filter internally), so core keeps `unsafe_code = forbid`.
+# Linux-only; enabling the feature off-Linux does not try to build it.
+seccompiler = { version = "0.5", optional = true }
+# Used ONLY for portable syscall/errno/address-family CONSTANTS
+# (`SYS_socket` / `AF_INET*` / `AF_PACKET` / `EACCES`) when building that seccomp
+# filter — no `unsafe` calls, so `unsafe_code = forbid` still holds. Gated with
+# seccompiler under `linux-landlock`.
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Test-only: proves the #372 async-consumer contract (`net_proxy` tests/
+# net_proxy_async_finalize.rs) — an async caller must finalize the blocking
+# proxy off the Tokio reactor. Dev-only, so a non-async embedder's build graph
+# stays tokio-free unless `spawn-tokio` is also enabled (core's production code
+# remains std-only regardless).
+tokio = { workspace = true }

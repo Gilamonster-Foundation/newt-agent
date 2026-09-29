@@ -1,4 +1,126 @@
 use super::*;
+use crate::ExecOutcome;
+
+// -----------------------------------------------------------------------
+// #2419: a pre-dispatch MCP permission refusal must record `ok = false` and
+// never reach the connector — grounded in the dispatch OUTCOME (the
+// `execution` slot), not in the refusal string's wording.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn missing_gate_mcp_refusal_records_not_ok_and_never_reaches_connector() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+    let mut mcp = OneRemoteTool::new("review_source__get_review");
+    let execution = std::sync::OnceLock::new();
+    let out = execute_tool_with_collaborators(
+        "review_source__get_review",
+        &serde_json::json!({}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut mcp,
+        ToolCollaborators {
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !mcp.called,
+        "no interactive gate is available: the connector must receive zero calls"
+    );
+    assert!(
+        tool_result_ok(&out),
+        "demonstrates the bug in isolation: the refusal wording alone still \
+         reads as success: {out}"
+    );
+    assert_eq!(
+        execution.get(),
+        Some(&ExecOutcome::Denied),
+        "the host never reached the connector, and must say so structurally"
+    );
+    assert!(
+        !tool_ok(&out, execution.get().copied()),
+        "the typed dispatch outcome must override the text-based classifier"
+    );
+}
+
+#[tokio::test]
+async fn denied_gate_mcp_refusal_records_not_ok_and_never_reaches_connector() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+    let mut mcp = OneRemoteTool::new("review_source__get_review");
+    let mut gate = MockGate::new(false, &caveats);
+    let execution = std::sync::OnceLock::new();
+    let out = execute_tool_with_collaborators(
+        "review_source__get_review",
+        &serde_json::json!({}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut mcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate),
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !mcp.called,
+        "a denied/cancelled gate must never reach the connector"
+    );
+    assert_eq!(execution.get(), Some(&ExecOutcome::Denied));
+    assert!(!tool_ok(&out, execution.get().copied()));
+}
+
+#[tokio::test]
+async fn approved_gate_mcp_call_reaches_connector_once_and_records_ok() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = Caveats::top();
+    let mut mcp = OneRemoteTool::new("review_source__get_review");
+    let mut gate = MockGate::new(true, &caveats);
+    let execution = std::sync::OnceLock::new();
+    let out = execute_tool_with_collaborators(
+        "review_source__get_review",
+        &serde_json::json!({}),
+        &ws.path().to_string_lossy(),
+        false,
+        20,
+        &caveats,
+        &mut mcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate),
+            execution: Some(&execution),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        mcp.called,
+        "an explicit exact approval must reach the connector"
+    );
+    assert_eq!(out, "remote-tool-ran");
+    assert!(tool_ok(&out, execution.get().copied()));
+}
 
 #[tokio::test]
 async fn persona_preferences_research_discovers_and_requests_remote_permission() {

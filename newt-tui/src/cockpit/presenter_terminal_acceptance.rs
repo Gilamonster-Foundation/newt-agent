@@ -9,8 +9,12 @@ const CTRL_C: &[u8] = &[0x03];
 /// cursor-addressed rows must reach the operator tty, own input through resize,
 /// and disappear before the restored composer accepts its next submission.
 /// Primary-screen history must survive both unchanged and resized pager visits.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[cfg(feature = "live-spill")]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn completed_spill_pager_owns_the_terminal_through_resize_and_close() {
     crate::interaction_view_pty_test::drive_cockpit_pager();
 }
@@ -59,7 +63,11 @@ pub(crate) fn cockpit_pager_case() {
 /// real tty: crossterm may already hold input after a terminal query or poll,
 /// leaving the kernel fd empty. Both Enter and Ctrl-C must work without a
 /// subsequent key, while another stdin owner must still keep those events.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn buffered_paste_enter_and_interrupt_do_not_need_another_key() {
     crate::interaction_view_pty_test::drive_cockpit_buffered_input();
 }
@@ -177,10 +185,143 @@ fn buffered_input_case() {
     assert!(matches!(closed, Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
 }
 
+/// #2540 round 2 item 2 (red first): the clarification modal's real terminal
+/// input path — the tier that caught NOTHING before this round, because
+/// `clarification_modal`'s own unit tests drive `FreeTextInput` with
+/// synthetic `Event::Key`/`Event::Paste` values, never a real device. Driven
+/// live (Herdr pane, release build) the modal rendered correctly and then
+/// could neither be answered nor left: a paste echoed as literal
+/// `^[[200~…^[[201~`, Enter as literal `^M`, Esc/Ctrl-C/Ctrl-U did nothing.
+/// This types an ordinal answer + Enter, pastes a bracketed `/discuss …` +
+/// Enter, presses Esc, and checks `stty -g` afterward — the four things
+/// measured broken live.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn the_clarification_modal_can_be_answered_pasted_into_and_escaped() {
+    crate::interaction_view_pty_test::drive_cockpit_clarification_input();
+}
+
+pub(crate) fn cockpit_clarification_input_case() {
+    let result = std::panic::catch_unwind(clarification_input_case);
+    if let Err(error) = result {
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-text panic");
+        println!("CLARIFICATION_INPUT_FAILURE:{message}");
+        std::panic::resume_unwind(error);
+    }
+}
+
+fn clarification_input_case() {
+    let tty = TestTty::install();
+    let before = termios_of(0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+
+    // 1: a typed ordinal answer + Enter must reach the clarification path.
+    // A unique batch marker per round, so `type_when_painted`'s whole-buffer
+    // scan (the painted transcript only ever grows across these three
+    // rounds) cannot fire early on a marker an EARLIER round already drew.
+    let (reply, received) = std::sync::mpsc::sync_channel(1);
+    let typer = tty.type_when_painted("CLAR_ROUND_ONE", b"1: keep the index\r");
+    cockpit
+        .handle_request(SurfaceRequest::PresentClarification {
+            batch: "CLAR_ROUND_ONE\n1: keep the index\n2: rebuild it".into(),
+            hint: "ordinal locks it".into(),
+            prompt: String::new(),
+            color: false,
+            verbose: false,
+            reply,
+        })
+        .unwrap();
+    assert!(
+        typer.join().expect("round-one prompt watcher"),
+        "the modal must reach the real terminal before input is sent"
+    );
+    assert!(
+        matches!(received.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line == "1: keep the index"),
+        "a typed ordinal + Enter must reach the clarification path, not \
+         literal bytes: {:?}",
+        received.try_recv()
+    );
+
+    // 2: a bracketed paste of `/discuss …` + Enter must reach the path too —
+    // decoded as ONE `Event::Paste`, not the escape markers themselves typed
+    // character by character.
+    let (reply2, received2) = std::sync::mpsc::sync_channel(1);
+    let typer2 = tty.type_when_painted(
+        "CLAR_ROUND_TWO",
+        b"\x1b[200~/discuss why the plan changed\x1b[201~\r",
+    );
+    cockpit
+        .handle_request(SurfaceRequest::PresentClarification {
+            batch: "CLAR_ROUND_TWO\n1: keep the index".into(),
+            hint: "ordinal locks it".into(),
+            prompt: String::new(),
+            color: false,
+            verbose: false,
+            reply: reply2,
+        })
+        .unwrap();
+    assert!(
+        typer2.join().expect("round-two prompt watcher"),
+        "the modal must reach the real terminal before input is sent"
+    );
+    assert!(
+        matches!(received2.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line == "/discuss why the plan changed"),
+        "a bracketed paste + Enter must reach the clarification path, not \
+         raw escape bytes: {:?}",
+        received2.try_recv()
+    );
+
+    // 3: Esc must dismiss — the caller gets an ordinary answer back, not a
+    // modal the operator cannot leave.
+    let (reply3, received3) = std::sync::mpsc::sync_channel(1);
+    let typer3 = tty.type_when_painted("CLAR_ROUND_THREE", b"\x1b");
+    cockpit
+        .handle_request(SurfaceRequest::PresentClarification {
+            batch: "CLAR_ROUND_THREE\n1: keep the index".into(),
+            hint: "ordinal locks it".into(),
+            prompt: String::new(),
+            color: false,
+            verbose: false,
+            reply: reply3,
+        })
+        .unwrap();
+    assert!(
+        typer3.join().expect("round-three prompt watcher"),
+        "the modal must reach the real terminal before input is sent"
+    );
+    assert!(
+        matches!(received3.try_recv(), Ok(Ok(ReadOutcome::Line(line))) if line.is_empty()),
+        "Esc must dismiss to an ordinary (empty) answer, not trap the \
+         operator: {:?}",
+        received3.try_recv()
+    );
+
+    drop(cockpit);
+    // 4: the terminal must come back byte-for-byte itself after all three
+    // rounds — `stty -g` identical to before the first modal opened.
+    assert!(
+        modes_equal(&before, &termios_of(0)),
+        "exact termios restore after the clarification modal"
+    );
+    println!("CLARIFICATION_INPUT_RESTORED");
+}
+
 /// Grounds surface forwarding in a real foreground terminal: the external
 /// command reads operator input, receives its own interrupt/EOF, and gives
 /// the keyboard and exact terminal mode back to the mounted editor.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn bang_commands_lend_the_terminal_and_restore_the_editor() {
     crate::interaction_view_pty_test::drive_cockpit_bang();
 }
@@ -235,8 +376,12 @@ pub(crate) fn cockpit_bang_case() {
 /// Grounds the mocked modal reservation geometry: a real panel may consume
 /// resize events while the presenter is parked, so release must read the tty
 /// dimensions before restoring the preserved draft.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn panel_release_resynchronizes_terminal_size_before_restoring_draft() {
     crate::interaction_view_pty_test::drive_cockpit_resize();
 }
@@ -284,6 +429,187 @@ pub(crate) fn panel_resize_case() {
     assert!(cockpit.screen.viewport_rect().bottom() <= 12);
 }
 
+/// #2571: a panel follows the terminal while it is OPEN, not only on release.
+/// Shrink then grow a real tty under a live inline panel; each re-measure must
+/// hand back the panel's rows anchored at the new bottom, at the new width.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds `PanelWindow`'s mocked
+/// remeasure tests and `panel::classify`, which cannot observe a real
+/// terminal's size.
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn an_open_panel_follows_the_terminal_through_shrink_and_grow() {
+    crate::interaction_view_pty_test::drive_cockpit_live_resize();
+}
+
+pub(crate) fn panel_live_resize_case() {
+    let _tty = TestTty::install();
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit
+        .editor
+        .on_event(
+            Event::Paste("draft survives a live resize".into()),
+            &mut cockpit.screen,
+        )
+        .unwrap();
+    let draft = cockpit.editor.draft();
+    let (reply, received) =
+        std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+    let panel = std::thread::spawn(move || {
+        let window = received.recv().unwrap().expect("reserved panel");
+        let resize = |rows: u16, cols: u16| {
+            let size = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: TestTty installed this test's owned slave on fd 0; no
+            // live developer terminal is touched.
+            assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
+        };
+        resize(12, 46);
+        window.remeasure(None);
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 4, 46, 8),
+            "shrink"
+        );
+        resize(30, 100);
+        window.remeasure(None);
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 22, 100, 8),
+            "grow"
+        );
+        window.remeasure(None);
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 22, 100, 8),
+            "no change"
+        );
+        drop(window);
+    });
+    cockpit
+        .handle_request(SurfaceRequest::Panel {
+            mode: PanelMode::Inline(8),
+            reply,
+        })
+        .unwrap();
+    panel.join().unwrap();
+    assert_eq!((cockpit.screen.cols, cockpit.screen.rows), (100, 30));
+    assert_eq!(cockpit.editor.draft(), draft);
+    assert!(!cockpit.chat_inactive);
+    assert!(cockpit.screen.viewport_rect().bottom() <= 30);
+
+    // #2574 review: an alternate-screen loan owns the whole screen. Its
+    // resize contract is the presenter's own resize — re-measuring hands back
+    // the whole NEW screen, and no inline rows are reserved for it.
+    let (reply, received) =
+        std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+    let alternate = std::thread::spawn(move || {
+        let window = received.recv().unwrap().expect("alternate-screen loan");
+        let size = libc::winsize {
+            ws_row: 20,
+            ws_col: 70,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: as above — this test's own slave on fd 0.
+        assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSWINSZ, &size) }, 0);
+        window.remeasure(None);
+        assert_eq!(window.area(), ratatui::layout::Rect::new(0, 0, 70, 20));
+        window.remeasure(Some(5));
+        assert_eq!(
+            window.area(),
+            ratatui::layout::Rect::new(0, 0, 70, 20),
+            "a height request does not shrink a full-screen loan"
+        );
+        drop(window);
+    });
+    cockpit
+        .handle_request(SurfaceRequest::Panel {
+            mode: PanelMode::AlternateScreen,
+            reply,
+        })
+        .unwrap();
+    alternate.join().unwrap();
+    assert_eq!((cockpit.screen.cols, cockpit.screen.rows), (70, 20));
+    assert_eq!(cockpit.editor.draft(), draft);
+}
+
+/// #2573 review: the whole panel path on a real terminal — the cockpit lends
+/// rows, `panel::drive` runs a real panel through its own event loop, and the
+/// parent resizes and types. Grounds `panel::classify`, `PanelWindow`'s
+/// remeasure tests and `panel_erase_from`, none of which can observe a real
+/// terminal's resize, rendered cells or restored modes.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_driven_panel_survives_resizes_keeps_its_selection_and_hands_back_the_draft() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_loop();
+}
+
+/// #2573 hardening: closing a panel leaves the transcript above it and none
+/// of the panel (replayed with erases, no zoom, no resize).
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load).
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn closing_a_panel_leaves_the_transcript_above_it_and_none_of_the_panel() {
+    crate::interaction_view_pty_test::drive_cockpit_panel_close();
+}
+
+pub(crate) fn cockpit_panel_loop_case() {
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let before = termios_of(0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit
+        .screen
+        .insert_rows(vec![b"HISTORY_ABOVE_PANEL".to_vec()])
+        .unwrap();
+    cockpit
+        .editor
+        .on_event(
+            Event::Paste("draft-survives-the-panel".into()),
+            &mut cockpit.screen,
+        )
+        .unwrap();
+    cockpit.draw().unwrap();
+    let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
+    let worker = std::thread::spawn(move || {
+        let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
+        let window = crate::chat::InputSurface::open_panel(&mut remote, PanelMode::Inline(8));
+        let rows = (0..30).map(|n| format!("panel-row-{n:02}")).collect();
+        let mut panel = crate::lines_panel::LinesPanel::new("loop", rows);
+        crate::panel::drive(&mut panel, 8, window.as_ref()).unwrap();
+        drop(window);
+        println!("PANEL_CLOSED");
+        match remote.read_line("after panel").unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "draft-survives-the-panel"),
+            other => panic!("the panel lost the draft: {other:?}"),
+        }
+    });
+    cockpit.run(&requests).unwrap();
+    worker.join().unwrap();
+    assert!(
+        modes_equal(&before, &termios_of(0)),
+        "exact termios restore"
+    );
+    println!("PANEL_LOOP_RESTORED");
+    // Let the parent sample modes before session-leader exit hangs up the tty.
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
 /// The three properties #1744 turns on, proven on one real terminal with
 /// one cockpit: Ctrl-C's two tiers, a modal occluding the composer, and the
 /// terminal handed back exactly as it was found.
@@ -296,8 +622,12 @@ pub(crate) fn panel_resize_case() {
 /// process-global counter
 /// `permission_prompt_tests::headless_and_piped_sessions_never_construct_a_prompt_window`
 /// asserts is untouched.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
     crate::interaction_view_pty_test::drive_cockpit_acceptance();
 }
@@ -307,6 +637,39 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
 // capture can otherwise keep dup2 from restoring fd 1 during teardown.
 pub(crate) fn cockpit_acceptance_case() {
     let tty = TestTty::install();
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    //
+    // `Presenter::open` asks `crossterm::terminal::size()` FIRST, and crossterm
+    // 0.28 resolves that to `open("/dev/tty")` directly (not stdin) in
+    // `window_size()`. `/dev/tty` is the process's *controlling* terminal; the
+    // parent hands this child fd 0/1 as a pty slave but does NOT make it the
+    // controlling terminal (that needs `setsid` + `TIOCSCTTY`). Without one the
+    // open returns ENXIO, `size()?` errors, `Presenter::open` fails, and the
+    // child panics with "cockpit failed to open" — which is exactly the macOS
+    // real-PTY failure (the self-hosted Linux ARC runner happens to have a
+    // controlling terminal, so it passed; the macos-latest runner does not).
+    //
+    // The `setsid`/`TIOCSCTTY` MUST follow `TestTty::install()`, which puts the
+    // fresh pty on fd 0: setting the controlling terminal on the inherited
+    // slave instead would make crossterm report the inherited slave's 50x200
+    // size rather than the 24x80 the app actually paints into. Every other PTY
+    // child sets this up before opening the terminal; this one had to, and was
+    // missing it. `setsid()` returns the new session id (its own pid) on
+    // success, not 0, so `>= 0` is the same guard the other PTY cases use.
+    assert!(
+        unsafe { libc::setsid() } >= 0,
+        "setsid for the controlling tty"
+    );
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    // The child now owns the controlling terminal, so on exit the tty driver
+    // sends SIGHUP to the session (the "session-leader exit hangs up its tty"
+    // hazard the other cases dodge by blocking on a `read_line` tail so the
+    // parent samples first). This case is driven by `drive_cockpit_case`, which
+    // asserts the child exited *successfully* and only then drains the screen,
+    // so the child must NOT die from that SIGHUP: ignore it so the child exits
+    // with status 0 and the parent samples restoration from the already-written
+    // pty buffer after the child is gone.
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
     newt_core::tty::set_interrupt_pending(false);
 
     // A shell's terminal: canonical, echoing.
@@ -949,8 +1312,12 @@ pub(crate) fn cockpit_acceptance_case() {
 /// capture install precisely so a `?` or a panic cannot strand the
 /// terminal), and one cockpit per process is a harness limit, not a reason
 /// to leave the unwind path unproven.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
 #[serial_test::serial(tty_arbiter)]
 #[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn a_panic_restores_the_real_termios_through_the_modes_guard() {
     let _tty = TestTty::install();
     // Clear crossterm's saved-mode static FIRST. It is process-global, so

@@ -243,6 +243,7 @@ env = { ROOT = "/tmp" }
             login_argv: Vec::new(),
             request_timeout_secs: None,
             trust: crate::mcp::McpTrust::Trusted,
+            origin: None,
         }
     }
 

@@ -58,6 +58,9 @@ fn ephemeral_notice_names_both_halves() {
 #[serial_test::serial(real_fs)]
 #[tokio::test]
 async fn compressed_session_round_trips_summary_through_save_and_restore() {
+    // rebuild_system_prompt below republishes process-global runtime
+    // settings as a side effect; hold the guard for the whole test.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -158,7 +161,6 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         active_prompt_context: &mut active_prompt_context,
         mode_states: &ConversationModeStates::default(),
     };
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 
     let messages = memory2.build_messages(&system, "next task");

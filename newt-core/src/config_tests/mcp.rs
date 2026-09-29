@@ -79,6 +79,7 @@ command = \"modulex-mcp\"
         login_argv: Vec::new(),
         request_timeout_secs: Some(120),
         trust: crate::mcp::McpTrust::Trusted,
+        origin: None,
     };
     let out = Config::with_mcp_server_added(text, &entry).unwrap();
     assert!(
@@ -121,6 +122,7 @@ fn with_mcp_server_added_creates_section_in_empty_text() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
+        origin: None,
     };
     let out = Config::with_mcp_server_added("", &entry).unwrap();
     let cfg: Config = toml::from_str(&out).unwrap();
@@ -143,6 +145,7 @@ fn with_mcp_server_added_writes_sse_transport_and_url() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
+        origin: None,
     };
     let out = Config::with_mcp_server_added("", &entry).unwrap();
     let cfg: Config = toml::from_str(&out).unwrap();
@@ -168,6 +171,7 @@ fn with_mcp_server_added_rejects_duplicates_and_invalid_entries() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
+        origin: None,
     };
     let err = Config::with_mcp_server_added(text, &dup).unwrap_err();
     assert!(err.to_string().contains("scrybe"), "names the dup: {err}");
@@ -249,6 +253,7 @@ fn mcp_writer_error_branches_are_loud() {
         login_argv: Vec::new(),
         request_timeout_secs: None,
         trust: crate::mcp::McpTrust::Trusted,
+        origin: None,
     };
     // Invalid TOML input text.
     let err = Config::with_mcp_server_added("not toml [", &entry).unwrap_err();

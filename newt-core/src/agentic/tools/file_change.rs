@@ -70,7 +70,11 @@ pub(super) fn from_versions(
     // Diffy quotes filenames itself, and its escaping differs from Git C
     // quoting. Use fixed engine labels and replace only their known headers;
     // source hunks are preserved byte-for-byte and our labels are quoted once.
-    let engine_text = patch.to_string();
+    // Keep the context marker on blank lines for strict unified-diff readers.
+    let engine_text = diffy::PatchFormatter::new()
+        .suppress_blank_empty(false)
+        .fmt_patch(&patch)
+        .to_string();
     let hunks = engine_text
         .strip_prefix("--- before\n+++ after\n")
         .ok_or(ReceiptError::PatchHeaders)?;
@@ -94,6 +98,16 @@ pub(super) fn receipt(
 }
 
 pub(super) fn receipt_from_model(model: &ChangeSet, unchanged: bool) -> String {
+    format!(
+        "{}\n\n{}",
+        receipt_headline(model, unchanged),
+        model.to_markdown()
+    )
+}
+
+/// The receipt's first line — `Modified (+1 -1)` — which is all a SUCCESSFUL
+/// mutation tells the model; the patch below it is the operator's.
+pub(super) fn receipt_headline(model: &ChangeSet, unchanged: bool) -> String {
     let file = &model.files()[0];
     let kind = if unchanged {
         "No content change"
@@ -104,12 +118,7 @@ pub(super) fn receipt_from_model(model: &ChangeSet, unchanged: bool) -> String {
             _ => "Modified",
         }
     };
-    format!(
-        "{kind} (+{} -{})\n\n{}",
-        file.additions(),
-        file.removals(),
-        model.to_markdown()
-    )
+    format!("{kind} (+{} -{})", file.additions(), file.removals())
 }
 
 // Quote the path as Git patch syntax, keeping each header on one physical line.
@@ -213,6 +222,23 @@ mod tests {
             assert_eq!(newtui::diff::from_unified(&unified).unwrap(), model);
             let patch = diffy::Patch::from_str(&unified).unwrap();
             assert_eq!(diffy::apply(before, &patch).unwrap(), after);
+        }
+    }
+
+    #[test]
+    fn blank_context_receipt_round_trips_source_bytes() {
+        for (before, after) in [
+            ("same\n\nbefore\n", "same\n\nafter\n"),
+            ("same\r\n\nbefore", "same\r\n\nafter"),
+        ] {
+            let model = from_versions("file", Some(before), Some(after)).unwrap();
+            let unified = model.to_unified();
+            assert!(unified.contains("\n \n"), "{unified:?}");
+            assert_eq!(newtui::diff::from_unified(&unified).unwrap(), model);
+            let patch = diffy::Patch::from_str(&unified).unwrap();
+            assert_eq!(diffy::apply(before, &patch).unwrap(), after);
+            assert_eq!(model.files()[0].additions(), 1);
+            assert_eq!(model.files()[0].removals(), 1);
         }
     }
 

@@ -11,7 +11,7 @@
   /probe reset             - wipe all learned probe values (conformance, windows, calibration)
   /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)
   /summarizer              - show or change the summarizer backend and knobs
-  /rounds [n|double|reset|config|unlimited] - set this session's tool-call round limit
+  /rounds [n|double|reset|config|unlimited] - set this session's initial tool-call round allowance
   /context                 - show the active context manager + features
   /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)
   /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)
@@ -19,6 +19,7 @@
   /context stats           - experimentation dashboard: budget, compression, feature states
   /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status
   /remember <fact>         - add a fact to persistent NOTES.md
+  /discuss [text]          - talk through a pending clarification batch instead of answering it (alias: /chat); says so if nothing is pending
   /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)
   /end                     - the same, recorded as ended by /end rather than /new (it no longer exits — use /exit)
   /restart                 - the same, recorded as a restart

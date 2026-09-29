@@ -545,11 +545,12 @@ fn unaddressed_debt() -> Vec<(&'static str, &'static str, &'static str)> {
             "The persistent denylist is READ BACK by `load_denials` and \
              consulted as authority. Unaddressed evidence that re-enters an \
              authority decision is the highest-severity row here: editing a \
-             line edits what the agent may do. NOTE: this file carries a \
+             line edits what the agent may do. This file used to carry a \
              SECOND unaddressed type, `PermissionRecord` (the \
-             `permission-log.jsonl` audit trail). Addressing only one drops \
-             the file from the scan, so the exact-set assertion goes red and \
-             the row must be justified again by hand rather than lapsing.",
+             `permission-log.jsonl` audit trail) — paid off (#2524 item 3): \
+             it now chains through `crate::permission_journal`, the same \
+             `event_journal` machinery `denial_journal` uses, so it falls out \
+             of this scan entirely rather than moving to tier 2.",
         ),
         (
             "newt-core/src/flight_recorder.rs",

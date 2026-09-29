@@ -856,6 +856,7 @@ fn real_context_discovery_resolves_model_over_tui_default_false() {
             ..Default::default()
         }),
         model_tuning: vec![newt_core::config::ModelTuning {
+            overflow_retry: Default::default(),
             model: "m".into(),
             num_ctx: None,
             context_window: None,

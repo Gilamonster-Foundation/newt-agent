@@ -89,6 +89,44 @@ fn the_seal_probe_crate_is_pinned_to_the_workspace_lockfile() {
          workspace would make it use that workspace's lockfile instead of the \
          one written beside it; manifest={manifest}"
     );
+
+    // A copied lockfile alone cannot activate a workspace-level path patch.
+    // Compare every declaration, preserving its options and anchoring only
+    // paths; the probe must neither omit a patch nor invent an extra one.
+    let probe: toml::Value = toml::from_str(&manifest).expect("parse probe manifest");
+    let workspace: toml::Value = toml::from_str(
+        &std::fs::read_to_string(workspace_root().join("Cargo.toml"))
+            .expect("read workspace manifest"),
+    )
+    .expect("parse workspace manifest");
+    let declared = workspace
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let resolved = probe
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        resolved.len(),
+        declared.len(),
+        "patch source inventory differs"
+    );
+    for (source, packages) in declared {
+        let packages = packages.as_table().expect("patch packages are a table");
+        let actual = resolved[&source].as_table().expect("probe patch packages");
+        assert_eq!(actual.len(), packages.len(), "patch inventory for {source}");
+        for (name, definition) in packages {
+            let mut expected = definition.clone();
+            if let Some(path) = definition.get("path").and_then(toml::Value::as_str) {
+                expected["path"] =
+                    toml::Value::String(workspace_root().join(path).to_string_lossy().into_owned());
+            }
+            assert_eq!(actual.get(name), Some(&expected), "patch {source}/{name}");
+        }
+    }
 }
 
 fn assert_compile_fails(fixture: &str, line: usize, needles: &[&str]) {
@@ -162,7 +200,9 @@ fn assert_compile_fails(fixture: &str, line: usize, needles: &[&str]) {
 ///
 /// Copying the workspace lock in makes the probe resolve what the workspace
 /// resolves. `cargo` keeps every pin it recognises and adds only the probe's own
-/// root package, so the guarantee costs one file copy.
+/// root package. Workspace patch declarations must also be copied: Cargo
+/// ignores dependency workspaces' `[patch]` tables, and a lockfile does not
+/// activate them. Relative patch paths are anchored to the real workspace.
 ///
 /// The empty `[workspace]` table keeps the probe its own workspace root even if
 /// `TMPDIR` points inside a cargo workspace, so the lock beside it is the lock
@@ -174,10 +214,11 @@ fn write_seal_probe_crate(root: &std::path::Path, fixture_path: &std::path::Path
     let dep = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .to_string_lossy()
         .replace('\\', "/");
+    let patches = workspace_patch_manifest();
     std::fs::write(
         root.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"prompt-window-seal-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nnewt-core = {{ path = \"{dep}\" }}\n"
+            "[package]\nname = \"prompt-window-seal-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n\n[dependencies]\nnewt-core = {{ path = \"{dep}\" }}\n\n{patches}"
         ),
     )
     .expect("write compile-fail manifest");
@@ -188,6 +229,30 @@ fn write_seal_probe_crate(root: &std::path::Path, fixture_path: &std::path::Path
         format!("include!(r#\"{}\"#);\n", fixture_path.display()),
     )
     .expect("write compile-fail main");
+}
+
+/// Reuse the workspace's exact patch resolution without introducing another
+/// dependency list. This becomes empty when the temporary patches are removed.
+fn workspace_patch_manifest() -> String {
+    let root = workspace_root();
+    let workspace: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest"),
+    )
+    .expect("parse workspace manifest");
+    let Some(mut patches) = workspace.get("patch").cloned() else {
+        return String::new();
+    };
+    for (_, packages) in patches.as_table_mut().expect("patch sources").iter_mut() {
+        for (_, definition) in packages.as_table_mut().expect("patch packages").iter_mut() {
+            if let Some(path) = definition.get_mut("path") {
+                let anchored = root.join(path.as_str().expect("patch path is a string"));
+                *path = toml::Value::String(anchored.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut manifest = toml::Table::new();
+    manifest.insert("patch".into(), patches);
+    toml::to_string(&manifest).expect("serialize workspace patch declarations")
 }
 
 /// The workspace root: the nearest ancestor of this crate that owns a

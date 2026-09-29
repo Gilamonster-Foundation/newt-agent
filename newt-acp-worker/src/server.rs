@@ -444,7 +444,7 @@ impl AcpServer {
         let diff = crate::diff::capture_diff(&session.workspace_path)?;
         let raw_emission = reply.content.clone();
 
-        let pricing = newt_core::Config::resolve()
+        let pricing = crate::read_with_notices(|report| newt_core::Config::resolve(report))
             .ok()
             .and_then(|c| c.pricing)
             .unwrap_or_default();
@@ -522,7 +522,7 @@ impl AcpServer {
             run.emission_shape,
         );
 
-        let pricing = newt_core::Config::resolve()
+        let pricing = crate::read_with_notices(|report| newt_core::Config::resolve(report))
             .ok()
             .and_then(|c| c.pricing)
             .unwrap_or_default();

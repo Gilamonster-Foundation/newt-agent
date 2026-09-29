@@ -268,17 +268,53 @@ impl Screen {
     /// Give the blocking window the composer's rows. Erase the editor first,
     /// then preserve any covered transcript in scrollback. The draft stays in
     /// memory and is painted again only after this window releases input.
-    fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
+    /// Re-reserve a live panel's rows after a resize (#2573). Unlike
+    /// [`Self::reserve_modal_rows`] this erases only from `erase_from` — what
+    /// the OLD panel could still occupy — and scrolls nothing: the transcript
+    /// above the panel is left where the terminal put it.
+    fn remeasure_modal_rows(
+        &mut self,
+        requested: u16,
+        erase_from: u16,
+    ) -> io::Result<ModalReservation> {
         let plan = plan_modal_reservation(self.top, self.rows, requested);
         self.tty.hold()?;
         let mut buf = Vec::new();
         queue!(
             buf,
             crossterm::cursor::Hide,
-            MoveTo(0, self.top),
+            MoveTo(0, erase_from.min(plan.start)),
             Clear(ClearType::FromCursorDown)
         )?;
-        let covered_transcript = self.top.saturating_sub(plan.start);
+        self.tty.write_all(&buf)?;
+        self.tty.flush()?;
+        self.term.clear()?;
+        Ok(plan)
+    }
+
+    fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
+        self.reserve_modal_rows_from(self.top, requested)
+    }
+
+    /// Reserve `requested` rows for a modal whose rows today start at
+    /// `occupied_top` — the block's top when a modal opens, the panel's own top
+    /// when the operator sizes it (#2574). Only transcript rows the new plan
+    /// covers above `occupied_top` scroll into scrollback.
+    fn reserve_modal_rows_from(
+        &mut self,
+        occupied_top: u16,
+        requested: u16,
+    ) -> io::Result<ModalReservation> {
+        let plan = plan_modal_reservation(self.top, self.rows, requested);
+        self.tty.hold()?;
+        let mut buf = Vec::new();
+        queue!(
+            buf,
+            crossterm::cursor::Hide,
+            MoveTo(0, occupied_top),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        let covered_transcript = occupied_top.saturating_sub(plan.start);
         if covered_transcript > 0 {
             queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
             buf.extend(std::iter::repeat_n(b'\n', covered_transcript as usize));
@@ -585,6 +621,27 @@ fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
     old_top.min(new_top).min(rows.saturating_sub(1))
 }
 
+/// The row a live panel's resize erases from (#2573): the higher of its old
+/// and new tops — both bottom-anchored, the same rule the block uses — raised
+/// by the rows a narrower terminal reflowed its old full-width rows onto.
+/// Nothing above that is the panel's, so the transcript survives.
+fn panel_erase_from(
+    old_start: u16,
+    old_rows: u16,
+    old_cols: u16,
+    cols: u16,
+    rows: u16,
+    requested: u16,
+) -> u16 {
+    let new_start = plan_modal_reservation(0, rows, requested).start;
+    let lifted = if cols < old_cols {
+        reflow_growth(&vec![usize::from(old_cols); usize::from(old_rows)], cols)
+    } else {
+        0
+    };
+    resize_erase_from(old_start, new_start, rows).saturating_sub(lifted)
+}
+
 /// How many rows the old block grows by when a terminal reflows it at `cols`:
 /// each row `w` wide now takes `ceil(w / cols)` rows instead of one.
 fn reflow_growth(widths: &[usize], cols: u16) -> u16 {
@@ -671,6 +728,9 @@ pub(crate) struct Presenter {
     chat_inactive: bool,
     dirty: bool,
     last_draw: Instant,
+    /// The meta prefix at the prompt (`ctrl+space` then a key), fed before the
+    /// editor sees a key — the same sequencer and table panels use.
+    meta: crate::prefix::Sequencer,
     /// Restores the terminal modes `open` took — raw mode, line wrap, bracketed
     /// paste, cursor visibility — on EVERY exit of the session: a clean return,
     /// an `io::Error` propagating out of `run`, or a panic (via Drop during
@@ -841,6 +901,7 @@ impl Presenter {
             was_suspended: false,
             chat_inactive: false,
             dirty: true,
+            meta: crate::prefix::Sequencer::new(crate::prefix::current()),
             last_draw: Instant::now(),
             _restore: restore,
             _raw: raw,
@@ -898,6 +959,69 @@ impl Presenter {
                     self.pending_read = Some(reply);
                 }
                 self.dirty = true;
+            }
+            // #2524 item 7: the cockpit's own terminal handoff, mirroring
+            // `Interact` below rather than `ReadLine` above — a pending
+            // clarification takes the modal's reserved rows the same way a
+            // permission prompt does, instead of the persistently-mounted
+            // chat editor `ReadLine` queues into.
+            SurfaceRequest::PresentClarification {
+                batch,
+                hint,
+                prompt: _,
+                color: _,
+                verbose: _,
+                reply,
+            } => {
+                if self.surface.take_end_quit() {
+                    let _ = reply.send(Ok(ReadOutcome::EndAndQuit));
+                    self.dirty = true;
+                    return Ok(());
+                }
+                let prompt_output = self.screen.tty.try_clone()?;
+                if self.dirty {
+                    self.draw()?;
+                }
+                let requested_rows =
+                    crate::clarification_modal::requested_rows(&batch, self.screen.cols);
+                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                self.chat_inactive = true;
+                if reservation.chat_visible {
+                    if let Err(error) = self.draw() {
+                        self.chat_inactive = false;
+                        return Err(error);
+                    }
+                }
+                if let Err(error) = self.screen.place_cursor(reservation.start) {
+                    self.chat_inactive = false;
+                    let _ = self.finish_modal(Some(&reservation));
+                    let _ = self.draw();
+                    return Err(error);
+                }
+                let window = Self::suspend_terminal(prompt_output);
+                let result: io::Result<ReadOutcome> = self
+                    .screen
+                    .tty
+                    .try_clone()
+                    .and_then(|out| {
+                        crate::inline_viewport::cockpit_panel_terminal(
+                            out,
+                            Rect::new(0, reservation.start, self.screen.cols, reservation.rows),
+                        )
+                    })
+                    .and_then(|mut terminal| {
+                        crate::clarification_modal::present_in(&mut terminal, &batch, &hint)
+                    });
+                drop(window);
+                let modal_cleanup = self.finish_modal(Some(&reservation));
+                self.chat_inactive = false;
+                let repaint = (|| -> io::Result<()> {
+                    self.screen.term.clear()?;
+                    self.draw()
+                })();
+                let _ = reply.send(result.map_err(anyhow::Error::from));
+                modal_cleanup?;
+                repaint?;
             }
             SurfaceRequest::Reload { reply } => {
                 let result = self.surface.reload();
@@ -1084,14 +1208,9 @@ impl Presenter {
                 // unwind — so the rows cannot be stranded by a panel that
                 // returns through a path nobody thought about.
                 let (release, released) = std::sync::mpsc::sync_channel(1);
-                let (top, rows) = reservation
-                    .as_ref()
-                    .map_or((0, self.screen.rows), |window| (window.start, window.rows));
                 let window = crate::session_worker::PanelWindow::new(
                     panel_output,
-                    top,
-                    rows,
-                    self.screen.cols,
+                    self.lent_area(reservation.as_ref()),
                     Some(release),
                 );
                 if reply.send(Some(window)).is_err() {
@@ -1106,7 +1225,24 @@ impl Presenter {
                 // Park. A `RecvError` means the window was dropped without a
                 // send — the same "the panel is done" signal, reached by a
                 // path that could not send. Either way: clean up.
-                let _ = released.recv();
+                // #2571: while parked, answer re-measure requests — the panel
+                // hears the resize (it owns the keyboard), this thread owns
+                // the layout. A `RecvError` is the drop: the panel is done.
+                let mut reservation = reservation;
+                let mut mode = mode;
+                while let Ok(crate::session_worker::PanelSignal::Remeasure { rows, reply }) =
+                    released.recv()
+                {
+                    // The operator sized the panel (Shift-↑/↓, zoom): an inline
+                    // loan takes the new request; the screen clamps it.
+                    if let (Some(rows), PanelMode::Inline(_)) = (rows, mode) {
+                        mode = PanelMode::Inline(rows);
+                    }
+                    // A failed re-plan keeps the old region rather than
+                    // stranding the panel: the reply still goes out.
+                    let _ = self.remeasure_panel(mode, &mut reservation);
+                    let _ = reply.send(self.lent_area(reservation.as_ref()));
+                }
                 let modal_cleanup = self.finish_modal(reservation.as_ref());
                 self.chat_inactive = false;
                 // The panel wrote outside ratatui's diff, so the mounted block
@@ -1257,6 +1393,7 @@ impl Presenter {
                 self.escape_during_turn();
                 Ok(())
             }
+            Event::Key(key) if key.kind == KeyEventKind::Press && self.meta_key(&key)? => Ok(()),
             other => {
                 let outcome = self.editor.on_event(other, &mut self.screen)?;
                 if let Some(outcome) = outcome {
@@ -1265,6 +1402,87 @@ impl Presenter {
                 Ok(())
             }
         }
+    }
+
+    /// The meta prefix at the prompt. `Ok(true)` when the key was the
+    /// prefix's (consumed); `Ok(false)` hands it to the editor — including a
+    /// doubled prefix, which is how the chord itself still reaches the editor.
+    fn meta_key(&mut self, key: &crossterm::event::KeyEvent) -> io::Result<bool> {
+        use crate::prefix::{MetaAction, Sequencer, Step, BINDINGS};
+        let prefix = crate::prefix::current();
+        if self.meta != Sequencer::new(prefix) && !self.meta.armed() {
+            self.meta = Sequencer::new(prefix);
+        }
+        let ctrl = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+        let note = match self
+            .meta
+            .feed(crate::panel::key_from_event(key.code, ctrl), &BINDINGS)
+        {
+            Step::Pass(_) => return Ok(false),
+            Step::Armed | Step::Cancelled => return Ok(true),
+            Step::Act(MetaAction::Redraw) => {
+                self.screen.term.clear()?;
+                self.draw()?;
+                return Ok(true);
+            }
+            Step::Act(MetaAction::Help) => format!(
+                "{}: {}  (zoom and resize act on an open panel)",
+                crate::prefix::chord_label(prefix),
+                BINDINGS.describe()
+            ),
+            Step::Act(action @ (MetaAction::Zoom | MetaAction::Resize)) => format!(
+                "{} acts on an open panel (e.g. /settings) — at the prompt: {} then ? for keys",
+                action.name(),
+                crate::prefix::chord_label(prefix)
+            ),
+        };
+        self.screen.insert_rows(vec![note.into_bytes()])?;
+        Ok(true)
+    }
+
+    /// The region lent to a panel: its reservation, or the whole screen for an
+    /// alternate-screen loan.
+    fn lent_area(&self, reservation: Option<&ModalReservation>) -> Rect {
+        let (top, rows) = reservation.map_or((0, self.screen.rows), |r| (r.start, r.rows));
+        Rect::new(0, top, self.screen.cols, rows)
+    }
+
+    /// #2571: the terminal resized under a live panel, or the operator asked
+    /// for a different height (Shift-↑/↓, zoom). The same re-layout
+    /// `finish_modal_rows` applies to a resize that lands after a dialog
+    /// closes — clear what a narrower panel may have rewrapped above its old
+    /// top, then the presenter's own resize — and the panel's rows reserved
+    /// again against the new screen.
+    fn remeasure_panel(
+        &mut self,
+        mode: PanelMode,
+        reservation: &mut Option<ModalReservation>,
+    ) -> io::Result<()> {
+        let (cols, rows) = self.screen.terminal_size()?;
+        let resized = (cols, rows) != (self.screen.cols, self.screen.rows);
+        // Measured before the presenter's own resize moves its geometry.
+        let old = reservation.as_ref().map(|r| (r.start, r.rows));
+        let old_cols = self.screen.cols;
+        if resized {
+            self.on_event(Event::Resize(cols, rows))?;
+        }
+        // An alternate-screen loan owns the whole screen and redraws it: the
+        // presenter's own resize above is its whole resize contract (#2573).
+        let (PanelMode::Inline(requested), Some((old_start, old_rows))) = (mode, old) else {
+            return Ok(());
+        };
+        if resized {
+            let erase_from = panel_erase_from(old_start, old_rows, old_cols, cols, rows, requested);
+            *reservation = Some(self.screen.remeasure_modal_rows(requested, erase_from)?);
+        } else if old_rows != requested.min(self.screen.rows) {
+            // The operator sized the panel (#2574): reserved from the panel's
+            // own top, so a grow scrolls only the rows it newly covers into
+            // scrollback and a shrink erases only the rows it gives back.
+            *reservation = Some(self.screen.reserve_modal_rows_from(old_start, requested)?);
+        }
+        Ok(())
     }
 
     /// A blocking dialog may have consumed every resize event while this
@@ -1771,6 +1989,24 @@ mod tests {
         assert_eq!(reflow_growth(&[47], 47), 0, "an exact fit does not wrap");
     }
 
+    /// #2573 review: a live panel's resize erases only rows the panel could
+    /// still occupy. The regression: clearing from row 0 wiped the transcript.
+    #[test]
+    fn a_panel_resize_erases_only_what_the_old_panel_could_occupy() {
+        // Same height, wider: only the panel's own rows (13..).
+        assert_eq!(panel_erase_from(13, 18, 100, 118, 31, 18), 13);
+        // Taller terminal: the old panel at 13.. is stale; nothing above it.
+        assert_eq!(panel_erase_from(13, 18, 100, 100, 45, 18), 13);
+        // Shorter: the new panel starts higher, so erase from its top.
+        assert_eq!(panel_erase_from(13, 18, 100, 100, 25, 18), 7);
+        // Narrower: each full-width old row reflows onto two, lifting the
+        // stale panel by its height — never past the top of the screen.
+        assert_eq!(panel_erase_from(20, 8, 100, 60, 31, 8), 12);
+        assert_eq!(panel_erase_from(13, 18, 100, 60, 31, 18), 0);
+        // Never row 0 unless the reflow truly reaches it.
+        assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
+    }
+
     #[test]
     fn resize_erases_from_the_higher_of_the_old_and_new_block_tops() {
         // Terminal grew 24->30, block 4: old top 20, new top 26 — clear from 20.
@@ -1829,5 +2065,15 @@ mod terminal_acceptance;
 pub(crate) use terminal_acceptance::cockpit_pager_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
-    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case, panel_resize_case,
+    cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,
+    cockpit_clarification_input_case, cockpit_panel_loop_case, panel_live_resize_case,
+    panel_resize_case,
+};
+
+#[cfg(test)]
+#[path = "presenter_migration_acceptance.rs"]
+mod migration_acceptance;
+#[cfg(test)]
+pub(crate) use migration_acceptance::{
+    cockpit_migration_case, persona_migration_case, startup_migration_case,
 };

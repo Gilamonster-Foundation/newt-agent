@@ -97,6 +97,7 @@ fn lifecycle_audit_names_the_resolved_command() {
         "lifecycle",
         &serde_json::json!({"phase": "test", "action": "run"}),
         ws.path(),
+        &crate::caveats::Scope::All,
     );
     let resolved = crate::tooling::resolved_phase_commands(ws.path(), crate::tooling::Phase::Test);
 
@@ -112,6 +113,7 @@ fn audit_preserves_whitespace_in_real_paths() {
         "read_file",
         &serde_json::json!({"path": " leading and trailing "}),
         ws.path(),
+        &crate::caveats::Scope::All,
     );
 
     assert_eq!(name, "read_file");
@@ -121,6 +123,7 @@ fn audit_preserves_whitespace_in_real_paths() {
         "run_command",
         &serde_json::json!({"command": "cd nested && printf exact-command"}),
         ws.path(),
+        &crate::caveats::Scope::All,
     );
     assert_eq!(name, "run_command");
     assert_eq!(detail, "cd nested && printf exact-command");
@@ -404,6 +407,8 @@ async fn run_tool_captured_with_context_and_live(
 #[cfg(not(windows))]
 #[tokio::test]
 async fn live_shell_observation_does_not_change_headless_completion_bytes() {
+    let _lock = super::super::disable_ocap_tests::env_lock().await;
+    let _ocap = super::super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
     #[derive(Default)]
     struct CapturedLiveOutput {
         events: std::sync::Mutex<Vec<String>>,
@@ -429,6 +434,9 @@ async fn live_shell_observation_does_not_change_headless_completion_bytes() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats {
         exec: crate::caveats::Scope::only(["echo".to_string()]),
+        // This fixture checks streaming bytes, with explicit authority for a
+        // real native child on platforms without restricted-network proof.
+        net: crate::caveats::Scope::All,
         ..caveats_rw(ws.path())
     };
     let args = serde_json::json!({"command": "echo byte-stable"});

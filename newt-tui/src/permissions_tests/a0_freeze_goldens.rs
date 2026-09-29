@@ -36,7 +36,7 @@ fn terminal_low_net_offers_every_grant_including_the_permanents() {
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
              [a]llow once\n\
              [s]ession allow\n\
-             [A]llow permanently (adds host to config)\n\
+             [A]llow permanently (signs a durable grant)\n\
              [d]eny (default)\n\
              [D]eny always\n\
              [P]ermanently deny"

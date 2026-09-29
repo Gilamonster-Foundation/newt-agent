@@ -120,17 +120,26 @@ use super::*;
 /// listed way to see the names. **A ratchet that does not know about a
 /// command cannot stop it growing.** This raise makes the guarded surface the
 /// surface that exists; it is honest rather than a weakening.
+///
+/// # 43/53 → 44/55: `/discuss` (alias `/chat`), #2515
+///
+/// A genuine new command, not a rediscovered one: the clarification gate's
+/// own escape hatch was shipped and advertised in the batch text with no
+/// slash-registry row at all, so it read as "unknown command" the one time
+/// an operator tried it. Registering it — plus its `/chat` alias — is the
+/// same honest raise as `/models` above: the guarded surface catching up to
+/// the surface that exists.
 #[test]
 fn the_registered_surface_only_shrinks() {
     assert!(
-        slash_commands().count() <= 43,
+        slash_commands().count() <= 44,
         "the slash surface GREW to {} commands. #1981 is a reduction: a \
          new command needs an argument for why it is not a field of \
          /settings or a subcommand of an existing verb",
         slash_commands().count()
     );
     assert!(
-        slash_tokens().len() <= 53,
+        slash_tokens().len() <= 55,
         "the slash surface GREW to {} tokens",
         slash_tokens().len()
     );

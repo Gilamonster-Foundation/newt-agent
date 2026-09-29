@@ -9,6 +9,15 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — prompt-draw readers no longer republish runtime settings (#2488)
+
+- A hand edit to `config.toml` is no longer picked up by the next prompt
+  draw; it takes effect where the session publishes settings on purpose.
+  The edit-mode, gutter, footer, prompt-template and preview readers in
+  `newt-tui/src/prompt.rs` now resolve without publishing the process-global
+  runtime settings, so a prompt draw cannot rewrite what a running turn has
+  already captured.
+
 ### Changed — tenacity split into tenacity and initiative (psyche effort dials, slice 1b)
 
 - **Initiative (`patient` / `measured` (default) / `decisive` / `eager`) is

@@ -231,10 +231,12 @@ pub fn project(markdown: &str) -> Vec<SpanLine> {
                 }
             }
             Event::Code(code) => push(&mut line, &code, Emphasis::Code),
-            // The canonical dialect folds soft breaks (C0a froze that); a
-            // hard break is a real new line.
-            Event::SoftBreak => push(&mut line, " ", current(&stack)),
-            Event::HardBreak => break_line(&mut line, &mut out),
+            // A soft break is a new line here, as the web's `<br>` and the
+            // plain projection's verbatim body already show it: this
+            // projection's one caller is the interaction modal, where a
+            // model's `A) …\nB) …` question folded into one unreadable
+            // paragraph while every other surface kept its lines.
+            Event::SoftBreak | Event::HardBreak => break_line(&mut line, &mut out),
             // Raw HTML is rendered as literal visible text, never
             // interpreted — the canonical dialect's rule, restated here so
             // the rich view cannot quietly differ from the plain one.
@@ -351,13 +353,10 @@ mod c2 {
     }
 
     #[test]
-    fn a_soft_break_folds_and_a_hard_break_does_not() {
-        // The canonical dialect folds soft breaks; C0a froze that.
-        assert_eq!(flat("one\ntwo"), vec!["one two".to_string()]);
-        assert_eq!(
-            flat("one  \ntwo"),
-            vec!["one".to_string(), "two".to_string()]
-        );
+    fn soft_and_hard_breaks_both_start_a_new_line() {
+        let lines = vec!["one".to_string(), "two".to_string()];
+        assert_eq!(flat("one\ntwo"), lines);
+        assert_eq!(flat("one  \ntwo"), lines);
     }
 
     #[test]

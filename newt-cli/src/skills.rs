@@ -75,8 +75,9 @@ pub enum SkillsCmd {
 /// Entry point dispatched from `newt skills …`.
 pub fn run(cmd: SkillsCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
     let cfg = match config_path {
-        Some(p) => newt_core::Config::load(p)?,
-        None => newt_core::Config::resolve().unwrap_or_default(),
+        Some(p) => crate::migration_notices::read(|report| newt_core::Config::load(p, report))?,
+        None => crate::migration_notices::read(|report| newt_core::Config::resolve(report))
+            .unwrap_or_default(),
     };
     let search = cfg.skill_search_dirs();
     let mut out = std::io::stdout();

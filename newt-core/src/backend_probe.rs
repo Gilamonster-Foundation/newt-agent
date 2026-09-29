@@ -1142,6 +1142,107 @@ pub fn parse_llamacpp_model_states(json: &serde_json::Value) -> Option<Vec<(Stri
     )
 }
 
+/// One model's launch declaration on a llama.cpp router (#2567): the argv the
+/// router spawned it with (binary path dropped) and its preset block, both
+/// verbatim from the router's `/models` entry (`status.args`, `status.preset`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlamaCppLaunch {
+    pub args: Vec<String>,
+    pub preset: Option<String>,
+}
+
+impl LlamaCppLaunch {
+    /// The value following `--flag`, e.g. `flag("--ctx-size")`.
+    #[must_use]
+    pub fn flag(&self, name: &str) -> Option<&str> {
+        let at = self.args.iter().position(|arg| arg == name)?;
+        self.args.get(at + 1).map(String::as_str)
+    }
+}
+
+/// Pure: `model`'s launch declaration from a router `/models` body. `None` when
+/// the entry is absent or declares neither args nor a preset.
+pub fn parse_llamacpp_launch(json: &serde_json::Value, model: &str) -> Option<LlamaCppLaunch> {
+    let entries = json["data"].as_array().or_else(|| json.as_array())?;
+    let status = &entries
+        .iter()
+        .find(|entry| entry["id"].as_str().or_else(|| entry["model"].as_str()) == Some(model))?
+        ["status"];
+    let args: Vec<String> = status["args"]
+        .as_array()
+        .map(|argv| {
+            argv.iter()
+                .skip(1)
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let preset = status["preset"].as_str().map(str::to_string);
+    (!args.is_empty() || preset.is_some()).then_some(LlamaCppLaunch { args, preset })
+}
+
+/// GET the router's `/models` and read `model`'s launch declaration. Thin IO
+/// shell over [`parse_llamacpp_launch`], same endpoint as
+/// [`fetch_llamacpp_model_states`].
+pub async fn fetch_llamacpp_launch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    model: &str,
+) -> anyhow::Result<Option<LlamaCppLaunch>> {
+    let url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let response = maybe_bearer(client.get(url), api_key).send().await?;
+    if !response.status().is_success() {
+        return Err(ProbeHttpStatus(response.status()).into());
+    }
+    Ok(parse_llamacpp_launch(&response.json().await?, model))
+}
+
+/// What asking a server for a model's launch declaration found. A timeout or
+/// a refused credential is not "this is not a router" — the operator acts on
+/// the difference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchProbe {
+    /// The router declared how it launched the model.
+    Declared(LlamaCppLaunch),
+    /// The server answered `/models` but declares no launch arguments for it.
+    Absent,
+    /// The server has no router `/models` (404/405/501, or a body that is not
+    /// a model list): not a llama.cpp router.
+    Unsupported,
+    /// The server refused the credential (401/403).
+    Refused(u16),
+    /// No answer within the deadline.
+    TimedOut,
+    /// Could not connect, or another HTTP failure; the detail says which.
+    Failed(String),
+}
+
+impl LaunchProbe {
+    /// Classify [`fetch_llamacpp_launch`]'s outcome. Pure.
+    #[must_use]
+    pub fn from_result(result: anyhow::Result<Option<LlamaCppLaunch>>) -> Self {
+        let error = match result {
+            Ok(Some(launch)) => return Self::Declared(launch),
+            Ok(None) => return Self::Absent,
+            Err(error) => error,
+        };
+        if let Some(ProbeHttpStatus(status)) = error.downcast_ref::<ProbeHttpStatus>() {
+            return match status.as_u16() {
+                401 | 403 => Self::Refused(status.as_u16()),
+                404 | 405 | 501 => Self::Unsupported,
+                other => Self::Failed(format!("HTTP {other}")),
+            };
+        }
+        match error.downcast_ref::<reqwest::Error>() {
+            Some(e) if e.is_timeout() => Self::TimedOut,
+            Some(e) if e.is_decode() => Self::Unsupported,
+            Some(e) if e.is_connect() => Self::Failed("could not connect".to_string()),
+            _ => Self::Failed(error.to_string()),
+        }
+    }
+}
+
 /// Extract the warm subset using the same state parser as the model manager.
 pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String>> {
     Some(
