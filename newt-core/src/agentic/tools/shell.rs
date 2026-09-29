@@ -1360,6 +1360,20 @@ pub(super) fn confined_result(
     if let Some(refusal) = kernel_refused_binary(cmd, envelope, &caveats.fs_read) {
         return (refusal, ExecOutcome::Denied);
     }
+    // #2629 (revised): a child exec the sandbox refused (e.g. git's own
+    // `fatal: cannot exec 'branch': Permission denied`) is neither 126 nor 127
+    // at the TOP level — the parent ran fine, only its internal spawn of a
+    // helper failed, so it reaches the model as UNSTRUCTURED stderr with no
+    // axis or target. That refusal is invisible to the interceptor's `denials`
+    // array (only the top-level spawn is instrumented, see #2421), and the
+    // parent's own exit code is neither 126 nor 127, so there is NO trusted
+    // sandbox refusal evidence to key a structured denial off. Per the review
+    // on #2633, child-controlled stderr is not authoritative and must not be
+    // promoted to a `capability denied` assertion or used to pick an exec-
+    // grant target, so the raw stderr passes through unannotated and the
+    // honest outcome (Failed) is kept. A structured, invocation-bound refusal
+    // from the leash/interceptor seam (#2421) is what would be needed before
+    // this can be rendered as a named denial.
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
     if let Some(note) = absent {
