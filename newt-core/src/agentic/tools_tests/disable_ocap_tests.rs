@@ -1171,7 +1171,6 @@ async fn run_command_with_legacy_git(
         None, // permission_gate
         None, // exec_floor
         Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
-=======
         None, // crew_runner
         None, // scratchpad_store
         None, // code_search
@@ -1469,7 +1468,6 @@ async fn state_modifying_git_add_is_not_routed() {
     caveats.net = Scope::All;
     let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
     assert!(denied.contains("capability denied"), "{denied}");
-=======
     assert!(
         !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
         "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
@@ -1487,7 +1485,6 @@ async fn state_modifying_git_add_is_not_routed() {
             .output()
             .unwrap();
     assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
-=======
     #[cfg(target_os = "windows")]
     {
         assert!(
@@ -1507,7 +1504,6 @@ async fn state_modifying_git_add_is_not_routed() {
         "stage-me.txt",
         "native dispatch must actually stage the file: {out}"
     );
-=======
 }
 
 /// An interactive exec grant retries once with the freshly minted caveats. On
