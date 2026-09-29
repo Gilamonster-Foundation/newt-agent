@@ -149,6 +149,86 @@ fn stale_warm_entry_not_in_served_is_ignored() {
     );
 }
 
+// --- adopt(): #2622 multi-warm ambiguity ---
+
+#[test]
+fn two_loaded_models_and_no_pin_does_not_pick_by_list_order() {
+    // The observed failure: the router had Qwen and ornith BOTH loaded, no
+    // pin resolved (declared model missing/unset), and "first warm" took
+    // whichever the router happened to list first. Regression: adopt()
+    // must refuse to guess rather than silently picking list order.
+    let backend = BackendConfig {
+        name: "b".into(),
+        endpoint: "http://h:11434".into(),
+        kind: Some(BackendKind::Ollama),
+        ..Default::default()
+    };
+    let adoption = adopt(
+        &backend,
+        &served_warm(
+            &["Qwen2.5-14B-Instruct-1M-Q8_0", "ornith-1.5-35b"],
+            &["Qwen2.5-14B-Instruct-1M-Q8_0", "ornith-1.5-35b"],
+        ),
+        None,
+    );
+    assert_eq!(
+        adoption.model, None,
+        "must not pick either by list order when both are loaded"
+    );
+    assert_eq!(
+        adoption.ambiguous_warm,
+        vec!["Qwen2.5-14B-Instruct-1M-Q8_0", "ornith-1.5-35b"],
+        "the candidates are surfaced for the caller to ask/refuse with"
+    );
+}
+
+#[test]
+fn one_loaded_model_still_adopts_and_is_named() {
+    // Unchanged: exactly one warm model is not ambiguous — adopt it.
+    let backend = BackendConfig {
+        name: "b".into(),
+        endpoint: "http://h:11434".into(),
+        kind: Some(BackendKind::Ollama),
+        ..Default::default()
+    };
+    let adoption = adopt(
+        &backend,
+        &served_warm(
+            &["Qwen2.5-14B-Instruct-1M-Q8_0", "ornith-1.5-35b"],
+            &["ornith-1.5-35b"],
+        ),
+        None,
+    );
+    assert_eq!(adoption.model.as_deref(), Some("ornith-1.5-35b"));
+    assert!(adoption.ambiguous_warm.is_empty());
+}
+
+#[test]
+fn ambiguous_warm_never_fires_when_a_pin_resolves() {
+    // Two warm models, but the declared model IS one of them — no ambiguity,
+    // the pin still wins (unchanged precedence).
+    let declared = BackendConfig {
+        name: "b".into(),
+        endpoint: "http://h:11434".into(),
+        model: Some("Qwen2.5-14B-Instruct-1M-Q8_0".into()),
+        kind: Some(BackendKind::Ollama),
+        ..Default::default()
+    };
+    let adoption = adopt(
+        &declared,
+        &served_warm(
+            &["Qwen2.5-14B-Instruct-1M-Q8_0", "ornith-1.5-35b"],
+            &["Qwen2.5-14B-Instruct-1M-Q8_0", "ornith-1.5-35b"],
+        ),
+        None,
+    );
+    assert_eq!(
+        adoption.model.as_deref(),
+        Some("Qwen2.5-14B-Instruct-1M-Q8_0")
+    );
+    assert!(adoption.ambiguous_warm.is_empty());
+}
+
 #[test]
 fn instance_adoption_unchanged_by_warm() {
     let backend = openai_backend(Some("requested"), Some(Serving::Instance));
