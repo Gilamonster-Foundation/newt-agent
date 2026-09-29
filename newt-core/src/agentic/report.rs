@@ -101,15 +101,21 @@ const RENDER_REPORT_DESCRIPTION: &str =
      missing. Prefer ONE report with `sections` over many small calls. The tool \
      result you receive back is a short ack, not the rendered text — the \
      document has already been shown to the user, so do not repeat it in your \
-     reply. Reporting findings does not complete an unfinished execution request: \
+     reply. If your reading changes after rendering, explicitly state \
+     \"Correction: [one-line reason] — supersedes the report above\" before the \
+     corrected version. Reporting findings does not complete an unfinished execution request: \
      continue the requested work with tools. When the task is complete, keep the \
      final reply brief and include only new information.";
 
 const REPORT_DELIVERY_GUIDANCE: &str =
-    "The report is already visible to the user. Do not repeat its contents. \
-     Continue any unfinished requested work with tools; rendering a report is \
-     not completion of that work. When the task is complete, keep the final \
-     reply brief and include only new information.";
+    "The report is already visible to the user. Do not repeat its contents in \
+     your reply. If the report was wrong or you have changed your reading of \
+     the request, say so explicitly — start your reply with a statement such \
+     as \"Correction: [one-line reason] — supersedes the report above\" — and \
+     then give the corrected version. A silent second copy of the table is not \
+     a correction. Continue any unfinished requested work with tools; rendering \
+     a report is not completion of that work. When the task is complete, keep \
+     the final reply brief and include only new information.";
 
 /// The `render_report` tool definition. Registered `Gate::Always` (no injected
 /// capability required — see the module docs), so it is advertised every
@@ -599,6 +605,38 @@ mod tests {
             !latest.markdown.contains("Refactor plan v1"),
             "the draft slot holds ONE revision, not a history: {}",
             latest.markdown
+        );
+    }
+
+    /// #2625 regression: the post-render nudge must give the model an explicit
+    /// correction format ("Correction: … supersedes the report above") instead of
+    /// an unconditional "do not repeat". Fails on main if the nudge text lacks it.
+    #[test]
+    fn report_delivery_nudge_permits_explicit_correction() {
+        assert!(
+            REPORT_DELIVERY_GUIDANCE.contains("supersedes the report above"),
+            "nudge must provide the correction form the model can use: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        assert!(
+            REPORT_DELIVERY_GUIDANCE.contains("Correction:"),
+            "nudge must name the prefix the model should start with: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        // The original advisory must still be present so the model's first instinct
+        // (no repeat) is unchanged when the report was right.
+        assert!(
+            REPORT_DELIVERY_GUIDANCE.contains("Do not repeat"),
+            "nudge must still discourage silent repetition: {REPORT_DELIVERY_GUIDANCE}"
+        );
+        // The tool description and the delivery nudge must prescribe ONE
+        // correction path, or a model following either can still produce a
+        // second, unlabelled table.
+        assert!(
+            RENDER_REPORT_DESCRIPTION.contains("supersedes the report above"),
+            "tool description must prescribe the same correction statement: {RENDER_REPORT_DESCRIPTION}"
+        );
+        assert!(
+            !RENDER_REPORT_DESCRIPTION.contains("render_report again"),
+            "tool description must not offer a second, unlabelled correction path: {RENDER_REPORT_DESCRIPTION}"
         );
     }
 }
