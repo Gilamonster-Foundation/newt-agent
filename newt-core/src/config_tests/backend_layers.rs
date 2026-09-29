@@ -753,6 +753,54 @@ fn an_empty_model_path_dropin_cannot_replace_a_declaration() {
     assert_eq!(cfg.backends[0].model.as_deref(), Some("declared"));
 }
 
+/// #2623: a stale probe drop-in naming a backend no declaration matches
+/// warned on EVERY load — the backend set is reloaded roughly a dozen
+/// times over one TUI session (`/model`, a backend switch, or a gate check
+/// each call `resolve_runtime` again), so one leftover file spammed the
+/// log a dozen times in a single start.
+///
+/// Per-load `warnings()` must still report the miss every time (a caller
+/// inspecting one load's result needs to see it); only the human-facing
+/// `tracing::warn!` line is deduplicated process-wide. Asserted by calling
+/// the same gate `BackendAssembly::warn` checks directly, rather than
+/// scraping a tracing subscriber across concurrent tests — see
+/// `BackendAssembly::warnings`'s doc on why that scrape was flaky (#1984).
+#[test]
+fn stale_probe_warning_logs_once_across_many_reloads() {
+    reset_emitted_warnings_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("ghost.toml"),
+        "record = \"probe_v1\"\nendpoint = \"http://h:1\"\nkind = \"ollama\"\n",
+    )
+    .unwrap();
+    let expected = format!(
+        "{}: probe record names an unconfigured backend — ignored (delete the file)",
+        dir.path().join("ghost.toml").display()
+    );
+
+    // Simulate the ~dozen reloads one TUI session performs against the
+    // same orphaned probe file.
+    for i in 0..14 {
+        let mut cfg = Config::default();
+        let (_receipts, warnings) =
+            resolve_for_test_with_warnings(&mut cfg, &[dir.path()], None).unwrap();
+        assert!(
+            warnings.contains(&expected),
+            "load {i}: every call's own warnings() must still report the miss: {warnings:?}"
+        );
+    }
+
+    // 14 separate loads each called `warn()` with this exact message, so if
+    // the dedup gate were not in place the log line would have fired 14
+    // times. It is exhausted after the very first: a further check returns
+    // false.
+    assert!(
+        !first_emission_this_process(&expected),
+        "the 14 loads above must have already logged this warning once"
+    );
+}
+
 /// Preview/composition NORMALIZATION parity: a declaration with a
 /// model_path and a stale HTTP kind composes to Embedded with no CLI
 /// request — so the identical config must also accept a harmless
