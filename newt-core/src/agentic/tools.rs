@@ -3870,6 +3870,40 @@ async fn execute_authorized_tool(
                 workspace,
                 cd_path.as_deref().or_else(|| args["cwd"].as_str()),
             );
+            // issue-1188: `git push` / `gh pr create` cannot reach the forge
+            // from the confined child at all (#2619 narrows any host-scoped
+            // net grant to `net: none` for spawned children on Linux — the
+            // kernel fence cannot bound hosts). A recognized push/PR-create
+            // invocation is diverted here to run HOST-SIDE, entirely outside
+            // the confined shell, under a fixed argv the broker itself
+            // constructs — never falling through to the confined executor,
+            // where it would either hang against `net: none` or (if that
+            // narrowing ever regressed) inherit the session's full net scope
+            // inside a hostile-repo-influenced child.
+            if native_git::needs_push_broker(cmd) {
+                let reason = native_git::execute_governed_push(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                );
+                return host_return(match reason {
+                    Ok(out) => out,
+                    Err(reason) => format!("error: {reason}"),
+                });
+            }
+            if native_git::needs_pr_create_broker(cmd) {
+                let reason = native_git::execute_governed_pr_create(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                );
+                return host_return(match reason {
+                    Ok(out) => out,
+                    Err(reason) => format!("error: {reason}"),
+                });
+            }
             if let Err(reason) = native_git::preflight(
                 cmd,
                 std::path::Path::new(&run_cwd),

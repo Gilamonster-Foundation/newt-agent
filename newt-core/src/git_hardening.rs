@@ -216,7 +216,7 @@ fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
 
 /// The checked-out branch name (`refs/heads/<name>` stripped), or `None` for
 /// detached HEAD / an unresolvable symbolic ref.
-fn own_branch(workspace: &Path) -> Option<String> {
+pub(crate) fn own_branch(workspace: &Path) -> Option<String> {
     let output = hardened_git(workspace, &["symbolic-ref", "-q", "HEAD"])
         .ok()?
         .output()
@@ -233,7 +233,7 @@ fn own_branch(workspace: &Path) -> Option<String> {
 /// Is `branch` the repo's default branch — `main`, `master`, or whatever the
 /// remote's `HEAD` points at? The remote lookup is best-effort: an offline or
 /// remote-less repo just falls back to the hardcoded names.
-fn is_default_branch(workspace: &Path, branch: &str) -> bool {
+pub(crate) fn is_default_branch(workspace: &Path, branch: &str) -> bool {
     if branch == "main" || branch == "master" {
         return true;
     }
@@ -252,6 +252,28 @@ fn is_default_branch(workspace: &Path, branch: &str) -> bool {
         .trim()
         .strip_prefix("refs/remotes/origin/")
         .is_some_and(|default| default == branch)
+}
+
+/// The remote `origin`'s default branch name (`refs/remotes/origin/HEAD`),
+/// or `None` when it cannot be resolved (offline/remote-less repo) — the
+/// governed PR broker (issue-1188 amendment A4) falls back to `"main"` in
+/// that case, same as [`is_default_branch`]'s hardcoded-name fallback.
+#[must_use]
+pub fn origin_default_branch_name(workspace: &Path) -> Option<String> {
+    let output = hardened_git(
+        workspace,
+        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+    )
+    .ok()?
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_owned)
 }
 
 /// Git config keys/values forced via `-c` so a hostile repo `.git/config` cannot
@@ -489,6 +511,248 @@ pub fn hardened_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
     // The enclosing-repo leak this was guarding against is fixed instead
     // where it is actually observed: `claim_check::snapshot_workspace`
     // scopes and prefix-strips its own status, below.
+    Ok(c)
+}
+
+/// Repo-local `.git/config` keys that can redirect a host-side `git push` to a
+/// hostile transport, credential sink, or hook — even though `hardened_git`'s
+/// `-c` overrides already neutralize the *command-execution* gadgets
+/// (`core.fsmonitor`/`hooksPath`/`sshCommand`/`askpass`/`editor`,
+/// `protocol.ext`). A push additionally reads `url.*`, `remote.*`, `http.*`,
+/// and `credential.*` for the destination and the credentials sent to it —
+/// none of those are single-valued keys `-c` can safely override away (git
+/// takes the LAST/most-specific of several `url.*.insteadOf` matches, so an
+/// override cannot out-rank an unknown number of repo-local entries the way a
+/// single `-c core.pager=cat` out-ranks one config key). Refuse-if-present
+/// instead (issue-1188 design review, amendment A1).
+const HOSTILE_PUSH_CONFIG_PREFIXES: &[&str] = &[
+    "url.",
+    "http.",
+    "credential.",
+    "include.",
+    "includeif.",
+    "protocol.",
+];
+
+/// Exact (non-prefix) keys refused for the same reason — `remote.<name>.*`
+/// wildcards would also refuse the ordinary `remote.<name>.url` this feature
+/// reads (via [`local_remote_url`]), so those four are refused as literal
+/// suffixes on any remote instead of a blanket `remote.` prefix.
+const HOSTILE_PUSH_REMOTE_SUFFIXES: &[&str] =
+    &[".pushurl", ".receivepack", ".uploadpack", ".proxy"];
+
+const HOSTILE_PUSH_EXACT_KEYS: &[&str] = &[
+    "core.sshcommand",
+    "core.hookspath",
+    "core.fsmonitor",
+    "core.askpass",
+];
+
+/// The first hostile key found in a `git config --local --list` style
+/// listing (`key=value` per line), or `None` if the repo-local config carries
+/// none of [`HOSTILE_PUSH_CONFIG_PREFIXES`] / [`HOSTILE_PUSH_REMOTE_SUFFIXES`]
+/// / [`HOSTILE_PUSH_EXACT_KEYS`]. Pure — the caller decides how to read the
+/// listing (always [`local_config_listing`], never ambient/global config).
+#[must_use]
+pub fn hostile_push_config_key(listing: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (key, _) = line.split_once('=')?;
+        let lower = key.to_ascii_lowercase();
+        let hostile = HOSTILE_PUSH_CONFIG_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+            || HOSTILE_PUSH_REMOTE_SUFFIXES
+                .iter()
+                .any(|suffix| lower.starts_with("remote.") && lower.ends_with(suffix))
+            || HOSTILE_PUSH_EXACT_KEYS.contains(&lower.as_str());
+        hostile.then(|| key.to_string())
+    })
+}
+
+/// `git config --local --list` for `workspace`'s repository, via
+/// [`hardened_git`] (so this read itself cannot be redirected by the same
+/// hostile config it is inspecting). A repository with no local config
+/// section at all is a clean, empty listing, not an error.
+///
+/// # Errors
+/// When git cannot be located or spawned at all.
+pub fn local_config_listing(workspace: &Path) -> io::Result<String> {
+    let output = hardened_git(workspace, &["config", "--local", "--list"])?.output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `git remote get-url <remote>` for `workspace`, via [`hardened_git`].
+/// Returns the exact URL git would push to — this, not the remote's bare
+/// name, is what issue-1188's amendment A2 requires the push broker to
+/// authorize and dial, so a repo-local `insteadOf` rewrite (already refused
+/// by [`hostile_push_config_key`] before this is ever called) cannot have
+/// silently retargeted a plain `<remote>` argument.
+///
+/// # Errors
+/// A message naming the remote when git reports no such remote, or on I/O
+/// failure launching git.
+pub fn resolve_remote_url(workspace: &Path, remote: &str) -> Result<String, String> {
+    let output = hardened_git(workspace, &["remote", "get-url", remote])
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "no such remote '{remote}': {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Validate a resolved remote URL against issue-1188's amendment A2: only
+/// `https://` and `ssh://` (including the scp-like `user@host:path` shorthand,
+/// which IS an ssh URL to git) are pushable by the broker. `file://`, `ext::`,
+/// bare local paths, and anything else are refused — `file://` can point
+/// anywhere on the host filesystem and `ext::` runs an arbitrary program AS
+/// the transport, exactly the class of gadget the rest of this module exists
+/// to keep out of a host-side git invocation.
+///
+/// Returns the URL's host on success.
+pub fn push_url_host(url: &str) -> Result<String, String> {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return rest
+            .split(['/', '@'])
+            .find(|s| !s.is_empty())
+            .filter(|h| !h.contains(':') || h.split(':').next().is_some_and(|h| !h.is_empty()))
+            .map(|h| h.split(':').next().unwrap_or(h).to_string())
+            .ok_or_else(|| format!("cannot parse host from https url: {url}"));
+    }
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let after_auth = rest.split('@').next_back().unwrap_or(rest);
+        let host = after_auth
+            .split(['/', ':'])
+            .next()
+            .filter(|h| !h.is_empty());
+        return host
+            .map(str::to_string)
+            .ok_or_else(|| format!("cannot parse host from ssh url: {url}"));
+    }
+    // scp-like shorthand: `user@host:path` (no scheme, no leading `/`, and a
+    // `:` before the first `/`). This is what `git@github.com:owner/repo.git`
+    // looks like — an ssh URL by git's own rules, not a windows drive letter
+    // (those don't contain `@`) or a bare path.
+    if !url.contains("://") && url.contains('@') && url.contains(':') {
+        if let Some((auth_and_host, _path)) = url.split_once(':') {
+            if let Some(host) = auth_and_host.split('@').next_back() {
+                if !host.is_empty() && !host.contains('/') {
+                    return Ok(host.to_string());
+                }
+            }
+        }
+    }
+    Err(format!(
+        "unsupported remote URL scheme for a governed push: {url} (only https:// and ssh:// are pushable)"
+    ))
+}
+
+/// `(owner, name)` from a GitHub `https://github.com/…` or scp-like
+/// `git@github.com:…` URL — amendment A4's `--repo owner/name` for `gh pr
+/// create`. `None` for anything not shaped like a GitHub remote (the caller
+/// refuses the PR broker in that case rather than guessing).
+#[must_use]
+pub fn github_owner_repo(url: &str) -> Option<(String, String)> {
+    let host = push_url_host(url).ok()?;
+    if host != "github.com" {
+        return None;
+    }
+    let path = if let Some(rest) = url.strip_prefix("https://") {
+        rest.split_once('/')?.1
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        rest.split_once('/')?.1
+    } else {
+        url.split_once(':')?.1
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
+}
+
+/// A **deliberate, narrow exception** to [`hardened_git`]'s "no ambient
+/// config, no ambient credentials" posture (issue-1188 design review,
+/// amendment A3): a governed `git push` needs the OPERATOR's own credential
+/// resolution (an ssh key, a stored token via `credential.helper`) to
+/// authenticate to the forge, and that can only come from config `git` reads
+/// itself, non-interactively.
+///
+/// Differences from `hardened_git`:
+/// - The operator's real global config (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`)
+///   is NOT redirected to `/dev/null` — left as git's own default resolution,
+///   so `credential.helper` and any real ssh config are exactly what the
+///   operator configured on this host.
+/// - System config is still excluded (`GIT_CONFIG_NOSYSTEM=1`), same as
+///   `hardened_git`.
+/// - `core.hooksPath=/dev/null` is still forced, unconditionally, so a
+///   repo-local hook cannot run even though this reads the repo — this is
+///   belt-and-suspenders alongside [`hostile_push_config_key`] refusing a
+///   repo-local `core.hooksPath` override outright before this ever runs.
+/// - `core.sshCommand`/`core.askpass`/`core.fsmonitor` are NOT forced to
+///   inert values (unlike `hardened_git`) — those are exactly the operator's
+///   legitimate, ambient credential/auth machinery this exception exists to
+///   preserve. The repo-local *versions* of those same keys are still refused
+///   by [`hostile_push_config_key`], so only the operator's own global/system-
+///   adjacent config can set them.
+/// - `GIT_TERMINAL_PROMPT=0`: still fails closed rather than hanging on an
+///   interactive credential prompt with no attached terminal.
+///
+/// No token, password, or credential-helper output is ever read back by this
+/// function or its callers — git handles the credential round-trip itself
+/// and only the push's own stdout/stderr/exit status return to the caller.
+///
+/// # Errors
+/// Same as [`hardened_git`]: an unresolvable git executable or working
+/// directory.
+pub fn credentialed_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
+    let path = std::env::var_os("PATH");
+    let mut c = Command::new(git_program(cwd, path.as_deref())?);
+    c.arg("--no-optional-locks");
+    c.arg("-c").arg("core.hooksPath=/dev/null");
+    c.arg("-c").arg("protocol.ext.allow=never");
+    c.arg("-c").arg("core.pager=cat");
+    c.args(args).current_dir(cwd);
+
+    c.env_clear();
+    if let Some(path) = path {
+        c.env("PATH", path);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        c.env("HOME", home);
+    }
+    c.env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat");
+    Ok(c)
+}
+
+/// `gh` invoked the same neutral way [`credentialed_git`] invokes `git`: the
+/// operator's own `gh` auth (`~/.config/gh/hosts.yml` or `GITHUB_TOKEN`) is
+/// ambient and untouched; only `HOME`/`PATH` and a fixed, minimal env are
+/// forwarded. `gh` does not read repository hooks, so there is no
+/// `core.hooksPath`-shaped gadget to neutralize here — the caller (amendment
+/// A4) still always passes an explicit `--repo`, so `gh` never falls back to
+/// inferring the repository from ambient git remotes/config at all.
+///
+/// # Errors
+/// When `HOME` cannot be resolved (`gh` cannot authenticate without it) or
+/// the working directory is unavailable.
+pub fn credentialed_gh(cwd: &Path, args: &[&str]) -> io::Result<Command> {
+    let mut c = Command::new("gh");
+    c.args(args).current_dir(cwd);
+    c.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        c.env("PATH", path);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        c.env("HOME", home);
+    }
+    c.env("LC_ALL", "C").env("LANG", "C");
     Ok(c)
 }
 
@@ -885,5 +1149,193 @@ mod own_gitdir_grant_tests {
             "detached HEAD must not get write roots"
         );
         assert!(!grant.read.is_empty(), "detached HEAD still gets read");
+    }
+}
+
+/// issue-1188 amendment A1/A2: pure parsing/validation for the governed push
+/// broker, exercised without a real git process.
+#[cfg(test)]
+mod governed_push_config_tests {
+    use super::*;
+
+    /// Would have failed before A1: a repo-local `url.*.insteadOf` silently
+    /// retargets `git push origin ...` to an attacker-controlled remote.
+    #[test]
+    fn insteadof_rewrite_is_hostile() {
+        let listing = "user.name=Op\nurl.https://evil.example/.insteadof=https://github.com/\n";
+        assert_eq!(
+            hostile_push_config_key(listing).as_deref(),
+            Some("url.https://evil.example/.insteadof")
+        );
+    }
+
+    #[test]
+    fn sshcommand_hookspath_fsmonitor_askpass_are_hostile() {
+        for key in [
+            "core.sshCommand=ssh -oProxyCommand=evil",
+            "core.hooksPath=./evil-hooks",
+            "core.fsmonitor=./evil-watcher",
+            "core.askPass=./evil-askpass",
+        ] {
+            assert!(
+                hostile_push_config_key(key).is_some(),
+                "{key} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_pushurl_receivepack_uploadpack_proxy_are_hostile() {
+        for key in [
+            "remote.origin.pushurl=https://evil.example/x",
+            "remote.origin.receivepack=/bin/evil",
+            "remote.origin.uploadpack=/bin/evil",
+            "remote.origin.proxy=evil:1080",
+        ] {
+            assert!(
+                hostile_push_config_key(key).is_some(),
+                "{key} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_http_include_protocol_are_hostile() {
+        for key in [
+            "credential.helper=!evil",
+            "http.proxy=evil:1080",
+            "include.path=../evil",
+            "includeif.onbranch:main.path=../evil",
+            "protocol.ext.allow=always",
+        ] {
+            assert!(
+                hostile_push_config_key(key).is_some(),
+                "{key} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_local_config_is_not_hostile() {
+        let listing = "user.name=Op\nuser.email=op@example.invalid\nremote.origin.url=https://github.com/o/r.git\ncore.autocrlf=input\n";
+        assert_eq!(hostile_push_config_key(listing), None);
+    }
+
+    #[test]
+    fn https_ssh_and_scp_like_urls_resolve_the_right_host() {
+        assert_eq!(
+            push_url_host("https://github.com/o/r.git").as_deref(),
+            Ok("github.com")
+        );
+        assert_eq!(
+            push_url_host("ssh://git@github.com:22/o/r.git").as_deref(),
+            Ok("github.com")
+        );
+        assert_eq!(
+            push_url_host("git@github.com:o/r.git").as_deref(),
+            Ok("github.com")
+        );
+    }
+
+    /// Would have failed before A2: `file://` and `ext::` are not screened by
+    /// any existing host allowlist check, so nothing else in the broker would
+    /// have refused them.
+    #[test]
+    fn file_and_ext_transports_are_refused() {
+        assert!(push_url_host("file:///home/op/other-repo").is_err());
+        assert!(push_url_host("ext::sh -c evil").is_err());
+        assert!(push_url_host("git://github.com/o/r.git").is_err());
+    }
+
+    #[test]
+    fn github_owner_repo_parses_https_and_scp_like() {
+        assert_eq!(
+            github_owner_repo("https://github.com/Org/Repo.git"),
+            Some(("Org".to_string(), "Repo".to_string()))
+        );
+        assert_eq!(
+            github_owner_repo("git@github.com:Org/Repo.git"),
+            Some(("Org".to_string(), "Repo".to_string()))
+        );
+        assert_eq!(
+            github_owner_repo("https://gitlab.example.com/Org/Repo.git"),
+            None,
+            "non-github hosts refuse the gh broker rather than guessing --repo"
+        );
+    }
+}
+
+/// Real git + a real tempdir repo: grounds [`local_config_listing`] and
+/// [`resolve_remote_url`] against actual `git config`/`git remote` behavior,
+/// per the workspace's expensive/real-resource testing tier (small and
+/// self-contained enough to run inline, same posture as
+/// `own_gitdir_grant_tests` above).
+#[cfg(all(test, unix))]
+mod governed_push_process_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git invocation");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Would have failed before A2: reading the bare `remote.origin.url`
+    /// instead of resolving it through `git remote get-url` cannot detect an
+    /// `insteadOf` rewrite the repo applied on top of it.
+    #[test]
+    fn resolve_remote_url_matches_what_git_would_actually_push_to() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        assert_eq!(
+            resolve_remote_url(repo.path(), "origin").unwrap(),
+            "https://github.com/o/r.git"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_url_errors_on_missing_remote() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        assert!(resolve_remote_url(repo.path(), "origin").is_err());
+    }
+
+    #[test]
+    fn local_config_listing_sees_a_hostile_repo_local_key() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(
+            repo.path(),
+            &[
+                "config",
+                "--local",
+                "core.sshCommand",
+                "ssh -oProxyCommand=evil",
+            ],
+        );
+        let listing = local_config_listing(repo.path()).unwrap();
+        assert_eq!(
+            hostile_push_config_key(&listing).as_deref(),
+            Some("core.sshcommand")
+        );
+    }
+
+    #[test]
+    fn clean_repo_local_config_has_no_hostile_key() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        let listing = local_config_listing(repo.path()).unwrap();
+        assert_eq!(hostile_push_config_key(&listing), None);
     }
 }

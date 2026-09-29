@@ -2,10 +2,8 @@
 //! Keep the caller's shell source unchanged and preserve the embedded adapter's
 //! destructive-operation confirmations while the command interface migrates.
 
-use super::PermissionGate;
-use crate::caveats::Caveats;
-#[cfg(target_os = "windows")]
-use crate::caveats::CaveatsExt;
+use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+use crate::caveats::{Caveats, CaveatsExt};
 use crate::git_caveats::GitCaveats;
 use agent_bridle::{inspect_shell, ShellInspection};
 use std::path::Path;
@@ -56,6 +54,388 @@ pub(super) fn needs_commit_broker(source: &str) -> bool {
 
 fn unresolved(detail: &str) -> String {
     format!("refused: {detail}; native Git ref mutation is not yet supported by the repository authority adapter")
+}
+
+fn is_gh(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.eq_ignore_ascii_case("gh") || name.eq_ignore_ascii_case("gh.exe")
+}
+
+/// issue-1188: is `source` a `git push` invocation anywhere in it (loose
+/// trigger, same shape as [`needs_commit_broker`])? A `true` here routes the
+/// WHOLE `run_command` call to [`execute_governed_push`] instead of the
+/// confined shell — that function applies the strict standalone/fixed-argv
+/// check and refuses anything this loose scan admits but the broker cannot
+/// safely execute (composed commands, extra flags, a non-matching branch).
+pub(super) fn needs_push_broker(source: &str) -> bool {
+    fn contains(inspection: &ShellInspection) -> bool {
+        inspection.commands.iter().any(|command| {
+            command.program.as_deref().is_some_and(is_git)
+                && invocation(&command.argv)
+                    .ok()
+                    .and_then(|(verb, _, _)| literal(verb))
+                    .as_deref()
+                    == Some("push")
+        }) || inspection
+            .constructs
+            .iter()
+            .any(|construct| construct.inspection.as_deref().is_some_and(contains))
+    }
+    inspect_shell(source).is_ok_and(|inspection| contains(&inspection))
+}
+
+/// issue-1188 amendment A4: is `source` a `gh pr create` invocation anywhere
+/// in it? Same loose-trigger/strict-execute split as [`needs_push_broker`].
+pub(super) fn needs_pr_create_broker(source: &str) -> bool {
+    fn contains(inspection: &ShellInspection) -> bool {
+        inspection.commands.iter().any(|command| {
+            command.program.as_deref().is_some_and(is_gh)
+                && command.argv.get(1).map(String::as_str) == Some("pr")
+                && command.argv.get(2).map(String::as_str) == Some("create")
+        }) || inspection
+            .constructs
+            .iter()
+            .any(|construct| construct.inspection.as_deref().is_some_and(contains))
+    }
+    inspect_shell(source).is_ok_and(|inspection| contains(&inspection))
+}
+
+/// Is `source` a single, literal, standalone command (no compound/redirect/
+/// descendant-exec/dynamic-argv shape)? Shared strictness gate for both
+/// governed brokers below — anything else is refused rather than guessed at,
+/// same posture as `inspect_commands`'s "composed or redirected Git mutation"
+/// refusal.
+fn standalone_literal_argv(source: &str) -> Result<Vec<String>, String> {
+    let inspection =
+        inspect_shell(source).map_err(|e| unresolved(&format!("shell inspection failed: {e}")))?;
+    if inspection.commands.len() != 1 || !inspection.constructs.is_empty() {
+        return Err(unresolved("composed or redirected Git/gh invocation"));
+    }
+    let command = &inspection.commands[0];
+    if !command.redirects.is_empty() || !command.descendant_execs.is_empty() {
+        return Err(unresolved("composed or redirected Git/gh invocation"));
+    }
+    command
+        .argv
+        .iter()
+        .map(|arg| literal(arg).ok_or_else(|| unresolved("dynamic Git/gh arguments")))
+        .collect()
+}
+
+/// issue-1188 amendment A1/A2: the exact push this broker will execute —
+/// never taken verbatim from the model's argv, only VALIDATED against it. The
+/// remote name is the only thing the model's command may choose; the branch
+/// is always the workspace's OWN checked-out branch, resolved independently
+/// (never trusted from argv), so an explicit branch/refspec operand must
+/// match it exactly or the whole call is refused.
+struct GovernedPush {
+    remote: String,
+}
+
+fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
+    let (verb, args, same_repository) = invocation(argv)?;
+    let args = args.to_vec();
+    if verb != "push" {
+        return Err(unresolved("not a `git push` invocation"));
+    }
+    if !same_repository {
+        return Err(unresolved(
+            "`-C`/`--git-dir`/`--work-tree` on a governed push",
+        ));
+    }
+    if args.iter().any(|a| a.starts_with('-')) {
+        return Err(unresolved(
+            "a governed push accepts no flags (no --force, --all, --mirror, --tags, -u, …)",
+        ));
+    }
+    match args.len() {
+        0 => Ok(GovernedPush {
+            remote: "origin".to_string(),
+        }),
+        1 => Ok(GovernedPush {
+            remote: args[0].clone(),
+        }),
+        2 => {
+            let remote = args[0].clone();
+            let refspec = &args[1];
+            let (src, dst) = refspec.split_once(':').unwrap_or((refspec, refspec));
+            if src != dst {
+                return Err(unresolved(
+                    "a governed push only pushes a branch to its own name",
+                ));
+            }
+            Ok(GovernedPush { remote })
+        }
+        _ => Err(unresolved("unsupported governed push form")),
+    }
+}
+
+/// issue-1188: execute a governed `git push`, entirely host-side (never
+/// through the confined shell — see the call site's comment in `tools.rs`).
+/// `cwd` is the resolved directory the model's `run_command` targeted (after
+/// any folded leading `cd`); every git operation below runs there, exactly
+/// where an ordinary `git push` from that command would have run.
+pub(super) fn execute_governed_push(
+    source: &str,
+    cwd: &Path,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<String, String> {
+    let (url, refspec) = plan_governed_push(source, cwd, caveats, gate)?;
+    let output = crate::git_hardening::credentialed_git(cwd, &["push", &url, &refspec])
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(render_git_process_output(
+        &format!("git push {url} {refspec}"),
+        &output,
+    ))
+}
+
+/// Everything [`execute_governed_push`] must verify BEFORE it may spawn a
+/// process at all: argv shape, A1's hostile-config refusal, main/master
+/// refusal, A2's URL resolution/scheme validation, and the net-gate prompt.
+/// Split out from [`execute_governed_push`] so the test suite can pin every
+/// refusal and the exact `(url, refspec)` a granted happy path resolves to
+/// without needing a real reachable forge — the same boundary amendment A4
+/// already draws for `gh pr create`'s live-forge exercise.
+fn plan_governed_push(
+    source: &str,
+    cwd: &Path,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<(String, String), String> {
+    let argv = standalone_literal_argv(source)?;
+    let request = parse_governed_push(&argv)?;
+
+    // A1: repo-local config that could redirect the push's transport,
+    // credentials, or hooks is hostile input, refused before anything spawns.
+    let listing = crate::git_hardening::local_config_listing(cwd).map_err(|e| e.to_string())?;
+    if let Some(key) = crate::git_hardening::hostile_push_config_key(&listing) {
+        return Err(format!(
+            "refused: repo-local git config sets '{key}', which a governed push \
+             cannot safely honor (transport/credential/hook gadget) — remove it \
+             from this repository's .git/config and retry"
+        ));
+    }
+
+    let branch = crate::git_hardening::own_branch(cwd)
+        .ok_or_else(|| "refused: detached HEAD has no branch to push".to_string())?;
+    if crate::git_hardening::is_default_branch(cwd, &branch) {
+        return Err(format!(
+            "refused: cannot push the default branch '{branch}' (open a feature branch instead)"
+        ));
+    }
+
+    // A2: push the resolved URL, not the bare remote name — a repo-local
+    // `insteadOf` rewrite is already refused above, but resolving through
+    // `git remote get-url` (rather than trusting the argv's remote name) is
+    // what actually proves the two agree.
+    let url = crate::git_hardening::resolve_remote_url(cwd, &request.remote)?;
+    let host = crate::git_hardening::push_url_host(&url)?;
+
+    ensure_net_granted(
+        caveats,
+        gate,
+        &host,
+        &format!("push branch '{branch}' to {host} ({url})"),
+    )?;
+
+    let refspec = format!("{branch}:{branch}");
+    Ok((url, refspec))
+}
+
+/// issue-1188 amendment A4: the exact `gh pr create` this broker will
+/// execute. Only `--title`/`-t` and `--body`/`-b` are accepted from the
+/// model's argv; `--repo`, `--base`, and `--head` are always resolved by the
+/// broker itself so `gh` never infers (or is told to use) anything else.
+struct GovernedPrCreate {
+    title: String,
+    body: String,
+}
+
+fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, String> {
+    // argv[0] = "gh", argv[1] = "pr", argv[2] = "create", rest are flags.
+    let mut title = None;
+    let mut body = None;
+    let mut i = 3;
+    while i < argv.len() {
+        let word = argv[i].as_str();
+        let (flag, inline_value) = match word.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (word, None),
+        };
+        let mut take_value = || -> Result<String, String> {
+            if let Some(v) = &inline_value {
+                return Ok(v.clone());
+            }
+            i += 1;
+            argv.get(i)
+                .cloned()
+                .ok_or_else(|| unresolved("gh pr create flag missing its value"))
+        };
+        match flag {
+            "--title" | "-t" => title = Some(take_value()?),
+            "--body" | "-b" => body = Some(take_value()?),
+            _ => {
+                return Err(unresolved(&format!(
+                    "unsupported `gh pr create` flag '{flag}' — only --title/--body are \
+                     accepted; --repo/--base/--head are resolved automatically"
+                )))
+            }
+        }
+        i += 1;
+    }
+    let title = title.ok_or_else(|| unresolved("gh pr create: --title is required"))?;
+    let body = body.ok_or_else(|| unresolved("gh pr create: --body is required"))?;
+    Ok(GovernedPrCreate { title, body })
+}
+
+/// issue-1188 amendment A4: execute a governed `gh pr create`, host-side, for
+/// the same reason as [`execute_governed_push`] (the confined child cannot
+/// reach the forge at all).
+pub(super) fn execute_governed_pr_create(
+    source: &str,
+    cwd: &Path,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<String, String> {
+    let plan = plan_governed_pr_create(source, cwd, caveats, gate)?;
+    let output = crate::git_hardening::credentialed_gh(
+        cwd,
+        &[
+            "pr",
+            "create",
+            "--repo",
+            &plan.repo,
+            "--base",
+            &plan.base,
+            "--head",
+            &plan.head,
+            "--title",
+            &plan.title,
+            "--body",
+            &plan.body,
+        ],
+    )
+    .map_err(|e| e.to_string())?
+    .output()
+    .map_err(|e| e.to_string())?;
+    Ok(render_git_process_output(
+        &format!(
+            "gh pr create --repo {} --base {} --head {} ...",
+            plan.repo, plan.base, plan.head
+        ),
+        &output,
+    ))
+}
+
+/// The exact `gh pr create` invocation [`execute_governed_pr_create`] will
+/// run, resolved and net-gated but not yet spawned — same split rationale as
+/// [`plan_governed_push`].
+#[derive(Debug)]
+struct GovernedPrCreatePlan {
+    repo: String,
+    base: String,
+    head: String,
+    title: String,
+    body: String,
+}
+
+fn plan_governed_pr_create(
+    source: &str,
+    cwd: &Path,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<GovernedPrCreatePlan, String> {
+    let argv = standalone_literal_argv(source)?;
+    let request = parse_governed_pr_create(&argv)?;
+
+    let url = crate::git_hardening::resolve_remote_url(cwd, "origin")?;
+    let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
+        return Err(format!(
+            "refused: gh pr create is only supported for a github.com 'origin' remote (got {url})"
+        ));
+    };
+    let host = "github.com".to_string();
+
+    let head = crate::git_hardening::own_branch(cwd)
+        .ok_or_else(|| "refused: detached HEAD has no branch to open a PR from".to_string())?;
+    let base =
+        crate::git_hardening::origin_default_branch_name(cwd).unwrap_or_else(|| "main".to_string());
+    if head == base {
+        return Err(format!(
+            "refused: cannot open a PR from the default branch '{base}' to itself"
+        ));
+    }
+
+    ensure_net_granted(
+        caveats,
+        gate,
+        &host,
+        &format!("open a PR on {owner}/{name}"),
+    )?;
+
+    Ok(GovernedPrCreatePlan {
+        repo: format!("{owner}/{name}"),
+        base,
+        head,
+        title: request.title,
+        body: request.body,
+    })
+}
+
+/// issue-1188 amendment A5: fold into the existing `net:<host>` vocabulary —
+/// the same [`DenialKind::Net`]/[`PermissionRequest`] shape `web_fetch`
+/// already uses (`tools.rs`'s `web_fetch` arm), so a granted host from either
+/// path satisfies the other, and durable persistence (if the concrete gate
+/// offers it) is the SAME store, not a second one.
+fn ensure_net_granted(
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+    host: &str,
+    action: &str,
+) -> Result<(), String> {
+    if caveats.permits_net(host) {
+        return Ok(());
+    }
+    let Some(gate) = gate.as_deref_mut() else {
+        return Err(format!(
+            "refused: no network authority for '{host}' and no operator to ask"
+        ));
+    };
+    let request = PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::Net,
+        target: host.to_string(),
+        reason: format!("{action} — net does not permit '{host}'"),
+    };
+    match gate.ask(std::slice::from_ref(&request)) {
+        PermissionDecision::Allow(_) => Ok(()),
+        PermissionDecision::Deny => Err(format!(
+            "refused: operator did not grant network access to '{host}'"
+        )),
+    }
+}
+
+/// Render a completed host-side git/gh process's output the same way a
+/// confined-shell command's output would read to the model: the argv that
+/// ran, then stdout/stderr, then an explicit exit-code note on failure (a
+/// non-zero exit is real command output, not a broker refusal).
+fn render_git_process_output(rendered_argv: &str, output: &std::process::Output) -> String {
+    let mut text = format!("$ {rendered_argv}\n");
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        text.push_str(&format!(
+            "\n(exited {})",
+            output
+                .status
+                .code()
+                .map_or_else(|| "without a status code".to_string(), |c| c.to_string())
+        ));
+    }
+    text
 }
 
 fn is_git(program: &str) -> bool {
@@ -1006,5 +1386,334 @@ mod tests {
         assert!(git(repo.path(), &["stash", "list"]).is_empty());
         assert_eq!(gate.requests.len(), 2);
         assert_eq!(gate.requests[1].target, "stash-drop");
+    }
+}
+
+/// issue-1188: real git + real tempdir repos, per the workspace's
+/// expensive/real-resource testing tier (small and self-contained enough to
+/// run inline, same posture as `git_hardening`'s own real-process tests).
+/// One test per DESIGN.md/DESIGN-REVIEW.md contract and amendment.
+#[cfg(all(test, unix))]
+mod governed_push_tests {
+    use super::*;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = crate::git_hardening::hardened_git(cwd, args)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    struct Gate {
+        allow: bool,
+        requests: Vec<PermissionRequest>,
+    }
+
+    impl PermissionGate for Gate {
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            self.requests.extend_from_slice(requests);
+            if self.allow {
+                PermissionDecision::Allow(Caveats::top())
+            } else {
+                PermissionDecision::Deny
+            }
+        }
+        fn ask_question(&mut self, _question: &str) -> crate::agentic::HumanQuestionOutcome {
+            crate::agentic::HumanQuestionOutcome::Unavailable
+        }
+    }
+
+    /// A repo on `task`, tracking a `https://` `origin` a granted-host test
+    /// can "push" against (planning only — see [`plan_governed_push`]'s doc
+    /// comment for why no test here dials a real forge).
+    fn repo_on_feature_branch() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "one\n").unwrap();
+        git(repo.path(), &["add", "f.txt"]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        git(repo.path(), &["checkout", "-q", "-b", "task"]);
+        repo
+    }
+
+    /// Would have failed before A2/main-refusal ordering: pushing while on
+    /// `main` must be refused before any network authority is even checked.
+    #[test]
+    fn main_branch_push_is_refused() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "one\n").unwrap();
+        git(repo.path(), &["add", "f.txt"]);
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        let err = plan_governed_push(
+            "git push origin main:main",
+            repo.path(),
+            &Caveats::top(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("default branch"), "{err}");
+    }
+
+    /// Force is not merely checked at runtime — the fixed-argv builder has no
+    /// slot for it at all. Every spelling of "force" is refused before the
+    /// remote/branch are even resolved.
+    #[test]
+    fn force_push_forms_are_refused() {
+        let repo = repo_on_feature_branch();
+        for source in [
+            "git push --force origin task:task",
+            "git push origin task:task --force-with-lease",
+            "git push -f origin task:task",
+        ] {
+            let err =
+                plan_governed_push(source, repo.path(), &Caveats::top(), &mut None).unwrap_err();
+            assert!(err.contains("no flags"), "{source}: {err}");
+        }
+    }
+
+    /// Would have failed before A1: a repo-local `core.sshCommand` gadget
+    /// would otherwise run silently on the FIRST git invocation planning
+    /// performs (`config --local --list` itself); this pins that the plan
+    /// refuses before any push-shaped command reaches the network stage.
+    #[test]
+    fn hostile_repo_local_config_is_refused_and_never_reached() {
+        let repo = repo_on_feature_branch();
+        let sentinel = repo.path().join("payload-ran");
+        git(
+            repo.path(),
+            &[
+                "config",
+                "--local",
+                "core.sshCommand",
+                &format!("touch {}", sentinel.display()),
+            ],
+        );
+        let err = plan_governed_push(
+            "git push origin task:task",
+            repo.path(),
+            &Caveats::top(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("core.sshcommand"), "{err}");
+        assert!(
+            !sentinel.exists(),
+            "the hostile sshCommand payload must never run"
+        );
+    }
+
+    /// A `file://` remote (or anything else not `https://`/`ssh://`/scp-like)
+    /// is refused by amendment A2, structurally, before the net gate runs.
+    #[test]
+    fn file_and_ext_remotes_are_refused() {
+        for url in ["file:///home/op/other-repo", "ext::sh -c evil"] {
+            let repo = tempfile::tempdir().unwrap();
+            git(repo.path(), &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.path().join("f.txt"), "one\n").unwrap();
+            git(repo.path(), &["add", "f.txt"]);
+            git(
+                repo.path(),
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "init",
+                ],
+            );
+            git(repo.path(), &["remote", "add", "origin", url]);
+            git(repo.path(), &["checkout", "-q", "-b", "task"]);
+            let err = plan_governed_push(
+                "git push origin task:task",
+                repo.path(),
+                &Caveats::top(),
+                &mut None,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("unsupported remote URL scheme"),
+                "{url}: {err}"
+            );
+        }
+    }
+
+    /// An ungranted host is a permission-gate PROMPT (folded into the
+    /// existing `net:<host>` vocabulary, amendment A5), not a silent denial —
+    /// and a deny leaves the push unexecuted.
+    #[test]
+    fn ungranted_host_prompts_and_a_denial_refuses() {
+        let repo = repo_on_feature_branch();
+        let restricted = Caveats {
+            net: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let err = plan_governed_push(
+            "git push origin task:task",
+            repo.path(),
+            &restricted,
+            &mut Some(&mut gate),
+        )
+        .unwrap_err();
+        assert!(err.contains("did not grant"), "{err}");
+        assert_eq!(gate.requests.len(), 1);
+        assert_eq!(gate.requests[0].target, "github.com");
+    }
+
+    /// The happy path: every structural gate passes and the plan resolves to
+    /// the EXACT fixed argv a real push would run — `git remote get-url`'s
+    /// answer, not the bare `origin` argument, and `<branch>:<branch>` for
+    /// the repository's own checked-out branch. Actually dialing a real
+    /// `https://github.com` remote is exercised by the witnessed v0.8.0 gate
+    /// run, not this unit-tier test (same scope boundary amendment A4 draws
+    /// for `gh pr create`'s live forge).
+    #[test]
+    fn granted_host_plans_the_exact_fixed_push() {
+        let repo = repo_on_feature_branch();
+        let mut gate = Gate {
+            allow: true,
+            requests: vec![],
+        };
+        let (url, refspec) = plan_governed_push(
+            "git push origin task:task",
+            repo.path(),
+            &Caveats::top(),
+            &mut Some(&mut gate),
+        )
+        .unwrap();
+        assert_eq!(url, "https://github.com/o/r.git");
+        assert_eq!(refspec, "task:task");
+
+        // Bare `git push` (no operands) resolves the same way, from origin +
+        // the repository's own branch.
+        let (url2, refspec2) =
+            plan_governed_push("git push", repo.path(), &Caveats::top(), &mut None).unwrap();
+        assert_eq!(url2, url);
+        assert_eq!(refspec2, refspec);
+    }
+
+    /// The exact `gh pr create` argv this broker resolves — `--repo` is
+    /// ALWAYS present (amendment A4), base/head are resolved by the broker,
+    /// never taken from the model's argv.
+    #[test]
+    fn granted_host_plans_the_exact_fixed_pr_create() {
+        let repo = repo_on_feature_branch();
+        // `origin/HEAD` unset in this fixture, so the base falls back to the
+        // documented "main" default.
+        let mut gate = Gate {
+            allow: true,
+            requests: vec![],
+        };
+        let restricted = Caveats {
+            net: crate::caveats::Scope::only([]),
+            ..Caveats::top()
+        };
+        let plan = plan_governed_pr_create(
+            "gh pr create --title 't' --body 'b'",
+            repo.path(),
+            &restricted,
+            &mut Some(&mut gate),
+        )
+        .unwrap();
+        assert_eq!(plan.repo, "o/r");
+        assert_eq!(plan.base, "main");
+        assert_eq!(plan.head, "task");
+        assert_eq!(plan.title, "t");
+        assert_eq!(plan.body, "b");
+        assert_eq!(gate.requests[0].target, "github.com");
+    }
+
+    #[test]
+    fn unsupported_flags_are_refused() {
+        let repo = repo_on_feature_branch();
+        let err = plan_governed_pr_create(
+            "gh pr create --title t --body b --base other",
+            repo.path(),
+            &Caveats::top(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn non_github_remote_is_refused() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::git_hardening::hardened_git(repo.path(), args)
+                .unwrap()
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "one\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.example.com/o/r.git",
+        ]);
+        git(&["checkout", "-q", "-b", "task"]);
+        let err = plan_governed_pr_create(
+            "gh pr create --title t --body b",
+            repo.path(),
+            &Caveats::top(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(err.contains("github.com"), "{err}");
     }
 }
