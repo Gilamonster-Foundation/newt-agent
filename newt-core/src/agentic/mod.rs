@@ -4394,7 +4394,7 @@ impl RepeatCallGuard {
         result: &str,
         execution: Option<crate::ExecOutcome>,
     ) {
-        if tools::permission_grant_succeeded(name, args, ok, result) {
+        if tools::permission_grant_succeeded(name, args, ok, result, execution) {
             self.repeat_memos.retain(|_, memo| {
                 !matches!(
                     memo,

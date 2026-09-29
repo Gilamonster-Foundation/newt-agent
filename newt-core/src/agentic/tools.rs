@@ -1782,6 +1782,7 @@ pub(super) fn permission_grant_succeeded(
     args: &serde_json::Value,
     ok: bool,
     result: &str,
+    execution: Option<crate::ExecOutcome>,
 ) -> bool {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
@@ -1792,13 +1793,19 @@ pub(super) fn permission_grant_succeeded(
     {
         return false;
     }
-    // #2628: when a pending run_command was re-run on approval, the result is
-    // the command output rather than the "granted: … Retry" string.  Both
-    // shapes count as a successful grant for loop-suppression purposes.
+    // #2628/#2636: when a pending run_command was re-run on approval, the
+    // result is the command's real output rather than the "granted: …
+    // Retry" string. Recognize that shape from the SAME typed
+    // `ExecOutcome` the replay's own `executed()` call already records
+    // (round1's "additional nonblocking concern": a string heuristic here
+    // is misled by child output that happens to start with "denied:", and
+    // — the defect this replaces — misled the other way by output that
+    // merely doesn't start with a denial prefix, which is not evidence of
+    // a real grant). `execution` is `None` for the ordinary non-replay
+    // path (`request_permissions` never calls `executed()` unless it
+    // replayed), so it cannot false-positive on that path.
     result == permission_granted_result(capability, target)
-        || (!result.starts_with("denied:")
-            && !result.starts_with("no operator available")
-            && !result.starts_with("request_permissions:"))
+        || execution == Some(crate::ExecOutcome::Passed)
 }
 
 /// #2628/#2636: a `run_command` denied purely for undeclared filesystem

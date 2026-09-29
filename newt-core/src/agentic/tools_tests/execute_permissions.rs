@@ -1152,7 +1152,8 @@ fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
                     "request_permissions",
                     &args,
                     true,
-                    &result
+                    &result,
+                    None
                 ));
                 assert_eq!(result.contains("run_command"), native_hint, "{result:?}");
                 if native_hint {
