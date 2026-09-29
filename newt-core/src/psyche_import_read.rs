@@ -30,8 +30,10 @@ pub fn read_persona_file(
     report: &mut dyn FnMut(Notice<'static>),
 ) -> std::io::Result<String> {
     read_migrating(
-        path,
-        path,
+        MigratingPath {
+            shown: path,
+            operated: path,
+        },
         "persona",
         migrate_persona_text,
         true,
@@ -80,8 +82,10 @@ pub fn read_config_file(
     let operated = destination.map_or(path, crate::atomic_fs::ResolvedPath::as_path);
     let mut reported = false;
     let result = read_migrating(
-        path,
-        operated,
+        MigratingPath {
+            shown: path,
+            operated,
+        },
         "config",
         migrate_config_text,
         destination.is_some(),
@@ -118,11 +122,19 @@ pub fn read_config_file(
     result
 }
 
+/// The path shown to the operator and the path actually read/written.
+/// Canonicalization can add a verbatim `\\?\` prefix (Windows), expand 8.3
+/// short names, or follow a symlinked directory; `shown` is what the
+/// operator named, `operated` is what the filesystem calls resolved to.
+pub(super) struct MigratingPath<'a> {
+    pub(super) shown: &'a Path,
+    pub(super) operated: &'a Path,
+}
+
 /// Injected filesystem seam. Reporting does not own stdout, stderr, a tracing
 /// subscriber, or a terminal. A host may retain the value until a safe point.
 pub(super) fn read_migrating(
-    path: &Path,
-    operated: &Path,
+    path: MigratingPath<'_>,
     kind: &str,
     migrate: fn(&str) -> Option<Migration>,
     rewrite: bool,
@@ -130,12 +142,13 @@ pub(super) fn read_migrating(
     write: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
     report: &mut dyn FnMut(Notice<'static>),
 ) -> std::io::Result<String> {
+    let MigratingPath { shown, operated } = path;
     let raw = read(operated)?;
     let Some(migration) = migrate(&raw) else {
         return Ok(raw);
     };
     let changes = migration.changes.join(", ");
-    let shown = path.display();
+    let shown = shown.display();
     if !rewrite {
         report(Notice::new(
             Level::Warn,
