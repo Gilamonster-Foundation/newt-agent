@@ -127,7 +127,12 @@ impl Session {
             return global;
         };
         let (provider, model) = (entry.provider, entry.model);
-        let model_from_project = model.is_some();
+        // Only a BARE project model (no provider of its own) is the "picked
+        // while already active" case the field exists for (#2626 review
+        // P1-2). An entry that names its OWN provider couples model to that
+        // provider exactly like the global table does, so it must keep
+        // going through the ordinary provider-match guard in `restore`.
+        let model_from_project = model.is_some() && provider.is_none();
         Self {
             model: match (&provider, model) {
                 (_, Some(m)) => Some(m),
@@ -738,6 +743,31 @@ mod tests {
             Some("ornith-1.5-35b"),
             "a project's own remembered model must not be gated on a stale \
              global provider"
+        );
+    }
+
+    /// PR #2626 review P1-2: a project entry that names ITS OWN provider
+    /// couples model to that provider, same as a global entry — it is not
+    /// the bare "picked while already active" case `model_from_project`
+    /// exists for. An explicit-provider entry for a DIFFERENT backend than
+    /// the one actually effective must not restore its model onto the
+    /// wrong backend's credentials.
+    #[test]
+    fn explicit_project_provider_still_gates_the_model_on_a_mismatch() {
+        let mut d = doc("");
+        switch(&mut d, "/a", Choice::Provider("A"));
+        switch(&mut d, "/a", Choice::Model("A-model"));
+        let s = Session::for_project(&d, "/a");
+        assert_eq!(
+            (s.provider.as_deref(), s.model.as_deref()),
+            (Some("A"), Some("A-model"))
+        );
+        // The effective backend is B (e.g. --loadout), not the project's A.
+        let r = s.restore(Some("B"), false, all_exist);
+        assert_eq!(
+            r.model, None,
+            "a model coupled to an explicit project provider must not \
+             follow onto a different active backend"
         );
     }
 
