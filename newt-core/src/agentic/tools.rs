@@ -3365,7 +3365,6 @@ async fn execute_authorized_tool(
         };
     let args = command_args.as_ref();
 
-
     // Eligible file reads and lifecycle commands use the governed built-ins.
     // Git commands keep their original arguments and use the confined exec
     // path. The route/gate split is data in `routing::RouteTable`.
