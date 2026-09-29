@@ -5058,7 +5058,22 @@ async fn execute_authorized_tool(
                 // timeout) — surface the reason; Display is safe. Private-address
                 // denials gain an MCP-first recovery hint without weakening the
                 // refusal itself.
-                Err(e) => render_web_fetch_error(url, &e.to_string(), &*mcp, persona_tools, disposition),
+                Err(e) => {
+                    let reason = e.to_string();
+                    // #2643: the exec/run_command path journals denials via
+                    // `record_envelope`; this leash refusal has no envelope
+                    // (net is checked before any subprocess exists), so it
+                    // needs its own append or `newt ocap denials` never sees
+                    // a `web_fetch` net denial at all.
+                    if let Some(host) = host_of_url(url) {
+                        if reason.contains("is not within the granted authority")
+                            && reason.contains("network access to")
+                        {
+                            crate::denial_journal::record_net_denial("web_fetch", &host, &reason);
+                        }
+                    }
+                    render_web_fetch_error(url, &reason, &*mcp, persona_tools, disposition)
+                }
             }
         }
 

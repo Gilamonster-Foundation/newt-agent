@@ -475,3 +475,88 @@ fn ordinary_web_fetch_results_do_not_gain_mcp_recovery() {
         "error: denied: request to \"docs.example.test\" timed out"
     );
 }
+
+/// #2643 regression: a `web_fetch` net-caveat denial is written to the SAME
+/// `DenialJournal` chain the exec/`run_command` path already appends to
+/// (`newt-core/src/agentic/tools/shell.rs`'s two `record_envelope` calls) —
+/// before the fix, `newt ocap denials` showed nothing for this call even
+/// though the on-screen `error:` refusal (proven above) was real.
+#[tokio::test]
+async fn web_fetch_net_denial_is_journaled() {
+    let _env_lock = crate::process_env::lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let journal = dir.path().join("denial-journal.jsonl");
+    crate::process_env::set_var(
+        crate::denial_journal::DENIAL_JOURNAL_PATH_ENV,
+        &journal.to_string_lossy(),
+    );
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = caveats_rw(ws.path()); // net: Scope::none()
+    let mut gate = MockGate::new(false, &caveats);
+    let out = run_tool_gated(
+        "web_fetch",
+        serde_json::json!({"url": "https://denied.example.com/page"}),
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert!(out.starts_with("error:"), "leash denial surfaces: {out}");
+
+    crate::process_env::remove_var(crate::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+
+    let body = std::fs::read_to_string(&journal).expect("journal written");
+    let lines = crate::denial_journal::read_jsonl(&body);
+    assert_eq!(lines.len(), 1, "exactly one denial record: {body}");
+    let denials = &lines[0].node.payload().denials;
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].kind, "net");
+    assert_eq!(denials[0].target, "denied.example.com");
+    let head = crate::denial_journal::read_head(&journal).expect("head ref written");
+    assert_eq!(
+        crate::denial_journal::verify_chain(&lines, Some(&head)),
+        vec![],
+        "chain still verifies"
+    );
+}
+
+/// A `web_fetch` whose host is already in scope never reaches the net leash
+/// refusal, so nothing is appended — the journal file is never even created.
+#[tokio::test]
+async fn web_fetch_allowed_host_appends_nothing() {
+    let _env_lock = crate::process_env::lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let journal = dir.path().join("denial-journal.jsonl");
+    crate::process_env::set_var(
+        crate::denial_journal::DENIAL_JOURNAL_PATH_ENV,
+        &journal.to_string_lossy(),
+    );
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let mut caveats = caveats_rw(ws.path());
+    caveats.net = Scope::All;
+    // An already-permitted host skips the gate pre-check entirely (#263) —
+    // MockGate's `allow` value is irrelevant here.
+    let mut gate = MockGate::new(false, &caveats);
+    let _out = run_tool_gated(
+        "web_fetch",
+        // Reserved TEST-NET-1 address (RFC 5737): never routable, so the real
+        // dispatch fails on connect, not on the net leash.
+        serde_json::json!({"url": "http://192.0.2.1/unreachable"}),
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+
+    crate::process_env::remove_var(crate::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+    assert!(
+        gate.asks.is_empty(),
+        "an already-permitted host never consults the gate"
+    );
+    assert!(
+        !journal.exists(),
+        "an already-permitted host never touches the journal"
+    );
+}

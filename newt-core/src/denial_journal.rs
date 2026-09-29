@@ -166,10 +166,34 @@ pub fn append_record(path: &Path, record: DenialRecord) -> anyhow::Result<Denial
 /// best-effort: an observability failure must never alter enforcement, so
 /// minting an id — which is fallible — cannot introduce a failure path here.
 pub fn record_envelope(command: &str, cwd: &str, stage: DenialStage, envelope: &serde_json::Value) {
-    let Some(path) = std::env::var_os(DENIAL_JOURNAL_PATH_ENV) else {
+    let Some(record) = DenialRecord::from_envelope(command, cwd, stage, envelope) else {
         return;
     };
-    let Some(record) = DenialRecord::from_envelope(command, cwd, stage, envelope) else {
+    record_denial(record);
+}
+
+/// Record a denial built directly by a caller that has no confined-shell
+/// envelope to lift (#2643) — `web_fetch`'s `net`-axis refusal is denied by
+/// the leash before any subprocess exists, so there is no `{ denied, denials
+/// }` envelope for [`record_envelope`] to parse. Same opt-in path, same
+/// chain, same reader (`newt ocap denials`): the two callers differ only in
+/// how the `DenialRecord` is built, not where it goes.
+pub fn record_net_denial(tool: &str, host: &str, reason: &str) {
+    record_denial(DenialRecord {
+        ts_claim: chrono::Utc::now().to_rfc3339(),
+        command: tool.to_string(),
+        cwd: String::new(),
+        stage: DenialStage::Initial,
+        denials: vec![JournalDenial {
+            kind: "net".to_string(),
+            target: host.to_string(),
+            reason: reason.to_string(),
+        }],
+    });
+}
+
+fn record_denial(record: DenialRecord) {
+    let Some(path) = std::env::var_os(DENIAL_JOURNAL_PATH_ENV) else {
         return;
     };
     let _ = append_record(Path::new(&path), record);
