@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use agent_mesh_bus::{Bus, PeerEndpoint, RequestContext, Topic};
 use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
+use newt_core::dock_registry::PairingStep;
 use serde::{Deserialize, Serialize};
 
 /// Topic (under the operator's user namespace) for dock requests.
@@ -42,7 +43,9 @@ pub enum DockRole {
 }
 
 impl DockRole {
-    fn name(self) -> &'static str {
+    /// `hub` or `host`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
         match self {
             Self::Hub => "hub",
             Self::Host => "host",
@@ -206,8 +209,8 @@ fn authorize_caller(state_dir: &Path, caller_agent_fp: &str) -> Result<Authz, Do
     if dock_approval_disabled() {
         return Ok(None);
     }
-    match approved_scope(state_dir, caller_agent_fp) {
-        Some(scope) => Ok(Some(scope)),
+    match approved_record(state_dir, caller_agent_fp) {
+        Some(record) => Ok(Some(record.scope)),
         None => Err(DockReply::Error(format!(
             "caller {}… is not an approved dock on this peer (run `newt dock approve` here)",
             &caller_agent_fp[..12.min(caller_agent_fp.len())]
@@ -215,37 +218,102 @@ fn authorize_caller(state_dir: &Path, caller_agent_fp: &str) -> Result<Authz, Do
     }
 }
 
-/// The scope `agent_fp` is approved at in `state_dir`'s signed dock registry,
-/// re-read and re-verified from disk. `None` when it is not approved.
-fn approved_scope(state_dir: &Path, agent_fp: &str) -> Option<newt_core::dock_registry::DockScope> {
+/// `agent_fp`'s approval in `state_dir`'s signed dock registry, re-read and
+/// re-verified from disk. `None` when it is not approved.
+fn approved_record(
+    state_dir: &Path,
+    agent_fp: &str,
+) -> Option<newt_core::dock_registry::DockRecord> {
     let config = state_dir.join("config.toml");
     let identity = state_dir.join("identity.pem");
     let (registry, _warnings) =
         newt_core::dock_registry::load_docks_with_identity(&config, &identity);
-    registry.approved(agent_fp).map(|record| record.scope)
+    registry.approved(agent_fp)
 }
 
-/// Whether the host that sent `host` is promoted on this hub: approved in the
-/// hub's own signed registry. A host that is not is staged instead, for the
-/// operator to promote with `newt dock approve --staged` (K8.5).
+/// Admit the host that sent `host`: promoted if this hub's own signed registry
+/// approves it; otherwise staged, for the operator to promote with `newt dock
+/// approve --staged` (K8.5). A pairing `step` is applied whether or not the
+/// host is promoted, since a host that no longer approves this hub pairs again
+/// to re-approve it (K8.8). The reply names the pairing this hub holds for the
+/// host, so a host can tell when the pairing it shows is no longer the hub's.
 ///
 /// Only the registry decides. The responder's insecure opt-out
 /// (`NEWT_INSECURE_DOCK_NO_APPROVAL`) is not consulted here: it may loosen who
 /// a host answers, never which hosts a hub serves.
-fn host_promoted(state_dir: &Path, host: &crate::uplink::Hello) -> bool {
+fn admit_host(
+    state_dir: &Path,
+    host: &crate::uplink::Hello,
+    step: Option<PairingStep>,
+    hub_pubkey: &[u8; 32],
+) -> crate::uplink::Admit {
+    use newt_core::dock_registry::{
+        decode_agent_pubkey, pair_staged_host, stage_host, staged_hosts,
+    };
     let host_fp = Fingerprint::of_bytes(&host.pubkey).hex();
-    if approved_scope(state_dir, &host_fp).is_some() {
-        return true;
+    let approval = approved_record(state_dir, &host_fp);
+    let config = state_dir.join("config.toml");
+    let now = std::time::SystemTime::now();
+    let mut pairing = None;
+    if approval.is_none() || step.is_some() {
+        let fresh_nonce = agent_mesh_bus::CorrelationId::new_random().0;
+        match stage_host(&config, &host.pubkey, &host.instance, hub_pubkey, now).and_then(|()| {
+            step.map(|step| {
+                pair_staged_host(&config, &host.pubkey, hub_pubkey, step, fresh_nonce, now)
+            })
+            .transpose()
+        }) {
+            Ok(reply) => pairing = reply,
+            Err(e) => {
+                tracing::warn!(error = %e, host = %host_fp, "dock uplink: could not stage host");
+            }
+        }
     }
-    if let Err(e) = newt_core::dock_registry::stage_host(
-        &state_dir.join("config.toml"),
-        &host.pubkey,
-        &host.instance,
-        std::time::SystemTime::now(),
-    ) {
-        tracing::warn!(error = %e, host = %host_fp, "dock uplink: could not stage host");
+    // A pairing under way outranks the one an approval was signed under.
+    let staged = staged_hosts(&config, now).into_iter().find(|s| {
+        s.peer_agent_fingerprint == host_fp
+            && decode_agent_pubkey(&s.hub_pubkey).as_ref() == Some(hub_pubkey)
+    });
+    let paired = staged
+        .and_then(|s| s.pairing())
+        .map(|p| p.transcript_id)
+        .or_else(|| approval.as_ref().map(|r| r.transcript_id.clone()));
+    crate::uplink::Admit {
+        promoted: approval.is_some(),
+        pairing,
+        paired,
     }
-    false
+}
+
+/// The marker file, in a state dir, that is the operator's dock kill switch
+/// (`/dock disable`): while it exists, every dock request is refused and every
+/// uplink closes.
+pub const DOCK_DISABLED_MARKER: &str = "dock-exposure-disabled";
+
+/// Where a hub stands with this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubStanding {
+    /// Approved in this host's own registry: the host serves it.
+    Approved,
+    /// Not approved (never, or revoked): the host may pair with it but serves
+    /// it nothing.
+    NotApproved,
+    /// Dock exposure is disabled on this host (the kill switch).
+    Disabled,
+}
+
+/// Where the hub with fingerprint `hub_fp` stands with this host. Only this
+/// host's registry and kill switch decide; the responder's insecure opt-out
+/// does not approve a hub.
+#[must_use]
+pub fn hub_standing(state_dir: &Path, hub_fp: &str) -> HubStanding {
+    if state_dir.join(DOCK_DISABLED_MARKER).exists() {
+        HubStanding::Disabled
+    } else if approved_record(state_dir, hub_fp).is_some() {
+        HubStanding::Approved
+    } else {
+        HubStanding::NotApproved
+    }
 }
 
 /// Synchronous (SQLite); the async handler runs it on a blocking thread.
@@ -254,7 +322,7 @@ fn handle_dock(state_dir: &Path, authz: Authz, req: DockRequest) -> DockReply {
     // the state dir. Fail-closed — while present, every dock request is refused
     // over the MESH too, not only over HTTP, so a forcible undock is complete
     // across transports.
-    if state_dir.join("dock-exposure-disabled").exists() {
+    if state_dir.join(DOCK_DISABLED_MARKER).exists() {
         return DockReply::Error("dock exposure disabled by the operator".into());
     }
     // Per-operation scope enforcement (skipped only under the unsafe opt-out):
@@ -447,6 +515,8 @@ impl From<PeerEndpoint> for DockPeer {
 /// The dock **dialer**: a hub-side bus that requests docks from peers.
 pub struct DockClient {
     bus: Bus,
+    /// This hub's dock key, recorded with each host it stages.
+    hub_pubkey: [u8; 32],
     user_fp: Fingerprint,
     uplinks: std::sync::Arc<crate::uplink::UplinkHub>,
 }
@@ -458,10 +528,12 @@ impl DockClient {
     /// Propagates a bus bind failure.
     pub async fn bind(user: &UserKey, agent: AgentKey, port: u16) -> anyhow::Result<Self> {
         let user_fp = user.fingerprint();
+        let hub_pubkey = agent.public_bytes();
         let bus = Bus::bind(user, agent, port).await?;
         let uplinks = std::sync::Arc::default();
         Ok(Self {
             bus,
+            hub_pubkey,
             user_fp,
             uplinks,
         })
@@ -478,21 +550,29 @@ impl DockClient {
     /// loses its uplink at its next poll. A served host still authorizes every
     /// request against its own registry (K8.2).
     pub fn serve_uplinks(&self, state_dir: PathBuf) {
-        self.serve_uplinks_with(move |host| host_promoted(&state_dir, host));
+        let hub_pubkey = self.hub_pubkey;
+        self.serve_uplinks_with(move |host, step| admit_host(&state_dir, host, step, &hub_pubkey));
     }
 
     fn serve_uplinks_with(
         &self,
-        promoted: impl Fn(&crate::uplink::Hello) -> bool + Send + Sync + 'static,
+        admit: impl Fn(&crate::uplink::Hello, Option<PairingStep>) -> crate::uplink::Admit
+            + Send
+            + Sync
+            + 'static,
     ) {
-        crate::uplink::serve(&self.bus, self.user_fp, self.uplinks.clone(), promoted);
+        crate::uplink::serve(&self.bus, self.user_fp, self.uplinks.clone(), admit);
     }
 
     /// Serve every uplink without consulting a registry, for tests of the
     /// carrier itself.
     #[cfg(test)]
     pub(crate) fn serve_all_uplinks(&self) {
-        self.serve_uplinks_with(|_| true);
+        self.serve_uplinks_with(|_, _| crate::uplink::Admit {
+            promoted: true,
+            pairing: None,
+            paired: None,
+        });
     }
 
     /// The promoted hosts holding a live uplink to this hub, as each last
@@ -635,6 +715,17 @@ mod tests {
         caller_pubkey: &[u8; 32],
         scope: DockScope,
     ) {
+        approve_caller_under(user, state_dir, caller_pubkey, scope, "tx");
+    }
+
+    /// Approve `caller_pubkey` under the pairing transcript `transcript_id`.
+    fn approve_caller_under(
+        user: &UserKey,
+        state_dir: &Path,
+        caller_pubkey: &[u8; 32],
+        scope: DockScope,
+        transcript_id: &str,
+    ) {
         let config = state_dir.join("config.toml");
         let identity = state_dir.join("identity.pem");
         if !identity.exists() {
@@ -646,7 +737,13 @@ mod tests {
         // UserKey type crosses the newt-mesh (path agent-mesh) / newt-core
         // (registry agent-mesh) seam.
         newt_core::dock_registry::approve_dock_with_identity(
-            &config, &identity, &fp, "hub", &hex, scope, "tx",
+            &config,
+            &identity,
+            &fp,
+            "hub",
+            &hex,
+            scope,
+            transcript_id,
         )
         .unwrap();
     }
@@ -769,13 +866,74 @@ mod tests {
         let staged =
             || newt_core::dock_registry::staged_hosts(&config, std::time::SystemTime::now());
 
-        assert!(!host_promoted(dir.path(), &hello), "unapproved");
+        use crate::uplink::Admit;
+        use newt_core::dock_registry::{pairing_commitment, PairingReply};
+        let admit = |step| admit_host(dir.path(), &hello, step, &[9; 32]);
+        let commit = |nonce| {
+            Some(PairingStep::Commit(pairing_commitment(
+                &[9; 32],
+                &hello.pubkey,
+                &nonce,
+            )))
+        };
+        assert_eq!(admit(None), Admit::default(), "unapproved");
         assert_eq!(staged().len(), 1, "an unapproved host is staged");
+        assert!(matches!(
+            admit(commit([5; 16])),
+            Admit {
+                promoted: false,
+                pairing: Some(PairingReply::Nonce(_)),
+                paired: None,
+            }
+        ));
+        let paired = admit(Some(PairingStep::Reveal([5; 16])));
+        let held = staged()[0].pairing().expect("the hub holds the pairing");
+        assert_eq!(
+            paired,
+            Admit {
+                promoted: false,
+                pairing: Some(PairingReply::Paired),
+                paired: Some(held.transcript_id.clone()),
+            }
+        );
 
-        approve_caller(&user, dir.path(), &hello.pubkey, DockScope::Mirror);
-        assert!(
-            host_promoted(dir.path(), &hello),
-            "approved in the hub's registry"
+        newt_core::dock_registry::unstage_host(&config, &staged()[0].peer_agent_fingerprint)
+            .unwrap();
+        approve_caller_under(
+            &user,
+            dir.path(),
+            &hello.pubkey,
+            DockScope::Mirror,
+            &held.transcript_id,
+        );
+        let promoted = Admit {
+            promoted: true,
+            pairing: None,
+            paired: Some(held.transcript_id.clone()),
+        };
+        assert_eq!(admit(None), promoted, "approved under the pairing");
+        assert!(staged().is_empty(), "a promoted host is not restaged");
+
+        // A promoted host that no longer approves this hub pairs again (#2616).
+        assert!(matches!(
+            admit(commit([6; 16])),
+            Admit {
+                promoted: true,
+                pairing: Some(PairingReply::Nonce(_)),
+                ..
+            }
+        ));
+        let repaired = admit(Some(PairingStep::Reveal([6; 16])));
+        let fresh = staged()[0].pairing().unwrap();
+        assert_ne!(fresh.transcript_id, held.transcript_id);
+        assert_eq!(
+            repaired,
+            Admit {
+                promoted: true,
+                pairing: Some(PairingReply::Paired),
+                paired: Some(fresh.transcript_id),
+            },
+            "the pairing under way outranks the approval's"
         );
     }
 
@@ -1228,7 +1386,7 @@ mod tests {
         let work: serde_json::Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(
             work,
-            serde_json::json!({ "job": null, "staged": false }),
+            serde_json::json!({ "job": null, "staged": false, "pairing": null, "paired": null }),
             "a poll naming another key gets no work"
         );
         spoofer.close().await.unwrap();
@@ -1265,12 +1423,199 @@ mod tests {
         hub.close().await.unwrap();
     }
 
+    /// K8-e acceptance (K8.8): a host and hub pair by Numeric Comparison. Both
+    /// derive the same 6-digit code and transcript from the exchange; neither
+    /// is served until both sides approve, and the host's approval commits to
+    /// the pairing transcript. Real loopback QUIC.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live transport — nightly/full mesh-integration tier only"]
+    async fn a_host_and_hub_pair_by_numeric_comparison_before_either_is_served() {
+        use newt_core::dock_registry as registry;
+        let user = UserKey::generate();
+        let hub_dir = tempfile::tempdir().unwrap();
+        let host_dir = tempfile::tempdir().unwrap();
+        user.save(&hub_dir.path().join("identity.pem")).unwrap();
+        user.save(&host_dir.path().join("identity.pem")).unwrap();
+        let store =
+            newt_core::ConversationStore::new(host_dir.path(), host_dir.path(), 100).unwrap();
+        store.create("paired session", None).unwrap();
+
+        let hub_agent = dock_agent(&user, DockRole::Hub, "home-hub");
+        let hub_pubkey = hub_agent.public_bytes();
+        let hub = DockClient::bind(&user, hub_agent, 0).await.unwrap();
+        hub.serve_uplinks(hub_dir.path().to_path_buf());
+        let host_agent = dock_agent(&user, DockRole::Host, "nuc2");
+        let (host_fp, host_pubkey) = (host_agent.fingerprint(), host_agent.public_bytes());
+        let mut host = crate::DockUplink::start(
+            &user,
+            "nuc2",
+            host_dir.path().to_path_buf(),
+            loopback(hub_pubkey, hub.local_port()),
+        )
+        .await
+        .unwrap();
+
+        let pairing = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(p) = host.pairing() {
+                    return p;
+                }
+                host.changed().await;
+            }
+        })
+        .await
+        .expect("the host completes pairing");
+        assert_eq!(pairing.code.len(), registry::PAIRING_CODE_DIGITS);
+        let staged = registry::staged_hosts(
+            &hub_dir.path().join("config.toml"),
+            std::time::SystemTime::now(),
+        );
+        assert_eq!(
+            staged[0].pairing(),
+            Some(pairing.clone()),
+            "the hub derives the same code and transcript"
+        );
+        assert!(
+            hub.list_sessions(DockPeer::Uplink(host_fp)).await.is_err(),
+            "no host is served before both sides approve"
+        );
+
+        // The host operator confirms (what `newt-mesh dock` signs). Approved
+        // on one side only, the host is still not served.
+        let hub_fp = registry::agent_fingerprint_of_pubkey(&hub_pubkey);
+        let hub_hex: String = hub_pubkey.iter().map(|b| format!("{b:02x}")).collect();
+        let host_config = host_dir.path().join("config.toml");
+        let host_identity = host_dir.path().join("identity.pem");
+        let approve_hub = |transcript_id: &str| {
+            registry::approve_dock_with_identity(
+                &host_config,
+                &host_identity,
+                &hub_fp,
+                "hub",
+                &hub_hex,
+                DockScope::Mirror,
+                transcript_id,
+            )
+            .unwrap();
+        };
+        approve_hub(&pairing.transcript_id);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            hub.list_sessions(DockPeer::Uplink(host_fp)).await.is_err(),
+            "approved by the host only, the host is not served"
+        );
+
+        // The hub operator confirms (what `newt dock approve --staged` signs).
+        let hub_config = hub_dir.path().join("config.toml");
+        approve_caller_under(
+            &user,
+            hub_dir.path(),
+            &host_pubkey,
+            DockScope::Mirror,
+            &pairing.transcript_id,
+        );
+        registry::unstage_host(&hub_config, &staged[0].peer_agent_fingerprint).unwrap();
+        let wait_served = || async {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                hub.uplinks().wait_for_uplink(host_fp),
+            )
+            .await
+            .expect("promoted at its next poll");
+        };
+        wait_served().await;
+        let sessions = hub.list_sessions(DockPeer::Uplink(host_fp)).await.unwrap();
+        assert!(
+            sessions.iter().any(|s| s.title == "paired session"),
+            "{sessions:?}"
+        );
+        let transcript_of = |dir: &std::path::Path, fp: &str| {
+            let (registry, _) = registry::load_docks_with_identity(
+                &dir.join("config.toml"),
+                &dir.join("identity.pem"),
+            );
+            registry.approved(fp).unwrap().transcript_id
+        };
+        assert_eq!(
+            transcript_of(host_dir.path(), &hub_fp),
+            pairing.transcript_id,
+            "the host's approval commits to the pairing"
+        );
+        assert_eq!(
+            transcript_of(hub_dir.path(), &host_fp.hex()),
+            pairing.transcript_id,
+            "the hub's approval commits to the same pairing"
+        );
+
+        // Revoked on the host only, the host undocks. Restarted under the same
+        // key against the hub that kept running, it pairs afresh although the
+        // hub still approves it — and, approved by the hub only, it refuses the
+        // hub (#2616; the restart needs agent-mesh#100's sequence floor).
+        registry::revoke_dock_with_identity(&host_config, &host_identity, &hub_fp).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            host.reached(crate::uplink::UplinkState::Undocked),
+        )
+        .await
+        .expect("a host undocks itself once its hub is revoked");
+        host.close().await;
+        let mut host = crate::DockUplink::start(
+            &user,
+            "nuc2",
+            host_dir.path().to_path_buf(),
+            loopback(hub_pubkey, hub.local_port()),
+        )
+        .await
+        .unwrap();
+        let repaired = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(p) = host.pairing() {
+                    return p;
+                }
+                host.changed().await;
+            }
+        })
+        .await
+        .expect("the restarted host pairs again with a hub that still approves it");
+        assert_ne!(repaired.transcript_id, pairing.transcript_id);
+        let restaged = registry::staged_hosts(&hub_config, std::time::SystemTime::now());
+        assert_eq!(
+            restaged[0].pairing(),
+            Some(repaired.clone()),
+            "the hub shows the same new code"
+        );
+        wait_served().await;
+        let refused = hub.list_sessions(DockPeer::Uplink(host_fp)).await;
+        assert!(
+            format!("{refused:?}").contains("not an approved dock"),
+            "approved by the hub only, the host refuses it: {refused:?}"
+        );
+        approve_hub(&repaired.transcript_id);
+        assert!(
+            hub.list_sessions(DockPeer::Uplink(host_fp)).await.is_ok(),
+            "re-approved under the new pairing, the host serves the hub again"
+        );
+
+        // The kill switch closes every uplink: the host undocks itself.
+        std::fs::write(host_dir.path().join(DOCK_DISABLED_MARKER), b"").unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            host.reached(crate::uplink::UplinkState::Undocked),
+        )
+        .await
+        .expect("dock exposure disabled undocks the host");
+
+        host.close().await;
+        hub.close().await.unwrap();
+    }
+
     /// K8-c acceptance: a docked host serves list, transcript and inject to its
     /// hub over an uplink it dialed, while accepting no inbound connection. The
     /// host authorizes the hub against its own registry on every request
     /// (K8.2), through the uplink exactly as through a direct dial: an
-    /// unapproved hub, a Mirror-only inject, a revoked hub and the kill switch
-    /// are each refused by the host with its own reason. Real loopback QUIC.
+    /// unapproved hub and a Mirror-only inject are each refused by the host
+    /// with its own reason, and revoking the hub undocks the host (K8-e).
+    /// Real loopback QUIC.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live transport — nightly/full mesh-integration tier only"]
     async fn docked_host_serves_its_hub_over_an_uplink_and_accepts_no_inbound() {
@@ -1291,7 +1636,7 @@ mod tests {
         // The hub serves only a host it has promoted (K8-d); this test shares
         // one state dir between hub and host.
         approve_caller(&user, dir.path(), &host_pubkey, DockScope::Mirror);
-        let host = crate::DockUplink::start(
+        let mut host = crate::DockUplink::start(
             &user,
             "laptop",
             dir.path().to_path_buf(),
@@ -1346,24 +1691,6 @@ mod tests {
             "the inject lands in the host's own inbox (the host stays sole writer)"
         );
 
-        std::fs::write(dir.path().join("dock-exposure-disabled"), b"").unwrap();
-        let killed = refusal(hub.list_sessions(laptop).await);
-        assert!(killed.contains("dock exposure disabled"), "{killed}");
-        std::fs::remove_file(dir.path().join("dock-exposure-disabled")).unwrap();
-
-        let hub_fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&hub_pubkey);
-        newt_core::dock_registry::revoke_dock_with_identity(
-            &dir.path().join("config.toml"),
-            &dir.path().join("identity.pem"),
-            &hub_fp,
-        )
-        .unwrap();
-        let revoked = refusal(hub.list_sessions(laptop).await);
-        assert!(
-            revoked.contains("is not an approved dock"),
-            "a revoked hub is refused on its next request: {revoked}"
-        );
-
         // The host accepts nothing: a direct dial to its port is refused by the
         // transport, not merely unanswered.
         let direct = hub
@@ -1376,6 +1703,25 @@ mod tests {
                 Some(agent_mesh_bus::BusError::Transport(_))
             ),
             "a dial to the docked host must be refused, got {direct:?}"
+        );
+
+        // Undock: revoking the hub on the host closes the uplink itself (K8-e).
+        let hub_fp = newt_core::dock_registry::agent_fingerprint_of_pubkey(&hub_pubkey);
+        newt_core::dock_registry::revoke_dock_with_identity(
+            &dir.path().join("config.toml"),
+            &dir.path().join("identity.pem"),
+            &hub_fp,
+        )
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            host.reached(crate::uplink::UplinkState::Undocked),
+        )
+        .await
+        .expect("a host undocks itself once its hub is revoked");
+        assert!(
+            hub.list_sessions(laptop).await.is_err(),
+            "the hub reaches it no more"
         );
 
         host.close().await;
