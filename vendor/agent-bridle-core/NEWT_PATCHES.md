@@ -58,3 +58,13 @@ Seatbelt's existing fence identity records caveats and mechanism, not this
 SandboxPolicy option or a complete SBPL ruleset. This patch does not promote
 that partial projection to a ruleset-level filesystem proof. Inherited terminal
 descriptors and `/dev/tty` remain separate surfaces.
+
+## agent-mesh-protocol 0.7
+
+The published 0.8.0-rc.5 manifest requires `agent-mesh-protocol` 0.6.4. This
+copy requires 0.7.0, the version the rest of the Newt workspace pins. Without
+this change, Cargo resolves the two ranges to two separate crates, and every
+`Caveats` crossing between Newt and agent-bridle becomes a type mismatch. Only
+the version requirement changed: protocol 0.7 adds `AgentKey::issue_derived`
+and removes nothing this crate uses. Upstream agent-bridle needs the same bump
+before this vendored copy can be retired.

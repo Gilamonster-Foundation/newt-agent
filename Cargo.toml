@@ -343,7 +343,7 @@ tests-pty = { path = "tests/pty" }
 # closing the door on a silent agent-mesh-protocol skew. Issue #95:
 # this replaces the hand-mirrored `newt_core::caveats` module — the
 # types are now re-exported straight from `agent-mesh-protocol`.
-agent-mesh-protocol = "0.6"
+agent-mesh-protocol = "0.7"
 
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.8.0" }
