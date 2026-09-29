@@ -193,6 +193,18 @@ pub fn record_net_denial(tool: &str, host: &str, reason: &str) {
 }
 
 fn record_denial(record: DenialRecord) {
+    // #2645 round 3: read `DENIAL_JOURNAL_PATH_ENV` under `process_env`'s
+    // one lock over the process environment, same as every test that arms
+    // it (`crate::process_env::lock()`). Without this, a sibling test's real
+    // `web_fetch`/`run_command` denial — running on another thread, holding
+    // no lock itself — could observe the var mid-scenario and append into a
+    // journal file that belongs to the test that armed it (the parallel-run
+    // contamination `web_fetch_net_denial_is_journaled` demonstrated:
+    // 2 records where exactly 1 was expected). Locking THIS read serializes
+    // every caller — audited or not — against every test that holds the
+    // lock while the var is set, rather than requiring each new caller to
+    // remember to take the lock itself.
+    let _env_lock = crate::process_env::lock();
     let Some(path) = std::env::var_os(DENIAL_JOURNAL_PATH_ENV) else {
         return;
     };
