@@ -1156,6 +1156,47 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
     assert_eq!(choice.active_model.as_deref(), Some("gated-model"));
 }
 
+// PR #2626 review P2-3: the picker's result is explicit intent, honored
+// against the served set from the CURRENT probe rather than silently
+// discarded when it isn't one of the (possibly narrower) ambiguous-warm
+// candidates the picker was raised from.
+#[test]
+fn resolve_modal_choice_honors_an_initially_warm_candidate() {
+    let served = vec!["A".to_string(), "B".to_string()];
+    assert_eq!(
+        resolve_modal_choice(Some("A".to_string()), &served).as_deref(),
+        Some("A")
+    );
+}
+
+#[test]
+fn resolve_modal_choice_honors_an_unloaded_offered_candidate() {
+    // C was served but not warm at probe time — loading it inside the
+    // picker must not be silently discarded like a cancel.
+    let served = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    assert_eq!(
+        resolve_modal_choice(Some("C".to_string()), &served).as_deref(),
+        Some("C")
+    );
+}
+
+#[test]
+fn resolve_modal_choice_refuses_a_pick_no_longer_served() {
+    // Residency/roster changed while the picker was open — the choice is no
+    // longer honest and must fall through to refusal, not be forced.
+    let served = vec!["A".to_string(), "B".to_string()];
+    assert_eq!(
+        resolve_modal_choice(Some("gone".to_string()), &served),
+        None
+    );
+}
+
+#[test]
+fn resolve_modal_choice_is_none_on_cancel() {
+    let served = vec!["A".to_string(), "B".to_string()];
+    assert_eq!(resolve_modal_choice(None, &served), None);
+}
+
 #[test]
 fn prewarm_applies_is_url_equality_modulo_trailing_slash() {
     // The pre-warm probe is consumed only for the endpoint it ran against —

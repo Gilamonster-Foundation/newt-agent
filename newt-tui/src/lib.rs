@@ -4020,6 +4020,16 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
     }
 }
 
+/// PR #2626 review P2-3: the model-picker's result is explicit operator
+/// intent, honored against the served set from the CURRENT probe rather than
+/// the (possibly narrower) `ambiguous_warm` snapshot the picker was raised
+/// from — `None` (cancel, or a picked model the server no longer lists) is
+/// the only case that falls through to refusal. Pure so the decision is
+/// unit-testable without driving a real terminal or probe.
+fn resolve_modal_choice(picked: Option<String>, served_at_probe: &[String]) -> Option<String> {
+    picked.filter(|m| served_at_probe.contains(m))
+}
+
 /// The shared adopt tail: probe results (live or pre-warmed) → the choice's
 /// model/serving/window/api, with the honest status lines.
 fn finish_adoption(
@@ -4055,6 +4065,7 @@ fn finish_adoption(
             // declaration; Managed Shared may prefer a warm model).
             let (synth, requested) = adoption_inputs(choice);
             let warm_at_probe = warm.clone();
+            let models_at_probe = models.clone();
             let declared_name = synth.effective_model().map(str::to_string);
             let mut adoption =
                 backend_probe::adopt(&synth, &Served { models, warm }, requested.as_deref());
@@ -4082,16 +4093,33 @@ fn finish_adoption(
             // one extra short note; blank gets none.
             let backend_default =
                 requested.is_none() && (declared_name.is_none() || adoption.declared_unavailable);
-            if backend_default && !adoption.ambiguous_warm.is_empty() {
+            // PR #2626 review P2-4: ambiguity must be resolved or explicitly
+            // refused whenever adopt() returns it — including when the
+            // ORIGINAL request named a model that turned out unavailable
+            // (`requested.is_some()`, so `backend_default` is false). Gating
+            // this on `backend_default` left that case with only the generic
+            // #1122 typo warning above and no fallback model, candidate list,
+            // or modal at all.
+            if !adoption.ambiguous_warm.is_empty() {
                 // #2622: several models loaded, no pin resolved — list order
                 // is arbitrary. Tiebreak on the ONE backend-keyed fact newt
                 // already has: the model this operator last ran on this
                 // endpoint (usage.jsonl). Falls through to asking only when
                 // that history doesn't cover any of the loaded candidates.
+                // #2626 review: the history rule is the most recent row
+                // naming an ELIGIBLE candidate, not merely the most recent
+                // row for this endpoint — a later row for a model that's
+                // since been unloaded must not shadow an earlier eligible
+                // one, so the candidate check runs INSIDE the log scan.
                 let last_used = newt_core::Config::user_config_path()
                     .map(|p| p.with_file_name("usage.jsonl"))
-                    .and_then(|log| newt_core::metrics::last_model_for_endpoint(&log, &choice.url))
-                    .filter(|m| adoption.ambiguous_warm.contains(m));
+                    .and_then(|log| {
+                        newt_core::metrics::last_eligible_model_for_endpoint(
+                            &log,
+                            &choice.url,
+                            &adoption.ambiguous_warm,
+                        )
+                    });
                 match last_used {
                     Some(m) => {
                         lines.push(format!(
@@ -4123,7 +4151,16 @@ fn finish_adoption(
                             .flatten();
                         #[cfg(not(feature = "rich-tui"))]
                         let picked: Option<String> = None;
-                        match picked.filter(|m| adoption.ambiguous_warm.contains(m)) {
+                        // PR #2626 review P2-3: the picker offers every
+                        // served model (including ones not warm at probe
+                        // time, and its own load/refresh controls), but this
+                        // arm used to accept a choice only when it belonged
+                        // to the STALE `ambiguous_warm` snapshot — silently
+                        // discarding any other deliberate pick as if it were
+                        // a cancel. Validate against the served set from
+                        // THIS probe instead: any model the backend actually
+                        // lists is honored as explicit intent.
+                        match resolve_modal_choice(picked, &models_at_probe) {
                             Some(m) => {
                                 lines.push(format!("backend default → {m} (picked)"));
                                 adoption.model = Some(m);
