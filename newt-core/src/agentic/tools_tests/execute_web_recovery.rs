@@ -560,3 +560,48 @@ async fn web_fetch_allowed_host_appends_nothing() {
         "an already-permitted host never touches the journal"
     );
 }
+
+/// #2645 round 2: `agent-bridle-tool-web`'s `fetch_with_leashed_redirects`
+/// calls `ToolContext::check_net(&host)` fresh on EVERY hop (host A on entry,
+/// host B after a redirect); a denial's `reason` therefore names whichever
+/// host the leash actually refused, not necessarily `url`'s own host. Before
+/// the fix, the classifier took `host_of_url(url)` — the ORIGINAL host — so
+/// an allowed A redirecting to a denied B misfiled the record under A.
+/// `parse_net_denial_host` must recover B (the real target) from the leash's
+/// own exact wording instead.
+#[test]
+fn redirect_denial_reason_names_the_redirect_target_not_the_original_host() {
+    // Exactly agent_bridle_core::ToolContext::check_net's format for the
+    // SECOND hop's host (`B.example.net`), verbatim (vendor/agent-bridle-core/
+    // src/context.rs): `format!("network access to {host:?} is not within
+    // the granted authority")`. The original request went to `a.example.com`;
+    // it must not appear in the recovered host.
+    let reason = "network access to \"b.example.net\" is not within the granted authority";
+    assert_eq!(
+        parse_net_denial_host(reason).as_deref(),
+        Some("b.example.net"),
+        "recovers the actually-denied redirect target, not the original host"
+    );
+}
+
+/// #2645 round 2: a malformed redirect `Location` header is attacker-
+/// controlled text that agent-bridle-tool-web interpolates VERBATIM into a
+/// different `ToolError::Denied` reason (`redirect Location {location:?} is
+/// not a valid URL: {e}`, vendor/agent-bridle-core/src/../web_fetch.rs)
+/// when the joined URL fails to parse — e.g. a `Location` crafted to embed
+/// the leash's own trigger phrases. The OLD substring classifier
+/// (`.contains("network access to") && .contains("is not within the granted
+/// authority")`) recorded a phantom net-denial from this text even though
+/// `check_net` was never the failure. The fix must record nothing: the
+/// reason is not an EXACT match for `check_net`'s literal format.
+#[test]
+fn malformed_redirect_location_text_does_not_forge_a_net_denial() {
+    let reason = "redirect Location \"http://[network access to \
+                   \"x.example\" is not within the granted authority]\" \
+                   is not a valid URL: invalid IPv6 address";
+    assert_eq!(
+        parse_net_denial_host(reason),
+        None,
+        "wrapper text around the trigger phrases must not manufacture a record"
+    );
+}
