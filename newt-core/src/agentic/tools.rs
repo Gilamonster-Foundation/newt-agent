@@ -1972,6 +1972,59 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
     }
 }
 
+/// Extract the denied host from a [`agent_bridle::ToolError::Denied`] reason
+/// IFF the reason is an EXACT match for the literal wording two known leash
+/// constructors emit — never a substring check (#2645 round 2). Both
+/// `agent_bridle_core::ToolContext::check_net`
+/// (vendor/agent-bridle-core/src/context.rs) AND agent-bridle-tool-web's own
+/// `NetGuardError::HostNotAllowed` (`net_guard.rs`, converted to `Denied` at
+/// `web_fetch.rs`'s `net_guard_to_tool`) use the identical
+/// `format!("network access to {host:?} is not within the granted authority")`
+/// — correcting round 2's comment, which claimed only `check_net` emits this
+/// (#2645 round-2 review). Both are genuine net-authority denials for the
+/// SAME host/scope the fetch loop already re-checks per hop
+/// (`web_fetch.rs:250-269` calls `check_net` before `screen_host`), so
+/// treating them alike is not a widening.
+///
+/// This function only ever sees the `Denied` variant's raw `reason` field —
+/// never `ToolError`'s `Display` (which prepends `"denied: "`) and never any
+/// other variant — see [`web_fetch_denial_host`], which matches the variant
+/// FIRST (#2645 round 3). Requiring the anchored prefix/suffix (not
+/// `.contains`) means wrapper text around an untrusted, interpolated string
+/// — e.g. agent-bridle-tool-web's `redirect Location {location:?} is not a
+/// valid URL: {e}` when a server sends a malformed `Location` — can never
+/// satisfy the match merely by *containing* both trigger phrases somewhere in
+/// a longer message.
+fn parse_net_denial_host(reason: &str) -> Option<String> {
+    let host = reason
+        .strip_prefix("network access to \"")?
+        .strip_suffix("\" is not within the granted authority")?;
+    // A real hostname/IP never contains a literal `"` — the format's
+    // `{host:?}` would escape one. Bail rather than guess at unescaping.
+    (!host.is_empty() && !host.contains('"')).then(|| host.to_string())
+}
+
+/// The `web_fetch` dispatch-error → net-denial-journal decision (#2645 round
+/// 3), factored out of the `execute_tool` match arm as a narrow seam: it
+/// takes exactly what the call site has (the request URL, for parity with
+/// the pre-#2645 shape of this decision, and the leash's `ToolError`) so
+/// tests can drive it with a CONSTRUCTED error instead of a live network
+/// dispatch. `url` is not consulted for the recorded host — #2645 round 2
+/// fixed the bug where it was (a redirect can be denied on a DIFFERENT host
+/// than the original request) — it is accepted only so the seam's signature
+/// matches what a caller here actually has in hand.
+///
+/// Matches the `Denied` VARIANT before parsing anything (#2645 round-3
+/// review): a `NotFound`, `Budget`, `Generation`, `Exec` or `Other` failure
+/// never reaches [`parse_net_denial_host`] at all, regardless of what text it
+/// happens to contain.
+fn web_fetch_denial_host(_url: &str, err: &agent_bridle::ToolError) -> Option<String> {
+    match err {
+        agent_bridle::ToolError::Denied { reason } => parse_net_denial_host(reason),
+        _ => None,
+    }
+}
+
 /// MCP `_meta` extension by which an admitted connector declares the exact URL
 /// prefixes a tool can read.  The value is an array of absolute HTTP(S) URLs.
 ///
@@ -5058,7 +5111,20 @@ async fn execute_authorized_tool(
                 // timeout) — surface the reason; Display is safe. Private-address
                 // denials gain an MCP-first recovery hint without weakening the
                 // refusal itself.
-                Err(e) => render_web_fetch_error(url, &e.to_string(), &*mcp, persona_tools, disposition),
+                Err(e) => {
+                    let reason = e.to_string();
+                    // #2643: the exec/run_command path journals denials via
+                    // `record_envelope`; this leash refusal has no envelope
+                    // (net is checked before any subprocess exists), so it
+                    // needs its own append or `newt ocap denials` never sees
+                    // a `web_fetch` net denial at all. #2645 rounds 2-3: see
+                    // `web_fetch_denial_host`'s doc comment for why this
+                    // can't just substring-match `reason`.
+                    if let Some(host) = web_fetch_denial_host(url, &e) {
+                        crate::denial_journal::record_net_denial("web_fetch", &host, &reason);
+                    }
+                    render_web_fetch_error(url, &reason, &*mcp, persona_tools, disposition)
+                }
             }
         }
 
