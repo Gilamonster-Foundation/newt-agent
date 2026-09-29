@@ -141,6 +141,7 @@ fn declined_permissions_report_defaults_without_refreshing_authority() {
                 false,
                 20,
                 "/parent/child",
+                None,
             )
             .1;
             // The tool trims requested targets; diagnostics must reflect the
@@ -328,6 +329,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         false,
         20,
         "/workspace",
+        None,
     )
     .1;
     assert!(out.starts_with("granted:"), "got: {out}");
@@ -346,6 +348,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         false,
         20,
         "/workspace",
+        None,
     )
     .1;
     assert!(out.starts_with("denied:"), "got: {out}");
@@ -359,6 +362,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         false,
         20,
         "/workspace",
+        None,
     )
     .1;
     assert!(out.contains("no operator available"), "got: {out}");
@@ -406,19 +410,33 @@ fn permission_grant_releases_only_cached_authority_failures() {
 
         let mut allow = MockGate::new(true, &Caveats::top());
         let mut deny = MockGate::new(false, &Caveats::top());
-        let granted =
-            execute_request_permissions(&permission, Some(&mut allow), false, 20, "/workspace").1;
+        let granted = execute_request_permissions(
+            &permission,
+            Some(&mut allow),
+            false,
+            20,
+            "/workspace",
+            None,
+        )
+        .1;
         for (name, request, result) in [
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, Some(&mut deny), false, 20, "/workspace")
-                    .1,
+                execute_request_permissions(
+                    &permission,
+                    Some(&mut deny),
+                    false,
+                    20,
+                    "/workspace",
+                    None,
+                )
+                .1,
             ),
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, None, false, 20, "/workspace").1,
+                execute_request_permissions(&permission, None, false, 20, "/workspace", None).1,
             ),
             (
                 "request_permissions",
@@ -429,6 +447,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
                     false,
                     20,
                     "/workspace",
+                    None,
                 )
                 .1,
             ),
@@ -524,7 +543,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
                 let declined =
-                    execute_request_permissions(&permission, None, false, 20, "/workspace").1;
+                    execute_request_permissions(&permission, None, false, 20, "/workspace", None).1;
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -541,6 +560,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     false,
                     20,
                     "/workspace",
+                    None,
                 )
                 .1;
                 guard.record(
@@ -596,7 +616,7 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
     let mut gate = MockGate::new(true, &base);
     let permission = serde_json::json!({"capability": "fs_read", "target": file});
     let granted =
-        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace").1;
+        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace", None).1;
     assert!(granted.starts_with("granted:"), "{granted}");
     guard.record(
         "request_permissions",
@@ -649,6 +669,7 @@ fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
         false,
         20,
         "/workspace",
+        None,
     )
     .1;
     // Preserves the recoverable "no operator" signal.
@@ -684,6 +705,7 @@ fn request_permissions_coaches_bad_inputs() {
         false,
         20,
         "/workspace",
+        None,
     )
     .1;
     assert!(out.contains("unknown capability"), "got: {out}");
@@ -695,6 +717,7 @@ fn request_permissions_coaches_bad_inputs() {
         false,
         20,
         "/workspace",
+        None,
     )
     .1;
     assert!(out.contains("'target' is required"), "got: {out}");
@@ -1116,8 +1139,15 @@ fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
             {
                 let args = serde_json::json!({"capability": capability, "target": target});
                 let mut gate = MockGate::new(true, &Caveats::top());
-                let result =
-                    execute_request_permissions(&args, Some(&mut gate), false, 20, "/workspace").1;
+                let result = execute_request_permissions(
+                    &args,
+                    Some(&mut gate),
+                    false,
+                    20,
+                    "/workspace",
+                    None,
+                )
+                .1;
                 assert!(permission_grant_succeeded(
                     "request_permissions",
                     &args,
@@ -1716,12 +1746,15 @@ async fn lifecycle_build_grant_runs_real_cargo() {
     }
 }
 
-/// #2628 regression: after a `run_command` denial, the operator approving
-/// via `request_permissions` must cause the harness to re-run the command
-/// with the widened one-shot grant.  The model must receive the command
-/// result directly — never "Retry the original operation now".
+/// #2628/#2636 regression: after a `run_command` denial, the operator
+/// approving via `request_permissions` must cause the harness to re-run the
+/// command with the widened one-shot grant, EXACTLY ONCE, under exactly the
+/// authority it was denied on. The model must receive the command result
+/// directly — never "Retry the original operation now".
 ///
-/// Grounds: `pending_rerun` wiring through the dispatch arms.
+/// Grounds: `pending_rerun` wiring through the dispatch arms, plus round1's
+/// four P1 findings — binding to the denial, replaying under original
+/// policy, one-shot grant consumption, and disclosure of what approval runs.
 #[cfg(unix)]
 #[tokio::test]
 async fn approved_request_permissions_reruns_denied_run_command() {
@@ -1729,13 +1762,28 @@ async fn approved_request_permissions_reruns_denied_run_command() {
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
 
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().canonicalize().unwrap();
+    let outer = tempfile::tempdir().unwrap();
+    let workspace_dir = tempfile::tempdir_in(outer.path()).unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
     let workspace_str = workspace.to_string_lossy().into_owned();
     // A target path the command declares it will write (outside workspace so
-    // that the workspace-scoped write-scope does not accidentally permit it).
-    let outfile = dir.path().parent().unwrap().join("out_2628.txt");
+    // that the workspace-scoped write-scope does not accidentally permit it),
+    // owned by its own TempDir rather than a fixed sibling path.
+    let target_dir = tempfile::tempdir_in(outer.path()).unwrap();
+    let outfile = target_dir.path().join("out_2628.txt");
     let outfile_str = outfile.to_string_lossy().into_owned();
+    // `cp` rather than shell redirection (`>`): the safe-subset engine's
+    // confined free-form dispatch does not support redirection (verified: a
+    // bare `printf … > file` fails "No such file or directory" even with an
+    // absolute binary path, while `touch`/`cp` with no redirection succeed).
+    let src = target_dir.path().join("src_2628.txt");
+    std::fs::write(&src, "HELLO_2628").unwrap();
+    let src_str = src.to_string_lossy().into_owned();
+    // Pre-created (empty), not newly minted by the replay: an OVERWRITE, not
+    // a CREATE — the confined shell's kernel-level fs_write grant is scoped
+    // to the leaf path and (verified) does not itself carry the parent
+    // directory's create permission a brand-new file would need.
+    std::fs::write(&outfile, "").unwrap();
 
     // Caveats with no fs_write — the declared write request will be denied.
     let base = Caveats {
@@ -1745,12 +1793,13 @@ async fn approved_request_permissions_reruns_denied_run_command() {
 
     // ── Step 1: run_command denied because it declares fs_write ──────────────
     let mut deny_gate = MockGate::new(false, &base);
-    let mut pending_rerun: Option<serde_json::Value> = None;
+    let mut pending_rerun: Option<crate::agentic::tools::PendingRerun> = None;
     let execution1 = std::sync::OnceLock::<ExecOutcome>::new();
     let result1 = execute_tool_with_collaborators(
         "run_command",
         &serde_json::json!({
-            "command": format!("printf HELLO_2628 > {outfile_str}"),
+            "command": format!("/bin/cp {src_str} {outfile_str}"),
+            "fs_read": [src_str.clone()],
             "fs_write": [outfile_str.clone()],
         }),
         &workspace_str,
@@ -1772,7 +1821,8 @@ async fn approved_request_permissions_reruns_denied_run_command() {
     .unwrap()
     .unwrap();
 
-    // Verify the denial was observed and recorded for re-run.
+    // Verify the denial was observed and recorded for re-run, and nothing
+    // wrote the target yet.
     assert_eq!(
         execution1.get(),
         Some(&ExecOutcome::Denied),
@@ -1782,8 +1832,139 @@ async fn approved_request_permissions_reruns_denied_run_command() {
         pending_rerun.is_some(),
         "#2628: denied run_command must be stored in pending_rerun: {result1}"
     );
+    assert_eq!(
+        std::fs::read_to_string(&outfile).unwrap(),
+        "",
+        "denied command must not have run: {result1}"
+    );
 
-    // ── Step 2: request_permissions approved → harness re-runs the command ───
+    // ── finding 1: an UNRELATED tool call in between invalidates the slot ────
+    let mut noop_gate = MockGate::new(true, &base);
+    let _ = execute_tool_with_collaborators(
+        "resume_context",
+        &serde_json::json!({}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut noop_gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        pending_rerun.is_none(),
+        "#2636 finding 1: an intervening unrelated tool call must invalidate a stale pending_rerun"
+    );
+
+    // ── Re-deny to repopulate the slot, then approve a DIFFERENT target —────
+    // finding 1: an unrelated grant must not authorize replaying this
+    // invocation. This is its own isolated deny→(wrong)approve cycle —
+    // `request_permissions` always consumes whatever slot it finds (matched
+    // or not), so this deliberately spends and discards it, then the main
+    // happy path below re-denies fresh for the correctly-bound approval.
+    {
+        let mut deny_gate2 = MockGate::new(false, &base);
+        let result1b = execute_tool_with_collaborators(
+            "run_command",
+            &serde_json::json!({
+                "command": format!("/bin/cp {src_str} {outfile_str}"),
+                "fs_read": [src_str.clone()],
+                "fs_write": [outfile_str.clone()],
+            }),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut deny_gate2 as &mut dyn PermissionGate),
+                pending_rerun: Some(&mut pending_rerun),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(pending_rerun.is_some(), "{result1b}");
+
+        let unrelated_target = target_dir.path().join("unrelated.txt");
+        let mut allow_unrelated_gate = MockGate::new(true, &base);
+        let unrelated_result = execute_tool_with_collaborators(
+            "request_permissions",
+            &serde_json::json!({
+                "capability": "fs_write",
+                "target": unrelated_target.to_string_lossy(),
+                "reason": "unrelated grant",
+            }),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut allow_unrelated_gate as &mut dyn PermissionGate),
+                pending_rerun: Some(&mut pending_rerun),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&outfile).unwrap(),
+            "",
+            "#2636 finding 1: an unrelated grant must not replay the bound denial: {unrelated_result}"
+        );
+        assert!(
+            pending_rerun.is_none(),
+            "request_permissions always consumes the slot it finds"
+        );
+    }
+
+    // ── re-deny fresh, then Step 2: request_permissions approved for the
+    // ACTUAL bound target —────
+    let mut deny_gate3 = MockGate::new(false, &base);
+    let result1c = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!("/bin/cp {src_str} {outfile_str}"),
+            "fs_read": [src_str.clone()],
+            "fs_write": [outfile_str.clone()],
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut deny_gate3 as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(pending_rerun.is_some(), "{result1c}");
+    // harness re-runs the command exactly once.
     let mut allow_gate = MockGate::new(true, &base);
     let execution2 = std::sync::OnceLock::<ExecOutcome>::new();
     let result2 = execute_tool_with_collaborators(
@@ -1821,5 +2002,58 @@ async fn approved_request_permissions_reruns_denied_run_command() {
     assert!(
         !result2.contains("Retry the original operation"),
         "#2628: harness must re-run the command directly, not instruct the model to retry: {result2}"
+    );
+    // The command must actually have executed exactly once, with its real effect.
+    assert_eq!(
+        execution2.get(),
+        Some(&ExecOutcome::Passed),
+        "#2636 finding 5: replay must actually succeed: {result2}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outfile).expect("replay must have written the file"),
+        "HELLO_2628",
+        "#2636 finding 5: the replay's real effect must be observed directly, not inferred from output text"
+    );
+
+    // ── sanity: a later operation is gated fresh, not silently replayed ──────
+    // `MockGate` has no `pending_once_grants` queue to reproduce the real
+    // finding-2 defect (round1's own note); that mechanism is covered by
+    // `consume_pending_once_removes_what_ask_just_queued_for_request_permissions`
+    // in newt-tui against the real gate. This only pins that the #2628 slot
+    // itself does not leak a second execution.
+    let mut second_write_gate = MockGate::new(false, &base);
+    let later_result = execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!("/bin/cp {src_str} {outfile_str}"),
+            "fs_read": [src_str.clone()],
+            "fs_write": [outfile_str.clone()],
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut second_write_gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_rerun),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        later_result.starts_with("capability denied:"),
+        "#2636 finding 2: a later operation on the same target must be denied again, \
+         not silently honor the already-spent allow-once grant: {later_result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outfile).unwrap(),
+        "HELLO_2628",
+        "the denied second write must not have run"
     );
 }

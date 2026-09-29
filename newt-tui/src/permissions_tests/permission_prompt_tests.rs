@@ -903,6 +903,51 @@ pub(super) fn scripted_gate<'a>(
     }
 }
 
+/// #2636 round1 finding 2: an `AllowOnce` answer to a `request_permissions`
+/// call queues a proactive once-grant for the model's own later retry
+/// (`pending_once_grants`). When that same grant is instead spent
+/// immediately by a #2628 automatic replay, the caller (`newt-core`'s
+/// `execute_request_permissions`) tells the gate via `consume_pending_once`
+/// — this must remove the SAME entry `ask` just queued, so it cannot also
+/// widen a later, unrelated operation on the same (kind, target).
+#[test]
+fn consume_pending_once_removes_what_ask_just_queued_for_request_permissions() {
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0usize));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    let request = PermissionRequest {
+        tool: "request_permissions".to_string(),
+        kind: DenialKind::FsWrite,
+        target: "/ws/out.txt".to_string(),
+        reason: "model requested fs_write for '/ws/out.txt'".to_string(),
+    };
+    let decision = gate.ask(&[request]);
+    assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
+    assert!(
+        gate.state
+            .pending_once_grants
+            .contains(&(DenialKind::FsWrite, "/ws/out.txt".to_string())),
+        "AllowOnce on request_permissions must queue a proactive once-grant"
+    );
+
+    gate.consume_pending_once(DenialKind::FsWrite, "/ws/out.txt");
+
+    assert!(
+        !gate
+            .state
+            .pending_once_grants
+            .contains(&(DenialKind::FsWrite, "/ws/out.txt".to_string())),
+        "#2636: a replay-spent grant must not remain queued for a later unrelated operation"
+    );
+}
+
 #[test]
 fn mcp_net_prompt_routes_choices_and_controls_through_the_terminal_owner() {
     for (outcome, allowed, remembered, cancelled, exited) in [

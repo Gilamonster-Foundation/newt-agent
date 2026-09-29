@@ -896,6 +896,14 @@ async fn dispatch_bridled_shell_with_floor(
     result
 }
 
+/// #2636: the EXACT message emitted only when `run_command` is refused
+/// before anything ran, purely for missing declared filesystem authority —
+/// the one denial shape a #2628 rerun is allowed to bind to (round1 finding
+/// 3). Any other `Denied` result (a broker-bearing runtime refusal, a build
+/// fence, a compound command that partially ran) must never enter that slot.
+pub(super) const UNGRANTED_FS_AUTHORITY_DENIAL: &str =
+    "capability denied: declared filesystem authority was not granted for this command";
+
 /// Parse the entire invocation manifest before any approval can be consumed.
 pub(super) fn declared_filesystem_requests(
     args: &serde_json::Value,
@@ -1125,12 +1133,14 @@ pub(super) async fn exec_confined_command_with_broker(
             {
                 Some(allowed)
             }
-            _ => return with_denial_context(
-                ("capability denied: declared filesystem authority was not granted for this command".into(), ExecOutcome::Denied),
-                workspace,
-                cwd,
-                Some(caveats),
-            ),
+            _ => {
+                return with_denial_context(
+                    (UNGRANTED_FS_AUTHORITY_DENIAL.into(), ExecOutcome::Denied),
+                    workspace,
+                    cwd,
+                    Some(caveats),
+                )
+            }
         }
     };
     let caveats = admitted.as_ref().unwrap_or(caveats);

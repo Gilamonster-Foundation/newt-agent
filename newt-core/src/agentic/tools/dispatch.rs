@@ -95,7 +95,7 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// when the operator approves, which then re-runs the command with the
     /// widened one-shot caveats so the model receives the result directly
     /// instead of a "retry" instruction.
-    pub(crate) pending_rerun: Option<&'gate mut Option<serde_json::Value>>,
+    pub(crate) pending_rerun: Option<&'gate mut Option<super::PendingRerun>>,
 }
 
 #[allow(clippy::too_many_arguments)]

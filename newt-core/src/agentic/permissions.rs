@@ -227,6 +227,14 @@ pub struct PermissionRequest {
     pub reason: String,
 }
 
+/// #2636 (round1 finding 4): prefix marking a `request_permissions` reason
+/// as HARNESS-authored (it discloses the exact command a #2628 replay is
+/// about to run), not the model-supplied text. `reason_is_model_authored`
+/// in the interactive gate must not label this "model says (unverified)" —
+/// it is the one case where the reason IS verified, because the harness
+/// wrote it from the bound denial record, not from the model's tool call.
+pub const BOUND_REASON_PREFIX: &str = "#2628 approval executes: ";
+
 /// Verdict from consulting the gate.
 pub enum PermissionDecision {
     /// Re-execute the denied call under these caveats. They are a freshly
@@ -296,6 +304,17 @@ pub trait PermissionGate {
     /// can be refused on several targets at once). `Allow` means every
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
+
+    /// #2636: a caller that just spent an `Allow(kind, target)` on an
+    /// immediate, one-shot action — rather than leaving it for the model's
+    /// own later retry — tells the gate so any proactive once-grant it
+    /// queued for that later retry is dropped too. Without this, a gate that
+    /// tracks a separate "the model's next matching call auto-approves"
+    /// queue (built for the ordinary request→retry flow) keeps honoring a
+    /// grant that was already spent, widening its effective lifetime past
+    /// the single approval the operator gave. Default no-op: gates with no
+    /// such queue have nothing to drop.
+    fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
 
     /// Ask for additions to this invocation's authority, retaining its caller
     /// bounds and prior one-shot grants. Legacy gates may conservatively drop

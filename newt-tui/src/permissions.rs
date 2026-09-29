@@ -81,7 +81,10 @@ pub(crate) fn should_prompt_permissions(
 pub(crate) use newt_core::tty::try_watch_stdin;
 
 pub(crate) fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bool {
-    req.tool == "request_permissions"
+    // #2636 round1 finding 4: a #2628-bound approval's reason is written by
+    // the harness from the denial record, not by the model — see
+    // `BOUND_REASON_PREFIX`'s doc comment.
+    req.tool == "request_permissions" && !req.reason.starts_with(newt_core::BOUND_REASON_PREFIX)
 }
 
 /// How long the gate waits for a web decision before failing closed.
@@ -1784,6 +1787,12 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
 
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
         self.ask_with_caveats(&self.base.clone(), requests)
+    }
+
+    fn consume_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
+        self.state
+            .pending_once_grants
+            .remove(&(kind, target.to_string()));
     }
 
     fn ask_with_caveats(

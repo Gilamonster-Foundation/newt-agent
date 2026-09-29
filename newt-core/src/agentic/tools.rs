@@ -14,6 +14,7 @@ use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition};
 use super::note_sink::{execute_save_note, save_note_tool_definition};
 use super::permissions::{
     DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
+    BOUND_REASON_PREFIX,
 };
 use super::prompt_intake::PromptDisposition;
 use super::prompt_read::execute_prompt_read_silent;
@@ -72,7 +73,7 @@ use shell::{
 };
 use shell::{
     declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,
-    resolve_exec_cwd, split_leading_cd,
+    permits_filesystem_request, resolve_exec_cwd, split_leading_cd, UNGRANTED_FS_AUTHORITY_DENIAL,
 };
 #[cfg(all(test, not(windows)))]
 use shell::{
@@ -1800,6 +1801,27 @@ pub(super) fn permission_grant_succeeded(
             && !result.starts_with("request_permissions:"))
 }
 
+/// #2628/#2636: a `run_command` denied purely for undeclared filesystem
+/// authority, remembered for ONE immediate `request_permissions` reply — see
+/// `UNGRANTED_FS_AUTHORITY_DENIAL` for the exact denial shape eligible here.
+///
+/// Binding (round1 finding 1): `missing` is the exact set of filesystem
+/// requests this command was denied on, captured at denial time. Replay is
+/// permitted only when the operator's grant now covers every one of them —
+/// an unrelated or narrower approval does not authorize replaying this
+/// invocation. The slot is cleared on ANY tool call other than the
+/// `request_permissions` that consumes it (see `execute_authorized_tool`),
+/// so an unrelated intervening command — successful, failed, or a
+/// replacement for this one — invalidates a stale rerun.
+pub(super) struct PendingRerun {
+    cmd: String,
+    cwd: String,
+    declared: Vec<PermissionRequest>,
+    /// The subset of `declared` NOT covered by caveats at denial time — what
+    /// the operator's grant must cover for replay to proceed.
+    missing: Vec<PermissionRequest>,
+}
+
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
 /// path. It builds a [`PermissionRequest`] from `{capability, target, reason}`
 /// and consults the SAME #263 [`PermissionGate`] a denial would: `Allow` reports
@@ -1818,12 +1840,26 @@ pub(super) fn permission_grant_succeeded(
 /// Returns `(Some(widened), message)` when the operator approved, `(None,
 /// message)` on denial or when no gate is available.  The `widened` caveats
 /// are threaded back to the dispatch arm for the #2628 one-shot re-run.
+///
+/// `bound`: `Some(pending)` when a #2628 `pending_rerun` is queued for THIS
+/// call — the model is answering a specific prior denial, not asking
+/// proactively. Then:
+/// - On `Allow`, immediately tell the gate to drop any proactive once-grant
+///   it queued for a later retry (round1 finding 2): the automatic replay is
+///   about to spend it right here, so it must not also remain available to
+///   widen a later, unrelated operation on the same (kind, target).
+/// - The reason shown to the operator is harness-authored, not the
+///   model-supplied text: it names the bound command and cwd and says
+///   plainly that approval executes it once (round1 finding 4) — the model's
+///   `reason` cannot be trusted to disclose that, since the tool call is
+///   model-selected and unverified.
 fn execute_request_permissions(
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
     _color: bool,
     _tool_output_lines: usize,
     workspace: &str,
+    bound: Option<&PendingRerun>,
 ) -> (Option<crate::caveats::Caveats>, String) {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
@@ -1850,10 +1886,17 @@ fn execute_request_permissions(
         tool: "request_permissions".to_string(),
         kind,
         target: target.to_string(),
-        reason: if reason.is_empty() {
-            format!("model requested {capability} for '{target}'")
-        } else {
-            reason.to_string()
+        reason: match bound {
+            // #2636 round1 finding 4: harness-authored disclosure of the
+            // execution this approval triggers — never the model's `reason`.
+            Some(pending) => format!(
+                "{BOUND_REASON_PREFIX}approving this widens {capability} for '{target}' and \
+                 IMMEDIATELY re-runs the command it was denied for, ONCE, under exactly that \
+                 grant: `{}` in `{}`. It will not run again without a fresh approval.",
+                pending.cmd, pending.cwd
+            ),
+            None if reason.is_empty() => format!("model requested {capability} for '{target}'"),
+            None => reason.to_string(),
         },
     };
 
@@ -1863,6 +1906,9 @@ fn execute_request_permissions(
         // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(widened) => {
+                if bound.is_some() {
+                    g.consume_pending_once(kind, target);
+                }
                 return (Some(widened), permission_granted_result(capability, target));
             }
             PermissionDecision::Deny => (
@@ -3262,6 +3308,19 @@ async fn execute_authorized_tool(
         routed_to: routed_to_slot,
         pending_rerun,
     } = collab;
+    // #2636 (round1 finding 1): a queued #2628 rerun binds to the denial that
+    // set it. ANY tool call other than the `request_permissions` that
+    // consumes it invalidates a stale slot immediately — including a
+    // successful/failed run_command that replaces the denied one, or any
+    // unrelated tool activity in between. Only `request_permissions` reads
+    // the slot below (and takes it), so every other arm sees it already
+    // cleared.
+    let pending_rerun = pending_rerun.map(|slot| {
+        if name != "request_permissions" {
+            *slot = None;
+        }
+        slot
+    });
     let smart_harness = invocation.map(|call| call.harness());
     // #2315: hand the shell's execution class to the funnel, return the text.
     let executed = |(text, outcome): (String, crate::ExecOutcome)| {
@@ -3662,38 +3721,43 @@ async fn execute_authorized_tool(
         // than blocking. Consumes the gate (mutually exclusive with the
         // run_command / fs arms that also use it — only one arm runs per call).
         //
-        // #2628: on approval, if a pending_rerun slot carries the args of the
-        // denied run_command, re-run it immediately with the widened one-shot
-        // caveats so the model receives the result directly instead of a
-        // "Retry the original operation now" instruction.
+        // #2628/#2636: on approval, if a pending_rerun slot carries a denial
+        // this exact approval covers, re-run it immediately with the widened
+        // one-shot caveats so the model receives the result directly instead
+        // of a "Retry the original operation now" instruction.
+        //
+        // Binding (round1 finding 1): replay proceeds ONLY when the grant
+        // just obtained covers EVERY filesystem request the command was
+        // denied on (`pending.missing`) — an approval for a different
+        // capability, target, or axis is not consent to replay this
+        // invocation, and the model's own retry path (a fresh `run_command`
+        // call) is unaffected either way.
         "request_permissions" => {
-            let rerun_args = pending_rerun.and_then(|slot| slot.take());
-            let (granted, msg) =
-                execute_request_permissions(args, permission_gate, color, tool_output_lines, workspace);
-            match (granted, rerun_args) {
-                (Some(widened), Some(rerun)) => {
-                    let raw_cmd = rerun["command"].as_str().unwrap_or("");
-                    let (cd_path, cmd_owned) = split_leading_cd(raw_cmd);
-                    let cmd = cmd_owned.as_str();
-                    let run_cwd = resolve_exec_cwd(
-                        workspace,
-                        cd_path
-                            .as_deref()
-                            .or_else(|| rerun.get("cwd").and_then(|v| v.as_str())),
-                    );
-                    let fs_reqs = match declared_filesystem_requests(&rerun, cmd, &run_cwd) {
-                        Ok(r) => r,
-                        Err(e) => return host_return(e),
-                    };
+            let rerun = pending_rerun.and_then(|slot| slot.take());
+            let (granted, msg) = execute_request_permissions(
+                args,
+                permission_gate,
+                color,
+                tool_output_lines,
+                workspace,
+                rerun.as_ref(),
+            );
+            match (granted, rerun) {
+                (Some(widened), Some(pending))
+                    if pending
+                        .missing
+                        .iter()
+                        .all(|request| permits_filesystem_request(&widened, request)) =>
+                {
                     executed(
                         exec_confined_command(
-                            cmd,
-                            &run_cwd,
+                            &pending.cmd,
+                            &pending.cwd,
                             workspace,
                             color,
                             tool_output_lines,
                             &widened,
-                            &fs_reqs,
+                            &pending.declared,
                             exec_floor,
                             &mut None, // one-shot: no further interactive prompting
                             tool_offload,
@@ -3704,7 +3768,9 @@ async fn execute_authorized_tool(
                         .await,
                     )
                 }
-                // No pending rerun or denied/headless: fall back to the grant/denial message.
+                // No pending rerun, denied/headless, or the grant just given
+                // does not cover what this specific denial needed: fall back
+                // to the grant/denial message.
                 (_, _) => msg,
             }
         }
@@ -3951,7 +4017,16 @@ async fn execute_authorized_tool(
                 Err(error) => return host_return(error),
             };
             if let Some(program) = build_shell::build_program(cmd) {
-                let result = executed(
+                // #2636 (round1 finding 3): a build denial is NEVER eligible
+                // for #2628 replay. `build_shell::execute` enforces the
+                // calibrated build fence and explicitly forbids re-running
+                // after a denial (earlier stages may already have side
+                // effects) — routing it back through plain `exec_confined_command`
+                // on approval would drop that fence and could repeat a write
+                // that already happened. `pending_rerun` is left untouched
+                // here (already cleared above), so no build denial can ever
+                // populate it.
+                return executed(
                     build_shell::execute(
                         cmd,
                         &program,
@@ -3971,18 +4046,13 @@ async fn execute_authorized_tool(
                     )
                     .await,
                 );
-                if let Some(slot) = pending_rerun {
-                    if execution.and_then(|e| e.get()) == Some(&crate::ExecOutcome::Denied) {
-                        *slot = Some(raw_args.clone());
-                    }
-                }
-                return result;
             }
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
             // `objects/` for THIS dispatch only — see
             // `dispatch_caveats_for_git_shell`'s doc comment.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
+            let commit_broker_used = commit_broker.is_some();
             let result = executed(
                 shell::exec_confined_command_with_broker(
                     cmd,
@@ -4002,9 +4072,32 @@ async fn execute_authorized_tool(
                 )
                 .await,
             );
+            // #2636 (round1 findings 1 & 3): capture ONLY the one denial shape
+            // #2628 is meant for — refused before anything ran, purely for
+            // undeclared filesystem authority (`UNGRANTED_FS_AUTHORITY_DENIAL`,
+            // checked by prefix since `with_denial_context` appends a diagnostic
+            // suffix). Every other denial (a broker-bearing runtime refusal, a
+            // compound command that partially ran, an exec/net denial) produces
+            // a different message and is never captured. A native-Git
+            // commit-producing command is excluded even then: replay drops
+            // `commit_broker` and `git_shell_caveats`, which would bypass the
+            // attribution/signing policy and the gitdir-write caveat this
+            // dispatch applied — finding 3's "route through the original
+            // dispatch policy, never a bypass". Bind the record to the exact
+            // missing authority so an unrelated later grant cannot replay it.
             if let Some(slot) = pending_rerun {
-                if execution.and_then(|e| e.get()) == Some(&crate::ExecOutcome::Denied) {
-                    *slot = Some(raw_args.clone());
+                if !commit_broker_used && result.starts_with(UNGRANTED_FS_AUTHORITY_DENIAL) {
+                    let missing: Vec<_> = filesystem_requests
+                        .iter()
+                        .filter(|request| !permits_filesystem_request(caveats, request))
+                        .cloned()
+                        .collect();
+                    *slot = Some(PendingRerun {
+                        cmd: cmd.to_string(),
+                        cwd: run_cwd.clone(),
+                        declared: filesystem_requests.clone(),
+                        missing,
+                    });
                 }
             }
             result
