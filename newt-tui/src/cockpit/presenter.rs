@@ -409,6 +409,7 @@ impl Screen {
         status_rows: u16,
     ) -> io::Result<()> {
         let old_top = self.top;
+        let old_rows = self.rows;
         // Narrowing reflows any old block row wider than the new terminal onto
         // extra rows, lifting the stale block above `old_top`.
         let lifted = if cols.max(1) < self.cols {
@@ -421,7 +422,7 @@ impl Screen {
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
-        self.top = self.rows - new_h;
+        self.top = resize_new_top(old_top, old_rows, self.rows, new_h);
         // FORCED: the TERMINAL resized; the block's new position is a
         // consequence, not a request.
         self.region.relocate(
@@ -611,6 +612,24 @@ fn restore_terminal_modes() {
     // it is declared after this guard so it restores AFTER these — see that
     // field's doc for why the order matters.
     let _ = write_mode_restores(&mut io::stdout());
+}
+
+/// Where the block moves to on a resize event (#2441).
+///
+/// A terminal that GROWS does not pull the transcript down to meet a
+/// bottom-anchored block — most terminals add the new rows below existing
+/// content instead of scrolling it (confirmed against a real herdr pane
+/// grow, #2441 evidence) — so jumping straight to `new_rows - new_h` opens a
+/// blank canyon between the transcript, which stayed where it was, and the
+/// block, which jumped to the new bottom. Keep the block where the content
+/// actually ends (`old_top`) and only fall back to the bottom anchor when
+/// the terminal did not grow, or the block would not fit there.
+fn resize_new_top(old_top: u16, old_rows: u16, new_rows: u16, new_h: u16) -> u16 {
+    if new_rows > old_rows && old_top + new_h <= new_rows {
+        old_top
+    } else {
+        new_rows - new_h
+    }
 }
 
 /// The row `resize` clears downward from so the OLD cockpit region cannot
@@ -2005,6 +2024,33 @@ mod tests {
         assert_eq!(panel_erase_from(13, 18, 100, 60, 31, 18), 0);
         // Never row 0 unless the reflow truly reaches it.
         assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
+    }
+
+    /// #2441: a herdr pane grew from 30 to 63 rows with the block at top 27,
+    /// height 3. Before this fix the block jumped to `63 - 3 = 60`, opening a
+    /// 30-row blank canyon between the untouched transcript and the block —
+    /// exactly the "rows 27-60 blank" gap the evidence files captured. It
+    /// must stay put, directly under the existing content, instead.
+    #[test]
+    fn growing_the_terminal_keeps_the_block_under_existing_content_2441() {
+        assert_eq!(resize_new_top(27, 30, 63, 3), 27);
+    }
+
+    #[test]
+    fn a_shrinking_terminal_still_bottom_anchors_the_block() {
+        assert_eq!(resize_new_top(20, 30, 10, 3), 7);
+    }
+
+    #[test]
+    fn growth_too_small_for_the_block_to_fit_falls_back_to_the_bottom() {
+        // Old top 27 + height 3 would land on row 30, past the new 28-row
+        // screen: bottom-anchor instead of hanging the block off-screen.
+        assert_eq!(resize_new_top(27, 30, 28, 3), 25);
+    }
+
+    #[test]
+    fn equal_rows_keeps_the_existing_bottom_anchor_behavior() {
+        assert_eq!(resize_new_top(20, 24, 24, 4), 20);
     }
 
     #[test]
