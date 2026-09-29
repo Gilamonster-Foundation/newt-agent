@@ -369,3 +369,80 @@ fn a_piped_absence_keeps_its_output_and_names_the_program() {
     );
     assert_eq!(outcome, crate::ExecOutcome::Passed);
 }
+
+/// #2629 — the CHILD-exec sibling of the kernel-refusal test above. `git`
+/// itself ran (exit 1, neither 126 nor 127, no `denials` entry) and only its
+/// OWN internal exec of a helper was refused, exactly the issue's literal
+/// example: `fatal: cannot exec 'branch': Permission denied`. Before the fix
+/// this text reached the model completely unstructured; after it, the same
+/// axis+target+`request_permissions` shape every other denial already uses
+/// covers it too.
+#[test]
+fn a_denied_child_exec_is_a_named_denial() {
+    let present = present_host_binary();
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": format!("fatal: cannot exec '{present}': Permission denied\n"),
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        "git branch",
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| unreachable!("a recognised child-exec denial must short-circuit rendering"),
+    );
+    assert!(text.starts_with("capability denied:"), "{text}");
+    assert!(
+        text.contains(&present),
+        "must name the exact child target: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "request_permissions(capability=\"exec\", target=\"{present}\""
+        )),
+        "must offer the copy-pasteable request_permissions call: {text}"
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Denied);
+}
+
+/// An ordinary, unrelated failure (no `cannot exec '...': Permission denied`
+/// shape at all) must fall through untouched — this is a narrow structural
+/// match, not a stderr keyword grep.
+#[test]
+fn an_unrelated_failure_is_not_a_child_exec_denial() {
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "error: test assertion failed\n",
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        "cargo test",
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "error: test assertion failed".to_owned(),
+    );
+    assert_eq!(text, "error: test assertion failed");
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
+}
+
+/// A child name that cannot be resolved on the host at all yields no exact
+/// target, so no structured denial is minted — never guess a target.
+#[test]
+fn an_unresolvable_child_name_is_not_a_named_denial() {
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": format!("fatal: cannot exec '{ABSENT}': Permission denied\n"),
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        &format!("git {ABSENT}"),
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "fatal: cannot exec".to_owned(),
+    );
+    assert_eq!(text, "fatal: cannot exec");
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
+}

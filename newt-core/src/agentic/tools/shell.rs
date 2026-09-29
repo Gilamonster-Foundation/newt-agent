@@ -1360,6 +1360,14 @@ pub(super) fn confined_result(
     if let Some(refusal) = kernel_refused_binary(cmd, envelope, &caveats.fs_read) {
         return (refusal, ExecOutcome::Denied);
     }
+    // #2629: a CHILD exec the sandbox refused (e.g. git's own `fatal: cannot
+    // exec 'branch': Permission denied`) is neither 126 nor 127 at the TOP
+    // level — the parent (`git`) ran fine; only its own internal spawn of a
+    // helper failed — so it fell through both checks above as unstructured
+    // stderr with no axis or target.
+    if let Some(refusal) = child_exec_denial(cmd, envelope) {
+        return (refusal, ExecOutcome::Denied);
+    }
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
     if let Some(note) = absent {
@@ -2110,6 +2118,57 @@ pub(crate) const NOT_ON_HOST_MARKER: &str = "not installed on this host";
 /// [`failed_program`]). Only then is it rendered in newt's own denial vocabulary
 /// so the guidance stops asking for an edit; an ordinary 126 inside the grant
 /// falls through untouched.
+/// #2629: the CHILD-exec sibling of [`kernel_refused_binary`]. A confined
+/// `git` (or any parent that execs its own helper, e.g. a `cargo` subcommand
+/// binary) can run fine at the TOP level while the sandbox refuses the
+/// helper it tries to exec internally — git's own `fatal: cannot exec
+/// 'branch': Permission denied`. That refusal is invisible to the
+/// interceptor's `denials` array (only the top-level spawn is instrumented)
+/// and the parent's own exit code is neither 126 nor 127, so it reached the
+/// model as raw, unstructured child stderr with no axis or target — the
+/// exact gap the issue names ("23 commands of touch/mkdir tests" probing for
+/// what was actually refused).
+///
+/// STRUCTURED, not a stderr guess of intent: only the literal
+/// `cannot exec '<name>': Permission denied` shape (the wording brush's own
+/// exec syscall wrapper and real `git`/`cargo` share) is recognised, and only
+/// when the named child resolves to a real file on the host — standalone, or
+/// as `<parent>-<child>` (git's own subcommand-binary convention, e.g.
+/// `git-branch`). An unresolvable name means no exact target is known, so
+/// `None` is returned rather than guessing one; the raw stderr still reaches
+/// the model, just without this structured annotation.
+fn child_exec_denial(cmd: &str, envelope: &serde_json::Value) -> Option<String> {
+    // A structured top-level denial is the leash's own shape to render.
+    if envelope_denied(envelope)
+        || envelope
+            .get("denials")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|d| !d.is_empty())
+    {
+        return None;
+    }
+    const MARKER: &str = "cannot exec '";
+    const SUFFIX: &str = "': Permission denied";
+    let stderr = envelope.get("stderr").and_then(serde_json::Value::as_str)?;
+    let at = stderr.find(MARKER)?;
+    let rest = &stderr[at + MARKER.len()..];
+    let end = rest.find('\'')?;
+    let child = &rest[..end];
+    if !rest[end..].starts_with(SUFFIX) {
+        return None;
+    }
+    let abs = host_path_lookup(child).or_else(|| {
+        let parent = leading_program(cmd)?;
+        host_path_lookup(&format!("{parent}-{child}"))
+    })?;
+    Some(format!(
+        "capability denied: exec of child program '{child}' at {abs} was refused \
+         by the sandbox — the parent command's own internal exec, not newt's \
+         top-level spawn.\n  {}",
+        denial_recovery_hint("exec", &abs)
+    ))
+}
+
 pub(crate) fn kernel_refused_binary(
     cmd: &str,
     envelope: &serde_json::Value,
