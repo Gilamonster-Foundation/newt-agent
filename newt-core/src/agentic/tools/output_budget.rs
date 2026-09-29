@@ -211,7 +211,7 @@ pub(super) fn paginate_read(
 /// deliberately NOT part of `read_file`'s public schema (see
 /// `tools/catalog.rs`) — the model learns it only from a page's own footer,
 /// which is the one place it is ever correct to use.
-pub(super) fn paginate_read_from(
+pub(crate) fn paginate_read_from(
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,

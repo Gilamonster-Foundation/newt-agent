@@ -405,17 +405,40 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
         .and_then(Value::as_u64)
         .filter(|&o| o > 0)
         .unwrap_or(1) as usize;
-    let entries = crate::ast_outline::outline_rust(content, first_line)?;
+    // A paginated/truncated read_file result is `body + "\n\n[<footer>]"`
+    // (`output_budget::paginate_read_from`) — the footer is tool-message
+    // metadata, not source, so it must not be parsed or counted as lines.
+    let (source, truncated) = strip_read_footer(content);
+    let entries = crate::ast_outline::outline_rust(source, first_line)?;
     if entries.is_empty() {
         return None;
     }
-    let last_line = first_line + content.lines().count().saturating_sub(1);
-    let body = crate::ast_outline::render_outline(&entries);
+    let last_line = first_line + source.lines().count().saturating_sub(1);
+    let mut body = crate::ast_outline::render_outline(&entries);
+    // The page may have been cut mid-definition; error recovery can still
+    // tag a partial node ending at the page's last line, which is NOT the
+    // definition's real end. Flag it instead of asserting a complete span.
+    if truncated && entries.last().is_some_and(|e| e.end_line >= last_line) {
+        body.push_str("\n    (last entry may continue past this page — re-read to confirm)");
+    }
     let outline = format!(
         "[read_file] {path} lines {first_line}-{last_line} — outline (re-read any span with \
          offset/limit):\n{body}",
     );
     (json_str_len(&outline) < json_str_len(content)).then_some(outline)
+}
+
+/// Strip the `\n\n[<footer>]` pagination/truncation notice a `read_file`
+/// result carries (`output_budget::paginate_read_from`), if present.
+/// Returns the real source page and whether a footer was found.
+#[cfg(feature = "ast")]
+fn strip_read_footer(content: &str) -> (&str, bool) {
+    match content.rsplit_once("\n\n[") {
+        Some((body, tail)) if tail.strip_suffix(']').is_some_and(|t| !t.contains('\n')) => {
+            (body, true)
+        }
+        _ => (content, false),
+    }
 }
 
 /// Does `content` look like a [`one_line_summary`] this module produced?
@@ -799,6 +822,113 @@ pub(crate) enum ResponsesCompaction {
         );
         assert!(line.contains("    1-8\tfn compact_responses_input(x: u32) -> u32"));
         assert!(line.contains("    10-13\tpub(crate) enum ResponsesCompaction"));
+    }
+
+    /// #2638 fix: a paginated/truncated `read_file` result is `body + "\n\n[
+    /// footer]"`, not raw source. Drives the REAL pagination
+    /// (`output_budget::paginate_read_from`, nonzero offset + a limit that
+    /// cuts mid-definition) into the summarizer and asserts the outline's
+    /// range and the flagged last entry come from the real source page, not
+    /// the rendered footer notice.
+    ///
+    /// Red before the fix: the old code counted the footer's two lines
+    /// (blank + `[showing lines …]`) as source, so `last_line` claimed line
+    /// 12 when the actual page only reached line 10 — asserting `lines 3-10`
+    /// failed with `left: "...lines 3-12..."`.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn paginated_aged_rust_read_outlines_only_the_real_page() {
+        let full_source = "\
+mod header;
+
+fn first(x: u32) -> u32 {
+    x + 1
+}
+
+fn second(y: u32) -> u32 {
+    // pad this body so pass 2's rewrite threshold is cleared once
+    // paginated down to just this page.
+    let mut z = y;
+    z += 1;
+    z += 1;
+    z
+}
+
+fn third(z: u32) -> u32 {
+    z
+}
+";
+        // offset=3, limit=8 -> real page is lines 3-10 (through `second`'s
+        // closing brace); `third` at line 12 is NOT in this page.
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            full_source,
+            Some(3),
+            Some(8),
+            0,
+            None,
+        );
+        assert!(
+            page.contains("[showing lines 3-10 of 18"),
+            "test fixture didn't paginate as expected: {page}"
+        );
+
+        let line = summarize_one(
+            "read_file",
+            json!({"path": "src/lib.rs", "offset": 3}),
+            &page,
+        );
+        assert!(
+            line.starts_with("[read_file] src/lib.rs lines 3-10 — outline"),
+            "got: {line}"
+        );
+        assert!(line.contains("    3-5\tfn first(x: u32) -> u32"));
+        // `second`'s closing brace is on the NEXT page — tree-sitter's tags
+        // query only tags a complete function definition, so the cut-off
+        // fragment produces no tag at all rather than a false "complete"
+        // span. Confirms the fix's line math (not the footer's inflated
+        // count) is what `first`'s span and the page boundary are read from.
+        assert!(
+            !line.contains("second"),
+            "incomplete fn wrongly tagged: {line}"
+        );
+        assert!(!line.contains("third"), "next page's fn leaked in: {line}");
+    }
+
+    /// #2638 fix, other half: when a tag IS produced right up to the page's
+    /// last line (unlike the case above, where tree-sitter simply declines
+    /// to tag an incomplete fn), the outline must not silently claim that
+    /// span is complete — it flags it, since the page boundary — not the
+    /// definition's real end — may be why the tag stops there.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn truncated_last_entry_touching_the_page_boundary_is_flagged() {
+        // A one-line `mod` definition, immediately followed by the real
+        // pagination footer — its tagged end lands exactly on the page's
+        // last line, the truncation signal the flag checks for. Padding
+        // lives in a trailing comment (outside the tagged node's byte
+        // range, so it never bloats the rendered header) so the fixture
+        // clears `summarize_min_chars` (mirrors #2557's own fixture
+        // padding) while the outline invariant — strictly shorter than
+        // the aged content — still holds.
+        let padding = "x".repeat(220);
+        let page = format!(
+            "mod header; // {padding}\n\n\
+             [showing lines 5-5 of 40; call read_file with offset=6 to continue]"
+        );
+        let line = summarize_one(
+            "read_file",
+            json!({"path": "src/lib.rs", "offset": 5}),
+            &page,
+        );
+        assert!(
+            line.starts_with("[read_file] src/lib.rs lines 5-5 — outline"),
+            "got: {line}"
+        );
+        assert!(line.contains("    5\tmod header"));
+        assert!(
+            line.contains("last entry may continue past this page"),
+            "got: {line}"
+        );
     }
 
     #[test]

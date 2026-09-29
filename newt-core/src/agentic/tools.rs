@@ -53,7 +53,7 @@ pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
 mod live_output;
 mod native_git;
-mod output_budget;
+pub(crate) mod output_budget;
 mod shell;
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
