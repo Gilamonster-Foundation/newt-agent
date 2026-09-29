@@ -525,33 +525,13 @@ fn classifier_leaves_ordinary_successes_repeatable() {
     let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "file contents");
     let file = serde_json::json!({"path": "src/lib.rs", "offset": 0});
     assert_eq!(
-        RepeatCallGuard::classify_repeat_memo(
-            "read_file",
-            &file,
-            true,
-            "file contents",
-            None,
-            ReadScope {
-                workspace: &workspace,
-                caveats: &caveats
-            },
-        ),
+        RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
         None
     );
 
     let tests = serde_json::json!({"command": "cargo test -p newt-core"});
     assert_eq!(
-        RepeatCallGuard::classify_repeat_memo(
-            "run_command",
-            &tests,
-            true,
-            "test result: ok",
-            None,
-            ReadScope {
-                workspace: &workspace,
-                caveats: &caveats
-            },
-        ),
+        RepeatCallGuard::classify_repeat_memo("run_command", &tests, true, "test result: ok", None),
         None
     );
 
@@ -594,17 +574,7 @@ fn bare_read_file_repeat_is_served_from_cache_not_refused() {
     let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "file contents");
     let file = serde_json::json!({"path": "src/lib.rs"});
     assert!(matches!(
-        RepeatCallGuard::classify_repeat_memo(
-            "read_file",
-            &file,
-            true,
-            "file contents",
-            None,
-            ReadScope {
-                workspace: &workspace,
-                caveats: &caveats
-            },
-        ),
+        RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
         Some(RepeatMemo::ReadRange { .. })
     ));
 
@@ -648,7 +618,19 @@ fn bare_read_file_repeat_is_served_from_cache_not_refused() {
             },
         )
         .expect("unchanged file content serves from cache");
-    assert_eq!(cached, "file contents");
+    assert_eq!(cached.content, "file contents");
+    assert_eq!(cached.path, "src/lib.rs");
+    // #2637 review P2: the caller sends the receipt, never `cached.content`,
+    // to the model — the full page is already in the outgoing context.
+    let receipt = cached.unchanged_receipt();
+    assert!(
+        receipt.contains("src/lib.rs") && receipt.contains(&cached.content_id.to_string()),
+        "the receipt names the path and the exact content id it certifies: {receipt}"
+    );
+    assert!(
+        !receipt.contains("file contents"),
+        "the receipt must not resend the bytes already delivered: {receipt}"
+    );
 }
 
 /// #2637: the file changing on disk invalidates the memo — freshness is
@@ -704,6 +686,106 @@ fn cached_read_is_dropped_when_the_file_actually_changes() {
     assert!(
         g.repeat_steer("read_file", &file).is_none(),
         "a stale memo is dropped, not turned into a refusal"
+    );
+}
+
+/// #2637 review P1 regression: the memo's identity must describe exactly the
+/// bytes SERVED (`result`), never a separate reread of the path taken at
+/// record time. Before the fix, `classify_repeat_memo` called
+/// `read_scope.content_id_of(path)` — an independent disk read — to mint the
+/// id. That opens a window: the real tool call reads A and returns
+/// `result = A`, then (before `record` runs) an out-of-band edit lands B on
+/// disk, and the old code stored `(hash(B), A)`. A LATER read, with the file
+/// still holding B unchanged, would match `hash(B)` and serve stale `A`.
+/// This drives exactly that race and asserts the memo is never confused: the
+/// id is bound to `result` (`A`), so it can only ever match a disk read that
+/// still shows `A`, and B on disk is correctly seen as a mismatch, not a hit.
+#[test]
+fn content_id_binds_to_the_served_result_not_a_reread_at_record_time() {
+    let (_dir, workspace, caveats) = read_memo_fixture("race.rs", "A");
+    let file = serde_json::json!({"path": "race.rs"});
+    let mut g = RepeatCallGuard::default();
+    // The tool's real read already happened and returned "A" as `result`.
+    // Simulate the out-of-band edit landing BEFORE `record` classifies it —
+    // the exact window the old reread-based id minting raced.
+    std::fs::write(std::path::Path::new(&workspace).join("race.rs"), "B").unwrap();
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "A",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    // Disk still holds "B" (untouched since the edit above) — this is NOT
+    // "unchanged since A", so it must never be served from the memo.
+    assert!(
+        g.cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_none(),
+        "the memo's id must bind to the served result (\"A\"), not a reread \
+         taken at record time — serving \"A\" for the current \"B\" would be \
+         exactly the stale-content bug this regression guards"
+    );
+}
+
+/// #2637 review P1: a cache HIT must go through the same disclosure fence a
+/// real tool result takes, not `push_tool_resolution` unfiltered — the exact
+/// gap the review named (`newt-core/src/agentic/mod.rs:4062/:4474`, pre-fix).
+/// The fix sends `CachedReadHit::unchanged_receipt()` through
+/// `maybe_offload_tool_result` (the same chokepoint `smart_harness::tool_result`
+/// uses) before it reaches `push_tool_resolution`; this pins that a session
+/// secret embedded in the memoized PATH is still redacted on that path.
+#[test]
+fn cache_hit_receipt_passes_through_the_disclosure_fence() {
+    let secret = "CANARY-cachehit-4d1e9a02";
+    let mut filter = crate::ocap::DisclosureFilter::new();
+    filter.register(secret);
+    let _guard = crate::ocap::scoped_session_disclosure(filter.clone());
+
+    let (_dir, workspace, caveats) = read_memo_fixture(&format!("{secret}.txt"), "file contents");
+    let file = serde_json::json!({"path": format!("{secret}.txt")});
+    let mut g = RepeatCallGuard::default();
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    let hit = g
+        .cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
+        )
+        .expect("unchanged content serves from cache");
+    let receipt = hit.unchanged_receipt();
+    assert!(
+        receipt.contains(secret),
+        "sanity: the raw receipt names the path before filtering: {receipt}"
+    );
+    let filtered = maybe_offload_tool_result("read_file", receipt, false, None, Some(&filter));
+    assert!(
+        !filtered.contains(secret),
+        "a cache-hit receipt must pass the live disclosure fence, exactly like \
+         a real tool result: {filtered}"
     );
 }
 

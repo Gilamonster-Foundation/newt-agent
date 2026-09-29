@@ -3873,16 +3873,27 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
-                    &cached,
+                    &cached.content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
+                // #2637 review P1/P2: the receipt, not `cached.content`, goes
+                // to the model — the full page is already in the outgoing
+                // context, and the receipt still passes the live disclosure
+                // fence (same chokepoint a real tool result takes).
+                let receipt = maybe_offload_tool_result(
+                    name,
+                    cached.unchanged_receipt(),
+                    tool_offload,
+                    spill_store,
+                    disclosure,
+                );
                 smart_harness::push_tool_resolution(
                     &mut messages,
-                    serde_json::json!({ "role": "tool", "content": cached }),
+                    serde_json::json!({ "role": "tool", "content": receipt }),
                     batch.as_ref(),
                     call_index,
                 )?;
@@ -4312,6 +4323,30 @@ impl ReadScope<'_> {
     }
 }
 
+/// #2637 review P2/doctrine ruling: what a `RepeatCallGuard::cached_read` hit
+/// hands back to a call site. `content` is the full prior page (for the
+/// terminal echo only); the model-facing message is the short receipt built
+/// by `unchanged_receipt`, never `content` itself — the whole point of the
+/// cache is that `content` is already sitting in the outgoing context.
+struct CachedReadHit {
+    path: String,
+    content: String,
+    content_id: content_addressable::RawContentId,
+}
+
+impl CachedReadHit {
+    /// A short, successful observation — not a refusal — naming the still-
+    /// verified identity of the page already in context. Per the review's
+    /// doctrine ruling: never demands a different call, an explicit range, or
+    /// negotiation; it just avoids resending bytes the model already has.
+    fn unchanged_receipt(&self) -> String {
+        format!(
+            "unchanged since the earlier read of `{}` (content id {}); it is above.",
+            self.path, self.content_id
+        )
+    }
+}
+
 #[derive(Default)]
 struct RepeatCallGuard {
     /// `(name + canonical args)` → the prior outcome that should steer an exact repeat.
@@ -4428,7 +4463,6 @@ impl RepeatCallGuard {
         ok: bool,
         result: &str,
         execution: Option<crate::ExecOutcome>,
-        read_scope: ReadScope<'_>,
     ) -> Option<RepeatMemo> {
         if !ok {
             let lower = result.to_ascii_lowercase();
@@ -4464,10 +4498,15 @@ impl RepeatCallGuard {
             });
         }
         if let Some(path) = Self::bare_read_file_path(name, args) {
-            // #2637: no content id, no memo — a fresh read still ran and
-            // returned the right content; it just isn't cached, so the next
-            // repeat runs fresh too. Never a refusal either way.
-            let content_id = read_scope.content_id_of(&path)?;
+            // #2637 review P1: the identity must describe exactly the bytes
+            // SERVED (`result`), never a separate reread of the path —
+            // rereading here races an out-of-band edit landing between the
+            // tool's real read (which produced `result`) and this
+            // classification, joining two different observations under one
+            // hash (read A → edit → hash B → memo says "A, id(B)" → a later
+            // unchanged B serves stale A). Hashing `result` itself has no
+            // such window: there is only one read.
+            let content_id = content_addressable::RawContentId::from_content(result.as_bytes());
             return Some(RepeatMemo::ReadRange {
                 path,
                 content_id,
@@ -4494,12 +4533,20 @@ impl RepeatCallGuard {
     /// A mismatch or an unprovable freshness check drops the memo and returns
     /// `None`, so the caller falls through to a real read — which then
     /// re-memoizes from the real outcome. This never itself denies access.
+    ///
+    /// Review P2 (context savings): a live memo means the original full page
+    /// is still in the outgoing context — it was delivered when the memo was
+    /// created and is only ever released by a real workspace change or a
+    /// committed compaction (`release_read_memos`), both of which drop the
+    /// memo outright. So a HIT never needs to resend the bytes: the caller
+    /// sends a short unchanged-receipt instead of `content`, and `content` is
+    /// returned only so the caller can still echo it to the terminal/log.
     fn cached_read(
         &mut self,
         name: &str,
         args: &serde_json::Value,
         read_scope: ReadScope<'_>,
-    ) -> Option<String> {
+    ) -> Option<CachedReadHit> {
         let path = Self::bare_read_file_path(name, args)?;
         let key = Self::key(name, args);
         let Some(RepeatMemo::ReadRange {
@@ -4511,7 +4558,11 @@ impl RepeatCallGuard {
             return None;
         };
         if read_scope.content_id_of(&path).as_ref() == Some(content_id) {
-            Some(content.clone())
+            Some(CachedReadHit {
+                path,
+                content: content.clone(),
+                content_id: *content_id,
+            })
         } else {
             self.repeat_memos.remove(&key);
             None
@@ -4527,7 +4578,11 @@ impl RepeatCallGuard {
         ok: bool,
         result: &str,
         execution: Option<crate::ExecOutcome>,
-        read_scope: ReadScope<'_>,
+        // #2637 review P1: no longer used to mint the `ReadRange` content id
+        // (that now hashes `result` directly — see `classify_repeat_memo`),
+        // kept so every call site still threads the confinement scope it
+        // would need if a future memo kind requires it.
+        _read_scope: ReadScope<'_>,
     ) {
         if tools::permission_grant_succeeded(name, args, ok, result) {
             self.repeat_memos.retain(|_, memo| {
@@ -4563,9 +4618,7 @@ impl RepeatCallGuard {
         if !ok {
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
         }
-        if let Some(memo) =
-            Self::classify_repeat_memo(name, args, ok, result, execution, read_scope)
-        {
+        if let Some(memo) = Self::classify_repeat_memo(name, args, ok, result, execution) {
             self.repeat_memos.insert(Self::key(name, args), memo);
         }
     }
@@ -8727,19 +8780,26 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
-                    &cached,
+                    &cached.content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
+                let receipt = maybe_offload_tool_result(
+                    name,
+                    cached.unchanged_receipt(),
+                    tool_offload,
+                    spill_store,
+                    disclosure,
+                );
                 smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
-                        "content": cached,
+                        "content": receipt,
                     }),
                     batch.as_ref(),
                     call_index,
@@ -11207,19 +11267,26 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
-                    &cached,
+                    &cached.content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
+                let receipt = maybe_offload_tool_result(
+                    name,
+                    cached.unchanged_receipt(),
+                    tool_offload,
+                    spill_store,
+                    disclosure,
+                );
                 smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
-                        "content": cached,
+                        "content": receipt,
                     }),
                     batch.as_ref(),
                     call_index,
@@ -12876,19 +12943,26 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     name,
                     &args,
                     workspace,
-                    &cached,
+                    &cached.content,
                     color,
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
                 }
+                let receipt = maybe_offload_tool_result(
+                    name,
+                    cached.unchanged_receipt(),
+                    tool_offload,
+                    spill_store,
+                    disclosure,
+                );
                 smart_harness::push_tool_resolution(
                     &mut input,
                     serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": cached,
+                        "output": receipt,
                     }),
                     batch.as_ref(),
                     call_index,
