@@ -353,12 +353,18 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
         }
         "read_file" => {
             let path = arg("path");
-            #[cfg(feature = "ast")]
-            if let Some(outline) = rust_outline_summary(&path, args, content) {
-                return outline;
-            }
-            if let Some(page_map) = read_file_page_map(&path, args, content) {
-                return page_map;
+            // Outline/page-map paths only ever read a SOURCE page. An error
+            // result (a refusal, a missing-file message) is not source and
+            // must stay `-> error, N lines` (#2638 finding 1) — otherwise a
+            // sufficiently long error body could be misread as a page map.
+            if status == "ok" {
+                #[cfg(feature = "ast")]
+                if let Some(outline) = rust_outline_summary(&path, args, content) {
+                    return outline;
+                }
+                if let Some(page_map) = read_file_page_map(&path, args, content) {
+                    return page_map;
+                }
             }
             format!("[read_file] read '{path}' -> {status}, {lines} lines ({chars} chars)",)
         }
@@ -411,7 +417,15 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
     // A paginated/truncated read_file result is `body + "\n\n[<footer>]"`
     // (`output_budget::paginate_read_from`) — the footer is tool-message
     // metadata, not source, so it must not be parsed or counted as lines.
-    let (source, truncated) = strip_read_footer(content);
+    let (source, footer) = strip_read_footer(content);
+    // The page's lexical boundary is unknown when the cut lands mid-line
+    // (`char_offset` in the footer) — tree-sitter would tag whatever
+    // incomplete token happens to start the page as if it were the real
+    // definition. Decline the outline rather than assert it (#2638 finding
+    // 3); the page-map fallback still covers the page.
+    if footer.is_some_and(|f| f.mid_line) {
+        return None;
+    }
     let entries = crate::ast_outline::outline_rust(source, first_line)?;
     if entries.is_empty() {
         return None;
@@ -421,7 +435,7 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
     // The page may have been cut mid-definition; error recovery can still
     // tag a partial node ending at the page's last line, which is NOT the
     // definition's real end. Flag it instead of asserting a complete span.
-    if truncated && entries.last().is_some_and(|e| e.end_line >= last_line) {
+    if footer.is_some() && entries.last().is_some_and(|e| e.end_line >= last_line) {
         body.push_str("\n    (last entry may continue past this page — re-read to confirm)");
     }
     let outline = format!(
@@ -431,15 +445,40 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
     (json_str_len(&outline) < json_str_len(content)).then_some(outline)
 }
 
+/// The literal substring every footer `output_budget::paginate_read_from`
+/// emits contains, and no ordinary source tail organically ending in a
+/// bracketed line does (#2638 finding 1). All three footer shapes end by
+/// naming the exact next call: `call read_file with offset=<n>` (with or
+/// without a trailing `char_offset=<n>`).
+const FOOTER_MARKER: &str = "call read_file with offset=";
+
+/// What a validated pagination footer says about the page it closes.
+#[derive(Clone, Copy)]
+struct ReadFooter {
+    /// Set when the footer names a `char_offset` — the page's cut point is
+    /// INSIDE a line, not on a line boundary (#2638 finding 3).
+    mid_line: bool,
+}
+
 /// Strip the `\n\n[<footer>]` pagination/truncation notice a `read_file`
-/// result carries (`output_budget::paginate_read_from`), if present.
-/// Returns the real source page and whether a footer was found.
-fn strip_read_footer(content: &str) -> (&str, bool) {
+/// result carries (`output_budget::paginate_read_from`), if present. Returns
+/// the real source page and, when the trailing bracketed line matches that
+/// producer's exact footer grammar, the parsed footer. A final bracketed
+/// line that does NOT match the grammar (ordinary source ending in
+/// `[section]`, a raw fragment that merely looks like one) is left as part
+/// of the source and not treated as metadata.
+fn strip_read_footer(content: &str) -> (&str, Option<ReadFooter>) {
     match content.rsplit_once("\n\n[") {
-        Some((body, tail)) if tail.strip_suffix(']').is_some_and(|t| !t.contains('\n')) => {
-            (body, true)
-        }
-        _ => (content, false),
+        Some((body, tail)) => match tail.strip_suffix(']') {
+            Some(f) if !f.contains('\n') && f.contains(FOOTER_MARKER) => (
+                body,
+                Some(ReadFooter {
+                    mid_line: f.contains("char_offset="),
+                }),
+            ),
+            _ => (content, None),
+        },
+        None => (content, None),
     }
 }
 
@@ -458,7 +497,7 @@ fn read_file_page_map(path: &str, args: Option<&Value>, content: &str) -> Option
         .and_then(Value::as_u64)
         .filter(|&o| o > 0)
         .unwrap_or(1) as usize;
-    let (source, _truncated) = strip_read_footer(content);
+    let (source, footer) = strip_read_footer(content);
     let total_lines = source.lines().count();
     if total_lines == 0 {
         return None;
@@ -476,9 +515,17 @@ fn read_file_page_map(path: &str, args: Option<&Value>, content: &str) -> Option
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // A mid-line cut has no exact resume point in offset/limit terms — say so,
+    // rather than let the offset/limit advice imply the last line is whole
+    // (#2638 finding 3).
+    let mid_line_note = if footer.is_some_and(|f| f.mid_line) {
+        format!(" (line {last_line} continues mid-line; re-read with char_offset)")
+    } else {
+        String::new()
+    };
     let page_map = format!(
         "[read_file] {path} lines {first_line}-{last_line} (page map; re-read any span with \
-         offset/limit): {spans}",
+         offset/limit): {spans}{mid_line_note}",
     );
     (json_str_len(&page_map) < json_str_len(content)).then_some(page_map)
 }
@@ -511,7 +558,13 @@ pub fn is_one_line_summary(content: &str) -> bool {
     if rest.contains('\n') {
         return false;
     }
-    rest.contains(" -> ok, ") || rest.contains(" -> error, ")
+    // The page-map fallback (#2638) carries no `-> ok,`/`-> error,` clause —
+    // it has its own literal marker, which only `read_file_page_map` emits.
+    // The multiline Rust outline is deliberately NOT recognized here: it is
+    // filtered out by the single-line check above, and stays already-pruned
+    // via its `[read_file] ` prefix (`already_pruned`) rather than folding.
+    const PAGE_MAP_MARKER: &str = " (page map; re-read any span with offset/limit): ";
+    rest.contains(" -> ok, ") || rest.contains(" -> error, ") || rest.contains(PAGE_MAP_MARKER)
 }
 
 /// First `max_chars` chars with newlines flattened, `…`-terminated if cut.
@@ -988,6 +1041,92 @@ fn third(z: u32) -> u32 {
             line,
             "[read_file] notes.md lines 1-900 (page map; re-read any span with \
              offset/limit): 1-400, 401-800, 801-900"
+        );
+    }
+
+    /// #2638 review finding 1: a real (non-Rust) source file ending in a
+    /// blank line then a bracketed final section — `\n\n[section]` — must
+    /// NOT be mistaken for `output_budget`'s pagination footer. Before the
+    /// fix, `strip_read_footer` treated ANY trailing single-line bracket as
+    /// a footer and dropped that real final section from the page's line
+    /// count and page map.
+    #[test]
+    fn a_bracketed_source_tail_is_not_mistaken_for_a_pagination_footer() {
+        let mut content = text_lines(900);
+        content.push_str("\n\n[unrelated section header]");
+        let real_lines = content.lines().count();
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
+        assert!(
+            line.contains(&format!("lines 1-{real_lines}")),
+            "the real bracketed final line was dropped from the page's line count: {line}"
+        );
+    }
+
+    /// #2638 review finding 1: a long read-error result must stay
+    /// `-> error, N lines` and never be reinterpreted as a source page map
+    /// (or outline) once it clears the shrink threshold.
+    #[test]
+    fn a_long_read_error_is_never_reinterpreted_as_a_page_map() {
+        let content = format!("error: permission denied\n{}", text_lines(900));
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
+        assert!(
+            line.starts_with("[read_file] read 'notes.md' -> error, "),
+            "an error result was folded into a page map instead of staying an error one-liner: \
+             {line}"
+        );
+    }
+
+    /// #2638 review finding 2: the digest fold's `is_one_line_summary`
+    /// predicate must recognize the page-map form the builder actually
+    /// emits for a non-Rust (or unparseable) read — not just the old
+    /// `-> ok,`/`-> error,` grammar — or aged page-map rounds never
+    /// qualify for folding.
+    #[test]
+    fn digest_fold_recognizes_the_real_page_map_form() {
+        let content = text_lines(900);
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
+        assert!(
+            is_one_line_summary(&line),
+            "the page map the builder emits is not recognized by the digest fold: {line:?}"
+        );
+    }
+
+    /// #2638 review finding 3: a page whose last line was cut MID-LINE (the
+    /// producer's `char_offset` continuation, with no footer flag beyond
+    /// that) must not be presented as an ordinary whole-line page: the
+    /// caveat has to survive into the page-map summary.
+    #[test]
+    fn a_mid_line_cut_page_keeps_its_char_offset_caveat() {
+        let content = format!(
+            "{}\n\n[payload truncated to 40 chars (~10 tokens); line 5 continues: call read_file \
+             with offset=5 char_offset=40 to continue]",
+            text_lines(900)
+        );
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
+        assert!(
+            line.contains("continues mid-line") && line.contains("char_offset"),
+            "the mid-line char_offset continuation was lost: {line}"
+        );
+    }
+
+    /// #2638 review finding 3, Rust side: a `.rs` page cut mid-line has an
+    /// unknown lexical boundary at the cut — the outline must decline
+    /// (falling back to the page map) rather than tag whatever incomplete
+    /// token starts the page as a real definition.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn a_mid_line_cut_rust_page_declines_the_outline() {
+        let page = "n_header; // mid-token fragment, not a real `fn`\n\n\
+                     [payload truncated to 40 chars (~10 tokens); line 5 continues: call \
+                     read_file with offset=5 char_offset=3 to continue]";
+        let line = summarize_one(
+            "read_file",
+            json!({"path": "src/lib.rs", "offset": 5}),
+            page,
+        );
+        assert!(
+            !line.contains("— outline"),
+            "a mid-line-cut fragment was still interpreted as a complete outline: {line}"
         );
     }
 
@@ -1639,6 +1778,19 @@ fn third(z: u32) -> u32 {
                 );
             }
         }
+        // #2638: a body large enough to actually produce the page-map form
+        // (the tiny fixtures above always fall back to the old
+        // `-> ok,`/`-> error,` one-liner and never exercise this arm).
+        let big_read = text_lines(900);
+        let page_map = one_line_summary("read_file", Some(&args), &big_read);
+        assert!(
+            page_map.contains("(page map; re-read any span with offset/limit): "),
+            "fixture didn't actually produce a page map: {page_map:?}"
+        );
+        assert!(
+            is_one_line_summary(&page_map),
+            "builder emitted a page map its own recognizer rejects: {page_map:?}"
+        );
     }
 
     /// The twin that stops "recognizes everything". A false positive here folds
