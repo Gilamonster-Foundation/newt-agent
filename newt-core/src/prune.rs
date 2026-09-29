@@ -414,16 +414,25 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
         .and_then(Value::as_u64)
         .filter(|&o| o > 0)
         .unwrap_or(1) as usize;
+    // An INCOMING `char_offset` means this page's first line is itself a
+    // mid-line fragment (the model resumed a previous page's mid-line cut) —
+    // the real lexical prefix of that line isn't in `content` at all, so
+    // tree-sitter would tag whatever token happens to start the fragment as
+    // if it began the line. Unknown starting lexical boundary, decline
+    // unconditionally (#2638 finding 2, round 3).
+    if incoming_char_offset(args).is_some() {
+        return None;
+    }
     // A paginated/truncated read_file result is `body + "\n\n[<footer>]"`
     // (`output_budget::paginate_read_from`) — the footer is tool-message
     // metadata, not source, so it must not be parsed or counted as lines.
-    let (source, footer) = strip_read_footer(content);
+    let (source, footer) = strip_read_footer(content, first_line);
     // The page's lexical boundary is unknown when the cut lands mid-line
     // (`char_offset` in the footer) — tree-sitter would tag whatever
     // incomplete token happens to start the page as if it were the real
     // definition. Decline the outline rather than assert it (#2638 finding
     // 3); the page-map fallback still covers the page.
-    if footer.is_some_and(|f| f.mid_line) {
+    if footer.is_some_and(|f| f.next_char_offset.is_some()) {
         return None;
     }
     let entries = crate::ast_outline::outline_rust(source, first_line)?;
@@ -452,34 +461,102 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
 /// without a trailing `char_offset=<n>`).
 const FOOTER_MARKER: &str = "call read_file with offset=";
 
-/// What a validated pagination footer says about the page it closes.
+/// What a validated pagination footer says about the page it closes: the
+/// producer's own exact `(offset, char_offset)` coordinates for the NEXT
+/// `read_file` call — not just a boolean (#2638 finding 2, round 3).
 #[derive(Clone, Copy)]
 struct ReadFooter {
-    /// Set when the footer names a `char_offset` — the page's cut point is
-    /// INSIDE a line, not on a line boundary (#2638 finding 3).
-    mid_line: bool,
+    /// The next call's `offset` (every footer names one).
+    next_offset: usize,
+    /// The next call's `char_offset` — set only when the cut lands INSIDE a
+    /// line, not on a line boundary (#2638 finding 3).
+    next_char_offset: Option<usize>,
+}
+
+/// The `char_offset` the model passed on THIS call, if any and nonzero — the
+/// value it read off a previous page's own footer to resume a mid-line cut.
+/// Not part of `read_file`'s public schema; only ever correct when echoed
+/// from a footer (`output_budget::paginate_read_from`'s doc comment). Its
+/// presence means the page's first line is itself a mid-line fragment.
+/// Only the AST outline path needs this (the page-map fallback makes no
+/// lexical claim, so it's fine without `ast`).
+#[cfg(feature = "ast")]
+fn incoming_char_offset(args: Option<&Value>) -> Option<usize> {
+    args.and_then(|a| a.get("char_offset"))
+        .and_then(Value::as_u64)
+        .filter(|&c| c > 0)
+        .map(|c| c as usize)
 }
 
 /// Strip the `\n\n[<footer>]` pagination/truncation notice a `read_file`
 /// result carries (`output_budget::paginate_read_from`), if present. Returns
-/// the real source page and, when the trailing bracketed line matches that
-/// producer's exact footer grammar, the parsed footer. A final bracketed
-/// line that does NOT match the grammar (ordinary source ending in
-/// `[section]`, a raw fragment that merely looks like one) is left as part
-/// of the source and not treated as metadata.
-fn strip_read_footer(content: &str) -> (&str, Option<ReadFooter>) {
+/// the real source page and, when the trailing bracketed line both matches
+/// the producer's exact footer grammar (the marker text plus a valid numeric
+/// `offset`/`char_offset` tail — round 2's bare substring check on
+/// `FOOTER_MARKER` still accepted an ordinary bracketed line that merely
+/// contained the marker text followed by unrelated words, #2638 finding 1)
+/// AND cross-validates against real data we already have — `first_line` plus
+/// the candidate body's own line count — the parsed footer. There is no
+/// producer-owned side channel into this module (`read_file_page` in
+/// `output_budget.rs` returns a plain `String`, nothing else; pruning runs
+/// later over serialized chat history, not at tool-call time), so this
+/// cross-check, not a side channel, is what makes the footer producer-known
+/// rather than an assumed text match: the two non-mid-line footer shapes
+/// both name the exact next offset as "one past the last line shown", and
+/// the mid-line shape names the exact `(line, char_offset)` of the cut — a
+/// number invented by an unrelated bracketed source tail will essentially
+/// never land on that exact value. A footer-shaped line whose coordinate
+/// doesn't match is left as part of the source and not treated as metadata
+/// (the round 3 brief's "conservatively decline for ambiguous results").
+fn strip_read_footer(content: &str, first_line: usize) -> (&str, Option<ReadFooter>) {
     match content.rsplit_once("\n\n[") {
         Some((body, tail)) => match tail.strip_suffix(']') {
-            Some(f) if !f.contains('\n') && f.contains(FOOTER_MARKER) => (
-                body,
-                Some(ReadFooter {
-                    mid_line: f.contains("char_offset="),
-                }),
-            ),
+            Some(f) if !f.contains('\n') => match parse_read_footer(f) {
+                Some(footer) if footer_matches_body(footer, first_line, body) => {
+                    (body, Some(footer))
+                }
+                _ => (content, None),
+            },
             _ => (content, None),
         },
         None => (content, None),
     }
+}
+
+/// Parse a bracketed footer line's exact tail —
+/// `…call read_file with offset=<n>[ char_offset=<m>] to continue` — with
+/// `<n>`/`<m>` valid `usize` and nothing else following. `None` for anything
+/// that merely contains [`FOOTER_MARKER`] as a substring without the rest of
+/// the producer's exact grammar.
+fn parse_read_footer(f: &str) -> Option<ReadFooter> {
+    let after_marker = f.rsplit_once(FOOTER_MARKER)?.1;
+    let after_marker = after_marker.strip_suffix(" to continue")?;
+    match after_marker.split_once(" char_offset=") {
+        Some((offset_s, char_offset_s)) => Some(ReadFooter {
+            next_offset: offset_s.parse().ok()?,
+            next_char_offset: Some(char_offset_s.parse().ok()?),
+        }),
+        None => Some(ReadFooter {
+            next_offset: after_marker.parse().ok()?,
+            next_char_offset: None,
+        }),
+    }
+}
+
+/// Does the footer's claimed next-call coordinate match what the candidate
+/// `body` and the page's own `first_line` actually imply? A non-mid-line
+/// footer always names one past the last line `body` shows; a mid-line
+/// footer always names the SAME line `body`'s single (partial) line is —
+/// see `output_budget::paginate_read_from`'s `whole_through`/`mid_line`
+/// arithmetic, which this mirrors.
+fn footer_matches_body(footer: ReadFooter, first_line: usize, body: &str) -> bool {
+    let body_lines = body.lines().count();
+    let expected = if footer.next_char_offset.is_some() {
+        first_line + body_lines.saturating_sub(1)
+    } else {
+        first_line + body_lines
+    };
+    footer.next_offset == expected
 }
 
 /// Language-neutral `read_file` fallback (#2638): when there is no outline
@@ -497,7 +574,7 @@ fn read_file_page_map(path: &str, args: Option<&Value>, content: &str) -> Option
         .and_then(Value::as_u64)
         .filter(|&o| o > 0)
         .unwrap_or(1) as usize;
-    let (source, footer) = strip_read_footer(content);
+    let (source, footer) = strip_read_footer(content, first_line);
     let total_lines = source.lines().count();
     if total_lines == 0 {
         return None;
@@ -515,13 +592,18 @@ fn read_file_page_map(path: &str, args: Option<&Value>, content: &str) -> Option
         })
         .collect::<Vec<_>>()
         .join(", ");
-    // A mid-line cut has no exact resume point in offset/limit terms — say so,
-    // rather than let the offset/limit advice imply the last line is whole
-    // (#2638 finding 3).
-    let mid_line_note = if footer.is_some_and(|f| f.mid_line) {
-        format!(" (line {last_line} continues mid-line; re-read with char_offset)")
-    } else {
-        String::new()
+    // A mid-line cut has no exact resume point in offset/limit terms — say so
+    // WITH the producer's own exact coordinates, rather than let the
+    // offset/limit advice imply the last line is whole, or name the caveat
+    // without the value needed to act on it (#2638 finding 2, round 3: the
+    // prior caveat text named no coordinate at all).
+    let mid_line_note = match footer.and_then(|f| f.next_char_offset.map(|co| (f.next_offset, co)))
+    {
+        Some((offset, char_offset)) => format!(
+            " (line {last_line} continues mid-line; re-read with offset={offset} \
+             char_offset={char_offset})"
+        ),
+        None => String::new(),
     };
     let page_map = format!(
         "[read_file] {path} lines {first_line}-{last_line} (page map; re-read any span with \
@@ -1062,6 +1144,28 @@ fn third(z: u32) -> u32 {
         );
     }
 
+    /// #2638 round 3, finding 1: a source tail that carries the producer's
+    /// exact MARKER TEXT (`call read_file with offset=N to continue`) but
+    /// whose number is arithmetically wrong for the real page — the
+    /// realistic accidental case, not a deliberately byte-identical forgery
+    /// — must still not be mistaken for a real footer. Round 2's fix
+    /// (`FOOTER_MARKER` substring + grammar) alone accepts this: `offset=42`
+    /// parses fine and the line matches the grammar exactly. Only the round
+    /// 3 cross-check (the footer's claimed next `offset` must equal
+    /// `first_line + body's own line count`) catches it — 900 real lines at
+    /// `first_line=1` implies `offset=901`, not `42`.
+    #[test]
+    fn a_footer_shaped_tail_with_the_wrong_arithmetic_is_not_mistaken_for_a_real_footer() {
+        let mut content = text_lines(900);
+        content.push_str("\n\n[call read_file with offset=42 to continue]");
+        let real_lines = content.lines().count();
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
+        assert!(
+            line.contains(&format!("lines 1-{real_lines}")),
+            "a footer-shaped tail with the wrong coordinate was still stripped as metadata: {line}"
+        );
+    }
+
     /// #2638 review finding 1: a long read-error result must stay
     /// `-> error, N lines` and never be reinterpreted as a source page map
     /// (or outline) once it clears the shrink threshold.
@@ -1091,43 +1195,118 @@ fn third(z: u32) -> u32 {
         );
     }
 
-    /// #2638 review finding 3: a page whose last line was cut MID-LINE (the
-    /// producer's `char_offset` continuation, with no footer flag beyond
-    /// that) must not be presented as an ordinary whole-line page: the
-    /// caveat has to survive into the page-map summary.
+    /// #2638 round 3, finding 2: an INITIAL long-line truncation — the real
+    /// producer (`output_budget::paginate_read_from`), not a hand-built
+    /// footer — cutting a single line too long for the budget on the very
+    /// first read. The mid-line caveat must carry the producer's own exact
+    /// resume coordinates, not just say the word "char_offset".
     #[test]
-    fn a_mid_line_cut_page_keeps_its_char_offset_caveat() {
-        let content = format!(
-            "{}\n\n[payload truncated to 40 chars (~10 tokens); line 5 continues: call read_file \
-             with offset=5 char_offset=40 to continue]",
-            text_lines(900)
+    fn an_initial_long_line_truncation_keeps_its_exact_char_offset_coordinates() {
+        let long_line = "y".repeat(2_000);
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            &long_line, None, None, 100, None,
         );
-        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
         assert!(
-            line.contains("continues mid-line") && line.contains("char_offset"),
-            "the mid-line char_offset continuation was lost: {line}"
+            page.contains("char_offset="),
+            "test fixture didn't actually truncate mid-line: {page}"
+        );
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &page);
+        assert!(
+            line.contains("continues mid-line") && line.contains("offset=1 char_offset="),
+            "the producer's exact resume coordinates were lost: {line}"
         );
     }
 
-    /// #2638 review finding 3, Rust side: a `.rs` page cut mid-line has an
-    /// unknown lexical boundary at the cut — the outline must decline
-    /// (falling back to the page map) rather than tag whatever incomplete
-    /// token starts the page as a real definition.
+    /// #2638 round 3, finding 2: a RESUMED `char_offset` page — the model's
+    /// second call, echoing back the first page's own footer coordinates —
+    /// still mid-line-cuts. The Rust outline must decline (unknown lexical
+    /// boundary at an INCOMING mid-line start), and the page-map fallback
+    /// must still carry the new exact resume coordinates.
+    #[test]
+    fn a_resumed_char_offset_page_declines_the_outline_and_keeps_its_page_map() {
+        let long_line = "z".repeat(2_000);
+        let first = crate::agentic::tools::output_budget::paginate_read_from(
+            &long_line, None, None, 100, None,
+        );
+        let (_, first_char_offset) = parse_offset_and_char_offset(&first);
+        let resumed = crate::agentic::tools::output_budget::paginate_read_from(
+            &long_line,
+            Some(1),
+            None,
+            100,
+            Some(first_char_offset.expect("first page must mid-line cut")),
+        );
+        assert!(
+            resumed.contains("char_offset="),
+            "test fixture's resumed page didn't mid-line-cut again: {resumed}"
+        );
+        let args = json!({"path": "notes.md", "offset": 1, "char_offset": first_char_offset});
+        let line = summarize_one("read_file", args, &resumed);
+        assert!(
+            line.contains("continues mid-line") && line.contains("char_offset"),
+            "the resumed page's own coordinates were lost: {line}"
+        );
+    }
+
+    /// #2638 round 3, finding 2: a FINAL no-footer fragment — the model
+    /// resumes with an incoming `char_offset` and this time the remainder
+    /// fits under budget, so the real producer returns it with NO footer at
+    /// all. The outline must still decline: the fragment's first line is a
+    /// mid-line continuation even though nothing in `content` says so — only
+    /// the incoming call argument does.
     #[cfg(feature = "ast")]
     #[test]
-    fn a_mid_line_cut_rust_page_declines_the_outline() {
-        let page = "n_header; // mid-token fragment, not a real `fn`\n\n\
-                     [payload truncated to 40 chars (~10 tokens); line 5 continues: call \
-                     read_file with offset=5 char_offset=3 to continue]";
+    fn a_final_no_footer_fragment_still_declines_the_outline() {
+        let prefix = "w".repeat(4_000);
+        let full_line = format!("{prefix}fn resumed_after_cut() {{}}");
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            &full_line,
+            Some(1),
+            None,
+            10_000, // budget large enough the remainder fits whole
+            Some(4_000),
+        );
+        assert!(
+            !page.contains('['),
+            "test fixture expected a final no-footer fragment: {page}"
+        );
+        // Prove the guard is doing real work, not vacuously declining an
+        // already-untaggable fragment (the review's critique of the old
+        // fixture, #2638 finding 3): the fragment alone WOULD tag.
+        assert!(
+            crate::ast_outline::outline_rust(&page, 1).is_some_and(|e| !e.is_empty()),
+            "fixture doesn't actually produce a tag on its own: {page}"
+        );
         let line = summarize_one(
             "read_file",
-            json!({"path": "src/lib.rs", "offset": 5}),
-            page,
+            json!({"path": "src/lib.rs", "offset": 1, "char_offset": 4_000}),
+            &page,
         );
         assert!(
             !line.contains("— outline"),
-            "a mid-line-cut fragment was still interpreted as a complete outline: {line}"
+            "a resumed fragment with no footer at all was still interpreted as a complete \
+             outline: {line}"
         );
+    }
+
+    /// Pulls `offset=` and `char_offset=` back out of a real page's footer,
+    /// for tests that chain a second real `paginate_read_from` call the way
+    /// the model would (round 3: drive the real producer, not a hand-built
+    /// footer).
+    fn parse_offset_and_char_offset(page: &str) -> (Option<usize>, Option<usize>) {
+        let Some(footer) = page.rsplit_once("\n\n[").map(|(_, t)| t) else {
+            return (None, None);
+        };
+        let mut offset = None;
+        let mut char_offset = None;
+        for tok in footer.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("offset=") {
+                offset = v.parse().ok();
+            } else if let Some(v) = tok.strip_prefix("char_offset=") {
+                char_offset = v.trim_end_matches(']').parse().ok();
+            }
+        }
+        (offset, char_offset)
     }
 
     #[test]
