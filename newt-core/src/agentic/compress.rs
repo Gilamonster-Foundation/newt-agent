@@ -1846,7 +1846,8 @@ fn working_set_card(path: &str, content: &str) -> Value {
 
 /// The working set to pin: the VERBATIM contents of the file the model most
 /// recently read, taken from the PRE-prune history. Structural prune one-lines
-/// aged `read_file` results (`[read_file] read '…' -> ok, N lines`), so the
+/// aged `read_file` results (`[read_file] … lines A-B (page map …)` or, for
+/// Rust with the `ast` feature, an outline), so the
 /// verbatim body must be captured before prune runs, or the pin preserves the
 /// one-liner instead of the code. Returns `(path, content)`, or `None` when
 /// there is no read, its result is empty, or it is too large to pin without

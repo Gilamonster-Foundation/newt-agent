@@ -115,7 +115,7 @@ pub struct PruneOutcome {
 /// let outcome = prune(&messages, &PruneConfig::default());
 /// assert_eq!(
 ///     outcome.messages[2]["content"].as_str().unwrap(),
-///     "[read_file] read 'src/lib.rs' -> ok, 1 lines (500 chars)",
+///     "[read_file] src/lib.rs lines 1-1 (page map; re-read any span with offset/limit): 1",
 /// );
 /// assert!(outcome.chars_reclaimed > 400);
 /// ```
@@ -357,6 +357,9 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             if let Some(outline) = rust_outline_summary(&path, args, content) {
                 return outline;
             }
+            if let Some(page_map) = read_file_page_map(&path, args, content) {
+                return page_map;
+            }
             format!("[read_file] read '{path}' -> {status}, {lines} lines ({chars} chars)",)
         }
         "write_file" => {
@@ -431,7 +434,6 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
 /// Strip the `\n\n[<footer>]` pagination/truncation notice a `read_file`
 /// result carries (`output_budget::paginate_read_from`), if present.
 /// Returns the real source page and whether a footer was found.
-#[cfg(feature = "ast")]
 fn strip_read_footer(content: &str) -> (&str, bool) {
     match content.rsplit_once("\n\n[") {
         Some((body, tail)) if tail.strip_suffix(']').is_some_and(|t| !t.contains('\n')) => {
@@ -439,6 +441,46 @@ fn strip_read_footer(content: &str) -> (&str, bool) {
         }
         _ => (content, false),
     }
+}
+
+/// Language-neutral `read_file` fallback (#2638): when there is no outline
+/// engine for this page (a non-`.rs` path, or a `.rs` fragment with no
+/// tagged definitions), keep a page map of fixed-size line spans instead of
+/// a bare line count — no parsing, no regex, just the real source page's
+/// line accounting (the same [`strip_read_footer`] split the outline path
+/// uses), so the model still knows where to re-read. Default-on: unlike
+/// [`rust_outline_summary`] this needs no grammar. `None` falls back to the
+/// plain one-liner (empty page, or the map isn't strictly shorter).
+fn read_file_page_map(path: &str, args: Option<&Value>, content: &str) -> Option<String> {
+    const CHUNK: usize = 400;
+    let first_line = args
+        .and_then(|a| a.get("offset"))
+        .and_then(Value::as_u64)
+        .filter(|&o| o > 0)
+        .unwrap_or(1) as usize;
+    let (source, _truncated) = strip_read_footer(content);
+    let total_lines = source.lines().count();
+    if total_lines == 0 {
+        return None;
+    }
+    let last_line = first_line + total_lines - 1;
+    let spans = (first_line..=last_line)
+        .step_by(CHUNK)
+        .map(|start| {
+            let end = (start + CHUNK - 1).min(last_line);
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let page_map = format!(
+        "[read_file] {path} lines {first_line}-{last_line} (page map; re-read any span with \
+         offset/limit): {spans}",
+    );
+    (json_str_len(&page_map) < json_str_len(content)).then_some(page_map)
 }
 
 /// Does `content` look like a [`one_line_summary`] this module produced?
@@ -782,14 +824,18 @@ mod tests {
         assert_eq!(content_of(&out[2]), "(exit 0)");
     }
 
+    /// #2638: `read_file`'s default fallback is the page map (not the plain
+    /// line-count one-liner) once content clears the shrink threshold — even
+    /// for a `.rs` path, when the content isn't real parseable Rust (or the
+    /// `ast` feature is off) so the outline path declines.
     #[test]
     fn one_liner_read_file() {
         let content = text_lines(120);
-        let chars = content.chars().count();
         let line = summarize_one("read_file", json!({"path": "src/main.rs"}), &content);
         assert_eq!(
             line,
-            format!("[read_file] read 'src/main.rs' -> ok, 120 lines ({chars} chars)")
+            "[read_file] src/main.rs lines 1-120 (page map; re-read any span with \
+             offset/limit): 1-120"
         );
     }
 
@@ -931,6 +977,20 @@ fn third(z: u32) -> u32 {
         );
     }
 
+    /// #2638, page-map fallback: a non-Rust path has no outline engine, so
+    /// an aged read keeps a page map of fixed-size spans instead of a bare
+    /// line count — default-on, no `ast` feature needed.
+    #[test]
+    fn aged_non_rust_read_becomes_a_page_map() {
+        let content = text_lines(900); // 900 lines, no trailing newline
+        let line = summarize_one("read_file", json!({"path": "notes.md"}), &content);
+        assert_eq!(
+            line,
+            "[read_file] notes.md lines 1-900 (page map; re-read any span with \
+             offset/limit): 1-400, 401-800, 801-900"
+        );
+    }
+
     #[test]
     fn one_liner_write_edit_list_search_fetch_and_generic() {
         let content = text_lines(20);
@@ -979,7 +1039,7 @@ fn third(z: u32) -> u32 {
     fn one_liner_missing_args_uses_placeholder() {
         let line = summarize_one("read_file", json!(null), &text_lines(20));
         assert!(
-            line.starts_with("[read_file] read '?' -> ok, 20 lines"),
+            line.starts_with("[read_file] ? lines 1-20 (page map"),
             "{line}"
         );
     }
@@ -1018,7 +1078,7 @@ fn third(z: u32) -> u32 {
             content_of(&out[2])
         );
         assert!(
-            content_of(&out[3]).starts_with("[read_file] read 'x.rs'"),
+            content_of(&out[3]).starts_with("[read_file] x.rs lines"),
             "{}",
             content_of(&out[3])
         );
@@ -1037,7 +1097,7 @@ fn third(z: u32) -> u32 {
         ];
         pad_tail(&mut msgs, 10);
         let out = summarize_aged_tool_results(&msgs, &PruneConfig::default());
-        assert!(content_of(&out[2]).starts_with("[read_file] read 'x.rs'"));
+        assert!(content_of(&out[2]).starts_with("[read_file] x.rs lines"));
         assert!(content_of(&out[3]).starts_with("[list_dir] listed 'src'"));
     }
 
