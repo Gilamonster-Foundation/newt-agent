@@ -118,6 +118,16 @@ repositories, explicit grants, and the absence of embedded dispatch. These
 source changes do not establish the two live acceptance tasks or platform
 parity by themselves.
 
+On Windows, the restricted AppContainer backend is a declared exception to
+native Git availability. After the ordinary filesystem and executable-authority
+checks succeed, a single literal direct Git program is refused before it is
+spawned when that backend is selected: Git for Windows resolves the current
+directory through ancestors outside the admitted roots. The result names the
+unavailable backend and confirms that no command ran; Newt neither widens those
+roots nor retries on the host. Compound or dynamic shell source retains its
+existing confined-executor semantics, and an operator can deliberately choose
+the existing non-AppContainer route with `--disable-ocap` or `--full-access`.
+
 The embedded schema is absent from both the default advertisement and
 `tool_search`. Its engine and dispatch arm remain internal dependencies.
 That is a migration state, not complete removal or a fully separate plugin.

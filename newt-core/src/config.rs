@@ -78,6 +78,8 @@ mod tool_exposure;
 mod tools;
 use backend::{cli_backend_override, validate_backend_names, BackendAssembly, RecordTag};
 #[cfg(test)]
+use backend::{first_emission_this_process, reset_emitted_warnings_for_test};
+#[cfg(test)]
 use context::default_input_ceiling_pct;
 use layering::{array_merge_strategy, base_is_ambient_newt_toml, mark_project_mcp_untrusted};
 use presentation::{default_spill_lines, default_time_marker_secs, default_tool_output_lines};

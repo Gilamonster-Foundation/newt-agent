@@ -435,6 +435,14 @@ parent-directory escapes. Network access remains separately configured.
 The default preset can also be set in trusted [tui.permissions] configuration.
 This startup choice does not change a running session's authority.
 
+For full access inside one directory, start:
+  newt --workspace-access code <directory>
+Commands can create, change, rename, and delete inside that workspace; native
+filesystem confinement still rejects outside targets, including symlink and
+parent-directory escapes. Network access remains separately configured.
+The trusted-config equivalent is [tui.permissions] preset = \"workspace_full_access\".
+This startup choice does not change a running session's authority.
+
 Usage:
   /permissions                overview of this session's prompt flow
   /permissions audit [N]      newest N audit rows from the persisted permission log

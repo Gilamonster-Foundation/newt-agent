@@ -233,7 +233,6 @@ async fn check_approval_handoff(wire: &'static str, smart: bool, reject_exit: bo
 macro_rules! approval_test {
     ($name:ident, $wire:literal, $smart:literal) => {
         #[tokio::test]
-        #[serial_test::serial(anthropic_loop_env)]
         async fn $name() {
             check_approval_handoff($wire, $smart, false).await;
         }
@@ -250,7 +249,6 @@ approval_test!(responses_plan_exit_yields, "responses", false);
 approval_test!(smart_responses_plan_exit_yields, "responses", true);
 
 #[tokio::test]
-#[serial_test::serial(anthropic_loop_env)]
 async fn rejected_plan_exit_does_not_invent_an_operator_handoff() {
     check_approval_handoff("openai", true, true).await;
 }

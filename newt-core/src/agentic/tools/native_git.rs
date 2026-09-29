@@ -4,6 +4,8 @@
 
 use super::PermissionGate;
 use crate::caveats::Caveats;
+#[cfg(target_os = "windows")]
+use crate::caveats::CaveatsExt;
 use crate::git_caveats::GitCaveats;
 use agent_bridle::{inspect_shell, ShellInspection};
 use std::path::Path;
@@ -59,6 +61,95 @@ fn unresolved(detail: &str) -> String {
 fn is_git(program: &str) -> bool {
     let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
     name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+}
+
+/// Git for Windows resolves its startup current directory through every
+/// profile ancestor. AppContainer deliberately cannot read those ancestors
+/// merely because the repository itself is admitted, so executing native Git
+/// would otherwise produce an opaque child error after the authority decision.
+///
+/// Keep this a named, pre-spawn refusal instead of widening the filesystem
+/// fence or falling back to the host. An operator may still make the explicit
+/// `--disable-ocap` / `--full-access` choice, which selects a non-AppContainer
+/// route before this check runs.
+#[cfg(any(target_os = "windows", test))]
+pub(super) const WINDOWS_APPCONTAINER_GIT_UNAVAILABLE: &str =
+    "native Git is unavailable under Windows AppContainer confinement: Git for Windows requires current-directory ancestry traversal outside the granted roots; no command ran";
+
+/// A single, literal direct native-Git command. Compound and dynamic forms
+/// retain their normal shell semantics: refusing a whole compound before its
+/// earlier stages run would be a separate behavior change.
+#[cfg(any(target_os = "windows", test))]
+fn literal_native_git_program(source: &str) -> Option<String> {
+    let inspection = inspect_shell(source).ok()?;
+    let command = inspection.commands.first()?;
+    if inspection.commands.len() == 1
+        && inspection.constructs.is_empty()
+        && command.redirects.is_empty()
+        && command.descendant_execs.is_empty()
+    {
+        command
+            .program
+            .as_deref()
+            .filter(|program| is_git(program))
+            .map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn appcontainer_native_git_refusal_for(
+    program: Option<&str>,
+    effective_sandbox: agent_bridle::SandboxKind,
+    exec_allowed: bool,
+) -> Option<&'static str> {
+    (program.is_some_and(is_git)
+        && exec_allowed
+        && effective_sandbox == agent_bridle::SandboxKind::AppContainer)
+        .then_some(WINDOWS_APPCONTAINER_GIT_UNAVAILABLE)
+}
+
+/// Mirror Bridle's executable authority check for a direct program word. A
+/// bare `git.exe` grant also authorizes a PATH-resolved `...\\git.exe`, so the
+/// pre-spawn refusal must recognize that exact effective authority rather than
+/// letting the eventual interceptor reach AppContainer first.
+#[cfg(target_os = "windows")]
+fn exec_scope_allows_program(caveats: &Caveats, program: &str) -> bool {
+    caveats.permits_exec(program)
+        || Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| caveats.permits_exec(name))
+}
+
+/// A Windows-only pre-spawn refusal for the one native Git shape known to be
+/// incompatible with the restricted AppContainer backend. Its backend choice
+/// is calculated from the same policy as the eventual shell dispatch; an
+/// unrestricted grant therefore stays on its existing non-AppContainer path.
+pub(super) fn windows_appcontainer_native_git_refusal(
+    source: &str,
+    caveats: &Caveats,
+) -> Option<&'static str> {
+    #[cfg(target_os = "windows")]
+    {
+        let program = literal_native_git_program(source);
+        let exec_allowed = program
+            .as_deref()
+            .is_some_and(|program| exec_scope_allows_program(caveats, program));
+        let policy = std::sync::Arc::new(crate::confined_exec::runtime_sandbox_policy());
+        let effective_sandbox = agent_bridle::effective_sandbox_kind(
+            agent_bridle::best_available_sandbox(&policy).kind(),
+            caveats,
+        );
+        appcontainer_native_git_refusal_for(program.as_deref(), effective_sandbox, exec_allowed)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (source, caveats);
+        None
+    }
 }
 
 /// Reuse Bridle's static executable-word resolution for a single literal
@@ -410,6 +501,70 @@ mod tests {
         .is_err());
     }
 
+    /// Windows AppContainer cannot run Git for Windows from a profile-backed
+    /// workspace: Git's startup cwd resolution needs ancestor access outside
+    /// the admitted filesystem roots.  The route must name that limitation
+    /// before spawning, while ordinary text that merely mentions Git remains
+    /// eligible for the normal shell path.
+    #[test]
+    fn appcontainer_refuses_recognized_native_git_without_matching_text() {
+        assert_eq!(
+            literal_native_git_program("git status").as_deref(),
+            Some("git")
+        );
+        assert_eq!(literal_native_git_program("echo git status"), None);
+        assert_eq!(literal_native_git_program("git status && echo done"), None);
+        assert_eq!(
+            appcontainer_native_git_refusal_for(
+                Some("git"),
+                agent_bridle::SandboxKind::AppContainer,
+                true,
+            ),
+            Some(WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        );
+        assert_eq!(
+            appcontainer_native_git_refusal_for(
+                Some("git"),
+                agent_bridle::SandboxKind::AppContainer,
+                false,
+            ),
+            None,
+        );
+        assert_eq!(
+            appcontainer_native_git_refusal_for(
+                Some("git"),
+                agent_bridle::SandboxKind::Landlock,
+                true,
+            ),
+            None,
+        );
+        assert_eq!(
+            appcontainer_native_git_refusal_for(
+                Some("git.exe"),
+                agent_bridle::SandboxKind::None,
+                true,
+            ),
+            None,
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn appcontainer_git_refusal_mirrors_bare_name_exec_grants() {
+        let caveats = Caveats {
+            exec: crate::Scope::only(["git.exe".to_owned()]),
+            ..Caveats::top()
+        };
+        assert!(exec_scope_allows_program(
+            &caveats,
+            r"C:\Program Files\Git\cmd\git.exe"
+        ));
+        assert!(!exec_scope_allows_program(
+            &caveats,
+            r"C:\Program Files\Git\cmd\not-git.exe"
+        ));
+    }
+
     struct Gate {
         allow: bool,
         requests: Vec<PermissionRequest>,
@@ -610,6 +765,23 @@ mod tests {
             .unwrap()
             .unwrap();
             let staged = git(repo.path(), &["diff", "--cached", "--name-only"]);
+            #[cfg(target_os = "windows")]
+            {
+                if allowed {
+                    assert!(
+                        out.contains(WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+                        "the recalled filesystem grant must reach the pre-spawn Windows guard: {out}"
+                    );
+                } else {
+                    assert!(out.contains("capability denied"), "{out}");
+                    assert!(
+                        !out.contains(WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+                        "a denied filesystem declaration must win before the Windows guard: {out}"
+                    );
+                }
+                assert_eq!(staged.trim(), "", "{out}");
+            }
+            #[cfg(not(target_os = "windows"))]
             assert_eq!(staged.trim(), "pending.txt", "{out}");
             assert_eq!(gate.refreshes, 1, "allowed={allowed}: {out}");
             if allowed {

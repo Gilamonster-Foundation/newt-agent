@@ -1693,6 +1693,8 @@ fn commits_since(
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+    #[cfg(unix)]
+    use newt_core::ScopeExt as _;
 
     /// #2552 round 3: `commits_since` — the exact function `handback`'s
     /// `commits` field is built from — is reached whenever `workspace` is
@@ -2551,7 +2553,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn headless_build_projection_handles_aliases_without_granting_symlink_escapes() {
-        use newt_core::ScopeExt as _;
         use std::os::unix::fs::symlink;
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap();

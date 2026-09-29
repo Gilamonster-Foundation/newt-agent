@@ -67,7 +67,10 @@ class PrePushTests(unittest.TestCase):
     def commit(self, path, contents):
         target = self.root / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(contents)
+        if isinstance(contents, bytes):
+            target.write_bytes(contents)
+        else:
+            target.write_text(contents)
         self.git("add", "--", path)
         self.git("commit", "-qm", "Synthetic test fixture")
         return self.git("rev-parse", "HEAD")
@@ -180,6 +183,14 @@ class PrePushTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("network-leak scan failed", result.stdout)
         self.assertEqual(calls, [])
+
+    def test_non_utf8_added_line_does_not_block_safe_push(self):
+        local = self.commit("fixtures/non-utf8.fixture", b"\xff\n")
+        result, calls = self.hook(
+            local, self.base, "export PYTHONIOENCODING=utf-8:strict",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, FULL_GATE)
 
     def test_unreadable_diff_refuses_before_builds(self):
         local = self.commit("feature.rs", "fn fixture() {}\n")

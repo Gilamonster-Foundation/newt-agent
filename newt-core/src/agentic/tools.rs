@@ -1520,8 +1520,8 @@ fn denial_recovery_hint(capability: &str, target: &str) -> String {
     )
 }
 
-/// Facts held by the caller at the refusal boundary. The workspace anchors
-/// relative file-tool paths, not an authority claim. Scope details come from the caller's
+/// Facts held by the caller at the refusal boundary. A workspace is a default
+/// directory, not an authority claim. Scope details come from the caller's
 /// already-held snapshot, which need not include command-specific setup roots.
 /// Formatting must not refresh or mint a grant.
 fn denial_context(
@@ -1546,7 +1546,7 @@ fn denial_context(
     }
 
     let mut text = format!(
-        "Workspace root: {}\nRelative file-tool paths resolve from the workspace root",
+        "Workspace root: {}\nDefault tool directory: workspace root",
         serde_json::json!(workspace)
     );
     if let Some(cwd) = requested_cwd {
@@ -3364,6 +3364,7 @@ async fn execute_authorized_tool(
             Err(error) => return host_return(error.to_owned()),
         };
     let args = command_args.as_ref();
+
 
     // Eligible file reads and lifecycle commands use the governed built-ins.
     // Git commands keep their original arguments and use the confined exec

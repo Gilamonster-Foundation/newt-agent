@@ -93,6 +93,29 @@ jobs:
           -p newt-core --lib private_review_fetch_recovers_through_tool_search_and_mcp
           -- --ignored --test-threads=1
 
+      # HOOK PARITY: these are the two real-resource stdio-net-scope tests
+      # documented as the `.githooks/pre-push` mocked-vs-real exception for
+      # #2596. When editing either test's name or this job, update the
+      # exception note in `.githooks/pre-push` to match.
+      - name: Run stdio MCP net:none admission acceptance (#2596)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test stdio_spawn_under_net_none_does_not_l3_bound_refuse
+          -p newt-mcp-client --lib stdio_spawn_under_net_none_does_not_l3_bound_refuse
+          -- --ignored --test-threads=1
+
+      - name: Run stdio MCP host-scoped net narrowing acceptance (#2596)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused
+          -p newt-mcp-client --lib
+          stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused
+          -- --ignored --test-threads=1
+
       - name: Run MCP HTTP transport acceptance suite
         shell: bash
         run: >-

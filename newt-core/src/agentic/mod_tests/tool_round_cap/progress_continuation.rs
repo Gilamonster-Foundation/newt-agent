@@ -296,6 +296,11 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
     crate::initiative::set_initiative_config(Default::default());
     crate::initiative::set_cli_initiative(crate::initiative::Initiative::Measured);
     let _env = crate::agentic::anthropic_loop_tests::test_env(false);
+    let command = if cfg!(windows) {
+        "cmd.exe /d /c cd"
+    } else {
+        "pwd"
+    };
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -308,7 +313,7 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
                 tools: vec![
                     (
                         "run_command",
-                        serde_json::json!({"command":"pwd", "cwd":"missing-subdirectory"}),
+                        serde_json::json!({"command":command, "cwd":"missing-subdirectory"}),
                     ),
                     ("read_file", serde_json::json!({"path":"evidence.txt"})),
                 ],
@@ -324,10 +329,22 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         .unwrap();
         let task = "Inspect the workspace and report the findings.";
         let messages = vec![MemMessage::user(task)];
-        let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-        // Exercise the invalid cwd, not this host's restricted-network support.
-        // The command itself is a local pwd and makes no network request.
-        caveats.net = crate::caveats::Scope::All;
+        // Windows: this is a recovery-transcript fixture, not an AppContainer
+        // proof. Unrestricted axes let the invalid cwd reach the operating
+        // system; AppContainer evidence lives in the dedicated Windows
+        // evidence lane.
+        #[cfg(windows)]
+        let caveats = crate::caveats::Caveats::top();
+        // Everywhere else: exercise the invalid cwd under the same confined
+        // caveats (network excepted) this scenario runs under in practice,
+        // so the non-Windows lane still covers "confined except network"
+        // rather than losing that coverage to the Windows exception above.
+        #[cfg(not(windows))]
+        let caveats = {
+            let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+            caveats.net = crate::caveats::Scope::All;
+            caveats
+        };
         let uri = server.uri();
         let kind = match wire {
             "ollama" => BackendKind::Ollama,
@@ -369,10 +386,12 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
                     .last()
                     .unwrap()
                     .contains("cannot find the path")
-                // CreateProcess reports ERROR_DIRECTORY for a missing cwd.
-                // Match its stable code, not locale-dependent Windows wording.
-                || (cfg!(windows)
-                    && request_text.last().unwrap().contains("(os error 267)")),
+                // Windows reports an absent process working directory as
+                // ERROR_DIRECTORY (267), whose system message is this text.
+                || request_text
+                    .last()
+                    .unwrap()
+                    .contains("directory name is invalid"),
             "{wire}: failure must come from the absent cwd: {}",
             request_text.last().unwrap()
         );

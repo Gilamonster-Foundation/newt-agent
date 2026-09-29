@@ -999,6 +999,37 @@ pub(super) struct BackendAssembly {
     warnings: Vec<String>,
 }
 
+/// Process-wide "have we already logged this exact string" set — see
+/// [`BackendAssembly::warn`]. A `Mutex<HashSet<String>>` rather than
+/// anything fancier: warnings are rare (a handful of distinct strings per
+/// process, ever) and this only needs to answer "seen before?".
+fn emitted_warnings() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static EMITTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    EMITTED.get_or_init(Default::default)
+}
+
+/// True the first time `message` is seen this process, false every time
+/// after. Poisoning (a prior panic while holding the lock) is not a reason
+/// to stop deduping — recover the set and carry on.
+pub(super) fn first_emission_this_process(message: &str) -> bool {
+    let mut seen = emitted_warnings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.insert(message.to_string())
+}
+
+/// Test-only reset: the dedup set is process-wide, so a test asserting "this
+/// message logs once" must clear it first or an earlier test in the same
+/// binary may have already consumed that message's one emission.
+#[cfg(test)]
+pub(super) fn reset_emitted_warnings_for_test() {
+    emitted_warnings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 impl BackendAssembly {
     /// Stage `backends` (pure declarations) for assembly, validating
     /// backend identity first — see [`validate_backend_names`].
@@ -1022,8 +1053,19 @@ impl BackendAssembly {
     /// (the default — see #1951) still sees it live. `message` should read
     /// the same whether it reaches a human via the log or a test via
     /// [`Self::warnings`].
+    ///
+    /// The backend set is re-loaded many times over one TUI session (every
+    /// feature that needs a fresh read — `/model`, a backend switch, a
+    /// gate check — calls `resolve_runtime` again; #2623 counted 14 loads
+    /// in a single start). A stale drop-in's warning would otherwise repeat
+    /// once per load. [`first_emission_this_process`] dedups the
+    /// human-facing log line process-wide; [`Self::warnings`] stays
+    /// per-call so callers and tests still see every occurrence this
+    /// particular load produced.
     fn warn(&mut self, message: String) {
-        tracing::warn!("{message}");
+        if first_emission_this_process(&message) {
+            tracing::warn!("{message}");
+        }
         self.warnings.push(message);
     }
 

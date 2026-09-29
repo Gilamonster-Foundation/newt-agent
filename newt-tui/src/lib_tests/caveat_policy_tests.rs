@@ -76,6 +76,8 @@ fn approved_workspace_policy_stays_frozen_until_a_new_process_session() {
 }
 
 #[test]
+=======
+>>>>>>> origin/main
 fn workspace_access_launch_keeps_directory_fence_and_configured_network() {
     let _env = crate::test_env_guard::env_write_guard();
     let mut tui = tui_with(newt_core::PermissionPreset::ReadOnly);

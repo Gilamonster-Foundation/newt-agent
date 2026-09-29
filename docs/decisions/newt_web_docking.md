@@ -240,10 +240,11 @@ the sole writer. Opening an uplink grants the hub nothing the registry does not.
 caveats at open. That primitive is still design-only upstream (`agent-mesh`
 `docs/decisions/session_streams.md`, status "proposed"; no `open_session` at `c137d9e`). Until it
 lands, the interim is an **outbound long-poll over today's request/reply**: the host sends a
-`dock/uplink/poll` request, the hub holds it until it has a `DockRequest` to deliver, and the
-host's next request carries the result. Each reply follows a request by seconds, so dial-back
-reaches the host while its NAT mapping is still alive. The interim is replaced, not extended, when
-`session_streams` ships.
+`newt/dock/uplink/v1` request, the hub holds it until it has a `DockRequest` to deliver, and the
+host's next request carries the result. The host's bus is outbound-only (agent-mesh
+`Bus::bind_outbound_only`, #95): it refuses every connection it did not dial, and each poll's reply
+returns on the connection the poll went out on, so no dial-back and no NAT mapping is involved. The
+interim is replaced, not extended, when `session_streams` ships.
 
 **K8.4 — Stable dock identities on both ends, derived rather than stored.** The hub and every
 docked host hold a dock `AgentKey` whose fingerprint survives a restart, so an approval that pins it
@@ -283,6 +284,44 @@ promoted host, grouped by host and addressed as `session@host`, in the same side
 until K8 is proven, then is reviewed for retirement: two dock directions are two protocols to keep
 secure.
 
+**K8.8 — The first dock pairs by Numeric Comparison (amendment, 2026-09-27).** Operator
+direction: pairing is a second factor between the two endpoints, modelled on Bluetooth Secure
+Simple Pairing's Numeric Comparison. It supersedes the host half of K8.5's word check for a first
+dock; `pubkey_words` stays as a display of each key.
+- *Exchange, over the uplink, while either side has yet to approve the other.* This includes a
+  host the hub still approves after the host revoked it. The host sends a commitment
+  `C = H(hub key, host key, Nh)` to a fresh 128-bit nonce `Nh`; the hub answers at once with a
+  fresh nonce `Nb`; the host reveals `Nh`; the hub checks it opens `C`. A failed or out-of-order
+  step clears the pairing and the host starts again with fresh nonces. The host is committed to
+  `Nh` before it sees `Nb`, so neither end can steer the result: an attacker gets one guess per
+  attempt.
+- *Code and transcript.* Both ends build the same `PairingTranscript`: both keys (role order:
+  hub, host), `C`, `Nb` and `Nh`. The transcript id is its dag-cbor `ContentId`. The six digits
+  are a separate, domain-tagged hash of it (`newt_core::dock_registry::pairing`).
+- *One pairing, held by the hub.* Every reply names the transcript id of the pairing the hub
+  holds for the host: its staged pairing, or else the one its approval was signed under. A host
+  withdraws a code the hub no longer holds (expired, replaced or forgotten) and pairs again.
+  Each confirmation re-checks, after "yes", that the pairing compared is still the one held. On
+  the hub the check, the signature and consuming the staged record hold the staging lock the
+  pairing steps take (`promote_staged_host`), so a racing step cannot slip between them.
+- *Restart.* Re-docking restarts the host under the same key against a hub that kept running.
+  The host's uplink reserves its envelope sequences durably in its state dir (agent-mesh
+  `bind_outbound_only_reserving`, agent-mesh#100), so its successor starts above them. A hub
+  that restarts while its hosts keep running needs the same treatment; that is a follow-up.
+- *Confirmation on both ends before either side is approved.* The host (`newt-mesh dock`) shows
+  the code and writes its approval of the hub only on "yes" at its terminal; the hub keeps the
+  exchange with the staged host, and `newt dock approve --staged` recomputes the code, shows it,
+  and promotes only on "yes" at the hub's terminal. It refuses a host that has not completed
+  pairing. Both signed approvals commit to the pairing's transcript id.
+- *Where the host verbs live.* `newt` cannot link `newt-mesh` (it is outside the workspace), so
+  the host side ships in the `newt-mesh` binary: `newt-mesh dock-key` prints this
+  installation's hub and host keys and words, for copying to the other end, and `newt-mesh dock
+  <hub-key>@<ip>:<port>` pairs and holds the uplink in the foreground. Undocking is the existing
+  registry verbs: `newt dock revoke|revoke-all` on the host, or `/dock disable`. The uplink
+  re-reads the host's registry and kill switch before every poll, and closes itself once a hub it
+  approved is revoked or exposure is disabled. The TUI verbs of K8.6 follow when `newt-mesh`
+  can join the workspace.
+
 ### Non-goals
 
 - NAT hole-punching, iroh relays, or hub-to-hub relaying: the host must be able to reach the hub
@@ -304,13 +343,21 @@ secure.
 
 ### Ladder (one concern per PR)
 
-- [ ] **K8-a** — agent-mesh: accept-none bind mode (Gilamonster-Foundation/agent-mesh#92).
-- [ ] **K8-b** — derived dock `AgentKey` for hub and host (K8.4; needs agent-mesh
+- [x] **K8-a** — agent-mesh: accept-none bind mode, with replies on the requester's own connection
+  (Gilamonster-Foundation/agent-mesh#95, closing #92).
+- [x] **K8-b** — derived dock `AgentKey` for hub and host (K8.4; agent-mesh
   `AgentKey::issue_derived`, Gilamonster-Foundation/agent-mesh#93); regression that an approval
   survives a hub restart.
-- [ ] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
-  serves list/transcript/inject while accepting no inbound connection.
-- [ ] **K8-d** — hub side: accept uplinks, stage and promote hosts (K8.5), list sessions by host
-  (K8.7).
-- [ ] **K8-e** — TUI verbs `/dock <hub>`, `/undock`, `/dock status` (K8.6).
+- [x] **K8-c** — `newt-mesh` uplink, interim long-poll carrier (K8.3); loopback test proving the host
+  serves list/transcript/inject while accepting no inbound connection. The hub half is
+  `DockClient::serve_uplinks` (opt-in) plus `DockPeer::Uplink`; which hosts it serves is K8-d.
+- [x] **K8-d** — hub side, in two PRs:
+  - [x] **K8-d1** — admission: a hub serves only hosts promoted in its own registry, stages the
+    rest (`docks.staged`, expiring) and promotes them with `newt dock approve --staged` (K8.5).
+  - [x] **K8-d2** — newt-web accepts uplinks on `NEWT_WEB_DOCK_UPLINK_PORT` and lists each promoted
+    host's sessions under its instance name, addressed `session@host` (K8.7).
+- [x] **K8-e** — host side (K8.6, as amended by K8.8): Numeric Comparison pairing,
+  `newt-mesh dock-key` and `newt-mesh dock`, and an uplink that closes itself when undocked.
+- [ ] **K8-e2** — TUI verbs `/dock <hub>`, `/undock`, `/dock status` once `newt-mesh` can join
+  the workspace.
 - [ ] **K8-f** — swap the carrier to `session_streams` when agent-mesh ships it.

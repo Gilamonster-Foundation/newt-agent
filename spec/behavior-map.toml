@@ -406,6 +406,50 @@ symbol = "rebase"
 path = "newt-git/src/lib.rs"
 symbol = "checkout"
 
+# ───────────────── Native Git AppContainer boundary (#2610) ─────────────────
+
+[BHV-GIT-002]
+description = "On Windows, after ordinary filesystem admission and only when the effective restricted backend is AppContainer, an already exec-authorized single literal direct Git program is refused before spawn with a named unavailable result, because Git for Windows needs current-directory ancestor traversal outside the admitted roots. Newt does not widen those roots or retry unconfined; missing exec authority retains the normal capability denial, and text merely mentioning Git plus compound or dynamic shell source retains ordinary confined-executor semantics."
+[BHV-GIT-002.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "tests::appcontainer_refuses_recognized_native_git_without_matching_text"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "native_git_status_requires_exec_and_reads_the_actual_repository"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "state_modifying_git_add_is_not_routed"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "native_git_exec_grant_retry_is_refused_before_spawn"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
+symbol = "windows_disable_ocap_keeps_native_git_available"
+tier = "unit"
+[[BHV-GIT-002.refs.rust_tests]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "tests::native_staging_uses_current_workspace_grants"
+tier = "unit"
+[[BHV-GIT-002.refs.production]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "literal_native_git_program"
+[[BHV-GIT-002.refs.production]]
+path = "newt-core/src/agentic/tools/native_git.rs"
+symbol = "windows_appcontainer_native_git_refusal"
+[[BHV-GIT-002.refs.production]]
+path = "newt-core/src/agentic/tools/shell.rs"
+symbol = "exec_confined_command_with_broker"
+
 # ─────────────────────── Chat-loop dispatch recovery (#1533) ──────────────────
 # The temporal contract for the chat loops' dispatch recovery, machine-checked by
 # spec/tla/ChatRecovery.tla (TLC, MaxRounds 1 & 2). A dispatch RECOVERY retries
@@ -1385,7 +1429,7 @@ path = "newt-tui/src/cockpit/presenter.rs"
 symbol = "escape_during_turn"
 
 [BHV-ROUTE-001]
-description = "A run_command(\"git …\") call stays on the native exec path with its original flags, revisions, pathspecs, presentation options, and cwd. The router neither translates Git reads into embedded operations nor refuses a shape because the embedded Git interface cannot represent it. Existing exec, filesystem, and native Git authority checks still apply."
+description = "A run_command(\"git …\") call is never silently rewritten to Newt's smaller Git interface: routing and direct-tool correction leave its command and fields intact for native Git handling, including flags, revisions/ranges, -- pathspecs, cwd, and timeout. The routing table has no Git reach, and the direct-tool correction does not treat Git as a tool. This preserves Git's command and output semantics instead of dropping operands or refusing with a smaller supported-op list."
 [BHV-ROUTE-001.status]
 lean = "none"
 rust = "tested"
@@ -1412,13 +1456,12 @@ tier = "unit"
 path = "newt-core/src/agentic/tools_tests/helper_shell_routing.rs"
 symbol = "git_commands_are_never_redirected_to_a_special_tool"
 tier = "unit"
-[[BHV-ROUTE-001.refs.rust_tests]]
-path = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs"
-symbol = "native_git_status_requires_exec_and_reads_the_actual_repository"
-tier = "unit"
 [[BHV-ROUTE-001.refs.production]]
 path = "newt-core/src/agentic/routing.rs"
-symbol = "classify_call"
+symbol = "SHELL_ROUTES"
+[[BHV-ROUTE-001.refs.production]]
+path = "newt-core/src/agentic/tools/catalog.rs"
+symbol = "run_command_redirect"
 
 # ─────────────────────────────── OCAP durable grants ─────────────────────────
 

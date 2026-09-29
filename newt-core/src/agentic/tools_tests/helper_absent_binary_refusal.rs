@@ -369,3 +369,49 @@ fn a_piped_absence_keeps_its_output_and_names_the_program() {
     );
     assert_eq!(outcome, crate::ExecOutcome::Passed);
 }
+
+/// An ordinary, unrelated failure must fall through untouched as an honest
+/// failure — never relabelled into a `capability denied` sandbox denial and
+/// never offered an exec-grant target. This pins the reviewer's invariant on
+/// #2633: a non-zero exit carries no authoritative sandbox-refusal evidence of
+/// its own, so it is rendered as itself (see shell.rs's `confined_result`).
+#[test]
+fn an_unrelated_failure_is_not_a_child_exec_denial() {
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "error: test assertion failed\n",
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        "cargo test",
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "error: test assertion failed".to_owned(),
+    );
+    assert_eq!(text, "error: test assertion failed");
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
+}
+
+/// A failure whose stderr merely *names* a child but names nothing the
+/// sandbox actually refused carries no resolvable, invocation-bound target,
+/// so no structured denial is minted — never guess a grant target. This is
+/// the guard against re-deriving a sandbox denial from child stderr: only the
+/// leash's own structured refusal (#2421) could ever mint one.
+#[test]
+fn an_unresolvable_child_name_is_not_a_named_denial() {
+    let envelope = serde_json::json!({
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": format!("fatal: cannot exec '{ABSENT}': Permission denied\n"),
+    });
+    let (text, outcome) = super::super::shell::confined_result(
+        &format!("git {ABSENT}"),
+        &envelope,
+        &crate::caveats::Caveats::top(),
+        false,
+        |_| "fatal: cannot exec".to_owned(),
+    );
+    assert_eq!(text, "fatal: cannot exec");
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
+}

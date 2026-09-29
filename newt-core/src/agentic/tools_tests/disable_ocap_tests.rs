@@ -1171,6 +1171,39 @@ async fn run_command_with_legacy_git(
         None, // permission_gate
         None, // exec_floor
         Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
+=======
+        None, // crew_runner
+        None, // scratchpad_store
+        None, // code_search
+        None, // where_is
+        None, // experience_store
+        None, // step_ledger
+    )
+    .await
+}
+
+#[cfg(target_os = "windows")]
+async fn run_command_with_legacy_git_and_gate(
+    command: &str,
+    ws: &std::path::Path,
+    caveats: &Caveats,
+    permission_gate: &mut dyn super::PermissionGate,
+) -> String {
+    execute_tool(
+        "run_command",
+        &serde_json::json!({ "command": command }),
+        &ws.to_string_lossy(),
+        false,
+        20,
+        caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None, // memory_source
+        Some(permission_gate),
+        None, // exec_floor
+        Some(&UnexpectedEmbeddedGit as &dyn crate::agentic::GitTool),
         None, // crew_runner
         None, // scratchpad_store
         None, // code_search
@@ -1338,14 +1371,58 @@ async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     caveats.net = Scope::All;
     let denied = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
     assert!(denied.contains("capability denied"), "{denied}");
+    assert!(
+        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
+    );
     caveats.exec = Scope::All;
     let out = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
+    #[cfg(target_os = "windows")]
+    {
+        assert!(
+            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+            "restricted AppContainer must refuse before native Git runs: {out}"
+        );
+        assert!(!out.contains("routed:"), "{out}");
+        assert!(!ws.path().join(".git/index").exists());
+    }
+    #[cfg(not(target_os = "windows"))]
     assert!(
         out.contains("native-only.txt"),
         "native Git must report the actual untracked file: {out}"
     );
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert!(!out.contains("routed:"), "{out}");
+        assert!(!ws.path().join(".git/index").exists());
+    }
+}
+
+/// The documented operator-controlled host route is intentionally distinct
+/// from the restricted AppContainer path: it preserves ordinary native Git
+/// behavior rather than silently widening a confined invocation.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn windows_disable_ocap_keeps_native_git_available() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("native-only.txt"), "host route evidence\n").unwrap();
+    let out =
+        run_command_with_legacy_git("git status", ws.path(), &caveats_no_exec(ws.path())).await;
+    assert!(out.contains("native-only.txt"), "{out}");
+    assert!(
+        !out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the explicit host route must not take the AppContainer refusal: {out}"
+    );
     assert!(!out.contains("routed:"), "{out}");
-    assert!(!ws.path().join(".git/index").exists());
 }
 
 /// #1022: `run_command("rm file")` routes to the governed delete_file arm,
@@ -1372,8 +1449,9 @@ async fn routed_rm_dispatches_through_delete_file() {
     );
 }
 
-/// The same exec boundary governs mutations: denial creates no index; an
-/// explicitly authorized native `git add` stages the real file.
+/// The same exec boundary governs mutations: denial creates no index. On
+/// Windows, restricted AppContainer reports the documented pre-spawn native
+/// Git incompatibility; other platforms stage the real file.
 #[tokio::test]
 async fn state_modifying_git_add_is_not_routed() {
     let _l = env_lock().await;
@@ -1391,6 +1469,11 @@ async fn state_modifying_git_add_is_not_routed() {
     caveats.net = Scope::All;
     let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
     assert!(denied.contains("capability denied"), "{denied}");
+=======
+    assert!(
+        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
+    );
     assert!(!ws.path().join(".git/index").exists());
     caveats.exec = Scope::All;
     let out = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
@@ -1404,10 +1487,85 @@ async fn state_modifying_git_add_is_not_routed() {
             .output()
             .unwrap();
     assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
+=======
+    #[cfg(target_os = "windows")]
+    {
+        assert!(
+            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+            "restricted AppContainer must refuse before native Git runs: {out}"
+        );
+        assert!(!ws.path().join(".git/index").exists());
+        assert_eq!(
+            String::from_utf8(staged.stdout).unwrap().trim(),
+            "",
+            "the unavailable command must not stage the file: {out}"
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
     assert_eq!(
         String::from_utf8(staged.stdout).unwrap().trim(),
         "stage-me.txt",
         "native dispatch must actually stage the file: {out}"
+    );
+=======
+}
+
+/// An interactive exec grant retries once with the freshly minted caveats. On
+/// Windows that retry must still fail before native Git reaches AppContainer.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn native_git_exec_grant_retry_is_refused_before_spawn() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    std::fs::write(ws.path().join("retry-me.txt"), "retry evidence\n").unwrap();
+
+    struct GrantExecGate {
+        requests: Vec<super::PermissionRequest>,
+        granted: Caveats,
+    }
+    impl super::PermissionGate for GrantExecGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            self.requests.extend_from_slice(requests);
+            super::PermissionDecision::Allow(self.granted.clone())
+        }
+        fn ask_question(&mut self, _: &str) -> super::HumanQuestionOutcome {
+            super::HumanQuestionOutcome::Unavailable
+        }
+    }
+
+    let mut caveats = caveats_no_exec(ws.path());
+    caveats.net = Scope::All;
+    let mut granted = caveats.clone();
+    granted.exec = Scope::All;
+    let mut gate = GrantExecGate {
+        requests: vec![],
+        granted,
+    };
+    let out = run_command_with_legacy_git_and_gate(
+        "git add retry-me.txt",
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert!(
+        out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
+        "the post-grant retry must be refused before native Git runs: {out}"
+    );
+    assert_eq!(gate.requests.len(), 1, "{out}");
+    assert_eq!(gate.requests[0].kind, super::DenialKind::Exec, "{out}");
+    assert_eq!(gate.requests[0].target, "git", "{out}");
+    assert!(
+        !ws.path().join(".git/index").exists(),
+        "the refused retry must not stage a file: {out}"
     );
 }
 

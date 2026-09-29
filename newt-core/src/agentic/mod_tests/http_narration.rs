@@ -909,3 +909,33 @@ fn looks_like_intent_to_act_separates_narration_from_final_answers() {
     let multibyte = format!("{}let me edit", "…".repeat(200));
     assert!(looks_like_intent_to_act(&multibyte));
 }
+
+/// #2625: when the model follows the post-render nudge and prefixes a corrected
+/// table with the prescribed "Correction: … — supersedes the report above" form,
+/// the harness returns that reply unchanged — the correction statement is not
+/// stripped or collapsed. The companion unit test (in report.rs) asserts the nudge
+/// text carries the instruction; this test asserts the reply path honours it.
+#[tokio::test]
+async fn explicit_correction_statement_passes_through_to_caller() {
+    let correction_reply = "Correction: I listed files shortest to longest, not longest \
+        to shortest — supersedes the report above\n\n\
+        | File | Lines |\n|------|-------|\n| gamma.rs | 300 |\n| beta.rs | 200 |\n| alpha.rs | 100 |";
+    let (reply, _rounds) = run_openai_script(vec![
+        // Round 1: render_report with a table
+        serde_json::json!({"tool_calls": [{"id": "rpt", "function": {
+            "name": "render_report",
+            "arguments": "{\"title\":\"Top files\",\"body\":\"| File | Lines |\\n|------|-------|\\n| alpha.rs | 100 |\\n| beta.rs | 200 |\\n| gamma.rs | 300 |\"}"
+        }}]}),
+        // Round 2: final reply uses the correction format
+        serde_json::json!({ "content": correction_reply }),
+    ])
+    .await;
+    assert!(
+        reply.contains("supersedes the report above"),
+        "correction statement must reach the caller: {reply}"
+    );
+    assert!(
+        reply.contains("Correction:"),
+        "correction prefix must be present in the returned reply: {reply}"
+    );
+}

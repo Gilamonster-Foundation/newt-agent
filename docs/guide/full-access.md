@@ -20,7 +20,6 @@ preview and explicit confirmation, then applies the saved profile on the next
 real Newt process launch. `/restart` does not reload authority. See
 [saved workspace access](workspace-settings.md) for directory management,
 default-workspace selection, independent approvals, and protection requirements.
-
 To persist this filesystem and executable preset, use an operator-owned, trusted
 config such as `~/.newt/config.toml` (or `$NEWT_CONFIG_DIR/config.toml`):
 
@@ -48,7 +47,6 @@ Explicit conflicting `--full-access` or `--yolo` flags are refused. Explicit
 `--workspace-access` keeps the saved directories while selecting workspace full
 access for that one run. Removing the saved profile restores configured fallback
 behavior and leaves independent saved approvals intact.
-
 On macOS, the current Bridle backend cannot enforce restricted network grants,
 including the default empty `net` list. Confined commands require the operator
 to explicitly allow unrestricted networking. For that choice, include this in

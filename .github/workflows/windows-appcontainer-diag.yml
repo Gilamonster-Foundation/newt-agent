@@ -1,0 +1,116 @@
+name: Windows AppContainer diagnostic (manual)
+
+# Narrow, manually-triggered diagnostic for PR #2614's Windows CI failure
+# (agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants
+# and the two disable_ocap_tests siblings: `fatal: detected dubious ownership`).
+#
+# This does NOT run on push/PR — it never affects the ordinary CI gate. It
+# exists because that failure could not be reproduced locally: the only
+# native Windows box available (Caster) is a Windows 10/11 Pro client, not
+# the Server 2022 image `windows-latest` runs, and on Caster even a bare
+# `whoami.exe` launched through `agent-bridle-aclaunch.exe` crashes with
+# STATUS_DLL_INIT_FAILED before reaching git at all — a different, more
+# fundamental failure than CI's, most likely an OS-family difference. This
+# workflow runs the same isolation steps on the real CI OS so a human/agent
+# can see which failure (if either) actually reproduces there, without
+# waiting on a full `cargo test --workspace` cycle each time.
+#
+# See knowledge/board/newt-agent/2026-09-28_newt-pr2614-pipeline-repair-HANDOFF.md
+# for the full investigation history.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/ref to check out and build"
+        required: true
+        default: "step-27.13-workspace-settings"
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Show OS/runner identity
+        shell: pwsh
+        run: |
+          Get-ComputerInfo | Select-Object WindowsProductName, OsBuildNumber, WindowsVersion, OsHardwareAbstractionLayer
+          Write-Output "Current identity: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          Write-Output "Is elevated: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator))"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install AppContainer launcher
+        run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
+
+      - name: Prepare NUL device for AppContainer tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows/Enable-AppContainerNull.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerNull.ps1
+
+      - name: Prepare bounded DOS path lookup and verify confinement
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -NamespaceOnly
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
+
+      # Isolates the launcher from the Rust test harness entirely: does the
+      # child process even start under AppContainer, for progressively more
+      # git-like targets, before ever touching a repository.
+      - name: Direct AppContainer child-process isolation (no test harness)
+        shell: pwsh
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: |
+          $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
+          $work = Join-Path $env:RUNNER_TEMP 'actest'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          git init -q -b main
+          "original`n" | Out-File tracked.txt -NoNewline
+          git add tracked.txt
+          git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
+          "stage me`n" | Out-File pending.txt -NoNewline
+
+          function Run-Diag($label, $exe, $args) {
+            Write-Output "== $label =="
+            & $launcher --fs-write $work $exe @args
+            Write-Output "EXIT=$LASTEXITCODE"
+            Write-Output ""
+          }
+
+          Run-Diag "cmd.exe (echo)" "cmd" @("/c", "echo hello")
+          Run-Diag "whoami.exe (System32, no unusual deps)" "$env:WINDIR\System32\whoami.exe" @()
+          Run-Diag "git --version" (Get-Command git.exe).Source @("--version")
+          Run-Diag "git status (real repo)" (Get-Command git.exe).Source @("status")
+          Run-Diag "git add pending.txt (the actual failing operation)" (Get-Command git.exe).Source @("add", "--", "pending.txt")
+
+      - name: Stage launcher next to test binaries and run the actual failing test
+        if: always()
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+          BRIDLE_REQUIRE_UNC_CONTROL: "1"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target\debug\deps | Out-Null
+          Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
+          $tests = @(
+            'agentic::tools::disable_ocap_tests::native_git_status_requires_exec_and_reads_the_actual_repository',
+            'agentic::tools::disable_ocap_tests::state_modifying_git_add_is_not_routed',
+            'agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants'
+          )
+          foreach ($t in $tests) {
+            Write-Output "===== cargo test $t ====="
+            cargo test -p newt-core --lib --features windows-appcontainer $t -- --test-threads=1 --nocapture
+            Write-Output "EXIT=$LASTEXITCODE"
+          }

@@ -93,7 +93,6 @@ async fn run_with(
     tool_call_on: Option<usize>,
     overflow_retry: crate::config::OverflowRetry,
 ) -> Run {
-    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let bodies = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -256,7 +255,6 @@ async fn separated_overflow_episodes(
     supports_thinking_off: bool,
     cancel_later_overflow: bool,
 ) -> Run {
-    let _settings = default_loop_settings();
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(
         workspace.path().join("observation.txt"),

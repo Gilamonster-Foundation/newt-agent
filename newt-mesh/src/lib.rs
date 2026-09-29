@@ -59,15 +59,18 @@ pub mod error;
 pub mod plugin_envelope;
 pub mod protocol;
 pub mod service;
+pub mod uplink;
 
 pub use agent_mesh_bus::PeerEndpoint;
 pub use ask::MeshAsker;
 pub use caveats::{caveats_for_peer, caveats_for_peer_at, CaveatsError};
 pub use dock::{
-    dock_agent, dock_instance, DockClient, DockReply, DockRequest, DockRole, DockSessionInfo,
-    DockTranscript, DockTurn, NewtDockService, DOCK_CAPABILITY_TAG, DOCK_INSTANCE_FILE, DOCK_TOPIC,
+    dock_agent, dock_instance, hub_standing, DockClient, DockPeer, DockReply, DockRequest,
+    DockRole, DockSessionInfo, DockTranscript, DockTurn, HubStanding, NewtDockService,
+    DOCK_CAPABILITY_TAG, DOCK_INSTANCE_FILE, DOCK_TOPIC,
 };
 pub use error::MeshIntegrationError;
 pub use plugin_envelope::{caveats_from_envelope, serialize_for_plugin, EnvelopeError};
 pub use protocol::{InferenceReply, InferenceRequest, TokenUsage, CAPABILITY_TAG, INFERENCE_TOPIC};
 pub use service::NewtMeshService;
+pub use uplink::{DockUplink, UplinkState, DOCK_UPLINK_TOPIC};

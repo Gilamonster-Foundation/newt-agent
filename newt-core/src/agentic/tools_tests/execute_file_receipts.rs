@@ -535,17 +535,13 @@ async fn unavailable_receipt_preview_preserves_mutation_outcome() {
     );
 
     // The parent is a regular file, so the actual authorized write fails.
-    // Withhold reads so the optional receipt is unavailable on every platform:
-    // Windows reports this missing child as NotFound, Unix as NotADirectory.
-    // Neither an unavailable preview nor a write-only grant may imply success.
+    // Its unavailable receipt must not acquire success wording or hide failure.
     std::fs::write(ws.path().join("blocked"), "keep these bytes").unwrap();
-    let mut write_only = caveats_rw(ws.path());
-    write_only.fs_read = Scope::none();
     let (failed, display) = model_and_display(
         "write_file",
         serde_json::json!({"path": "blocked/child.txt", "content": "not written"}),
         ws.path(),
-        &write_only,
+        &caveats_rw(ws.path()),
         ToolCollaborators::default(),
     )
     .await;
@@ -563,6 +559,80 @@ async fn unavailable_receipt_preview_preserves_mutation_outcome() {
         std::fs::read_to_string(ws.path().join("blocked")).unwrap(),
         "keep these bytes"
     );
+}
+
+/// A precise file grant remains sufficient to verify its own deletion after
+/// the path cannot be canonicalized any more. This is a Windows-only witness:
+/// the fallback physical-containment probe must not turn a successful,
+/// authorized delete into an unverified mutation merely because its exact
+/// scope root has disappeared.
+#[cfg(windows)]
+#[tokio::test]
+async fn exact_file_grant_verifies_its_deleted_leaf() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let file = ws.path().join("state.txt");
+    std::fs::write(&file, "before\n").unwrap();
+    let granted = file.to_string_lossy().into_owned();
+    let caveats = Caveats {
+        fs_read: Scope::only([granted.clone()]),
+        fs_write: Scope::only([granted]),
+        ..Caveats::top()
+    };
+
+    let output = run_tool(
+        "delete_file",
+        serde_json::json!({"path": "state.txt"}),
+        ws.path(),
+        &caveats,
+        None,
+    )
+    .await;
+    assert!(output.starts_with("deleted state.txt"), "{output}");
+    assert!(output.contains("Deleted (+0 -1)"), "{output}");
+    assert!(!file.exists());
+}
+
+/// Windows maps both a missing leaf and a regular-file-parent traversal to
+/// `NotFound`; only the former may prove an absent postimage. An existing
+/// directory is likewise unreadable as a regular file, not absent.
+#[cfg(windows)]
+#[test]
+fn windows_not_found_receipts_require_a_missing_leaf_below_a_directory() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let blocked = ws.path().join("blocked");
+    std::fs::write(&blocked, "regular file").unwrap();
+    let workspace_scope = Scope::only([ws.path().to_string_lossy().into_owned()]);
+    let through_regular_file = blocked.join("child.txt");
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&workspace_scope, &through_regular_file),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &workspace_scope,
+        &through_regular_file
+    ));
+
+    let through_missing_parent = ws.path().join("missing-parent/child.txt");
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&workspace_scope, &through_missing_parent),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &workspace_scope,
+        &through_missing_parent
+    ));
+
+    let directory = ws.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let exact_directory_scope = Scope::only([directory.to_string_lossy().into_owned()]);
+    assert!(matches!(
+        crate::agentic::tools::file_capture::capture(&exact_directory_scope, &directory),
+        crate::agentic::tools::file_capture::TextSnapshot::Unavailable(_)
+    ));
+    assert!(!crate::agentic::tools::file_capture::absent(
+        &exact_directory_scope,
+        &directory
+    ));
 }
 
 #[cfg(unix)]

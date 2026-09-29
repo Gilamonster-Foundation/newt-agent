@@ -478,6 +478,32 @@ fn workspace_write_classifier_is_narrow() {
     assert!(!is_workspace_write_call("read_file"));
 }
 
+/// #2618/F46: `may_change_workspace` gates ELIGIBILITY for a
+/// `progress_workspace_state` before/after snapshot, not progress itself — a
+/// `run_command` that wrote via shell redirection must be ELIGIBLE for that
+/// snapshot; `is_workspace_write_call` (the narrow, name-only classifier used
+/// for the headless write-trajectory) never would, by design, which was the
+/// bug: the brake's snapshot selector used to gate eligibility on that
+/// predicate instead of `may_change_workspace`. Whether the round actually
+/// AWARDS progress is a separate question, answered by comparing the
+/// before/after `ProgressSnapshot`s in `WorkflowRuntimeState::record_workspace_change`
+/// (pinned directly, on the real production snapshot function, by
+/// `progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change` in
+/// `http_smart_completion.rs`) — not by this predicate alone.
+#[test]
+fn may_change_workspace_counts_a_run_command_redirect_write() {
+    let args = serde_json::json!({"command": "head -n 9309 x | tail -n 2183 > out.rs"});
+    assert!(may_change_workspace("run_command", &args));
+}
+
+/// A pure read command must still be INELIGIBLE for a workspace snapshot
+/// under the same predicate the brake's snapshot selector now gates on.
+#[test]
+fn may_change_workspace_excludes_a_pure_read_command() {
+    let args = serde_json::json!({"command": "grep -n x f"});
+    assert!(!may_change_workspace("run_command", &args));
+}
+
 #[test]
 fn no_result_reason_classifies_and_routes() {
     // recall / state_get no-result prefixes classify…
@@ -979,43 +1005,14 @@ async fn named_mutation_progress_uses_exact_file_grants_and_absent_postimage() {
     assert!(state.record_workspace_change(before, after));
     std::fs::remove_file(&file).unwrap();
     let absent = progress_workspace_state("delete_file", &args, workspace, &scope).await;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
-        assert!(state.record_workspace_change(after, absent));
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // The diagnostic fallback cannot canonicalize an absent exact-file
-        // grant. Unlike the descriptor-bound backends, it has no held parent
-        // capability proving absence, so it must not invent progress.
-        assert!(absent.is_none());
-        assert!(!state.record_workspace_change(after, absent));
-    }
+    assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
+    assert!(state.record_workspace_change(after, absent));
     let sibling = serde_json::json!({"path":"not-granted.txt"});
     assert!(
         progress_workspace_state("write_file", &sibling, workspace, &scope)
             .await
             .is_none()
     );
-}
-
-#[tokio::test]
-async fn named_mutation_progress_observes_absence_under_directory_grants() {
-    let root = tempfile::tempdir().unwrap();
-    let file = root.path().join("source.txt");
-    let workspace = root.path().to_str().unwrap();
-    let args = serde_json::json!({"path":"source.txt"});
-    let scope = crate::caveats::Scope::only([workspace.to_owned()]);
-    std::fs::write(&file, "before deletion").unwrap();
-    let before = progress_workspace_state("delete_file", &args, workspace, &scope).await;
-    assert!(matches!(before, Some(ProgressSnapshot::File(_))));
-    std::fs::remove_file(&file).unwrap();
-    // An existing directory grant supplies the fallback's physical anchor.
-    // Workspace/directory grants must observe deletion on Windows as well.
-    let absent = progress_workspace_state("delete_file", &args, workspace, &scope).await;
-    assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
-    assert!(WorkflowRuntimeState::default().record_workspace_change(before, absent));
 }
 
 #[test]

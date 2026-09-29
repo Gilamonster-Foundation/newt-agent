@@ -227,6 +227,43 @@ pub fn permits_path(scope: &Scope<String>, full_path: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Spawn net scope (agent-bridle 0.8 admission narrowing)
+// ---------------------------------------------------------------------------
+
+/// The `net` caveat to hand a **spawned child** (confined shell / stdio MCP
+/// server), as opposed to the in-process `web_fetch` caller that can actually
+/// enforce a host allow-list.
+///
+/// Under agent-bridle 0.8, admission fails closed (L3 BOUND) on the Linux
+/// Landlock backend when the delegated `net` scope is a non-empty host list:
+/// `Scope::Only(_)` resolves to `Unknown` (only `Scope::none()` is bindable
+/// to a kernel primitive there), and `Unknown` refuses at admission
+/// independent of enforcement strength. A spawned child was never able to
+/// honor a host-scoped allow-list anyway — no kernel primitive here bounds
+/// *which* host a TCP socket reaches, only whether it may open one at all —
+/// so that grant was already advisory-only for a spawn. Narrowing it to
+/// `Scope::none()` here loses nothing a spawn could actually enforce, and
+/// makes admission decidable on Linux (`none` + `ChildNetworkPolicy::DenyDirect`
+/// ⇒ `Kernel`).
+///
+/// **Measured on Linux** (Landlock + `DenyDirect` → `Kernel`-decidable after
+/// this narrowing). On macOS, Seatbelt still refuses a restricted `net` scope
+/// — including `none` — independently; a separate agent-bridle fix is under
+/// way. On Windows, AppContainer can bind `net:none`, but other axes (e.g.
+/// restricted exec) can still refuse; behaviour is unvalidated here.
+///
+/// `Scope::All` and `Scope::none()` pass through unchanged: `All` is already
+/// unrestricted (nothing to narrow), and `none()` is already the bindable
+/// shape. Only a non-empty `Only(_)` host list is narrowed.
+#[must_use]
+pub fn spawn_net_scope(net: &Scope<String>) -> Scope<String> {
+    match net {
+        Scope::Only(set) if !set.is_empty() => Scope::none(),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +286,18 @@ mod tests {
 
     fn s(v: &[&str]) -> std::collections::BTreeSet<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn spawn_net_scope_narrows_a_nonempty_host_list_to_none() {
+        let hosts = Scope::only(["api.example.com".to_string()]);
+        assert_eq!(spawn_net_scope(&hosts), Scope::none());
+    }
+
+    #[test]
+    fn spawn_net_scope_preserves_all_and_empty() {
+        assert_eq!(spawn_net_scope(&Scope::All), Scope::All);
+        assert_eq!(spawn_net_scope(&Scope::none()), Scope::none());
     }
 
     #[test]
