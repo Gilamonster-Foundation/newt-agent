@@ -136,13 +136,78 @@ fn check_chain(path: &Path, fs_write: &Scope<String>) -> Result<(), String> {
 
 /// Check one component; returns its owner so the walk can apply the sticky
 /// rule to the directory above it.
+/// Like [`permits_path`] but also resolves each scope root through symlinks
+/// before comparing.  On macOS, system directories are symlinked (`/var →
+/// /private/var`, `/tmp → /private/tmp`): a canonical path under
+/// `/private/var/…` does not match the scope root `/var/…` lexically, but
+/// does once `/var` is resolved.  The *path being checked* is NOT
+/// canonicalized here; pass the canonical form yourself when you already
+/// have it.  Scope roots that cannot be resolved are skipped (they're
+/// effectively empty grants and the lexical check already handled the match).
+fn permits_path_with_canonical_roots(scope: &Scope<String>, path: &Path) -> bool {
+    if permits_path(scope, &path.to_string_lossy()) {
+        return true;
+    }
+    match scope {
+        Scope::All => true,
+        Scope::Only(roots) => roots.iter().any(|root| {
+            std::fs::canonicalize(root)
+                .ok()
+                .is_some_and(|cr| path.starts_with(&cr))
+        }),
+    }
+}
+
+/// Returns `true` if any component of `path` is a symlink that is NOT a
+/// root-owned system symlink (owned by root in a root-owned, non-world-
+/// writable parent).  System symlinks such as `/var → /private/var` on macOS
+/// are exempt; user-owned or user-planted symlinks are not.
+///
+/// Used to detect a model-planted symlink at the staging repo path after
+/// `DirBuilder::create` returned `AlreadyExists`.
+#[cfg(unix)]
+fn path_has_user_symlink(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.uid() != 0 {
+            return true; // user-owned symlink
+        }
+        if let Some(parent) = current.parent() {
+            if let Ok(pm) = std::fs::symlink_metadata(parent) {
+                let pmode = pm.permissions().mode();
+                // Parent must be root-owned and not writable without sticky.
+                if pm.uid() != 0 || (pmode & 0o022 != 0 && pmode & 0o1000 == 0) {
+                    return true;
+                }
+            } else {
+                return true; // can't verify parent → conservative
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn path_has_user_symlink(_path: &Path) -> bool {
+    false // broker is refused on Windows before this is reached
+}
+
 fn check_one(
     path: &Path,
     below_owner: Option<u32>,
     fs_write: &Scope<String>,
 ) -> Result<u32, String> {
     let short = shorten_home(path);
-    if permits_path(fs_write, &path.to_string_lossy()) {
+    if permits_path_with_canonical_roots(fs_write, path) {
         return Err(format!(
             "governed push refused: '{short}' is inside a model-writable tree; \
              the file must live outside the session's writable roots"
@@ -180,11 +245,30 @@ fn writable_by_others(meta: &std::fs::Metadata, below_owner: Option<u32>) -> boo
     if mode & 0o022 == 0 {
         return false;
     }
+    // A2 exemption: root-owned sticky directory whose immediate child is owned
+    // by root or the current user (e.g. /tmp on Linux).
     let secure_sticky = meta.is_dir()
         && mode & 0o1000 != 0
         && meta.uid() == 0
         && below_owner.is_some_and(|uid| uid == 0 || uid == effective_uid());
-    !secure_sticky
+    if secure_sticky {
+        return false;
+    }
+    // macOS admin-group exemption: root-owned directories that are group-writable
+    // but NOT other-writable, where the current user is in that group (e.g.
+    // /Applications owned by root:admin).  The model running as the user already
+    // has that group-write access, so the broker refusing this ancestor adds no
+    // security; the user could already add entries there.  Only applicable when
+    // the parent direction (world-write) is absent, keeping the scope tight.
+    #[cfg(target_os = "macos")]
+    if meta.is_dir()
+        && meta.uid() == 0
+        && mode & 0o002 == 0  // NOT other-writable
+        && user_in_group(meta.gid())
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(not(unix))]
@@ -206,6 +290,29 @@ fn owner(_meta: &std::fs::Metadata) -> u32 {
 fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
+}
+
+/// Returns true when the current process is a member of `gid` (effective GID
+/// or any supplementary group).  Used to exempt root-owned, group-only-writable
+/// system directories on macOS (e.g. /Applications, group=admin) where the
+/// user already holds that write access and the model gains nothing new.
+#[cfg(target_os = "macos")]
+fn user_in_group(gid: u32) -> bool {
+    if gid == unsafe { libc::getegid() } {
+        return true;
+    }
+    // SAFETY: passing null for the list ptr queries the count; both calls have
+    // no preconditions beyond a valid pointer (or null).
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n <= 0 {
+        return false;
+    }
+    let mut buf = vec![0u32; n as usize];
+    let got = unsafe { libc::getgroups(buf.len() as i32, buf.as_mut_ptr()) };
+    if got <= 0 {
+        return false;
+    }
+    buf[..got as usize].contains(&gid)
 }
 
 /// Shorten `path` to `~/…` when it lies under `$HOME`.
@@ -230,7 +337,7 @@ fn read_no_symlink_file(path: &Path, fs_read: &Scope<String>) -> Result<Option<S
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
 
-    if !permits_path(fs_read, &path.to_string_lossy()) {
+    if !permits_path_with_canonical_roots(fs_read, path) {
         return Err(format!(
             "refused: '{}' is outside this session's filesystem read authority",
             path.display()
@@ -472,7 +579,7 @@ pub fn discover_git_dirs(
         let resolved = std::fs::canonicalize(p)
             .map_err(|e| format!("refused: '{}' cannot be resolved ({e})", p.display()))?;
         for candidate in [p, resolved.as_path()] {
-            if !permits_path(fs_read, &candidate.to_string_lossy()) {
+            if !permits_path_with_canonical_roots(fs_read, candidate) {
                 return Err(format!(
                     "refused: '{}' is outside this session's filesystem read authority",
                     candidate.display()
@@ -871,9 +978,12 @@ impl StagingRepo {
             .map_err(|e| format!("refused: cannot create staging dir ({e})"))?;
         let staging = Self { dir };
         trust_check(&staging.dir, fs_write)?;
-        if std::fs::canonicalize(&staging.dir).ok().as_deref() != Some(staging.dir.as_path()) {
+        // Refuse if any component of the staging path is a user-owned symlink:
+        // DirBuilder::create may have returned AlreadyExists on a planted symlink.
+        // Root-owned system symlinks (macOS /var → /private/var) are exempt.
+        if path_has_user_symlink(&staging.dir) {
             return Err(format!(
-                "refused: staging path '{}' traverses a symlink",
+                "refused: staging path '{}' traverses a user-owned symlink",
                 staging.dir.display()
             ));
         }
@@ -1178,7 +1288,7 @@ pub fn resolve_alternates_chain(
         if !seen.insert(canonical.clone()) {
             continue;
         }
-        if !permits_path(fs_read, &canonical.to_string_lossy()) {
+        if !permits_path_with_canonical_roots(fs_read, &canonical) {
             return Err(format!(
                 "refused: alternates chain reaches '{}', outside authorized read roots",
                 canonical.display()
