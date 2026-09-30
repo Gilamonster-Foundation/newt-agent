@@ -1,11 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import net from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { waitUntilReady } from "./readiness.mjs";
 
 const webRoot = fileURLToPath(new URL("../..", import.meta.url));
 const repoRoot = path.resolve(webRoot, "..");
@@ -32,50 +32,6 @@ async function reservePort() {
   const port = await listen(server);
   await new Promise((resolve) => server.close(resolve));
   return port;
-}
-
-const READY_TIMEOUT_MS = 45_000;
-
-/// The last `maxLines` lines of a log — so a runaway or noisy process can't
-/// make the diagnostic itself unusable.
-function logTail(log, maxLines = 50) {
-  return log.split("\n").slice(-maxLines).join("\n");
-}
-
-/// `isExited`/`getLog` default to the real `appProcess`/`appLog`, and are
-/// overridable so this loop's deadline behaviour is testable without a real
-/// `newt-web` process (see the accept-without-response test below).
-async function waitUntilReady(url, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? READY_TIMEOUT_MS;
-  const isExited = opts.isExited ?? (() => appProcess.exitCode);
-  const getLog = opts.getLog ?? (() => appLog);
-  const start = Date.now();
-  const deadline = start + timeoutMs;
-  while (Date.now() < deadline) {
-    const exitCode = isExited();
-    if (exitCode !== null) {
-      throw new Error(
-        `newt-web exited before readiness (${exitCode}) after ${Date.now() - start}ms\n${logTail(getLog())}`,
-      );
-    }
-    try {
-      // Bounded by the REMAINING overall deadline, not an unbounded fetch:
-      // a socket that accepts but never answers (the failure this readiness
-      // check exists for) must not stop the loop from rechecking its
-      // deadline and reporting elapsed time + log tail.
-      const response = await fetch(`${url}/healthz`, {
-        signal: AbortSignal.timeout(Math.max(deadline - Date.now(), 1)),
-      });
-      if (response.ok) return;
-    } catch (_error) {
-      // Still starting, or this probe itself hit the remaining deadline.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(
-    `newt-web did not become ready after ${Date.now() - start}ms (deadline ${timeoutMs}ms)\n` +
-      `last log output:\n${logTail(getLog()) || "(empty — see stdio capture)"}`,
-  );
 }
 
 test.beforeAll(async ({}, testInfo) => {
@@ -113,76 +69,115 @@ test.beforeAll(async ({}, testInfo) => {
   baseURL = `http://127.0.0.1:${appPort}`;
   stateDir = await mkdtemp(path.join(tmpdir(), "newt-web-acceptance-"));
 
-  // Build BEFORE timing readiness. A cold or invalidated target/ can take
-  // well over 45s to compile under `--quiet` (which prints nothing while
-  // compiling), and that build time was being counted against the
-  // readiness deadline: the empty-appLog, still-running failure this
-  // regresses was newt-web still compiling, not newt-web hanging. Building
-  // first, on its own generous deadline, narrows that gap — the following
-  // `cargo run` can still wait on Cargo's lock or a fingerprint recheck, so
-  // waitUntilReady is not guaranteed a strictly warm-binary startup, just a
-  // much shorter one.
-  await buildFirst();
+  // Build BEFORE timing readiness, and launch the resulting BINARY directly
+  // rather than `cargo run`: `cargo run` re-invokes Cargo (lock + fingerprint
+  // recheck) even against a warm target/, so readiness was still timing
+  // Cargo's overhead, not just newt-web's startup. `--message-format
+  // json-render-diagnostics` reports the exact `executable` path Cargo
+  // produced for THIS manifest/profile/features — no guessing the target dir.
+  const buildStart = Date.now();
+  const executable = await buildFirst();
+  console.log(`[cockpit.spec] build done in ${Date.now() - buildStart}ms: ${executable}`);
 
-  appProcess = spawn(
-    "cargo",
-    ["run", "--quiet", "--manifest-path", path.join(webRoot, "Cargo.toml")],
-    {
-      cwd: repoRoot,
-      env: {
-        ...process.env,
-        NEWT_WEB_BIND: `127.0.0.1:${appPort}`,
-        NEWT_WEB_AUTH_HEADER: "",
-        NEWT_WEB_STATE_DIR: stateDir,
-        NEWT_WEB_WORKSPACE: repoRoot,
-      },
-      // Capture BOTH streams: an empty appLog on a live, unresponsive
-      // process used to be indistinguishable between "logged nothing" and
-      // "logged to the stream we ignored".
-      stdio: ["ignore", "pipe", "pipe"],
+  const spawnStart = Date.now();
+  appProcess = spawn(executable, [], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      NEWT_WEB_BIND: `127.0.0.1:${appPort}`,
+      NEWT_WEB_AUTH_HEADER: "",
+      NEWT_WEB_STATE_DIR: stateDir,
+      NEWT_WEB_WORKSPACE: repoRoot,
     },
-  );
+    // Capture BOTH streams: an empty appLog on a live, unresponsive
+    // process used to be indistinguishable between "logged nothing" and
+    // "logged to the stream we ignored".
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  appProcess.once("error", (error) => {
+    console.log(`[cockpit.spec] spawn error after ${Date.now() - spawnStart}ms: ${error.message}`);
+  });
+  appProcess.once("exit", (code, signal) => {
+    console.log(`[cockpit.spec] app exited (code=${code} signal=${signal}) after ${Date.now() - spawnStart}ms`);
+  });
   appProcess.stdout.on("data", (chunk) => {
     appLog += chunk.toString();
   });
   appProcess.stderr.on("data", (chunk) => {
     appLog += chunk.toString();
   });
-  await waitUntilReady(baseURL);
+  const readyStart = Date.now();
+  await waitUntilReady(baseURL, {
+    isExited: () => appProcess.exitCode,
+    getLog: () => appLog,
+  });
+  console.log(`[cockpit.spec] spawn ok, ready after ${Date.now() - readyStart}ms`);
 });
 
-/// Compile newt-web on its own deadline, separate from `waitUntilReady`'s.
-/// `--quiet` prints nothing while compiling, so its own output cannot show
-/// progress; a build that hangs or fails still reports exit code and output.
+/// Compile newt-web on its own deadline, separate from `waitUntilReady`'s,
+/// and return the `executable` path Cargo's own build output names for the
+/// `newt-web` bin — never a guessed `target/…` path. `--message-format
+/// json-render-diagnostics` still renders human diagnostics on stderr while
+/// emitting one JSON object per line on stdout.
 async function buildFirst() {
   const BUILD_TIMEOUT_MS = 180_000;
-  await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const build = spawn(
       "cargo",
-      ["build", "--quiet", "--manifest-path", path.join(webRoot, "Cargo.toml")],
+      [
+        "build",
+        "--message-format=json-render-diagnostics",
+        "--manifest-path",
+        path.join(webRoot, "Cargo.toml"),
+      ],
       { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
     );
-    let log = "";
-    build.stdout.on("data", (chunk) => (log += chunk.toString()));
-    build.stderr.on("data", (chunk) => (log += chunk.toString()));
+    let stdout = "";
+    let stderrLog = "";
+    build.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+    build.stderr.on("data", (chunk) => (stderrLog += chunk.toString()));
     const timer = setTimeout(() => {
       build.kill("SIGKILL");
-      reject(new Error(`newt-web build did not finish within ${BUILD_TIMEOUT_MS}ms\n${log}`));
+      reject(new Error(`newt-web build did not finish within ${BUILD_TIMEOUT_MS}ms\n${stderrLog}`));
     }, BUILD_TIMEOUT_MS);
     // 'error' (e.g. `cargo` not found) never fires 'close', so it needs its
     // own handler or a bad spawn hangs until the timeout instead of failing
     // fast with the real reason.
     build.on("error", (error) => {
       clearTimeout(timer);
-      reject(new Error(`newt-web build failed to start: ${error.message}\n${log}`));
+      reject(new Error(`newt-web build failed to start: ${error.message}\n${stderrLog}`));
     });
     // 'close', not 'exit': 'exit' can fire before the stdio pipes have
-    // flushed their last chunks, so `log` could still be missing trailing
-    // output at the moment this reads it.
+    // flushed their last chunks, so `stdout` could still be missing the
+    // trailing compiler-artifact line at the moment this reads it.
     build.on("close", (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`newt-web build failed (${code})\n${log}`));
+      if (code !== 0) {
+        reject(new Error(`newt-web build failed (${code})\n${stderrLog}`));
+        return;
+      }
+      const executable = stdout
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .find(
+          (message) =>
+            message?.reason === "compiler-artifact" &&
+            message.target?.name === "newt-web" &&
+            message.target?.kind?.includes("bin") &&
+            message.executable,
+        )?.executable;
+      if (!executable) {
+        reject(new Error(`newt-web build reported no bin executable\n${stderrLog}`));
+        return;
+      }
+      resolve(executable);
     });
   });
 }
@@ -194,33 +189,6 @@ test.afterAll(async () => {
   }
   if (backend) await new Promise((resolve) => backend.close(resolve));
   if (stateDir) await rm(stateDir, { recursive: true, force: true });
-});
-
-test("waitUntilReady reports elapsed time and a bounded log tail at its deadline", async () => {
-  // Accepts the TCP connection but never writes a response — the exact
-  // failure mode an unbounded `fetch` can't distinguish from "still
-  // starting": the socket is live, so the loop must keep rechecking its
-  // deadline instead of hanging on one probe.
-  const stuck = net.createServer((_socket) => {});
-  const port = await listen(stuck);
-  const manyLines = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n");
-
-  let caught;
-  try {
-    await waitUntilReady(`http://127.0.0.1:${port}`, {
-      timeoutMs: 300,
-      isExited: () => null,
-      getLog: () => manyLines,
-    });
-  } catch (error) {
-    caught = error;
-  } finally {
-    await new Promise((resolve) => stuck.close(resolve));
-  }
-
-  expect(caught?.message).toMatch(/did not become ready after \d+ms \(deadline 300ms\)/);
-  expect(caught?.message).toContain("line 59");
-  expect(caught?.message).not.toContain("line 0\n");
 });
 
 test("BAT: a diagram renders server-side in the page's own ink @bat", async ({ page }) => {
