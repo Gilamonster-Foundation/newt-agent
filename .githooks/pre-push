@@ -15,9 +15,13 @@
 #   - `cargo fmt --all -- --check` (whole tree; fast enough that scoping
 #     buys nothing)
 #   - `cargo clippy -D warnings --all-targets` on the changed crates plus
-#     reverse dependents (`--workspace` when classification says ALL)
+#     their TRANSITIVE reverse dependents (`--workspace` when classification
+#     says ALL; otherwise scripts/reverse_deps.py computes the closure from
+#     `cargo metadata` once and both clippy and the no-nextest fallback
+#     below use that same expanded `-p` set)
 #   - `cargo nextest run -E 'rdeps(<crate>) + ...'` on the same crate set
-#     (falls back to `cargo test -p <crate>` if nextest is missing)
+#     (falls back to `cargo test -p <crate>` per the expanded set above if
+#     nextest is missing)
 #   - `python3 scripts/spawn_inventory.py` (~0.2s, whole tree -- matches
 #     CI's spawn-inventory step; cheap enough to run unscoped every push)
 #   - `just docs-check` (~0.5s, whole tree -- matches the lint job's
@@ -36,6 +40,26 @@
 #   - `just harness-python` (uv + CPython real-resource lane)
 #   - the PTY (newt-tui-pty.yml) and mcp-import-real.yml real-resource lanes
 #   - the npm installer matrix (test-npm) beyond the local OS
+#   - this hook's OWN regression suites (scripts/test_pre_push.py,
+#     scripts/test_changed_scope.py, scripts/test_reverse_deps.py) --
+#     running a hook's self-test from inside itself proves nothing; CI's
+#     "push-hook ... regression" steps in the `lint` job are what gate them
+#   - OCAP register honesty (`scripts/ocap_check.py`) and cross-language
+#     conformance (`newt-interaction/conformance/newt_conformance.py`) --
+#     both pure-Python but multi-invocation; the `lint` job's own steps
+#   - the vendored crossterm regression (`vendor/crossterm-0.28.1-patched`,
+#     `just check-vendor-crossterm`) -- outside the workspace the changed-
+#     scope classifier maps against
+#   - the `windows` and `musl` jobs (ci.yml) -- no Windows dev box / musl
+#     cross-target+musl-tools on a typical dev box; ci.yml's own top comment
+#     names these as the same kind of exception
+#   - every workflow that provides its own non-standard checkout or
+#     toolchain and says so in its own HOOK PARITY comment: newt-web.yml /
+#     newt-web-drive.yml (excluded newt-mesh crate + browser install),
+#     mesh-integration.yml (sibling agent-mesh checkout), formal.yml /
+#     behavior-formal.yml (Lean/JDK toolchain), behavior-registry.yml (its
+#     Rust-source trigger is cheap but still a separate workflow, not a
+#     hook-shaped pre-flight)
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml -- see that
 # file's HOOK PARITY comment for the job-by-job mapping. Editing either one
@@ -241,8 +265,23 @@ cargo fmt --all -- --check
 # `binary_id()` predicate hard-errors ("no binary IDs matched") on a name with
 # zero matches in the discovered set, unlike `package()`. Fixing the three
 # excluded binaries' arg handling is tracked separately; out of scope for
-# #1098's hook-only change. `cargo test --workspace` in CI is unaffected and
-# still covers all six normally.
+# #1098's hook-only change.
+#
+# What CI actually exercises for these three, named rather than assumed (fix-
+# first review on #2658, finding P2/5 -- do not claim execution from mere
+# compilation): the `test` job's `cargo test --workspace` (ci.yml) DOES
+# compile and invoke all three main()s with no extra args, same as this
+# hook's own no-nextest fallback above. Under that no-arg invocation,
+# writer_inheritance always runs its real fork test (its main() ignores argv
+# entirely) -- so CI's plain `cargo test --workspace` genuinely covers it.
+# native_git_commit and brush_build_pipeline instead gate their real body on
+# an exact `--ignored` match and print a one-line "... ignored" stub without
+# it; grepping every workflow in .github/workflows/ for their test-binary
+# names or an `-- --ignored` invocation that reaches them finds NONE. Their
+# real bodies are therefore DISCLOSED GAPS, not covered anywhere in CI today
+# -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
+# `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
+# real-resource CI lane of their own (tracked separately; out of scope here).
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(agent-harness::writer_inheritance)
     and not binary_id(newt-git::native_git_commit)'
@@ -260,12 +299,18 @@ if [ "$SCOPE" = "ALL" ]; then
     fi
 else
     echo "[pre-push] changed scope: $SCOPE"
-    # -p accepts multiple package flags; build the arg list once for both
-    # clippy and the nextest expression's `rdeps(...)` terms.
+    # nextest expands reverse dependents itself via `rdeps(...)`; clippy and
+    # the no-nextest `cargo test` fallback have no such expression, so they
+    # were silently missing them (fix-first review on #2658, finding P2 #1).
+    # scripts/reverse_deps.py computes the identical transitive closure from
+    # `cargo metadata` once, and both of those gates use it for `-p`.
+    _expanded_scope="$(python3 scripts/reverse_deps.py $SCOPE)"
     _pkg_args=()
     _rdeps_expr=""
-    for _crate in $SCOPE; do
+    for _crate in $_expanded_scope; do
         _pkg_args+=(-p "$_crate")
+    done
+    for _crate in $SCOPE; do
         if [ -z "$_rdeps_expr" ]; then
             _rdeps_expr="rdeps($_crate)"
         else
