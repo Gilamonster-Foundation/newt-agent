@@ -648,7 +648,11 @@ pub fn discover_git_dirs(
     let readable = |p: &Path| -> Result<PathBuf, String> {
         let resolved = std::fs::canonicalize(p)
             .map_err(|e| format!("refused: '{}' cannot be resolved ({e})", p.display()))?;
-        if !permits_path_with_bound_roots(fs_read, bound, &resolved) {
+        // Check both canonical and original: system-alias symlinks (e.g. /var
+        // on macOS) mean the canonical form may not match a non-canonical scope.
+        if !permits_path_with_bound_roots(fs_read, bound, &resolved)
+            && !permits_path_with_bound_roots(fs_read, bound, p)
+        {
             return Err(format!(
                 "refused: '{}' is outside this session's filesystem read authority",
                 resolved.display()
@@ -674,7 +678,9 @@ pub fn discover_git_dirs(
             let canon_dir = std::fs::canonicalize(dir).map_err(|e| {
                 format!("refused: '{}' cannot be resolved ({e})", dir.display())
             })?;
-            if !permits_path_with_bound_roots(fs_read, bound, &canon_dir) {
+            if !permits_path_with_bound_roots(fs_read, bound, &canon_dir)
+                && !permits_path_with_bound_roots(fs_read, bound, dir)
+            {
                 return Err(format!(
                     "refused: '{}' is outside this session's filesystem read authority",
                     canon_dir.display()
@@ -1391,7 +1397,12 @@ pub fn resolve_alternates_chain(
         if !seen.insert(canonical.clone()) {
             continue;
         }
-        if !permits_path_with_bound_roots(fs_read, bound, &canonical) {
+        // Check canonical AND original: when the scope has non-canonical roots
+        // (e.g. /var on macOS), the original path may still satisfy the scope
+        // even though the canonical /private/var form does not.
+        if !permits_path_with_bound_roots(fs_read, bound, &canonical)
+            && !permits_path_with_bound_roots(fs_read, bound, &dir)
+        {
             return Err(format!(
                 "refused: alternates chain reaches '{}', outside authorized read roots",
                 canonical.display()
