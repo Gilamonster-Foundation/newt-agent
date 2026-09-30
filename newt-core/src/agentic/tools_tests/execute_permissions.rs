@@ -535,6 +535,25 @@ fn permission_grant_releases_only_cached_authority_failures() {
             "a successful read of the SAME path must replace the failure memo"
         );
 
+        // Re-seed the failure the same-path read above just cleared, so the
+        // grant assertion below is checking the grant's own effect rather
+        // than one already undone by the prior block.
+        guard.record(
+            "read_file",
+            &args,
+            false,
+            &denied_fs_result("fs_read", "report.txt"),
+            None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
+        );
+        assert!(
+            guard.repeat_steer("read_file", &args).is_some(),
+            "re-seeded failure must be present before the grant clears it"
+        );
+
         guard.record(
             "request_permissions",
             &permission,
@@ -566,8 +585,8 @@ fn permission_grant_releases_only_cached_authority_failures() {
         assert!(guard.repeat_steer("web_fetch", &fetch).is_some());
         assert_eq!(
             guard.total_failures(),
-            4,
-            "invalidation does not erase executed history"
+            5,
+            "invalidation does not erase executed history (includes the re-seeded failure above)"
         );
     }
 }

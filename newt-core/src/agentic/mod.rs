@@ -3878,7 +3878,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
-                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
                 }
                 let offloaded =
                     maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
@@ -8740,7 +8740,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
-                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
                 }
                 let offloaded =
                     maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
@@ -11222,7 +11222,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
-                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
                 }
                 let offloaded =
                     maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
@@ -12893,7 +12893,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &completed_spill_renderer,
                 );
                 if let Some(rec) = tool_events.as_deref_mut() {
-                    rec.push(crate::ToolEvent::from_call(name, &args, true, Some(0)));
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
                 }
                 let offloaded =
                     maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);

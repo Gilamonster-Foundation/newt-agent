@@ -53,6 +53,13 @@ pub struct ToolEvent {
     /// older rows and omitted when `None`, so those serialize as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecOutcome>,
+    /// #2637: true when this call was served from `RepeatCallGuard::cached_read`
+    /// (a proven-unchanged bare re-read replayed silently) rather than a real
+    /// execution. Deterministic — unlike `duration_ms`, which a fast real read
+    /// can also report as `Some(0)`. Additive: absent from older rows and
+    /// omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_cache: bool,
 }
 
 pub use agent_harness::ExecOutcome;
@@ -88,6 +95,17 @@ impl ToolEvent {
             ok,
             duration_ms,
             execution: None,
+            from_cache: false,
+        }
+    }
+
+    /// Record a bare re-read served silently from `RepeatCallGuard::cached_read`
+    /// — never a real execution, so `from_cache` is the deterministic signal a
+    /// test (or future analysis) should key on instead of `duration_ms`.
+    pub fn from_cache(tool: impl Into<String>, args: &serde_json::Value) -> Self {
+        Self {
+            from_cache: true,
+            ..Self::from_call(tool, args, true, Some(0))
         }
     }
 }

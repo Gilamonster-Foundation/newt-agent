@@ -1059,13 +1059,15 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
 /// content id against the file's actual current bytes on every cache
 /// lookup, so a content mismatch would already force a real read
 /// independent of this hook — that path can't observe the release call at
-/// all). The signal that DOES distinguish them is `tool_events`: a
-/// cache-serve pushes its event inline with a hardcoded `duration_ms:
-/// Some(0)` (mod.rs `cached_read` call site); a real execution measures
-/// actual wall-clock via `record_completed_tool_event`. Immediately after a
-/// COMMITTED compaction (the summarizer having just fired), the guard must
-/// have dropped the memo, so that round's `read_file` must NOT be the
-/// hardcoded-zero cache shape.
+/// all). The signal that DOES distinguish them is `ToolEvent::from_cache`:
+/// the `cached_read` call site stamps it `true` and a real execution never
+/// sets it — deterministic, unlike the `duration_ms == Some(0)` shape this
+/// test used to key on (a real sub-millisecond read also records zero).
+/// Immediately after a COMMITTED compaction (the summarizer having just
+/// fired), the guard must have dropped the memo, so that round's
+/// `read_file` must NOT be `from_cache`; every other round (content held
+/// constant throughout) must be, checked per round rather than in
+/// aggregate.
 #[tokio::test]
 async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
     let line = "the quick brown newt compresses context without discarding it\n";
@@ -1126,32 +1128,43 @@ async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
     );
     let read_events: Vec<&crate::ToolEvent> =
         events.iter().filter(|e| e.tool == "read_file").collect();
-    assert!(
-        read_events.len() > summarizer_calls,
-        "expected at least one read_file round per compaction plus the \
-         round after the last one (got {} read_file events for {} \
-         compactions)",
+    // `log` (one entry per dispatched tool-offering round) and `read_events`
+    // (one `read_file` ToolEvent per round, per the doc comment above) are
+    // index-aligned — required so the per-round pairing below lines up.
+    assert_eq!(
         read_events.len(),
-        summarizer_calls
+        log.lock().unwrap().len(),
+        "one read_file ToolEvent must exist per dispatched round"
     );
-    // Round 0's read is real by construction (nothing memoized yet), so it
-    // proves nothing about the release hook — exclude it. Every OTHER round
-    // in this fixture has unchanged file content, so absent the release
-    // hook every one of them would be served from the memo (the hardcoded
-    // `duration_ms: Some(0)` cache-hit shape) and none would be real. The
-    // release hook must force at least one real (non-cache) read_file per
-    // committed compaction — the round right after each memo release.
-    let real_reads_after_round_zero = read_events[1..]
-        .iter()
-        .filter(|e| e.duration_ms != Some(0))
-        .count();
-    assert!(
-        real_reads_after_round_zero >= summarizer_calls,
-        "expected at least one real (non-cache) read_file per committed \
-         compaction after round 0 (got {real_reads_after_round_zero} real \
-         reads for {summarizer_calls} compactions) — the read memo is not \
-         being released on commit"
+    // `log[r].0` is the dispatched message COUNT for round r's request — a
+    // drop from round r-1 to r means a compaction committed between them
+    // (mid-loop compression shrinks the dispatched history; nothing else in
+    // this fixture ever shrinks it). That is the per-round commit signal,
+    // independent of `tool_events` entirely. Round 0 is excluded (nothing
+    // memoized yet, so it proves nothing about the release hook).
+    let log = log.lock().unwrap();
+    let commits: usize = (1..log.len()).filter(|&r| log[r].0 < log[r - 1].0).count();
+    assert_eq!(
+        commits, summarizer_calls,
+        "the dispatched-length-drop signal must count exactly one commit per \
+         summarizer call (got {commits} drops for {summarizer_calls} calls)"
     );
+    for round in 1..log.len() {
+        let just_committed = log[round].0 < log[round - 1].0;
+        let served_from_cache = read_events[round].from_cache;
+        assert_eq!(
+            served_from_cache,
+            !just_committed,
+            "round {round}: {}, so its read_file must be {} \
+             (from_cache={served_from_cache})",
+            if just_committed {
+                "a compaction just committed"
+            } else {
+                "no compaction committed since the previous round"
+            },
+            if just_committed { "real" } else { "cached" }
+        );
+    }
 }
 
 /// F2 regression — the reviewer's 600-char-results multi-turn shape:
