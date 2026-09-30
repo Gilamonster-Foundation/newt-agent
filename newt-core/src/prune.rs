@@ -357,7 +357,17 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
             // result (a refusal, a missing-file message) is not source and
             // must stay `-> error, N lines` (#2638 finding 1) — otherwise a
             // sufficiently long error body could be misread as a page map.
-            if status == "ok" {
+            //
+            // A page whose final line is the replay disambiguator
+            // (`output_budget::REPLAY_DISAMBIGUATOR`) has that line counted
+            // as page metadata, not source — computing an outline/page-map
+            // boundary from it would put the boundary one line past the
+            // real saved content (#2638 review round 6, finding 1). Decline
+            // both and fall through to the plain line count instead of
+            // inventing a boundary that excludes it.
+            let is_replay_disambiguated =
+                content.ends_with(crate::agentic::tools::output_budget::REPLAY_DISAMBIGUATOR);
+            if status == "ok" && !is_replay_disambiguated {
                 #[cfg(feature = "ast")]
                 if let Some(outline) = rust_outline_summary(&path, args, content) {
                     return outline;
@@ -543,8 +553,13 @@ fn strip_read_footer<'a>(
 /// candidate must run to the content's end with `strip_suffix(']')` and no
 /// embedded newline) — this wraps that same check, it does not re-implement
 /// footer parsing.
-pub(crate) fn final_line_is_a_verified_pagination_footer(content: &str, path: &str) -> bool {
-    strip_read_footer(content, path, 1, 0)
+pub(crate) fn final_line_is_a_verified_pagination_footer(
+    content: &str,
+    path: &str,
+    first_line: usize,
+    char_offset_in: usize,
+) -> bool {
+    strip_read_footer(content, path, first_line, char_offset_in)
         .1
         .is_some_and(|f| f.trusted)
 }
@@ -1339,13 +1354,18 @@ fn third(z: u32) -> u32 {
         );
 
         let line = summarize_one("read_file", json!({"path": path}), &replayed);
-        // Every line — the 200 real lines, the replayed footer line, AND the
-        // appended disambiguator — must count as real source.
-        let expected_total = saved_page_lines + 1;
+        // #2638 review round 6, finding 1: the disambiguator is a marker
+        // that this page is NOT live pagination metadata, not a source line
+        // an outline/page-map boundary should be computed from — computing
+        // one anyway put the boundary a line past `saved_page`'s real
+        // content. The conservative generic summary invents no boundary: it
+        // reports the plain physical line count, no claim about structure.
+        let expected_total = saved_page_lines + 1; // + the disambiguator line
+        assert_eq!(replayed.lines().count(), expected_total);
         assert!(
-            line.contains(&format!("lines 1-{expected_total}")),
-            "must count every source line, including the replayed footer and the \
-             appended disambiguator: {line}"
+            line.contains(&format!("{expected_total} lines")) && !line.contains("lines 1-"),
+            "a replay must get the conservative generic summary, not an invented \
+             outline/page-map boundary: {line}"
         );
         assert!(
             !line.contains(FOOTER_MARKER),
@@ -1407,6 +1427,96 @@ fn third(z: u32) -> u32 {
         assert!(
             line.contains("lines 1-200 (page map"),
             "genuine pagination must still produce a precise, trusted page map: {line}"
+        );
+    }
+
+    /// #2638 review round 6 (P2), finding 2: the whole-file guard only ran
+    /// for `start == 1 && char_offset == 0` — a FINAL-RANGE read (to EOF, no
+    /// truncation) returns `body` with no footer of its own at all, so a
+    /// genuine earlier page saved back into the file and re-read from its
+    /// real starting line reproduces the same MAC inputs the whole-file case
+    /// does. Real incoming coordinates (`offset=5`, not `1`) must still be
+    /// checked.
+    #[test]
+    fn a_final_range_replay_is_not_mistaken_for_a_live_footer() {
+        let path = "notes.md";
+        let full_source = text_lines(300);
+        // A genuine page starting at line 5 — real body, real MAC-verifying
+        // footer pointing at offset=205.
+        let saved_page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &full_source,
+            Some(5),
+            Some(200),
+            0,
+            None,
+        );
+        assert!(
+            saved_page.contains("call read_file with offset=205"),
+            "fixture must paginate as expected: {saved_page}"
+        );
+        // "the file rewritten as 4 original lines plus that page" — lines
+        // 1-4 stay real source, everything from line 5 on becomes the saved
+        // page (body + its own footer bracket, now just more file bytes).
+        let first_four: String = full_source.lines().take(4).collect::<Vec<_>>().join("\n");
+        let rewritten = format!("{first_four}\n{saved_page}");
+
+        // Read from offset=5 through EOF — a final-range read, no
+        // truncation, so `paginate_read_from` takes the no-footer branch.
+        let replayed = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &rewritten,
+            Some(5),
+            Some(100_000),
+            0,
+            None,
+        );
+        assert!(
+            replayed.ends_with(crate::agentic::tools::output_budget::REPLAY_DISAMBIGUATOR),
+            "a final-range replay of a saved page must append the disambiguator: {replayed}"
+        );
+
+        let line = summarize_one("read_file", json!({"path": path, "offset": 5}), &replayed);
+        assert!(
+            !line.contains("lines 5-") && !line.contains(FOOTER_MARKER),
+            "a final-range replay must get the conservative generic summary, nothing \
+             stripped, and never be reinterpreted as live pagination metadata: {line}"
+        );
+        assert_eq!(
+            replayed.lines().count(),
+            line.split(' ')
+                .find_map(|w| w.parse::<usize>().ok())
+                .expect("generic summary names a line count"),
+            "the generic summary's count must match the replayed content's real physical \
+             lines, not an invented boundary: {line}"
+        );
+    }
+
+    /// #2638 review round 6, finding 2, positive control: the SAME starting
+    /// coordinates (`offset=5`, final-range, no truncation) as the replay
+    /// test above, but reading real source that was never saved-and-reread,
+    /// must still get the precise page map — the new final-range guard must
+    /// not blanket-decline every final-range read.
+    #[test]
+    fn a_genuine_final_range_read_still_gets_a_precise_page_map() {
+        let path = "notes.md";
+        let full_source = text_lines(300);
+        let tail = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &full_source,
+            Some(5),
+            Some(100_000),
+            0,
+            None,
+        );
+        assert!(
+            !tail.contains(FOOTER_MARKER),
+            "reading to real EOF must carry no footer: {tail}"
+        );
+        let line = summarize_one("read_file", json!({"path": path, "offset": 5}), &tail);
+        assert!(
+            line.contains("lines 5-300 (page map"),
+            "a genuine final-range read must still get a precise, trusted page map: {line}"
         );
     }
 

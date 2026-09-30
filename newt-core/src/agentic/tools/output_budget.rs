@@ -341,10 +341,8 @@ pub(crate) fn paginate_read_from(
         // a plain disambiguating line — NOT a footer (no `FOOTER_MARKER`
         // text, so `prune.rs` never strips it) — so the page stays source
         // and the summary counts every line, including the bracketed one.
-        if crate::prune::final_line_is_a_verified_pagination_footer(contents, path) {
-            return format!(
-                "{contents}\n[end of file: the bracketed line above is part of the file]"
-            );
+        if crate::prune::final_line_is_a_verified_pagination_footer(contents, path, 1, 0) {
+            return format!("{contents}{REPLAY_DISAMBIGUATOR}");
         }
         return contents.to_string();
     }
@@ -457,9 +455,35 @@ pub(crate) fn paginate_read_from(
     };
     match footer {
         Some(f) => format!("{body}\n\n[{f}]"),
-        None => body,
+        // A final-range read (to EOF, no truncation) carries no footer of its
+        // own — but the SAME replay the whole-file branch above guards
+        // against applies here too: a genuine earlier page saved back to
+        // this path and read from its real starting coordinates reproduces
+        // every MAC input (#2638 review round 6, finding 2). Use the call's
+        // actual incoming coordinates, not the whole-file 1/0 (finding 2's
+        // "any unframed return" also covers this one).
+        None => {
+            if crate::prune::final_line_is_a_verified_pagination_footer(
+                &body,
+                path,
+                start,
+                char_offset,
+            ) {
+                format!("{body}{REPLAY_DISAMBIGUATOR}")
+            } else {
+                body
+            }
+        }
     }
 }
+
+/// Appended (never as a bracketed footer: no `FOOTER_MARKER`-shaped text,
+/// so `prune.rs` never strips it as pagination metadata) when a page's own
+/// final line verifies as a copy of an earlier, genuine pagination footer
+/// for the same path — disambiguating "this is now real source" from "this
+/// is live resume metadata" (#2638 review round 6).
+pub(crate) const REPLAY_DISAMBIGUATOR: &str =
+    "\n[end of file: the bracketed line above is part of the file]";
 
 /// The page `read_file` returns. With content offload on, a page over the
 /// spill cap is replaced by a teaser + `spill:` handle — the model asked for
