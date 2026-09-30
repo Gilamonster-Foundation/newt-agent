@@ -275,12 +275,15 @@ fn writable_by_others(meta: &std::fs::Metadata, below_owner: Option<u32>, _path:
     true
 }
 
-/// True iff `path` is exactly `/Applications/Xcode.app` or a descendant, OR
-/// exactly `/Library/Developer/CommandLineTools` or a descendant.  These are
-/// the ONLY root-owned group-writable directories trusted by A5.
+/// True iff `path` is an ancestor or descendant of the Apple developer dirs
+/// trusted by A5: `/Applications/Xcode.app` and
+/// `/Library/Developer/CommandLineTools`.  `/Applications` itself is also
+/// included because macOS ships it as `drwxrwxr-x root admin` — the trust
+/// check would otherwise refuse the Xcode exec-path while walking parents.
 #[cfg(target_os = "macos")]
 fn is_apple_developer_path(path: &Path) -> bool {
-    path.starts_with("/Applications/Xcode.app")
+    path == Path::new("/Applications")
+        || path.starts_with("/Applications/Xcode.app")
         || path.starts_with("/Library/Developer/CommandLineTools")
 }
 
@@ -328,7 +331,16 @@ fn permits_path_with_bound_roots(scope: &Scope<String>, bound: &[PathBuf], path:
     }
     match scope {
         Scope::All => true,
-        Scope::Only(_) => bound.iter().any(|cr| path.starts_with(cr)),
+        Scope::Only(_) => {
+            // Fast check with the path as given.
+            if bound.iter().any(|cr| path.starts_with(cr)) {
+                return true;
+            }
+            // macOS: tempdir paths start with /var/... but canonical form is
+            // /private/var/... — canonicalize and retry when the fast check misses.
+            std::fs::canonicalize(path)
+                .is_ok_and(|canon| bound.iter().any(|cr| canon.starts_with(cr)))
+        }
     }
 }
 
