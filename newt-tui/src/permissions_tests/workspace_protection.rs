@@ -66,6 +66,7 @@ fn request(kind: DenialKind, target: &Path) -> PermissionRequest {
         kind,
         target: target.to_string_lossy().into_owned(),
         reason: "fixture request".into(),
+        harness_bound: false,
     }
 }
 
