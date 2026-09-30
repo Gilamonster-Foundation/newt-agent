@@ -1103,12 +1103,19 @@ resolved in a later release:
   `failed(refused_by_harness)`, since a refusal can quote operator config.
 - The trust predicate refuses any group- or other-writable component, so an
   operator whose umask left `~/.newt`, `~/.gitconfig` or `~/.config/gh`
-  group-writable must `chmod g-w` them. The one accepted exception is a
-  root-owned sticky directory such as `/tmp` (CERT FIO15-C).
-- The confined copy's exec axis is unrestricted, like every `AgentInfluenced`
-  spawn: Landlock enforces exec only at the interceptor level, so a Kernel
-  floor refuses a restricted exec scope. Its fs and net axes are
-  kernel-enforced, and the broker checks the sandbox kind actually applied.
+  group-writable must `chmod g-w` them. The operator-accepted 2026-09-30
+  amendment permits a root-owned sticky directory such as `/tmp` (CERT
+  FIO15-C): a directory is exempt when it has the sticky bit, is owned by
+  root, and its immediate child is owned by root or by the current user.
+  Negative controls: non-sticky world-writable directories are refused, and
+  sticky directories not owned by root are refused.
+- The confined copy's exec axis is unrestricted (operator-accepted 2026-09-30):
+  Landlock/Seatbelt deliver exec restriction only at the interceptor level, so
+  a `Kernel` floor refuses a restricted exec scope; neither Landlock nor
+  Seatbelt can kernel-enforce which executables the confined git spawns.  Its fs
+  and net axes are kernel-enforced (Landlock on Linux, Seatbelt on macOS), and
+  the broker checks the sandbox kind actually applied.  A follow-up issue will
+  bound exec to the trusted git and its exec-path via Landlock `EXECUTE`.
 - Concurrent edits to a TRUSTED OPERATOR's own git/gh config files (made by
   the operator themselves, not the model, which cannot write those paths at
   all) between the broker's trust check and its dial are not detected.

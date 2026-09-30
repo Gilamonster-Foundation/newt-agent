@@ -141,17 +141,33 @@ fn check_one(
     below_owner: Option<u32>,
     fs_write: &Scope<String>,
 ) -> Result<u32, String> {
-    let display = path.to_string_lossy();
-    if permits_path(fs_write, &display) {
+    let short = shorten_home(path);
+    if permits_path(fs_write, &path.to_string_lossy()) {
         return Err(format!(
-            "'{display}' is inside a model-writable tree; refusing to trust it"
+            "governed push refused: '{short}' is inside a model-writable tree; \
+             the file must live outside the session's writable roots"
         ));
     }
     let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("'{display}' cannot be inspected ({e}); refusing to trust it"))?;
+        .map_err(|e| format!("governed push refused: '{short}' cannot be inspected ({e})"))?;
     if !meta.file_type().is_symlink() && writable_by_others(&meta, below_owner) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            let chmod_arg = match (mode & 0o020 != 0, mode & 0o002 != 0) {
+                (true, true) => "g-w,o-w",
+                (true, false) => "g-w",
+                _ => "o-w",
+            };
+            return Err(format!(
+                "governed push refused: '{short}' is group- or other-writable (mode {mode:04o})\n\
+                 Fix: chmod {chmod_arg} {short}"
+            ));
+        }
+        #[cfg(not(unix))]
         return Err(format!(
-            "'{display}' is group- or other-writable; refusing to trust it"
+            "governed push refused: '{short}' is group- or other-writable"
         ));
     }
     Ok(owner(&meta))
@@ -190,6 +206,59 @@ fn owner(_meta: &std::fs::Metadata) -> u32 {
 fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
+}
+
+/// Shorten `path` to `~/…` when it lies under `$HOME`.
+fn shorten_home(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(rel) = path.strip_prefix(Path::new(&home)) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Open a planning file with `O_NOFOLLOW`: if the FINAL path component is a
+/// symlink the open fails with `ELOOP`, preventing a model-planted child
+/// symlink from steering reads to outside the authorized roots.
+///
+/// Returns `Ok(None)` when the file is absent, `Ok(Some(…))` on success,
+/// and `Err` on `ELOOP` or any other I/O failure.  Also verifies the path
+/// (lexically) lies inside `fs_read` before attempting the open.
+#[cfg(unix)]
+fn read_no_symlink_file(path: &Path, fs_read: &Scope<String>) -> Result<Option<String>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !permits_path(fs_read, &path.to_string_lossy()) {
+        return Err(format!(
+            "refused: '{}' is outside this session's filesystem read authority",
+            path.display()
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).custom_flags(libc::O_NOFOLLOW);
+    match opts.open(path) {
+        Ok(mut f) => {
+            let mut content = String::new();
+            f.read_to_string(&mut content)
+                .map_err(|e| format!("refused: '{}': {e}", path.display()))?;
+            Ok(Some(content))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(format!(
+            "refused: '{}' is a symlink; planning reads must not follow symlinks",
+            path.display()
+        )),
+        Err(e) => Err(format!("refused: '{}': {e}", path.display())),
+    }
+}
+
+// The broker refuses at preflight_availability() on non-unix platforms, but
+// the compiler still checks all code paths.
+#[cfg(not(unix))]
+fn read_no_symlink_file(_path: &Path, _fs_read: &Scope<String>) -> Result<Option<String>, String> {
+    Err("refused: symlink-safe file reads are not available on this platform".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -435,10 +504,12 @@ pub fn discover_git_dirs(
             dir.join(target) // an absolute target replaces `dir` entirely
         };
         let git_dir = readable(&git_dir)?;
-        let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-            Ok(text) => readable(&git_dir.join(text.trim()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
-            Err(e) => return Err(format!("refused: '{}/commondir': {e}", git_dir.display())),
+        // Use O_NOFOLLOW so a model-planted child symlink for `commondir`
+        // cannot redirect the read to outside the authorized roots.
+        let common_dir = match read_no_symlink_file(&git_dir.join("commondir"), fs_read) {
+            Ok(Some(text)) => readable(&git_dir.join(text.trim()))?,
+            Ok(None) => git_dir.clone(),
+            Err(e) => return Err(e),
         };
         return Ok((common_dir, git_dir));
     }
@@ -446,12 +517,15 @@ pub fn discover_git_dirs(
 }
 
 /// The branch `git_dir`'s `HEAD` names, read as a file (no git process).
+/// Uses `O_NOFOLLOW` on `HEAD` itself so a model-planted child symlink cannot
+/// redirect the read outside the authorized roots.
 ///
 /// # Errors
-/// On detached HEAD, a non-`refs/heads/` symref, or an unsafe branch name.
-pub fn read_head_branch(git_dir: &Path) -> Result<String, String> {
-    let head = std::fs::read_to_string(git_dir.join("HEAD"))
-        .map_err(|e| format!("refused: cannot read HEAD ({e})"))?;
+/// On detached HEAD, a non-`refs/heads/` symref, an unsafe branch name, a
+/// symlink at `HEAD`, or a path outside `fs_read`.
+pub fn read_head_branch(git_dir: &Path, fs_read: &Scope<String>) -> Result<String, String> {
+    let head = read_no_symlink_file(&git_dir.join("HEAD"), fs_read)?
+        .ok_or_else(|| "refused: cannot read HEAD (not found)".to_string())?;
     let branch = head
         .trim()
         .strip_prefix("ref: refs/heads/")
@@ -506,19 +580,27 @@ fn validate_branch_name(name: &str) -> Result<(), String> {
 /// item 3): if the ref isn't readable as a file or a `packed-refs` entry, the
 /// broker refuses rather than trusting a config-driven resolver.
 ///
+/// Uses `O_NOFOLLOW` on both the loose ref and `packed-refs` so a model-planted
+/// child symlink cannot redirect reads outside the authorized roots.
+///
 /// # Errors
-/// When the branch has no readable ref, loose or packed.
-pub fn read_branch_oid(git_dir: &Path, branch: &str) -> Result<String, String> {
+/// When the branch has no readable ref, loose or packed, a symlink is found,
+/// or a path lies outside `fs_read`.
+pub fn read_branch_oid(
+    git_dir: &Path,
+    branch: &str,
+    fs_read: &Scope<String>,
+) -> Result<String, String> {
     validate_branch_name(branch)?;
     let loose = git_dir.join("refs").join("heads").join(branch);
-    if let Ok(contents) = std::fs::read_to_string(&loose) {
+    if let Some(contents) = read_no_symlink_file(&loose, fs_read)? {
         let oid = contents.trim();
         if is_hex_oid(oid) {
             return Ok(oid.to_string());
         }
     }
     let packed = git_dir.join("packed-refs");
-    if let Ok(contents) = std::fs::read_to_string(&packed) {
+    if let Some(contents) = read_no_symlink_file(&packed, fs_read)? {
         let full_ref = format!("refs/heads/{branch}");
         for line in contents.lines() {
             if let Some((oid, name)) = line.split_once(' ') {
@@ -540,30 +622,43 @@ fn is_hex_oid(s: &str) -> bool {
 /// The literal, undecoded value of `remote.<name>.url` from the repository's
 /// own config file — NOT `git remote get-url`, which applies `url.*
 /// .insteadOf`/`pushInsteadOf` rewrites (DESIGN-r4 probe P1). Read with the
-/// CHECKED git and allowlist env, `--file` (includes are off for an explicit
-/// file). This literal string is BOTH the value shown in the approval prompt
-/// and the exact string later dialed from staging (which has no `url.*` keys
-/// to rewrite it).
+/// CHECKED git and allowlist env, `--file /dev/stdin` fed from the bytes
+/// already read via `O_NOFOLLOW` — race-resistant because the content is in
+/// memory before git's stdin is written. This literal string is BOTH the value
+/// shown in the approval prompt and the exact string later dialed from staging
+/// (which has no `url.*` keys to rewrite it).
 ///
 /// # Errors
-/// When git cannot run, or the key has no value.
+/// When the config file is a symlink, outside `fs_read`, git cannot run, or
+/// the key has no value.
 pub fn literal_remote_url(
     tools: &TrustedTools,
     common_dir: &Path,
     remote: &str,
+    fs_read: &Scope<String>,
 ) -> Result<String, String> {
+    use std::io::Write;
     let key = format!("remote.{remote}.url");
-    let config = common_dir.join("config");
-    let output = tools
-        .git([
-            OsStr::new("config"),
-            OsStr::new("--file"),
-            config.as_os_str(),
-            OsStr::new("--get"),
-            OsStr::new(&key),
-        ])
-        .current_dir(common_dir)
-        .output()
+    // O_NOFOLLOW open proves the config file is not a child symlink.  The
+    // content goes to git via /dev/stdin so we never re-open the path.
+    let config_text = read_no_symlink_file(&common_dir.join("config"), fs_read)?
+        .ok_or_else(|| format!("refused: no local '{key}' — is '{remote}' configured?"))?;
+    let mut cmd = tools.git([
+        OsStr::new("config"),
+        OsStr::new("--file"),
+        OsStr::new("/dev/stdin"),
+        OsStr::new("--get"),
+        OsStr::new(&key),
+    ]);
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("refused: trusted git could not run ({e})"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(config_text.as_bytes());
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("refused: trusted git could not run ({e})"))?;
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || url.is_empty() {
@@ -621,37 +716,47 @@ pub fn run_confined_git(
     Ok(out)
 }
 
-/// The sandbox the executor REPORTS it applied must be a kernel fence; an
-/// advisory run (`SandboxKind::None`) refuses whatever its exit status.
+/// The sandbox the executor REPORTS it applied must be the platform's kernel
+/// fence (Landlock on Linux, Seatbelt on macOS).  An advisory run or the wrong
+/// kind refuses regardless of exit status.
 fn require_kernel_fence(kind: agent_bridle::SandboxKind) -> Result<(), String> {
-    if kind == agent_bridle::SandboxKind::None {
-        Err("refused: the confined git step was not kernel-enforced (advisory sandbox)".to_string())
-    } else {
+    #[cfg(target_os = "linux")]
+    let expected = agent_bridle::SandboxKind::Landlock;
+    #[cfg(target_os = "macos")]
+    let expected = agent_bridle::SandboxKind::Seatbelt;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let expected = agent_bridle::SandboxKind::None; // always refuses below
+
+    if kind == expected && kind != agent_bridle::SandboxKind::None {
         Ok(())
+    } else {
+        Err(format!(
+            "refused: the confined git step was not kernel-enforced \
+             (got {kind:?}, expected {expected:?})"
+        ))
     }
 }
 
 /// Plan-time half of F3: `oid` must name a COMMIT in the workspace's object
-/// store, checked by a confined `cat-file -t` (read-only fence).
+/// store, checked by a read-only `cat-file -t` through the CHECKED git binary
+/// and the F2 allowlist environment.
+///
+/// A1 operator-accepted 2026-09-30: this step does NOT use the confined
+/// (exec-widening) executor — `cat-file -t` is a read-only type lookup that
+/// needs no exec at all, and widening exec before operator approval is not
+/// required by SPEC-FINAL F4.  The confined executor is reserved for
+/// `confined_fetch`, the ONLY step that reads workspace objects into staging.
+/// See `docs/security/ocap-deviations.md` §4 "Known issues (governed push)".
 ///
 /// # Errors
-/// When the confined check cannot run or the object is not a commit.
-pub fn verify_commit(
-    tools: &TrustedTools,
-    common_dir: &Path,
-    oid: &str,
-    session: &Caveats,
-) -> Result<(), String> {
+/// When the checked git cannot run or the object is not a commit.
+pub fn verify_commit(tools: &TrustedTools, common_dir: &Path, oid: &str) -> Result<(), String> {
     let git_dir = common_dir.to_string_lossy();
-    let out = run_confined_git(
-        tools,
-        &["--git-dir", &git_dir, "cat-file", "-t", oid],
-        common_dir,
-        session,
-        session.fs_read.clone(),
-        Scope::none(),
-    )?;
-    if out.success && out.stdout.trim_ascii() == b"commit" {
+    let out = tools
+        .git(["--git-dir", &git_dir, "cat-file", "-t", oid])
+        .output()
+        .map_err(|e| format!("refused: trusted git could not run ({e})"))?;
+    if out.status.success() && out.stdout.trim_ascii() == b"commit" {
         Ok(())
     } else {
         Err(format!(
@@ -1080,11 +1185,12 @@ pub fn resolve_alternates_chain(
             ));
         }
         chain.push(canonical.clone());
+        // O_NOFOLLOW: the alternates file itself must not be a child symlink.
         let alt_file = canonical.join("info").join("alternates");
-        let contents = match std::fs::read_to_string(&alt_file) {
-            Ok(contents) => contents,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("refused: '{}': {e}", alt_file.display())),
+        let contents = match read_no_symlink_file(&alt_file, fs_read) {
+            Ok(Some(c)) => c,
+            Ok(None) => continue,
+            Err(e) => return Err(e),
         };
         for line in contents.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
@@ -1318,7 +1424,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("refs/heads")).unwrap();
         let oid = "a".repeat(40);
         std::fs::write(dir.path().join("refs/heads/main"), format!("{oid}\n")).unwrap();
-        assert_eq!(read_branch_oid(dir.path(), "main").unwrap(), oid);
+        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        assert_eq!(read_branch_oid(dir.path(), "main", &fs_read).unwrap(), oid);
     }
 
     #[test]
@@ -1330,14 +1437,187 @@ mod tests {
             format!("{oid} refs/heads/main\n"),
         )
         .unwrap();
-        assert_eq!(read_branch_oid(dir.path(), "main").unwrap(), oid);
+        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        assert_eq!(read_branch_oid(dir.path(), "main", &fs_read).unwrap(), oid);
     }
 
     #[test]
     fn read_branch_oid_refuses_when_neither_source_has_the_branch() {
         let dir = tempdir();
         std::fs::create_dir_all(dir.path().join("refs/heads")).unwrap();
-        assert!(read_branch_oid(dir.path(), "missing").is_err());
+        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        assert!(read_branch_oid(dir.path(), "missing", &fs_read).is_err());
+    }
+
+    // --- Item 1: O_NOFOLLOW / symlink-safe planning reads ----------------------
+
+    /// A child symlink at `HEAD` (a typical model-planted attack: replace HEAD
+    /// with a symlink pointing outside the authorized roots) is refused by the
+    /// O_NOFOLLOW open.  Red without the fix: `std::fs::read_to_string` would
+    /// follow it silently.
+    #[cfg(unix)]
+    #[test]
+    fn read_head_branch_refuses_a_child_symlink() {
+        let dir = tempdir();
+        let git_dir = dir.path().join("git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "ref: refs/heads/main\n").unwrap();
+        std::os::unix::fs::symlink(&outside, git_dir.join("HEAD")).unwrap();
+        let fs_read = scope(&[git_dir.to_str().unwrap()]);
+        let err = read_head_branch(&git_dir, &fs_read).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// A child symlink at `refs/heads/<branch>` (loose ref) is refused.
+    #[cfg(unix)]
+    #[test]
+    fn read_branch_oid_refuses_a_symlinked_loose_ref() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join("refs/heads")).unwrap();
+        let outside = dir.path().join("outside_oid");
+        std::fs::write(&outside, "a".repeat(40)).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("refs/heads/main")).unwrap();
+        // Also write a packed-refs with no matching entry so the packed path
+        // is exercised but the symlink path is tested first.
+        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        let err = read_branch_oid(dir.path(), "main", &fs_read).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// A child symlink at `packed-refs` is refused.
+    #[cfg(unix)]
+    #[test]
+    fn read_branch_oid_refuses_a_symlinked_packed_refs() {
+        let dir = tempdir();
+        let oid = "b".repeat(40);
+        let outside = dir.path().join("outside_packed");
+        std::fs::write(&outside, format!("{oid} refs/heads/feat\n")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("packed-refs")).unwrap();
+        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        let err = read_branch_oid(dir.path(), "feat", &fs_read).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// A child symlink at `objects/info/alternates` is refused.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_alternates_chain_refuses_a_symlinked_alternates_file() {
+        let dir = tempdir();
+        let objects = dir.path().join("objects");
+        std::fs::create_dir_all(objects.join("info")).unwrap();
+        let outside = dir.path().join("outside_alts");
+        std::fs::write(&outside, "/etc\n").unwrap();
+        std::os::unix::fs::symlink(&outside, objects.join("info/alternates")).unwrap();
+        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        let err = resolve_alternates_chain(&objects, &fs_read).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    // --- Item 2 (A1): exec=All only for confined_fetch -------------------------
+
+    /// `verify_commit` does not widen exec — it uses the checked git binary
+    /// directly rather than `run_confined_git`.  This structural test verifies
+    /// the function signature: no `session: &Caveats` parameter exists, so
+    /// exec-widening is architecturally impossible through this path.
+    ///
+    /// Measured red: the OLD signature `verify_commit(tools, dir, oid, caveats)`
+    /// required a Caveats and internally called `run_confined_git(exec: All)`.
+    /// The new signature `verify_commit(tools, dir, oid)` compiles only with
+    /// the non-widening implementation.
+    #[test]
+    fn verify_commit_has_no_caveats_parameter() {
+        // If this compiles without a &Caveats argument, exec-widening is absent.
+        let dir = tempdir();
+        let tools = tools_with(dir.path(), None);
+        // We expect an error (no real git objects), but exec widening is
+        // structurally absent — the function signature enforces it.
+        let _ = verify_commit(
+            &tools,
+            dir.path(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+    }
+
+    /// `require_kernel_fence` refuses an advisory sandbox regardless of outcome.
+    /// This is the descendant-fence proof: a `SandboxKind::None` result means
+    /// no kernel fence was applied, and the copy is refused even on success.
+    #[test]
+    fn require_kernel_fence_refuses_advisory_sandbox() {
+        assert!(require_kernel_fence(agent_bridle::SandboxKind::None).is_err());
+    }
+
+    // --- Item 3 (A2): sticky-directory negative controls ----------------------
+
+    /// A world-writable directory WITHOUT the sticky bit is refused by
+    /// `trust_check` — the sticky exemption requires the bit.
+    ///
+    /// Measured red: if `writable_by_others` returned false for any world-
+    /// writable dir, this test would pass when it should fail (the exemption
+    /// would be over-broad).
+    #[cfg(unix)]
+    #[test]
+    fn trust_check_refuses_world_writable_dir_without_sticky_bit() {
+        let dir = tempdir();
+        let non_sticky = dir.path().join("non_sticky");
+        std::fs::create_dir(&non_sticky).unwrap();
+        chmod(&non_sticky, 0o777); // world-writable, NO sticky bit
+        let target = owned_file(&non_sticky, "config", 0o600);
+        let err = trust_check(&target, &scope(&["/some/other/root"])).unwrap_err();
+        assert!(
+            err.contains("group- or other-writable"),
+            "expected group/other-writable refusal for non-sticky 0o777 dir: {err}"
+        );
+    }
+
+    /// A sticky directory we OWN (not root-owned) is NOT exempt — the
+    /// A2 exemption requires `uid == 0` (root-owned).  This covers the
+    /// "foreign-ownership" dimension: if the sticky dir is owned by a non-root
+    /// non-current uid, the exemption does not apply.
+    ///
+    /// We test the closest approximation available without root: a sticky dir
+    /// we own (uid == effective_uid, not 0) is not exempt.
+    #[cfg(unix)]
+    #[test]
+    fn trust_check_refuses_world_writable_sticky_dir_not_owned_by_root() {
+        let dir = tempdir();
+        let sticky_ours = dir.path().join("sticky_ours");
+        std::fs::create_dir(&sticky_ours).unwrap();
+        chmod(&sticky_ours, 0o1777); // sticky + world-writable, but owned by us (not root)
+        let target = owned_file(&sticky_ours, "config", 0o600);
+        let err = trust_check(&target, &scope(&["/some/other/root"])).unwrap_err();
+        assert!(
+            err.contains("group- or other-writable"),
+            "expected refusal: sticky-but-not-root-owned dir passes: {err}"
+        );
+    }
+
+    // --- Actionable trust-refusal message (ADDED 2026-09-30) ------------------
+
+    /// A group-writable credential-origin file produces an operator message
+    /// naming the path, the failed condition, and the `chmod g-w` fix.
+    ///
+    /// Measured red: before adding `shorten_home` + fix-hint to `check_one`,
+    /// the error message contained neither "Fix:" nor "chmod", failing this test.
+    #[cfg(unix)]
+    #[test]
+    fn trust_check_group_writable_credential_origin_message_is_actionable() {
+        let dir = tempdir();
+        let cred_origin = owned_file(dir.path(), "gitconfig", 0o664); // group-writable
+        let err = trust_check(&cred_origin, &scope(&["/some/other/root"])).unwrap_err();
+        assert!(
+            err.contains("group- or other-writable"),
+            "condition missing: {err}"
+        );
+        assert!(err.contains("Fix:"), "fix hint missing: {err}");
+        assert!(err.contains("chmod"), "chmod missing: {err}");
+        assert!(
+            err.contains("g-w") || err.contains("o-w"),
+            "fix operand missing: {err}"
+        );
+        // The path (possibly as ~/…) must appear in the message.
+        let file_name = cred_origin.file_name().unwrap().to_string_lossy();
+        assert!(err.contains(file_name.as_ref()), "path missing: {err}");
     }
 
     /// HEAD is model-writable: a branch name must never traverse out of

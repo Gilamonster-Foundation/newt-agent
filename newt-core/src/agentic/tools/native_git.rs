@@ -270,7 +270,7 @@ fn plan_governed_push(
     // Administrative dirs by file reads, each read-authorized before use.
     let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read)?;
 
-    let branch = staging::read_head_branch(&git_dir)?;
+    let branch = staging::read_head_branch(&git_dir, &caveats.fs_read)?;
     if staging::is_default_branch(&common_dir, &branch) {
         return Err(format!(
             "refused: cannot push the default branch '{branch}' (open a feature branch instead)"
@@ -289,7 +289,7 @@ fn plan_governed_push(
 
     // The LITERAL `remote.<name>.url` (never `git remote get-url`, which
     // applies insteadOf): what the operator approves is what staging dials.
-    let url = staging::literal_remote_url(&tools, &common_dir, &request.remote)?;
+    let url = staging::literal_remote_url(&tools, &common_dir, &request.remote, &caveats.fs_read)?;
     let host = crate::git_hardening::push_url_host(&url)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
@@ -298,10 +298,10 @@ fn plan_governed_push(
     };
 
     // F3: pin the commit at PLAN time; it is carried to the dial unchanged.
-    let oid = staging::read_branch_oid(&git_dir, &branch)
-        .or_else(|_| staging::read_branch_oid(&common_dir, &branch))?;
+    let oid = staging::read_branch_oid(&git_dir, &branch, &caveats.fs_read)
+        .or_else(|_| staging::read_branch_oid(&common_dir, &branch, &caveats.fs_read))?;
     staging::resolve_alternates_chain(&common_dir.join("objects"), &caveats.fs_read)?;
-    staging::verify_commit(&tools, &common_dir, &oid, caveats)?;
+    staging::verify_commit(&tools, &common_dir, &oid)?;
 
     ensure_net_granted(
         caveats,
@@ -582,7 +582,7 @@ fn plan_governed_pr_create(
 
     // The `gh` dial runs from a fresh staging directory (Phase 4), so a
     // repo-local config gadget has nothing to reach.
-    let url = staging::literal_remote_url(&tools, &common_dir, "origin")?;
+    let url = staging::literal_remote_url(&tools, &common_dir, "origin", &caveats.fs_read)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
             "refused: gh pr create is only supported for a github.com 'origin' remote (got {url})"
@@ -590,7 +590,7 @@ fn plan_governed_pr_create(
     };
     let host = "github.com".to_string();
 
-    let head = staging::read_head_branch(&git_dir)
+    let head = staging::read_head_branch(&git_dir, &caveats.fs_read)
         .map_err(|_| "refused: detached HEAD has no branch to open a PR from".to_string())?;
     let base = staging::origin_default_branch(&common_dir).unwrap_or_else(|| "main".to_string());
     if head == base {
