@@ -802,11 +802,21 @@ pub fn run_confined_git(
     fs_read: Scope<String>,
     fs_write: Scope<String>,
 ) -> Result<crate::confined_exec::ConfinedOutput, String> {
+    // macOS Seatbelt cannot kernel-enforce a restricted net scope (Advisory
+    // only per agent-bridle; admission refuses under the Kernel floor).  The
+    // confined fetch reads from a LOCAL workspace path — no network is used —
+    // so net = Scope::All is safe: Seatbelt still kernel-enforces fs + exec.
+    // Linux keeps net: none() (enforced by Landlock + seccomp via net-guard).
+    // See docs/security/ocap-deviations.md §mach-xpc-ambient-deputy.
+    #[cfg(target_os = "macos")]
+    let net_scope = Scope::All;
+    #[cfg(not(target_os = "macos"))]
+    let net_scope = Scope::none();
     let caveats = Caveats {
         fs_read,
         fs_write,
         exec: Scope::All,
-        net: Scope::none(),
+        net: net_scope,
         ..session.clone()
     };
     let req = crate::confined_exec::ExecRequest::new(
