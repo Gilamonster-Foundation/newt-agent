@@ -47,6 +47,7 @@ pub mod permission_journal;
 pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
+pub mod git_staging;
 pub mod grant_tree;
 pub mod grounding;
 /// The initiative dial: how much the agent looks before acting (split from

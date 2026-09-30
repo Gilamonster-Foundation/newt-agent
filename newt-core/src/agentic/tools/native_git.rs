@@ -6,7 +6,8 @@ use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::{Caveats, CaveatsExt};
 use crate::git_caveats::GitCaveats;
 use agent_bridle::{inspect_shell, ShellInspection};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub(super) fn preflight(
     source: &str,
@@ -183,41 +184,43 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
     }
 }
 
-/// issue-1188: execute a governed `git push`, entirely host-side (never
+/// issue-1188 #2641 design round 4: execute a governed `git push` through the
+/// staging-repo broker (`crate::git_staging`), entirely host-side (never
 /// through the confined shell — see the call site's comment in `tools.rs`).
 /// `cwd` is the resolved directory the model's `run_command` targeted (after
-/// any folded leading `cd`); every git operation below runs there, exactly
-/// where an ordinary `git push` from that command would have run.
+/// any folded leading `cd`).
+///
+/// Unlike the earlier "credentialed_git in the workspace" mechanism, nothing
+/// git executes here ever reads the workspace's `.git/config` — see
+/// [`crate::git_staging`]'s module doc for the six-phase staging mechanism.
+/// The model only ever sees the fixed-form [`crate::git_staging::Outcome`]
+/// string (F6): raw child stdout/stderr is captured and dropped.
 pub(super) fn execute_governed_push(
     source: &str,
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> Result<String, String> {
-    let (url, refspec) = plan_governed_push(source, cwd, caveats, gate)?;
-    let output = crate::git_hardening::credentialed_git(cwd, &["push", &url, &refspec])
-        .map_err(|e| e.to_string())?
-        .output()
-        .map_err(|e| e.to_string())?;
-    Ok(render_git_process_output(
-        &format!("git push {url} {refspec}"),
-        &output,
-    ))
+    let plan = plan_governed_push(source, cwd, caveats, gate)?;
+    let outcome = run_staged_push(&plan, cwd, caveats)?;
+    Ok(outcome.to_string())
 }
 
-/// Everything [`execute_governed_push`] must verify BEFORE it may spawn a
-/// process at all: argv shape, A1's hostile-config refusal, main/master
-/// refusal, A2's URL resolution/scheme validation, and the net-gate prompt.
-/// Split out from [`execute_governed_push`] so the test suite can pin every
-/// refusal and the exact `(url, refspec)` a granted happy path resolves to
-/// without needing a real reachable forge — the same boundary amendment A4
-/// already draws for `gh pr create`'s live-forge exercise.
+/// Everything [`execute_governed_push`] must verify BEFORE it may create a
+/// staging repo at all: argv shape, main/master refusal, the literal
+/// destination URL and its scheme, and the net-gate prompt. Split out from
+/// [`execute_governed_push`] so the test suite can pin every refusal and the
+/// exact plan a granted happy path resolves to without needing a real
+/// reachable forge — the same boundary amendment A4 already draws for `gh pr
+/// create`'s live-forge exercise.
 fn plan_governed_push(
     source: &str,
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
-) -> Result<(String, String), String> {
+) -> Result<GovernedPushPlan, String> {
+    crate::git_staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
+
     let argv = standalone_literal_argv(source)?;
     let request = parse_governed_push(&argv)?;
 
@@ -236,17 +239,6 @@ fn plan_governed_push(
     }
     if !caveats.permits_exec("git") {
         return Err("refused: no exec authority for 'git'".to_string());
-    }
-
-    // A1: repo-local config that could redirect the push's transport,
-    // credentials, or hooks is hostile input, refused before anything spawns.
-    let listing = crate::git_hardening::local_config_listing(cwd).map_err(|e| e.to_string())?;
-    if let Some(key) = crate::git_hardening::hostile_push_config_key(&listing) {
-        return Err(format!(
-            "refused: repo-local git config sets '{key}', which a governed push \
-             cannot safely honor (transport/credential/hook gadget) — remove it \
-             from this repository's .git/config and retry"
-        ));
     }
 
     let branch = crate::git_hardening::own_branch(cwd)
@@ -268,15 +260,20 @@ fn plan_governed_push(
         }
     }
 
-    // A2: push the resolved URL, not the bare remote name — a repo-local
-    // `insteadOf` rewrite is already refused above. Resolve it through
-    // `credentialed_git` (the SAME config view — including the operator's
-    // own ambient global config — the actual push below runs under), not
-    // `hardened_git`'s ambient-config-free view: otherwise a global
-    // `url.*.insteadOf` could rewrite the destination AFTER the host check
-    // passes here but BEFORE the credentialed push dials it.
-    let url = resolve_remote_url_for_push(cwd, &request.remote)?;
+    // A2 + staging design P1: the LITERAL declared value of
+    // `remote.<name>.url`, never `git remote get-url` (which applies
+    // `insteadOf`/`pushInsteadOf` — DESIGN-r4 probe P1: that rewrite survives
+    // every `-c`/env override, so reading through it at all is the wrong
+    // primitive). This exact string is BOTH what the operator is shown and
+    // what staging later dials — staging has no `url.*` keys to rewrite it a
+    // second time, which is what closes the approve/dial bait-and-switch.
+    let url = crate::git_staging::literal_remote_url(cwd, &request.remote)?;
     let host = crate::git_hardening::push_url_host(&url)?;
+    let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
+        return Err(format!(
+            "refused: a governed push is only supported for a github.com remote (got {url})"
+        ));
+    };
 
     ensure_net_granted(
         caveats,
@@ -285,32 +282,208 @@ fn plan_governed_push(
         &format!("push branch '{branch}' to {host} ({url})"),
     )?;
 
-    // Finding 2: full ref identity, never a bare short name that could
-    // collide with `refs/heads/refs/heads/main`-shaped input, and no leading
-    // character `git push` would ever read as the force-push prefix.
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    Ok((url, refspec))
+    Ok(GovernedPushPlan {
+        url,
+        owner,
+        name,
+        branch,
+    })
 }
 
-/// [`crate::git_hardening::resolve_remote_url`], but through
-/// [`crate::git_hardening::credentialed_git`]'s config view (finding 1,
-/// issue-1188 review #2641) — the same process family that will actually
-/// dial the URL, so an operator-global `url.*.insteadOf` rewrite is captured
-/// by the SAME host check that authorizes it, rather than checked against
-/// `hardened_git`'s ambient-config-free resolution and then silently
-/// rewritten by the time the credentialed push runs.
-fn resolve_remote_url_for_push(cwd: &Path, remote: &str) -> Result<String, String> {
-    let output = crate::git_hardening::credentialed_git(cwd, &["remote", "get-url", remote])
-        .map_err(|e| e.to_string())?
+/// The exact push [`execute_governed_push`] will stage and dial, resolved and
+/// net-gated but not yet spawned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GovernedPushPlan {
+    url: String,
+    owner: String,
+    name: String,
+    branch: String,
+}
+
+/// Phases 2-6 of the staging-repo broker (`crate::git_staging`) for a push
+/// already planned and net-gated by [`plan_governed_push`]. Returns a fixed-
+/// form [`crate::git_staging::Outcome`] — never the raw child output (F6).
+fn run_staged_push(
+    plan: &GovernedPushPlan,
+    cwd: &Path,
+    caveats: &Caveats,
+) -> Result<crate::git_staging::Outcome, String> {
+    use crate::git_staging::{self, FailureCategory, Outcome};
+
+    if !crate::confined_exec::kernel_fs_fence_available() {
+        return Err(git_staging::Unavailable::NoConfinement.to_string());
+    }
+
+    let (common_dir, git_dir) = resolve_git_dirs_trusted(cwd, caveats)?;
+    let oid = git_staging::read_branch_oid(&git_dir, &plan.branch)
+        .or_else(|_| git_staging::read_branch_oid(&common_dir, &plan.branch))?;
+
+    let objects_dir = common_dir.join("objects");
+    let chain = git_staging::resolve_alternates_chain(&objects_dir, &caveats.fs_read)?;
+    let first = chain
+        .first()
+        .cloned()
+        .ok_or_else(|| "refused: could not resolve workspace objects directory".to_string())?;
+
+    let path = std::env::var_os("PATH");
+    let git_bin =
+        crate::git_hardening::trusted_git_program(path.as_deref()).map_err(|e| e.to_string())?;
+    let gh_bin =
+        crate::git_hardening::trusted_gh_program(path.as_deref()).map_err(|e| e.to_string())?;
+    git_staging::trust_check(&git_bin, &caveats.fs_write)?;
+    git_staging::trust_check(&gh_bin, &caveats.fs_write)?;
+    let git_bin_dir = git_bin
+        .parent()
+        .ok_or_else(|| "refused: git binary has no parent directory".to_string())?;
+    let gh_bin_dir = gh_bin
+        .parent()
+        .ok_or_else(|| "refused: gh binary has no parent directory".to_string())?;
+    git_staging::trust_check(git_bin_dir, &caveats.fs_write)?;
+    git_staging::trust_check(gh_bin_dir, &caveats.fs_write)?;
+
+    let state_dir = crate::config::Config::user_config_dir()
+        .ok_or_else(|| "refused: no resolvable state directory for a staging repo".to_string())?
+        .join("staging");
+    let staging = git_staging::StagingRepo::create(&state_dir, &caveats.fs_write)?;
+
+    git_staging::import_credentials(&staging, &caveats.fs_write, &gh_bin)?;
+    git_staging::write_alternates(&staging, &first)?;
+
+    // Phase 3 (F4): the ONLY step that reads workspace objects runs CONFINED.
+    let confined_caveats = Caveats {
+        fs_read: narrowed_read_scope(&caveats.fs_read, staging.path()),
+        fs_write: crate::caveats::Scope::only([staging.path().to_string_lossy().into_owned()]),
+        exec: crate::caveats::Scope::only([git_bin.to_string_lossy().into_owned()]),
+        net: crate::caveats::Scope::none(),
+        ..caveats.clone()
+    };
+    let staging_display = staging.path().to_string_lossy().into_owned();
+    let first_display = first.to_string_lossy().into_owned();
+    let fetch_req = crate::confined_exec::ExecRequest::new(
+        crate::confined_exec::ExecOrigin::TrustedInfra,
+        git_bin.to_string_lossy().into_owned(),
+        [
+            "-C",
+            staging_display.as_str(),
+            "fetch",
+            "--no-tags",
+            first_display.as_str(),
+            oid.as_str(),
+        ],
+        staging.path().to_path_buf(),
+        confined_caveats,
+    );
+    let fetch_out = crate::confined_exec::ConstrainedExecutor::run(&fetch_req)
+        .map_err(|e| format!("refused: confined fetch could not run — {e}"))?;
+    if !fetch_out.success {
+        return Ok(Outcome::Failed {
+            category: FailureCategory::GitError,
+        });
+    }
+
+    // F4: delete alternates, then prove self-containment BEFORE the network
+    // step runs — a nested alternate swapped out from under the earlier
+    // check has no effect once this passes, because a missing alternates
+    // file cannot resolve anything outside staging's own object store.
+    git_staging::remove_alternates(&staging)?;
+    let fsck = Command::new(&git_bin)
+        .arg("-C")
+        .arg(staging.path())
+        .args(["fsck", "--connectivity-only", &oid])
+        .env_clear()
         .output()
         .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "no such remote '{remote}': {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    if !fsck.status.success() {
+        return Err(
+            "refused: staging repo failed connectivity check after the confined fetch".to_string(),
+        );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+    let refspec = format!("refs/heads/{}:refs/heads/{}", plan.branch, plan.branch);
+    let gh_config_dir = git_staging::trusted_gh_config_dir(&caveats.fs_write)?;
+    let env = git_staging::governed_child_env(&[git_bin_dir, gh_bin_dir], gh_config_dir.as_deref());
+
+    let mut cmd = Command::new(&git_bin);
+    cmd.arg("-C")
+        .arg(staging.path())
+        .arg("-c")
+        .arg("http.followRedirects=false")
+        .args(["push", &plan.url, &refspec])
+        .env_clear();
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(Outcome::Pushed {
+            oid,
+            owner: plan.owner.clone(),
+            name: plan.name.clone(),
+            branch: plan.branch.clone(),
+        })
+    } else {
+        Ok(Outcome::Failed {
+            category: classify_failure(&output.stderr),
+        })
+    }
+}
+
+/// Follow a linked worktree's `gitdir:` file to the real administrative
+/// directory and its commondir (CONDUCTOR-ADDENDUM item 3), verifying BOTH
+/// are inside the session's authorized read roots before anything reads a
+/// ref from them.
+fn resolve_git_dirs_trusted(cwd: &Path, caveats: &Caveats) -> Result<(PathBuf, PathBuf), String> {
+    let (common_dir, git_dir) = crate::git_hardening::git_dirs(cwd).ok_or_else(|| {
+        "refused: could not resolve this repository's git directories".to_string()
+    })?;
+    for dir in [&common_dir, &git_dir] {
+        if !crate::caveats::permits_path(&caveats.fs_read, &dir.to_string_lossy()) {
+            return Err(format!(
+                "refused: '{}' is outside this session's filesystem read authority",
+                dir.display()
+            ));
+        }
+    }
+    Ok((common_dir, git_dir))
+}
+
+/// Add `extra` to a read scope without discarding `Scope::All` (there is
+/// nothing to narrow when the session already has unrestricted read).
+fn narrowed_read_scope(
+    fs_read: &crate::caveats::Scope<String>,
+    extra: &Path,
+) -> crate::caveats::Scope<String> {
+    match fs_read {
+        crate::caveats::Scope::All => crate::caveats::Scope::All,
+        crate::caveats::Scope::Only(set) => {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.push(extra.to_string_lossy().into_owned());
+            crate::caveats::Scope::only(v)
+        }
+    }
+}
+
+/// Best-effort classification of a failed dial from the child's stderr BYTES
+/// — read only in-process to pick one of a small fixed set of words (F6); the
+/// bytes themselves are never returned to the model, the terminal, or a log.
+fn classify_failure(stderr: &[u8]) -> crate::git_staging::FailureCategory {
+    use crate::git_staging::FailureCategory;
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if text.contains("could not resolve host")
+        || text.contains("connection refused")
+        || text.contains("connection timed out")
+        || text.contains("network is unreachable")
+    {
+        FailureCategory::Network
+    } else if text.contains("authentication failed")
+        || text.contains("permission denied")
+        || text.contains("403")
+        || text.contains("401")
+    {
+        FailureCategory::Auth
+    } else {
+        FailureCategory::GitError
+    }
 }
 
 /// issue-1188 amendment A4: the exact `gh pr create` this broker will
@@ -359,9 +532,12 @@ fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, String>
     Ok(GovernedPrCreate { title, body })
 }
 
-/// issue-1188 amendment A4: execute a governed `gh pr create`, host-side, for
-/// the same reason as [`execute_governed_push`] (the confined child cannot
-/// reach the forge at all).
+/// issue-1188 #2641 design round 4: execute a governed `gh pr create` from a
+/// fresh staging directory (Phase 4 — `cwd = staging`, so no workspace
+/// `.git/config` is ever in scope for `gh`'s own git children), for the same
+/// reason as [`execute_governed_push`] (the confined child cannot reach the
+/// forge at all). The model only ever sees the fixed-form
+/// [`crate::git_staging::Outcome`] string.
 pub(super) fn execute_governed_pr_create(
     source: &str,
     cwd: &Path,
@@ -369,13 +545,54 @@ pub(super) fn execute_governed_pr_create(
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> Result<String, String> {
     let plan = plan_governed_pr_create(source, cwd, caveats, gate)?;
-    let output = crate::git_hardening::credentialed_gh(
-        cwd,
-        &[
+    let outcome = run_staged_pr_create(&plan, caveats)?;
+    Ok(outcome.to_string())
+}
+
+/// Phase 2/4/5 for `gh pr create`: a bare staging dir (no objects needed —
+/// `gh` never reads repository content to open a PR), `gh`'s own trust-
+/// checked config dir, and the fixed-form outcome (F6): a `pr_created`
+/// outcome's URL is validated against
+/// [`crate::git_staging::validate_pr_url`] or the outcome degrades to
+/// `failed(parse)`.
+fn run_staged_pr_create(
+    plan: &GovernedPrCreatePlan,
+    caveats: &Caveats,
+) -> Result<crate::git_staging::Outcome, String> {
+    use crate::git_staging::{self, FailureCategory, Outcome};
+
+    let path = std::env::var_os("PATH");
+    let git_bin =
+        crate::git_hardening::trusted_git_program(path.as_deref()).map_err(|e| e.to_string())?;
+    let gh_bin =
+        crate::git_hardening::trusted_gh_program(path.as_deref()).map_err(|e| e.to_string())?;
+    git_staging::trust_check(&git_bin, &caveats.fs_write)?;
+    git_staging::trust_check(&gh_bin, &caveats.fs_write)?;
+    let git_bin_dir = git_bin
+        .parent()
+        .ok_or_else(|| "refused: git binary has no parent directory".to_string())?;
+    let gh_bin_dir = gh_bin
+        .parent()
+        .ok_or_else(|| "refused: gh binary has no parent directory".to_string())?;
+    git_staging::trust_check(git_bin_dir, &caveats.fs_write)?;
+    git_staging::trust_check(gh_bin_dir, &caveats.fs_write)?;
+
+    let state_dir = crate::config::Config::user_config_dir()
+        .ok_or_else(|| "refused: no resolvable state directory for a staging repo".to_string())?
+        .join("staging");
+    let staging = git_staging::StagingRepo::create(&state_dir, &caveats.fs_write)?;
+    git_staging::import_credentials(&staging, &caveats.fs_write, &gh_bin)?;
+
+    let gh_config_dir = git_staging::trusted_gh_config_dir(&caveats.fs_write)?;
+    let env = git_staging::governed_child_env(&[git_bin_dir, gh_bin_dir], gh_config_dir.as_deref());
+
+    let mut cmd = Command::new(&gh_bin);
+    cmd.current_dir(staging.path())
+        .args([
             "pr",
             "create",
             "--repo",
-            &plan.repo,
+            &format!("github.com/{}", plan.repo),
             "--base",
             &plan.base,
             "--head",
@@ -384,18 +601,23 @@ pub(super) fn execute_governed_pr_create(
             &plan.title,
             "--body",
             &plan.body,
-        ],
-    )
-    .map_err(|e| e.to_string())?
-    .output()
-    .map_err(|e| e.to_string())?;
-    Ok(render_git_process_output(
-        &format!(
-            "gh pr create --repo {} --base {} --head {} ...",
-            plan.repo, plan.base, plan.head
-        ),
-        &output,
-    ))
+        ])
+        .env_clear();
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Ok(Outcome::Failed {
+            category: classify_failure(&output.stderr),
+        });
+    }
+    match git_staging::validate_pr_url(&String::from_utf8_lossy(&output.stdout)) {
+        Some(url) => Ok(Outcome::PrCreated { url }),
+        None => Ok(Outcome::Failed {
+            category: FailureCategory::Parse,
+        }),
+    }
 }
 
 /// The exact `gh pr create` invocation [`execute_governed_pr_create`] will
@@ -416,6 +638,8 @@ fn plan_governed_pr_create(
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> Result<GovernedPrCreatePlan, String> {
+    crate::git_staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
+
     let argv = standalone_literal_argv(source)?;
     let request = parse_governed_pr_create(&argv)?;
 
@@ -430,19 +654,11 @@ fn plan_governed_pr_create(
         return Err("refused: no exec authority for 'gh'".to_string());
     }
 
-    // Finding 3: A1's hostile-config refusal never ran on this path at all —
-    // `gh` shells out to Git for repository/branch resolution too, so the
-    // same transport/credential/hook gadgets [`hostile_push_config_key`]
-    // screens for a push apply here.
-    let listing = crate::git_hardening::local_config_listing(cwd).map_err(|e| e.to_string())?;
-    if let Some(key) = crate::git_hardening::hostile_push_config_key(&listing) {
-        return Err(format!(
-            "refused: repo-local git config sets '{key}', which a governed PR create \
-             cannot safely honor (transport/credential/hook gadget) — remove it \
-             from this repository's .git/config and retry"
-        ));
-    }
-
+    // Unlike the earlier mechanism, a repo-local config gadget has no effect
+    // on this broker at all: `gh pr create` now always dials from a fresh
+    // staging directory with no workspace `.git/config` in scope (Phase 4),
+    // so there is nothing here left to screen for — see
+    // `crate::git_staging`'s module doc.
     let url = crate::git_hardening::resolve_remote_url(cwd, "origin")?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
@@ -515,26 +731,6 @@ fn ensure_net_granted(
             "refused: operator did not grant network access to '{host}'"
         )),
     }
-}
-
-/// Render a completed host-side git/gh process's output the same way a
-/// confined-shell command's output would read to the model: the argv that
-/// ran, then stdout/stderr, then an explicit exit-code note on failure (a
-/// non-zero exit is real command output, not a broker refusal).
-fn render_git_process_output(rendered_argv: &str, output: &std::process::Output) -> String {
-    let mut text = format!("$ {rendered_argv}\n");
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
-        text.push_str(&format!(
-            "\n(exited {})",
-            output
-                .status
-                .code()
-                .map_or_else(|| "without a status code".to_string(), |c| c.to_string())
-        ));
-    }
-    text
 }
 
 fn is_git(program: &str) -> bool {
@@ -1510,6 +1706,18 @@ mod tests {
 mod governed_push_tests {
     use super::*;
 
+    /// `Caveats::top()` narrowed to a github.com net grant: unlike
+    /// `Caveats::top()`'s bare `Scope::All`, this passes SPEC-FINAL F5's
+    /// preflight (an unrestricted net grant disclaims push governance
+    /// entirely) while still exercising every other check at full authority
+    /// — the shape a governed push actually expects to run under.
+    fn scoped_caveats() -> Caveats {
+        Caveats {
+            net: crate::caveats::Scope::only(["github.com".to_string()]),
+            ..Caveats::top()
+        }
+    }
+
     fn git(cwd: &Path, args: &[&str]) -> String {
         let output = crate::git_hardening::hardened_git(cwd, args)
             .unwrap()
@@ -1597,7 +1805,7 @@ mod governed_push_tests {
         let err = plan_governed_push(
             "git push origin main:main",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut None,
         )
         .unwrap_err();
@@ -1616,17 +1824,21 @@ mod governed_push_tests {
             "git push -f origin task:task",
         ] {
             let err =
-                plan_governed_push(source, repo.path(), &Caveats::top(), &mut None).unwrap_err();
+                plan_governed_push(source, repo.path(), &scoped_caveats(), &mut None).unwrap_err();
             assert!(err.contains("no flags"), "{source}: {err}");
         }
     }
 
-    /// Would have failed before A1: a repo-local `core.sshCommand` gadget
-    /// would otherwise run silently on the FIRST git invocation planning
-    /// performs (`config --local --list` itself); this pins that the plan
-    /// refuses before any push-shaped command reaches the network stage.
+    /// DESIGN-r4's finding-closure table, F2 row: a repo-local config gadget
+    /// planted in the workspace's `.git/config` has NO EFFECT on the plan at
+    /// all — `plan_governed_push` never reads `.git/config` for anything but
+    /// `remote.<name>.url` any more (`crate::git_staging::literal_remote_url`,
+    /// a literal `git config --get`, not a config-driven resolver a hook
+    /// could hijack). Would have failed against the OLD mechanism only in the
+    /// sense that it asserted a REFUSAL; the staging design's answer is that
+    /// the gadget is simply never consulted, so planning still succeeds.
     #[test]
-    fn hostile_repo_local_config_is_refused_and_never_reached() {
+    fn hostile_repo_local_config_has_no_effect_on_the_plan() {
         let repo = repo_on_feature_branch();
         let sentinel = repo.path().join("payload-ran");
         git(
@@ -1638,17 +1850,17 @@ mod governed_push_tests {
                 &format!("touch {}", sentinel.display()),
             ],
         );
-        let err = plan_governed_push(
+        let plan = plan_governed_push(
             "git push origin task:task",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut None,
         )
-        .unwrap_err();
-        assert!(err.contains("core.sshcommand"), "{err}");
+        .unwrap();
+        assert_eq!(plan.url, "https://github.com/o/r.git");
         assert!(
             !sentinel.exists(),
-            "the hostile sshCommand payload must never run"
+            "a repo-local config gadget must never run just from planning a push"
         );
     }
 
@@ -1678,7 +1890,7 @@ mod governed_push_tests {
             let err = plan_governed_push(
                 "git push origin task:task",
                 repo.path(),
-                &Caveats::top(),
+                &scoped_caveats(),
                 &mut None,
             )
             .unwrap_err();
@@ -1729,22 +1941,23 @@ mod governed_push_tests {
             allow: true,
             requests: vec![],
         };
-        let (url, refspec) = plan_governed_push(
+        let plan = plan_governed_push(
             "git push origin task:task",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut Some(&mut gate),
         )
         .unwrap();
-        assert_eq!(url, "https://github.com/o/r.git");
-        assert_eq!(refspec, "refs/heads/task:refs/heads/task");
+        assert_eq!(plan.url, "https://github.com/o/r.git");
+        assert_eq!(plan.owner, "o");
+        assert_eq!(plan.name, "r");
+        assert_eq!(plan.branch, "task");
 
         // Bare `git push` (no operands) resolves the same way, from origin +
         // the repository's own branch.
-        let (url2, refspec2) =
-            plan_governed_push("git push", repo.path(), &Caveats::top(), &mut None).unwrap();
-        assert_eq!(url2, url);
-        assert_eq!(refspec2, refspec);
+        let plan2 =
+            plan_governed_push("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        assert_eq!(plan2, plan);
     }
 
     /// Finding 2 (issue-1188 review #2641): a `<remote> <branch>:<branch>`
@@ -1759,7 +1972,7 @@ mod governed_push_tests {
         let err = plan_governed_push(
             "git push origin other:other",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut None,
         )
         .unwrap_err();
@@ -1776,6 +1989,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let no_exec = Caveats {
             exec: crate::caveats::Scope::only([]),
+            net: crate::caveats::Scope::only(["github.com".to_string()]),
             ..Caveats::top()
         };
         let err = plan_governed_push(
@@ -1793,6 +2007,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let no_read = Caveats {
             fs_read: crate::caveats::Scope::only([]),
+            net: crate::caveats::Scope::only(["github.com".to_string()]),
             ..Caveats::top()
         };
         let err = plan_governed_push(
@@ -1858,6 +2073,35 @@ mod governed_push_tests {
         assert!(err.is_err(), "{source}: {err:?}");
     }
 
+    /// SPEC-FINAL F5, through the OUTER tool path (`needs_push_broker` +
+    /// `execute_governed_push`, the same route `tools.rs`'s dispatch takes):
+    /// under an unrestricted (`Scope::All`) net grant, a top-level `git push`
+    /// gets the broker-refused message and no mutation — push governance is
+    /// disclaimed entirely rather than pretending to bound an opaque
+    /// launcher's descendant network.
+    #[test]
+    fn f5_top_level_push_under_scope_all_net_is_refused_and_never_mutates() {
+        let repo = repo_on_feature_branch();
+        let source = "git push origin task:task";
+        assert!(
+            needs_push_broker(source),
+            "must route to the governed broker"
+        );
+        let caveats = Caveats {
+            net: crate::caveats::Scope::All,
+            ..Caveats::top()
+        };
+        let err = execute_governed_push(source, repo.path(), &caveats, &mut None).unwrap_err();
+        assert!(
+            err.contains("Scope::All") || err.contains("disclaimed"),
+            "{err}"
+        );
+        // No ref moved on the remote-tracking side; the workspace's own
+        // branch ref is untouched too (refusal happened before staging).
+        let head_after = git(repo.path(), &["rev-parse", "task"]);
+        assert!(!head_after.trim().is_empty());
+    }
+
     /// The exact `gh pr create` argv this broker resolves — `--repo` is
     /// ALWAYS present (amendment A4), base/head are resolved by the broker,
     /// never taken from the model's argv.
@@ -1895,7 +2139,7 @@ mod governed_push_tests {
         let err = plan_governed_pr_create(
             "gh pr create --title t --body b --base other",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut None,
         )
         .unwrap_err();
@@ -1934,18 +2178,18 @@ mod governed_push_tests {
         let err = plan_governed_pr_create(
             "gh pr create --title t --body b",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut None,
         )
         .unwrap_err();
         assert!(err.contains("github.com"), "{err}");
     }
 
-    /// Finding 3 (issue-1188 review #2641): the PR-create broker never ran
-    /// A1's hostile-config check at all. Would have failed before the fix:
-    /// `plan_governed_pr_create` resolved straight through to `Ok`.
+    /// DESIGN-r4 finding closure, PR-create side: the actual `gh pr create`
+    /// dial runs from a fresh staging directory (Phase 4), so a repo-local
+    /// config gadget has no way to reach it — planning still succeeds.
     #[test]
-    fn pr_create_refuses_hostile_repo_local_config() {
+    fn pr_create_plan_is_unaffected_by_a_hostile_repo_local_config() {
         let repo = repo_on_feature_branch();
         git(
             repo.path(),
@@ -1956,14 +2200,14 @@ mod governed_push_tests {
                 "ssh -oProxyCommand=evil",
             ],
         );
-        let err = plan_governed_pr_create(
+        let plan = plan_governed_pr_create(
             "gh pr create --title t --body b",
             repo.path(),
-            &Caveats::top(),
+            &scoped_caveats(),
             &mut None,
         )
-        .unwrap_err();
-        assert!(err.contains("core.sshcommand"), "{err}");
+        .unwrap();
+        assert_eq!(plan.repo, "o/r");
     }
 
     /// Finding 6 (issue-1188 review #2641): the PR-create broker must bind
@@ -1973,6 +2217,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let no_exec = Caveats {
             exec: crate::caveats::Scope::only([]),
+            net: crate::caveats::Scope::only(["github.com".to_string()]),
             ..Caveats::top()
         };
         let err = plan_governed_pr_create(
@@ -1986,6 +2231,7 @@ mod governed_push_tests {
 
         let no_read = Caveats {
             fs_read: crate::caveats::Scope::only([]),
+            net: crate::caveats::Scope::only(["github.com".to_string()]),
             ..Caveats::top()
         };
         let err = plan_governed_pr_create(

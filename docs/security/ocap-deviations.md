@@ -1078,6 +1078,31 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   pins the fence; `dependency_fetch::tests` pin the screens and the fail-closed gate.
 - **Status:** OPEN. owner: — · review-by: #1599.
 
+### Known issues (governed push)
+
+The staging-repo governed push / `gh pr create` broker (issue #1188, #2641
+design round 4, `newt-core/src/git_staging.rs`) closes the config-gadget
+class of finding this register otherwise tracks per-key. The operator
+accepted the following residuals on 2026-09-29 as known issues, each to be
+resolved in a later release:
+
+- Windows is refused outright — no native ownership/writability check exists
+  yet for the trust predicate the broker relies on.
+- `Scope::All` (unrestricted network) is refused, and push governance is
+  disclaimed there entirely — the model already holds unrestricted network
+  in that grant, so nothing this broker adds would bound it.
+- Credential-helper compatibility is limited to two forms: a bare name
+  (resolved inside the trusted git's `--exec-path`) and the exact `gh
+  setup-git` form (`!<trusted gh> auth git-credential`). Any other
+  `credential.helper` value is refused, naming it.
+- Raw git/gh child diagnostic output (stdout/stderr) is captured and dropped
+  entirely — never surfaced to the model, the terminal, or a log — so a
+  failed push or PR create degrades to one of a small fixed-form outcome
+  category and the operator must re-run by hand to see the real error.
+- Concurrent edits to a TRUSTED OPERATOR's own git/gh config files (made by
+  the operator themselves, not the model, which cannot write those paths at
+  all) between the broker's trust check and its dial are not detected.
+
 ## 5. How to use this (for the practical-caveat moments)
 
 When you must cut a corner to get function:
