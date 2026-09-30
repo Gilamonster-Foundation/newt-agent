@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Ground pre-push range selection in real Git histories and the actual hook.
 
-Only expensive gate commands are stubbed. Real commits, refs, ancestry, diffs,
-and hook subprocesses verify that a rebase does not turn upstream fixtures into
-new disclosures or change which local checks run. No remote is contacted.
+Only expensive gate commands (`cargo`, `just`) are stubbed. Real commits,
+refs, ancestry, diffs, and the hook subprocess verify that a rebase does not
+turn upstream fixtures into new disclosures, and that #1098's changed-scope
+classification picks the right gate. No remote is contacted.
+
+scripts/changed-scope.sh and scripts/spawn_inventory.py run FOR REAL (via
+symlink into the fixture repo) — spawn_inventory.py resolves its own repo
+root through its real file path, so it harmlessly re-scans the actual
+newt-agent tree rather than the fixture. `just` stays stubbed: it never
+executes a real recipe, so the fixture repo needs no justfile.
 """
 
 import ipaddress
@@ -14,24 +21,34 @@ import tempfile
 import unittest
 
 
-HOOK = Path(__file__).resolve().parents[1] / ".githooks" / "pre-push"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HOOK = REPO_ROOT / ".githooks" / "pre-push"
+CHANGED_SCOPE = REPO_ROOT / "scripts" / "changed-scope.sh"
+SPAWN_INVENTORY = REPO_ROOT / "scripts" / "spawn_inventory.py"
 ZERO = "0" * 40
-FULL_GATE = ["check", "audit", "msrv", "cov-ci"]
+DOCS_GATE = ["docs-check"]
+CODE_GATE = ["docs-check", "fmt", "clippy", "nextest"]
 # Generated synthetic addresses exercise the guard without embedding a host.
 PRIVATE_FIXTURE = str(ipaddress.IPv4Network("10.0.0.0/8")[7])
 PRIVATE_ADDITION = str(ipaddress.IPv4Network("10.0.0.0/8")[8])
 METADATA_CONSTANT = "169.254.169.254"
 CGNAT_CONSTANT = "100.64.0.0/10"
 LINK_LOCAL_FIXTURE = str(ipaddress.IPv4Address(0xA9FE0007))
-# The hook prepends ~/.cargo/bin. Exported Bash functions keep these stubs ahead
-# of that path without changing HOME or accidentally invoking a real build.
+# The hook prepends ~/.cargo/bin. Exported Bash functions keep these stubs
+# ahead of that path without changing HOME or invoking a real build. `just`
+# only LOGS — the fixture repo carries no justfile for it to actually run.
+# `cargo` logs its first word (fmt/clippy/test) so gate selection is
+# observable without a real compile.
 STUBS = r'''
-just() { printf '%s\n' "$*" >> "$PRE_PUSH_TEST_LOG"; }
-cargo() { test "$*" = 'llvm-cov --version'; }
-rustup() { return 0; }
-cargo-llvm-cov() { return 0; }
-npm() { return 0; }
-export -f just cargo rustup cargo-llvm-cov npm
+just() { printf '%s\n' "$1" >> "$PRE_PUSH_TEST_LOG"; }
+cargo() {
+    # changed-scope.sh calls the REAL `cargo metadata` to map files to
+    # crates; only the gate subcommands (fmt/clippy/test/nextest) are stubbed.
+    if [ "$1" = "metadata" ]; then command cargo "$@"; return; fi
+    printf '%s\n' "$1" >> "$PRE_PUSH_TEST_LOG"
+}
+cargo-nextest() { printf 'nextest\n' >> "$PRE_PUSH_TEST_LOG"; }
+export -f just cargo cargo-nextest
 exec bash "$1"
 '''
 
@@ -54,6 +71,9 @@ class PrePushTests(unittest.TestCase):
             PRE_PUSH_TEST_LOG=str(self.log),
         )
         self.git("init", "-q", "--initial-branch=main", "--template=")
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts" / "changed-scope.sh").symlink_to(CHANGED_SCOPE)
+        (self.root / "scripts" / "spawn_inventory.py").symlink_to(SPAWN_INVENTORY)
         self.base = self.commit("README.md", "Fixture repository.\n")
         self.git("update-ref", "refs/remotes/origin/main", self.base)
 
@@ -113,8 +133,7 @@ class PrePushTests(unittest.TestCase):
         self.assertNotIn("NETWORK-LEAK GUARD", result.stdout)
         # The actual pushed diff includes upstream Rust even though the feature
         # itself only changes Markdown; rebasing must not select the docs gate.
-        self.assertEqual(calls, FULL_GATE)
-        self.assertNotIn("documentation-only push", result.stdout)
+        self.assertEqual(calls, CODE_GATE)
 
     def test_rebased_private_addition_still_fails(self):
         old, local = self.rebased(PRIVATE_ADDITION)
@@ -145,7 +164,7 @@ class PrePushTests(unittest.TestCase):
                 local = self.commit("constant.rs", f'let public_constant = "{literal}";\n')
                 result, calls = self.hook(local, self.base)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(calls, FULL_GATE)
+                self.assertEqual(calls, CODE_GATE)
 
     def test_noncanonical_link_local_and_cgnat_literals_stay_blocked(self):
         cgnat = ipaddress.IPv4Network(CGNAT_CONSTANT)
@@ -190,7 +209,7 @@ class PrePushTests(unittest.TestCase):
             local, self.base, "export PYTHONIOENCODING=utf-8:strict",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(calls, FULL_GATE)
+        self.assertEqual(calls, CODE_GATE)
 
     def test_unreadable_diff_refuses_before_builds(self):
         local = self.commit("feature.rs", "fn fixture() {}\n")
@@ -203,20 +222,21 @@ class PrePushTests(unittest.TestCase):
         local = self.commit("feature.md", "Safe documentation.\n")
         result, calls = self.hook(local, self.base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(calls, ["docs-check"])
+        self.assertEqual(calls, DOCS_GATE)
 
     def test_code_update_keeps_full_gate(self):
         local = self.commit("feature.rs", "fn fixture() {}\n")
         result, calls = self.hook(local, self.base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(calls, FULL_GATE)
+        self.assertEqual(calls, CODE_GATE)
+        self.assertIn("changed scope: ALL", result.stdout)
 
     def test_missing_remote_object_cannot_select_docs_fast_path(self):
         local = self.commit("feature.md", "Safe documentation.\n")
         result, calls = self.hook(local, "f" * 40)
         # Refusal is safe too; a successful hook must execute the full gate.
-        self.assertTrue(result.returncode != 0 or calls == FULL_GATE, result.stdout + result.stderr)
-        self.assertNotIn("documentation-only push", result.stdout)
+        self.assertTrue(result.returncode != 0 or calls == CODE_GATE, result.stdout + result.stderr)
+        self.assertNotIn("no code-affecting change", result.stdout)
 
 
 if __name__ == "__main__":
