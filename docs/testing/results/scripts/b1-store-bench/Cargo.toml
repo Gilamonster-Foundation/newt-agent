@@ -33,14 +33,13 @@ anyhow = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 blake3 = "1"
 
-# Mirror of the workspace's [patch.crates-io] (agent-bridle is not on
-# crates.io yet — see agent-bridle#20). This crate has its own [workspace]
-# table, so it must repeat the patch to resolve newt-core's dependency.
+# Cargo applies patches only from the active workspace root. Keep these aligned
+# with the repository root until the Bridle integration is published; see
+# ../../../../../vendor/agent-bridle-tool-shell/NEWT_PATCHES.md for provenance.
 [patch.crates-io]
-agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
-agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
-agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-shell = { path = "../../../../../vendor/agent-bridle-tool-shell" }
+agent-bridle-core = { path = "../../../../../vendor/agent-bridle-core" }
+agent-bridle-fdguard = { path = "../../../../../vendor/agent-bridle-fdguard" }
 
 [profile.release]
 debug = false

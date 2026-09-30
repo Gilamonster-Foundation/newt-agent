@@ -40,6 +40,7 @@ mod native_git_broker;
 pub mod netguard;
 pub mod owned_hosts;
 pub mod permission_journal;
+pub mod workspace_protection;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
 // Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
@@ -213,8 +214,8 @@ pub use agentic::{
     SessionSpillStore, SessionStepLedger, ShellObservation, SolveObservation, SpillStore, Step,
     StepLedger, StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture,
     Summarizer, ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle,
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
-    MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, BOUND_REASON_PREFIX,
+    EXPERIENCE_TOP_K, MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};

@@ -778,7 +778,6 @@ fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
 /// the WHOLE spawn (L3 BOUND), and a stdio child can't bind a host
 /// allow-list either way (see `caveats::spawn_net_scope`). `Scope::All` and
 /// `Scope::none()` still pass through unchanged.
-#[cfg(unix)]
 fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     use newt_core::caveats::Scope;
     let mut caveats = session.clone();
@@ -792,6 +791,25 @@ fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     // `net: none`, which the `DenyDirect` sandbox policy below can bind.
     caveats.net = newt_core::caveats::spawn_net_scope(&caveats.net);
     caveats
+}
+
+/// Prepare the exact server authority before environment resolution or spawning.
+fn prepare_stdio_caveats(
+    session: &Caveats,
+    command: &str,
+    protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
+    policy: &agent_bridle::SandboxPolicy,
+    confined_transport: bool,
+) -> Result<Caveats> {
+    let prepared = spawn_caveats(session, command);
+    if let Some(protection) = protection {
+        anyhow::ensure!(confined_transport,
+            "workspace-protected stdio MCP requires native process confinement; the advisory transport is unavailable for this session");
+        protection
+            .validate_with_sandbox_policy(&prepared, policy)
+            .context("workspace-protected MCP authority refused")?;
+    }
+    Ok(prepared)
 }
 
 /// Log the confinement actually achieved — honest, never over-claimed.
@@ -896,6 +914,15 @@ impl StdioTransport {
     /// axis cannot be kernel-enforced. `stderr` is discarded so server logging
     /// cannot corrupt the JSON-RPC stream.
     pub fn spawn(admitted: &newt_core::mcp::AdmittedServer<'_>, caveats: &Caveats) -> Result<Self> {
+        Self::spawn_with_protection(admitted, caveats, None)
+    }
+
+    /// Confined stdio startup with immutable operator-resource admission.
+    pub fn spawn_with_protection(
+        admitted: &newt_core::mcp::AdmittedServer<'_>,
+        caveats: &Caveats,
+        protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
+    ) -> Result<Self> {
         // Admission is a compile-time precondition of a spawn: the only way to
         // hold an `AdmittedServer` is a successful `newt_core::mcp::admit`, so a
         // disabled or untrusted entry cannot reach this constructor (the witness
@@ -905,21 +932,13 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        let grants = resolve_env_grants(entry)?;
-        // Admit exec of the configured server command; keep its runtime authority
-        // (fs) from the session leash; `net` is narrowed to `none` by
-        // `spawn_caveats` (`spawn_net_scope`) — a host list cannot be enforced
-        // by any spawn backend, so narrowing loses nothing a child could honor.
-        let cx = mint_spawn_context(&spawn_caveats(caveats, command)).with_context(|| {
-            format!("authorizing confined spawn of MCP server `{}`", entry.name)
-        })?;
-
         // agent-bridle 0.8's L3 admission bound only resolves a RESTRICTED
         // `net` axis when `child_network == DenyDirect`; under the default
         // `LandlockOnly` a `net: none` server is `Unknown` and every confined
         // spawn fails closed with "not decidable ... (L3 BOUND)".
-        // `spawn_caveats` above has already narrowed any host-scoped session
-        // grant to `none`, so the child's net is always `All` or `none` here.
+        // `spawn_caveats` (via `prepare_stdio_caveats`) has already narrowed any
+        // host-scoped session grant to `none`, so the child's net is always `All`
+        // or `none` here.
         // `DenyDirect` is then a no-op on `All`, and resolves `none` to
         // `Kernel`-decidable on Linux. Non-Unix MCP takes the raw Tokio path
         // (`#[cfg(not(unix))]` below) — env-scrubbed but unconfined.
@@ -929,6 +948,11 @@ impl StdioTransport {
             child_network: ChildNetworkPolicy::DenyDirect,
             ..SandboxPolicy::default()
         });
+        let prepared = prepare_stdio_caveats(caveats, command, protection, &sandbox_policy, true)?;
+        let cx = mint_spawn_context(&prepared).with_context(|| {
+            format!("authorizing confined spawn of MCP server `{}`", entry.name)
+        })?;
+        let grants = resolve_env_grants(entry)?;
         let mut cmd = ConfinedCommand::new(command)
             .args(&entry.args)
             .sandbox_policy(sandbox_policy);
@@ -967,9 +991,16 @@ impl StdioTransport {
     /// sandbox — the confined `spawn_tokio` primitive is Unix-only. `caveats` is
     /// accepted for signature parity and to keep the boundary explicit; it does
     /// not yet kernel-confine here.
-    pub fn spawn(
+    pub fn spawn(admitted: &newt_core::mcp::AdmittedServer<'_>, caveats: &Caveats) -> Result<Self> {
+        Self::spawn_with_protection(admitted, caveats, None)
+    }
+
+    /// Protected sessions require a native confinement mechanism; the legacy
+    /// advisory transport remains available only without this guard.
+    pub fn spawn_with_protection(
         admitted: &newt_core::mcp::AdmittedServer<'_>,
-        _caveats: &Caveats,
+        caveats: &Caveats,
+        protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
     ) -> Result<Self> {
         // Admission is a compile-time precondition (see the Unix `spawn`).
         let entry = admitted.entry();
@@ -977,6 +1008,13 @@ impl StdioTransport {
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
+        let _prepared = prepare_stdio_caveats(
+            caveats,
+            command,
+            protection,
+            &agent_bridle::SandboxPolicy::default(),
+            false,
+        )?;
         let grants = resolve_env_grants(entry)?;
         let mut child = Command::new(command)
             .args(&entry.args)
@@ -2050,6 +2088,17 @@ pub async fn connect_stdio(
     admitted: &newt_core::mcp::AdmittedServer<'_>,
     caveats: &Caveats,
 ) -> Result<ConnectedServer> {
+    connect_stdio_with_protection(admitted, caveats, None).await
+}
+
+/// Connect stdio with the session's immutable operator-resource protection.
+/// The configured executable and actual sandbox substrate are validated before
+/// environment references are resolved or a child is spawned.
+pub async fn connect_stdio_with_protection(
+    admitted: &newt_core::mcp::AdmittedServer<'_>,
+    caveats: &Caveats,
+    protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
+) -> Result<ConnectedServer> {
     // step-1.1: the caller proved admission at the `admit()` gate — an
     // un-admitted server cannot be spawned because there is no other way to
     // obtain an `AdmittedServer`.
@@ -2060,7 +2109,7 @@ pub async fn connect_stdio(
             entry.name
         ));
     }
-    let transport = StdioTransport::spawn(admitted, caveats)?;
+    let transport = StdioTransport::spawn_with_protection(admitted, caveats, protection)?;
     let sandbox_kind = Some(transport.sandbox_kind());
     // #1243 Leg 4: spawn_tokio engaged the egress proxy iff the child's egress
     // is fenced (a remote-host grant on a fence-capable host); its posture is
@@ -2544,3 +2593,7 @@ mod env_grant_assembly_tests;
 #[cfg(test)]
 #[path = "lib_tests/env_isolation.rs"]
 mod env_isolation_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/workspace_protection.rs"]
+mod workspace_protection_tests;

@@ -59,6 +59,67 @@ pub(crate) fn cockpit_pager_case() {
     std::io::stdin().read_line(&mut String::new()).unwrap();
 }
 
+/// #2489: `/psyche` once drew through its OWN inline viewport on the captured
+/// stdout while the cockpit owned the screen — two writers, so the title
+/// stacked and rows interleaved. Every other panel takes the presenter's lent
+/// window; this pins that `/psyche` does too, on a real tty.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the seam test
+/// `psyche_panel_uses_the_surface_window`, which is the fast-path gate.
+#[cfg(feature = "rich-tui")]
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn psyche_panel_draws_once_in_the_lent_rows_under_the_cockpit() {
+    crate::interaction_view_pty_test::drive_cockpit_psyche();
+}
+
+#[cfg(feature = "rich-tui")]
+pub(crate) fn cockpit_psyche_case() {
+    use crate::chat::InputSurface as _;
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit.draw().unwrap();
+    let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
+    let worker = std::thread::spawn(move || {
+        let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
+        let window = remote.open_panel(crate::session_worker::PanelMode::Inline(
+            crate::config_panel::PANEL_HEIGHT,
+        ));
+        assert!(window.is_some(), "the cockpit must lend rows for /psyche");
+        let seed = crate::config_panel::PanelSeed {
+            via: "/psyche",
+            personas: Vec::new(),
+            current_persona: None,
+            backend: Some("sol".to_string()),
+            base_initiative: newt_core::initiative::Initiative::default(),
+            initiative_from_family: false,
+            models: None,
+            current_model: String::new(),
+            personality: Default::default(),
+        };
+        let outcome = crate::config_panel::run(
+            seed,
+            |_, _, _| crate::config_panel::SaveResult::Failed("unused".into()),
+            window,
+        )
+        .unwrap();
+        println!("PSYCHE_RETURNED:{outcome:?}");
+        match remote.read_line("after panel").unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "after-psyche", "panel keys leaked"),
+            other => panic!("panel left the editor unusable: {other:?}"),
+        }
+    });
+    cockpit.run(&requests).unwrap();
+    worker.join().unwrap();
+    println!("PSYCHE_RESTORED");
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
 /// Grounds the mounted editor's submission and escape-ladder key tests in a
 /// real tty: crossterm may already hold input after a terminal query or poll,
 /// leaving the kernel fd empty. Both Enter and Ctrl-C must work without a
@@ -541,6 +602,49 @@ pub(crate) fn panel_live_resize_case() {
     assert_eq!(cockpit.editor.draft(), draft);
 }
 
+/// #2632 review finding 1: a same-size resize notification, and a
+/// height-only shrink that still leaves the block room, must not move the
+/// block away from the content it sits under — that is exactly how the
+/// #2441 blank canyon reappeared with no terminal movement at all. Grounds
+/// `resize_new_top`'s mocked arithmetic against a real `Presenter` and a
+/// real terminal (`cockpit.screen.top`), which a pure-function test cannot
+/// observe end to end.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY).
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_same_size_resize_does_not_move_the_block_away_from_its_content_2632() {
+    let _tty = TestTty::install();
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+
+    let content_top = cockpit.screen.top;
+    let block_h = cockpit.screen.block_h;
+    let (cols, rows) = (cockpit.screen.cols, cockpit.screen.rows);
+
+    // A same-size resize notification: nothing moved on the real terminal,
+    // so the block must stay exactly where the content ends.
+    cockpit.on_event(Event::Resize(cols, rows)).unwrap();
+    assert_eq!(
+        cockpit.screen.top, content_top,
+        "a same-size resize must not recreate the #2441 gap"
+    );
+
+    // A height-only shrink that still leaves room for the block at its old,
+    // non-bottom position must not re-anchor it to the new bottom.
+    let shrunk = rows - 2;
+    assert!(
+        content_top + block_h <= shrunk,
+        "test precondition: the block still fits after the shrink"
+    );
+    cockpit.on_event(Event::Resize(cols, shrunk)).unwrap();
+    assert_eq!(
+        cockpit.screen.top, content_top,
+        "a partial shrink that still fits must not re-anchor to the bottom"
+    );
+}
+
 /// #2573 review: the whole panel path on a real terminal — the cockpit lends
 /// rows, `panel::drive` runs a real panel through its own event loop, and the
 /// parent resizes and types. Grounds `panel::classify`, `PanelWindow`'s
@@ -636,6 +740,22 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
 // from libtest's parallel result writer: a blocked write to the undrained
 // capture can otherwise keep dup2 from restoring fd 1 during teardown.
 pub(crate) fn cockpit_acceptance_case() {
+    let result = std::panic::catch_unwind(acceptance_case);
+    if let Err(error) = result {
+        // The inner fixture has restored stdout after unwinding its owned
+        // terminal. Preserve the assertion for the parent, whose child stderr
+        // is intentionally disconnected from the terminal under test.
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-text panic");
+        println!("COCKPIT_ACCEPTANCE_FAILURE:{message}");
+        std::panic::resume_unwind(error);
+    }
+}
+
+fn acceptance_case() {
     let tty = TestTty::install();
     // This disposable child owns the tty queried by Crossterm's geometry API.
     //

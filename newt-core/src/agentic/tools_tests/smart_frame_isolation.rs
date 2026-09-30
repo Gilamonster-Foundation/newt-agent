@@ -716,6 +716,51 @@ async fn smart_tools_refuse_unconfined_launch_authority() {
     }
 }
 
+/// #2636 finding 2 (FIX-FIRST): FramePermissionGate must forward consume_pending_once to
+/// its inner gate. The default no-op silently drops the call, leaving the inner gate's
+/// once-grant alive for a later unrelated operation.
+/// Before the fix: ConsumeSpy.consumed remains false → assertion red.
+#[test]
+fn frame_permission_gate_forwards_consume_pending_once() {
+    use crate::agentic::smart_harness::FramePermissionGate;
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let consumed = Rc::new(Cell::new(false));
+
+    struct ConsumeSpy(Rc<Cell<bool>>);
+    impl PermissionGate for ConsumeSpy {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {
+            self.0.set(true);
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (h, _) = harness(directory.path());
+    let mut spy = ConsumeSpy(consumed.clone());
+    {
+        let mut gate = FramePermissionGate {
+            harness: &h,
+            workspace: workspace.path(),
+            inner: &mut spy,
+            refusal: None,
+        };
+        gate.consume_pending_once(DenialKind::FsWrite, "/ws/out.txt");
+    }
+    assert!(
+        consumed.get(),
+        "#2636 finding 2: FramePermissionGate must forward consume_pending_once to inner gate"
+    );
+}
+
 /// A native positive control prevents a macOS run from passing only because
 /// every dispatch was refused before any file operation.
 #[cfg(target_os = "macos")]

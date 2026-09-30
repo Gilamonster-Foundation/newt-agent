@@ -171,6 +171,14 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      - name: vendor crossterm regression gate (newt #2644)
+        # The `[patch.crates-io]` vendored crossterm is excluded from the workspace
+        # so its unit tests are never reached by `cargo test --workspace`.
+        # This step runs the regression directly so a future `Err(_) => {}`
+        # restoration in unix.rs must fail this gate before reaching main.
+        # Unix-only: the test is `#[cfg(all(test, unix))]`.
+        # HOOK PARITY: mirrored by `just check-vendor-crossterm`.
+        run: cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_2644 -- --test-threads=1
 
   lean-build:
     name: lean strip-down build + tests (--no-default-features)
@@ -460,6 +468,50 @@ jobs:
         run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      - name: Stage trusted AppContainer launcher for ordinary tests
+        if: always()
+        # Ordinary workspace tests also execute confined native commands.
+        # Bridle accepts the shipped sibling, never an ambient PATH lookup.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target\debug\deps | Out-Null
+          Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
+      - name: Prepare NUL device for AppContainer tools (elevated host prerequisite)
+        if: always()
+        shell: pwsh
+        # Explicit host setup, not a launcher/runtime privilege escalation.
+        # Native Git tests below must still execute and assert real effects.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows/Enable-AppContainerNull.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerNull.ps1
+          $repeated = ./scripts/windows/Enable-AppContainerNull.ps1
+          Write-Output $repeated
+          if ($repeated -notmatch 'already present; no change') {
+            throw 'NUL preparation was not idempotent after kernel readback.'
+          }
+      - name: Probe confined DOS path lookup before host preparation
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source
+      - name: Prepare bounded DOS path lookup and verify confinement
+        if: always()
+        shell: pwsh
+        # No filesystem ancestor listing, device data access, or broader fallback.
+        # The native Git tests below retain their real status/staging assertions.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -NamespaceOnly
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1
+          $repeated = ./scripts/windows/Enable-AppContainerDosPaths.ps1
+          Write-Output $repeated
+          if ($repeated -notmatch 'already present; no change') {
+            throw 'DOS path preparation was not idempotent after kernel readback.'
+          }
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos
       - name: cargo test
         # `if: always()` so a clippy failure can't mask a test failure — both
         # surface in one run (same rationale as the Linux lint job).

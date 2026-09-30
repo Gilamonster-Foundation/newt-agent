@@ -475,3 +475,260 @@ fn ordinary_web_fetch_results_do_not_gain_mcp_recovery() {
         "error: denied: request to \"docs.example.test\" timed out"
     );
 }
+
+/// #2643 regression: a `web_fetch` net-caveat denial is written to the SAME
+/// `DenialJournal` chain the exec/`run_command` path already appends to
+/// (`newt-core/src/agentic/tools/shell.rs`'s two `record_envelope` calls) —
+/// before the fix, `newt ocap denials` showed nothing for this call even
+/// though the on-screen `error:` refusal (proven above) was real.
+#[tokio::test]
+async fn web_fetch_net_denial_is_journaled() {
+    let _env_lock = crate::process_env::lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let journal = dir.path().join("denial-journal.jsonl");
+    crate::process_env::set_var(
+        crate::denial_journal::DENIAL_JOURNAL_PATH_ENV,
+        &journal.to_string_lossy(),
+    );
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let caveats = caveats_rw(ws.path()); // net: Scope::none()
+    let mut gate = MockGate::new(false, &caveats);
+    let out = run_tool_gated(
+        "web_fetch",
+        serde_json::json!({"url": "https://denied.example.com/page"}),
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert!(out.starts_with("error:"), "leash denial surfaces: {out}");
+
+    crate::process_env::remove_var(crate::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+
+    let body = std::fs::read_to_string(&journal).expect("journal written");
+    let lines = crate::denial_journal::read_jsonl(&body);
+    assert_eq!(lines.len(), 1, "exactly one denial record: {body}");
+    let denials = &lines[0].node.payload().denials;
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].kind, "net");
+    assert_eq!(denials[0].target, "denied.example.com");
+    let head = crate::denial_journal::read_head(&journal).expect("head ref written");
+    assert_eq!(
+        crate::denial_journal::verify_chain(&lines, Some(&head)),
+        vec![],
+        "chain still verifies"
+    );
+}
+
+/// A `web_fetch` whose host is already in scope never reaches the net leash
+/// refusal, so nothing is appended — the journal file is never even created.
+#[tokio::test]
+async fn web_fetch_allowed_host_appends_nothing() {
+    let _env_lock = crate::process_env::lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let journal = dir.path().join("denial-journal.jsonl");
+    crate::process_env::set_var(
+        crate::denial_journal::DENIAL_JOURNAL_PATH_ENV,
+        &journal.to_string_lossy(),
+    );
+
+    let ws = tempfile::TempDir::new().unwrap();
+    let mut caveats = caveats_rw(ws.path());
+    caveats.net = Scope::All;
+    // An already-permitted host skips the gate pre-check entirely (#263) —
+    // MockGate's `allow` value is irrelevant here.
+    let mut gate = MockGate::new(false, &caveats);
+    let _out = run_tool_gated(
+        "web_fetch",
+        // Reserved TEST-NET-1 address (RFC 5737). `net: Scope::All` clears the
+        // net leash's OWN check, but agent-bridle-tool-web's separate SSRF
+        // screen (`net_guard::screen_host`) still rejects it as a
+        // private/loopback-shaped address not opted into via `net_private` —
+        // a genuine dispatch failure (`NetGuardError::PrivateAddress`), not a
+        // connect failure, and NOT the `HostNotAllowed` wording this test's
+        // assertions are about (#2645 round-3 review: this comment
+        // previously misstated the failure as a connection failure).
+        serde_json::json!({"url": "http://192.0.2.1/unreachable"}),
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+
+    crate::process_env::remove_var(crate::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+    assert!(
+        gate.asks.is_empty(),
+        "an already-permitted host never consults the gate"
+    );
+    assert!(
+        !journal.exists(),
+        "an already-permitted host never touches the journal"
+    );
+}
+
+/// #2645 round 3: drives `web_fetch_denial_host` — the exact decision the
+/// `execute_tool` match arm makes — into a REAL, isolated journal, then
+/// reads it back with `denial_journal::read_jsonl` (the same assertion style
+/// `web_fetch_net_denial_is_journaled` uses). Testing the parser's return
+/// value alone (round 2) can't catch a wiring bug that sends the right host
+/// to the wrong place (#2645 round-2 review); this closes that gap. Holds
+/// `process_env::lock()` for isolation from sibling tests (#2645 round-3
+/// review, finding 1) — production `denial_journal::record_denial` now reads
+/// `DENIAL_JOURNAL_PATH_ENV` under the SAME lock, so this scenario's
+/// set/dispatch/remove window can't be observed mid-flight by another
+/// thread's denial.
+fn assert_web_fetch_denial_journals(url: &str, err: &agent_bridle::ToolError, want_hosts: &[&str]) {
+    let _env_lock = crate::process_env::lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let journal = dir.path().join("denial-journal.jsonl");
+    crate::process_env::set_var(
+        crate::denial_journal::DENIAL_JOURNAL_PATH_ENV,
+        &journal.to_string_lossy(),
+    );
+    if let Some(host) = web_fetch_denial_host(url, err) {
+        crate::denial_journal::record_net_denial("web_fetch", &host, &err.to_string());
+    }
+    crate::process_env::remove_var(crate::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+
+    let got: Vec<String> = if journal.exists() {
+        let body = std::fs::read_to_string(&journal).unwrap();
+        crate::denial_journal::read_jsonl(&body)
+            .into_iter()
+            .map(|line| line.node.payload().denials[0].target.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        got,
+        want_hosts.to_vec(),
+        "journaled net-denial hosts for url={url:?} err={err}"
+    );
+}
+
+/// A byte-for-byte reproduction of the classifier `newt-core/src/agentic/tools.rs`
+/// actually shipped at commit `0910d322338079443103d7035cb442e38c803a9c`
+/// (round 1, the version PR #2645 was opened against). It cannot be checked
+/// out and called directly — it was inline in the `execute_tool` match arm,
+/// not a standalone function — so it is reproduced here, verbatim in logic,
+/// to drive the SAME observable-journal assertions the round-3 seam is
+/// tested with below (#2645 round-3 review: a compile error against absent
+/// new code, round 2's evidence, proves an API was missing, not that the old
+/// classifier misjournaled anything).
+fn round1_web_fetch_denial_host(url: &str, reason: &str) -> Option<String> {
+    if reason.contains("is not within the granted authority")
+        && reason.contains("network access to")
+    {
+        host_of_url(url)
+    } else {
+        None
+    }
+}
+
+fn assert_round1_journals(url: &str, reason: &str, want_hosts: &[&str]) {
+    let _env_lock = crate::process_env::lock();
+    let dir = tempfile::TempDir::new().unwrap();
+    let journal = dir.path().join("denial-journal.jsonl");
+    crate::process_env::set_var(
+        crate::denial_journal::DENIAL_JOURNAL_PATH_ENV,
+        &journal.to_string_lossy(),
+    );
+    if let Some(host) = round1_web_fetch_denial_host(url, reason) {
+        crate::denial_journal::record_net_denial("web_fetch", &host, reason);
+    }
+    crate::process_env::remove_var(crate::denial_journal::DENIAL_JOURNAL_PATH_ENV);
+
+    let got: Vec<String> = if journal.exists() {
+        let body = std::fs::read_to_string(&journal).unwrap();
+        crate::denial_journal::read_jsonl(&body)
+            .into_iter()
+            .map(|line| line.node.payload().denials[0].target.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        got,
+        want_hosts.to_vec(),
+        "round-1 journaled hosts for url={url:?}"
+    );
+}
+
+/// #2645 round 3 regression: an allowed host A redirecting to a denied host
+/// B must journal B, never A. Confirmed as a real ASSERTION failure against
+/// `round1_web_fetch_denial_host` before pinning it here (see RESULT-r3.md
+/// for the transcript: asserting `["b.example.net"]` against round 1's
+/// reproduction fails with `["a.example.com"]`) — this test pins BOTH the
+/// historical bug (round 1 really did this) and the round-3 fix (it no
+/// longer does), so the delta stays provable without re-deriving it.
+#[test]
+fn redirect_denial_journals_the_redirect_target_round1_journaled_the_original_host() {
+    let url = "https://a.example.com/start";
+    let reason = "network access to \"b.example.net\" is not within the granted authority";
+
+    assert_eq!(
+        round1_web_fetch_denial_host(url, &format!("denied: {reason}")).as_deref(),
+        Some("a.example.com"),
+        "round 1's actual algorithm: the ORIGINAL host, not the denied one"
+    );
+    assert_round1_journals(url, &format!("denied: {reason}"), &["a.example.com"]);
+
+    let err = agent_bridle::ToolError::denied(reason);
+    assert_eq!(
+        web_fetch_denial_host(url, &err).as_deref(),
+        Some("b.example.net"),
+        "round 3: the actually-denied redirect target"
+    );
+    assert_web_fetch_denial_journals(url, &err, &["b.example.net"]);
+}
+
+/// #2645 round 3 regression: a malformed redirect `Location` is untrusted
+/// text a server controls, interpolated into a URL-parse-error `Denied`
+/// reason that happens to CONTAIN both of round 1's trigger phrases. Round 1
+/// journaled a phantom record from it; round 3 must record nothing.
+/// Confirmed as a real ASSERTION failure against `round1_web_fetch_denial_host`
+/// before pinning it here (see RESULT-r3.md: asserting `[]` against round 1's
+/// reproduction fails with `["a.example.com"]`).
+#[test]
+fn malformed_redirect_location_round1_forged_a_phantom_record() {
+    let url = "https://a.example.com/start";
+    let wrapped = "redirect Location \"http://[network access to \"x.example\" is not \
+                    within the granted authority]\" is not a valid URL: invalid IPv6 address";
+
+    assert_eq!(
+        round1_web_fetch_denial_host(url, &format!("denied: {wrapped}")).as_deref(),
+        Some("a.example.com"),
+        "round 1's `.contains` classifier matched the embedded trigger phrases"
+    );
+    assert_round1_journals(url, &format!("denied: {wrapped}"), &["a.example.com"]);
+
+    let err = agent_bridle::ToolError::denied(wrapped);
+    assert_eq!(
+        web_fetch_denial_host(url, &err),
+        None,
+        "round 3: wrapper text can't satisfy the anchored full-string match"
+    );
+    assert_web_fetch_denial_journals(url, &err, &[]);
+}
+
+/// #2645 round 3: `ToolError::Denied` isn't the only variant with a
+/// `Display`-visible string — `web_fetch_denial_host` must never even try
+/// `parse_net_denial_host` on anything else, no matter what the text says.
+#[test]
+fn non_denied_variant_never_journals_even_with_matching_text() {
+    let url = "https://a.example.com/start";
+    // `NotFound`'s Display is fixed ("no such tool: ..."), so construct a
+    // variant whose *message* would satisfy the anchor if the code matched
+    // on text instead of the variant — proving the variant match, not the
+    // text shape, is what gates this.
+    let err = agent_bridle::ToolError::Other(anyhow::anyhow!(
+        "network access to \"b.example.net\" is not within the granted authority"
+    ));
+    assert_eq!(
+        web_fetch_denial_host(url, &err),
+        None,
+        "only the Denied variant is ever inspected"
+    );
+    assert_web_fetch_denial_journals(url, &err, &[]);
+}

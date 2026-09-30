@@ -95,6 +95,7 @@ async fn run(scenario: Scenario<'_>) -> (String, Vec<Request>, Vec<crate::ToolEv
 async fn run_with_stream_state(
     scenario: Scenario<'_>,
 ) -> (String, bool, Vec<Request>, Vec<crate::ToolEvent>) {
+    let _settings = default_loop_settings();
     let _lock = env_lock().await;
     let _verify = EnvVar::set("NEWT_SELF_VERIFY", "0");
     let _stream = EnvVar::set(

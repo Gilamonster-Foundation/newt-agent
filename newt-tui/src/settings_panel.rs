@@ -78,6 +78,7 @@ const SECTIONS: &[(&str, char, &str)] = &[
         'i',
         "window · ceiling · thinking · sampling · server launch",
     ),
+    ("Workspaces", 'w', "directories · commands · next launch"),
 ];
 
 /// Index of the Session section in the shell — the one whose outcome
@@ -309,6 +310,10 @@ impl Row {
 /// What the panel wants to happen after it closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    OpenWorkspaces {
+        lines: Vec<String>,
+        model: Option<String>,
+    },
     OpenPermissions {
         lines: Vec<String>,
         model: Option<String>,
@@ -547,6 +552,7 @@ fn settings_shell<'a>(
         section(4, crate::shell::Body::Screen(theme)),
         section(5, crate::shell::Body::Link),
         section(6, crate::shell::Body::Screen(inference)),
+        section(7, crate::shell::Body::Link),
     ]);
     if let Some(index) = initial_section.and_then(|initial| {
         SECTIONS
@@ -618,7 +624,9 @@ pub(crate) fn run(
         let mut lines = panel.commit();
         lines.extend(theme_panel.applied.clone());
         let model = panel.picked_model();
-        return Ok(if linked == 5 {
+        return Ok(if linked == 7 {
+            Outcome::OpenWorkspaces { lines, model }
+        } else if linked == 5 {
             Outcome::OpenMcp { lines, model }
         } else if linked == 1 {
             Outcome::OpenPermissions { lines, model }
@@ -675,6 +683,27 @@ mod tests {
                 && summary.contains("servers")
                 && summary.contains("tools")
         }));
+    }
+
+    #[test]
+    fn workspaces_link_opens_the_operator_workflow() {
+        let _g = GlobalSettingsGuard::acquire();
+        assert!(SECTIONS.iter().any(|(name, accelerator, summary)| {
+            *name == "Workspaces" && *accelerator == 'w' && summary.contains("next launch")
+        }));
+        let mut panel = panel();
+        let mut audit = crate::lines_panel::LinesPanel::new("audit", Vec::new());
+        let mut theme = crate::theme_panel::ThemePanel::new();
+        let mut inference = crate::lines_panel::LinesPanel::new("inference", Vec::new());
+        let mut shell = settings_shell(
+            &mut panel,
+            &mut audit,
+            &mut theme,
+            &mut inference,
+            Some('w'),
+        );
+        assert_eq!(shell.key(Key::Enter), Flow::Close(false));
+        assert_eq!(shell.linked(), Some(7));
     }
 
     fn models(names: &[&str]) -> Option<Vec<ModelChoice>> {

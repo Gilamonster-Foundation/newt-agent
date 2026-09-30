@@ -313,10 +313,10 @@ fn map_tenacity_value(item: &mut toml_edit::Item, key: &str, changes: &mut Vec<S
 #[path = "psyche_import_read.rs"]
 mod reader;
 #[cfg(test)]
-use reader::read_migrating;
-#[cfg(test)]
 pub(crate) use reader::reset_lock_contention_warned_for_test;
 pub use reader::{read_config_file, read_persona_file};
+#[cfg(test)]
+use reader::{read_migrating, MigratingPath};
 
 #[cfg(test)]
 mod tests {
@@ -461,7 +461,10 @@ Body keeps cognition = \"contemplating\" and tenacity = \"relaxed\" as prose.
         write: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
     ) -> std::io::Result<String> {
         read_migrating(
-            path,
+            MigratingPath {
+                shown: path,
+                operated: path,
+            },
             "persona",
             migrate_persona_text,
             rewrite,
@@ -677,7 +680,10 @@ kimi = \"insistent\"
     #[test]
     fn a_file_that_must_not_be_rewritten_migrates_in_memory_only() {
         let got = read_migrating(
-            Path::new("/repo/.newt/config.toml"),
+            MigratingPath {
+                shown: Path::new("/repo/.newt/config.toml"),
+                operated: Path::new("/repo/.newt/config.toml"),
+            },
             "config",
             migrate_config_text,
             false,
@@ -701,7 +707,10 @@ kimi = \"insistent\"
     #[test]
     fn a_read_error_propagates_without_a_write() {
         let err = read_migrating(
-            Path::new("/missing.md"),
+            MigratingPath {
+                shown: Path::new("/missing.md"),
+                operated: Path::new("/missing.md"),
+            },
             "persona",
             migrate_persona_text,
             true,

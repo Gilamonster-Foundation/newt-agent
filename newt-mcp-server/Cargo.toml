@@ -39,7 +39,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# The capability lattice — same `agent-mesh-protocol "0.6"` the rest of the
+# The capability lattice — same `agent-mesh-protocol "0.7"` the rest of the
 # workspace pins (see newt-core), so the `Caveats` type the config helper loads
 # is *identical* to the one `agent-bridle`'s `Registry::dispatch` accepts (no
 # version skew).

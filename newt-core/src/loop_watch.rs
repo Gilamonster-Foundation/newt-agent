@@ -232,6 +232,7 @@ mod loop_watch_tests {
             ok,
             duration_ms: Some(ms),
             execution: None,
+            from_cache: false,
         }
     }
 

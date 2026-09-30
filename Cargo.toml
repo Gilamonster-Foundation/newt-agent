@@ -50,6 +50,7 @@ exclude = [
     "vendor/agent-bridle-tool-shell",
     "vendor/agent-bridle-core",
     "vendor/agent-bridle-fdguard",
+    "vendor/crossterm-0.28.1-patched",
 ]
 
 # Temporary, reproducible integration patch; see vendor/agent-bridle-tool-shell/NEWT_PATCHES.md.
@@ -57,6 +58,16 @@ exclude = [
 agent-bridle-tool-shell = { path = "vendor/agent-bridle-tool-shell" }
 agent-bridle-core = { path = "vendor/agent-bridle-core" }
 agent-bridle-fdguard = { path = "vendor/agent-bridle-fdguard" }
+# #2644: crossterm 0.28.1's cursor-position retry loop swallows a `poll`
+# error and retries forever instead of returning it (upstream still has
+# this in 0.29.0 and current master — see vendor/crossterm-0.28.1-patched/
+# for the one-function diff and upstream-crossterm/ for the draft PR).
+# `cargo tree -i crossterm` must show exactly one resolved crossterm for
+# both newt's direct calls and ratatui's — this patches that single copy.
+# NOTE: this [patch.crates-io] only applies to builds FROM this workspace
+# (CI, `just install`) — `cargo install newt-agent` from crates.io ignores
+# it and reintroduces the hang. See vendor/crossterm-0.28.1-patched/NEWT_PATCH_NOTE.md.
+crossterm = { path = "vendor/crossterm-0.28.1-patched" }
 
 [workspace.package]
 # Semver — 0.7.1 (see the version block above); 0.6.8 was: the honest, measurable, family-aware harness — verify oracle
@@ -343,7 +354,7 @@ tests-pty = { path = "tests/pty" }
 # closing the door on a silent agent-mesh-protocol skew. Issue #95:
 # this replaces the hand-mirrored `newt_core::caveats` module — the
 # types are now re-exported straight from `agent-mesh-protocol`.
-agent-mesh-protocol = "0.6"
+agent-mesh-protocol = "0.7"
 
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.8.0" }

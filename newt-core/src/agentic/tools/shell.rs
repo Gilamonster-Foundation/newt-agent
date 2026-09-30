@@ -10,7 +10,10 @@ use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
-use super::{denial_context, denial_recovery_hint, full_access_requested, ocap_disabled};
+use super::{
+    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled, resolve_tool_alias,
+    AliasOutcome,
+};
 use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {
@@ -177,6 +180,35 @@ fn shell_env_passthrough() -> Vec<String> {
     }
 }
 
+/// Supply the operator's command default without changing the recorded model
+/// arguments, workspace identity, or any grant. Presentation uses the same
+/// projection as dispatch so it cannot predict a root-relative file redirect.
+pub(super) fn command_args_with_default_cwd<'a>(
+    name: &str,
+    args: &'a serde_json::Value,
+    workspace: &str,
+    default_cwd: Option<&std::path::Path>,
+) -> Result<std::borrow::Cow<'a, serde_json::Value>, &'static str> {
+    let is_command = name == "run_command"
+        || matches!(
+            resolve_tool_alias(name),
+            Some(AliasOutcome::Rewrite("run_command"))
+        );
+    let Some(default_cwd) = default_cwd.filter(|cwd| *cwd != std::path::Path::new(workspace))
+    else {
+        return Ok(std::borrow::Cow::Borrowed(args));
+    };
+    if !is_command || args.get("cwd").is_some() || !args.is_object() {
+        return Ok(std::borrow::Cow::Borrowed(args));
+    }
+    let cwd = default_cwd.to_str().ok_or(
+        "error: the command working directory is not valid UTF-8; select a UTF-8 directory",
+    )?;
+    let mut projected = args.clone();
+    projected["cwd"] = serde_json::Value::String(cwd.to_owned());
+    Ok(std::borrow::Cow::Owned(projected))
+}
+
 /// Build the dispatch args for agent-bridle's confined `shell` tool (#783): the
 /// RAW user command (free-form `cmd` mode) plus the venv carried through the
 /// structured `env` seam ([`venv_env_map`]). Deliberately NO `export …;` prefix
@@ -189,7 +221,7 @@ fn shell_env_passthrough() -> Vec<String> {
 /// (the confined shell's fs fence rejects any path that escapes the workspace,
 /// so this never widens reach). `None` runs at the workspace root, as before.
 pub(super) fn resolve_exec_cwd(workspace: &str, cwd: Option<&str>) -> String {
-    match cwd.map(str::trim).filter(|c| !c.is_empty()) {
+    match cwd.filter(|c| !c.trim().is_empty()) {
         None => workspace.to_string(),
         Some(c) if std::path::Path::new(c).is_absolute() => c.to_string(),
         Some(c) => std::path::Path::new(workspace)
@@ -567,10 +599,11 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
 }
 
 pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
+    let env = venv_env_map();
     serde_json::json!({
         "cmd": cmd,
         "cwd": cwd,
-        "env": venv_env_map(),
+        "env": env,
     })
 }
 
@@ -896,6 +929,14 @@ async fn dispatch_bridled_shell_with_floor(
     result
 }
 
+/// #2636: the EXACT message emitted only when `run_command` is refused
+/// before anything ran, purely for missing declared filesystem authority —
+/// the one denial shape a #2628 rerun is allowed to bind to (round1 finding
+/// 3). Any other `Denied` result (a broker-bearing runtime refusal, a build
+/// fence, a compound command that partially ran) must never enter that slot.
+pub(super) const UNGRANTED_FS_AUTHORITY_DENIAL: &str =
+    "capability denied: declared filesystem authority was not granted for this command";
+
 /// Parse the entire invocation manifest before any approval can be consumed.
 pub(super) fn declared_filesystem_requests(
     args: &serde_json::Value,
@@ -932,6 +973,7 @@ pub(super) fn declared_filesystem_requests(
                     kind,
                     target: target.into(),
                     reason: format!("declared {field} for command {cmd:?} in {cwd:?}"),
+                    harness_bound: false,
                 });
             }
         }
@@ -993,6 +1035,7 @@ pub(super) async fn exec_confined_command(
         live_tool_output,
         presentation,
         None,
+        &mut None,
     )
     .await
 }
@@ -1016,6 +1059,11 @@ pub(super) async fn exec_confined_command_with_broker(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    // #2636 finding 1: typed signal for the pre-exec FS denial — set to the
+    // missing authority set when the denial fires BEFORE the child runs. Only
+    // this path produces a rerun-eligible slot; child stdout that happens to
+    // contain the denial string does not.
+    fs_pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
 ) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
@@ -1125,12 +1173,15 @@ pub(super) async fn exec_confined_command_with_broker(
             {
                 Some(allowed)
             }
-            _ => return with_denial_context(
-                ("capability denied: declared filesystem authority was not granted for this command".into(), ExecOutcome::Denied),
-                workspace,
-                cwd,
-                Some(caveats),
-            ),
+            _ => {
+                *fs_pre_exec_missing = Some(missing);
+                return with_denial_context(
+                    (UNGRANTED_FS_AUTHORITY_DENIAL.into(), ExecOutcome::Denied),
+                    workspace,
+                    cwd,
+                    Some(caveats),
+                );
+            }
         }
     };
     let caveats = admitted.as_ref().unwrap_or(caveats);
@@ -2614,6 +2665,7 @@ pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<P
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            harness_bound: false,
         });
     }
     Some(requests)
@@ -2649,6 +2701,7 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            harness_bound: false,
         });
     }
     Some(requests)

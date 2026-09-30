@@ -152,6 +152,10 @@ async fn run_turn(turn: Turn<'_>) -> Run {
         env,
         workspace_task,
     } = turn;
+    // Verification scenarios use the default progress budget, independently
+    // of sibling tests that intentionally install a much shorter brake.
+    // Match other loop fixtures: settings ownership precedes async setup.
+    let _settings = default_loop_settings();
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
     let _confined = EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -822,4 +826,70 @@ async fn every_verification_case_ends_within_its_allowance() {
             }
         }
     }
+}
+
+/// A sibling brake fixture publishes stop_after=2 while holding the shared
+/// settings guard. The verification fixture must establish its own default
+/// policy rather than inherit that unrelated budget, and restore its caller.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget() {
+    use crate::agentic::self_verify::{CheckStatus, VERIFY_REPAIR_ALLOWANCE};
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 2,
+        },
+        ..Default::default()
+    });
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run("openai", false, true, FAILING_CHECK),
+    )
+    .await
+    .expect("the current-thread nested settings scope must not deadlock");
+    assert_eq!(crate::initiative::installed_no_progress().stop_after, 2);
+    assert_eq!(run.reason, "repair_exhausted");
+    let signals = run
+        .signals
+        .iter()
+        .filter_map(|signal| match signal {
+            observability::BehaviorSignal::Verification {
+                decision, report, ..
+            } => Some((decision.as_str(), report)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signals
+            .iter()
+            .map(|(decision, _)| *decision)
+            .collect::<Vec<_>>(),
+        ["nudge", "nudge", "nudge", "repair_exhausted"]
+    );
+    assert_eq!(
+        signals
+            .last()
+            .unwrap()
+            .1
+            .checks
+            .iter()
+            .map(|check| check.status)
+            .collect::<Vec<_>>(),
+        [CheckStatus::Failed]
+    );
+    let histories = run
+        .bodies
+        .iter()
+        .map(|body| serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].clone())
+        .collect::<Vec<_>>();
+    let rounds = histories
+        .iter()
+        .enumerate()
+        .filter(|(i, history)| *i == 0 || histories[i - 1] != **history)
+        .count();
+    assert_eq!(rounds, 5);
+    assert!(rounds <= VERIFY_REPAIR_ALLOWANCE + 2);
 }

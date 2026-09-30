@@ -1221,10 +1221,18 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
-        let output = crate::git_hardening::hardened_git(cwd, args)
-            .unwrap()
-            .output()
-            .unwrap();
+        let mut cmd = crate::git_hardening::hardened_git(cwd, args).unwrap();
+        // Windows CI: temp fixture owned by a different principal than the git process.
+        // Add safe.directory only for this test fixture's command, not in production.
+        #[cfg(windows)]
+        if let Ok(canonical) = cwd.canonicalize() {
+            if let Some(dir) = canonical.to_str() {
+                cmd.env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "safe.directory")
+                    .env("GIT_CONFIG_VALUE_0", dir);
+            }
+        }
+        let output = cmd.output().unwrap();
         assert!(
             output.status.success(),
             "{args:?}: {}",

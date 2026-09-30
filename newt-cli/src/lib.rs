@@ -1353,6 +1353,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => {
+            let selected_workspace = newt_tui::resolve_code_workspace(path.as_deref())?;
+            anyhow::ensure!(
+                !selected_workspace.has_profile || (!cli.full_access && !cli.disable_ocap),
+                "saved workspace settings require a confined launch; remove --full-access/--yolo or use another workspace"
+            );
+            let path = selected_workspace.path;
             // --debug / --trace / --num-ctx set env vars so the TUI picks them up
             // without requiring a run_code signature change.
             if cli.debug || cli.trace {
@@ -1554,6 +1560,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // cannot widen authority mid-process (noninteractive-launch-policy).
             newt_core::launch_authority::freeze(if cli.workspace_access {
                 newt_core::launch_authority::LaunchAuthority::WORKSPACE_ACCESS
+            } else if selected_workspace.has_profile {
+                // A verified operator profile selects confinement, including
+                // when a parent shell carried legacy global/bypass switches.
+                newt_core::launch_authority::LaunchAuthority::CONFINED
             } else {
                 newt_core::launch_authority::LaunchAuthority::from_env()
             });

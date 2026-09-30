@@ -698,6 +698,7 @@ async fn run_one_turn(
         messages: &messages,
         task,
         workspace: &config.workspace,
+        default_command_cwd: None,
         // The driver is headless: the loop's inline progress prints are
         // suppressed so nothing fights the consumer's ratatui frame.
         color: false,

@@ -158,6 +158,7 @@ impl Respond for OpenAiReasoningCapResponder {
 
 #[tokio::test]
 async fn ollama_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing_messages() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let task = "CURRENT-B: keep this exact prompt through cap trim";
     let pair_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -196,6 +197,7 @@ async fn ollama_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing
 
 #[tokio::test]
 async fn openai_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing_messages() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let task = "CURRENT-B: keep this exact OpenAI prompt through cap trim";
     let pair_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -234,6 +236,7 @@ async fn openai_cap_trim_keeps_headless_active_pair_after_more_than_six_trailing
 
 #[tokio::test]
 async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let first_plan_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let policy_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -278,6 +281,7 @@ async fn openai_cap_exit_preserves_the_full_current_turn_reasoning_tail() {
 
 #[tokio::test]
 async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let served = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -307,6 +311,7 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
             messages: &messages,
             task: "do the thing",
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,
@@ -399,6 +404,7 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
 
 #[tokio::test]
 async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
             .and(path("/api/chat"))
@@ -466,6 +472,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
 
 #[tokio::test]
 async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -538,6 +545,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
 
 #[tokio::test]
 async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -604,6 +612,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
 
 #[tokio::test]
 async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -692,6 +701,7 @@ impl Respond for ThrashResponder {
 
 #[tokio::test]
 async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -718,6 +728,7 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
             messages: &messages,
             task: "do the thing",
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,
@@ -812,6 +823,7 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
 
 #[tokio::test]
 async fn responses_unusable_cap_summary_returns_a_round_cap_fallback() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -848,6 +860,7 @@ async fn responses_unusable_cap_summary_returns_a_round_cap_fallback() {
 
 #[tokio::test]
 async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let served = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -877,6 +890,7 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
             messages: &messages,
             task: "do the thing",
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,
@@ -965,6 +979,7 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
 
 #[tokio::test]
 async fn cap_exit_fallback_when_final_summary_errors() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     // No mock for the tools-disabled request would still 404 via the
     // tool-offering mock only matching when... actually both match the same
     // path, so instead we mount a server that always 500s the *second*
@@ -1013,6 +1028,7 @@ async fn cap_exit_fallback_when_final_summary_errors() {
             messages: &messages,
             task: "do the thing",
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,
@@ -1102,6 +1118,7 @@ async fn cap_exit_fallback_when_final_summary_errors() {
 /// must still be returned (not None), so usage.jsonl is not blank.
 #[tokio::test]
 async fn accumulated_usage_survives_summary_failure() {
+    let _settings = crate::agentic::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let served = Arc::new(AtomicUsize::new(0));
 
@@ -1151,6 +1168,7 @@ async fn accumulated_usage_survives_summary_failure() {
             messages: &messages,
             task: "do the thing",
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,

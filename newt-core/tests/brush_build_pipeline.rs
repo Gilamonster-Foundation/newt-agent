@@ -118,6 +118,10 @@ mod cleanup_authority;
 mod native_git_diff;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "support/workspace_policy.rs"]
+mod workspace_policy;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod native {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -190,6 +194,9 @@ mod native {
         isolate(&root);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
+            if selected("saved_workspace_profile_confines_native_commands") {
+                super::workspace_policy::run(&root).await;
+            }
             if selected("native_cleanup_uses_scoped_authority") {
                 super::cleanup_authority::run(&root).await;
             }

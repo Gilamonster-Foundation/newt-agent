@@ -34,11 +34,26 @@ const MAX_WORKSPACES: usize = 256;
 /// Exact capability-kind and target pairs; no wildcard or path-prefix matching.
 pub type GrantSet = BTreeSet<(DenialKind, String)>;
 
+#[path = "durable_grants_profiles.rs"]
+mod profiles;
+pub use profiles::{
+    commit, load_snapshot, ProfileChange, ProfileState, ReviewedWorkspaceEdit, VerifiedSnapshot,
+    WorkspaceEdit, WorkspaceProfile,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Payload {
     schema: String,
     workspaces: BTreeMap<String, GrantSet>,
+    // Omitting the empty extension preserves the canonical bytes/signatures
+    // of v1 stores written before workspace profiles existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    profiles: BTreeMap<String, WorkspaceProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profile_history: Vec<crate::event_journal::JournalLine<ProfileChange>>,
 }
 
 impl Payload {
@@ -46,6 +61,9 @@ impl Payload {
         Self {
             schema: SCHEMA.into(),
             workspaces: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            default_workspace: None,
+            profile_history: Vec::new(),
         }
     }
 
@@ -70,7 +88,7 @@ impl Payload {
             );
             validate_grants(grants)?;
         }
-        Ok(())
+        self.validate_profiles()
     }
 }
 
@@ -288,3 +306,7 @@ fn decode(bytes: &[u8], root: &UserPublic, encryption: &TokenIdentity) -> anyhow
 #[cfg(test)]
 #[path = "durable_grants_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "durable_grants_profile_tests.rs"]
+mod profile_tests;

@@ -8,6 +8,7 @@ fn net_low() -> PermissionRequest {
         kind: DenialKind::Net,
         target: "https://example.com/api".into(),
         reason: String::new(),
+        harness_bound: false,
     }
 }
 
@@ -17,6 +18,7 @@ fn exec_high() -> PermissionRequest {
         kind: DenialKind::Exec,
         target: "bash".into(),
         reason: "exec of \"bash\" is not within the granted authority".into(),
+        harness_bound: false,
     }
 }
 

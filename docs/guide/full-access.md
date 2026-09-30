@@ -14,6 +14,12 @@ and symlink escapes. Explicit `--read` and `--write` grants can open additional
 paths. Network access follows the separately configured network permissions;
 this option grants no network access by itself.
 
+To save a policy for a particular workspace, open `/settings workspaces` (or
+`/workspace`) in a protected interactive session. The editor offers a resolved
+preview and explicit confirmation, then applies the saved profile on the next
+real Newt process launch. `/restart` does not reload authority. See
+[saved workspace access](workspace-settings.md) for directory management,
+default-workspace selection, independent approvals, and protection requirements.
 To persist this filesystem and executable preset, use an operator-owned, trusted
 config such as `~/.newt/config.toml` (or `$NEWT_CONFIG_DIR/config.toml`):
 
@@ -35,6 +41,12 @@ clear inherited `NEWT_FULL_ACCESS` or `NEWT_DISABLE_OCAP`; use the explicit
 `--workspace-access` flag to select that confined startup behavior. An active
 posture or operating mode may still narrow the session's authority.
 
+A saved workspace profile is different from that general config preset: its
+startup path selects confinement even when global-access switches were inherited.
+Explicit conflicting `--full-access` or `--yolo` flags are refused. Explicit
+`--workspace-access` keeps the saved directories while selecting workspace full
+access for that one run. Removing the saved profile restores configured fallback
+behavior and leaves independent saved approvals intact.
 On macOS, the current Bridle backend cannot enforce restricted network grants,
 including the default empty `net` list. Confined commands require the operator
 to explicitly allow unrestricted networking. For that choice, include this in
@@ -61,6 +73,7 @@ outside the current [native commit adapter's scope](../design/agent-toolchain.md
 review session decisions; they do not edit the preset. Terminal permission
 prompts can grant access for the session and offer permanent grants for eligible
 filesystem, executable, and network requests.
+The workspace editor neither revokes these approvals nor changes active jobs.
 
 ## Global full access
 

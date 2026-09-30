@@ -200,6 +200,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             messages: &messages,
             task: &task,
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,

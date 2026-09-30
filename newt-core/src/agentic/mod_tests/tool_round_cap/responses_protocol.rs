@@ -396,6 +396,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
             messages: &messages,
             task: exact_task,
             workspace: ".",
+            default_command_cwd: None,
             color: false,
             markdown: false,
             tool_offload: false,

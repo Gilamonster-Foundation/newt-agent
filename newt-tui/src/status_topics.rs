@@ -267,8 +267,12 @@ mod tests {
     /// `/status models`, which is this module's rewrite BACK to `/models` —
     /// the live implementation. Un-retiring it (the `/models` discoverability
     /// fix) drops the count by one without weakening this guard: what it
-    /// exists to prove is that rows DO retire into `/status`, and six still
-    /// do. The `models` TOPIC stays; both doors still reach one handler.
+    /// exists to prove is that rows DO retire into `/status`.
+    ///
+    /// **6 → 5: Step 27.13 restores `/workspace` as the operator editor.**
+    /// `/status workspace` remains a read: chat intercepts the editor request
+    /// before this router rewrites the status topic to its existing read arm.
+    /// The five other retired rows must remain, alongside that distinction.
     #[test]
     fn something_actually_retired_into_status() {
         let count = crate::slash_registry::COMMANDS
@@ -279,8 +283,20 @@ mod tests {
             })
             .count();
         assert!(
-            count >= 6,
+            count >= 5,
             "only {count} rows retired into /status; the fold is eight topics"
+        );
+        let workspace = crate::slash_registry::lookup("workspace").unwrap();
+        assert_eq!(workspace.surface, crate::slash_registry::Surface::Slash);
+        assert_eq!(
+            workspace.disposition,
+            crate::slash_registry::Disposition::Panel
+        );
+        assert!(crate::workspace_settings::requested("/workspace"));
+        assert!(!crate::workspace_settings::requested("/status workspace"));
+        assert_eq!(
+            route("/status workspace"),
+            Route::Topic("/workspace".to_string())
         );
     }
 

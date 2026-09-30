@@ -398,9 +398,10 @@ impl Screen {
         self.rebuild_term()
     }
 
-    /// The terminal changed size: put the block at the bottom of the new
-    /// screen and start the viewport clean. The transcript above is the
-    /// terminal's to reflow.
+    /// The terminal changed size: keep the block where the content actually
+    /// ends when it still fits there, and only fall back to the bottom
+    /// anchor when it doesn't. The transcript above is the terminal's to
+    /// reflow.
     fn resize(
         &mut self,
         cols: u16,
@@ -421,7 +422,7 @@ impl Screen {
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
-        self.top = self.rows - new_h;
+        self.top = resize_new_top(old_top, self.rows, new_h);
         // FORCED: the TERMINAL resized; the block's new position is a
         // consequence, not a request.
         self.region.relocate(
@@ -429,10 +430,10 @@ impl Screen {
             newt_core::tty::OnCollision::SuspendHolder,
         );
         // Erase from the topmost of the OLD and new block tops, not just the new
-        // one (#4), raised by the rows the old block reflowed onto. Both blocks
-        // are bottom-anchored, so this wipes every stale status/editor row;
-        // nothing but block chrome sits below that row, so no transcript is
-        // lost.
+        // one (#4), raised by the rows the old block reflowed onto. Whichever
+        // top is higher, nothing but block chrome sits below it (the block
+        // never moves past its own old or new position), so this wipes every
+        // stale status/editor row without losing transcript.
         let erase_from = resize_erase_from(old_top, self.top, self.rows).saturating_sub(lifted);
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, erase_from), Clear(ClearType::FromCursorDown))?;
@@ -613,10 +614,34 @@ fn restore_terminal_modes() {
     let _ = write_mode_restores(&mut io::stdout());
 }
 
+/// Where the block moves to on a resize event (#2441, #2632).
+///
+/// A terminal that GROWS does not pull the transcript down to meet a
+/// bottom-anchored block — most terminals add the new rows below existing
+/// content instead of scrolling it (confirmed against a real herdr pane
+/// grow, #2441 evidence) — so jumping straight to `new_rows - new_h` opens a
+/// blank canyon between the transcript, which stayed where it was, and the
+/// block, which jumped to the new bottom.
+///
+/// This holds for ANY resize event, not only a grow: a same-size
+/// notification (no content moved at all) and a height-only shrink that
+/// still leaves the block room both leave the transcript exactly where it
+/// was, so `old_top` is still correct ground truth there too. Move the block
+/// only when it no longer fits at `old_top` — the one case where the old
+/// position is not a valid answer — and fall back to the bottom anchor then.
+fn resize_new_top(old_top: u16, new_rows: u16, new_h: u16) -> u16 {
+    if old_top.saturating_add(new_h) <= new_rows {
+        old_top
+    } else {
+        new_rows.saturating_sub(new_h)
+    }
+}
+
 /// The row `resize` clears downward from so the OLD cockpit region cannot
-/// survive above the new block (#4). Both blocks are bottom-anchored, so the
-/// topmost of the two tops covers both regions; clamped into the (possibly
-/// smaller) new screen.
+/// survive above the new block (#4). The block may now stay put instead of
+/// re-anchoring to the bottom (#2632), so the topmost of the two tops is what
+/// covers both regions, not a shared bottom anchor; clamped into the
+/// (possibly smaller) new screen.
 fn resize_erase_from(old_top: u16, new_top: u16, rows: u16) -> u16 {
     old_top.min(new_top).min(rows.saturating_sub(1))
 }
@@ -2007,6 +2032,74 @@ mod tests {
         assert!(panel_erase_from(20, 8, 100, 118, 31, 8) > 0);
     }
 
+    /// #2441: a herdr pane grew from 30 to 63 rows with the block at top 27,
+    /// height 3. Before this fix the block jumped to `63 - 3 = 60`, opening a
+    /// 30-row blank canyon between the untouched transcript and the block —
+    /// exactly the "rows 27-60 blank" gap the evidence files captured. It
+    /// must stay put, directly under the existing content, instead.
+    #[test]
+    fn growing_the_terminal_keeps_the_block_under_existing_content_2441() {
+        assert_eq!(resize_new_top(27, 63, 3), 27);
+    }
+
+    #[test]
+    fn a_shrinking_terminal_still_bottom_anchors_the_block() {
+        assert_eq!(resize_new_top(20, 10, 3), 7);
+    }
+
+    /// #2632 review finding 2: the old fallback test claimed to cover growth
+    /// but actually shrank (28 < 30 rows). Use a real grow that still doesn't
+    /// fit: old top 27 + height 5 would land on row 32, past the new 31-row
+    /// screen, so it must bottom-anchor instead of hanging off-screen.
+    #[test]
+    fn growth_too_small_for_the_block_to_fit_falls_back_to_the_bottom() {
+        assert_eq!(resize_new_top(27, 31, 5), 26);
+    }
+
+    #[test]
+    fn equal_rows_keeps_the_existing_bottom_anchor_behavior() {
+        assert_eq!(resize_new_top(20, 24, 4), 20);
+    }
+
+    /// #2632 review finding 1: a same-size notification (no rows added or
+    /// removed at all) used to fall through to the bottom-anchor branch and
+    /// silently move a block that was never bottom-anchored to begin with —
+    /// recreating the exact #2441 gap with no terminal movement. Repeated
+    /// same-size resizes, and repeated grows, must both keep the block at the
+    /// one position the content actually ends.
+    #[test]
+    fn repeated_same_size_resizes_do_not_recreate_the_gap_2632() {
+        // 30 -> 63 (grow, matches #2441) -> 63 (no-op notification).
+        let top = resize_new_top(27, 63, 3);
+        assert_eq!(top, 27);
+        let top = resize_new_top(top, 63, 3);
+        assert_eq!(
+            top, 27,
+            "a same-size resize must not move a block that already fits"
+        );
+    }
+
+    #[test]
+    fn repeated_grows_keep_the_block_under_the_content_2632() {
+        let mut top = resize_new_top(27, 63, 3);
+        assert_eq!(top, 27);
+        top = resize_new_top(top, 90, 3);
+        assert_eq!(top, 27);
+    }
+
+    /// #2632 review finding 1: a height-only shrink that still leaves the
+    /// block room must not move it down to a new bottom anchor — the block
+    /// at its old, non-bottom position still fits, so it stays.
+    #[test]
+    fn a_partial_shrink_that_still_fits_keeps_the_old_position_2632() {
+        // Grown to 63 with the block at 27 (matches #2441), then shrunk to
+        // 40: 27 + 3 = 30 <= 40, so the block still fits at 27.
+        let top = resize_new_top(27, 63, 3);
+        assert_eq!(top, 27);
+        let top = resize_new_top(top, 40, 3);
+        assert_eq!(top, 27, "old position still fits; must not re-anchor to 37");
+    }
+
     #[test]
     fn resize_erases_from_the_higher_of_the_old_and_new_block_tops() {
         // Terminal grew 24->30, block 4: old top 20, new top 26 — clear from 20.
@@ -2063,6 +2156,8 @@ mod terminal_acceptance;
 
 #[cfg(all(test, feature = "live-spill"))]
 pub(crate) use terminal_acceptance::cockpit_pager_case;
+#[cfg(all(test, feature = "rich-tui"))]
+pub(crate) use terminal_acceptance::cockpit_psyche_case;
 #[cfg(test)]
 pub(crate) use terminal_acceptance::{
     cockpit_acceptance_case, cockpit_bang_case, cockpit_buffered_input_case,

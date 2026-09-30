@@ -178,6 +178,10 @@ fn interaction_view_child() {
         "cockpit_clarification_input" => {
             crate::cockpit::presenter::cockpit_clarification_input_case();
         }
+        #[cfg(feature = "rich-tui")]
+        "cockpit_psyche" => {
+            crate::cockpit::presenter::cockpit_psyche_case();
+        }
         #[cfg(feature = "live-spill")]
         "cockpit_pager" => {
             crate::cockpit::presenter::cockpit_pager_case();
@@ -340,7 +344,11 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
         .stderr(std::process::Stdio::null());
     if matches!(
         mode,
-        "cockpit_bang" | "cockpit_buffered_input" | "cockpit_pager" | "cockpit_panel_loop"
+        "cockpit_bang"
+            | "cockpit_buffered_input"
+            | "cockpit_pager"
+            | "cockpit_panel_loop"
+            | "cockpit_psyche"
     ) {
         child.env("NEWT_EDIT_MODE", "emacs");
     }
@@ -381,6 +389,69 @@ pub(crate) fn drive_cockpit_buffered_input() {
 
 pub(crate) fn drive_cockpit_clarification_input() {
     drive_cockpit_case("cockpit_clarification_input");
+}
+
+/// #2489: open the real `/psyche` panel under a real cockpit and read the
+/// screen the way the operator does. `screen_grid` ignores erase commands, so a
+/// second writer's stale frame shows up as a repeated title or two dials on one
+/// row — exactly the garble in the report.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn drive_cockpit_psyche() {
+    const TITLE: &str = "psyche — operator dials";
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(30, 100);
+    let baseline = pty.termios_snapshot();
+    let mut child = spawn_child(&pty, "cockpit_psyche");
+    let mut transcript = String::new();
+    let result = (|| -> Result<(), String> {
+        if !pty.wait_for_screen_after(TITLE, "Esc cancel", REACH_TIMEOUT) {
+            return Err("the psyche panel never painted its footer".into());
+        }
+        let frame = pty.screen();
+        transcript.push_str(&frame);
+        let rows = screen_grid(&frame);
+        let titles = rows.iter().filter(|row| row.contains(TITLE)).count();
+        if titles != 1 {
+            return Err(format!(
+                "panel title drawn {titles} times, want 1: {rows:?}"
+            ));
+        }
+        // Each dial owns its own row: two labels on one row means the rows were
+        // wrapped or scrolled into each other.
+        const LABELS: [&str; 4] = ["agreeableness", "extraversion", "warmth", "prosocial"];
+        for row in &rows {
+            let n = LABELS.iter().filter(|l| row.contains(**l)).count();
+            if n > 1 {
+                return Err(format!(
+                    "dial rows interleaved on one row {row:?}: {rows:?}"
+                ));
+            }
+        }
+        pty.type_in("\x1b");
+        if !pty.wait_for_screen_after("PSYCHE_RETURNED", "^D exit", REACH_TIMEOUT) {
+            return Err("Esc did not close the panel and restore the editor".into());
+        }
+        transcript.push_str(&pty.screen());
+        pty.type_in("after-psyche\r");
+        if !pty.wait_for_screen("PSYCHE_RESTORED", REACH_TIMEOUT) {
+            return Err("the next submission was lost or contaminated by panel keys".into());
+        }
+        if pty.termios_snapshot() != baseline {
+            return Err("panel/cockpit did not restore the exact terminal mode".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    transcript.push_str(&pty.screen_to_eof());
+    assert!(result.is_ok(), "{result:?}: {transcript:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {transcript:?}"
+    );
 }
 
 #[cfg(feature = "live-spill")]
@@ -592,6 +663,69 @@ pub(crate) fn erasing_screen(stream: &str, rows: usize) -> (Vec<String>, (usize,
     (lines, (row, col))
 }
 
+fn panel_repaint_rows(stream: &str, terminal_rows: usize) -> Vec<String> {
+    erasing_grid(stream, terminal_rows)
+}
+
+fn panel_height(rows: &[String]) -> Option<usize> {
+    let top = rows.iter().position(|row| row.contains('╭'));
+    let bottom = rows.iter().rposition(|row| row.contains('╰'));
+    top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
+}
+
+fn wait_for_panel_repaint(
+    pty: &Pty,
+    terminal_rows: usize,
+    ready: impl Fn(&[String]) -> bool,
+) -> Result<(String, Vec<String>), String> {
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    let mut repaint = String::new();
+    let mut rows = Vec::new();
+    // Ratatui ends each panel frame by hiding the cursor. A corner alone
+    // can belong to an earlier repaint or precede the remainder of a frame.
+    // Accumulate complete frames until the actual requested state is visible;
+    // a drain is not a frame boundary, and an old frame cannot acknowledge
+    // the next input just because it also contains a bottom-right corner.
+    const FRAME_END: &str = "\x1b[?25l";
+    while pty.wait_for_screen(
+        FRAME_END,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        repaint.push_str(&pty.screen());
+        if let Some(end) = repaint.rfind(FRAME_END) {
+            rows = panel_repaint_rows(&repaint[..end + FRAME_END.len()], terminal_rows);
+            if ready(&rows) {
+                return Ok((repaint, rows));
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err(format!(
+        "panel repaint did not reach the requested state: {rows:?}; bytes: {repaint:?}"
+    ))
+}
+
+#[test]
+fn panel_repaint_discards_erased_zoom_frame_in_one_drain() {
+    // A drain may contain the final zoomed frame followed by its erase and
+    // the restored inline frame. These are the same ED/CUP operations the
+    // real panel emits; the first border must no longer count toward height.
+    let repaint = concat!(
+        "\x1b[1;1H╭ zoom ╮\x1b[2;1H❯ stale selection",
+        "\x1b[20;1H╰──────╯\x1b[?25l",
+        "\x1b[1;1H\x1b[J",
+        "\x1b[13;1H╭ loop ╮\x1b[14;1H❯ panel-row-03",
+        "\x1b[20;1H╰──────╯\x1b[?25l",
+    );
+    let rows = panel_repaint_rows(repaint, 20);
+    assert_eq!(rows.iter().position(|row| row.contains('╭')), Some(12));
+    assert_eq!(rows.iter().rposition(|row| row.contains('╰')), Some(19));
+    assert!(rows[13].contains("❯ panel-row-03"));
+    assert!(!rows.iter().any(|row| row.contains("stale selection")));
+}
+
 /// #2573 review: drive a real panel through resizes and keys, then close it.
 /// The selection must survive, no resize may erase from row 0 (the transcript
 /// above the panel stays), the border must sit at each new width, and the
@@ -603,27 +737,27 @@ pub(crate) fn drive_cockpit_panel_loop() {
     let mut child = spawn_child(&pty, "cockpit_panel_loop");
     let mut transcript = String::new();
     let result = (|| -> Result<(), String> {
-        if !pty.wait_for_screen_after("panel-row-00", "╯", REACH_TIMEOUT) {
-            return Err("the panel never painted".into());
-        }
-        transcript.push_str(&pty.screen());
+        let (repaint, _) = wait_for_panel_repaint(&pty, 24, |rows| {
+            panel_height(rows) == Some(8) && rows.iter().any(|row| row.contains("❯ panel-row-00"))
+        })?;
+        transcript.push_str(&repaint);
         pty.type_in("jjj");
-        if !pty.wait_for_screen("panel-row-03", REACH_TIMEOUT) {
-            return Err("the selection did not move".into());
-        }
-        transcript.push_str(&pty.screen());
+        let (repaint, _) = wait_for_panel_repaint(&pty, 24, |rows| {
+            rows.iter().any(|row| row.contains("❯ panel-row-03"))
+        })?;
+        transcript.push_str(&repaint);
         for &(height, width) in &[(24u16, 50u16), (24, 100), (40, 100), (16, 100)] {
             pty.resize(height, width);
             signal_winch(child.id());
-            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
-                return Err(format!("no repaint after resize to {width}x{height}"));
-            }
-            let repaint = pty.screen();
+            let (repaint, rows) = wait_for_panel_repaint(&pty, usize::from(height), |rows| {
+                rows.iter()
+                    .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
+                    && rows.iter().any(|row| row.contains("❯ panel-row-03"))
+            })?;
             transcript.push_str(&repaint);
             if repaint.contains("\x1b[1;1H\x1b[J") || repaint.contains("\x1b[2J") {
                 return Err(format!("resize to {width}x{height} erased from row 0"));
             }
-            let rows = screen_grid(&repaint);
             if !rows
                 .iter()
                 .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
@@ -638,11 +772,7 @@ pub(crate) fn drive_cockpit_panel_loop() {
         }
         // #2574: the sizing keys, through the same loop. Height is counted
         // from the drawn borders; the selection must survive every step.
-        let panel_height = |rows: &[String]| {
-            let top = rows.iter().position(|row| row.contains('╭'));
-            let bottom = rows.iter().rposition(|row| row.contains('╰'));
-            top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
-        };
+        let mut terminal_height = 16;
         for (keys, want, what) in [
             ("\x1b[1;2A", Some(9), "Shift-Up grows one row"),
             ("\x1b[1;2B", Some(8), "Shift-Down shrinks one row"),
@@ -666,17 +796,21 @@ pub(crate) fn drive_cockpit_panel_loop() {
                 let (h, w) = size.split_once('x').expect("HxW");
                 let (h, w): (u16, u16) = (h.parse().unwrap(), w.parse().unwrap());
                 width = w;
+                terminal_height = usize::from(h);
                 pty.resize(h, w);
                 signal_winch(child.id());
             } else {
                 pty.type_in(keys);
             }
-            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
-                return Err(format!("no repaint after: {what}"));
-            }
-            let repaint = pty.screen();
+            let (repaint, rows) = wait_for_panel_repaint(&pty, terminal_height, |rows| {
+                panel_height(rows) == want
+                    && rows.iter().any(|row| row.contains("❯ panel-row-03"))
+                    && rows
+                        .iter()
+                        .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
+            })
+            .map_err(|error| format!("{what}: {error}"))?;
             transcript.push_str(&repaint);
-            let rows = screen_grid(&repaint);
             if panel_height(&rows) != want {
                 return Err(format!(
                     "{what}: height {:?}: {rows:?}",

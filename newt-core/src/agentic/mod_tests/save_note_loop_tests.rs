@@ -28,6 +28,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         messages,
         task: "do the thing",
         workspace: ".",
+        default_command_cwd: None,
         color: false,
         markdown: false,
         tool_offload: false,

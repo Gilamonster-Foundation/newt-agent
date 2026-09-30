@@ -14,6 +14,7 @@ use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition};
 use super::note_sink::{execute_save_note, save_note_tool_definition};
 use super::permissions::{
     DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
+    BOUND_REASON_PREFIX,
 };
 use super::prompt_intake::PromptDisposition;
 use super::prompt_read::execute_prompt_read_silent;
@@ -72,7 +73,7 @@ use shell::{
 };
 use shell::{
     declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,
-    resolve_exec_cwd, split_leading_cd,
+    permits_filesystem_request, resolve_exec_cwd, split_leading_cd,
 };
 #[cfg(all(test, not(windows)))]
 use shell::{
@@ -1250,6 +1251,7 @@ fn lifecycle_build_request(
         kind: DenialKind::Build,
         target: workspace.into(),
         reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites within the workspace and its build scratch directory; {network}. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
+        harness_bound: false,
     }
 }
 
@@ -1610,7 +1612,7 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
 /// or only a #263 permission-gate grant (the human approving this exact
 /// out-of-scope path)? That distinction decides whether the read is
 /// object-bound. `Err` carries the model-facing refusal or read error.
-fn authorized_read(
+pub(super) fn authorized_read(
     tool: &str,
     path: &str,
     workspace: &str,
@@ -1666,6 +1668,7 @@ fn fs_gate_allows(
         kind,
         target: full_path.to_string(),
         reason: format!("{} does not permit '{full_path}'", kind.as_str()),
+        harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&request)) {
         PermissionDecision::Allow(widened) => tui_permits_path(axis(&widened), full_path),
@@ -1716,6 +1719,7 @@ fn git_data_loss_confirmed(gate: &mut dyn PermissionGate, op: &str) -> bool {
         reason: format!(
             "git {op} DESTROYS work irrecoverably (a dropped stash / deleted              branch cannot be recovered) — confirm before proceeding"
         ),
+        harness_bound: false,
     };
     matches!(
         gate.ask(std::slice::from_ref(&request)),
@@ -1729,6 +1733,7 @@ fn git_gate_allows(gate: &mut dyn PermissionGate, op: &str) -> bool {
         kind: DenialKind::GitWrite,
         target: op.to_string(),
         reason: format!("git {op} is outside the granted git-write authority"),
+        harness_bound: false,
     };
     matches!(
         gate.ask(std::slice::from_ref(&request)),
@@ -1781,14 +1786,95 @@ pub(super) fn permission_grant_succeeded(
     args: &serde_json::Value,
     ok: bool,
     result: &str,
+    execution: Option<crate::ExecOutcome>,
 ) -> bool {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
-    name == "request_permissions"
-        && ok
-        && parse_capability(capability).is_some()
-        && !target.is_empty()
-        && result == permission_granted_result(capability, target)
+    if name != "request_permissions"
+        || !ok
+        || parse_capability(capability).is_none()
+        || target.is_empty()
+    {
+        return false;
+    }
+    // #2628/#2636: when a pending run_command was re-run on approval, the
+    // result is the command's real output rather than the "granted: …
+    // Retry" string. Recognize that shape from the SAME typed
+    // `ExecOutcome` the replay's own `executed()` call already records
+    // (round1's "additional nonblocking concern": a string heuristic here
+    // is misled by child output that happens to start with "denied:", and
+    // — the defect this replaces — misled the other way by output that
+    // merely doesn't start with a denial prefix, which is not evidence of
+    // a real grant). `execution` is `None` for the ordinary non-replay
+    // path (`request_permissions` never calls `executed()` unless it
+    // replayed), so it cannot false-positive on that path.
+    result == permission_granted_result(capability, target)
+        || execution == Some(crate::ExecOutcome::Passed)
+}
+
+/// #2628/#2636: a `run_command` denied purely for undeclared filesystem
+/// authority, remembered for ONE immediate `request_permissions` reply — see
+/// `UNGRANTED_FS_AUTHORITY_DENIAL` for the exact denial shape eligible here.
+///
+/// Binding (round1 finding 1): `missing` is the exact set of filesystem
+/// requests this command was denied on, captured at denial time. Replay is
+/// permitted only when the operator's grant now covers every one of them —
+/// an unrelated or narrower approval does not authorize replaying this
+/// invocation. The slot is cleared on ANY tool call other than the
+/// `request_permissions` that consumes it (see `execute_authorized_tool`),
+/// so an unrelated intervening command — successful, failed, or a
+/// replacement for this one — invalidates a stale rerun.
+pub(super) struct PendingRerun {
+    cmd: String,
+    cwd: String,
+    declared: Vec<PermissionRequest>,
+    /// The subset of `declared` NOT covered by caveats at denial time — what
+    /// the operator's grant must cover for replay to proceed.
+    missing: Vec<PermissionRequest>,
+}
+
+/// #2636 round4/round5: typed token the caller requires, ALONGSIDE its own
+/// coverage re-check, before treating an approval as replay authorization.
+/// The private field plus the single checked constructor (`new`) mean
+/// nothing outside this module can mint one except by actually satisfying
+/// `covers_missing` — this is nonblocking hardening of the intended
+/// construction site (`tools_tests` never had another path to one; see
+/// round4's token ruling), not a claim that the type alone makes an
+/// ineligible replay impossible elsewhere in the codebase.
+pub(super) struct EligibleReplay(());
+
+impl EligibleReplay {
+    /// Mint the token only when `covers_missing` actually holds — the
+    /// RETURNED caveats cover every entry in `pending.missing`, not merely
+    /// pre-prompt eligibility.
+    fn new(covers_missing: bool) -> Option<Self> {
+        covers_missing.then_some(Self(()))
+    }
+}
+
+/// #2636 round3 blocker 1: does a single grant of `kind` for `target` cover
+/// EVERY request in `missing`? Checked BEFORE asking the operator, using only
+/// the requested capability/target — never the widened caveats the gate
+/// eventually returns, which don't exist yet — so the prompt shown to the
+/// operator can honestly say whether this approval alone would replay the
+/// bound command. A single-target grant only ever produces one path-scope
+/// root, so this mirrors `permits_filesystem_request` against that one-root
+/// scope: an unrelated target, the wrong axis, or a grant that covers only
+/// part of `missing` (e.g. one of two denied paths) all return `false`.
+fn single_grant_covers_missing(
+    kind: DenialKind,
+    target: &str,
+    missing: &[PermissionRequest],
+) -> bool {
+    if missing.is_empty() {
+        return false;
+    }
+    let scope = crate::caveats::Scope::only([target.to_string()]);
+    missing.iter().all(|request| {
+        request.kind == kind
+            && matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
+            && crate::caveats::permits_path(&scope, &request.target)
+    })
 }
 
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
@@ -1806,50 +1892,123 @@ pub(super) fn permission_grant_succeeded(
 /// being merged: this one widens authority through the ocap gate, the other only
 /// gathers text. `request_permissions` is deliberately NOT routed through
 /// `request_user_input` — it mints caveats, which a free-text answer cannot.
+/// Returns `(Some(widened), message)` when the operator approved, `(None,
+/// message)` on denial or when no gate is available.  The `widened` caveats
+/// are threaded back to the dispatch arm for the #2628 one-shot re-run.
+///
+/// `bound`: `Some(pending)` when a #2628 `pending_rerun` is queued for THIS
+/// call — the model is answering a specific prior denial, not asking
+/// proactively. Then:
+/// - On `Allow`, immediately tell the gate to drop any proactive once-grant
+///   it queued for a later retry (round1 finding 2): the automatic replay is
+///   about to spend it right here, so it must not also remain available to
+///   widen a later, unrelated operation on the same (kind, target).
+/// - The reason shown to the operator is harness-authored, not the
+///   model-supplied text: it names the bound command and cwd and says
+///   plainly that approval executes it once (round1 finding 4) — the model's
+///   `reason` cannot be trusted to disclose that, since the tool call is
+///   model-selected and unverified.
 fn execute_request_permissions(
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
     _color: bool,
     _tool_output_lines: usize,
     workspace: &str,
-) -> String {
+    bound: Option<&PendingRerun>,
+) -> (
+    Option<crate::caveats::Caveats>,
+    Option<EligibleReplay>,
+    String,
+) {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
     let reason = args["reason"].as_str().unwrap_or("").trim();
     let Some(kind) = parse_capability(capability) else {
-        return format!(
-            "request_permissions: unknown capability '{capability}'. Use one of: \
-             exec, fs_read, fs_write, net."
+        return (
+            None,
+            None,
+            format!(
+                "request_permissions: unknown capability '{capability}'. Use one of: \
+                 exec, fs_read, fs_write, net."
+            ),
         );
     };
     if target.is_empty() {
-        return "request_permissions: 'target' is required — the executable path or command name (exec), \
+        return (
+            None,
+            None,
+            "request_permissions: 'target' is required — the executable path or command name (exec), \
                    the path (fs_read/fs_write), or the host (net)."
-            .to_string();
+                .to_string(),
+        );
     }
+
+    // #2636 round3 blocker 1: only promise the IMMEDIATELY-re-runs wording
+    // when this exact grant would cover the COMPLETE missing set the command
+    // was denied on. A partial or unrelated request still clears the pending
+    // slot (already taken by the caller) but gets ordinary access-grant
+    // wording that says plainly no automatic replay will happen.
+    let eligible =
+        bound.filter(|pending| single_grant_covers_missing(kind, target, &pending.missing));
 
     let request = PermissionRequest {
         tool: "request_permissions".to_string(),
         kind,
         target: target.to_string(),
-        reason: if reason.is_empty() {
-            format!("model requested {capability} for '{target}'")
-        } else {
-            reason.to_string()
+        reason: match eligible {
+            // #2636 finding 4: harness-authored disclosure of the execution this
+            // approval triggers — never the model's `reason`. The `harness_bound`
+            // field (not the prefix string) is what reason_is_model_authored checks.
+            Some(pending) => format!(
+                "{BOUND_REASON_PREFIX}approving this widens {capability} for '{target}' and \
+                 IMMEDIATELY re-runs the command it was denied for, ONCE, under exactly that \
+                 grant: `{}` in `{}`. It will not run again without a fresh approval.",
+                pending.cmd, pending.cwd
+            ),
+            None if bound.is_some() => format!(
+                "model requested {capability} for '{target}'. This grant alone does not \
+                 cover everything the previously denied command needs, so it will NOT be \
+                 automatically re-run — retry it yourself with a fresh run_command call."
+            ),
+            None if reason.is_empty() => format!("model requested {capability} for '{target}'"),
+            None => reason.to_string(),
         },
+        harness_bound: eligible.is_some(),
     };
 
     let quoted_target = serde_json::json!(target);
     let mut out = match gate {
         // The gate consults the operator and (for a session grant) remembers it,
-        // exactly as a denial-driven prompt does. We do not re-execute anything
-        // here — the model retries its original tool call, which rides the #263
-        // re-exec path under the now-granted caveats.
+        // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
-            PermissionDecision::Allow(_widened) => permission_granted_result(capability, target),
-            PermissionDecision::Deny => format!(
-                "denied: the operator declined {capability} for {quoted_target}. \
-                 Do not retry it — take a different approach."
+            PermissionDecision::Allow(widened) => {
+                // #2636 round5: consumption and the `EligibleReplay` token both
+                // require the RETURNED `widened` caveats to actually cover
+                // every entry in `pending.missing` — not just pre-prompt
+                // eligibility (the operator's Allow can widen a narrower or
+                // different scope than requested). An eligible-but-insufficient
+                // approval must neither execute the replay NOR spend the
+                // once-grant: report plainly (via the caller's fallback
+                // message) that the command was not re-run.
+                let covers_missing = eligible.is_some_and(|pending| {
+                    pending
+                        .missing
+                        .iter()
+                        .all(|r| permits_filesystem_request(&widened, r))
+                });
+                let replay_auth = EligibleReplay::new(covers_missing);
+                if replay_auth.is_some() {
+                    g.consume_pending_once(kind, target);
+                }
+                return (Some(widened), replay_auth, permission_granted_result(capability, target));
+            }
+            PermissionDecision::Deny => (
+                None,
+                None,
+                format!(
+                    "denied: the operator declined {capability} for {quoted_target}. \
+                     Do not retry it — take a different approach."
+                ),
             ),
         },
         // Headless / eval / ACP: no interactive gate exists to grant authority.
@@ -1861,22 +2020,24 @@ fn execute_request_permissions(
         // to finish and burns rounds. Tell it to stop re-asking and proceed
         // within the authority it already has; only report the blocker if the
         // target is genuinely essential and out of scope.
-        None => format!(
-            "no operator available to grant {capability} for {quoted_target} — this session \
-             has no interactive permission gate (headless / eval / piped), so authority \
-             cannot be widened mid-run and re-calling request_permissions will not help. \
-             Proceed within the authority you already have and the tools available to you; \
-             if {quoted_target} is genuinely essential and outside your current scope, say so in \
-             your final answer rather than retrying it."
+        None => (
+            None,
+            None,
+            format!(
+                "no operator available to grant {capability} for {quoted_target} — this session \
+                 has no interactive permission gate (headless / eval / piped), so authority \
+                 cannot be widened mid-run and re-calling request_permissions will not help. \
+                 Proceed within the authority you already have and the tools available to you; \
+                 if {quoted_target} is genuinely essential and outside your current scope, say so in \
+                 your final answer rather than retrying it."
+            ),
         ),
     };
-    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
-        && out != permission_granted_result(capability, target)
-    {
-        out.push('\n');
+    if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+        out.2.push('\n');
         // A declined question supplies no fresh authority snapshot. In
         // particular, do not remint capabilities just to render diagnostics.
-        out.push_str(&denial_context(workspace, None, None));
+        out.2.push_str(&denial_context(workspace, None, None));
     }
     out
 }
@@ -1969,6 +2130,59 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Extract the denied host from a [`agent_bridle::ToolError::Denied`] reason
+/// IFF the reason is an EXACT match for the literal wording two known leash
+/// constructors emit — never a substring check (#2645 round 2). Both
+/// `agent_bridle_core::ToolContext::check_net`
+/// (vendor/agent-bridle-core/src/context.rs) AND agent-bridle-tool-web's own
+/// `NetGuardError::HostNotAllowed` (`net_guard.rs`, converted to `Denied` at
+/// `web_fetch.rs`'s `net_guard_to_tool`) use the identical
+/// `format!("network access to {host:?} is not within the granted authority")`
+/// — correcting round 2's comment, which claimed only `check_net` emits this
+/// (#2645 round-2 review). Both are genuine net-authority denials for the
+/// SAME host/scope the fetch loop already re-checks per hop
+/// (`web_fetch.rs:250-269` calls `check_net` before `screen_host`), so
+/// treating them alike is not a widening.
+///
+/// This function only ever sees the `Denied` variant's raw `reason` field —
+/// never `ToolError`'s `Display` (which prepends `"denied: "`) and never any
+/// other variant — see [`web_fetch_denial_host`], which matches the variant
+/// FIRST (#2645 round 3). Requiring the anchored prefix/suffix (not
+/// `.contains`) means wrapper text around an untrusted, interpolated string
+/// — e.g. agent-bridle-tool-web's `redirect Location {location:?} is not a
+/// valid URL: {e}` when a server sends a malformed `Location` — can never
+/// satisfy the match merely by *containing* both trigger phrases somewhere in
+/// a longer message.
+fn parse_net_denial_host(reason: &str) -> Option<String> {
+    let host = reason
+        .strip_prefix("network access to \"")?
+        .strip_suffix("\" is not within the granted authority")?;
+    // A real hostname/IP never contains a literal `"` — the format's
+    // `{host:?}` would escape one. Bail rather than guess at unescaping.
+    (!host.is_empty() && !host.contains('"')).then(|| host.to_string())
+}
+
+/// The `web_fetch` dispatch-error → net-denial-journal decision (#2645 round
+/// 3), factored out of the `execute_tool` match arm as a narrow seam: it
+/// takes exactly what the call site has (the request URL, for parity with
+/// the pre-#2645 shape of this decision, and the leash's `ToolError`) so
+/// tests can drive it with a CONSTRUCTED error instead of a live network
+/// dispatch. `url` is not consulted for the recorded host — #2645 round 2
+/// fixed the bug where it was (a redirect can be denied on a DIFFERENT host
+/// than the original request) — it is accepted only so the seam's signature
+/// matches what a caller here actually has in hand.
+///
+/// Matches the `Denied` VARIANT before parsing anything (#2645 round-3
+/// review): a `NotFound`, `Budget`, `Generation`, `Exec` or `Other` failure
+/// never reaches [`parse_net_denial_host`] at all, regardless of what text it
+/// happens to contain.
+fn web_fetch_denial_host(_url: &str, err: &agent_bridle::ToolError) -> Option<String> {
+    match err {
+        agent_bridle::ToolError::Denied { reason } => parse_net_denial_host(reason),
+        _ => None,
     }
 }
 
@@ -3209,6 +3423,7 @@ async fn execute_authorized_tool(
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
+        default_command_cwd,
         invocation,
         build_check_cmd,
         tool_evidence,
@@ -3238,7 +3453,21 @@ async fn execute_authorized_tool(
         completed_spill_renderer: _,
         execution,
         routed_to: routed_to_slot,
+        pending_rerun,
     } = collab;
+    // #2636 (round1 finding 1): a queued #2628 rerun binds to the denial that
+    // set it. ANY tool call other than the `request_permissions` that
+    // consumes it invalidates a stale slot immediately — including a
+    // successful/failed run_command that replaces the denied one, or any
+    // unrelated tool activity in between. Only `request_permissions` reads
+    // the slot below (and takes it), so every other arm sees it already
+    // cleared.
+    let pending_rerun = pending_rerun.map(|slot| {
+        if name != "request_permissions" {
+            *slot = None;
+        }
+        slot
+    });
     let smart_harness = invocation.map(|call| call.harness());
     // #2315: hand the shell's execution class to the funnel, return the text.
     let executed = |(text, outcome): (String, crate::ExecOutcome)| {
@@ -3331,6 +3560,7 @@ async fn execute_authorized_tool(
             kind: DenialKind::RemoteTool,
             target: name.to_string(),
             reason: "Approve this remote MCP operation. Persona preferences and server tool hints do not grant permission.".into(),
+            harness_bound: false,
         };
         let grant = matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
             .then_some(McpGrant::HumanApproved);
@@ -3356,6 +3586,13 @@ async fn execute_authorized_tool(
         Some(AliasOutcome::Correct(msg)) => return host_return(msg),
         None => name,
     };
+
+    let command_args =
+        match shell::command_args_with_default_cwd(name, args, workspace, default_command_cwd) {
+            Ok(args) => args,
+            Err(error) => return host_return(error.to_owned()),
+        };
+    let args = command_args.as_ref();
 
     // Eligible file reads and lifecycle commands use the governed built-ins.
     // Git commands keep their original arguments and use the confined exec
@@ -3638,8 +3875,67 @@ async fn execute_authorized_tool(
         // headless / eval / ACP, where it answers "no operator available" rather
         // than blocking. Consumes the gate (mutually exclusive with the
         // run_command / fs arms that also use it — only one arm runs per call).
+        //
+        // #2628/#2636: on approval, if a pending_rerun slot carries a denial
+        // this exact approval covers, re-run it immediately with the widened
+        // one-shot caveats so the model receives the result directly instead
+        // of a "Retry the original operation now" instruction.
+        //
+        // Binding (round1 finding 1): replay proceeds ONLY when the grant
+        // just obtained covers EVERY filesystem request the command was
+        // denied on (`pending.missing`) — an approval for a different
+        // capability, target, or axis is not consent to replay this
+        // invocation, and the model's own retry path (a fresh `run_command`
+        // call) is unaffected either way.
         "request_permissions" => {
-            execute_request_permissions(args, permission_gate, color, tool_output_lines, workspace)
+            let rerun = pending_rerun.and_then(|slot| slot.take());
+            let (granted, replay_auth, msg) = execute_request_permissions(
+                args,
+                permission_gate,
+                color,
+                tool_output_lines,
+                workspace,
+                rerun.as_ref(),
+            );
+            // #2636 round5: `replay_auth` is minted only when the RETURNED
+            // `widened` caveats actually cover every entry in `pending.missing`
+            // (`EligibleReplay::new`, tools.rs) — pre-prompt eligibility alone
+            // is not enough. This match re-checks the same coverage
+            // independently as a caller-side belt-and-suspenders, not because
+            // the token could otherwise be forged: an ineligible or
+            // insufficient approval never reaches `Some(_auth)` in the first
+            // place.
+            match (granted, replay_auth, rerun) {
+                (Some(widened), Some(_auth), Some(pending))
+                    if pending
+                        .missing
+                        .iter()
+                        .all(|request| permits_filesystem_request(&widened, request)) =>
+                {
+                    executed(
+                        exec_confined_command(
+                            &pending.cmd,
+                            &pending.cwd,
+                            workspace,
+                            color,
+                            tool_output_lines,
+                            &widened,
+                            &pending.declared,
+                            exec_floor,
+                            &mut None, // one-shot: no further interactive prompting
+                            tool_offload,
+                            spill_store,
+                            live_tool_output.clone(),
+                            presentation,
+                        )
+                        .await,
+                    )
+                }
+                // No pending rerun, denied/headless, ineligible approval, or
+                // the grant just given does not cover what this specific denial
+                // needed: fall back to the grant/denial message.
+                (_, _, _) => msg,
+            }
         }
 
         // #728: the GENERIC ask-the-human tool — surfaces a free-text question to
@@ -3866,10 +4162,8 @@ async fn execute_authorized_tool(
             // `lifecycle` arm (#891) so both honor identical exec caveats. A
             // folded leading `cd` becomes the cwd (it wins over an explicit
             // `cwd` arg — it's the more specific, in-command intent).
-            let run_cwd = resolve_exec_cwd(
-                workspace,
-                cd_path.as_deref().or_else(|| args["cwd"].as_str()),
-            );
+            let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
+            let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
             // issue-1188: `git push` / `gh pr create` cannot reach the forge
             // from the confined child at all (#2619 narrows any host-scoped
             // net grant to `net: none` for spawned children on Linux — the
@@ -3910,30 +4204,44 @@ async fn execute_authorized_tool(
                 Err(error) => return host_return(error),
             };
             if let Some(program) = build_shell::build_program(cmd) {
-                return executed(build_shell::execute(
-                    cmd,
-                    &program,
-                    &run_cwd,
-                    workspace,
-                    caveats,
-                    &filesystem_requests,
-                    &mut permission_gate,
-                    smart_harness,
-                    tool_output_lines,
-                    color,
-                    tool_offload,
-                    spill_store,
-                    live_tool_output.clone(),
-                    presentation,
-                    commit_broker,
-                ).await);
+                // #2636 (round1 finding 3): a build denial is NEVER eligible
+                // for #2628 replay. `build_shell::execute` enforces the
+                // calibrated build fence and explicitly forbids re-running
+                // after a denial (earlier stages may already have side
+                // effects) — routing it back through plain `exec_confined_command`
+                // on approval would drop that fence and could repeat a write
+                // that already happened. `pending_rerun` is left untouched
+                // here (already cleared above), so no build denial can ever
+                // populate it.
+                return executed(
+                    build_shell::execute(
+                        cmd,
+                        &program,
+                        &run_cwd,
+                        workspace,
+                        caveats,
+                        &filesystem_requests,
+                        &mut permission_gate,
+                        smart_harness,
+                        tool_output_lines,
+                        color,
+                        tool_offload,
+                        spill_store,
+                        live_tool_output.clone(),
+                        presentation,
+                        commit_broker,
+                    )
+                    .await,
+                );
             }
             // F32/#2537 round 3: a bare `git …` in this session's own repo, on
             // a non-default branch, gets kernel WRITE on its own gitdir +
             // `objects/` for THIS dispatch only — see
             // `dispatch_caveats_for_git_shell`'s doc comment.
             let git_shell_caveats = dispatch_caveats_for_git_shell(cmd, workspace, caveats);
-            executed(
+            let commit_broker_used = commit_broker.is_some();
+            let mut fs_pre_exec_missing: Option<Vec<PermissionRequest>> = None;
+            let result = executed(
                 shell::exec_confined_command_with_broker(
                     cmd,
                     &run_cwd,
@@ -3949,9 +4257,27 @@ async fn execute_authorized_tool(
                     live_tool_output.clone(),
                     presentation,
                     commit_broker,
+                    &mut fs_pre_exec_missing,
                 )
                 .await,
-            )
+            );
+            // #2636 finding 1: use the typed out-param from the pre-exec denial
+            // path — only a denial that fired BEFORE the child ran populates
+            // fs_pre_exec_missing. Child stdout that happens to contain the
+            // denial string does not. A native-Git commit-producing command is
+            // excluded (commit_broker_used) to prevent replaying under a bypass
+            // of the attribution/signing policy and the gitdir-write caveat.
+            if let (Some(slot), Some(missing)) = (pending_rerun, fs_pre_exec_missing) {
+                if !commit_broker_used {
+                    *slot = Some(PendingRerun {
+                        cmd: cmd.to_string(),
+                        cwd: run_cwd.clone(),
+                        declared: filesystem_requests.clone(),
+                        missing,
+                    });
+                }
+            }
+            result
         }
 
         // #891: the model-facing lifecycle surface over the #880 system. Resolve
@@ -5054,6 +5380,7 @@ async fn execute_authorized_tool(
                         kind: DenialKind::Net,
                         target: host.clone(),
                         reason: format!("net does not permit '{host}'"),
+                        harness_bound: false,
                     };
                     match gate.ask(std::slice::from_ref(&request)) {
                         PermissionDecision::Allow(widened) => Some(widened),
@@ -5084,7 +5411,20 @@ async fn execute_authorized_tool(
                 // timeout) — surface the reason; Display is safe. Private-address
                 // denials gain an MCP-first recovery hint without weakening the
                 // refusal itself.
-                Err(e) => render_web_fetch_error(url, &e.to_string(), &*mcp, persona_tools, disposition),
+                Err(e) => {
+                    let reason = e.to_string();
+                    // #2643: the exec/run_command path journals denials via
+                    // `record_envelope`; this leash refusal has no envelope
+                    // (net is checked before any subprocess exists), so it
+                    // needs its own append or `newt ocap denials` never sees
+                    // a `web_fetch` net denial at all. #2645 rounds 2-3: see
+                    // `web_fetch_denial_host`'s doc comment for why this
+                    // can't just substring-match `reason`.
+                    if let Some(host) = web_fetch_denial_host(url, &e) {
+                        crate::denial_journal::record_net_denial("web_fetch", &host, &reason);
+                    }
+                    render_web_fetch_error(url, &reason, &*mcp, persona_tools, disposition)
+                }
             }
         }
 

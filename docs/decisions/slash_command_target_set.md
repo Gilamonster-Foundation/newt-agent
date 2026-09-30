@@ -46,6 +46,16 @@ where each event's id covers its payload AND its link to the one before it. The
 receipt column carries the file, because a destination that lives in prose
 rather than on the row is a destination that drifts.
 
+Workspace profiles add a distinct authority-store destination in Step 27.13:
+`Receipt::WorkspacePolicy` names the signed, encrypted
+`ocap/session-grants.age` beside the selected trusted operator config. Its
+content-addressed before/after history is committed atomically with the policy
+and verified when read. `/workspace` is an operator editor shortcut for
+`/settings workspaces`; it is no longer the retired read-only alias. That read
+remains available through `/status workspace`. This intentionally adds one
+command and one token to the advertised surface; it does not add a model tool
+or put authority changes in the ordinary settings receipt file.
+
 ## The three open questions, answered
 
 **1. Does `/settings` subsume `/psyche`?** No — and the question dissolves once
@@ -172,7 +182,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/setup` | — | `/` command | Meta | keep — it performs | **none — #1965** |
 | `/status` | — | `/` command | Meta | keep — it performs | — read-only |
 | `/version` | — | retired → `/status version` | Meta | keep — it performs | — read-only |
-| `/workspace` | — | retired → `/status workspace` | Meta | keep — it performs | — read-only |
+| `/workspace` | — | `/` command | Meta | panel — a chooser, needs a region (#1979) | `ocap/session-grants.age` beside operator config (signed, encrypted, chained) |
 | `/backends` | `/backend` | `/` command | Model | panel — a chooser, needs a region (#1979) | **none — #1965** |
 | `/dgx` | — | `/` command | Model | keep — it performs | — read-only |
 | `/model` | — | `/` command | Model | absorb → `/settings model` | **none — #1965** |
@@ -238,6 +248,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**80 registered, 44 of them typed as `/` commands (55 tokens).** Absorb 20 · keep 57 · panel 3. Receipts: settings 19 · events 6 · read-only 37 · **missing 18**.
+**80 registered, 45 of them typed as `/` commands (56 tokens).** Absorb 20 · keep 56 · panel 4. Receipts: settings 19 · events 6 · workspace policies 1 · read-only 36 · **missing 18**.
 
 <!-- END GENERATED -->

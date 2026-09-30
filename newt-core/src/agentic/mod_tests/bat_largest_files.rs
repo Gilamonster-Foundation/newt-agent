@@ -190,6 +190,7 @@ pub(super) async fn run_scenario_for(
         messages: &messages,
         task: prompt,
         workspace: &ws,
+        default_command_cwd: None,
         color: false,
         markdown: false,
         tool_offload: false,

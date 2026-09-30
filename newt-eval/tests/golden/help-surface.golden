@@ -53,6 +53,8 @@
   /mode [name]             - show/set operating style: chat, dev, admin, plan, diagnose, auto, full-auto
   /posture [name]          - show/set configured posture; permission floor is optional
   /permissions             - prompted decisions + active permission posture
+  /workspace               - review and save workspace access for the next process launch
+  /settings workspaces     - open the same operator workspace editor
   /status                  - session and environment summary (the default view)
   /status <topic>          - config · version · workspace · loadout · byline · memory · models · info
   /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers

@@ -2097,6 +2097,33 @@ when the required set cannot fit, the 512-byte pointer reserve still hardcoded
 in the deterministic `project` fallback, classifier-verdict parsing, and any
 change to authority or to the validator.
 
+## Step 27.13 — Operator-managed workspace profiles
+
+**Branch:** `step-27.13-workspace-settings`
+
+Add `/settings workspaces` with `/workspace` as its operator shortcut; keep
+`/status workspace` read-only. Review canonical directory roots, a confined
+command/write preset, a working directory inside the workspace, and an optional
+default workspace. Save the exact reviewed snapshot with full-store CID
+compare-and-set in the existing signed, encrypted approval store. Verify linked
+before/after history on read and retain inverse edits. Apply saved authority only
+in a new Newt process; `/restart` does not reload it. Protect operator keys,
+configuration, and policy against model access and later grant expansion.
+
+**Acceptance:** stale reviews and changed directory aliases fail closed;
+unrelated missing profiles remain repairable. The model and noninteractive
+surfaces cannot save profiles. Existing approvals, explicit launch choices,
+network policy, and Build gates remain independently visible and enforced.
+Deleting a profile neither erases its history nor revokes a running session.
+
+**Platform validation:** native filesystem confinement is exercised on macOS.
+Linux and Windows runtime qualification remains separate; this step does not
+add sandbox capabilities missing from a platform backend.
+
+**Out of scope:** live capability revocation/job draining, model-authored
+authority changes, network-rule monitoring, and new platform sandbox backends.
+See [saved workspace access](guide/workspace-settings.md).
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

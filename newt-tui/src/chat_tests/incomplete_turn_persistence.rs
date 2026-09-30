@@ -88,6 +88,7 @@ fn a_tool_event() -> newt_core::ToolEvent {
         ok: true,
         duration_ms: Some(42),
         execution: None,
+        from_cache: false,
     }
 }
 

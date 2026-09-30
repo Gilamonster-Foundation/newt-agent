@@ -15,6 +15,7 @@ fn payload() -> Payload {
                 (DenialKind::GitWrite, "add".into()),
             ]),
         )]),
+        ..Payload::empty()
     }
 }
 
@@ -109,4 +110,43 @@ fn durable_grants_bounds_reject_before_encrypting_or_parsing() {
         .map(|index| (format!("{workspace}/{index}"), grants.clone()))
         .collect();
     assert!(encode(&excessive, &root, &encryption).is_err());
+}
+
+#[test]
+fn verified_store_accepts_a_profile_and_its_content_addressed_history() {
+    let root = UserKey::generate();
+    let encryption = TokenIdentity::generate();
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let profile = serde_json::json!({
+        "preset": "workspace_edit",
+        "default_cwd": workspace,
+        "read_dirs": [],
+        "write_dirs": []
+    });
+    let profiles = BTreeMap::from([(workspace.to_str().unwrap(), profile)]);
+    let mut journal = crate::event_journal::Journal::new();
+    let change = journal
+        .append(serde_json::json!({
+            "before": {},
+            "after": { "profiles": profiles }
+        }))
+        .unwrap();
+    let payload = serde_json::json!({
+        "schema": SCHEMA,
+        "workspaces": {},
+        "profiles": profiles,
+        "profile_history": [change]
+    });
+    let signature = SerdeSig(root.sign(&canonical::to_canonical_dagcbor(&payload).unwrap()));
+    let signed = serde_json::json!({ "payload": payload, "signature": signature });
+    let ciphertext = crate::secrets::encrypt_to_identity(
+        &encryption,
+        &canonical::to_canonical_dagcbor(&signed).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        decode(ciphertext.as_bytes(), &root.public(), &encryption).is_ok(),
+        "a signed profile with a verified genesis change must load"
+    );
 }
