@@ -31,6 +31,12 @@ Required local tools:
 - `agent-bridle-aclaunch.exe` from `cargo install agent-bridle-aclaunch --version 0.7.10 --locked`
 - `ab-netprobe.exe`, installed by the same package
 
+Current native Git tests additionally require the explicit elevated
+[NUL host preparation](../../guide/windows-prerequisites.md) once per boot.
+CI runs that bounded DACL update before ordinary tests; it is not performed by
+the sandbox launcher or by Newt at runtime. The historical evidence below
+predates this prerequisite and is not itself proof of native Git effects.
+
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing
 launcher/probe or missing UNC positive control is a hard failure rather than a

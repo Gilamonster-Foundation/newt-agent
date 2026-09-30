@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn workspace_editor_is_advertised_with_its_signed_policy_receipt() {
+    let command = lookup("workspace").expect("workspace is registered");
+    assert_eq!(command.surface, Surface::Slash);
+    assert_eq!(command.disposition, Disposition::Panel);
+    assert_eq!(format!("{:?}", receipt_for("workspace")), "WorkspacePolicy");
+    let page = crate::command_help_page("workspace").unwrap();
+    for fact in [
+        "/settings workspaces",
+        "/status workspace",
+        "restart",
+        "approvals",
+    ] {
+        assert!(page.contains(fact), "workspace help omits {fact}: {page}");
+    }
+    assert!(crate::help_lines()
+        .iter()
+        .any(|line| line.trim_start().starts_with("/workspace ")));
+}
+
 /// **The #1965 debt, counted so it can be paid down.**
 ///
 /// Slash commands never reach the receipt path — that is how a round-cap

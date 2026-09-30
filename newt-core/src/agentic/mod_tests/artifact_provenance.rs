@@ -36,6 +36,7 @@ fn ctx<'a>(
         messages,
         task,
         workspace,
+        default_command_cwd: None,
         color: false,
         markdown: false,
         tool_offload: false,

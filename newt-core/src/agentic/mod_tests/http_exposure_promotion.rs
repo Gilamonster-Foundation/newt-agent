@@ -115,6 +115,7 @@ impl Wire {
 
     /// Point `context` at this wire and run the turn.
     async fn run(self, mut context: ChatCtx<'_>, mcp: &mut dyn McpTools) {
+        let _settings = default_loop_settings();
         match self {
             Self::Ollama => {
                 chat_complete(context, mcp).await.unwrap();

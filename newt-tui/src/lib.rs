@@ -20,6 +20,9 @@ mod inference_panel;
 mod migration_notices;
 mod navigator_cmds;
 mod session_capability;
+mod workspace_launch;
+mod workspace_settings;
+pub use workspace_launch::{resolve_code_workspace, CodeWorkspace};
 // `chat.rs` establishes and reapplies the session capability, and
 // lib_tests/caveat_policy_tests.rs covers it beside `policy_for`, which stays
 // here — so this is a named re-export rather than a moved test module.
@@ -9808,8 +9811,9 @@ fn confine_under_root(
 }
 
 /// Execute `/cd` against `session_cwd`. Never touches the agent's `workspace`,
-/// the OCAP fence, or the process cwd — only the local `session_cwd`, confined
-/// under `root`. A bare `/cd` (empty `arg`) returns to the root.
+/// the OCAP fence, or the process cwd. The local `session_cwd` supplies the
+/// default for subsequent run_command calls, confined under `root`. A bare
+/// `/cd` (empty `arg`) returns to the root.
 fn run_cd(arg: &str, session_cwd: &mut std::path::PathBuf, root: &str, color: bool, verbose: bool) {
     if matches!(arg, "--help" | "-h") {
         print_newt(

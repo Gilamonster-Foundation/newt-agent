@@ -20,6 +20,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         messages,
         task: "do the thing",
         workspace: ".",
+        default_command_cwd: None,
         color: false,
         markdown: false,
         tool_offload: false,
@@ -184,6 +185,27 @@ impl Respond for AcceptsLargePrompts {
 /// the Refused bail across the following rounds.
 #[tokio::test]
 async fn poisoned_low_budget_recovers_via_accepted_observation_and_raise() {
+    // Model the two-round brake installed by a sibling fixture. The budget
+    // observation scenario must own its default policy and restore the caller.
+    let _caller = crate::test_guard::GlobalSettingsGuard::acquire();
+    let foreign = crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 2,
+        },
+        ..Default::default()
+    };
+    crate::initiative::set_initiative_config(foreign.clone());
+    check_accepted_observation_raises_budget().await;
+    assert_eq!(
+        crate::initiative::initiative_config(),
+        Some(foreign),
+        "the observation fixture must restore its caller's policy"
+    );
+}
+
+async fn check_accepted_observation_raises_budget() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let tools_rounds = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -260,6 +282,7 @@ impl Respond for ToolCallsWithUsage {
 /// skips (the spec's headline property).
 #[tokio::test]
 async fn err_turn_still_delivered_accepted_observations_first() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -344,6 +367,7 @@ impl Respond for ThinkingOnlyThenRecover {
 
 #[tokio::test]
 async fn thinking_only_response_emits_one_thinking_only_observation() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -421,6 +445,7 @@ impl Respond for TruncationSuspectResponder {
 
 #[tokio::test]
 async fn truncation_suspect_rounds_emit_nothing() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     // Derive the window from the live catalog. The exact prompt + schemas
     // must fit the input ceiling (input_ceiling_pct% of num_ctx), so reserve
@@ -507,6 +532,7 @@ impl Respond for OpenAiAcceptsResponder {
 
 #[tokio::test]
 async fn openai_loop_reports_accepted_rounds() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -576,6 +602,7 @@ impl Respond for PersistentEmptyOverflow {
 
 #[tokio::test]
 async fn persistent_empty_over_safe_context_emits_suspected_overflow() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -679,6 +706,7 @@ impl Respond for OllamaTextOnce {
 
 #[tokio::test]
 async fn accepted_text_emits_exactly_one_accepted() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -747,6 +775,7 @@ impl Respond for OllamaValidToolThenText {
 
 #[tokio::test]
 async fn validated_tool_calls_emit_one_accepted_and_survive_execution_failure() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -792,6 +821,7 @@ async fn validated_tool_calls_emit_one_accepted_and_survive_execution_failure() 
 /// Scope of the count: the Ollama primary loop's probe and cap-exit summary. Summarizer, auxiliary and other wires are not yet wired.
 #[tokio::test]
 async fn every_ollama_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -879,6 +909,7 @@ impl Respond for OllamaToolThenCapSummary {
 /// requests on `/api/chat` when the round cap ends the turn.
 #[tokio::test]
 async fn an_ollama_cap_exit_summary_is_one_ledger_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -959,6 +990,7 @@ impl Respond for OllamaBlockerThenAnswer {
 /// rejected was still generated, so its usage joins the turn.
 #[tokio::test]
 async fn a_grounding_nudge_keeps_the_rejected_answers_usage() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -1025,6 +1057,7 @@ impl Respond for OllamaMalformedThenText {
 
 #[tokio::test]
 async fn content_invalid_tool_batch_emits_no_accepted() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -1095,6 +1128,7 @@ impl Respond for OpenAiMalformedThenText {
 
 #[tokio::test]
 async fn openai_content_invalid_tool_batch_emits_no_accepted() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1168,6 +1202,7 @@ impl Respond for OpenAiTruncatedArgsThenText {
 
 #[tokio::test]
 async fn openai_truncated_tool_args_never_reach_a_later_request_body() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1227,6 +1262,7 @@ impl Respond for OpenAiDuplicateId {
 
 #[tokio::test]
 async fn openai_correlation_impossible_duplicate_id_emits_no_accepted() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1279,6 +1315,7 @@ impl Respond for OpenAiMissingId {
 
 #[tokio::test]
 async fn openai_correlation_impossible_missing_id_emits_no_accepted() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1329,6 +1366,7 @@ impl Respond for OllamaTextNoUsage {
 
 #[tokio::test]
 async fn none_usage_round_emits_no_accepted() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -1362,6 +1400,7 @@ async fn none_usage_round_emits_no_accepted() {
 /// it cancelled, with no usage.
 #[tokio::test]
 async fn an_interrupted_ollama_probe_is_a_cancelled_attempt() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (url, server) =
         super::http_loop_tests::serve_until_interrupted("/api/chat", flag.clone()).await;
@@ -1439,6 +1478,7 @@ fn final_answer() -> serde_json::Value {
 async fn run_scripted(
     script: Vec<serde_json::Value>,
 ) -> (anyhow::Result<String>, Vec<serde_json::Value>, usize, usize) {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1594,6 +1634,7 @@ async fn run_recovery(
     Vec<crate::ToolEvent>,
     Vec<crate::ParseSignal>,
 ) {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1766,6 +1807,7 @@ fn mcp_tool_call() -> serde_json::Value {
 
 #[tokio::test]
 async fn missing_permission_gate_mcp_refusal_records_not_ok_on_the_chat_wire() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("POST"))

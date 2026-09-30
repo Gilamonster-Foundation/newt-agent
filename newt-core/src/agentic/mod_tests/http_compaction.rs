@@ -142,6 +142,7 @@ impl Respond for TrimObservingResponder {
 
 #[tokio::test]
 async fn mid_loop_compression_fires_when_message_list_grows() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let marker_seen = Arc::new(AtomicBool::new(false));
     let old_placeholder_seen = Arc::new(AtomicBool::new(false));
@@ -242,6 +243,7 @@ const CURRENT_TASK: &str =
 
 #[tokio::test]
 async fn openai_mid_loop_compaction_anchors_the_current_turn_not_historical_prompt() {
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let directive_seen = Arc::new(AtomicBool::new(false));
     let current_task_in_directive = Arc::new(AtomicBool::new(false));

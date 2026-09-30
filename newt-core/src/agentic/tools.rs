@@ -3423,6 +3423,7 @@ async fn execute_authorized_tool(
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
+        default_command_cwd,
         invocation,
         build_check_cmd,
         tool_evidence,
@@ -3585,6 +3586,13 @@ async fn execute_authorized_tool(
         Some(AliasOutcome::Correct(msg)) => return host_return(msg),
         None => name,
     };
+
+    let command_args =
+        match shell::command_args_with_default_cwd(name, args, workspace, default_command_cwd) {
+            Ok(args) => args,
+            Err(error) => return host_return(error.to_owned()),
+        };
+    let args = command_args.as_ref();
 
     // Eligible file reads and lifecycle commands use the governed built-ins.
     // Git commands keep their original arguments and use the confined exec
@@ -4154,10 +4162,8 @@ async fn execute_authorized_tool(
             // `lifecycle` arm (#891) so both honor identical exec caveats. A
             // folded leading `cd` becomes the cwd (it wins over an explicit
             // `cwd` arg — it's the more specific, in-command intent).
-            let run_cwd = resolve_exec_cwd(
-                workspace,
-                cd_path.as_deref().or_else(|| args["cwd"].as_str()),
-            );
+            let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
+            let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
             if let Err(reason) = native_git::preflight(
                 cmd,
                 std::path::Path::new(&run_cwd),

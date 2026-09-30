@@ -31,11 +31,13 @@
 //! `/settings` mutation path is what makes fixing them tractable — one path
 //! to instrument instead of twenty.
 //!
-//! There are **two** destinations, and the column names which (#2085 PR-E2).
+//! The column names each destination (#2085 PR-E2; Step 27.13).
 //! A SETTING has a from→to and lands as a `newt_core::settings_receipt` row
 //! ([`Receipt::Journal`]); an OPERATION has no prior value and lands on the
 //! chained `newt_core::event_journal` ([`Receipt::Event`]). Both writers read
-//! this column, and neither reads the other's variant.
+//! this column, and neither reads the other's variant. Workspace profiles use
+//! their signed, encrypted authority store ([`Receipt::WorkspacePolicy`]); its
+//! verified history is committed atomically with the policy itself.
 
 /// Which surface a command belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +118,9 @@ pub(crate) enum Surface {
     /// mutator shim never gets to die. The nine reads folded into `/status`
     /// go on printing through the deprecation window, because printing twice
     /// harms nobody and §3.3 is explicit that reads must keep working on a
-    /// pipe — `newt solve`, the eval harness and wyvern read `/version` and
-    /// `/workspace` off one today. What retires now is the claim on the
+    /// pipe — `newt solve`, the eval harness and wyvern can read `/version`
+    /// off one. Workspace reads now use `/status workspace`; `/workspace`
+    /// was restored as the operator editor in Step 27.13. What retires is the claim on the
     /// top-level surface and the help line, not the output.
     Retired(&'static str),
 }
@@ -156,6 +159,11 @@ pub(crate) enum Receipt {
     /// that `settings_receipt` should join the chain, and when it does these
     /// two collapse back into one.
     Event,
+    /// The signed, encrypted `ocap/session-grants.age` authority store beside
+    /// the trusted operator config. Its linked before/after profile history
+    /// verifies on read and is saved by the reviewed compare-and-set operation,
+    /// not by the ordinary settings/event receipt writers.
+    WorkspacePolicy,
     /// Mutates session state and records NOTHING today — #1965.
     Missing,
 }
@@ -342,13 +350,12 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::None_,
         Surface::Retired("/status version"),
     ),
-    cmd_on(
+    cmd(
         "workspace",
         &[],
         Family::Meta,
-        Disposition::Keep,
-        Receipt::None_,
-        Surface::Retired("/status workspace"),
+        Disposition::Panel,
+        Receipt::WorkspacePolicy,
     ),
     cmd(
         "backends",
@@ -1189,6 +1196,9 @@ mod target_set_doc {
             Receipt::None_ => "— read-only",
             Receipt::Journal => "`~/.newt/receipts.jsonl`",
             Receipt::Event => "`~/.newt/events.jsonl` (chained)",
+            Receipt::WorkspacePolicy => {
+                "`ocap/session-grants.age` beside operator config (signed, encrypted, chained)"
+            }
             Receipt::Missing => "**none — #1965**",
         }
     }
@@ -1243,7 +1253,7 @@ mod target_set_doc {
         out.push_str(&format!(
             "\n**{} registered, {} of them typed as `/` commands ({} tokens).** \
              Absorb {} · keep {} · panel {}. \
-             Receipts: settings {} · events {} · read-only {} · **missing {}**.\n",
+             Receipts: settings {} · events {} · workspace policies {} · read-only {} · **missing {}**.\n",
             COMMANDS.len(),
             slash_commands().count(),
             slash_tokens().len(),
@@ -1252,6 +1262,7 @@ mod target_set_doc {
             count(Disposition::Panel),
             receipts(Receipt::Journal),
             receipts(Receipt::Event),
+            receipts(Receipt::WorkspacePolicy),
             receipts(Receipt::None_),
             receipts(Receipt::Missing),
         ));

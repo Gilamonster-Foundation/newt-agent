@@ -592,6 +592,69 @@ pub(crate) fn erasing_screen(stream: &str, rows: usize) -> (Vec<String>, (usize,
     (lines, (row, col))
 }
 
+fn panel_repaint_rows(stream: &str, terminal_rows: usize) -> Vec<String> {
+    erasing_grid(stream, terminal_rows)
+}
+
+fn panel_height(rows: &[String]) -> Option<usize> {
+    let top = rows.iter().position(|row| row.contains('╭'));
+    let bottom = rows.iter().rposition(|row| row.contains('╰'));
+    top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
+}
+
+fn wait_for_panel_repaint(
+    pty: &Pty,
+    terminal_rows: usize,
+    ready: impl Fn(&[String]) -> bool,
+) -> Result<(String, Vec<String>), String> {
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    let mut repaint = String::new();
+    let mut rows = Vec::new();
+    // Ratatui ends each panel frame by hiding the cursor. A corner alone
+    // can belong to an earlier repaint or precede the remainder of a frame.
+    // Accumulate complete frames until the actual requested state is visible;
+    // a drain is not a frame boundary, and an old frame cannot acknowledge
+    // the next input just because it also contains a bottom-right corner.
+    const FRAME_END: &str = "\x1b[?25l";
+    while pty.wait_for_screen(
+        FRAME_END,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        repaint.push_str(&pty.screen());
+        if let Some(end) = repaint.rfind(FRAME_END) {
+            rows = panel_repaint_rows(&repaint[..end + FRAME_END.len()], terminal_rows);
+            if ready(&rows) {
+                return Ok((repaint, rows));
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err(format!(
+        "panel repaint did not reach the requested state: {rows:?}; bytes: {repaint:?}"
+    ))
+}
+
+#[test]
+fn panel_repaint_discards_erased_zoom_frame_in_one_drain() {
+    // A drain may contain the final zoomed frame followed by its erase and
+    // the restored inline frame. These are the same ED/CUP operations the
+    // real panel emits; the first border must no longer count toward height.
+    let repaint = concat!(
+        "\x1b[1;1H╭ zoom ╮\x1b[2;1H❯ stale selection",
+        "\x1b[20;1H╰──────╯\x1b[?25l",
+        "\x1b[1;1H\x1b[J",
+        "\x1b[13;1H╭ loop ╮\x1b[14;1H❯ panel-row-03",
+        "\x1b[20;1H╰──────╯\x1b[?25l",
+    );
+    let rows = panel_repaint_rows(repaint, 20);
+    assert_eq!(rows.iter().position(|row| row.contains('╭')), Some(12));
+    assert_eq!(rows.iter().rposition(|row| row.contains('╰')), Some(19));
+    assert!(rows[13].contains("❯ panel-row-03"));
+    assert!(!rows.iter().any(|row| row.contains("stale selection")));
+}
+
 /// #2573 review: drive a real panel through resizes and keys, then close it.
 /// The selection must survive, no resize may erase from row 0 (the transcript
 /// above the panel stays), the border must sit at each new width, and the
@@ -603,27 +666,27 @@ pub(crate) fn drive_cockpit_panel_loop() {
     let mut child = spawn_child(&pty, "cockpit_panel_loop");
     let mut transcript = String::new();
     let result = (|| -> Result<(), String> {
-        if !pty.wait_for_screen_after("panel-row-00", "╯", REACH_TIMEOUT) {
-            return Err("the panel never painted".into());
-        }
-        transcript.push_str(&pty.screen());
+        let (repaint, _) = wait_for_panel_repaint(&pty, 24, |rows| {
+            panel_height(rows) == Some(8) && rows.iter().any(|row| row.contains("❯ panel-row-00"))
+        })?;
+        transcript.push_str(&repaint);
         pty.type_in("jjj");
-        if !pty.wait_for_screen("panel-row-03", REACH_TIMEOUT) {
-            return Err("the selection did not move".into());
-        }
-        transcript.push_str(&pty.screen());
+        let (repaint, _) = wait_for_panel_repaint(&pty, 24, |rows| {
+            rows.iter().any(|row| row.contains("❯ panel-row-03"))
+        })?;
+        transcript.push_str(&repaint);
         for &(height, width) in &[(24u16, 50u16), (24, 100), (40, 100), (16, 100)] {
             pty.resize(height, width);
             signal_winch(child.id());
-            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
-                return Err(format!("no repaint after resize to {width}x{height}"));
-            }
-            let repaint = pty.screen();
+            let (repaint, rows) = wait_for_panel_repaint(&pty, usize::from(height), |rows| {
+                rows.iter()
+                    .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
+                    && rows.iter().any(|row| row.contains("❯ panel-row-03"))
+            })?;
             transcript.push_str(&repaint);
             if repaint.contains("\x1b[1;1H\x1b[J") || repaint.contains("\x1b[2J") {
                 return Err(format!("resize to {width}x{height} erased from row 0"));
             }
-            let rows = screen_grid(&repaint);
             if !rows
                 .iter()
                 .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
@@ -638,11 +701,7 @@ pub(crate) fn drive_cockpit_panel_loop() {
         }
         // #2574: the sizing keys, through the same loop. Height is counted
         // from the drawn borders; the selection must survive every step.
-        let panel_height = |rows: &[String]| {
-            let top = rows.iter().position(|row| row.contains('╭'));
-            let bottom = rows.iter().rposition(|row| row.contains('╰'));
-            top.zip(bottom).map(|(top, bottom)| bottom - top + 1)
-        };
+        let mut terminal_height = 16;
         for (keys, want, what) in [
             ("\x1b[1;2A", Some(9), "Shift-Up grows one row"),
             ("\x1b[1;2B", Some(8), "Shift-Down shrinks one row"),
@@ -666,17 +725,21 @@ pub(crate) fn drive_cockpit_panel_loop() {
                 let (h, w) = size.split_once('x').expect("HxW");
                 let (h, w): (u16, u16) = (h.parse().unwrap(), w.parse().unwrap());
                 width = w;
+                terminal_height = usize::from(h);
                 pty.resize(h, w);
                 signal_winch(child.id());
             } else {
                 pty.type_in(keys);
             }
-            if !pty.wait_for_screen("╯", REACH_TIMEOUT) {
-                return Err(format!("no repaint after: {what}"));
-            }
-            let repaint = pty.screen();
+            let (repaint, rows) = wait_for_panel_repaint(&pty, terminal_height, |rows| {
+                panel_height(rows) == want
+                    && rows.iter().any(|row| row.contains("❯ panel-row-03"))
+                    && rows
+                        .iter()
+                        .any(|row| row.chars().nth(usize::from(width - 1)) == Some('╯'))
+            })
+            .map_err(|error| format!("{what}: {error}"))?;
             transcript.push_str(&repaint);
-            let rows = screen_grid(&repaint);
             if panel_height(&rows) != want {
                 return Err(format!(
                     "{what}: height {:?}: {rows:?}",

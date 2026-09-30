@@ -40,6 +40,7 @@ mod native_git_broker;
 pub mod netguard;
 pub mod owned_hosts;
 pub mod permission_journal;
+pub mod workspace_protection;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
 // Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).

@@ -129,17 +129,25 @@ use super::*;
 /// an operator tried it. Registering it — plus its `/chat` alias — is the
 /// same honest raise as `/models` above: the guarded surface catching up to
 /// the surface that exists.
+///
+/// # 44/55 → 45/56: operator workspace profiles (Step 27.13)
+///
+/// `/workspace` is restored as the explicit shortcut to the reviewed operator
+/// editor at `/settings workspaces`. The old path read remains `/status
+/// workspace`. This is an intentional additional operator entry point, not a
+/// model tool or a new settings implementation; both doors use one editor and
+/// the signed policy store. Its durable receipt is registered separately.
 #[test]
 fn the_registered_surface_only_shrinks() {
     assert!(
-        slash_commands().count() <= 44,
+        slash_commands().count() <= 45,
         "the slash surface GREW to {} commands. #1981 is a reduction: a \
          new command needs an argument for why it is not a field of \
          /settings or a subcommand of an existing verb",
         slash_commands().count()
     );
     assert!(
-        slash_tokens().len() <= 55,
+        slash_tokens().len() <= 56,
         "the slash surface GREW to {} tokens",
         slash_tokens().len()
     );

@@ -174,7 +174,7 @@ fn an_exec_grant_never_widens_recalled_fs_read_via_either_grant_store() {
     state
         .session_grants
         .insert((DenialKind::Exec, "cargo".to_string()));
-    let widened = state.recalled_caveats(&base, None);
+    let widened = state.recalled_caveats(&base, None).unwrap();
     assert!(widened.permits_exec("cargo"));
     assert!(
         !widened.permits_fs_read(credentials),
@@ -189,7 +189,7 @@ fn an_exec_grant_never_widens_recalled_fs_read_via_either_grant_store() {
     durable_state
         .durable_grants
         .insert((DenialKind::Exec, "cargo".to_string()));
-    let widened_durable = durable_state.recalled_caveats(&base, None);
+    let widened_durable = durable_state.recalled_caveats(&base, None).unwrap();
     assert!(
         !widened_durable.permits_fs_read(credentials),
         "a durable/ocap-approved exec:cargo grant must never widen fs_read either"
@@ -283,7 +283,7 @@ fn answering_the_fetch_prompt_with_the_strongest_allow_records_no_net_grant() {
         fetch_request("static.crates.io"),
     ];
     let _ = gate.ask(&requests);
-    let after = state.recalled_caveats(&base, None);
+    let after = state.recalled_caveats(&base, None).unwrap();
     for host in ["index.crates.io", "static.crates.io"] {
         assert!(
             !after.permits_net(host),

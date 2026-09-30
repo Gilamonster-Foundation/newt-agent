@@ -227,7 +227,7 @@ where
                 }
             }
         }
-        let caveats = gate.current_caveats();
+        let caveats = gate.current_caveats()?;
         let mut hosts = context
             .cfg
             .tui

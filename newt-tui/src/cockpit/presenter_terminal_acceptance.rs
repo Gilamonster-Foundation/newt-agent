@@ -679,6 +679,22 @@ fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
 // from libtest's parallel result writer: a blocked write to the undrained
 // capture can otherwise keep dup2 from restoring fd 1 during teardown.
 pub(crate) fn cockpit_acceptance_case() {
+    let result = std::panic::catch_unwind(acceptance_case);
+    if let Err(error) = result {
+        // The inner fixture has restored stdout after unwinding its owned
+        // terminal. Preserve the assertion for the parent, whose child stderr
+        // is intentionally disconnected from the terminal under test.
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("non-text panic");
+        println!("COCKPIT_ACCEPTANCE_FAILURE:{message}");
+        std::panic::resume_unwind(error);
+    }
+}
+
+fn acceptance_case() {
     let tty = TestTty::install();
     // This disposable child owns the tty queried by Crossterm's geometry API.
     //

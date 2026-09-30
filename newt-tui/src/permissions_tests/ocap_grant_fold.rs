@@ -59,7 +59,7 @@ fn ocap_approval_does_not_reach_caveats_before_folding() {
         ..Default::default()
     };
     let base = fenced_base("/ws");
-    let caveats = state.recalled_caveats(&base, None);
+    let caveats = state.recalled_caveats(&base, None).unwrap();
     assert!(
         !newt_core::caveats::permits_path(&caveats.fs_read, "/outside/token"),
         "an ocap_policy that is never folded must not widen recall"
@@ -68,7 +68,7 @@ fn ocap_approval_does_not_reach_caveats_before_folding() {
     // guard only pins that `ocap_policy` alone (pre-fold) does nothing.
     state.fold_ocap_approvals();
     assert!(newt_core::caveats::permits_path(
-        &state.recalled_caveats(&base, None).fs_read,
+        &state.recalled_caveats(&base, None).unwrap().fs_read,
         "/outside/token"
     ));
 }
@@ -85,7 +85,7 @@ fn fold_ocap_approvals_widens_recalled_caveats_like_a_durable_grant() {
     };
     state.fold_ocap_approvals();
     let base = fenced_base("/ws");
-    let widened = state.recalled_caveats(&base, None);
+    let widened = state.recalled_caveats(&base, None).unwrap();
     assert!(newt_core::caveats::permits_path(
         &widened.fs_read,
         "/outside/token"
@@ -97,7 +97,7 @@ fn fold_ocap_approvals_widens_recalled_caveats_like_a_durable_grant() {
     ));
     // Attenuate-only: the ceiling still wins over a folded grant.
     let ceiling = fenced_base("/ws");
-    let capped = state.recalled_caveats(&base, Some(&ceiling));
+    let capped = state.recalled_caveats(&base, Some(&ceiling)).unwrap();
     assert!(!newt_core::caveats::permits_path(
         &capped.fs_read,
         "/outside/token"
@@ -121,7 +121,7 @@ fn folding_never_resurrects_an_unverified_approve() {
         ..Default::default()
     };
     state.fold_ocap_approvals();
-    let widened = state.recalled_caveats(&fenced_base("/ws"), None);
+    let widened = state.recalled_caveats(&fenced_base("/ws"), None).unwrap();
     assert!(!newt_core::caveats::permits_path(
         &widened.fs_read,
         "/outside/token"

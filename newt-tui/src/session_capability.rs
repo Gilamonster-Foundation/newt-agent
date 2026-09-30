@@ -28,6 +28,7 @@ pub(crate) struct SessionCapability {
     op: Option<newt_identity::AgentKey>,
     caveats: newt_core::caveats::Caveats,
     delegation: Option<newt_identity::VerifiedDelegation>,
+    frozen_at_launch: bool,
 }
 
 impl SessionCapability {
@@ -39,6 +40,26 @@ impl SessionCapability {
         delegation: Option<newt_identity::VerifiedDelegation>,
     ) -> Self {
         let policy = policy_for(tui, workspace);
+        Self::from_policy(policy, key_path, delegation)
+    }
+
+    /// Establish an operator-reviewed launch policy independently of mutable
+    /// configuration. Saved profile edits are applied by a new process only.
+    pub(crate) fn establish_frozen(
+        policy: newt_core::Caveats,
+        key_path: Option<&std::path::Path>,
+        delegation: Option<newt_identity::VerifiedDelegation>,
+    ) -> Self {
+        let mut session = Self::from_policy(policy, key_path, delegation);
+        session.frozen_at_launch = true;
+        session
+    }
+
+    fn from_policy(
+        policy: newt_core::Caveats,
+        key_path: Option<&std::path::Path>,
+        delegation: Option<newt_identity::VerifiedDelegation>,
+    ) -> Self {
         // A delegated session inherits its ceiling; it does not establish one.
         //
         // `key_path` is deliberately still accepted and deliberately still
@@ -61,6 +82,7 @@ impl SessionCapability {
                 op: None,
                 caveats,
                 delegation: Some(d),
+                frozen_at_launch: false,
             };
         }
         let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());
@@ -72,6 +94,7 @@ impl SessionCapability {
             op,
             caveats,
             delegation: None,
+            frozen_at_launch: false,
         }
     }
 
@@ -118,6 +141,9 @@ impl SessionCapability {
     /// holds and was therefore clamped (so the caller can tell the user a
     /// restart is required to widen).
     pub(crate) fn reapply(&mut self, tui: Option<newt_core::TuiConfig>, workspace: &str) -> bool {
+        if self.frozen_at_launch {
+            return false;
+        }
         let requested = policy_for(tui, workspace);
         let narrowed = requested.meet(&self.caveats);
         let clamped = narrowed != requested;

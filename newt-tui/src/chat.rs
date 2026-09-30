@@ -1936,8 +1936,23 @@ fn session_body(
             (None, newt_core::durable_grants::GrantSet::new())
         }
     };
-    let mut cap =
-        SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
+    let mut workspace_settings =
+        crate::workspace_launch::WorkspaceSession::load(std::path::Path::new(workspace))?;
+    let workspace_permissions = resolve_tui(&cfg)
+        .map(|tui| tui.permissions)
+        .unwrap_or_default();
+    let mut cap = match workspace_settings
+        .policy(std::path::Path::new(workspace), &workspace_permissions)?
+    {
+        Some(policy) => SessionCapability::establish_frozen(policy, key_path.as_deref(), None),
+        None => {
+            SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None)
+        }
+    };
+    workspace_settings.protect(cap.caveats())?;
+    if workspace_settings.profile.is_some() {
+        print_newt("Saved workspace settings active. Changes in /settings workspaces apply after a full Newt restart.", color, verbose);
+    }
     let smart_startup_caveats = cap.caveats().clone();
     let smart_config = cfg.smart_harness.clone().filter(|config| config.enabled);
     anyhow::ensure!(
@@ -2056,6 +2071,7 @@ fn session_body(
     let mut permission_state =
         PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
     permission_state.durable_grants = durable_grants;
+    permission_state.protection = workspace_settings.protection.clone();
     permission_state.prompt_default = cfg
         .tui
         .as_ref()
@@ -2205,14 +2221,14 @@ fn session_body(
     explicit_net_hosts.sort();
     explicit_net_hosts.dedup();
     let startup_caveats =
-        permission_state.recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()));
+        permission_state.recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()))?;
     let startup_cancel = std::sync::atomic::AtomicBool::new(false);
     let startup_exit = std::sync::atomic::AtomicBool::new(false);
     permission_state.mcp_net_prompt_default = cfg
         .tui
         .as_ref()
         .map(|tui| tui.permissions.mcp_net_prompt_default);
-    let mut mcp = tokio::task::block_in_place(|| {
+    let mut mcp = tokio::task::block_in_place(|| -> anyhow::Result<_> {
         let mut permission_gate = interactive.then(|| PromptPermissionGate {
             ask_surface: Some(&ask_surface),
             #[cfg(feature = "rich-tui")]
@@ -2239,27 +2255,31 @@ fn session_body(
                     &newt_core::interaction_surface::SurfaceInteraction,
                 ) -> PromptChoice,
         });
-        let connect_caveats = permission_gate
-            .as_ref()
-            .map_or_else(|| startup_caveats.clone(), |gate| gate.current_caveats());
+        let connect_caveats = permission_gate.as_ref().map_or_else(
+            || Ok(startup_caveats.clone()),
+            |gate| gate.current_caveats(),
+        )?;
         let mut grant_net = |request: &newt_core::PermissionRequest| {
             if startup_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             permission_gate.as_mut()?.ask_mcp_net_grant(request)
         };
-        rt.block_on(Mcp::connect(
+        Ok(rt.block_on(Mcp::connect(
             workspace,
             &cfg_mcp_servers,
             sanitize_mcp,
             &allow_insecure_hosts,
             // #1243 Leg 3: the full session leash (not just its net axis) so a
             // spawned stdio MCP server is confined to the session's authority.
-            &connect_caveats,
+            crate::mcp::McpLaunchAuthority {
+                caveats: &connect_caveats,
+                protection: workspace_settings.protection.clone(),
+            },
             &explicit_net_hosts,
             Some((&mut grant_net, &startup_cancel)),
-        ))
-    });
+        )))
+    })?;
     if startup_exit.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
     }
@@ -2304,7 +2324,11 @@ fn session_body(
     // Human `/cd` session working directory — SEPARATE from the
     // OCAP-load-bearing `workspace`. `/cd` moves it (confined below `workspace`),
     // the prompt shows it; it never mutates `workspace` or the process cwd.
-    let mut session_cwd = std::path::PathBuf::from(workspace);
+    let mut session_cwd = workspace_settings
+        .profile
+        .as_ref()
+        .map(|profile| profile.default_cwd.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from(workspace));
 
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
@@ -3451,6 +3475,50 @@ fn session_body(
                     // A bare `/help` falls through to the full command list.
                     if let Some(topic) = help_request(&task) {
                         print_command_help(&topic, color, verbose, markdown_enabled(&cfg, color));
+                        println!();
+                        continue;
+                    }
+                    // Only operator-origin input reaches this branch. The form
+                    // edits an immutable next-launch candidate, never the live
+                    // capability or the model's tool surface.
+                    macro_rules! manage_workspaces {
+                        () => {{
+                            let result = (|| -> anyhow::Result<Vec<String>> {
+                                anyhow::ensure!(workspace_settings.protection.is_some(),
+                                    "{}", workspace_settings.unavailable.as_deref().unwrap_or("workspace settings were not protected at startup"));
+                                let recalled = permission_state.recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()))?;
+                                let posture = newt_core::posture::active_posture();
+                                let active = operating_mode_caveats(active_operating_mode,
+                                    conversation_mode_states.plan.is_active(), effective_caveats(&recalled, posture.as_ref()));
+                                let permissions = resolve_tui(&cfg).map(|tui| tui.permissions).unwrap_or_default();
+                                let mut additional = vec![
+                                    "Explicit launch grants and separate permanent approvals are independent of saved profiles.".to_owned(),
+                                    "Operating modes and inherited delegation may further narrow this authority.".to_owned(),
+                                ];
+                                additional.extend(newt_core::ocap_store::approved_grants(&permission_state.ocap_policy).iter()
+                                    .map(|(kind, target)| format!("Signed OCAP approval: {} {}", kind.as_str(), serde_json::to_string(target).unwrap_or_default())));
+                                if newt_core::launch_authority::current().workspace_access() {
+                                    additional.push("This launch's --workspace-access overrides the saved command preset for this session only.".to_owned());
+                                }
+                                let validate = |root: &std::path::Path, profile: &newt_core::durable_grants::WorkspaceProfile| {
+                                    workspace_settings.validate_candidate(root, profile, &permissions)
+                                };
+                                crate::workspace_settings::run(crate::workspace_settings::WorkspaceSettingsContext {
+                                    workspace: std::path::Path::new(workspace), current_dir: &session_cwd,
+                                    active: &active, permissions: &permissions,
+                                    config_path: workspace_settings.config_path.as_deref(), key_path: workspace_settings.key_path.as_deref(),
+                                    interactive_operator: interactive, additional_access: &additional, validate: &validate,
+                                }, &ask_surface).map_err(anyhow::Error::msg)
+                            })();
+                            match result {
+                                Ok(lines) => for line in lines { print_newt(&line, color, verbose); },
+                                Err(error) => print_newt(&format!("Workspace settings: {error:#}"), color, verbose),
+                            }
+                        }};
+                    }
+                    if crate::workspace_settings::requested(&task) {
+                        manage_workspaces!();
+                        surface.save_history();
                         println!();
                         continue;
                     }
@@ -6453,6 +6521,7 @@ fn session_body(
                         let mut initial_section = None;
                         loop {
                             let mut walked_to_permissions = false;
+                            let mut walked_to_workspaces = false;
                             let mut walked_to_mcp = false;
                             let window = surface
                                 .open_panel(PanelMode::Inline(settings_panel::panel_height()));
@@ -6489,6 +6558,13 @@ fn session_body(
                                             model,
                                         } => {
                                             walked_to_permissions = true;
+                                            (lines, model)
+                                        }
+                                        settings_panel::Outcome::OpenWorkspaces {
+                                            lines,
+                                            model,
+                                        } => {
+                                            walked_to_workspaces = true;
                                             (lines, model)
                                         }
                                         settings_panel::Outcome::OpenBackends { lines, model } => {
@@ -6530,6 +6606,11 @@ fn session_body(
                                 }
                             }
                             cfg = crate::resolve_runtime_or_default();
+                            if walked_to_workspaces {
+                                manage_workspaces!();
+                                initial_section = Some('w');
+                                continue;
+                            }
                             if walked_to_mcp {
                                 manage_mcp!();
                                 initial_section = Some('m');
@@ -7832,7 +7913,7 @@ fn session_body(
                     // not only before tool dispatch. The same value is the gate
                     // base and the ChatCtx authority later in this turn.
                     let recalled_caveats = permission_state
-                        .recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()));
+                        .recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()))?;
                     let turn_caveats = operating_mode_caveats(
                         active_operating_mode,
                         conversation_mode_states.plan.is_active(),
@@ -7842,8 +7923,12 @@ fn session_body(
                         ),
                     );
                     let mut turn_system = format!(
-                        "{}\n\n{}\n\n{system}\n\n{session_controls}",
+                        "{}\n\nCurrent command working directory: {}. \
+                         run_command without cwd starts here. Explicit relative cwd and \
+                         relative file-tool paths resolve from the workspace root. \
+                         This does not change granted access.\n\n{}\n\n{system}\n\n{session_controls}",
                         workspace_state_block(workspace, &turn_caveats.fs_read),
+                        serde_json::json!(session_cwd),
                         runtime_context_block(
                             &inf_model,
                             &inf_url,
@@ -8497,6 +8582,10 @@ fn session_body(
                                         messages: &messages,
                                         task: &task,
                                         workspace,
+                                        // Preserve root read routing; only a distinct operator cwd
+                                        // changes the default for commands in this turn.
+                                        default_command_cwd: (session_cwd != std::path::Path::new(workspace))
+                                            .then_some(session_cwd.as_path()),
                                         color,
                                         // Step 25.4 (#568): `[tui].markdown` ∧
                                         // `/markdown` override ∧ color.

@@ -44,6 +44,38 @@ fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
 }
 
 #[test]
+fn approved_workspace_policy_stays_frozen_until_a_new_process_session() {
+    let _env = crate::test_env_guard::env_write_guard();
+    let policy = newt_core::Caveats {
+        fs_read: newt_core::Scope::only(["/project".into(), "/reference".into()]),
+        fs_write: newt_core::Scope::only(["/project".into()]),
+        exec: newt_core::Scope::All,
+        net: newt_core::Scope::only(["example.test".into()]),
+        ..newt_core::Caveats::top()
+    };
+    let mut cap = SessionCapability::establish_frozen(policy.clone(), None, None);
+    for next in [
+        newt_core::PermissionPreset::ReadOnly,
+        newt_core::PermissionPreset::FullAccess,
+    ] {
+        assert!(!cap.reapply(Some(tui_with(next)), "/different-workspace"));
+        assert_eq!(
+            cap.caveats(),
+            &policy,
+            "saved edits and ordinary config refresh cannot activate a profile mid-session"
+        );
+    }
+    let next_policy = newt_core::Caveats {
+        fs_write: newt_core::Scope::none(),
+        exec: newt_core::Scope::none(),
+        ..policy
+    };
+    let next_session = SessionCapability::establish_frozen(next_policy.clone(), None, None);
+    assert_eq!(next_session.caveats(), &next_policy);
+    assert_ne!(next_session.caveats(), cap.caveats());
+}
+
+#[test]
 fn workspace_access_launch_keeps_directory_fence_and_configured_network() {
     let _env = crate::test_env_guard::env_write_guard();
     let mut tui = tui_with(newt_core::PermissionPreset::ReadOnly);

@@ -34,6 +34,7 @@ fn ctx<'a>(
         messages,
         task: TASK,
         workspace,
+        default_command_cwd: None,
         color: false,
         markdown: false,
         tool_offload: false,
@@ -370,6 +371,7 @@ async fn active_task_survives_compression() {
 /// because the `num_ctx` newt itself sent fed into nothing.
 #[tokio::test]
 async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let log = Arc::new(Mutex::new(Vec::new()));
     let task_in_marker = Arc::new(AtomicBool::new(false));
@@ -718,6 +720,7 @@ impl Respond for OpenAiGauntletResponder {
 
 #[tokio::test]
 async fn openai_loop_compresses_with_the_same_pipeline() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let task_in_marker = Arc::new(AtomicBool::new(false));
     let summary_in_marker = Arc::new(AtomicBool::new(false));
@@ -1258,6 +1261,7 @@ impl Respond for NudgedHaulResponder {
 /// budget).
 #[tokio::test]
 async fn nudged_long_haul_keeps_fresh_group_results_intact() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let log: NudgedLog = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1408,6 +1412,7 @@ impl Respond for OversizedRoundResponder {
 /// the model returns the real answer.
 #[tokio::test]
 async fn oversized_single_round_dispatches_within_the_window() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let log: OversizedLog = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1550,6 +1555,7 @@ impl Respond for UnderreportedAnchorResponder {
 /// request contains actual `read_file` output, not a hand-built tool result.
 #[tokio::test]
 async fn exact_request_pressure_self_compacts_after_tracker_underreport() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let log = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1606,6 +1612,7 @@ async fn exact_request_pressure_self_compacts_after_tracker_underreport() {
 /// incompressible follow-up is refused before its wire dispatch.
 #[tokio::test]
 async fn hard_budget_thrash_latches_then_bails_with_named_error() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let log = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -1661,6 +1668,7 @@ async fn hard_budget_thrash_latches_then_bails_with_named_error() {
 /// with the named error.
 #[tokio::test]
 async fn lone_hwm_budget_fails_open_and_does_not_bail() {
+    let _settings = super::http_loop_tests::default_loop_settings();
     let server = MockServer::start().await;
     let log = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))

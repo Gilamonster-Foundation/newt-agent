@@ -167,7 +167,10 @@ fn durable_allows_are_exact_and_denials_still_win() {
         assert!(caveats.permits_net("example.test"));
         assert_eq!(hosts, vec!["example.test"]);
         assert!(retained);
-        assert!(!gate.mint(&gate.base, &[]).permits_net("sibling.test"));
+        assert!(!gate
+            .mint(&gate.base, &[])
+            .unwrap()
+            .permits_net("sibling.test"));
     }
     assert_eq!(prompts.get(), 0);
     assert!(state.session_grants.is_empty());
@@ -186,7 +189,10 @@ fn durable_allows_are_exact_and_denials_still_win() {
         gate.ask(&[request]),
         newt_core::PermissionDecision::Deny
     ));
-    assert!(!gate.mint(&gate.base, &[]).permits_net("example.test"));
+    assert!(!gate
+        .mint(&gate.base, &[])
+        .unwrap()
+        .permits_net("example.test"));
 }
 
 /// Grounds recalled-scope denial filtering in the real built-in filesystem
@@ -214,7 +220,7 @@ async fn recalled_directory_grants_do_not_bypass_permanent_child_denials() {
             fs_write: newt_core::caveats::Scope::none(),
             ..Caveats::top()
         };
-        let caveats = state.recalled_caveats(&base, None);
+        let caveats = state.recalled_caveats(&base, None).unwrap();
         let prompts = Rc::new(Cell::new(0));
         let mut gate = super::permission_prompt_tests::scripted_gate(
             &mut state,
@@ -269,7 +275,10 @@ fn recalled_basename_exec_grant_excludes_a_permanently_denied_path() {
         exec: newt_core::caveats::Scope::none(),
         ..Caveats::top()
     };
-    assert!(!state.recalled_caveats(&base, None).permits_exec("inspect"));
+    assert!(!state
+        .recalled_caveats(&base, None)
+        .unwrap()
+        .permits_exec("inspect"));
     let configured = Caveats {
         exec: newt_core::caveats::Scope::only(["inspect".into()]),
         ..base
@@ -277,6 +286,7 @@ fn recalled_basename_exec_grant_excludes_a_permanently_denied_path() {
     assert!(
         state
             .recalled_caveats(&configured, None)
+            .unwrap()
             .permits_exec("inspect"),
         "recall filtering must not rewrite configured authority"
     );
@@ -334,7 +344,7 @@ fn recall_overlap_checks_all_deny_sources_without_removing_unrelated_authority()
                 exec: newt_core::caveats::Scope::none(),
                 ..Caveats::top()
             };
-            let recalled = state.recalled_caveats(&base, None);
+            let recalled = state.recalled_caveats(&base, None).unwrap();
             assert!(
                 !ceiling_permits(&recalled, kind, allowed),
                 "{source} {kind:?}"
@@ -345,7 +355,7 @@ fn recall_overlap_checks_all_deny_sources_without_removing_unrelated_authority()
             );
             let configured = newt_core::widen_caveats(&base, &[(kind, allowed.into())]);
             assert!(ceiling_permits(
-                &state.recalled_caveats(&configured, None),
+                &state.recalled_caveats(&configured, None).unwrap(),
                 kind,
                 allowed
             ));

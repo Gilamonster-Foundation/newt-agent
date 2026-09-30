@@ -28,6 +28,25 @@ fn resolve_exec_cwd_confines_to_workspace() {
 }
 
 #[test]
+fn command_cwd_preserves_nonblank_literal_path_whitespace() {
+    let relative = " directory ";
+    let expected = std::path::Path::new("/workspace").join(relative);
+    assert_eq!(
+        resolve_exec_cwd("/workspace", Some(relative)),
+        expected.to_string_lossy()
+    );
+    let absolute = if cfg!(windows) {
+        r"C:\workspace\directory "
+    } else {
+        "/workspace/directory "
+    };
+    assert_eq!(resolve_exec_cwd("/workspace", Some(absolute)), absolute);
+    for blank in ["", " ", "\t\n"] {
+        assert_eq!(resolve_exec_cwd("/workspace", Some(blank)), "/workspace");
+    }
+}
+
+#[test]
 fn split_leading_cd_folds_the_habitual_cd_prefix() {
     // The reported failure: `cd <workspace> && git checkout -b …` tried to
     // exec the `cd` builtin. Fold it: cwd = the path, run the real command.

@@ -10,7 +10,10 @@ use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
-use super::{denial_context, denial_recovery_hint, full_access_requested, ocap_disabled};
+use super::{
+    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled, resolve_tool_alias,
+    AliasOutcome,
+};
 use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {
@@ -177,6 +180,35 @@ fn shell_env_passthrough() -> Vec<String> {
     }
 }
 
+/// Supply the operator's command default without changing the recorded model
+/// arguments, workspace identity, or any grant. Presentation uses the same
+/// projection as dispatch so it cannot predict a root-relative file redirect.
+pub(super) fn command_args_with_default_cwd<'a>(
+    name: &str,
+    args: &'a serde_json::Value,
+    workspace: &str,
+    default_cwd: Option<&std::path::Path>,
+) -> Result<std::borrow::Cow<'a, serde_json::Value>, &'static str> {
+    let is_command = name == "run_command"
+        || matches!(
+            resolve_tool_alias(name),
+            Some(AliasOutcome::Rewrite("run_command"))
+        );
+    let Some(default_cwd) = default_cwd.filter(|cwd| *cwd != std::path::Path::new(workspace))
+    else {
+        return Ok(std::borrow::Cow::Borrowed(args));
+    };
+    if !is_command || args.get("cwd").is_some() || !args.is_object() {
+        return Ok(std::borrow::Cow::Borrowed(args));
+    }
+    let cwd = default_cwd.to_str().ok_or(
+        "error: the command working directory is not valid UTF-8; select a UTF-8 directory",
+    )?;
+    let mut projected = args.clone();
+    projected["cwd"] = serde_json::Value::String(cwd.to_owned());
+    Ok(std::borrow::Cow::Owned(projected))
+}
+
 /// Build the dispatch args for agent-bridle's confined `shell` tool (#783): the
 /// RAW user command (free-form `cmd` mode) plus the venv carried through the
 /// structured `env` seam ([`venv_env_map`]). Deliberately NO `export …;` prefix
@@ -189,7 +221,7 @@ fn shell_env_passthrough() -> Vec<String> {
 /// (the confined shell's fs fence rejects any path that escapes the workspace,
 /// so this never widens reach). `None` runs at the workspace root, as before.
 pub(super) fn resolve_exec_cwd(workspace: &str, cwd: Option<&str>) -> String {
-    match cwd.map(str::trim).filter(|c| !c.is_empty()) {
+    match cwd.filter(|c| !c.trim().is_empty()) {
         None => workspace.to_string(),
         Some(c) if std::path::Path::new(c).is_absolute() => c.to_string(),
         Some(c) => std::path::Path::new(workspace)
@@ -567,10 +599,11 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
 }
 
 pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
+    let env = venv_env_map();
     serde_json::json!({
         "cmd": cmd,
         "cwd": cwd,
-        "env": venv_env_map(),
+        "env": env,
     })
 }
 
