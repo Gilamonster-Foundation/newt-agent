@@ -427,6 +427,14 @@ pub(crate) fn drive_cockpit_psyche() {
                 ));
             }
         }
+        // ...and every dial is drawn exactly once: a missing or duplicated
+        // label also means the panel did not own its rows.
+        for label in LABELS {
+            let n = rows.iter().filter(|row| row.contains(label)).count();
+            if n != 1 {
+                return Err(format!("dial {label:?} drawn {n} times, want 1: {rows:?}"));
+            }
+        }
         pty.type_in("\x1b");
         if !pty.wait_for_screen_after("PSYCHE_RETURNED", "^D exit", REACH_TIMEOUT) {
             return Err("Esc did not close the panel and restore the editor".into());
