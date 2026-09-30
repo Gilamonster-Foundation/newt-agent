@@ -245,6 +245,47 @@ impl TurnMetrics {
     }
 }
 
+/// The most recent `model_id` this operator used on `endpoint`, replayed
+/// from the usage log (`~/.newt/usage.jsonl`) — the ONLY data on disk
+/// already keyed by (endpoint, model). Used as the #2622 tiebreak when a
+/// multiplexer has more than one model loaded and no pin resolved: rather
+/// than guess by server list order, prefer whichever model this operator
+/// actually ran on this backend last. Best-effort: a missing/unreadable/
+/// malformed log returns `None` (never blocks adoption), and a line that
+/// fails to parse is skipped rather than aborting the scan.
+pub fn last_model_for_endpoint(path: &std::path::Path, endpoint: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<TurnMetrics>(line).ok())
+        .find(|m| m.endpoint == endpoint)
+        .map(|m| m.model_id)
+}
+
+/// The #2622 tiebreak, clarified per PR #2626 review: the most recent row is
+/// NOT necessarily usable — the history rule is "most recent row naming a
+/// model that is still an ELIGIBLE `candidate`" (i.e. one of the loaded
+/// models `adopt()` is actually choosing among), not merely the most recent
+/// row for `endpoint` full stop. A later row naming a model that has since
+/// been unloaded (or was never a candidate) must not shadow an earlier row
+/// that still is — so this scans backward and keeps looking past a row that
+/// fails the candidate check, rather than stopping at the first endpoint
+/// match like [`last_model_for_endpoint`] does.
+pub fn last_eligible_model_for_endpoint(
+    path: &std::path::Path,
+    endpoint: &str,
+    candidates: &[String],
+) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<TurnMetrics>(line).ok())
+        .find(|m| m.endpoint == endpoint && candidates.iter().any(|c| c == &m.model_id))
+        .map(|m| m.model_id)
+}
+
 /// `n` with thousands separators, e.g. `104,857`.
 pub fn fmt_count(n: u64) -> String {
     // Insert thousands separators for readability.
@@ -604,6 +645,76 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = raw.lines().collect();
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn last_model_for_endpoint_picks_the_most_recent_matching_line() {
+        // Regression (#2622): the tiebreak must reflect the operator's LAST
+        // choice on this endpoint, not the first line in the log or a
+        // different endpoint's entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        for (endpoint, model) in [
+            ("http://mux:11434", "ornith-1.5-35b"),
+            ("http://other:11434", "unrelated-model"),
+            ("http://mux:11434", "Qwen2.5-14B-Instruct-1M-Q8_0"),
+        ] {
+            let mut m = metrics(1000, 10, 5, Some(0.0));
+            m.endpoint = endpoint.into();
+            m.model_id = model.into();
+            m.append_to_log(&path);
+        }
+        assert_eq!(
+            last_model_for_endpoint(&path, "http://mux:11434").as_deref(),
+            Some("Qwen2.5-14B-Instruct-1M-Q8_0"),
+            "must be the LAST entry for that endpoint, not the first"
+        );
+    }
+
+    #[test]
+    fn last_model_for_endpoint_missing_log_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-file.jsonl");
+        assert_eq!(last_model_for_endpoint(&path, "http://mux:11434"), None);
+    }
+
+    /// PR #2626 review: "history and validation notes" — the history rule is
+    /// the most recent row naming an ELIGIBLE candidate, not merely the most
+    /// recent row for the endpoint. A(loaded) then C(unloaded) must still
+    /// find A, not fall through to the picker despite earlier matching
+    /// history.
+    #[test]
+    fn last_eligible_model_for_endpoint_skips_a_later_ineligible_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        for model in ["A", "C"] {
+            let mut m = metrics(1000, 10, 5, Some(0.0));
+            m.endpoint = "http://mux:11434".into();
+            m.model_id = model.into();
+            m.append_to_log(&path);
+        }
+        let candidates = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(
+            last_eligible_model_for_endpoint(&path, "http://mux:11434", &candidates).as_deref(),
+            Some("A"),
+            "the later row (C) isn't a loaded candidate — an earlier \
+             eligible row must still win, not fall through to the picker"
+        );
+    }
+
+    #[test]
+    fn last_eligible_model_for_endpoint_none_when_no_row_is_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let mut m = metrics(1000, 10, 5, Some(0.0));
+        m.endpoint = "http://mux:11434".into();
+        m.model_id = "Z".into();
+        m.append_to_log(&path);
+        let candidates = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(
+            last_eligible_model_for_endpoint(&path, "http://mux:11434", &candidates),
+            None
+        );
     }
 
     #[test]

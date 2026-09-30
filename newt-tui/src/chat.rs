@@ -6930,7 +6930,7 @@ fn session_body(
                                     print_newt(&format!("models panel error: {e}"), color, verbose);
                                 }
                                 Ok(None) => {}
-                                Ok(Some(name)) => {
+                                Ok(Some((name, _served))) => {
                                     // Through the SAME function the
                                     // `/model <name>` text form calls,
                                     // so the picker cannot become a
