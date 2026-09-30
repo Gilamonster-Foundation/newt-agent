@@ -365,13 +365,21 @@ fn read_beneath_no_symlinks(
     bound: &[PathBuf],
 ) -> Result<Option<String>, String> {
     use std::io::Read;
-    if !permits_path_with_bound_roots(fs_read, bound, anchor) {
+    // Canonicalize the anchor so platform system-alias symlinks (e.g.
+    // /var → /private/var on macOS) do not cause GrantedRoot::acquire to
+    // refuse the anchor itself.  The permission check runs against the
+    // canonical path so the grant scope must also use canonical paths
+    // (bind_canonical_roots guarantees this at plan time).
+    let canon = std::fs::canonicalize(anchor).map_err(|e| {
+        format!("refused: cannot canonicalize anchor '{}' ({e})", anchor.display())
+    })?;
+    if !permits_path_with_bound_roots(fs_read, bound, &canon) {
         return Err(format!(
             "refused: '{}' is outside this session's filesystem read authority",
             anchor.display()
         ));
     }
-    let root = agent_bridle_fdguard::GrantedRoot::acquire(anchor).map_err(|e| {
+    let root = agent_bridle_fdguard::GrantedRoot::acquire(&canon).map_err(|e| {
         if agent_bridle_fdguard::is_resolution_refusal(&e) {
             format!(
                 "refused: '{}' contains a symlink; planning reads must use a canonical anchor",
