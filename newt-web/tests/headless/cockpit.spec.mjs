@@ -33,11 +33,16 @@ async function reservePort() {
   return port;
 }
 
+const READY_TIMEOUT_MS = 45_000;
+
 async function waitUntilReady(url) {
-  const deadline = Date.now() + 45_000;
+  const start = Date.now();
+  const deadline = start + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (appProcess.exitCode !== null) {
-      throw new Error(`newt-web exited before readiness (${appProcess.exitCode})\n${appLog}`);
+      throw new Error(
+        `newt-web exited before readiness (${appProcess.exitCode}) after ${Date.now() - start}ms\n${appLog}`,
+      );
     }
     try {
       const response = await fetch(`${url}/healthz`);
@@ -47,10 +52,18 @@ async function waitUntilReady(url) {
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`newt-web did not become ready\n${appLog}`);
+  throw new Error(
+    `newt-web did not become ready after ${Date.now() - start}ms (deadline ${READY_TIMEOUT_MS}ms)\n` +
+      `last log output:\n${appLog || "(empty — see stdio capture)"}`,
+  );
 }
 
-test.beforeAll(async () => {
+test.beforeAll(async ({}, testInfo) => {
+  // The default 60s hook timeout was sized for waitUntilReady alone. A cold
+  // build (buildFirst) can take minutes on a loaded box; give the hook room
+  // for build + readiness rather than let the *hook* time out uninformatively
+  // before waitUntilReady's own, more detailed error gets a chance to fire.
+  testInfo.setTimeout(5 * 60_000);
   const reply = [
     "# Portable result",
     "",
@@ -79,6 +92,16 @@ test.beforeAll(async () => {
   const appPort = await reservePort();
   baseURL = `http://127.0.0.1:${appPort}`;
   stateDir = await mkdtemp(path.join(tmpdir(), "newt-web-acceptance-"));
+
+  // Build BEFORE timing readiness. A cold or invalidated target/ can take
+  // well over 45s to compile under `--quiet` (which prints nothing while
+  // compiling), and that build time was being counted against the
+  // readiness deadline: the empty-appLog, still-running failure this
+  // regresses was newt-web still compiling, not newt-web hanging. Building
+  // first, on its own generous deadline, means waitUntilReady only ever
+  // times a warm-binary startup.
+  await buildFirst();
+
   appProcess = spawn(
     "cargo",
     ["run", "--quiet", "--manifest-path", path.join(webRoot, "Cargo.toml")],
@@ -91,14 +114,46 @@ test.beforeAll(async () => {
         NEWT_WEB_STATE_DIR: stateDir,
         NEWT_WEB_WORKSPACE: repoRoot,
       },
-      stdio: ["ignore", "ignore", "pipe"],
+      // Capture BOTH streams: an empty appLog on a live, unresponsive
+      // process used to be indistinguishable between "logged nothing" and
+      // "logged to the stream we ignored".
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  appProcess.stdout.on("data", (chunk) => {
+    appLog += chunk.toString();
+  });
   appProcess.stderr.on("data", (chunk) => {
     appLog += chunk.toString();
   });
   await waitUntilReady(baseURL);
 });
+
+/// Compile newt-web on its own deadline, separate from `waitUntilReady`'s.
+/// `--quiet` prints nothing while compiling, so its own output cannot show
+/// progress; a build that hangs or fails still reports exit code and output.
+async function buildFirst() {
+  const BUILD_TIMEOUT_MS = 180_000;
+  await new Promise((resolve, reject) => {
+    const build = spawn(
+      "cargo",
+      ["build", "--quiet", "--manifest-path", path.join(webRoot, "Cargo.toml")],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let log = "";
+    build.stdout.on("data", (chunk) => (log += chunk.toString()));
+    build.stderr.on("data", (chunk) => (log += chunk.toString()));
+    const timer = setTimeout(() => {
+      build.kill("SIGKILL");
+      reject(new Error(`newt-web build did not finish within ${BUILD_TIMEOUT_MS}ms\n${log}`));
+    }, BUILD_TIMEOUT_MS);
+    build.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`newt-web build failed (${code})\n${log}`));
+    });
+  });
+}
 
 test.afterAll(async () => {
   if (appProcess && appProcess.exitCode === null) {

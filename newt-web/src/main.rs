@@ -990,10 +990,19 @@ async fn main() {
         ),
         Err(why) => eprintln!("newt-web: passkey verification DISABLED — {why}"),
     }
+    // Start accepting connections BEFORE the mesh dock init runs, not after.
+    // init_mesh_dock() loads an identity file and can dial the network; a
+    // slow instance of either used to delay /healthz answering at all,
+    // because axum::serve (the accept loop) only started once that finished
+    // — see `serve_answers_healthz_while_a_concurrent_slow_init_is_still_running`
+    // for the ordering this proves.
+    let serve_task = tokio::spawn(async move {
+        axum::serve(listener, app()).await.expect("serve");
+    });
     // Phase 2: bring up the agent-mesh dock; hold the responder alive for the
     // life of the process (dropping it would tear the bus down).
     let _dock_service = init_mesh_dock().await;
-    axum::serve(listener, app()).await.expect("serve");
+    serve_task.await.expect("serve task panicked");
 }
 
 #[cfg(test)]

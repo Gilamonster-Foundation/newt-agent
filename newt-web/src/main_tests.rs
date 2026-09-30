@@ -2080,3 +2080,53 @@ async fn the_theme_toggle_names_the_cookie_the_server_reads() {
         "the server reads the cookie the toggle writes ({name})"
     );
 }
+
+/// Regression for the newt-web headless BAT flake: `main()` used to
+/// `.await` a slow init (the mesh dock: an identity-file load plus a
+/// network dial) BEFORE starting the accept loop, so `/healthz` could not
+/// answer at all until that init finished — a slow init (or a build, in the
+/// test harness) and an unreachable server were indistinguishable from the
+/// outside. `main()` now spawns the accept loop first and runs the slow
+/// init concurrently. This proves that ordering with a real bound socket and
+/// a real HTTP request, fully mocked otherwise (no real mesh init, no real
+/// network beyond loopback): a slow future stands in for `init_mesh_dock()`.
+#[tokio::test]
+async fn serve_answers_healthz_while_a_concurrent_slow_init_is_still_running() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The exact shape `main()` now uses: spawn the accept loop, then await
+    // something slow alongside it.
+    let serve_task = tokio::spawn(async move {
+        axum::serve(listener, app_with_auth(None)).await.unwrap();
+    });
+    let slow_init_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slow_init_done2 = slow_init_done.clone();
+    let slow_init = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        slow_init_done2.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // Probe well inside the slow init's 300ms window.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected /healthz response: {response}"
+    );
+    assert!(
+        !slow_init_done.load(std::sync::atomic::Ordering::SeqCst),
+        "/healthz answered only after the slow init finished — this is the \
+         bug: the accept loop must not wait on it"
+    );
+
+    slow_init.await.unwrap();
+    serve_task.abort();
+}
