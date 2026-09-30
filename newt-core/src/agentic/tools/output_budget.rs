@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// #719: default line window for `read_file`'s **model-facing** payload. The
 /// on-screen display is capped separately; this bounds what enters the model's
@@ -183,6 +184,77 @@ fn take_tail_chars(text: &str, max_chars: usize) -> String {
 /// Window + cap a file's contents for `read_file`'s model-facing payload (#719,
 /// #726). Returns lines `[offset, offset+limit)` (1-based `offset`, default 1;
 /// `limit` default [`DEFAULT_READ_LIMIT`]), with the char backstop derived from
+/// Process-lifetime random key for the pagination MAC. Two UUID v4 values give
+/// 32 bytes of OS randomness without adding a new dependency (uuid v4 is already
+/// a dep and uses getrandom internally). The model never sees this key; it only
+/// ever sees the 32-hex truncated tag in the footer.
+fn page_mac_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(a.as_bytes());
+        key[16..].copy_from_slice(b.as_bytes());
+        key
+    })
+}
+
+/// Compute the 32-hex MAC tag that authenticates a single pagination footer.
+///
+/// This is a MAC (blake3 keyed hash), NOT a content id: it authenticates the
+/// origin of the footer under a process-lifetime secret key. A content-addressable
+/// id is public and reproducible by anyone; this tag is only reproducible by code
+/// running in the same process with access to the key. blake3 keyed mode is a
+/// standard HMAC-equivalent primitive, not a hand-rolled encoding.
+fn page_mac_tag(
+    path: &str,
+    first_line: usize,
+    char_offset_in: usize,
+    body: &[u8],
+    next_offset: usize,
+    next_char_offset: usize,
+) -> String {
+    let mut h = blake3::Hasher::new_keyed(page_mac_key());
+    h.update(path.as_bytes());
+    h.update(&[0u8]); // separator prevents path || data colliding with path2 || data2
+    h.update(&(first_line as u64).to_le_bytes());
+    h.update(&(char_offset_in as u64).to_le_bytes());
+    h.update(body);
+    h.update(&(next_offset as u64).to_le_bytes());
+    h.update(&(next_char_offset as u64).to_le_bytes());
+    let digest = h.finalize();
+    digest.as_bytes()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Verify whether `tag` is the correct 32-hex MAC for the given footer parameters.
+/// Called by `prune.rs`; the key lives here, so verification is here too.
+///
+/// A copied-verbatim real page (body + footer) read back from a file verifies and
+/// yields an accurate map of that same content — this is harmless: the tag binds
+/// to the body bytes, so an unmodified page is as trustworthy as the original.
+pub(crate) fn verify_page_tag(
+    path: &str,
+    first_line: usize,
+    char_offset_in: usize,
+    body: &str,
+    next_offset: usize,
+    next_char_offset: usize,
+    tag: &str,
+) -> bool {
+    page_mac_tag(
+        path,
+        first_line,
+        char_offset_in,
+        body.as_bytes(),
+        next_offset,
+        next_char_offset,
+    ) == tag
+}
+
 /// the shared token budget (`max_output_tokens` × chars/token — #726, replacing
 /// #719's hardcoded 100k so both tools share one budget). A footer points at the
 /// next window so the model paginates instead of drowning. A whole-file read
@@ -197,7 +269,7 @@ pub(super) fn paginate_read(
     limit: Option<usize>,
     max_output_tokens: usize,
 ) -> String {
-    paginate_read_from(contents, offset, limit, max_output_tokens, None)
+    paginate_read_from("", contents, offset, limit, max_output_tokens, None)
 }
 
 /// [`paginate_read`] with an optional `char_offset`: the character position
@@ -211,7 +283,12 @@ pub(super) fn paginate_read(
 /// deliberately NOT part of `read_file`'s public schema (see
 /// `tools/catalog.rs`) — the model learns it only from a page's own footer,
 /// which is the one place it is ever correct to use.
+///
+/// `path` is included in the footer's MAC tag so `prune.rs` can verify that the
+/// footer originated from this process's own producer and was not synthesised
+/// from source content that happens to match the footer grammar.
 pub(crate) fn paginate_read_from(
+    path: &str,
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -312,22 +389,32 @@ pub(crate) fn paginate_read_from(
         }
     }
     let footer = if let Some((line, next_char_offset)) = mid_line {
+        let tag = page_mac_tag(
+            path,
+            start,
+            char_offset,
+            body.as_bytes(),
+            line,
+            next_char_offset,
+        );
         Some(format!(
             "payload truncated to {max_chars} chars (~{max_output_tokens} tokens); line {line} \
              continues: call read_file with offset={line} char_offset={next_char_offset} to \
-             continue"
+             continue page={tag}"
         ))
     } else if let Some(last) = whole_through {
+        let next = last + 1;
+        let tag = page_mac_tag(path, start, char_offset, body.as_bytes(), next, 0);
         Some(format!(
             "payload truncated to {max_chars} chars (~{max_output_tokens} tokens) at line \
-             {last} of {total}; call read_file with offset={} to continue",
-            last + 1
+             {last} of {total}; call read_file with offset={next} to continue page={tag}"
         ))
     } else if end < total {
+        let next = end + 1;
+        let tag = page_mac_tag(path, start, char_offset, body.as_bytes(), next, 0);
         Some(format!(
             "showing lines {start}-{end} of {total}; \
-             call read_file with offset={} to continue",
-            end + 1
+             call read_file with offset={next} to continue page={tag}"
         ))
     } else {
         None
@@ -343,6 +430,7 @@ pub(crate) fn paginate_read_from(
 /// text and got a handle to redeem — so the page is held under that cap and
 /// ends with the `offset=` to continue from instead.
 pub(super) fn read_file_page(
+    path: &str,
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -350,9 +438,16 @@ pub(super) fn read_file_page(
     tool_offload: bool,
 ) -> String {
     if tool_offload {
-        paginate_unspillable(contents, offset, limit, char_offset)
+        paginate_unspillable(path, contents, offset, limit, char_offset)
     } else {
-        paginate_read_from(contents, offset, limit, max_output_tokens(), char_offset)
+        paginate_read_from(
+            path,
+            contents,
+            offset,
+            limit,
+            max_output_tokens(),
+            char_offset,
+        )
     }
 }
 
@@ -362,6 +457,7 @@ pub(super) fn read_file_page(
 /// answer to "read this spill" would itself be spilled — a fresh handle to the
 /// very text the model asked for.
 pub(super) fn paginate_unspillable(
+    path: &str,
     contents: &str,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -375,7 +471,7 @@ pub(super) fn paginate_unspillable(
         0 => unspillable,
         budget => budget.min(unspillable),
     };
-    paginate_read_from(contents, offset, limit, tokens, char_offset)
+    paginate_read_from(path, contents, offset, limit, tokens, char_offset)
 }
 
 #[cfg(test)]
@@ -440,7 +536,7 @@ mod tests {
         let mut offset = None;
         let mut char_offset = None;
         for _ in 0..20 {
-            let page = paginate_read_from(&original, offset, None, budget_tokens, char_offset);
+            let page = paginate_read_from("", &original, offset, None, budget_tokens, char_offset);
             let (body, footer) = match page.rfind("\n\n[") {
                 Some(marker_start) => (&page[..marker_start], Some(&page[marker_start..])),
                 None => (page.as_str(), None),

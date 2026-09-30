@@ -420,19 +420,17 @@ fn rust_outline_summary(path: &str, args: Option<&Value>, content: &str) -> Opti
     // tree-sitter would tag whatever token happens to start the fragment as
     // if it began the line. Unknown starting lexical boundary, decline
     // unconditionally (#2638 finding 2, round 3).
-    if incoming_char_offset(args).is_some() {
+    let char_offset_in = incoming_char_offset(args);
+    if char_offset_in > 0 {
         return None;
     }
     // A paginated/truncated read_file result is `body + "\n\n[<footer>]"`
     // (`output_budget::paginate_read_from`) — the footer is tool-message
     // metadata, not source, so it must not be parsed or counted as lines.
-    let (source, footer) = strip_read_footer(content, first_line);
-    // Without authenticated producer metadata we cannot rule out a
-    // footer-shaped source tail: the arithmetic cross-check reduces false
-    // positives but cannot authenticate origin (no side channel exists).
-    // Decline the outline for any detected footer rather than assert spans
-    // over an ambiguous page (#2638 round 4).
-    if footer.is_some() {
+    let (source, footer) = strip_read_footer(content, path, first_line, char_offset_in);
+    // Untrusted footer (no tag or bad tag) → fall back to generic (#2638 r4).
+    // Trusted footer → proceed: the footer came from this process's producer.
+    if footer.as_ref().is_some_and(|f| !f.trusted) {
         return None;
     }
     let entries = crate::ast_outline::outline_rust(source, first_line)?;
@@ -464,13 +462,18 @@ const FOOTER_MARKER: &str = "call read_file with offset=";
 /// What a validated pagination footer says about the page it closes: the
 /// producer's own exact `(offset, char_offset)` coordinates for the NEXT
 /// `read_file` call — not just a boolean (#2638 finding 2, round 3).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ReadFooter {
     /// The next call's `offset` (every footer names one).
     next_offset: usize,
     /// The next call's `char_offset` — set only when the cut lands INSIDE a
     /// line, not on a line boundary (#2638 finding 3).
     next_char_offset: Option<usize>,
+    /// The 32-hex MAC tag from the footer, if present.
+    tag: Option<String>,
+    /// Set after tag verification: this footer came from THIS process's
+    /// own producer (not a source tail that happens to match the grammar).
+    trusted: bool,
 }
 
 /// The `char_offset` the model passed on THIS call, if any and nonzero — the
@@ -478,34 +481,44 @@ struct ReadFooter {
 /// Not part of `read_file`'s public schema; only ever correct when echoed
 /// from a footer (`output_budget::paginate_read_from`'s doc comment). Its
 /// presence means the page's first line is itself a mid-line fragment.
-/// Only the AST outline path needs this (the page-map fallback makes no
-/// lexical claim, so it's fine without `ast`).
-#[cfg(feature = "ast")]
-fn incoming_char_offset(args: Option<&Value>) -> Option<usize> {
+fn incoming_char_offset(args: Option<&Value>) -> usize {
     args.and_then(|a| a.get("char_offset"))
         .and_then(Value::as_u64)
         .filter(|&c| c > 0)
         .map(|c| c as usize)
+        .unwrap_or(0)
 }
 
 /// Strip the `\n\n[<footer>]` pagination/truncation notice a `read_file`
 /// result carries (`output_budget::paginate_read_from`), if present. Returns
 /// the body with the candidate stripped and the parsed footer when the
-/// trailing bracketed line matches the producer's exact footer grammar (the
-/// marker text plus a valid numeric `offset`/`char_offset` tail) AND the
-/// arithmetic cross-check passes (`first_line` + `body.lines().count()`
-/// equals the claimed next offset). A tail that fails either check is left
-/// as part of the source. The arithmetic cross-check reduces false positives
-/// but cannot authenticate origin: there is no side channel — `read_file_page`
-/// returns a plain `String`, pruning runs over serialized chat history, not
-/// at tool-call time — so even a passing candidate is ambiguous. Callers
-/// that need certainty must treat `Some(footer)` as unverified and fall back
-/// to a conservative summary (#2638 round 4).
-fn strip_read_footer(content: &str, first_line: usize) -> (&str, Option<ReadFooter>) {
+/// trailing bracketed line matches the producer's exact footer grammar. Sets
+/// `footer.trusted` by verifying the MAC tag against `path`, `first_line`,
+/// `char_offset_in`, and `body` — trusted means this footer came from THIS
+/// process's own producer. Untrusted (no tag, bad tag, or a lookalike with
+/// no tag) gives the arithmetic-checked footer struct but with `trusted=false`;
+/// callers fall back to the r4 generic summary for untrusted footers.
+fn strip_read_footer<'a>(
+    content: &'a str,
+    path: &str,
+    first_line: usize,
+    char_offset_in: usize,
+) -> (&'a str, Option<ReadFooter>) {
     match content.rsplit_once("\n\n[") {
         Some((body, tail)) => match tail.strip_suffix(']') {
             Some(f) if !f.contains('\n') => match parse_read_footer(f) {
-                Some(footer) if footer_matches_body(footer, first_line, body) => {
+                Some(mut footer) if footer_matches_body(&footer, first_line, body) => {
+                    footer.trusted = footer.tag.as_deref().is_some_and(|tag| {
+                        crate::agentic::tools::output_budget::verify_page_tag(
+                            path,
+                            first_line,
+                            char_offset_in,
+                            body,
+                            footer.next_offset,
+                            footer.next_char_offset.unwrap_or(0),
+                            tag,
+                        )
+                    });
                     (body, Some(footer))
                 }
                 _ => (content, None),
@@ -516,22 +529,33 @@ fn strip_read_footer(content: &str, first_line: usize) -> (&str, Option<ReadFoot
     }
 }
 
-/// Parse a bracketed footer line's exact tail —
-/// `…call read_file with offset=<n>[ char_offset=<m>] to continue` — with
-/// `<n>`/`<m>` valid `usize` and nothing else following. `None` for anything
-/// that merely contains [`FOOTER_MARKER`] as a substring without the rest of
-/// the producer's exact grammar.
+/// Parse a bracketed footer line's exact tail:
+/// `…call read_file with offset=<n>[ char_offset=<m>] to continue[ page=<32hex>]`
+/// with `<n>`/`<m>` valid `usize` and the 32-hex tag optional. `None` for
+/// anything that merely contains [`FOOTER_MARKER`] without the rest of the
+/// producer's exact grammar.
 fn parse_read_footer(f: &str) -> Option<ReadFooter> {
     let after_marker = f.rsplit_once(FOOTER_MARKER)?.1;
-    let after_marker = after_marker.strip_suffix(" to continue")?;
-    match after_marker.split_once(" char_offset=") {
+    // Strip optional trailing ` page=<32hex>` before the core parse.
+    let (core, tag) = match after_marker.rsplit_once(" page=") {
+        Some((rest, t)) if t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            (rest, Some(t.to_string()))
+        }
+        _ => (after_marker, None),
+    };
+    let core = core.strip_suffix(" to continue")?;
+    match core.split_once(" char_offset=") {
         Some((offset_s, char_offset_s)) => Some(ReadFooter {
             next_offset: offset_s.parse().ok()?,
             next_char_offset: Some(char_offset_s.parse().ok()?),
+            tag,
+            trusted: false,
         }),
         None => Some(ReadFooter {
-            next_offset: after_marker.parse().ok()?,
+            next_offset: core.parse().ok()?,
             next_char_offset: None,
+            tag,
+            trusted: false,
         }),
     }
 }
@@ -542,7 +566,7 @@ fn parse_read_footer(f: &str) -> Option<ReadFooter> {
 /// footer always names the SAME line `body`'s single (partial) line is —
 /// see `output_budget::paginate_read_from`'s `whole_through`/`mid_line`
 /// arithmetic, which this mirrors.
-fn footer_matches_body(footer: ReadFooter, first_line: usize, body: &str) -> bool {
+fn footer_matches_body(footer: &ReadFooter, first_line: usize, body: &str) -> bool {
     let body_lines = body.lines().count();
     let expected = if footer.next_char_offset.is_some() {
         first_line + body_lines.saturating_sub(1)
@@ -567,11 +591,11 @@ fn read_file_page_map(path: &str, args: Option<&Value>, content: &str) -> Option
         .and_then(Value::as_u64)
         .filter(|&o| o > 0)
         .unwrap_or(1) as usize;
-    let (source, footer) = strip_read_footer(content, first_line);
-    // Footer origin is unverified: no side channel authenticates it, so even
-    // an arithmetic-matching candidate may be source, not metadata. Fall back
-    // to the generic summary for any detected footer (#2638 round 4).
-    if footer.is_some() {
+    let char_offset_in = incoming_char_offset(args);
+    let (source, footer) = strip_read_footer(content, path, first_line, char_offset_in);
+    // Untrusted footer (no tag or bad tag) → fall back to generic (#2638 r4).
+    // Trusted footer → proceed with exact coordinates (#2638 r5).
+    if footer.as_ref().is_some_and(|f| !f.trusted) {
         return None;
     }
     let total_lines = source.lines().count();
@@ -1004,19 +1028,21 @@ pub(crate) enum ResponsesCompaction {
         assert!(line.contains("    10-13\tpub(crate) enum ResponsesCompaction"));
     }
 
-    /// #2638 fix: a paginated/truncated `read_file` result is `body + "\n\n[
-    /// footer]"`, not raw source. Without authenticated producer metadata,
-    /// the footer is ambiguous (the arithmetic cross-check is not sufficient
-    /// to authenticate origin), so both the outline and page-map paths fall
-    /// back to the generic summary — the honest cost of the round-4 fix.
+    /// #2638 fix, case 1 (round 5): a REAL paginated Rust page whose footer's
+    /// MAC tag verifies against the exact path the model's call used — the
+    /// producer and the caller agree on `path`, so the tag authenticates
+    /// origin and the outline fires with the page's own exact coordinates.
+    /// Round 4's generic fallback only applied to UNVERIFIABLE footers; this
+    /// is the trusted-footer counterpart. Red before round 5: this test
+    /// fails against the round-4 code (which declines every footer
+    /// unconditionally) with a generic summary instead of an outline.
     ///
-    /// The fixture footer does parse and pass the arithmetic cross-check
     /// (`[showing lines 3-10 of 18; call read_file with offset=11 to
-    /// continue]` at first_line=3, 8-line body → expected offset = 3+8=11 ✓)
-    /// so this test confirms the fallback fires for a valid-arithmetic footer.
+    /// continue page=<tag>]` at first_line=3, 8-line body → expected offset
+    /// = 3+8=11 ✓, and the tag was minted for THIS path/body/coordinates.)
     #[cfg(feature = "ast")]
     #[test]
-    fn paginated_aged_rust_read_gives_generic_summary() {
+    fn a_trusted_paginated_rust_page_gets_an_outline_with_exact_coordinates() {
         let full_source = "\
 mod header;
 
@@ -1037,17 +1063,77 @@ fn third(z: u32) -> u32 {
     z
 }
 ";
-        // offset=3, limit=8 -> real page is lines 3-10; footer offset=11.
+        let path = "src/lib.rs";
+        // offset=3, limit=12 -> real page is lines 3-14; footer offset=15.
+        // fn second spans lines 7-14 so limit must be at least 12 for the
+        // AST to see the complete closing brace.
         let page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
             full_source,
             Some(3),
-            Some(8),
+            Some(12),
             0,
             None,
         );
         assert!(
-            page.contains("[showing lines 3-10 of 18"),
+            page.contains("[showing lines 3-14 of 18"),
             "test fixture didn't paginate as expected: {page}"
+        );
+
+        let line = summarize_one("read_file", json!({"path": path, "offset": 3}), &page);
+        assert!(
+            line.starts_with("[read_file] src/lib.rs lines 3-14 — outline"),
+            "trusted footer (matching path) must produce an outline with exact \
+             coordinates, got: {line}"
+        );
+        // `fn second` starts inside this page (line 7) but its closing brace
+        // is past the page's last line (10) — the page cuts it mid-function,
+        // so tree-sitter's error recovery does not tag an incomplete
+        // definition. Only the one COMPLETE definition inside the page
+        // (`fn first`, lines 3-5) is entry-worthy; this is real,
+        // page-boundary-correct behavior, not a test artifact.
+        assert!(
+            line.contains("3-5\tfn first(x: u32) -> u32"),
+            "outline must cover the page's real, complete content: {line}"
+        );
+    }
+
+    /// #2638 round 4 (still holds under round 5's trust check): a paginated
+    /// page whose footer has NO tag at all (a hand-built or pre-#2638
+    /// footer shape) is untrusted regardless of arithmetic — generic
+    /// summary.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn a_footer_with_no_tag_is_untrusted_and_gives_generic_summary() {
+        let full_source = "\
+mod header;
+
+fn first(x: u32) -> u32 {
+    x + 1
+}
+
+fn second(y: u32) -> u32 {
+    // pad this body so pass 2's rewrite threshold is cleared once
+    // paginated down to just this page.
+    let mut z = y;
+    z += 1;
+    z += 1;
+    z
+}
+
+fn third(z: u32) -> u32 {
+    z
+}
+";
+        // Hand-built footer: valid grammar, valid arithmetic, no `page=` tag.
+        let page = format!(
+            "{}\n\n[showing lines 3-10 of 18; call read_file with offset=11 to continue]",
+            full_source
+                .lines()
+                .skip(2)
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
 
         let line = summarize_one(
@@ -1055,10 +1141,9 @@ fn third(z: u32) -> u32 {
             json!({"path": "src/lib.rs", "offset": 3}),
             &page,
         );
-        // Footer is ambiguous (no side-channel authentication) — generic summary.
         assert!(
             line.starts_with("[read_file] read 'src/lib.rs' ->"),
-            "paginated page must give generic summary, got: {line}"
+            "an untagged footer must give a generic summary, got: {line}"
         );
         assert!(
             !line.contains("— outline"),
@@ -1070,10 +1155,129 @@ fn third(z: u32) -> u32 {
         );
     }
 
-    /// #2638 fix, other half (round-4 update): a paginated page whose footer
-    /// passes the arithmetic cross-check still falls back to the generic
-    /// summary — the same conservative fallback as the plain paginated case
-    /// above — because footer origin is unverified without a side channel.
+    /// #2638 round 5: a footer carrying a FORGED tag (right shape, wrong
+    /// value) must be untrusted — the MAC, not the grammar, is what
+    /// authenticates origin.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn a_footer_with_a_forged_tag_is_untrusted_and_gives_generic_summary() {
+        let full_source = "\
+mod header;
+
+fn first(x: u32) -> u32 {
+    x + 1
+}
+
+fn second(y: u32) -> u32 {
+    let mut z = y;
+    z += 1;
+    z += 1;
+    z
+}
+
+fn third(z: u32) -> u32 {
+    z
+}
+";
+        let path = "src/lib.rs";
+        let real_page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            full_source,
+            Some(3),
+            Some(8),
+            0,
+            None,
+        );
+        // Forgery: replace the entire 32-hex tag with a fixed, definitely-wrong
+        // one of the same length/shape (same grammar, wrong MAC value).
+        let (before, tag_and_after) = real_page.rsplit_once("page=").expect("footer has a tag");
+        let after = &tag_and_after[32..];
+        let forged_page = format!("{before}page={}{after}", "0".repeat(32));
+        assert_ne!(
+            forged_page, real_page,
+            "the forged page must differ from the real one"
+        );
+
+        let line = summarize_one(
+            "read_file",
+            json!({"path": path, "offset": 3}),
+            &forged_page,
+        );
+        assert!(
+            line.starts_with("[read_file] read 'src/lib.rs' ->"),
+            "a forged tag must give a generic summary, got: {line}"
+        );
+        assert!(
+            !line.contains("— outline"),
+            "must not produce an outline: {line}"
+        );
+    }
+
+    /// #2638 round 5: a REAL footer moved onto a DIFFERENT body — the tag
+    /// binds to the body bytes, so pasting a genuine footer after unrelated
+    /// content must not verify.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn a_real_footer_moved_onto_a_different_body_is_untrusted() {
+        let full_source = "\
+mod header;
+
+fn first(x: u32) -> u32 {
+    x + 1
+}
+
+fn second(y: u32) -> u32 {
+    let mut z = y;
+    z += 1;
+    z += 1;
+    z
+}
+
+fn third(z: u32) -> u32 {
+    z
+}
+";
+        let path = "src/lib.rs";
+        let real_page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            full_source,
+            Some(3),
+            Some(8),
+            0,
+            None,
+        );
+        let (_, footer_bracket) = real_page.rsplit_once("\n\n[").expect("has a footer");
+        let different_body: String = (1..=8)
+            .map(|i| format!("// unrelated line {i}\n"))
+            .collect();
+        let different_body = different_body.trim_end_matches('\n');
+        assert_eq!(
+            different_body.lines().count(),
+            8,
+            "the swapped body must have the same line count as the real page's body \
+             so only the CONTENT differs, not the arithmetic"
+        );
+        let spliced_page = format!("{different_body}\n\n[{footer_bracket}");
+
+        let line = summarize_one(
+            "read_file",
+            json!({"path": path, "offset": 3}),
+            &spliced_page,
+        );
+        assert!(
+            line.starts_with("[read_file] read 'src/lib.rs' ->"),
+            "a real footer glued onto a different body must give a generic summary, got: {line}"
+        );
+        assert!(
+            !line.contains("— outline"),
+            "must not produce an outline: {line}"
+        );
+    }
+
+    /// #2638 fix (round 5 update): a hand-built footer that passes the
+    /// arithmetic cross-check but carries NO MAC tag still falls back to the
+    /// generic summary — the tag, not the arithmetic, is what authenticates
+    /// origin.
     #[cfg(feature = "ast")]
     #[test]
     fn paginated_page_with_valid_arithmetic_footer_gives_generic_summary() {
@@ -1154,12 +1358,11 @@ fn third(z: u32) -> u32 {
         );
     }
 
-    /// #2638 round 4, finding 1: a source tail that passes BOTH the grammar
-    /// check AND the arithmetic cross-check — the hardest ambiguous case —
-    /// must still give the generic summary. Without a side channel there is
-    /// no way to tell it from a real producer footer, so the conservative
-    /// fallback applies. `text_lines(200)` + a footer naming `offset=201`
-    /// passes: first_line=1, body.lines()=200, expected=201, matches.
+    /// #2638 round 5 update: a source tail that passes BOTH the grammar
+    /// check AND the arithmetic cross-check but carries no MAC tag — the
+    /// hardest ambiguous case without authentication — must still give the
+    /// generic summary. `text_lines(200)` + a footer naming `offset=201`
+    /// passes the arithmetic: first_line=1, body.lines()=200, expected=201.
     #[test]
     fn an_ambiguous_tail_passing_arithmetic_gives_generic_summary() {
         let mut content = text_lines(200);
@@ -1205,18 +1408,20 @@ fn third(z: u32) -> u32 {
         );
     }
 
-    /// #2638 round 4: an INITIAL long-line truncation — the real producer
-    /// (`output_budget::paginate_read_from`) — cutting a single line too long
-    /// for the budget. The footer carries exact coordinates (offset=1,
-    /// char_offset=300 for budget=100 at 3 c/t) but without a side channel
-    /// those coordinates are unverifiable, so the summarizer falls back to
-    /// the generic summary.
+    /// #2638 fix, case 2 (round 5): an INITIAL long-line truncation — the
+    /// real producer (`output_budget::paginate_read_from`) cutting a single
+    /// line too long for the budget, with a TRUSTED footer (matching path).
+    /// The page-map path's mid-line caveat must carry the exact resume
+    /// coordinates the producer minted — offset=1, char_offset=300 for
+    /// budget=100 at 3 c/t. Red before round 5 (r4 code): generic summary,
+    /// no coordinates.
     #[test]
-    fn an_initial_long_line_truncation_gives_generic_summary() {
+    fn a_trusted_initial_long_line_truncation_keeps_its_exact_char_offset_coordinates() {
         let long_line = "y".repeat(2_000);
+        let path = "notes.md";
         // 100 tokens × 3 chars/token = 300 char cap → mid-line at char 300.
         let page = crate::agentic::tools::output_budget::paginate_read_from(
-            &long_line, None, None, 100, None,
+            path, &long_line, None, None, 100, None,
         );
         // Verify exact fixture coordinates before feeding to the summarizer.
         let (footer_offset, footer_char_offset) = parse_offset_and_char_offset(&page);
@@ -1226,29 +1431,27 @@ fn third(z: u32) -> u32 {
             Some(300),
             "fixture char_offset mismatch: {page}"
         );
-        let line = summarize_one("read_file", json!({"path": "notes.md"}), &page);
-        // Footer is ambiguous — generic summary, no coordinates in the output.
+        let line = summarize_one("read_file", json!({"path": path}), &page);
         assert!(
-            line.starts_with("[read_file] read 'notes.md' ->"),
-            "paginated page must give generic summary: {line}"
-        );
-        assert!(
-            !line.contains("char_offset"),
-            "coordinates must not leak: {line}"
+            line.contains("re-read with offset=1 char_offset=300"),
+            "trusted footer must carry the producer's exact resume coordinates: {line}"
         );
     }
 
-    /// #2638 round 4: a RESUMED `char_offset` page — the model's second call,
-    /// echoing back the first page's footer coordinates. The footer of the
-    /// resumed page carries exact coordinates (offset=1, char_offset=600 for
-    /// budget=100 at 3 c/t: first cut at 300, second cut at 300 more), but
-    /// without a side channel those are unverifiable. Both outline (declined
-    /// by the incoming char_offset guard) and page-map fall back to generic.
+    /// #2638 round 5: a RESUMED `char_offset` page — the model's second call,
+    /// echoing back the first page's footer coordinates, with a TRUSTED
+    /// footer (matching path). The page map keeps its exact resumed
+    /// coordinates (offset=1, char_offset=600 for budget=100 at 3 c/t: first
+    /// cut at 300, second cut at 300 more) — trust restores round-3's
+    /// behavior. The AST outline guard (kept from round 4) still declines
+    /// unconditionally on any nonzero incoming `char_offset`, regardless of
+    /// trust: the page's first line is a lexical fragment either way.
     #[test]
-    fn a_resumed_char_offset_page_gives_generic_summary() {
+    fn a_trusted_resumed_char_offset_page_keeps_its_page_map_and_still_declines_the_outline() {
         let long_line = "z".repeat(2_000);
+        let path = "notes.md";
         let first = crate::agentic::tools::output_budget::paginate_read_from(
-            &long_line, None, None, 100, None,
+            path, &long_line, None, None, 100, None,
         );
         let (first_offset, first_char_offset) = parse_offset_and_char_offset(&first);
         assert_eq!(first_offset, Some(1), "first page offset mismatch: {first}");
@@ -1258,6 +1461,7 @@ fn third(z: u32) -> u32 {
             "first page char_offset mismatch: {first}"
         );
         let resumed = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
             &long_line,
             Some(1),
             None,
@@ -1276,16 +1480,15 @@ fn third(z: u32) -> u32 {
             Some(600),
             "resumed page char_offset mismatch: {resumed}"
         );
-        let args = json!({"path": "notes.md", "offset": 1, "char_offset": 300_u64});
+        let args = json!({"path": path, "offset": 1, "char_offset": 300_u64});
         let line = summarize_one("read_file", args, &resumed);
-        // Footer is ambiguous — generic summary, no coordinates in the output.
         assert!(
-            line.starts_with("[read_file] read 'notes.md' ->"),
-            "paginated page must give generic summary: {line}"
+            line.contains("re-read with offset=1 char_offset=600"),
+            "trusted resumed footer must keep its exact page-map coordinates: {line}"
         );
         assert!(
-            !line.contains("char_offset"),
-            "coordinates must not leak: {line}"
+            !line.contains("— outline"),
+            "the incoming char_offset guard must still decline the outline: {line}"
         );
     }
 
@@ -1324,6 +1527,43 @@ fn third(z: u32) -> u32 {
         assert!(
             !with_offset.contains("— outline"),
             "incoming char_offset must decline the outline for a mid-line fragment: {with_offset}"
+        );
+    }
+
+    /// #2638 round 5, case 6: the actual target case #2557 exists for — a
+    /// REAL ~13k-line file (this workspace's own `agentic/mod.rs`), always
+    /// paginated, through the real producer and then the real summarizer.
+    /// `include_str!` embeds the file at compile time — no runtime fs read,
+    /// keeping this a unit test per this repo's fully-mocked unit tier.
+    #[cfg(feature = "ast")]
+    #[test]
+    fn a_real_13k_line_file_through_paginate_and_prune_gets_an_outline() {
+        const MOD_RS: &str = include_str!("agentic/mod.rs");
+        let total_lines = MOD_RS.lines().count();
+        assert!(
+            total_lines > 10_000,
+            "fixture file is no longer ~13k lines ({total_lines}) — pick another large file"
+        );
+        let path = "newt-core/src/agentic/mod.rs";
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            MOD_RS,
+            Some(1),
+            None, // default read limit
+            0,    // no char cap — the line window alone triggers pagination
+            None,
+        );
+        assert!(
+            page.contains("call read_file with offset="),
+            "a 13k-line file at the default line window must paginate: got a page of \
+             {} chars with no footer",
+            page.len()
+        );
+        let line = summarize_one("read_file", json!({"path": path, "offset": 1}), &page);
+        assert!(
+            line.contains("— outline") || line.contains("page map"),
+            "the target case (#2557): a real paginated read of a real 13k-line file must \
+             get an outline or page map, not the plain one-liner: {line}"
         );
     }
 
