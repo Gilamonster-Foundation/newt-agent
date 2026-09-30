@@ -273,6 +273,7 @@ fn request_net_grant(
         kind: newt_core::DenialKind::Net,
         target: required.host.clone(),
         reason: format!("MCP server `{server_name}`: {reason}. {scope_note}"),
+        harness_bound: false,
     };
     let (caveats, mut hosts, remembered) = prompt.as_mut()?(&request)?;
     if !hosts.contains(&required.host) {

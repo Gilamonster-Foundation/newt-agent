@@ -72,6 +72,7 @@ fn web_fetch_request(host: &str) -> PermissionRequest {
         kind: DenialKind::Net,
         target: host.to_string(),
         reason: format!("net does not permit '{host}'"),
+        harness_bound: false,
     }
 }
 

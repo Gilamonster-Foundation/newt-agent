@@ -20,6 +20,7 @@ fn build_request(workspace: &str) -> PermissionRequest {
         kind: DenialKind::Build,
         target: workspace.into(),
         reason: "Run this resolved lifecycle command: cargo test".into(),
+        harness_bound: false,
     }
 }
 
@@ -55,6 +56,7 @@ fn a_session_build_grant_covers_exec_of_the_same_build_tool() {
         kind: DenialKind::Exec,
         target: "cargo".into(),
         reason: "cargo test".into(),
+        harness_bound: false,
     };
     assert!(
         session_grant_covers(&grants, &cargo_test),
@@ -79,6 +81,7 @@ fn a_session_build_grant_covers_exec_of_the_same_build_tool() {
         kind: DenialKind::Exec,
         target: "rm".into(),
         reason: "cleanup".into(),
+        harness_bound: false,
     };
     assert!(!session_grant_covers(&grants, &rm));
 }
@@ -94,6 +97,7 @@ fn a_build_covered_exec_keeps_network_authority_and_the_build_fence() {
         kind: DenialKind::Exec,
         target: "cargo".into(),
         reason: "cargo test".into(),
+        harness_bound: false,
     };
     for network in [Scope::none(), Scope::only(["crates.io".into()]), Scope::All] {
         let mut state = PermissionPromptState::default();
@@ -218,6 +222,7 @@ fn fetch_request(host: &str) -> PermissionRequest {
         kind: DenialKind::Net,
         target: host.into(),
         reason: "Fetch the crates Cargo.lock pins: `cargo fetch --locked`".into(),
+        harness_bound: false,
     }
 }
 

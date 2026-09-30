@@ -140,6 +140,7 @@ fn fetch_network_scope(
                     cwd.display(),
                     CRATES_IO_FETCH_HOSTS.join(" and "),
                 ),
+                harness_bound: false,
             })
             .collect();
         // OCAP-DANGER: dependency-fetch-egress

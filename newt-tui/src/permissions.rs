@@ -81,7 +81,10 @@ pub(crate) fn should_prompt_permissions(
 pub(crate) use newt_core::tty::try_watch_stdin;
 
 pub(crate) fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bool {
-    req.tool == "request_permissions"
+    // #2636 finding 4: use the typed harness_bound field, not the string prefix
+    // check. The model can forge BOUND_REASON_PREFIX in its reason text; it
+    // cannot set harness_bound, which is only set by execute_request_permissions.
+    req.tool == "request_permissions" && !req.harness_bound
 }
 
 /// How long the gate waits for a web decision before failing closed.
@@ -1784,6 +1787,12 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
 
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
         self.ask_with_caveats(&self.base.clone(), requests)
+    }
+
+    fn consume_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
+        self.state
+            .pending_once_grants
+            .remove(&(kind, target.to_string()));
     }
 
     fn ask_with_caveats(

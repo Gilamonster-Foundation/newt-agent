@@ -106,6 +106,7 @@ fn req(kind: DenialKind, target: &str) -> PermissionRequest {
         kind,
         target: target.to_string(),
         reason: "not within the granted authority".to_string(),
+        harness_bound: false,
     }
 }
 

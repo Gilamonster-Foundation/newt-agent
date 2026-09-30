@@ -301,6 +301,7 @@ pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeCon
 pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
+    BOUND_REASON_PREFIX,
 };
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
@@ -2262,6 +2263,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: the args of the most recently denied run_command — cleared when
+    // request_permissions consumes and re-runs it, or on the next turn.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -4022,6 +4026,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -4539,7 +4544,7 @@ impl RepeatCallGuard {
         // would need if a future memo kind requires it.
         _read_scope: ReadScope<'_>,
     ) {
-        if tools::permission_grant_succeeded(name, args, ok, result) {
+        if tools::permission_grant_succeeded(name, args, ok, result, execution) {
             self.repeat_memos.retain(|_, memo| {
                 !matches!(
                     memo,
@@ -7099,6 +7104,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -8877,6 +8884,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -9818,6 +9826,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -11352,6 +11362,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -12133,6 +12144,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let mut readonly_completion_retried = false;
@@ -13042,6 +13055,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,

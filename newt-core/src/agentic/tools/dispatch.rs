@@ -89,6 +89,13 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// exists to exclude. `None` when the call never routed (stayed
     /// `Exec`) or no funnel is listening.
     pub(crate) routed_to: Option<&'a std::sync::OnceLock<(&'static str, serde_json::Value)>>,
+    /// #2628: the args of the most-recently-denied `run_command` invocation.
+    /// Set by the `run_command` dispatch arm when the shell returns a
+    /// capability denial; taken (cleared) by the `request_permissions` arm
+    /// when the operator approves, which then re-runs the command with the
+    /// widened one-shot caveats so the model receives the result directly
+    /// instead of a "retry" instruction.
+    pub(crate) pending_rerun: Option<&'gate mut Option<super::PendingRerun>>,
 }
 
 #[allow(clippy::too_many_arguments)]

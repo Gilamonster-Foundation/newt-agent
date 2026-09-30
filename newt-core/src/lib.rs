@@ -212,8 +212,8 @@ pub use agentic::{
     SessionSpillStore, SessionStepLedger, ShellObservation, SolveObservation, SpillStore, Step,
     StepLedger, StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture,
     Summarizer, ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle,
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
-    MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, BOUND_REASON_PREFIX,
+    EXPERIENCE_TOP_K, MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};

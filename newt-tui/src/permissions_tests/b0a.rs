@@ -7,6 +7,7 @@ fn net_low() -> PermissionRequest {
         kind: DenialKind::Net,
         target: "https://example.com/api".into(),
         reason: String::new(),
+        harness_bound: false,
     }
 }
 
@@ -16,6 +17,7 @@ fn exec_high() -> PermissionRequest {
         kind: DenialKind::Exec,
         target: "bash".into(),
         reason: "exec of \"bash\" is not within the granted authority".into(),
+        harness_bound: false,
     }
 }
 
@@ -260,6 +262,7 @@ fn every_offered_action_is_a_valid_option_id() {
                 kind,
                 target: target.into(),
                 reason: String::new(),
+                harness_bound: false,
             };
             let definition = definition_of(&req, audience.clone());
             assert!(!offered(&definition).is_empty());
