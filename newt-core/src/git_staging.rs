@@ -213,8 +213,9 @@ pub struct TrustedTools {
 
 impl TrustedTools {
     /// Resolve and trust-check git, gh (if present), `/bin/sh` and git's
-    /// exec-path. The ONLY subprocess before the check is none; the one after
-    /// it (`git --exec-path`) already uses the checked binary and allowlist.
+    /// exec-path. No subprocess runs before git passes the check; the one
+    /// that follows (`git --exec-path`) already uses the checked binary and
+    /// the allowlist env.
     ///
     /// # Errors
     /// When git is missing or any executable/directory fails [`trust_check`].
