@@ -229,7 +229,11 @@ pub struct PermissionRequest {
     /// bound denial record (not the model's tool call). `reason_is_model_authored`
     /// uses this field, not the `BOUND_REASON_PREFIX` string check, so a model
     /// that forges the prefix cannot suppress the "(model says unverified)" label.
-    #[serde(default)]
+    /// Nonblocking hardening (#2636 round3): `skip_deserializing`, not just
+    /// `default` — a model-supplied JSON payload can never set this field
+    /// true even if it forges the key, because deserialization never reads
+    /// it at all.
+    #[serde(default, skip_deserializing)]
     pub harness_bound: bool,
 }
 

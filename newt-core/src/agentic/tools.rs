@@ -1833,6 +1833,31 @@ pub(super) struct PendingRerun {
     missing: Vec<PermissionRequest>,
 }
 
+/// #2636 round3 blocker 1: does a single grant of `kind` for `target` cover
+/// EVERY request in `missing`? Checked BEFORE asking the operator, using only
+/// the requested capability/target — never the widened caveats the gate
+/// eventually returns, which don't exist yet — so the prompt shown to the
+/// operator can honestly say whether this approval alone would replay the
+/// bound command. A single-target grant only ever produces one path-scope
+/// root, so this mirrors `permits_filesystem_request` against that one-root
+/// scope: an unrelated target, the wrong axis, or a grant that covers only
+/// part of `missing` (e.g. one of two denied paths) all return `false`.
+fn single_grant_covers_missing(
+    kind: DenialKind,
+    target: &str,
+    missing: &[PermissionRequest],
+) -> bool {
+    if missing.is_empty() {
+        return false;
+    }
+    let scope = crate::caveats::Scope::only([target.to_string()]);
+    missing.iter().all(|request| {
+        request.kind == kind
+            && matches!(kind, DenialKind::FsRead | DenialKind::FsWrite)
+            && crate::caveats::permits_path(&scope, &request.target)
+    })
+}
+
 /// #721: the model-facing `request_permissions` tool — the capability-GRANT
 /// path. It builds a [`PermissionRequest`] from `{capability, target, reason}`
 /// and consults the SAME #263 [`PermissionGate`] a denial would: `Allow` reports
@@ -1893,11 +1918,19 @@ fn execute_request_permissions(
         );
     }
 
+    // #2636 round3 blocker 1: only promise the IMMEDIATELY-re-runs wording
+    // when this exact grant would cover the COMPLETE missing set the command
+    // was denied on. A partial or unrelated request still clears the pending
+    // slot (already taken by the caller) but gets ordinary access-grant
+    // wording that says plainly no automatic replay will happen.
+    let eligible =
+        bound.filter(|pending| single_grant_covers_missing(kind, target, &pending.missing));
+
     let request = PermissionRequest {
         tool: "request_permissions".to_string(),
         kind,
         target: target.to_string(),
-        reason: match bound {
+        reason: match eligible {
             // #2636 finding 4: harness-authored disclosure of the execution this
             // approval triggers — never the model's `reason`. The `harness_bound`
             // field (not the prefix string) is what reason_is_model_authored checks.
@@ -1907,10 +1940,15 @@ fn execute_request_permissions(
                  grant: `{}` in `{}`. It will not run again without a fresh approval.",
                 pending.cmd, pending.cwd
             ),
+            None if bound.is_some() => format!(
+                "model requested {capability} for '{target}'. This grant alone does not \
+                 cover everything the previously denied command needs, so it will NOT be \
+                 automatically re-run — retry it yourself with a fresh run_command call."
+            ),
             None if reason.is_empty() => format!("model requested {capability} for '{target}'"),
             None => reason.to_string(),
         },
-        harness_bound: bound.is_some(),
+        harness_bound: eligible.is_some(),
     };
 
     let quoted_target = serde_json::json!(target);
@@ -1919,7 +1957,7 @@ fn execute_request_permissions(
         // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(widened) => {
-                if bound.is_some_and(|pending| {
+                if eligible.is_some_and(|pending| {
                     pending
                         .missing
                         .iter()
