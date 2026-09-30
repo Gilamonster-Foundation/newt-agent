@@ -239,20 +239,30 @@ fn every_msrv_gate_reads_the_declared_floor_instead_of_restating_it() {
     }
 }
 
-/// **The hook actually runs the gate it claims to mirror.**
+/// **The hook either runs the MSRV gate or names it as CI-only.**
 ///
-/// Without this the workflow and the recipe could stay in lockstep while the
-/// hook quietly stopped invoking either.
+/// Craft Register `CRAFT-14` (v3.0): the pre-push hook is a fast pre-flight on
+/// the changed scope, and every check the pipeline runs is either scoped in
+/// the hook or named there as CI-only. What this guards against is the silent
+/// case: the hook neither running `just msrv` nor saying that CI owns it.
 #[test]
-fn the_pre_push_hook_invokes_the_msrv_recipe() {
+fn the_pre_push_hook_runs_or_names_the_msrv_recipe_as_ci_only() {
     let invoked = HOOK
         .lines()
         .map(str::trim)
         .any(|l| l == "just msrv" || l.starts_with("just msrv "));
+    let ci_only = HOOK
+        .split_once("# CI-ONLY")
+        .map(|(_, rest)| {
+            rest.lines()
+                .skip(1) // the rest of the `# CI-ONLY (...)` heading line
+                .take_while(|l| l.starts_with('#'))
+                .any(|l| l.contains("`just msrv`"))
+        })
+        .unwrap_or(false);
     assert!(
-        invoked,
-        ".githooks/pre-push no longer runs `just msrv` as a command. Its own \
-         header still claims `just msrv` matches the MSRV job, so either the \
-         gate or the claim has to change."
+        invoked || ci_only,
+        ".githooks/pre-push neither runs `just msrv` nor names it in its CI-ONLY \
+         header, so the MSRV gate has silently dropped out of the hook's account."
     );
 }
