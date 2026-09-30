@@ -338,6 +338,28 @@ fn a_kernel_refused_binary_is_denied() {
     assert!(text.starts_with("capability denied:"), "{text}");
 }
 
+/// #2637: `from_cache` is additive on persisted `turns.events` and the headless
+/// trajectory. A legacy row without the field loads as `false`; `false` is
+/// omitted, so real-execution events serialize byte-identically to before;
+/// `true` round-trips. A historical `false` means "not recorded as cached",
+/// not proof of execution.
+#[test]
+fn from_cache_is_additive_on_the_persisted_event() {
+    let legacy: crate::ToolEvent =
+        serde_json::from_str(r#"{"tool":"read_file","args_digest":"keys=path;abc","ok":true}"#)
+            .unwrap();
+    assert!(!legacy.from_cache);
+    let real = crate::ToolEvent::from_call("read_file", &serde_json::json!({}), true, None);
+    assert!(!serde_json::to_string(&real).unwrap().contains("from_cache"));
+    let cached = crate::ToolEvent::from_cache("read_file", &serde_json::json!({}));
+    let json = serde_json::to_string(&cached).unwrap();
+    assert!(json.contains(r#""from_cache":true"#), "{json}");
+    assert_eq!(
+        serde_json::from_str::<crate::ToolEvent>(&json).unwrap(),
+        cached
+    );
+}
+
 /// Non-shell events serialize without the field, so their persisted bytes are
 /// unchanged; a shell event names its class in snake_case.
 #[test]
