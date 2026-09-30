@@ -3881,28 +3881,20 @@ async fn execute_authorized_tool(
             // narrowing ever regressed) inherit the session's full net scope
             // inside a hostile-repo-influenced child.
             if native_git::needs_push_broker(cmd) {
-                let reason = native_git::execute_governed_push(
+                return host_return(native_git::execute_governed_push(
                     cmd,
                     std::path::Path::new(&run_cwd),
                     caveats,
                     &mut permission_gate,
-                );
-                return host_return(match reason {
-                    Ok(out) => out,
-                    Err(reason) => format!("error: {reason}"),
-                });
+                ));
             }
             if native_git::needs_pr_create_broker(cmd) {
-                let reason = native_git::execute_governed_pr_create(
+                return host_return(native_git::execute_governed_pr_create(
                     cmd,
                     std::path::Path::new(&run_cwd),
                     caveats,
                     &mut permission_gate,
-                );
-                return host_return(match reason {
-                    Ok(out) => out,
-                    Err(reason) => format!("error: {reason}"),
-                });
+                ));
             }
             if let Err(reason) = native_git::preflight(
                 cmd,

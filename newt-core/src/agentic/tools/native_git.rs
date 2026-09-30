@@ -188,14 +188,47 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
 /// through the confined shell — see the call site's comment in `tools.rs`).
 /// `cwd` is the resolved directory the model's `run_command` targeted (after
 /// any folded leading `cd`).
+///
+/// F6: the returned text is ALWAYS fixed-form — an [`Unavailable`] notice
+/// (fixed text, no data), or an [`Outcome`]. Every other refusal or error
+/// exit is normalised here to `failed(refused_by_harness)`: its detail can
+/// carry operator config (a helper value, a path) and is dropped with the
+/// raw child output. Operators re-run by hand to debug.
+///
+/// [`Unavailable`]: crate::git_staging::Unavailable
+/// [`Outcome`]: crate::git_staging::Outcome
 pub(super) fn execute_governed_push(
     source: &str,
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
-) -> Result<String, String> {
-    let plan = plan_governed_push(source, cwd, caveats, gate)?;
-    Ok(run_staged_push(&plan, caveats)?.to_string())
+) -> String {
+    if let Err(unavailable) = broker_available(caveats) {
+        return unavailable.to_string();
+    }
+    fixed_form(
+        plan_governed_push(source, cwd, caveats, gate)
+            .and_then(|plan| run_staged_push(&plan, caveats)),
+    )
+}
+
+/// SPEC-FINAL F5/F4 preconditions, checked before any argv or file is read.
+fn broker_available(caveats: &Caveats) -> Result<(), crate::git_staging::Unavailable> {
+    crate::git_staging::preflight_availability(caveats)?;
+    if !crate::confined_exec::kernel_fs_fence_available() {
+        return Err(crate::git_staging::Unavailable::NoConfinement);
+    }
+    Ok(())
+}
+
+/// The broker boundary's F6 normalisation (see [`execute_governed_push`]).
+fn fixed_form(result: Result<crate::git_staging::Outcome, String>) -> String {
+    use crate::git_staging::{FailureCategory, Outcome};
+    result
+        .unwrap_or(Outcome::Failed {
+            category: FailureCategory::RefusedByHarness,
+        })
+        .to_string()
 }
 
 /// Everything [`execute_governed_push`] must verify BEFORE it may create a
@@ -433,15 +466,21 @@ fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, String>
 
 /// issue-1188 #2641 design round 4: execute a governed `gh pr create` from a
 /// fresh staging directory (Phase 4 — `cwd = staging`, so no workspace
-/// `.git/config` is ever in scope for `gh`'s own git children).
+/// `.git/config` is ever in scope for `gh`'s own git children). Same F6
+/// boundary as [`execute_governed_push`].
 pub(super) fn execute_governed_pr_create(
     source: &str,
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
-) -> Result<String, String> {
-    let plan = plan_governed_pr_create(source, cwd, caveats, gate)?;
-    Ok(run_staged_pr_create(&plan, caveats)?.to_string())
+) -> String {
+    if let Err(unavailable) = broker_available(caveats) {
+        return unavailable.to_string();
+    }
+    fixed_form(
+        plan_governed_pr_create(source, cwd, caveats, gate)
+            .and_then(|plan| run_staged_pr_create(&plan, caveats)),
+    )
 }
 
 /// Phase 2/4/5 for `gh pr create`: a bare staging dir (no objects needed —
@@ -1593,6 +1632,7 @@ mod governed_push_tests {
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
 
     /// A write root nothing in these fixtures lives under, so every trust
     /// check sees real (not model-writable) paths.
@@ -1680,7 +1720,7 @@ mod governed_push_tests {
     struct BrokerEnv {
         saved: Vec<(&'static str, Option<String>)>,
         home: tempfile::TempDir,
-        _bin: tempfile::TempDir,
+        bin: tempfile::TempDir,
         _state: tempfile::TempDir,
         _lock: crate::process_env::EnvGuard,
     }
@@ -1727,10 +1767,14 @@ mod governed_push_tests {
             Self {
                 saved,
                 home,
-                _bin: bin,
+                bin,
                 _state: state,
                 _lock: lock,
             }
+        }
+
+        fn gh(&self) -> PathBuf {
+            self.bin.path().join("gh")
         }
 
         /// `git config --global …` in this HOME, 0600 afterwards.
@@ -1921,6 +1965,88 @@ mod governed_push_tests {
             let _ = s.write_all(b"QUIT\r\n\r\n");
         }
         handle.join().expect("endpoint thread")
+    }
+
+    // -- sink doubles for F6 ------------------------------------------------
+
+    /// Everything written to file descriptor 2 — where any child with an
+    /// INHERITED stderr (a `.status()` call) would write — while `f` runs.
+    /// Positive control: a child that does inherit stderr IS captured.
+    fn capture_fd2<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::os::fd::AsRawFd;
+        let file = tempfile::tempfile().unwrap();
+        // SAFETY: dup/dup2/close on valid descriptors; fd 2 is restored below.
+        let saved = unsafe { libc::dup(2) };
+        assert!(saved >= 0);
+        unsafe { libc::dup2(file.as_raw_fd(), 2) };
+        let control = std::process::Command::new("/bin/sh")
+            .args(["-c", "echo FD2-CONTROL >&2"])
+            .status();
+        let out = f();
+        unsafe {
+            libc::dup2(saved, 2);
+            libc::close(saved);
+        }
+        assert!(control.is_ok_and(|s| s.success()));
+        let mut text = String::new();
+        let mut file = file;
+        std::io::Seek::rewind(&mut file).unwrap();
+        file.read_to_string(&mut text).unwrap();
+        assert!(text.contains("FD2-CONTROL"), "fd-2 double must capture");
+        (out, text)
+    }
+
+    /// A tracing subscriber recording every event/span field. Always
+    /// interested, with the callsite interest cache rebuilt on entry, so a
+    /// broker log line could not be filtered out before reaching it.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<Mutex<String>>);
+
+    struct Fields(Arc<Mutex<String>>);
+
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let mut log = self.0.lock().unwrap();
+            log.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for LogSink {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            span.record(&mut Fields(self.0.clone()));
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            values.record(&mut Fields(self.0.clone()));
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut Fields(self.0.clone()));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn capture_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = LogSink::default();
+        let log = sink.0.clone();
+        let out = tracing::subscriber::with_default(sink, || {
+            tracing::callsite::rebuild_interest_cache();
+            tracing::info!(control = "LOG-CONTROL");
+            f()
+        });
+        let text = log.lock().unwrap().clone();
+        assert!(text.contains("LOG-CONTROL"), "log double must capture");
+        (out, text)
     }
 
     // -- planning refusals (no confined step reached) ----------------------
@@ -2386,6 +2512,178 @@ mod governed_push_tests {
             "{refused:?}"
         );
         assert!(seen.requests.is_empty(), "{seen:?}");
+    }
+
+    /// F6 canary, push side: the credential helper (the gh form, a fake gh)
+    /// prints an unregistered secret on stderr while authenticating a real
+    /// push. The endpoint seeing credentials proves the helper ran; the
+    /// secret reaches neither the broker's result, nor fd 2 (the terminal a
+    /// `.status()` child would inherit), nor the log.
+    #[test]
+    fn a_helper_secret_on_stderr_never_leaves_the_push_broker() {
+        if !fence() {
+            return;
+        }
+        let env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let (port, endpoint) = receive_pack_endpoint(true);
+        // git matches a credential URL including its port.
+        let key = format!("credential.http://127.0.0.1:{port}.helper");
+        env.global(&[&key, ""]);
+        env.global(&[
+            "--add",
+            &key,
+            &format!("!{} auth git-credential", env.gh().display()),
+        ]);
+        let plan = plan_for_endpoint(repo.path(), &scoped_caveats(), port);
+        let ((outcome, log), fd2) =
+            capture_fd2(|| capture_log(|| fixed_form(run_staged_push(&plan, &scoped_caveats()))));
+        let seen = stop(port, endpoint);
+        assert!(
+            seen.requests.iter().any(|r| r.ends_with("auth=true")),
+            "the helper must have run: {seen:?}"
+        );
+        assert!(outcome.starts_with("pushed "), "{outcome}");
+        for (sink, text) in [("result", &outcome), ("fd2", &fd2), ("log", &log)] {
+            assert!(!text.contains(CANARY), "canary leaked to {sink}: {text}");
+        }
+    }
+
+    /// F6 at the broker boundary: a refusal whose detail carries operator
+    /// configuration (here a hostile helper value embedding the canary) is
+    /// normalised to the fixed form; the detail never reaches the model.
+    #[test]
+    fn a_refusal_detail_is_normalised_to_the_fixed_form() {
+        if !fence() {
+            return;
+        }
+        let env = BrokerEnv::new();
+        env.global(&["credential.helper", &format!("!echo {CANARY}")]);
+        let repo = repo_on_feature_branch();
+        let result = execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None);
+        assert_eq!(result, "failed(refused_by_harness)");
+    }
+
+    // -- the real outer dispatch --------------------------------------------
+
+    /// Run `command` through the REAL `run_command` dispatch with a
+    /// capturing display writer; returns (model result, terminal text).
+    fn dispatch_run_command(ws: &Path, command: &str, caveats: &Caveats) -> (String, String) {
+        #[derive(Clone, Default)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _ocap = crate::agentic::tools::disable_ocap_tests::ENV_LOCK.blocking_lock();
+        let _ocap_off =
+            crate::agentic::tools::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+        let terminal = Shared::default();
+        let mut display =
+            crate::agentic::display::ToolDisplay::new(terminal.clone(), false, 100, 40, false);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(super::super::execute_tool_with_display_cancellable(
+                &mut display,
+                "run_command",
+                &serde_json::json!({ "command": command }),
+                &ws.to_string_lossy(),
+                false,
+                40,
+                caveats,
+                &mut crate::agentic::NoMcp,
+                super::super::ToolCollaborators::default(),
+                false,
+                crate::agentic::PromptDisposition::Act,
+                None,
+            ))
+            .unwrap()
+            .unwrap();
+        drop(display);
+        let text = String::from_utf8_lossy(&terminal.0.lock().unwrap()).into_owned();
+        (result, text)
+    }
+
+    fn refs(repo: &Path) -> String {
+        git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// SPEC-FINAL F5 through the REAL outer dispatch: under `Scope::All` net
+    /// a top-level `git push` gets the disclaimer and moves no ref — neither
+    /// the workspace's nor the destination's. The destination is a local
+    /// bare repository, so a push that escaped the broker would be visible.
+    #[test]
+    fn f5_a_push_under_scope_all_net_is_refused_through_real_dispatch() {
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let dest = tempdir();
+        git(dest.path(), &["init", "-q", "--bare"]);
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &dest.path().to_string_lossy(),
+            ],
+        );
+        let (ws_before, dest_before) = (refs(repo.path()), refs(dest.path()));
+        // Write authority over both trees: were the push to escape the
+        // broker into the confined shell, it could really move `dest`.
+        let caveats = Caveats {
+            net: Scope::All,
+            fs_write: Scope::only(
+                [repo.path(), dest.path()].map(|p| p.to_string_lossy().into_owned()),
+            ),
+            ..scoped_caveats()
+        };
+        let (result, _terminal) =
+            dispatch_run_command(repo.path(), "git push origin task:task", &caveats);
+        assert!(result.contains("disclaimed"), "{result}");
+        assert_eq!(refs(repo.path()), ws_before);
+        assert_eq!(refs(dest.path()), dest_before);
+    }
+
+    /// F6 canary, PR side, through the REAL outer dispatch: gh prints an
+    /// unregistered secret on stderr while creating the PR. It reaches
+    /// neither the model result, the terminal writer, fd 2, nor the log;
+    /// the result is exactly the fixed form.
+    #[test]
+    fn a_gh_secret_on_stderr_never_leaves_pr_create_dispatch() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let (((result, terminal), log), fd2) = capture_fd2(|| {
+            capture_log(|| {
+                dispatch_run_command(
+                    repo.path(),
+                    "gh pr create --title t --body b",
+                    &scoped_caveats(),
+                )
+            })
+        });
+        assert!(
+            result.contains("pr_created https://github.com/o/r/pull/7"),
+            "{result}"
+        );
+        for (sink, text) in [
+            ("model result", &result),
+            ("terminal", &terminal),
+            ("fd2", &fd2),
+            ("log", &log),
+        ] {
+            assert!(!text.contains(CANARY), "canary leaked to {sink}: {text}");
+        }
     }
 
     // -- gh pr create planning ----------------------------------------------
