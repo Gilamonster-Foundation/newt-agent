@@ -1509,7 +1509,10 @@ mod tests {
         let outside = dir.path().join("outside_alts");
         std::fs::write(&outside, "/etc\n").unwrap();
         std::os::unix::fs::symlink(&outside, objects.join("info/alternates")).unwrap();
-        let fs_read = scope(&[dir.path().to_str().unwrap()]);
+        // Use the CANONICAL path in the scope so the test passes on platforms
+        // where the tempdir root is a symlink (e.g. macOS /var → /private/var).
+        let canon_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let fs_read = scope(&[canon_dir.to_str().unwrap()]);
         let err = resolve_alternates_chain(&objects, &fs_read).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
     }
@@ -1854,10 +1857,23 @@ file:/h/.gitconfig\0credential.interactive\0";
     #[test]
     fn an_advisory_sandbox_is_refused_even_after_a_successful_run() {
         assert!(require_kernel_fence(agent_bridle::SandboxKind::None).is_err());
+        // The expected kernel-fence kind is platform-specific: Landlock on Linux,
+        // Seatbelt on macOS — the other kind is wrong and must also be refused.
+        #[cfg(target_os = "linux")]
         assert_eq!(
             require_kernel_fence(agent_bridle::SandboxKind::Landlock),
             Ok(())
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            require_kernel_fence(agent_bridle::SandboxKind::Seatbelt),
+            Ok(())
+        );
+        // Wrong sandbox kind on the current platform is also refused.
+        #[cfg(target_os = "linux")]
+        assert!(require_kernel_fence(agent_bridle::SandboxKind::Seatbelt).is_err());
+        #[cfg(target_os = "macos")]
+        assert!(require_kernel_fence(agent_bridle::SandboxKind::Landlock).is_err());
     }
 
     /// Review #2641 r4 finding 4: only an absent alternates file is success.
