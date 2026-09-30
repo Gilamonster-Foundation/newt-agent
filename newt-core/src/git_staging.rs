@@ -220,7 +220,7 @@ fn check_one(
     }
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("governed push refused: '{short}' cannot be inspected ({e})"))?;
-    if !meta.file_type().is_symlink() && writable_by_others(&meta, below_owner) {
+    if !meta.file_type().is_symlink() && writable_by_others(&meta, below_owner, path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -244,7 +244,7 @@ fn check_one(
 }
 
 #[cfg(unix)]
-fn writable_by_others(meta: &std::fs::Metadata, below_owner: Option<u32>) -> bool {
+fn writable_by_others(meta: &std::fs::Metadata, below_owner: Option<u32>, _path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let mode = meta.permissions().mode();
     if mode & 0o022 == 0 {
@@ -268,7 +268,7 @@ fn writable_by_others(meta: &std::fs::Metadata, below_owner: Option<u32>) -> boo
     if meta.is_dir()
         && meta.uid() == 0
         && mode & 0o002 == 0  // NOT other-writable
-        && is_apple_developer_path(path)
+        && is_apple_developer_path(_path)
     {
         return false;
     }
@@ -285,7 +285,7 @@ fn is_apple_developer_path(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn writable_by_others(_meta: &std::fs::Metadata, _below_owner: Option<u32>) -> bool {
+fn writable_by_others(_meta: &std::fs::Metadata, _below_owner: Option<u32>, _path: &Path) -> bool {
     false // the broker is refused on Windows before any trust check runs
 }
 
