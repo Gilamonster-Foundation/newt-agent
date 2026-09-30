@@ -1824,7 +1824,7 @@ pub(super) fn permission_grant_succeeded(
 /// `request_permissions` that consumes it (see `execute_authorized_tool`),
 /// so an unrelated intervening command — successful, failed, or a
 /// replacement for this one — invalidates a stale rerun.
-pub(super) struct PendingRerun {
+pub(crate) struct PendingRerun {
     cmd: String,
     cwd: String,
     declared: Vec<PermissionRequest>,
