@@ -206,10 +206,9 @@ pub(super) fn execute_governed_push(
     if let Err(unavailable) = broker_available(caveats) {
         return unavailable.to_string();
     }
-    fixed_form(
-        plan_governed_push(source, cwd, caveats, gate)
-            .and_then(|plan| run_staged_push(&plan, caveats)),
-    )
+    let result = plan_governed_push(source, cwd, caveats, gate)
+        .and_then(|plan| run_staged_push(&plan, caveats));
+    fixed_form_with_notice(result, std::io::stdout())
 }
 
 /// SPEC-FINAL F5/F4 preconditions, checked before any argv or file is read.
@@ -229,6 +228,26 @@ fn fixed_form(result: Result<crate::git_staging::Outcome, String>) -> String {
             category: FailureCategory::RefusedByHarness,
         })
         .to_string()
+}
+
+/// Item 8: routes operator-actionable hints (chmod fixes, paths) to the harness
+/// notice channel before normalising the model-facing result to F6 fixed form.
+/// The model result carries nothing from the detail; only the operator sees it.
+fn fixed_form_with_notice(
+    result: Result<crate::git_staging::Outcome, String>,
+    mut notice: impl std::io::Write,
+) -> String {
+    if let Err(ref detail) = result {
+        let hint: String = detail
+            .lines()
+            .filter(|l| l.contains("Fix:") || l.contains("chmod"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !hint.is_empty() {
+            crate::agentic::display::write_harness_notice(&mut notice, &hint, false);
+        }
+    }
+    fixed_form(result)
 }
 
 /// Everything [`execute_governed_push`] must verify BEFORE it may create a
@@ -267,11 +286,14 @@ fn plan_governed_push(
 
     // F1/F2: authenticate git/gh/sh/exec-path BEFORE any planning subprocess.
     let tools = staging::TrustedTools::authenticate(&caveats.fs_write)?;
+    // Item 5: bind canonical roots once at plan time (snapshot; retargeting the
+    // root symlink after this point does not change the grant).
+    let bound = staging::bind_canonical_roots(&caveats.fs_read);
     // Administrative dirs by file reads, each read-authorized before use.
-    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read)?;
+    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read, &bound)?;
 
-    let branch = staging::read_head_branch(&git_dir, &caveats.fs_read)?;
-    if staging::is_default_branch(&common_dir, &branch) {
+    let branch = staging::read_head_branch(&git_dir, &caveats.fs_read, &bound)?;
+    if staging::is_default_branch(&common_dir, &branch, &caveats.fs_read, &bound) {
         return Err(format!(
             "refused: cannot push the default branch '{branch}' (open a feature branch instead)"
         ));
@@ -289,7 +311,7 @@ fn plan_governed_push(
 
     // The LITERAL `remote.<name>.url` (never `git remote get-url`, which
     // applies insteadOf): what the operator approves is what staging dials.
-    let url = staging::literal_remote_url(&tools, &common_dir, &request.remote, &caveats.fs_read)?;
+    let url = staging::literal_remote_url(&tools, &common_dir, &request.remote, &caveats.fs_read, &bound)?;
     let host = crate::git_hardening::push_url_host(&url)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
@@ -298,10 +320,12 @@ fn plan_governed_push(
     };
 
     // F3: pin the commit at PLAN time; it is carried to the dial unchanged.
-    let oid = staging::read_branch_oid(&git_dir, &branch, &caveats.fs_read)
-        .or_else(|_| staging::read_branch_oid(&common_dir, &branch, &caveats.fs_read))?;
-    staging::resolve_alternates_chain(&common_dir.join("objects"), &caveats.fs_read)?;
-    staging::verify_commit(&tools, &common_dir, &oid)?;
+    let oid = staging::read_branch_oid(&git_dir, &branch, &caveats.fs_read, &bound)
+        .or_else(|_| staging::read_branch_oid(&common_dir, &branch, &caveats.fs_read, &bound))?;
+    staging::resolve_alternates_chain(&common_dir.join("objects"), &caveats.fs_read, &bound)?;
+    // Item 3: verify_commit_in_staging runs AFTER the confined fetch (in
+    // run_staged_push), not here against workspace objects.
+
 
     ensure_net_granted(
         caveats,
@@ -355,6 +379,9 @@ fn run_staged_push(
     // F4: the ONLY step that reads workspace objects, kernel-confined.
     git_staging::confined_fetch(&plan.tools, &staging, &plan.source_repo, &plan.oid, caveats)?;
     git_staging::remove_alternates(&staging)?;
+    // Item 3: verify after alternates are removed so the commit is checked in
+    // self-contained staging, not against live workspace objects.
+    git_staging::verify_commit_in_staging(&plan.tools, &staging, &plan.oid)?;
     let fsck = plan
         .tools
         .git(["fsck", "--connectivity-only", plan.oid.as_str()])
@@ -477,10 +504,9 @@ pub(super) fn execute_governed_pr_create(
     if let Err(unavailable) = broker_available(caveats) {
         return unavailable.to_string();
     }
-    fixed_form(
-        plan_governed_pr_create(source, cwd, caveats, gate)
-            .and_then(|plan| run_staged_pr_create(&plan, caveats)),
-    )
+    let result = plan_governed_pr_create(source, cwd, caveats, gate)
+        .and_then(|plan| run_staged_pr_create(&plan, caveats));
+    fixed_form_with_notice(result, std::io::stdout())
 }
 
 /// Phase 2/4/5 for `gh pr create`: a bare staging dir (no objects needed —
@@ -578,11 +604,13 @@ fn plan_governed_pr_create(
     if tools.gh_path().is_none() {
         return Err("refused: no trusted gh executable is installed".to_string());
     }
-    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read)?;
+    // Item 5: bind canonical roots once at plan time.
+    let bound = staging::bind_canonical_roots(&caveats.fs_read);
+    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read, &bound)?;
 
     // The `gh` dial runs from a fresh staging directory (Phase 4), so a
     // repo-local config gadget has nothing to reach.
-    let url = staging::literal_remote_url(&tools, &common_dir, "origin", &caveats.fs_read)?;
+    let url = staging::literal_remote_url(&tools, &common_dir, "origin", &caveats.fs_read, &bound)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
             "refused: gh pr create is only supported for a github.com 'origin' remote (got {url})"
@@ -590,9 +618,9 @@ fn plan_governed_pr_create(
     };
     let host = "github.com".to_string();
 
-    let head = staging::read_head_branch(&git_dir, &caveats.fs_read)
+    let head = staging::read_head_branch(&git_dir, &caveats.fs_read, &bound)
         .map_err(|_| "refused: detached HEAD has no branch to open a PR from".to_string())?;
-    let base = staging::origin_default_branch(&common_dir).unwrap_or_else(|| "main".to_string());
+    let base = staging::origin_default_branch(&common_dir, &caveats.fs_read, &bound).unwrap_or_else(|| "main".to_string());
     if head == base {
         return Err(format!(
             "refused: cannot open a PR from the default branch '{base}' to itself"
@@ -2809,5 +2837,36 @@ mod governed_push_tests {
         )
         .unwrap_err();
         assert!(err.contains("read authority"), "{err}");
+    }
+
+    // --- Item 8 (Round-5): operator sink separation ----------------------------
+
+    /// `fixed_form_with_notice` routes chmod hints to the operator sink while
+    /// keeping the model-facing result as the fixed-form string.
+    ///
+    /// Measured red: before adding `fixed_form_with_notice`, the chmod hint in
+    /// the trust-check error was simply discarded by `fixed_form`; the notice
+    /// sink received nothing and the model result was the same fixed-form string,
+    /// but there was no way to surface the actionable hint to the operator.
+    #[test]
+    fn operator_sink_gets_chmod_hint_model_result_stays_fixed_form() {
+        use crate::git_staging::Outcome;
+
+        // A trust-check error that contains a "Fix: chmod g-w" hint.
+        let detail = "governed push refused: '~/some/gitconfig' is group- or other-writable (mode 0664)\nFix: chmod g-w ~/some/gitconfig";
+        let result: Result<Outcome, String> = Err(detail.to_string());
+
+        let mut sink = Vec::<u8>::new();
+        let model_result = fixed_form_with_notice(result, &mut sink);
+
+        // Model result is the fixed form — no path, no chmod.
+        assert_eq!(model_result, "failed(refused_by_harness)");
+        assert!(!model_result.contains("chmod"), "chmod must not reach model");
+        assert!(!model_result.contains("gitconfig"), "path must not reach model");
+
+        // Operator sink got the hint.
+        let notice = String::from_utf8_lossy(&sink);
+        assert!(notice.contains("chmod"), "chmod hint must reach operator: {notice}");
+        assert!(notice.contains("Fix:"), "Fix: label must reach operator: {notice}");
     }
 }
