@@ -1833,13 +1833,24 @@ pub(super) struct PendingRerun {
     missing: Vec<PermissionRequest>,
 }
 
-/// #2636 round4: typed token returned by `execute_request_permissions` only
-/// when the request was eligible for replay pre-prompt (i.e. a single grant
-/// of the requested `kind/target` would cover every entry in `pending.missing`
-/// before the operator was shown a prompt). The caller may replay solely when
-/// it holds this token AND the returned caveats actually cover `pending.missing`
-/// — making an ineligible approval unrepresentable as a replay authorization.
-pub(super) struct EligibleReplay;
+/// #2636 round4/round5: typed token the caller requires, ALONGSIDE its own
+/// coverage re-check, before treating an approval as replay authorization.
+/// The private field plus the single checked constructor (`new`) mean
+/// nothing outside this module can mint one except by actually satisfying
+/// `covers_missing` — this is nonblocking hardening of the intended
+/// construction site (`tools_tests` never had another path to one; see
+/// round4's token ruling), not a claim that the type alone makes an
+/// ineligible replay impossible elsewhere in the codebase.
+pub(super) struct EligibleReplay(());
+
+impl EligibleReplay {
+    /// Mint the token only when `covers_missing` actually holds — the
+    /// RETURNED caveats cover every entry in `pending.missing`, not merely
+    /// pre-prompt eligibility.
+    fn new(covers_missing: bool) -> Option<Self> {
+        covers_missing.then_some(Self(()))
+    }
+}
 
 /// #2636 round3 blocker 1: does a single grant of `kind` for `target` cover
 /// EVERY request in `missing`? Checked BEFORE asking the operator, using only
@@ -1971,18 +1982,24 @@ fn execute_request_permissions(
         // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(widened) => {
-                // #2636 round4: `consume_pending_once` fires when the request was
-                // eligible pre-prompt — we told the operator the command would replay,
-                // so the gate's proactive once-grant for the model's own retry must be
-                // dropped. Whether `widened` actually covers `pending.missing` is
-                // checked by the caller via the `EligibleReplay` token; here we only
-                // need eligibility.
-                let replay_auth = if eligible.is_some() {
+                // #2636 round5: consumption and the `EligibleReplay` token both
+                // require the RETURNED `widened` caveats to actually cover
+                // every entry in `pending.missing` — not just pre-prompt
+                // eligibility (the operator's Allow can widen a narrower or
+                // different scope than requested). An eligible-but-insufficient
+                // approval must neither execute the replay NOR spend the
+                // once-grant: report plainly (via the caller's fallback
+                // message) that the command was not re-run.
+                let covers_missing = eligible.is_some_and(|pending| {
+                    pending
+                        .missing
+                        .iter()
+                        .all(|r| permits_filesystem_request(&widened, r))
+                });
+                let replay_auth = EligibleReplay::new(covers_missing);
+                if replay_auth.is_some() {
                     g.consume_pending_once(kind, target);
-                    Some(EligibleReplay)
-                } else {
-                    None
-                };
+                }
                 return (Some(widened), replay_auth, permission_granted_result(capability, target));
             }
             PermissionDecision::Deny => (
@@ -3819,12 +3836,14 @@ async fn execute_authorized_tool(
                 workspace,
                 rerun.as_ref(),
             );
-            // #2636 round4: replay requires BOTH the pre-prompt eligibility
-            // token (the request was eligible before the operator was shown a
-            // prompt) AND that the returned caveats actually cover the denied
-            // set.  An ineligible approval whose widened authority happens to
-            // cover `pending.missing` cannot replay — the unsafe state is
-            // unrepresentable without the token.
+            // #2636 round5: `replay_auth` is minted only when the RETURNED
+            // `widened` caveats actually cover every entry in `pending.missing`
+            // (`EligibleReplay::new`, tools.rs) — pre-prompt eligibility alone
+            // is not enough. This match re-checks the same coverage
+            // independently as a caller-side belt-and-suspenders, not because
+            // the token could otherwise be forged: an ineligible or
+            // insufficient approval never reaches `Some(_auth)` in the first
+            // place.
             match (granted, replay_auth, rerun) {
                 (Some(widened), Some(_auth), Some(pending))
                     if pending

@@ -2666,3 +2666,372 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
          (once-grant spent after case 2a)"
     );
 }
+
+/// #2636 round5 [P2]: a REAL queue-owning gate (mirrors the TUI gate's
+/// `pending_once_grants`: `ask` for a non-`request_permissions` tool checks
+/// the queue FIRST and auto-approves without consulting the operator when a
+/// matching grant is queued; `request_permissions` always queues a proactive
+/// once-grant on `Allow`; `consume_pending_once` removes it). Round4's
+/// "stateful" gate only counted asks — it never modeled the queue a leftover
+/// grant lives in, so it could not tell an operator prompt apart from an
+/// auto-grant, nor prove a spent grant stays spent.
+///
+/// One gate instance owns the queue across the whole sequence:
+/// 1. Proactive grant with no #2628 binding queues a once-grant; the model's
+///    own plain `run_command` retry then auto-approves from the queue —
+///    ZERO operator prompts for that second call, proving the gate can
+///    auto-grant without consulting the operator (`prompt_count` stays flat
+///    while `ask_count` rises).
+/// 2. A #2628-bound approval (eligible, covers `pending.missing`) replays
+///    the denied command exactly once — proven by a counting side effect
+///    (line count, not mere existence) — and `consume_pending_once` removes
+///    the queued grant it just spent.
+/// 3. An ordinary matching `run_command` run afterward must consult the
+///    operator AGAIN (a fresh prompt) rather than reusing the leftover
+///    grant consumed in step 2.
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_owning_gate_proves_once_grant_lifetime_across_replay_and_fresh_command() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+
+    struct QueueGate {
+        queue: Rc<RefCell<BTreeSet<(DenialKind, String)>>>,
+        ask_count: Rc<Cell<usize>>,
+        prompt_count: Rc<Cell<usize>>,
+        consume_count: Rc<Cell<usize>>,
+    }
+    impl PermissionGate for QueueGate {
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            self.ask_count.set(self.ask_count.get() + 1);
+            let req = &requests[0];
+            if req.tool != "request_permissions" {
+                let key = (req.kind, req.target.clone());
+                if self.queue.borrow_mut().remove(&key) {
+                    // Auto-approved from the queued once-grant: the operator
+                    // is never consulted for this call.
+                    return PermissionDecision::Allow(Caveats::top());
+                }
+            }
+            self.prompt_count.set(self.prompt_count.get() + 1);
+            if req.tool == "request_permissions" {
+                self.queue
+                    .borrow_mut()
+                    .insert((req.kind, req.target.clone()));
+            }
+            PermissionDecision::Allow(Caveats::top())
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
+            self.consume_count.set(self.consume_count.get() + 1);
+            self.queue.borrow_mut().remove(&(kind, target.to_string()));
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace_str = ws.path().to_string_lossy().into_owned();
+    let hits = ws.path().join("hits");
+    std::fs::create_dir(&hits).unwrap();
+    // The grant target is the `hits` DIRECTORY, not the file each `mkdir`
+    // creates inside it: `permits_path` matches by prefix, so a grant on
+    // `hits` covers every `hits/N` the real (Landlock-backed) sandbox
+    // actually enforces, while the queue-matching key (an exact
+    // `(kind, target)` pair) still lines up between the proactive grant and
+    // the model's retry.
+    let hits_str = hits.to_string_lossy().into_owned();
+    // fs_read stays at `top()` (workspace browsing is ordinary authority);
+    // only fs_write is denied so every `mkdir` needs a grant. Denying
+    // fs_read too would make `ask_with_caveats`'s default `.meet(widen_caveats(
+    // baseline, grants))` narrow the CWD read scope for the plain
+    // `run_command` path (unlike `request_permissions`'s direct `gate.ask`,
+    // which returns the gate's `Allow` caveats unmet) and every ordinary
+    // `run_command` call would fail before it ever reached `mkdir`.
+    let base = Caveats {
+        fs_write: crate::caveats::Scope::none(),
+        ..Caveats::top()
+    };
+    // `mkdir` (unlike `touch`) fails loudly on a second attempt against the
+    // same path, so a hit count is genuine proof of exactly-once execution,
+    // not merely at-least-once — the gap the round4 review flagged.
+    let hit_count = || std::fs::read_dir(&hits).unwrap().count();
+
+    let queue = Rc::new(RefCell::new(BTreeSet::new()));
+    let ask_count = Rc::new(Cell::new(0usize));
+    let prompt_count = Rc::new(Cell::new(0usize));
+    let consume_count = Rc::new(Cell::new(0usize));
+    let mut gate = QueueGate {
+        queue: queue.clone(),
+        ask_count: ask_count.clone(),
+        prompt_count: prompt_count.clone(),
+        consume_count: consume_count.clone(),
+    };
+
+    // ── STEP 1: proactive grant (no #2628 binding) queues a once-grant ────────
+    let mut no_pending: Option<super::super::PendingRerun> = None;
+    execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({"capability": "fs_write", "target": &hits_str, "reason": "test"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut no_pending),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        prompt_count.get(),
+        1,
+        "proactive grant must prompt the operator once"
+    );
+    assert!(
+        queue
+            .borrow()
+            .contains(&(DenialKind::FsWrite, hits_str.clone())),
+        "AllowOnce on request_permissions must queue a proactive once-grant"
+    );
+
+    // The model's OWN retry: an ordinary matching run_command auto-approves
+    // from the queue — the gate is consulted (`ask_count` rises) but the
+    // operator is NOT (`prompt_count` stays flat).
+    let hit1 = hits.join("1").to_string_lossy().into_owned();
+    execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!("/bin/mkdir {hit1}"),
+            "fs_write": [&hits_str],
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut no_pending),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        prompt_count.get(),
+        1,
+        "the model's own retry must auto-grant from the queued once-grant, \
+         with NO fresh operator prompt"
+    );
+    assert_eq!(hit_count(), 1, "retry must run the command exactly once");
+    assert!(
+        queue.borrow().is_empty(),
+        "the once-grant must be consumed by the retry that spent it"
+    );
+
+    // ── STEP 2: #2628-bound approval replays exactly once, then consumes ──────
+    let missing = vec![PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::FsWrite,
+        target: hits_str.clone(),
+        reason: "test".to_string(),
+        harness_bound: false,
+    }];
+    let hit2 = hits.join("2").to_string_lossy().into_owned();
+    let mut pending_slot: Option<super::super::PendingRerun> = Some(super::super::PendingRerun {
+        cmd: format!("/bin/mkdir {hit2}"),
+        cwd: workspace_str.clone(),
+        declared: missing.clone(),
+        missing: missing.clone(),
+    });
+    execute_tool_with_collaborators(
+        "request_permissions",
+        &serde_json::json!({"capability": "fs_write", "target": &hits_str, "reason": "test"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_slot),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        prompt_count.get(),
+        2,
+        "#2628 approval must prompt the operator"
+    );
+    assert_eq!(
+        consume_count.get(),
+        1,
+        "eligible+covering approval must consume the once-grant"
+    );
+    assert_eq!(
+        hit_count(),
+        2,
+        "the replay must run the bound command exactly once (2 = 1 retry + 1 replay)"
+    );
+    assert!(
+        queue.borrow().is_empty(),
+        "consume_pending_once must leave nothing behind for a later command to reuse"
+    );
+
+    // ── STEP 3: a later ordinary matching run_command requires a FRESH prompt ─
+    let hit3 = hits.join("3").to_string_lossy().into_owned();
+    execute_tool_with_collaborators(
+        "run_command",
+        &serde_json::json!({
+            "command": format!("/bin/mkdir {hit3}"),
+            "fs_write": [&hits_str],
+        }),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut no_pending),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        prompt_count.get(),
+        3,
+        "#2636 round5: a matching run_command after the #2628 replay must NOT reuse the \
+         consumed grant — it must require a fresh operator approval"
+    );
+    assert_eq!(
+        hit_count(),
+        3,
+        "the fresh-approval command must also run exactly once"
+    );
+}
+
+/// #2636 round5 [P2]: an approval that is ELIGIBLE pre-prompt (the requested
+/// capability/target alone would, on paper, cover the complete `missing`
+/// set) but whose RETURNED `widened` caveats do not actually cover it (the
+/// gate granted something narrower/different than what it was asked, e.g. a
+/// danger-tier fence or a stale caveats computation) must neither replay the
+/// command NOR consume the queued once-grant. Consuming here would silently
+/// destroy authority the operator never got to spend on anything, while
+/// telling the model nothing ran.
+#[cfg(unix)]
+#[tokio::test]
+async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consumes() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct InsufficientGate {
+        consumed: Rc<Cell<bool>>,
+    }
+    impl PermissionGate for InsufficientGate {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            // Allow, but the returned caveats grant NOTHING for fs_write —
+            // eligible pre-prompt (target matches exactly), insufficient
+            // post-prompt.
+            PermissionDecision::Allow(Caveats {
+                fs_write: crate::caveats::Scope::none(),
+                ..Caveats::top()
+            })
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn consume_pending_once(&mut self, _: DenialKind, _: &str) {
+            self.consumed.set(true);
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let workspace_str = ws.path().to_string_lossy().into_owned();
+    let target = ws.path().join("a.txt").to_string_lossy().into_owned();
+    let base = Caveats {
+        fs_write: crate::caveats::Scope::none(),
+        ..Caveats::top()
+    };
+    let missing = vec![PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::FsWrite,
+        target: target.clone(),
+        reason: "test".to_string(),
+        harness_bound: false,
+    }];
+    let mut pending_slot: Option<super::super::PendingRerun> = Some(super::super::PendingRerun {
+        cmd: format!("/bin/touch {target}"),
+        cwd: workspace_str.clone(),
+        declared: missing.clone(),
+        missing: missing.clone(),
+    });
+    let consumed = Rc::new(Cell::new(false));
+    let mut gate = InsufficientGate {
+        consumed: consumed.clone(),
+    };
+
+    execute_tool_with_collaborators(
+        "request_permissions",
+        // Requesting EXACTLY the missing target — eligible pre-prompt.
+        &serde_json::json!({"capability": "fs_write", "target": &target, "reason": "test"}),
+        &workspace_str,
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            pending_rerun: Some(&mut pending_slot),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        !std::path::Path::new(&target).exists(),
+        "#2636 round5: an eligible-but-insufficient Allow must not execute the replay"
+    );
+    assert!(
+        !consumed.get(),
+        "#2636 round5: an eligible-but-insufficient Allow must not consume the once-grant \
+         either — the operator's grant was never actually spent on anything"
+    );
+}
