@@ -1813,6 +1813,69 @@ fn third(z: u32) -> u32 {
         );
     }
 
+    /// #2638 coverage fix, measured red before items 1/2: an `offset=6000`
+    /// page of the real file lands mid-body of `cap_exit_progress_handoff`
+    /// AND cuts `openai_chat_complete_with_prompt_and_artifacts` (2,300
+    /// lines) partway through — the two cases the fix items target. The
+    /// listed `fn` count must be at least the page's real `fn` count, grep
+    /// method: `^\s*(pub(\(crate\))? )?(async )?fn [A-Za-z_]` over the
+    /// page's own line range (matches the measurement in
+    /// `../pr-2638-r7/measure-2638`).
+    #[cfg(feature = "ast")]
+    #[test]
+    fn an_offset_6000_page_of_the_real_file_lists_at_least_every_real_fn() {
+        const MOD_RS: &str = include_str!("agentic/mod.rs");
+        let path = "newt-core/src/agentic/mod.rs";
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            MOD_RS,
+            Some(6000),
+            None,
+            0,
+            None,
+        );
+        let (next_offset, _) = parse_offset_and_char_offset(&page);
+        let last_line = next_offset.map_or(MOD_RS.lines().count(), |n| n - 1);
+        let real_fn_count = MOD_RS
+            .lines()
+            .skip(5999)
+            .take(last_line - 5999)
+            .filter(|l| {
+                let t = l.trim_start();
+                let indent = l.len() - t.len();
+                indent <= 8
+                    && [
+                        "fn ",
+                        "pub fn ",
+                        "pub(crate) fn ",
+                        "async fn ",
+                        "pub async fn ",
+                    ]
+                    .iter()
+                    .any(|kw| t.starts_with(kw))
+            })
+            .count();
+        assert!(
+            real_fn_count > 0,
+            "fixture page must contain real fns to compare against"
+        );
+
+        let line = summarize_one("read_file", json!({"path": path, "offset": 6000}), &page);
+        assert!(
+            line.contains("— outline"),
+            "an offset=6000 page of the real file must get an outline: {line}"
+        );
+        let listed_fn_count = line
+            .lines()
+            .filter(|l| l.split('\t').nth(1).is_some_and(|h| h.contains("fn ")))
+            .count();
+        assert!(
+            listed_fn_count >= real_fn_count,
+            "the outline must list at least every real fn on the page — got {listed_fn_count}, \
+             real count {real_fn_count} (last_line={last_line}): {line}"
+        );
+    }
+
     /// Pulls `offset=` and `char_offset=` back out of a real page's footer,
     /// for tests that chain a second real `paginate_read_from` call the way
     /// the model would (round 3: drive the real producer, not a hand-built
