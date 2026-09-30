@@ -2080,3 +2080,57 @@ async fn the_theme_toggle_names_the_cookie_the_server_reads() {
         "the server reads the cookie the toggle writes ({name})"
     );
 }
+
+/// Regression for the newt-web headless BAT flake: `main()` used to
+/// `.await` a slow init (the mesh dock: an identity-file load plus a
+/// network dial) BEFORE starting the accept loop, so `/healthz` could not
+/// answer at all until that init finished — a slow init (or a build, in the
+/// test harness) and an unreachable server were indistinguishable from the
+/// outside.
+///
+/// This drives `run_server` — the actual function `main()` calls, not a
+/// second copy of its body — so restoring await-before-serve in production
+/// fails THIS test, not just a duplicated example. The init future is held
+/// pending on a oneshot (not a sleep race): the probe is bounded by a
+/// timeout instead of racing a fixed delay, so there is no load-sensitive
+/// window to miss under CI contention.
+#[tokio::test]
+async fn run_server_serves_healthz_before_init_completes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (release_init, init_gate) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(run_server(listener, app_with_auth(None), async move {
+        // Stands in for `init_mesh_dock()`: held pending until the test
+        // explicitly releases it, after confirming /healthz already answered.
+        init_gate.await.ok();
+    }));
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    })
+    .await
+    .expect(
+        "/healthz did not answer within the bounded probe while init was \
+         still pending — this is the bug: the accept loop must not wait on it",
+    );
+
+    assert!(
+        probe.starts_with("HTTP/1.1 200"),
+        "unexpected /healthz response: {probe}"
+    );
+
+    // `run_server` (like `main()`) never returns on its own — `axum::serve`
+    // runs the accept loop forever by design — so there is nothing to await
+    // completion of. Release init (so it isn't left dangling) and abort.
+    release_init.send(()).ok();
+    server.abort();
+}
