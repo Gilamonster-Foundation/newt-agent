@@ -640,6 +640,7 @@ fn ensure_net_granted(
         kind: DenialKind::Net,
         target: host.to_string(),
         reason: format!("{action} — net does not permit '{host}'"),
+        harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&request)) {
         // Finding 6 (issue-1188 review #2641): the returned capability is the
