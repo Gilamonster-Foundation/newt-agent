@@ -59,6 +59,67 @@ pub(crate) fn cockpit_pager_case() {
     std::io::stdin().read_line(&mut String::new()).unwrap();
 }
 
+/// #2489: `/psyche` once drew through its OWN inline viewport on the captured
+/// stdout while the cockpit owned the screen — two writers, so the title
+/// stacked and rows interleaved. Every other panel takes the presenter's lent
+/// window; this pins that `/psyche` does too, on a real tty.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
+/// subprocess and races libtest under load). Grounds the seam test
+/// `psyche_panel_uses_the_surface_window`, which is the fast-path gate.
+#[cfg(feature = "rich-tui")]
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn psyche_panel_draws_once_in_the_lent_rows_under_the_cockpit() {
+    crate::interaction_view_pty_test::drive_cockpit_psyche();
+}
+
+#[cfg(feature = "rich-tui")]
+pub(crate) fn cockpit_psyche_case() {
+    use crate::chat::InputSurface as _;
+    // This disposable child owns the tty queried by Crossterm's geometry API.
+    assert!(unsafe { libc::setsid() } >= 0);
+    assert_eq!(unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) }, 0);
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+    cockpit.draw().unwrap();
+    let (to_ui, requests) = std::sync::mpsc::sync_channel(8);
+    let worker = std::thread::spawn(move || {
+        let mut remote = crate::session_worker::RemoteSurface::new(to_ui);
+        let window = remote.open_panel(crate::session_worker::PanelMode::Inline(
+            crate::config_panel::PANEL_HEIGHT,
+        ));
+        assert!(window.is_some(), "the cockpit must lend rows for /psyche");
+        let seed = crate::config_panel::PanelSeed {
+            via: "/psyche",
+            personas: Vec::new(),
+            current_persona: None,
+            backend: Some("sol".to_string()),
+            base_initiative: newt_core::initiative::Initiative::default(),
+            initiative_from_family: false,
+            models: None,
+            current_model: String::new(),
+            personality: Default::default(),
+        };
+        let outcome = crate::config_panel::run(
+            seed,
+            |_, _, _| crate::config_panel::SaveResult::Failed("unused".into()),
+            window,
+        )
+        .unwrap();
+        println!("PSYCHE_RETURNED:{outcome:?}");
+        match remote.read_line("after panel").unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "after-psyche", "panel keys leaked"),
+            other => panic!("panel left the editor unusable: {other:?}"),
+        }
+    });
+    cockpit.run(&requests).unwrap();
+    worker.join().unwrap();
+    println!("PSYCHE_RESTORED");
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+}
+
 /// Grounds the mounted editor's submission and escape-ladder key tests in a
 /// real tty: crossterm may already hold input after a terminal query or poll,
 /// leaving the kernel fd empty. Both Enter and Ctrl-C must work without a

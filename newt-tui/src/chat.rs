@@ -6743,13 +6743,17 @@ fn session_body(
                             // seam /models uses, tagged with cached conformance
                             // symbols. An unreachable backend → None → the row
                             // renders but won't dial.
-                            // #1666: the model spinner's option list — fetched
-                            // HERE (the panel stays network-free) via the same
-                            // seam /models uses, tagged with cached conformance
-                            // symbols. An unreachable backend → None → the row
-                            // renders but won't dial.
                             let panel_choice = resolve_backend_choice(&cfg).ok();
                             let served_models = commands::model::served_choices(&cfg);
+                            // Rows on the real terminal under a cockpit, `None`
+                            // elsewhere — like every other panel (#2489).
+                            let panel_window =
+                                if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                                    surface
+                                        .open_panel(PanelMode::Inline(config_panel::PANEL_HEIGHT))
+                                } else {
+                                    None
+                                };
                             let outcome = run_psyche_panel(
                                 config_panel::PanelSeed {
                                     via: psyche_route.unwrap_or("/psyche"),
@@ -6766,6 +6770,7 @@ fn session_body(
                                         .unwrap_or_default(),
                                 },
                                 persist,
+                                panel_window,
                                 color,
                                 verbose,
                             );

@@ -178,6 +178,10 @@ fn interaction_view_child() {
         "cockpit_clarification_input" => {
             crate::cockpit::presenter::cockpit_clarification_input_case();
         }
+        #[cfg(feature = "rich-tui")]
+        "cockpit_psyche" => {
+            crate::cockpit::presenter::cockpit_psyche_case();
+        }
         #[cfg(feature = "live-spill")]
         "cockpit_pager" => {
             crate::cockpit::presenter::cockpit_pager_case();
@@ -340,7 +344,11 @@ fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
         .stderr(std::process::Stdio::null());
     if matches!(
         mode,
-        "cockpit_bang" | "cockpit_buffered_input" | "cockpit_pager" | "cockpit_panel_loop"
+        "cockpit_bang"
+            | "cockpit_buffered_input"
+            | "cockpit_pager"
+            | "cockpit_panel_loop"
+            | "cockpit_psyche"
     ) {
         child.env("NEWT_EDIT_MODE", "emacs");
     }
@@ -381,6 +389,69 @@ pub(crate) fn drive_cockpit_buffered_input() {
 
 pub(crate) fn drive_cockpit_clarification_input() {
     drive_cockpit_case("cockpit_clarification_input");
+}
+
+/// #2489: open the real `/psyche` panel under a real cockpit and read the
+/// screen the way the operator does. `screen_grid` ignores erase commands, so a
+/// second writer's stale frame shows up as a repeated title or two dials on one
+/// row — exactly the garble in the report.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn drive_cockpit_psyche() {
+    const TITLE: &str = "psyche — operator dials";
+    let pty = Pty::open_with_cursor_reply(1, 1);
+    pty.resize(30, 100);
+    let baseline = pty.termios_snapshot();
+    let mut child = spawn_child(&pty, "cockpit_psyche");
+    let mut transcript = String::new();
+    let result = (|| -> Result<(), String> {
+        if !pty.wait_for_screen_after(TITLE, "Esc cancel", REACH_TIMEOUT) {
+            return Err("the psyche panel never painted its footer".into());
+        }
+        let frame = pty.screen();
+        transcript.push_str(&frame);
+        let rows = screen_grid(&frame);
+        let titles = rows.iter().filter(|row| row.contains(TITLE)).count();
+        if titles != 1 {
+            return Err(format!(
+                "panel title drawn {titles} times, want 1: {rows:?}"
+            ));
+        }
+        // Each dial owns its own row: two labels on one row means the rows were
+        // wrapped or scrolled into each other.
+        const LABELS: [&str; 4] = ["agreeableness", "extraversion", "warmth", "prosocial"];
+        for row in &rows {
+            let n = LABELS.iter().filter(|l| row.contains(**l)).count();
+            if n > 1 {
+                return Err(format!(
+                    "dial rows interleaved on one row {row:?}: {rows:?}"
+                ));
+            }
+        }
+        pty.type_in("\x1b");
+        if !pty.wait_for_screen_after("PSYCHE_RETURNED", "^D exit", REACH_TIMEOUT) {
+            return Err("Esc did not close the panel and restore the editor".into());
+        }
+        transcript.push_str(&pty.screen());
+        pty.type_in("after-psyche\r");
+        if !pty.wait_for_screen("PSYCHE_RESTORED", REACH_TIMEOUT) {
+            return Err("the next submission was lost or contaminated by panel keys".into());
+        }
+        if pty.termios_snapshot() != baseline {
+            return Err("panel/cockpit did not restore the exact terminal mode".into());
+        }
+        pty.type_in("\n");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = wait_for_child(&mut child, EXIT_TIMEOUT);
+    transcript.push_str(&pty.screen_to_eof());
+    assert!(result.is_ok(), "{result:?}: {transcript:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {transcript:?}"
+    );
 }
 
 #[cfg(feature = "live-spill")]

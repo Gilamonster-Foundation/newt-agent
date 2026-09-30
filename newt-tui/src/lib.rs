@@ -406,11 +406,12 @@ pub(crate) fn run_crew_edit_with_ask(
 pub(crate) fn run_psyche_panel(
     seed: config_panel::PanelSeed,
     persist: impl FnMut(&str, &str, bool) -> config_panel::SaveResult,
+    window: Option<session_worker::PanelWindow>,
     color: bool,
     verbose: bool,
 ) -> config_panel::PanelOutcome {
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        match config_panel::run(seed, persist) {
+        match config_panel::run(seed, persist, window) {
             Ok(outcome) => outcome,
             Err(e) => {
                 print_newt(&format!("psyche panel error: {e}"), color, verbose);

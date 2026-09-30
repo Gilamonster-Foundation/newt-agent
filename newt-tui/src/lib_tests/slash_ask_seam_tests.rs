@@ -196,3 +196,28 @@ fn a_panel_asks_the_surface_for_rows_before_it_draws() {
         "a lent window wins over the stdout path, and only its absence falls back"
     );
 }
+
+/// Mirrors `a_panel_asks_the_surface_for_rows_before_it_draws` for `/psyche`
+/// (#2489). The root cause of the garbled cockpit display was `config_panel::run`
+/// passing `None` to `panel::drive` — a missing argument invisible to the type
+/// checker. These three assertions together pin the wiring so the argument
+/// cannot quietly go missing again.
+#[test]
+fn psyche_panel_uses_the_surface_window() {
+    let chat = include_str!("../chat.rs").replace([' ', '\n'], "");
+    assert!(
+        chat.contains("surface.open_panel(PanelMode::Inline(config_panel::PANEL_HEIGHT))"),
+        "/psyche arm must ask its surface for rows before lending them to the panel"
+    );
+    assert!(
+        chat.contains("persist,panel_window,color,verbose,"),
+        "the window must reach run_psyche_panel, not be dropped on the floor"
+    );
+
+    // config_panel::run passes its window argument to panel::drive (not None).
+    let panel = include_str!("../config_panel.rs").replace([' ', '\n'], "");
+    assert!(
+        panel.contains("crate::panel::drive(&mutscreen,PANEL_HEIGHT,window.as_ref())"),
+        "config_panel::run must hand its lent window to the driver"
+    );
+}
