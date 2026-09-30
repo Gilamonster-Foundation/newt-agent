@@ -231,8 +231,10 @@ fn plan_governed_push(
     // authority for `git` itself. Without this, a model-chosen `cwd` naming
     // some OTHER operator repository (one the confined fence would have
     // refused to even read) reaches a real host-side git process.
+    // Prefix (containment) semantics, as at every fs enforcement site:
+    // `permits_fs_read` is exact-match and would refuse a subdirectory.
     let cwd_str = cwd.to_string_lossy();
-    if !caveats.permits_fs_read(&cwd_str) {
+    if !crate::caveats::permits_path(&caveats.fs_read, &cwd_str) {
         return Err(format!(
             "refused: '{cwd_str}' is outside this session's filesystem read authority"
         ));
@@ -644,8 +646,10 @@ fn plan_governed_pr_create(
     let request = parse_governed_pr_create(&argv)?;
 
     // Finding 6: same cwd authority/exec binding as the push broker.
+    // Prefix (containment) semantics, as at every fs enforcement site:
+    // `permits_fs_read` is exact-match and would refuse a subdirectory.
     let cwd_str = cwd.to_string_lossy();
-    if !caveats.permits_fs_read(&cwd_str) {
+    if !crate::caveats::permits_path(&caveats.fs_read, &cwd_str) {
         return Err(format!(
             "refused: '{cwd_str}' is outside this session's filesystem read authority"
         ));
@@ -2018,6 +2022,22 @@ mod governed_push_tests {
         )
         .unwrap_err();
         assert!(err.contains("read authority"), "{err}");
+    }
+
+    /// Read authority is a ROOT: a cwd in a subdirectory of the granted
+    /// workspace is inside it. `permits_fs_read` is exact-match (documented
+    /// in `CaveatsExt`), so the broker refused every subdirectory cwd.
+    #[test]
+    fn a_subdirectory_cwd_inside_the_read_roots_is_accepted() {
+        let repo = repo_on_feature_branch();
+        let sub = repo.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let caveats = Caveats {
+            fs_read: crate::caveats::Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..scoped_caveats()
+        };
+        let plan = plan_governed_push("git push", &sub, &caveats, &mut None).unwrap();
+        assert_eq!(plan.branch, "task");
     }
 
     /// Finding 6 (issue-1188 review #2641): `PermissionDecision::Allow`'s
