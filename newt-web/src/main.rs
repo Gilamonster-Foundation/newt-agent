@@ -970,6 +970,30 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The startup orchestration under test: start accepting connections BEFORE
+/// `init` resolves, not after. `init` stands in for `init_mesh_dock()` in
+/// production and for a controlled oneshot in
+/// `run_server_serves_healthz_before_init_completes` — the production
+/// function and the regression test drive the exact same ordering, so
+/// restoring await-before-serve here fails that test too (there is no
+/// second, undertested copy of this code path).
+///
+/// `init` loads an identity file and can dial the network; a slow instance
+/// of either used to delay `/healthz` answering at all, because
+/// `axum::serve` (the accept loop) only started once `init` finished.
+async fn run_server<F, T>(listener: tokio::net::TcpListener, app: Router, init: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let serve_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let result = init.await;
+    serve_task.await.expect("serve task panicked");
+    result
+}
+
 #[tokio::main]
 async fn main() {
     // D3 (LAN-bind posture): bind address comes from NEWT_WEB_BIND, defaulting
@@ -990,19 +1014,10 @@ async fn main() {
         ),
         Err(why) => eprintln!("newt-web: passkey verification DISABLED — {why}"),
     }
-    // Start accepting connections BEFORE the mesh dock init runs, not after.
-    // init_mesh_dock() loads an identity file and can dial the network; a
-    // slow instance of either used to delay /healthz answering at all,
-    // because axum::serve (the accept loop) only started once that finished
-    // — see `serve_answers_healthz_while_a_concurrent_slow_init_is_still_running`
-    // for the ordering this proves.
-    let serve_task = tokio::spawn(async move {
-        axum::serve(listener, app()).await.expect("serve");
-    });
-    // Phase 2: bring up the agent-mesh dock; hold the responder alive for the
-    // life of the process (dropping it would tear the bus down).
-    let _dock_service = init_mesh_dock().await;
-    serve_task.await.expect("serve task panicked");
+    // Phase 2 (bring up the agent-mesh dock) runs concurrently with the
+    // accept loop; hold the returned responder alive for the life of the
+    // process (dropping it would tear the bus down).
+    let _dock_service = run_server(listener, app(), init_mesh_dock()).await;
 }
 
 #[cfg(test)]

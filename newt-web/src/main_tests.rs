@@ -2086,47 +2086,51 @@ async fn the_theme_toggle_names_the_cookie_the_server_reads() {
 /// network dial) BEFORE starting the accept loop, so `/healthz` could not
 /// answer at all until that init finished — a slow init (or a build, in the
 /// test harness) and an unreachable server were indistinguishable from the
-/// outside. `main()` now spawns the accept loop first and runs the slow
-/// init concurrently. This proves that ordering with a real bound socket and
-/// a real HTTP request, fully mocked otherwise (no real mesh init, no real
-/// network beyond loopback): a slow future stands in for `init_mesh_dock()`.
+/// outside.
+///
+/// This drives `run_server` — the actual function `main()` calls, not a
+/// second copy of its body — so restoring await-before-serve in production
+/// fails THIS test, not just a duplicated example. The init future is held
+/// pending on a oneshot (not a sleep race): the probe is bounded by a
+/// timeout instead of racing a fixed delay, so there is no load-sensitive
+/// window to miss under CI contention.
 #[tokio::test]
-async fn serve_answers_healthz_while_a_concurrent_slow_init_is_still_running() {
+async fn run_server_serves_healthz_before_init_completes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // The exact shape `main()` now uses: spawn the accept loop, then await
-    // something slow alongside it.
-    let serve_task = tokio::spawn(async move {
-        axum::serve(listener, app_with_auth(None)).await.unwrap();
-    });
-    let slow_init_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let slow_init_done2 = slow_init_done.clone();
-    let slow_init = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        slow_init_done2.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    let (release_init, init_gate) = tokio::sync::oneshot::channel::<()>();
 
-    // Probe well inside the slow init's 300ms window.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let server = tokio::spawn(run_server(listener, app_with_auth(None), async move {
+        // Stands in for `init_mesh_dock()`: held pending until the test
+        // explicitly releases it, after confirming /healthz already answered.
+        init_gate.await.ok();
+    }));
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-
-    assert!(
-        response.starts_with("HTTP/1.1 200"),
-        "unexpected /healthz response: {response}"
-    );
-    assert!(
-        !slow_init_done.load(std::sync::atomic::Ordering::SeqCst),
-        "/healthz answered only after the slow init finished — this is the \
-         bug: the accept loop must not wait on it"
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    })
+    .await
+    .expect(
+        "/healthz did not answer within the bounded probe while init was \
+         still pending — this is the bug: the accept loop must not wait on it",
     );
 
-    slow_init.await.unwrap();
-    serve_task.abort();
+    assert!(
+        probe.starts_with("HTTP/1.1 200"),
+        "unexpected /healthz response: {probe}"
+    );
+
+    // `run_server` (like `main()`) never returns on its own — `axum::serve`
+    // runs the accept loop forever by design — so there is nothing to await
+    // completion of. Release init (so it isn't left dangling) and abort.
+    release_init.send(()).ok();
+    server.abort();
 }
