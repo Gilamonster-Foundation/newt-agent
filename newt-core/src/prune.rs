@@ -529,6 +529,26 @@ fn strip_read_footer<'a>(
     }
 }
 
+/// #2638 review round 6: does `content`'s OWN final line look like a
+/// pagination footer for `path`, at `first_line=1`/`char_offset_in=0` (the
+/// whole-file passthrough's fixed coordinates), with a tag that VERIFIES?
+///
+/// Called from `output_budget::paginate_read_from`'s whole-file passthrough
+/// to catch the replay `verify_page_tag`'s own doc names: a genuine
+/// paginated page (body + its real, verifying footer) saved back to the
+/// SAME path and then read WHOLE reproduces every MAC input, so the tag
+/// verifies even though this footer is now real source, not this call's
+/// metadata. `strip_read_footer` already considers only the content's own
+/// final line (`rsplit_once("\n\n[")` finds the last such split, and the
+/// candidate must run to the content's end with `strip_suffix(']')` and no
+/// embedded newline) — this wraps that same check, it does not re-implement
+/// footer parsing.
+pub(crate) fn final_line_is_a_verified_pagination_footer(content: &str, path: &str) -> bool {
+    strip_read_footer(content, path, 1, 0)
+        .1
+        .is_some_and(|f| f.trusted)
+}
+
 /// Parse a bracketed footer line's exact tail:
 /// `…call read_file with offset=<n>[ char_offset=<m>] to continue[ page=<32hex>]`
 /// with `<n>`/`<m>` valid `usize` and the 32-hex tag optional. `None` for
@@ -1271,6 +1291,122 @@ fn third(z: u32) -> u32 {
         assert!(
             !line.contains("— outline"),
             "must not produce an outline: {line}"
+        );
+    }
+
+    /// #2638 review round 6 (P2): the replay the reviewer's counterexample
+    /// names — a genuine paginated page (body + its real, MAC-verifying
+    /// footer) SAVED BACK to the same path, then read WHOLE in the same
+    /// process. Every MAC input reproduces exactly, so `verify_page_tag`
+    /// verifies the tag — but this footer is now real source, not live
+    /// pagination metadata. `paginate_read_from`'s whole-file passthrough
+    /// must append the plain disambiguator line rather than let `prune.rs`
+    /// reinterpret the bracketed line as a footer to strip.
+    #[test]
+    fn a_saved_paginated_page_replayed_whole_is_not_mistaken_for_a_live_footer() {
+        let path = "notes.md";
+        let full_source = text_lines(300);
+        // Paginate lines 1-200 at offset 1 — a real page with a real footer.
+        let saved_page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &full_source,
+            Some(1),
+            Some(200),
+            0,
+            None,
+        );
+        assert!(
+            saved_page.contains("call read_file with offset=201"),
+            "fixture must paginate as expected: {saved_page}"
+        );
+        let saved_page_lines = saved_page.lines().count(); // 200 real + 1 footer line
+
+        // "Save that exact page back to the SAME path, then read it whole in
+        // the same process" — the saved page IS now the file's full content,
+        // and it fits under budget (no cap, no offset) so this hits the
+        // whole-file passthrough.
+        let replayed = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &saved_page,
+            None,
+            None,
+            0,
+            None,
+        );
+        assert!(
+            replayed.ends_with("[end of file: the bracketed line above is part of the file]"),
+            "a whole-file replay of a saved page must append the disambiguator: {replayed}"
+        );
+
+        let line = summarize_one("read_file", json!({"path": path}), &replayed);
+        // Every line — the 200 real lines, the replayed footer line, AND the
+        // appended disambiguator — must count as real source.
+        let expected_total = saved_page_lines + 1;
+        assert!(
+            line.contains(&format!("lines 1-{expected_total}")),
+            "must count every source line, including the replayed footer and the \
+             appended disambiguator: {line}"
+        );
+        assert!(
+            !line.contains(FOOTER_MARKER),
+            "a replayed footer must never be reinterpreted as live pagination metadata: {line}"
+        );
+    }
+
+    /// #2638 review round 6: `strip_read_footer` must consider ONLY the
+    /// result's OWN FINAL line as a candidate footer — confirmed and tested
+    /// per the review, not just asserted in a doc comment. A real,
+    /// MAC-verifying footer line followed by MORE real content is not the
+    /// final line, so it must stay source: `tail.strip_suffix(']')` fails
+    /// once anything follows the closing bracket.
+    #[test]
+    fn a_verified_footer_shape_not_at_the_end_is_left_as_source() {
+        let path = "notes.md";
+        let full_source = text_lines(300);
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &full_source,
+            Some(1),
+            Some(200),
+            0,
+            None,
+        );
+        // A real, tag-verifying footer line — but NOT the final line, because
+        // more real content follows it.
+        let content = format!("{page}\ntest line 900\ntest line 901");
+        let real_lines = content.lines().count();
+        let line = summarize_one("read_file", json!({"path": path, "offset": 1}), &content);
+        assert!(
+            line.contains(&format!("lines 1-{real_lines}")),
+            "a footer-shaped line that is not the final line must stay source: {line}"
+        );
+        assert!(
+            !line.contains(FOOTER_MARKER),
+            "must not be treated as live pagination metadata: {line}"
+        );
+    }
+
+    /// #2638 review round 6, positive control: the disambiguator only fires
+    /// on the whole-file passthrough path. A genuine paginated read (the
+    /// SAME source, same path, same starting coordinates as the replay test
+    /// above, but NOT saved-and-reread) still gets the precise, trusted page
+    /// map for exactly the page it covers.
+    #[test]
+    fn genuine_pagination_of_the_same_source_still_gets_a_precise_page_map() {
+        let path = "notes.md";
+        let full_source = text_lines(300);
+        let page = crate::agentic::tools::output_budget::paginate_read_from(
+            path,
+            &full_source,
+            Some(1),
+            Some(200),
+            0,
+            None,
+        );
+        let line = summarize_one("read_file", json!({"path": path, "offset": 1}), &page);
+        assert!(
+            line.contains("lines 1-200 (page map"),
+            "genuine pagination must still produce a precise, trusted page map: {line}"
         );
     }
 

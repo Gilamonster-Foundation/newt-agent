@@ -181,9 +181,6 @@ fn take_tail_chars(text: &str, max_chars: usize) -> String {
     chars.into_iter().collect()
 }
 
-/// Window + cap a file's contents for `read_file`'s model-facing payload (#719,
-/// #726). Returns lines `[offset, offset+limit)` (1-based `offset`, default 1;
-/// `limit` default [`DEFAULT_READ_LIMIT`]), with the char backstop derived from
 /// Process-lifetime random key for the pagination MAC. Two UUID v4 values give
 /// 32 bytes of OS randomness without adding a new dependency (uuid v4 is already
 /// a dep and uses getrandom internally). The model never sees this key; it only
@@ -200,13 +197,26 @@ fn page_mac_key() -> &'static [u8; 32] {
     })
 }
 
+/// The MAC input encoding's version. Bump this if the field order, framing,
+/// or hash ever changes — a key is process-lifetime anyway (no tag survives
+/// a restart), so this exists to make the encoding self-describing and
+/// intentional, not to support cross-version verification.
+const PAGE_MAC_VERSION: u8 = 0x01;
+
 /// Compute the 32-hex MAC tag that authenticates a single pagination footer.
 ///
-/// This is a MAC (blake3 keyed hash), NOT a content id: it authenticates the
-/// origin of the footer under a process-lifetime secret key. A content-addressable
-/// id is public and reproducible by anyone; this tag is only reproducible by code
-/// running in the same process with access to the key. blake3 keyed mode is a
-/// standard HMAC-equivalent primitive, not a hand-rolled encoding.
+/// A keyed-BLAKE3 MAC over a documented, versioned, length-prefixed field
+/// encoding — an authentication tag, not a content identity: it proves the
+/// footer was minted by THIS process for exactly these inputs, under a
+/// process-lifetime secret key the model never sees. It is not a
+/// content-addressable id (those are public and reproducible by anyone;
+/// this tag is reproducible only by code holding the key).
+///
+/// Encoding (all integers little-endian `u64`): version byte, then for each
+/// variable-length field a length prefix followed by its bytes — no
+/// separator byte is needed once lengths are explicit, unlike a fixed
+/// delimiter, which a value containing that delimiter could exploit to
+/// shift field boundaries.
 fn page_mac_tag(
     path: &str,
     first_line: usize,
@@ -216,10 +226,12 @@ fn page_mac_tag(
     next_char_offset: usize,
 ) -> String {
     let mut h = blake3::Hasher::new_keyed(page_mac_key());
+    h.update(&[PAGE_MAC_VERSION]);
+    h.update(&(path.len() as u64).to_le_bytes());
     h.update(path.as_bytes());
-    h.update(&[0u8]); // separator prevents path || data colliding with path2 || data2
     h.update(&(first_line as u64).to_le_bytes());
     h.update(&(char_offset_in as u64).to_le_bytes());
+    h.update(&(body.len() as u64).to_le_bytes());
     h.update(body);
     h.update(&(next_offset as u64).to_le_bytes());
     h.update(&(next_char_offset as u64).to_le_bytes());
@@ -230,12 +242,20 @@ fn page_mac_tag(
         .collect()
 }
 
-/// Verify whether `tag` is the correct 32-hex MAC for the given footer parameters.
+/// Verify whether `tag` is the correct MAC for the given footer parameters.
 /// Called by `prune.rs`; the key lives here, so verification is here too.
 ///
-/// A copied-verbatim real page (body + footer) read back from a file verifies and
-/// yields an accurate map of that same content — this is harmless: the tag binds
-/// to the body bytes, so an unmodified page is as trustworthy as the original.
+/// What this proves: `tag` could only have been minted by this process for
+/// exactly this `(path, first_line, char_offset_in, body, next_offset,
+/// next_char_offset)` tuple. What it does NOT prove: that the footer
+/// belongs to the CURRENT `read_file` call rather than being a byte-for-byte
+/// copy of an earlier real footer that ended up in the file's own source
+/// content (e.g. a paginated page saved back to the same path and later
+/// read WHOLE) — a replay reproduces every input this check sees, so it
+/// verifies too. That specific replay is caught at the whole-file
+/// passthrough call site in [`paginate_read_from`], which treats a
+/// verifying tag on the content's OWN final line as reason to disambiguate
+/// explicitly rather than as proof of current-call origin.
 pub(crate) fn verify_page_tag(
     path: &str,
     first_line: usize,
@@ -255,6 +275,9 @@ pub(crate) fn verify_page_tag(
     ) == tag
 }
 
+/// Window + cap a file's contents for `read_file`'s model-facing payload (#719,
+/// #726). Returns lines `[offset, offset+limit)` (1-based `offset`, default 1;
+/// `limit` default [`DEFAULT_READ_LIMIT`]), with the char backstop derived from
 /// the shared token budget (`max_output_tokens` × chars/token — #726, replacing
 /// #719's hardcoded 100k so both tools share one budget). A footer points at the
 /// next window so the model paginates instead of drowning. A whole-file read
@@ -310,6 +333,19 @@ pub(crate) fn paginate_read_from(
     let char_offset = char_offset.unwrap_or(0);
     // Common case: a whole-file read that fits both caps → return verbatim.
     if char_offset == 0 && start == 1 && limit >= total && contents.len() <= max_chars {
+        // #2638 review round 6 (P2): a genuine paginated page (body + its
+        // real, MAC-verifying footer) saved back to THIS path and then read
+        // WHOLE reproduces every MAC input, so the tag verifies even though
+        // the bracketed line is now real source, not this call's metadata
+        // (`verify_page_tag`'s doc comment names this exact replay). Append
+        // a plain disambiguating line — NOT a footer (no `FOOTER_MARKER`
+        // text, so `prune.rs` never strips it) — so the page stays source
+        // and the summary counts every line, including the bracketed one.
+        if crate::prune::final_line_is_a_verified_pagination_footer(contents, path) {
+            return format!(
+                "{contents}\n[end of file: the bracketed line above is part of the file]"
+            );
+        }
         return contents.to_string();
     }
     let start0 = start - 1;
