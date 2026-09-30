@@ -1046,6 +1046,114 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
     );
 }
 
+/// #2637 / #2555: exercises the REAL production release hook
+/// (`record_compaction_artifact` → `RepeatCallGuard::release_read_memos`,
+/// mod.rs ~5349) through the actual chat loop, instead of calling
+/// `RepeatCallGuard` methods by hand (that version was tautological — see
+/// the removed `repeat_call_guard_tests::
+/// compaction_committed_forces_fresh_read_rejected_preserves_memo`).
+///
+/// A bare repeated `read_file` of an UNCHANGED file is never refused
+/// (#2637) and serves byte-identical content whether from the memo or a
+/// genuine re-read (`ReadScope::content_id_of` re-verifies the memoized
+/// content id against the file's actual current bytes on every cache
+/// lookup, so a content mismatch would already force a real read
+/// independent of this hook — that path can't observe the release call at
+/// all). The signal that DOES distinguish them is `tool_events`: a
+/// cache-serve pushes its event inline with a hardcoded `duration_ms:
+/// Some(0)` (mod.rs `cached_read` call site); a real execution measures
+/// actual wall-clock via `record_completed_tool_event`. Immediately after a
+/// COMMITTED compaction (the summarizer having just fired), the guard must
+/// have dropped the memo, so that round's `read_file` must NOT be the
+/// hardcoded-zero cache shape.
+#[tokio::test]
+async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
+    let line = "the quick brown newt compresses context without discarding it\n";
+    let threshold = 15usize;
+    let file = "big.txt";
+    let rounds = 40;
+
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 0,
+        },
+        ..Default::default()
+    });
+    let server = MockServer::start().await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let summarizer = canned_summarizer(prompts.clone());
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join(file), line.repeat(64)).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(LongHaulResponder {
+            path: file,
+            log: log.clone(),
+        })
+        .mount(&server)
+        .await;
+    let workspace = ws.path().to_string_lossy().to_string();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mem_messages = msgs();
+    let mut compress_state = CompressState::new();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &mem_messages, &caveats, &workspace);
+    c.max_tool_rounds = rounds;
+    c.mid_loop_trim_threshold = threshold;
+    c.mid_loop_trim_tokens = None;
+    c.summarizer = Some(&*summarizer);
+    c.compress_state = Some(&mut compress_state);
+    c.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the long haul must complete");
+    assert_eq!(reply, "long haul done");
+
+    // Every dispatched round's `read_file` produces exactly one ToolEvent
+    // (interleaved with the hallucinated `apply_patch`'s "unknown tool"
+    // event, which is not `read_file`). `summarizer_calls` (the number of
+    // prompts the canned summarizer recorded) is the number of committed
+    // compactions this run.
+    let summarizer_calls = prompts.lock().unwrap().len();
+    assert!(
+        summarizer_calls >= 2,
+        "the long haul must trigger at least one committed compaction \
+         (got {summarizer_calls} summarizer calls)"
+    );
+    let read_events: Vec<&crate::ToolEvent> =
+        events.iter().filter(|e| e.tool == "read_file").collect();
+    assert!(
+        read_events.len() > summarizer_calls,
+        "expected at least one read_file round per compaction plus the \
+         round after the last one (got {} read_file events for {} \
+         compactions)",
+        read_events.len(),
+        summarizer_calls
+    );
+    // Round 0's read is real by construction (nothing memoized yet), so it
+    // proves nothing about the release hook — exclude it. Every OTHER round
+    // in this fixture has unchanged file content, so absent the release
+    // hook every one of them would be served from the memo (the hardcoded
+    // `duration_ms: Some(0)` cache-hit shape) and none would be real. The
+    // release hook must force at least one real (non-cache) read_file per
+    // committed compaction — the round right after each memo release.
+    let real_reads_after_round_zero = read_events[1..]
+        .iter()
+        .filter(|e| e.duration_ms != Some(0))
+        .count();
+    assert!(
+        real_reads_after_round_zero >= summarizer_calls,
+        "expected at least one real (non-cache) read_file per committed \
+         compaction after round 0 (got {real_reads_after_round_zero} real \
+         reads for {summarizer_calls} compactions) — the read memo is not \
+         being released on commit"
+    );
+}
+
 /// F2 regression — the reviewer's 600-char-results multi-turn shape:
 /// count-only compressions whose per-pass reclaim is small must neither
 /// latch anti-thrash (silently killing the VRAM guard) nor escalate to

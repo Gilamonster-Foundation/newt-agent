@@ -484,6 +484,17 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 serde_json::json!({}),
                 granted.clone(),
             ),
+            (
+                // A successful read of a DIFFERENT path whose content happens
+                // to look grant-shaped must not clear `args`' (report.txt)
+                // failure memo — `classify_repeat_memo` only replaces the
+                // memo it is keyed on (same tool + same args), never another
+                // path's. See the same-path case below for the legitimate
+                // clear.
+                "read_file",
+                serde_json::json!({"path": "other.txt"}),
+                granted.clone(),
+            ),
         ] {
             guard.record(
                 name,
@@ -501,6 +512,28 @@ fn permission_grant_releases_only_cached_authority_failures() {
                 "{name}: {result}"
             );
         }
+
+        // #2637: a successful read of the SAME path legitimately replaces the
+        // failure memo — `classify_repeat_memo` hashes the served bytes
+        // unconditionally for a bare `read_file`, so a fresh, successful read
+        // of exactly the path that previously failed means the failure no
+        // longer describes the tree; there is nothing left to steer against
+        // (distinct from the "other.txt" case above, which is a different key).
+        guard.record(
+            "read_file",
+            &args,
+            true,
+            &granted,
+            None,
+            ReadScope {
+                workspace: "/workspace",
+                caveats: &Caveats::top(),
+            },
+        );
+        assert!(
+            guard.repeat_steer("read_file", &args).is_none(),
+            "a successful read of the SAME path must replace the failure memo"
+        );
 
         guard.record(
             "request_permissions",

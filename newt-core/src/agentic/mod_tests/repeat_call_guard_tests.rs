@@ -2069,40 +2069,9 @@ fn identical_read_only_probe_is_still_refused_without_a_change() {
     assert!(guard.repeat_steer("run_command", &args).is_some());
 }
 
-/// #2637 / #2555: the compaction hook must release the read memo on COMMIT
-/// so the next identical read gets fresh content, while a REJECTED attempt
-/// leaves the memo in place (no wasted re-read).
-/// Red: comment out `g.release_read_memos()` below → the `.is_none()` assertion fails.
-#[test]
-fn compaction_committed_forces_fresh_read_rejected_preserves_memo() {
-    let (_dir, workspace, caveats) = read_memo_fixture("c.rs", "the source");
-    let mut g = RepeatCallGuard::default();
-    let args = serde_json::json!({"path": "c.rs"});
-    let scope = ReadScope {
-        workspace: &workspace,
-        caveats: &caveats,
-    };
-
-    g.record("read_file", &args, true, "the source", None, scope);
-
-    // Before any compaction: memo is live — cache hit.
-    assert!(
-        g.cached_read("read_file", &args, scope).is_some(),
-        "memo must be live before any compaction"
-    );
-
-    // Rejected compaction: no release call — memo must survive.
-    assert!(
-        g.cached_read("read_file", &args, scope).is_some(),
-        "a rejected compaction must leave the read memo intact"
-    );
-
-    // Committed compaction: release the memos.
-    g.release_read_memos(); // comment out → the assertion below fails
-
-    // After committed compaction: memo is gone → next read runs fresh.
-    assert!(
-        g.cached_read("read_file", &args, scope).is_none(),
-        "committed compaction must clear the read memo so the next call reads fresh"
-    );
-}
+// #2637 / #2555: the real behavioral regression for the compaction release
+// hook (committed compaction → next read is fresh; a round where compaction
+// did not fire → the memo survives) lives in
+// `compression_loop_tests::compaction_release_forces_fresh_read_over_long_haul`,
+// driven through the actual chat loop instead of calling
+// `RepeatCallGuard` methods directly — see that test's docstring for why.
