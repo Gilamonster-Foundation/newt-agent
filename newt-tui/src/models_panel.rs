@@ -284,7 +284,7 @@ impl Screen for ModelsPanel {
 pub(crate) fn choose(
     choice: &crate::BackendChoice,
     window: Option<crate::session_worker::PanelWindow>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
     let active = choice.active_model.clone().unwrap_or_default();
     let mut focused = active.clone();
     let mut status = String::new();
@@ -303,8 +303,15 @@ pub(crate) fn choose(
         if !applied {
             return Ok(None);
         }
+        // PR #2626 review residual finding 3: the picker's own served roster
+        // (fetched fresh THIS iteration via `snapshot`, above) is the single
+        // source of truth for what the choice may be validated against — not
+        // a list the caller captured before the panel ever opened. Return it
+        // alongside the pick so no caller is tempted to reuse a stale outer
+        // snapshot.
+        let served: Vec<String> = panel.models.iter().map(|m| m.name.clone()).collect();
         match panel.outcome() {
-            Outcome::Chose(name) => return Ok(Some(name)),
+            Outcome::Chose(name) => return Ok(Some((name, served))),
             Outcome::Cancelled => return Ok(None),
             Outcome::Refresh => {}
             Outcome::Manage(action, name) => {

@@ -301,6 +301,7 @@ pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeCon
 pub use permissions::{
     append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, PersistentDenial,
+    BOUND_REASON_PREFIX,
 };
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
@@ -2265,6 +2266,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: the args of the most recently denied run_command — cleared when
+    // request_permissions consumes and re-runs it, or on the next turn.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -2604,6 +2608,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     // Persist provenance only after the transformed working
                     // set and its continuation have been installed.
                     record_compaction_artifact(
+                        &mut repeat_calls,
                         artifact_sink,
                         artifact_context,
                         outcome.action,
@@ -2951,6 +2956,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     },
                                 );
                                 record_compaction_artifact(
+                                    &mut repeat_calls,
                                     artifact_sink,
                                     artifact_context,
                                     outcome.action,
@@ -3637,6 +3643,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             },
                         );
                         record_compaction_artifact(
+                            &mut repeat_calls,
                             artifact_sink,
                             artifact_context,
                             outcome.action,
@@ -3680,6 +3687,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             messages = fallback.messages;
                             prompt_tracker.invalidate();
                             record_compaction_artifact(
+                                &mut repeat_calls,
                                 artifact_sink,
                                 artifact_context,
                                 CompressAction::Pruned,
@@ -3862,6 +3870,33 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: an exact bare re-read is NEVER refused — serve it
+            // silently from the memo when the file's actual current content
+            // still matches; otherwise fall through to a real read below.
+            if let Some(content) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &content,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
+                }
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
+                smart_harness::push_tool_resolution(
+                    &mut messages,
+                    serde_json::json!({ "role": "tool", "content": offloaded }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats — steer
             // instead of re-executing a dead or already-useful call. The bogus
             // emission is still counted above; we just don't run it again.
@@ -3995,6 +4030,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -4034,7 +4070,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 routed_to.get(),
             );
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -4234,6 +4277,50 @@ enum RepeatMemo {
         subject: String,
         advice: &'static str,
     },
+    /// #2555/#2637: a successful, argument-bare `read_file` (no explicit
+    /// `offset`/`limit`) — the shape that loops when a weak model re-pages
+    /// the same file. Per the harness-design doctrine this NEVER refuses the
+    /// repeat: `RepeatCallGuard::cached_read` re-verifies `content_id`
+    /// against the file's ACTUAL current bytes (never the recorded-tool-call
+    /// bookkeeping) and, on a match, replays `content` silently; on a
+    /// mismatch it drops the memo and a real read runs. Also released by ANY
+    /// workspace change (the existing `Failure` release already covers that)
+    /// and by compaction (`RepeatCallGuard::release_read_memos`) — a
+    /// post-compaction re-read is legitimate because the working-set card no
+    /// longer holds the page. An explicit `offset`/`limit` call is never
+    /// memoized at all (see `classify_repeat_memo`), so a deliberate paging
+    /// scan always runs.
+    ReadRange {
+        path: String,
+        content_id: content_addressable::RawContentId,
+        content: String,
+    },
+}
+
+/// #2637: the confinement context a `ReadRange` freshness check runs
+/// through — bundled so `record`/`classify_repeat_memo`/`cached_read` take
+/// one param instead of two (clippy's `too_many_arguments`), not because
+/// `workspace` and `caveats` are conceptually one thing.
+#[derive(Clone, Copy)]
+struct ReadScope<'a> {
+    workspace: &'a str,
+    caveats: &'a crate::caveats::Caveats,
+}
+
+impl ReadScope<'_> {
+    /// Content identity of `path`'s ACTUAL current bytes, through the same
+    /// confinement/authorization path a real `read_file` uses
+    /// (`tools::authorized_read`) — never a hand-rolled fs read, and never
+    /// trusting that no recorded workspace-changing tool ran since the last
+    /// memo as proof of "unchanged" (an editor or background process can
+    /// change a file without going through any tool this guard observes).
+    /// `None` when the read cannot be authorized right now (no gate offered
+    /// here) — callers treat that as "freshness unprovable", never as a grant.
+    fn content_id_of(&self, path: &str) -> Option<content_addressable::RawContentId> {
+        tools::authorized_read("read_file", path, self.workspace, self.caveats, None)
+            .ok()
+            .map(|contents| content_addressable::RawContentId::from_content(contents.as_bytes()))
+    }
 }
 
 #[derive(Default)]
@@ -4274,6 +4361,12 @@ impl RepeatCallGuard {
                 "You already observed {subject} with `{name}` and received output. Do NOT repeat \
                  the identical call — {advice}"
             ),
+            // #2637: never refuse a bare re-read. `RepeatCallGuard::cached_read`
+            // is called before this at every call site and either serves the
+            // memo silently (content unchanged) or drops it and lets a real
+            // read run (content changed / freshness unprovable) — this arm is
+            // unreachable in practice, kept only so the match stays exhaustive.
+            RepeatMemo::ReadRange { .. } => return None,
         };
         // disclosure-gate-live-path (#5): the steer is a SYNTHETIC model-ingress
         // message re-injected as a `{"role":"tool"}` turn, bypassing the
@@ -4380,7 +4473,64 @@ impl RepeatCallGuard {
                          file, or make the next edit/test decision.",
             });
         }
+        if let Some(path) = Self::bare_read_file_path(name, args) {
+            // #2637 review P1: the identity must describe exactly the bytes
+            // SERVED (`result`), never a separate reread of the path —
+            // rereading here races an out-of-band edit landing between the
+            // tool's real read (which produced `result`) and this
+            // classification, joining two different observations under one
+            // hash (read A → edit → hash B → memo says "A, id(B)" → a later
+            // unchanged B serves stale A). Hashing `result` itself has no
+            // such window: there is only one read.
+            let content_id = content_addressable::RawContentId::from_content(result.as_bytes());
+            return Some(RepeatMemo::ReadRange {
+                path,
+                content_id,
+                content: result.to_string(),
+            });
+        }
         None
+    }
+
+    /// #2555: the path of a `read_file` call with NO explicit `offset`/`limit`
+    /// — the shape a weak model repeats byte-for-byte when it re-pages a file
+    /// it already has. A call that names an explicit range is a deliberate
+    /// scan and is never memoized (it always runs, whatever the outcome).
+    fn bare_read_file_path(name: &str, args: &serde_json::Value) -> Option<String> {
+        if name != "read_file" || args.get("offset").is_some() || args.get("limit").is_some() {
+            return None;
+        }
+        Some(args.get("path")?.as_str()?.to_string())
+    }
+
+    /// #2637: silently serve an exact bare `read_file` repeat when it is
+    /// PROVEN unchanged right now, per the harness doctrine (never refuse a
+    /// successful re-read; make the redundant one cheap and silent instead).
+    /// A mismatch or an unprovable freshness check drops the memo and returns
+    /// `None`, so the caller falls through to a real read — which then
+    /// re-memoizes from the real outcome. This never itself denies access.
+    fn cached_read(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        read_scope: ReadScope<'_>,
+    ) -> Option<String> {
+        let path = Self::bare_read_file_path(name, args)?;
+        let key = Self::key(name, args);
+        let Some(RepeatMemo::ReadRange {
+            content_id,
+            content,
+            ..
+        }) = self.repeat_memos.get(&key)
+        else {
+            return None;
+        };
+        if read_scope.content_id_of(&path).as_ref() == Some(content_id) {
+            Some(content.clone())
+        } else {
+            self.repeat_memos.remove(&key);
+            None
+        }
     }
 
     /// Record a just-executed call's outcome. Failures are also counted for
@@ -4392,8 +4542,13 @@ impl RepeatCallGuard {
         ok: bool,
         result: &str,
         execution: Option<crate::ExecOutcome>,
+        // #2637 review P1: no longer used to mint the `ReadRange` content id
+        // (that now hashes `result` directly — see `classify_repeat_memo`),
+        // kept so every call site still threads the confinement scope it
+        // would need if a future memo kind requires it.
+        _read_scope: ReadScope<'_>,
     ) {
-        if tools::permission_grant_succeeded(name, args, ok, result) {
+        if tools::permission_grant_succeeded(name, args, ok, result, execution) {
             self.repeat_memos.retain(|_, memo| {
                 !matches!(
                     memo,
@@ -4406,10 +4561,18 @@ impl RepeatCallGuard {
         }
         // #2374/F37: a failure memo describes the tree it ran against. After a
         // real workspace change the identical call is the re-check the repair
-        // loop needs, so the memo is released in every mode.
+        // loop needs, so the memo is released in every mode. #2555: a
+        // `ReadRange` memo is released the same way — ANY workspace change
+        // (not just an edit of the memoized file) invalidates "nothing has
+        // changed since", because the model's next read is asking about the
+        // tree it just modified.
         if ok && may_change_workspace(name, args) {
-            self.repeat_memos
-                .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
+            self.repeat_memos.retain(|_, memo| {
+                !matches!(
+                    memo,
+                    RepeatMemo::Failure { .. } | RepeatMemo::ReadRange { .. }
+                )
+            });
         }
         if name == "update_plan" && ok {
             self.repeat_memos.retain(|key, _| {
@@ -4428,6 +4591,17 @@ impl RepeatCallGuard {
     /// a cap exit was thrash, not lack of rounds (Step 27.5).
     fn total_failures(&self) -> usize {
         self.fails_by_tool.values().sum()
+    }
+
+    /// #2555: release every `ReadRange` memo. Called at the ONE checkpoint
+    /// each backend loop's compaction reaches once it actually fires
+    /// (`record_compaction_artifact` for the three legacy chat loops;
+    /// `compact_responses_input`'s `Compacted` outcome for the Responses
+    /// loop) — never on a rejected/no-op compaction attempt, which changed
+    /// nothing the model could have already seen.
+    fn release_read_memos(&mut self) {
+        self.repeat_memos
+            .retain(|_, memo| !matches!(memo, RepeatMemo::ReadRange { .. }));
     }
 }
 
@@ -5156,6 +5330,13 @@ fn maybe_offload_tool_result(
 
 #[allow(clippy::too_many_arguments)]
 fn record_compaction_artifact(
+    // #2555: this is the ONE checkpoint every compaction that actually fired
+    // reaches, across all three legacy chat loops (the Responses loop's
+    // equivalent single entry point is `compact_responses_input`) — so it is
+    // also where the repeat-read steer memo is released. A post-compaction
+    // re-read is legitimate (the working-set card no longer holds the page),
+    // so the memo must not outlive the compaction that invalidated it.
+    repeat_calls: &mut RepeatCallGuard,
     artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
     artifact_context: Option<artifact_read::ArtifactReadContext<'_>>,
     action: CompressAction,
@@ -5174,6 +5355,7 @@ fn record_compaction_artifact(
     floor_trend: FloorTrend,
     color: bool,
 ) {
+    repeat_calls.release_read_memos();
     let (Some(sink), Some(context)) = (artifact_sink, artifact_context) else {
         return;
     };
@@ -6927,6 +7109,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -7212,6 +7396,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         },
                     );
                     record_compaction_artifact(
+                        &mut repeat_calls,
                         artifact_sink,
                         artifact_context,
                         outcome.action,
@@ -7617,6 +7802,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     },
                                 );
                                 record_compaction_artifact(
+                                    &mut repeat_calls,
                                     artifact_sink,
                                     artifact_context,
                                     outcome.action,
@@ -8551,6 +8737,37 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: never refuse an exact bare re-read — serve it silently
+            // from the memo when the file's actual current content still
+            // matches; otherwise fall through to a real read below.
+            if let Some(content) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &content,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
+                }
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
+                smart_harness::push_tool_resolution(
+                    &mut messages,
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": offloaded,
+                    }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats (mirrors the
             // Ollama path; Responses uses function_call_output). Counted as a
             // hallucination above first when applicable.
@@ -8673,6 +8890,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -8720,7 +8938,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 routed_to.get(),
             );
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -9608,6 +9833,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut stale_file_nudges: usize = 0;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let nudge_classifier = crate::NudgeClassifier::load_default();
@@ -9863,6 +10090,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         },
                     );
                     record_compaction_artifact(
+                        &mut repeat_calls,
                         artifact_sink,
                         artifact_context,
                         outcome.action,
@@ -10147,6 +10375,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     },
                                 );
                                 record_compaction_artifact(
+                                    &mut repeat_calls,
                                     artifact_sink,
                                     artifact_context,
                                     outcome.action,
@@ -10995,6 +11224,37 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: never refuse an exact bare re-read — serve it silently
+            // from the memo when the file's actual current content still
+            // matches; otherwise fall through to a real read below.
+            if let Some(content) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &content,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
+                }
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
+                smart_harness::push_tool_resolution(
+                    &mut messages,
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": offloaded,
+                    }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats (mirrors
             // the OpenAI path).
             if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
@@ -11110,6 +11370,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -11154,7 +11415,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 routed_to.get(),
             );
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -11885,6 +12153,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    // #2628: see the primary loop declaration above for the invariant.
+    let mut pending_rerun: Option<tools::PendingRerun> = None;
     let mut capability_evidence = capability_check::Evidence::default();
     let mut probe_correction_used = false;
     let mut readonly_completion_retried = false;
@@ -12056,6 +12326,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             hallucination_count,
                         ));
                     };
+                    // #2555: this loop's ONE compaction entry point
+                    // (`compact_responses_input`) reports a committed
+                    // compaction as `Compacted` — release repeat-read memos
+                    // there, mirroring `record_compaction_artifact`'s hook
+                    // in the three legacy chat loops.
+                    if matches!(outcome, ResponsesCompaction::Compacted) {
+                        repeat_calls.release_read_memos();
+                    }
                     proactive_rejection = outcome.rejection();
                 }
             }
@@ -12218,6 +12496,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                     hallucination_count,
                                 ));
                             };
+                            // #2555: same release as the proactive branch above.
+                            if matches!(outcome, ResponsesCompaction::Compacted) {
+                                repeat_calls.release_read_memos();
+                            }
                             match outcome {
                                 ResponsesCompaction::Compacted | ResponsesCompaction::NotFired => {}
                                 // ZERO second inference: surface the original 400 with the
@@ -12618,6 +12900,37 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // #2637: never refuse an exact bare re-read — serve it silently
+            // from the memo when the file's actual current content still
+            // matches; otherwise fall through to a real read below.
+            if let Some(content) =
+                repeat_calls.cached_read(name, &args, ReadScope { workspace, caveats })
+            {
+                print_synthetic_tool_result(
+                    name,
+                    &args,
+                    workspace,
+                    &content,
+                    color,
+                    &completed_spill_renderer,
+                );
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_cache(name, &args));
+                }
+                let offloaded =
+                    maybe_offload_tool_result(name, content, tool_offload, spill_store, disclosure);
+                smart_harness::push_tool_resolution(
+                    &mut input,
+                    serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": offloaded,
+                    }),
+                    batch.as_ref(),
+                    call_index,
+                )?;
+                continue;
+            }
             // Step 27.3/#771: short-circuit selected exact repeats (Responses
             // shape: echo a function_call_output with the steer).
             // Counted as a hallucination above first when applicable.
@@ -12752,6 +13065,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
                         routed_to: Some(&routed_to),
+                        pending_rerun: Some(&mut pending_rerun),
                     },
                     tool_offload,
                     prompt_disposition,
@@ -12797,7 +13111,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            repeat_calls.record(name, &args, ok, &result, execution.get().copied());
+            repeat_calls.record(
+                name,
+                &args,
+                ok,
+                &result,
+                execution.get().copied(),
+                ReadScope { workspace, caveats },
+            );
             append_clean_build_warning(
                 if batch.is_some() {
                     &mut tool_warnings
@@ -12952,6 +13273,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     hallucination_count,
                 ));
             };
+            // #2555: same release as the proactive branch above.
+            if matches!(outcome, ResponsesCompaction::Compacted) {
+                repeat_calls.release_read_memos();
+            }
             summary_rejection = outcome.rejection();
         }
     }

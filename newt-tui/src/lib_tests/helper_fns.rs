@@ -1156,6 +1156,144 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
     assert_eq!(choice.active_model.as_deref(), Some("gated-model"));
 }
 
+// PR #2626 review residual finding 3: the picker's result is explicit
+// intent, honored against the roster the picker ITSELF fetched fresh right
+// before returning — never a snapshot the caller took before the picker
+// opened, which can be stale in either direction (missing a model the
+// picker's own refresh/load surfaced, or still listing one that's gone).
+#[test]
+fn resolve_modal_choice_honors_an_initially_warm_candidate() {
+    let served = vec!["A".to_string(), "B".to_string()];
+    assert_eq!(
+        resolve_modal_choice(Some(("A".to_string(), served))).as_deref(),
+        Some("A")
+    );
+}
+
+#[test]
+fn resolve_modal_choice_honors_a_candidate_the_outer_probe_never_saw() {
+    // The outer/pre-picker probe served only A/B; the picker's OWN fresh
+    // roster (its own refresh, or a model that came up while it was open)
+    // adds C, and the operator picks it. Validating against the picker's
+    // fresh roster (not the outer snapshot) must honor that pick.
+    let picker_served = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    assert_eq!(
+        resolve_modal_choice(Some(("C".to_string(), picker_served))).as_deref(),
+        Some("C")
+    );
+}
+
+#[test]
+fn resolve_modal_choice_refuses_a_pick_no_longer_served() {
+    // Residency/roster changed while the picker was open — the choice is no
+    // longer honest and must fall through to refusal, not be forced.
+    let served = vec!["A".to_string(), "B".to_string()];
+    assert_eq!(
+        resolve_modal_choice(Some(("gone".to_string(), served))),
+        None
+    );
+}
+
+#[test]
+fn resolve_modal_choice_is_none_on_cancel() {
+    assert_eq!(resolve_modal_choice(None), None);
+}
+
+// PR #2626 review round 4 ("smallest repair"): the finding above is that
+// adapting `resolve_modal_choice`'s tests to its new signature never drove
+// the PRODUCTION caller — `finish_adoption`'s ambiguous-default branch,
+// which is exactly where the previous two rounds got the wiring wrong.
+// These drive `finish_adoption_with_picker` (the real production tail,
+// picker injected) with an initial A/B ambiguous warm set and no eligible
+// history, so `resolve_modal_choice` runs inside the real decision, not in
+// isolation.
+#[serial_test::serial(real_fs)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_adoption_picks_the_ambiguous_default_from_the_pickers_own_roster() {
+    let _pin = ConfigDirPin::new();
+    let mut choice = BackendChoice::synthesized(
+        "mux",
+        "http://127.0.0.1:1".into(),
+        newt_core::BackendKind::Ollama,
+        None,
+    );
+    let lines = finish_adoption_with_picker(
+        &mut choice,
+        Vec::new(),
+        vec!["A".into(), "B".into()],
+        vec!["A".into(), "B".into()],
+        None,
+        // Scripted stand-in for the picker: it opened on A/B, refreshed to
+        // A/B/C (a model came up while it was open), and the operator chose
+        // C — a candidate the FIRST probe never saw.
+        |_choice| Some(("C".to_string(), vec!["A".into(), "B".into(), "C".into()])),
+    );
+    assert_eq!(choice.active_model.as_deref(), Some("C"));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("backend default → C (picked)")),
+        "lines={lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("none is configured")),
+        "no-model refusal must not fire when the picker resolved a choice; lines={lines:?}"
+    );
+}
+
+#[serial_test::serial(real_fs)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_adoption_refuses_when_the_picker_is_cancelled() {
+    let _pin = ConfigDirPin::new();
+    let mut choice = BackendChoice::synthesized(
+        "mux",
+        "http://127.0.0.1:1".into(),
+        newt_core::BackendKind::Ollama,
+        None,
+    );
+    let lines = finish_adoption_with_picker(
+        &mut choice,
+        Vec::new(),
+        vec!["A".into(), "B".into()],
+        vec!["A".into(), "B".into()],
+        None,
+        |_choice| None, // Esc.
+    );
+    assert_eq!(choice.active_model, None);
+    assert!(
+        lines.iter().any(|l| l.contains("none is configured")),
+        "lines={lines:?}"
+    );
+}
+
+#[serial_test::serial(real_fs)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_adoption_refuses_a_pick_the_picker_no_longer_serves() {
+    // Refreshed-removal: the operator picked a name that the picker's OWN
+    // roster (from the same iteration) no longer lists — e.g. unloaded
+    // between highlighting it and pressing Enter. Never forced through.
+    let _pin = ConfigDirPin::new();
+    let mut choice = BackendChoice::synthesized(
+        "mux",
+        "http://127.0.0.1:1".into(),
+        newt_core::BackendKind::Ollama,
+        None,
+    );
+    let lines = finish_adoption_with_picker(
+        &mut choice,
+        Vec::new(),
+        vec!["A".into(), "B".into()],
+        vec!["A".into(), "B".into()],
+        None,
+        |_choice| Some(("gone".to_string(), vec!["A".into(), "B".into()])),
+    );
+    assert_eq!(choice.active_model, None);
+    assert!(
+        lines.iter().any(|l| l.contains("none is configured")),
+        "lines={lines:?}"
+    );
+}
+
 #[test]
 fn prewarm_applies_is_url_equality_modulo_trailing_slash() {
     // The pre-warm probe is consumed only for the endpoint it ran against —

@@ -541,6 +541,49 @@ pub(crate) fn panel_live_resize_case() {
     assert_eq!(cockpit.editor.draft(), draft);
 }
 
+/// #2632 review finding 1: a same-size resize notification, and a
+/// height-only shrink that still leaves the block room, must not move the
+/// block away from the content it sits under — that is exactly how the
+/// #2441 blank canyon reappeared with no terminal movement at all. Grounds
+/// `resize_new_top`'s mocked arithmetic against a real `Presenter` and a
+/// real terminal (`cockpit.screen.top`), which a pure-function test cannot
+/// observe end to end.
+///
+/// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY).
+#[serial_test::serial(tty_arbiter, prompt_stdin)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_same_size_resize_does_not_move_the_block_away_from_its_content_2632() {
+    let _tty = TestTty::install();
+    let surface = crate::rich_input::RichSurface::new(None).expect("rich surface");
+    let mut cockpit = Presenter::open(surface).expect("cockpit");
+
+    let content_top = cockpit.screen.top;
+    let block_h = cockpit.screen.block_h;
+    let (cols, rows) = (cockpit.screen.cols, cockpit.screen.rows);
+
+    // A same-size resize notification: nothing moved on the real terminal,
+    // so the block must stay exactly where the content ends.
+    cockpit.on_event(Event::Resize(cols, rows)).unwrap();
+    assert_eq!(
+        cockpit.screen.top, content_top,
+        "a same-size resize must not recreate the #2441 gap"
+    );
+
+    // A height-only shrink that still leaves room for the block at its old,
+    // non-bottom position must not re-anchor it to the new bottom.
+    let shrunk = rows - 2;
+    assert!(
+        content_top + block_h <= shrunk,
+        "test precondition: the block still fits after the shrink"
+    );
+    cockpit.on_event(Event::Resize(cols, shrunk)).unwrap();
+    assert_eq!(
+        cockpit.screen.top, content_top,
+        "a partial shrink that still fits must not re-anchor to the bottom"
+    );
+}
+
 /// #2573 review: the whole panel path on a real terminal — the cockpit lends
 /// rows, `panel::drive` runs a real panel through its own event loop, and the
 /// parent resizes and types. Grounds `panel::classify`, `PanelWindow`'s

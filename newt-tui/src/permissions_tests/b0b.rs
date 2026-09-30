@@ -15,6 +15,7 @@ fn request() -> PermissionRequest {
         kind: DenialKind::Exec,
         target: "bash".into(),
         reason: String::new(),
+        harness_bound: false,
     }
 }
 
@@ -111,6 +112,7 @@ fn the_registry_is_independent_of_the_form() {
         kind: DenialKind::Net,
         target: "https://example.com/api".into(),
         reason: String::new(),
+        harness_bound: false,
     };
     let terminal_form =
         permission_definition(&low, &danger::DangerTable::builtin(), Audience::Terminal);

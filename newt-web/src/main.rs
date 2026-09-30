@@ -917,7 +917,7 @@ async fn init_mesh_dock() -> Option<newt_mesh::NewtDockService> {
         },
         Err(_) => None,
     };
-    match newt_mesh::DockClient::bind(&user, hub, uplink_port.unwrap_or(0)).await {
+    match newt_mesh::DockClient::bind(&user, hub, uplink_port.unwrap_or(0), &state).await {
         Ok(client) => {
             if uplink_port.is_some() {
                 client.serve_uplinks(state.clone());

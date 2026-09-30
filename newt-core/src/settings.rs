@@ -67,6 +67,21 @@ pub struct Session {
     pub provider: Option<String>,
     /// Last model override chosen via `/model <name>` (the `NEWT_DGX_MODEL` axis).
     pub model: Option<String>,
+    /// True when `model` came from THIS project's OWN `settings.toml` entry
+    /// rather than the global `[session]` table (#2622 EVIDENCE). A project
+    /// entry records a bare model with no `provider` key whenever the model
+    /// was picked while already on the project's active backend (`Choice::
+    /// Model` in `apply_project_choice`) — `self.provider` then inherits the
+    /// GLOBAL session provider, which drifts independently (e.g. a later
+    /// `/backends` switch elsewhere, or simply going stale) and need not
+    /// match the backend actually in use. Gating restore on that inherited,
+    /// possibly-stale value dropped the project's own remembered model every
+    /// time it disagreed with the real active backend. A project-scoped
+    /// model restores whenever the project is active, full stop; only a
+    /// GLOBAL model (no project entry) still needs the provider-match guard
+    /// in [`Self::restore`], because that's the only case where the
+    /// model/provider coupling actually means something.
+    model_from_project: bool,
 }
 
 /// The startup environment a [`Session`] asks for: each field is `Some` only
@@ -94,6 +109,7 @@ impl Session {
         Self {
             provider: read("provider"),
             model: read("model"),
+            model_from_project: false,
         }
     }
 
@@ -111,6 +127,12 @@ impl Session {
             return global;
         };
         let (provider, model) = (entry.provider, entry.model);
+        // Only a BARE project model (no provider of its own) is the "picked
+        // while already active" case the field exists for (#2626 review
+        // P1-2). An entry that names its OWN provider couples model to that
+        // provider exactly like the global table does, so it must keep
+        // going through the ordinary provider-match guard in `restore`.
+        let model_from_project = model.is_some() && provider.is_none();
         Self {
             model: match (&provider, model) {
                 (_, Some(m)) => Some(m),
@@ -118,6 +140,7 @@ impl Session {
                 (None, None) => global.model,
             },
             provider: provider.or(global.provider),
+            model_from_project,
         }
     }
 
@@ -136,7 +159,10 @@ impl Session {
     /// — matching the in-app rule that picking a provider clears the model
     /// override. (When both are `None` the model was chosen on the default
     /// backend, which is also what's active, so a bare `/model` choice still
-    /// sticks.)
+    /// sticks.) #2622: this guard applies ONLY to a global model —
+    /// `self.model_from_project` restores unconditionally whenever its project
+    /// is active, since it was never coupled to a provider in the first place
+    /// (see that field's doc comment).
     pub fn restore(
         &self,
         current_provider: Option<&str>,
@@ -160,7 +186,7 @@ impl Session {
             .model
             .as_deref()
             .filter(|_| !model_pinned)
-            .filter(|_| effective == self.provider.as_deref())
+            .filter(|_| self.model_from_project || effective == self.provider.as_deref())
             .map(str::to_string);
         Restore { provider, model }
     }
@@ -466,6 +492,7 @@ mod tests {
         let s = Session {
             provider: Some("dgx1".into()),
             model: Some("gpt-4.1".into()),
+            model_from_project: false,
         };
         let r = s.restore(None, false, |n| n == "dgx1");
         assert_eq!(r.provider.as_deref(), Some("dgx1"));
@@ -479,6 +506,7 @@ mod tests {
         let s = Session {
             provider: None,
             model: Some("gpt-4.1".into()),
+            model_from_project: false,
         };
         let r = s.restore(None, false, |_| false);
         assert_eq!(r.provider, None);
@@ -490,6 +518,7 @@ mod tests {
         let s = Session {
             provider: Some("dgx1".into()),
             model: Some("gpt-4.1".into()),
+            model_from_project: false,
         };
         // Provider pinned (to the SAME backend) + model pinned → both untouched.
         assert_eq!(s.restore(Some("dgx1"), true, |_| true), Restore::default());
@@ -507,6 +536,7 @@ mod tests {
         let s = Session {
             provider: Some("openai".into()),
             model: Some("gpt-4.1".into()),
+            model_from_project: false,
         };
         // A --loadout/env pinned dgx1; the openai-era model must not ride along.
         let r = s.restore(Some("dgx1"), false, |_| true);
@@ -519,6 +549,7 @@ mod tests {
         let s = Session {
             provider: Some("ghost".into()),
             model: Some("gpt-4.1".into()),
+            model_from_project: false,
         };
         // Unknown backend → provider dropped; the model belonged to that gone
         // backend, so it is dropped too rather than bleeding onto the default.
@@ -690,6 +721,54 @@ mod tests {
     #[test]
     fn ephemeral_writes_nothing() {
         assert!(!should_persist(true));
+    }
+
+    /// #2622 EVIDENCE: a project-scoped model (written with no `provider`
+    /// key, since it was picked while already on the project's active
+    /// backend) restores even when the GLOBAL `[session]` provider has since
+    /// gone stale and no longer names the backend actually in use — it must
+    /// not be dropped just because the inherited `self.provider` disagrees
+    /// with `effective`.
+    #[test]
+    fn a_project_scoped_model_restores_despite_a_stale_global_provider() {
+        let mut d = doc("[session]\nprovider = \"ollama\"\n");
+        switch(&mut d, "/a", Choice::Model("ornith-1.5-35b"));
+        let s = Session::for_project(&d, "/a");
+        assert_eq!(s.model.as_deref(), Some("ornith-1.5-35b"));
+        // The active backend ("llama-router") does not match the stale
+        // global "ollama" — the OLD guard dropped the model here.
+        let r = s.restore(Some("llama-router"), false, all_exist);
+        assert_eq!(
+            r.model.as_deref(),
+            Some("ornith-1.5-35b"),
+            "a project's own remembered model must not be gated on a stale \
+             global provider"
+        );
+    }
+
+    /// PR #2626 review P1-2: a project entry that names ITS OWN provider
+    /// couples model to that provider, same as a global entry — it is not
+    /// the bare "picked while already active" case `model_from_project`
+    /// exists for. An explicit-provider entry for a DIFFERENT backend than
+    /// the one actually effective must not restore its model onto the
+    /// wrong backend's credentials.
+    #[test]
+    fn explicit_project_provider_still_gates_the_model_on_a_mismatch() {
+        let mut d = doc("");
+        switch(&mut d, "/a", Choice::Provider("A"));
+        switch(&mut d, "/a", Choice::Model("A-model"));
+        let s = Session::for_project(&d, "/a");
+        assert_eq!(
+            (s.provider.as_deref(), s.model.as_deref()),
+            (Some("A"), Some("A-model"))
+        );
+        // The effective backend is B (e.g. --loadout), not the project's A.
+        let r = s.restore(Some("B"), false, all_exist);
+        assert_eq!(
+            r.model, None,
+            "a model coupled to an explicit project provider must not \
+             follow onto a different active backend"
+        );
     }
 
     /// (g): the restore is lowest precedence — an env/flag-pinned provider is

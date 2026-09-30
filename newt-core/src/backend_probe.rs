@@ -1721,6 +1721,17 @@ pub struct Adoption {
     /// force a swap to your pin?"; a headless caller keeps the cooperative default
     /// and never silently evicts the warm model. `None` = no conflict.
     pub pin_conflict: Option<String>,
+    /// Populated (2+ entries) when NO pin resolved (no request, and the
+    /// declared model is unset or unavailable) and MORE THAN ONE served
+    /// model is warm — a multiplexer with two agents' models both loaded.
+    /// `adopt` has no principled way to break that tie (list order is
+    /// arbitrary and produced #2622: it silently picked the weaker
+    /// tool-caller of two loaded models). `model` is `None` in this case —
+    /// the caller must ask (interactive) or refuse with this list
+    /// (headless), rather than dispatch to whichever the server listed
+    /// first. Always empty otherwise, including the ordinary single-warm
+    /// case, which still adopts automatically.
+    pub ambiguous_warm: Vec<String>,
 }
 
 /// The pure adoption rule. `served` is what the probe saw; `requested` is the
@@ -1760,6 +1771,7 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
                 // adopt-warm and no swap to force.
                 adopted_warm: false,
                 pin_conflict: None,
+                ambiguous_warm: Vec::new(),
             }
         }
         Serving::Multiplexer => {
@@ -1789,13 +1801,16 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
             // instead, same as an unserved requested model already does.
             let declared_unavailable =
                 requested_ok != Some(true) && declared.is_some_and(|d| !is_served(d));
-            // The first WARM model the server still lists (a stale `/api/ps`
-            // entry not in `models` is ignored — see [`Served::warm`]).
-            let warm: Option<String> = served
+            // The WARM models the server still lists, in server order (a
+            // stale `/api/ps` entry not in `models` is ignored — see
+            // [`Served::warm`]).
+            let warm_candidates: Vec<String> = served
                 .warm
                 .iter()
-                .find(|w| served.models.contains(w))
-                .cloned();
+                .filter(|w| served.models.contains(w))
+                .cloned()
+                .collect();
+            let warm: Option<String> = warm_candidates.first().cloned();
 
             // `ManagedMode::Shared` adopt-warm: a cooperative guest PREFERS a
             // warm model over forcing its pin to load — a swap that would evict
@@ -1806,16 +1821,37 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
             // first-served), where warmth is only a tiebreaker and never
             // overrides an explicit choice.
             let shared = backend.managed == Some(ManagedMode::Shared);
-            let (model, adopted_warm, pin_conflict) = match warm {
-                Some(w) if shared && pin.as_deref() != Some(w.as_str()) => {
-                    let conflict = pin.filter(|p| p != &w);
-                    (Some(w), true, conflict)
-                }
-                other => {
-                    let model = pin.or(other).or_else(|| served.models.first().cloned());
-                    (model, false, None)
-                }
-            };
+            // A pin that is ALREADY warm needs no load and no eviction — it
+            // must win outright, never be reported as a conflict against
+            // whichever OTHER warm model the server happens to list first
+            // (PR #2626 review P1-1).
+            let pin_is_warm = pin
+                .as_deref()
+                .is_some_and(|p| warm_candidates.iter().any(|w| w == p));
+            let (model, adopted_warm, pin_conflict, ambiguous_warm) =
+                if pin.is_none() && warm_candidates.len() > 1 {
+                    // #2622: no pin resolved and MORE THAN ONE served model is
+                    // warm — list order is arbitrary (it previously picked
+                    // whichever the server happened to list first, regardless of
+                    // tool-calling quality). Refuse to guess; surface the
+                    // candidates for the caller to ask/refuse instead of forcing
+                    // an unloaded model or silently guessing. Checked BEFORE the
+                    // Shared cold-pin accommodation below so a genuinely
+                    // unpinned multi-warm set routes to ambiguity resolution in
+                    // every mode, not just unmanaged ones.
+                    (None, false, None, warm_candidates)
+                } else if shared && !pin_is_warm {
+                    if let Some(w) = warm.clone() {
+                        let conflict = pin.clone().filter(|p| p != &w);
+                        (Some(w), true, conflict, Vec::new())
+                    } else {
+                        let model = pin.or_else(|| served.models.first().cloned());
+                        (model, false, None, Vec::new())
+                    }
+                } else {
+                    let model = pin.or(warm).or_else(|| served.models.first().cloned());
+                    (model, false, None, Vec::new())
+                };
             Adoption {
                 model,
                 serving,
@@ -1824,6 +1860,7 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
                 declared_unavailable,
                 adopted_warm,
                 pin_conflict,
+                ambiguous_warm,
             }
         }
     }

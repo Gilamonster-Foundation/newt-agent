@@ -4023,14 +4023,65 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
     }
 }
 
+/// PR #2626 review residual finding 3: the model-picker's result is explicit
+/// operator intent, honored against the roster displayed by the picker in
+/// the selection iteration — never a snapshot taken before the picker
+/// opened (roster can change while the picker is open: refresh, load/unload,
+/// or simply time passing). `None` (cancel, or a picked model that isn't in
+/// that fresh roster) is the only case that falls through to refusal. Pure
+/// so the decision is unit-testable without driving a real terminal or probe.
+fn resolve_modal_choice(picked: Option<(String, Vec<String>)>) -> Option<String> {
+    picked.and_then(|(m, served)| served.contains(&m).then_some(m))
+}
+
+/// PR #2626 review round 4 ("smallest repair"): the ambiguous-default picker,
+/// as a seam `finish_adoption` calls rather than inlines. Production passes
+/// this real, terminal-driving implementation; tests pass a scripted
+/// stand-in so the picker-then-resolve decision inside `finish_adoption` runs
+/// for real without a PTY, a terminal, or a live probe.
+#[cfg_attr(not(feature = "rich-tui"), allow(unused_variables))]
+fn pick_ambiguous_default(choice: &BackendChoice) -> Option<(String, Vec<String>)> {
+    #[cfg(feature = "rich-tui")]
+    {
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+            .then(|| models_panel::choose(choice, None).ok().flatten())
+            .flatten()
+    }
+    #[cfg(not(feature = "rich-tui"))]
+    {
+        None
+    }
+}
+
 /// The shared adopt tail: probe results (live or pre-warmed) → the choice's
 /// model/serving/window/api, with the honest status lines.
 fn finish_adoption(
+    choice: &mut BackendChoice,
+    lines: Vec<String>,
+    models: Vec<String>,
+    warm: Vec<String>,
+    detected_kind: Option<newt_core::BackendKind>,
+) -> Vec<String> {
+    finish_adoption_with_picker(
+        choice,
+        lines,
+        models,
+        warm,
+        detected_kind,
+        pick_ambiguous_default,
+    )
+}
+
+/// Test seam: same as [`finish_adoption`] with the picker injectable. Kept
+/// as a thin wrapper rather than duplicating the tail so production and
+/// tests run the identical decision logic.
+fn finish_adoption_with_picker(
     choice: &mut BackendChoice,
     mut lines: Vec<String>,
     models: Vec<String>,
     warm: Vec<String>,
     detected_kind: Option<newt_core::BackendKind>,
+    picker: impl FnOnce(&BackendChoice) -> Option<(String, Vec<String>)>,
 ) -> Vec<String> {
     use newt_core::backend_probe::{self, Served};
     let secs = probe_timeout_secs(&choice.url);
@@ -4057,29 +4108,133 @@ fn finish_adoption(
             // fallback policy (an unavailable request falls back to the
             // declaration; Managed Shared may prefer a warm model).
             let (synth, requested) = adoption_inputs(choice);
-            let adoption =
+            let warm_at_probe = warm.clone();
+            let declared_name = synth.effective_model().map(str::to_string);
+            let mut adoption =
                 backend_probe::adopt(&synth, &Served { models, warm }, requested.as_deref());
             if adoption.requested_unavailable {
                 // #1122 fail-soft: a restored/typo'd model must not brick the
                 // session — say what happened and what we used instead.
-                lines.push(format!(
-                    "requested model isn't on {} — falling back (was it a typo, or \
-                     removed from the endpoint?); /models to list",
-                    choice.url
-                ));
+                lines.push(match adoption.model.as_deref() {
+                    Some(m) => format!(
+                        "requested model isn't on {} — falling back to {}; was it a typo, \
+                         or removed from the endpoint? /models to list",
+                        choice.url, m
+                    ),
+                    None => format!(
+                        "requested model isn't on {} — falling back (was it a typo, or \
+                         removed from the endpoint?); /models to list",
+                        choice.url
+                    ),
+                });
             }
-            if adoption.declared_unavailable {
-                // #2400 fail-soft: a config-declared model the server no
-                // longer serves (renamed, unloaded, removed) must not silently
-                // dispatch to that dead name — say what happened and what we
-                // used instead, same as the requested-model case above.
-                lines.push(format!(
-                    "configured model isn't on {} — falling back (was it renamed or \
-                     removed on the server?); /models to list",
-                    choice.url
-                ));
+            // SEMANTICS (2026-09-28): a blank/missing declared model and a
+            // STALE one (the server no longer serves that name) both mean
+            // "backend default" — adopt whatever the backend has loaded —
+            // and are reported the same non-alarming way, distinct from an
+            // explicit operator request (handled above). A stale name gets
+            // one extra short note; blank gets none.
+            let backend_default =
+                requested.is_none() && (declared_name.is_none() || adoption.declared_unavailable);
+            // PR #2626 review P2-4: ambiguity must be resolved or explicitly
+            // refused whenever adopt() returns it — including when the
+            // ORIGINAL request named a model that turned out unavailable
+            // (`requested.is_some()`, so `backend_default` is false). Gating
+            // this on `backend_default` left that case with only the generic
+            // #1122 typo warning above and no fallback model, candidate list,
+            // or modal at all.
+            if !adoption.ambiguous_warm.is_empty() {
+                // #2622: several models loaded, no pin resolved — list order
+                // is arbitrary. Tiebreak on the ONE backend-keyed fact newt
+                // already has: the model this operator last ran on this
+                // endpoint (usage.jsonl). Falls through to asking only when
+                // that history doesn't cover any of the loaded candidates.
+                // #2626 review: the history rule is the most recent row
+                // naming an ELIGIBLE candidate, not merely the most recent
+                // row for this endpoint — a later row for a model that's
+                // since been unloaded must not shadow an earlier eligible
+                // one, so the candidate check runs INSIDE the log scan.
+                let last_used = newt_core::Config::user_config_path()
+                    .map(|p| p.with_file_name("usage.jsonl"))
+                    .and_then(|log| {
+                        newt_core::metrics::last_eligible_model_for_endpoint(
+                            &log,
+                            &choice.url,
+                            &adoption.ambiguous_warm,
+                        )
+                    });
+                match last_used {
+                    Some(m) => {
+                        lines.push(format!(
+                            "backend default → {m} (last used on this backend; also loaded: \
+                             {})",
+                            adoption
+                                .ambiguous_warm
+                                .iter()
+                                .filter(|w| *w != &m)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        adoption.model = Some(m);
+                        adoption.ambiguous_warm.clear();
+                    }
+                    None => {
+                        // #2622 TIEBREAK DECIDED: no history covers any of the
+                        // loaded candidates — a default must still be chosen
+                        // DELIBERATELY, not by list order. On a rich, real
+                        // terminal, raise the existing model picker (same
+                        // surface `/models` opens) rather than a bare notice;
+                        // its choice — or a cancel — decides. Anywhere else
+                        // (lean build, piped/non-tty) fall through to the
+                        // refusal-with-list below. `picker` is
+                        // `pick_ambiguous_default` in production and a
+                        // scripted stand-in under test (round 4 seam).
+                        let picked = picker(choice);
+                        // PR #2626 review residual finding 3: the picker
+                        // offers every served model (including ones not warm
+                        // at probe time, and its own load/refresh controls),
+                        // and the roster can change again while the picker
+                        // is open. Validate against the roster displayed by
+                        // the picker in the selection iteration — not
+                        // `models_at_probe`, which is the OUTER probe from
+                        // before the picker ever opened and can no longer
+                        // speak for what the backend serves now.
+                        match resolve_modal_choice(picked) {
+                            Some(m) => {
+                                lines.push(format!("backend default → {m} (picked)"));
+                                adoption.model = Some(m);
+                                adoption.ambiguous_warm.clear();
+                            }
+                            None => lines.push(format!(
+                                "{} has {} models loaded ({}) and none is configured — \
+                                 pick one with /model <name>; /models to list",
+                                choice.url,
+                                adoption.ambiguous_warm.len(),
+                                adoption.ambiguous_warm.join(", ")
+                            )),
+                        }
+                    }
+                }
+            } else if backend_default {
+                if let Some(m) = adoption.model.as_deref() {
+                    let loaded = warm_at_probe.iter().any(|w| w == m);
+                    lines.push(format!(
+                        "backend default → {m}{}",
+                        if loaded { " (loaded)" } else { "" }
+                    ));
+                }
+                if adoption.declared_unavailable {
+                    if let Some(stale) = &declared_name {
+                        lines.push(format!(
+                            "configured model \"{stale}\" isn't served by {} (renamed or \
+                             removed?)",
+                            choice.url
+                        ));
+                    }
+                }
             }
-            if adoption.model.is_none() {
+            if adoption.model.is_none() && adoption.ambiguous_warm.is_empty() {
                 lines.push(format!(
                     "{} listed no models — pull one (or start the server with a model), \
                      then /models",

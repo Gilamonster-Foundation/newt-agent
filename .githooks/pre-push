@@ -48,6 +48,12 @@
 #   - `just check` runs `just eval-selftest` (bench ingestion fixtures, #2316, and
 #     the container adapter's lane tests against a test-only `harbor` stub),
 #     matching the "eval self-tests (eval-selftest)" step in the lint job.
+#   - `just check-vendor-crossterm` (Unix) matches the "vendor crossterm
+#     regression gate (newt #2644)" step in ci.yml: runs the regression test
+#     for the `[patch.crates-io]` vendored crossterm directly, since the crate
+#     is excluded from the workspace and its tests are never reached by
+#     `just check` / `cargo test --workspace`. Run locally after any edit to
+#     vendor/crossterm-0.28.1-patched/src/cursor/sys/unix.rs.
 #   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
 #   - `just audit` matches the "Security audit" job (cargo audit against the
 #     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit

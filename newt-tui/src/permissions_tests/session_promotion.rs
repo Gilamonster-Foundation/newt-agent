@@ -148,6 +148,7 @@ fn durable_allows_are_exact_and_denials_still_win() {
         kind: DenialKind::Net,
         target: "example.test".into(),
         reason: String::new(),
+        harness_bound: false,
     };
     let base = Caveats {
         net: newt_core::caveats::Scope::none(),
@@ -398,6 +399,7 @@ fn durable_remote_allow_works_with_new_prompts_disabled() {
         kind: DenialKind::RemoteTool,
         target: "server__search".into(),
         reason: String::new(),
+        harness_bound: false,
     };
     state
         .durable_grants

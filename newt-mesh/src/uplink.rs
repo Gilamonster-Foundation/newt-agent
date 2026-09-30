@@ -192,12 +192,12 @@ impl DockUplink {
             pubkey: agent.public_bytes(),
             instance: instance.to_owned(),
         };
-        // Reserved in the host's store, so a hub that outlives this uplink
-        // still admits the next one under this key (agent-mesh#100).
-        let reservations = agent_mesh_bus::FileSequenceReservations::new(
-            state_dir.join(format!("dock-sequence-{}", agent.fingerprint().hex())),
-        );
-        let bus = Bus::bind_outbound_only_reserving(user, agent, Arc::new(reservations)).await?;
+        // A hub that outlives this uplink still admits the next one under this
+        // key (agent-mesh#100).
+        let bus = match crate::dock::dock_sequences(&state_dir, &agent) {
+            Some(reserved) => Bus::bind_outbound_only_reserving(user, agent, reserved).await?,
+            None => Bus::bind_outbound_only(user, agent).await?,
+        };
         let local_port = bus.local_port();
         let (stop, stopped) = oneshot::channel();
         let (state_tx, state) = watch::channel(UplinkState::Polling);
@@ -479,9 +479,18 @@ struct Job {
 struct HostWork {
     queued: VecDeque<Job>,
     dispatched: HashMap<JobId, oneshot::Sender<DockReply>>,
-    /// Set when the host is staged: nothing is queued or dispatched on this
-    /// link again, whoever still holds it.
-    closed: bool,
+    /// Set once nothing is queued or dispatched on this link again, whoever
+    /// still holds it, and why.
+    closed: Option<Closed>,
+}
+
+/// Why a host's link was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// The host was staged: its held poll is told so.
+    Staged,
+    /// The hub is closing: its held poll is released with no work.
+    HubClosing,
 }
 
 impl HostWork {
@@ -495,7 +504,7 @@ impl HostWork {
     /// Take the next live job and mark it dispatched — the point after which
     /// its outcome belongs to the host.
     fn dispatch(&mut self, now: Instant) -> Option<(JobId, DockRequest)> {
-        if self.closed {
+        if self.closed.is_some() {
             return None;
         }
         self.prune(now);
@@ -515,6 +524,17 @@ struct HostLink {
 }
 
 impl HostLink {
+    /// Close the link for `why`: drop its queued and dispatched work (their
+    /// requesters fail at once) and wake any poll holding it.
+    fn close(&self, why: Closed) {
+        let mut work = self.work.lock().unwrap();
+        work.closed = Some(why);
+        work.queued.clear();
+        work.dispatched.clear();
+        drop(work);
+        self.queued.notify_waiters();
+    }
+
     /// Polled recently enough to take requests.
     fn is_live(&self) -> bool {
         self.last_poll.lock().unwrap().elapsed() < POLL_TIMEOUT
@@ -652,11 +672,15 @@ impl UplinkHub {
                 let mut work = link.work.lock().unwrap();
                 (work.dispatch(Instant::now()), work.closed)
             };
-            if closed {
-                return Work {
-                    staged: true,
-                    ..Work::default()
-                };
+            match closed {
+                Some(Closed::Staged) => {
+                    return Work {
+                        staged: true,
+                        ..Work::default()
+                    }
+                }
+                Some(Closed::HubClosing) => return Work::default(),
+                None => {}
             }
             if job.is_some() {
                 return Work {
@@ -685,12 +709,7 @@ impl UplinkHub {
             hosts.links.remove(&host)
         };
         if let Some(link) = link {
-            let mut work = link.work.lock().unwrap();
-            work.closed = true;
-            work.queued.clear();
-            work.dispatched.clear();
-            drop(work);
-            link.queued.notify_waiters();
+            link.close(Closed::Staged);
         }
         // A pairing reply goes back at once; otherwise hold, so the host does
         // not spin.
@@ -701,6 +720,23 @@ impl UplinkHub {
             staged: true,
             pairing,
             ..Work::default()
+        }
+    }
+
+    /// Release every held poll, so the bus can close at once rather than
+    /// wait out each [`HOLD`]: each link is closed, and its poll answered
+    /// with no work.
+    pub(crate) fn close(&self) {
+        let links: Vec<_> = self
+            .hosts
+            .lock()
+            .unwrap()
+            .links
+            .drain()
+            .map(|(_, l)| l)
+            .collect();
+        for link in links {
+            link.close(Closed::HubClosing);
         }
     }
 
@@ -720,7 +756,7 @@ impl UplinkHub {
         let (answer, answered) = oneshot::channel();
         {
             let mut work = link.work.lock().unwrap();
-            if work.closed {
+            if work.closed.is_some() {
                 anyhow::bail!("host {} has no open uplink", host.short());
             }
             work.prune(now);
@@ -904,6 +940,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no open uplink"), "{err}");
+    }
+
+    /// Closing the hub releases a held poll at once, with no work and not as
+    /// "staged" (the host would otherwise start pairing), and takes no more
+    /// requests for that host.
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_hub_releases_held_polls_without_staging_them() {
+        let hub = Arc::new(UplinkHub::default());
+        drop(hub.open(fp(1)));
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.poll_now(fp(1), Poll::answering(None)).await }
+        });
+        tokio::task::yield_now().await;
+        hub.close();
+        let work = tokio::time::timeout(Duration::from_secs(1), held)
+            .await
+            .expect("released at once, not after HOLD")
+            .unwrap();
+        assert!(work.job.is_none() && !work.staged, "{work:?}");
+        assert!(hub.request(fp(1), DockRequest::ListSessions).await.is_err());
     }
 
     /// A job reaches the polling host, its answer — carried on the host's
@@ -1357,7 +1414,9 @@ mod tests {
     async fn hub_for(user: &UserKey) -> (DockClient, PeerEndpoint) {
         let agent = dock_agent(user, DockRole::Hub, "hub");
         let pubkey = agent.public_bytes();
-        let hub = DockClient::bind(user, agent, 0).await.unwrap();
+        // Kept for the hub's lifetime: its sequence reservations live there.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let hub = DockClient::bind(user, agent, 0, &dir).await.unwrap();
         hub.serve_all_uplinks();
         let addr = (Ipv4Addr::LOCALHOST, hub.local_port()).into();
         (hub, PeerEndpoint::new(pubkey, addr))

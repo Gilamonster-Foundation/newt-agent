@@ -929,6 +929,14 @@ async fn dispatch_bridled_shell_with_floor(
     result
 }
 
+/// #2636: the EXACT message emitted only when `run_command` is refused
+/// before anything ran, purely for missing declared filesystem authority —
+/// the one denial shape a #2628 rerun is allowed to bind to (round1 finding
+/// 3). Any other `Denied` result (a broker-bearing runtime refusal, a build
+/// fence, a compound command that partially ran) must never enter that slot.
+pub(super) const UNGRANTED_FS_AUTHORITY_DENIAL: &str =
+    "capability denied: declared filesystem authority was not granted for this command";
+
 /// Parse the entire invocation manifest before any approval can be consumed.
 pub(super) fn declared_filesystem_requests(
     args: &serde_json::Value,
@@ -965,6 +973,7 @@ pub(super) fn declared_filesystem_requests(
                     kind,
                     target: target.into(),
                     reason: format!("declared {field} for command {cmd:?} in {cwd:?}"),
+                    harness_bound: false,
                 });
             }
         }
@@ -1026,6 +1035,7 @@ pub(super) async fn exec_confined_command(
         live_tool_output,
         presentation,
         None,
+        &mut None,
     )
     .await
 }
@@ -1049,6 +1059,11 @@ pub(super) async fn exec_confined_command_with_broker(
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    // #2636 finding 1: typed signal for the pre-exec FS denial — set to the
+    // missing authority set when the denial fires BEFORE the child runs. Only
+    // this path produces a rerun-eligible slot; child stdout that happens to
+    // contain the denial string does not.
+    fs_pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
 ) -> (String, ExecOutcome) {
     // #2558 (HANDOFF item 2): refuse a same-file redirect (`cmd f > f`)
     // BEFORE either lane below runs anything — this is the single choke
@@ -1158,12 +1173,15 @@ pub(super) async fn exec_confined_command_with_broker(
             {
                 Some(allowed)
             }
-            _ => return with_denial_context(
-                ("capability denied: declared filesystem authority was not granted for this command".into(), ExecOutcome::Denied),
-                workspace,
-                cwd,
-                Some(caveats),
-            ),
+            _ => {
+                *fs_pre_exec_missing = Some(missing);
+                return with_denial_context(
+                    (UNGRANTED_FS_AUTHORITY_DENIAL.into(), ExecOutcome::Denied),
+                    workspace,
+                    cwd,
+                    Some(caveats),
+                );
+            }
         }
     };
     let caveats = admitted.as_ref().unwrap_or(caveats);
@@ -2647,6 +2665,7 @@ pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<P
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            harness_bound: false,
         });
     }
     Some(requests)
@@ -2682,6 +2701,7 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            harness_bound: false,
         });
     }
     Some(requests)

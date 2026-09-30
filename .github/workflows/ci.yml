@@ -171,6 +171,14 @@ jobs:
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.
         run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+      - name: vendor crossterm regression gate (newt #2644)
+        # The `[patch.crates-io]` vendored crossterm is excluded from the workspace
+        # so its unit tests are never reached by `cargo test --workspace`.
+        # This step runs the regression directly so a future `Err(_) => {}`
+        # restoration in unix.rs must fail this gate before reaching main.
+        # Unix-only: the test is `#[cfg(all(test, unix))]`.
+        # HOOK PARITY: mirrored by `just check-vendor-crossterm`.
+        run: cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_2644 -- --test-threads=1
 
   lean-build:
     name: lean strip-down build + tests (--no-default-features)

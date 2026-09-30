@@ -1,5 +1,27 @@
 use super::*;
 
+/// #2637: a confined workspace with one real file, for tests exercising the
+/// `ReadRange` memo's content-identity check — it re-verifies against the
+/// file's ACTUAL current bytes through the same confined `authorized_read`
+/// path a real `read_file` call uses, so a fake/absent file must not be
+/// silently accepted as "unchanged". `path` is relative, as `read_file`'s
+/// `path` arg is.
+fn read_memo_fixture(
+    path: &str,
+    content: &str,
+) -> (tempfile::TempDir, String, crate::caveats::Caveats) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let full = root.join(path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&full, content).unwrap();
+    let caveats = crate::confined_exec::workspace_confined_caveats(&root);
+    let workspace = root.to_string_lossy().into_owned();
+    (dir, workspace, caveats)
+}
+
 #[test]
 fn clean_build_guidance_appends_one_exact_user_message_on_the_third_call() {
     let original = serde_json::json!({"role": "user", "content": "build the project"});
@@ -88,6 +110,7 @@ fn repeat_steer_value_filters_a_registered_session_secret() {
     filter.register(secret);
     let _guard = crate::ocap::scoped_session_disclosure(filter);
 
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({"command": "cat /etc/token"});
     // The tool FAILS with the secret echoed in the first line of its result.
@@ -97,6 +120,10 @@ fn repeat_steer_value_filters_a_registered_session_secret() {
         false,
         &format!("error: unexpected token {secret} in response"),
         None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     // The model repeats the exact call → the steer re-injects the prior line.
     let steer = g
@@ -116,6 +143,7 @@ fn repeat_steer_value_filters_a_registered_session_secret() {
 
 #[test]
 fn short_circuits_exact_repeat_without_discouraging_the_tool() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({"command": "python3 script.py"});
     // First sight of the call → let it run (no steer).
@@ -127,6 +155,10 @@ fn short_circuits_exact_repeat_without_discouraging_the_tool() {
         false,
         "error: command exited 1",
         Some(crate::ExecOutcome::Failed),
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     let s = g.repeat_steer("run_command", &args).expect("repeat steers");
     assert!(s.contains("already called"), "{s}");
@@ -138,6 +170,10 @@ fn short_circuits_exact_repeat_without_discouraging_the_tool() {
         false,
         "error: command exited 1",
         Some(crate::ExecOutcome::Failed),
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     let s2 = g.repeat_steer("run_command", &args).expect("still steers");
     assert!(s2.contains("error: command exited 1"), "{s2}");
@@ -163,6 +199,10 @@ async fn successful_script_edit_releases_the_exact_failed_command() {
         false,
         "error: command exited 1",
         Some(crate::ExecOutcome::Failed),
+        ReadScope {
+            workspace: &root.to_string_lossy(),
+            caveats: &caveats,
+        },
     );
     assert!(guard.repeat_steer("run_command", &command).is_some());
 
@@ -190,7 +230,17 @@ async fn successful_script_edit_releases_the_exact_failed_command() {
         .unwrap();
         let ok = tools::tool_ok(&result, None);
         assert_eq!(ok, succeeds, "{result}");
-        guard.record("edit_file", &args, ok, &result, None);
+        guard.record(
+            "edit_file",
+            &args,
+            ok,
+            &result,
+            None,
+            ReadScope {
+                workspace: &root.to_string_lossy(),
+                caveats: &caveats,
+            },
+        );
         assert_eq!(
             guard.repeat_steer("run_command", &command).is_none(),
             succeeds,
@@ -209,13 +259,36 @@ async fn successful_script_edit_releases_the_exact_failed_command() {
 
 #[test]
 fn ignores_successes_and_distinct_calls() {
+    // #2637: restored to its pre-#2555 form — a bare successful read_file is
+    // NEVER refused on repeat (doctrine: never refuse a successful re-read).
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let a = serde_json::json!({"path": "f.rs"});
-    g.record("read_file", &a, true, "file contents", None); // success → not remembered
+    g.record(
+        "read_file",
+        &a,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    ); // success → not remembered as a refusal
     assert!(g.repeat_steer("read_file", &a).is_none());
     // A failure under different args does not short-circuit a distinct call.
     let b = serde_json::json!({"path": "g.rs"});
-    g.record("read_file", &b, false, "error reading g.rs", None);
+    g.record(
+        "read_file",
+        &b,
+        false,
+        "error reading g.rs",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(
         g.repeat_steer("read_file", &a).is_none(),
         "distinct args still run"
@@ -228,6 +301,7 @@ fn steers_no_result_repeats_on_second_issuance() {
     // #718: a success-shaped no-result that the model re-issues byte-for-byte
     // is steered on its 2nd call — distinct from a hard failure (no escalation),
     // distinct from a genuine success (which is never steered).
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
 
     // recall "no matches" — first sight runs; record it; the identical 2nd
@@ -243,6 +317,10 @@ fn steers_no_result_repeats_on_second_issuance() {
         true,
         "no matches in past conversations for \"newt-tui PyO3 bindings\" — try different keywords.",
         None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     let s = g
         .repeat_steer("recall", &q)
@@ -260,7 +338,17 @@ fn steers_no_result_repeats_on_second_issuance() {
     // state_get "no such key" — same: 2nd identical probe is steered.
     let k = serde_json::json!({"key": "current_task"});
     assert!(g.repeat_steer("state_get", &k).is_none());
-    g.record("state_get", &k, true, "no such key: current_task", None);
+    g.record(
+        "state_get",
+        &k,
+        true,
+        "no such key: current_task",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(
         g.repeat_steer("state_get", &k).is_some(),
         "2nd identical state_get steers"
@@ -276,15 +364,30 @@ fn steers_no_result_repeats_on_second_issuance() {
         true,
         "no active plan — if this is multi-step work, call update_plan next",
         None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     let plan_steer = g
         .repeat_steer("plan_get", &empty_plan_args)
         .expect("2nd identical empty plan_get steers");
     assert!(plan_steer.contains("update_plan"), "{plan_steer}");
 
-    // A genuine success with content is still NEVER steered on repeat.
+    // #2637: a BARE read_file is still NEVER steered on repeat (covered in
+    // depth by the cached-read tests below).
     let f = serde_json::json!({"path": "f.rs"});
-    g.record("read_file", &f, true, "file contents", None);
+    g.record(
+        "read_file",
+        &f,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(g.repeat_steer("read_file", &f).is_none());
 
     // A no-result under DIFFERENT args is a distinct call — let it run.
@@ -297,6 +400,7 @@ fn steers_no_result_repeats_on_second_issuance() {
 
 #[test]
 fn steers_duplicate_successful_web_fetch() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let issue = serde_json::json!({
         "url": "https://github.com/Gilamonster-Foundation/newt-agent/issues/771"
@@ -306,7 +410,17 @@ fn steers_duplicate_successful_web_fetch() {
         g.repeat_steer("web_fetch", &issue).is_none(),
         "first fetch must run"
     );
-    g.record("web_fetch", &issue, true, "# Issue\n\nbody", None);
+    g.record(
+        "web_fetch",
+        &issue,
+        true,
+        "# Issue\n\nbody",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     let steer = g
         .repeat_steer("web_fetch", &issue)
         .expect("2nd identical successful fetch steers");
@@ -325,16 +439,28 @@ fn steers_duplicate_successful_web_fetch() {
         "distinct URLs still run"
     );
 
+    // #2637: a bare read_file is still never steered.
     let file = serde_json::json!({"path": "src/lib.rs"});
-    g.record("read_file", &file, true, "file contents", None);
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(
         g.repeat_steer("read_file", &file).is_none(),
-        "ordinary successful reads are still not steered"
+        "bare reads are still not steered"
     );
 }
 
 #[test]
 fn steers_duplicate_successful_read_only_run_command() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({
         "command": "grep -n 'help_lines' newt-tui/src/lib.rs"
@@ -350,6 +476,10 @@ fn steers_duplicate_successful_read_only_run_command() {
         true,
         "9439:fn help_lines() -> &'static [&'static str] {",
         None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
 
     let steer = g
@@ -364,10 +494,21 @@ fn steers_duplicate_successful_read_only_run_command() {
 
 #[test]
 fn does_not_steer_successful_write_capable_run_command() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({"command": "cargo test -p newt-tui"});
 
-    g.record("run_command", &args, true, "test result: ok", None);
+    g.record(
+        "run_command",
+        &args,
+        true,
+        "test result: ok",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
 
     assert!(
         g.repeat_steer("run_command", &args).is_none(),
@@ -377,7 +518,12 @@ fn does_not_steer_successful_write_capable_run_command() {
 
 #[test]
 fn classifier_leaves_ordinary_successes_repeatable() {
-    let file = serde_json::json!({"path": "src/lib.rs"});
+    // #2637: a bare read (no offset/limit) is ALSO an ordinary, non-refusing
+    // success now — it is never classified into a steering memo at all
+    // (`repeat_calls.cached_read` handles the exact-repeat case separately,
+    // ahead of `repeat_steer`). Only truly unclassified shapes belong here.
+    let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "file contents");
+    let file = serde_json::json!({"path": "src/lib.rs", "offset": 0});
     assert_eq!(
         RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
         None
@@ -390,11 +536,363 @@ fn classifier_leaves_ordinary_successes_repeatable() {
     );
 
     let mut g = RepeatCallGuard::default();
-    g.record("read_file", &file, true, "file contents", None);
-    g.record("run_command", &tests, true, "test result: ok", None);
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    g.record(
+        "run_command",
+        &tests,
+        true,
+        "test result: ok",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(
         g.repeat_memos.is_empty(),
-        "ordinary successful calls must stay repeatable"
+        "an explicit-range read and an ordinary command stay repeatable"
+    );
+}
+
+/// #2637: a bare `read_file` (no explicit `offset`/`limit`) IS memoized, but
+/// an exact repeat is NEVER refused — `cached_read` re-verifies the file's
+/// ACTUAL current bytes (a real confined read, not trusting recorded
+/// workspace-changing bookkeeping) and, unchanged, serves the earlier content
+/// silently.
+#[test]
+fn bare_read_file_repeat_is_served_from_cache_not_refused() {
+    let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "file contents");
+    let file = serde_json::json!({"path": "src/lib.rs"});
+    assert!(matches!(
+        RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents", None),
+        Some(RepeatMemo::ReadRange { .. })
+    ));
+
+    let mut g = RepeatCallGuard::default();
+    assert!(
+        g.cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_none(),
+        "first read has no memo yet"
+    );
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    // The doctrine: never refuse. The exact repeat is never steered...
+    assert!(
+        g.repeat_steer("read_file", &file).is_none(),
+        "a bare read_file repeat is never refused"
+    );
+    // ...it is served silently from the memo instead, with the ORIGINAL content.
+    let cached = g
+        .cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
+        )
+        .expect("unchanged file content serves from cache");
+    assert_eq!(cached, "file contents");
+}
+
+/// #2637: the file changing on disk invalidates the memo — freshness is
+/// proven against the file's ACTUAL bytes each time, never inferred from
+/// "no recorded workspace-changing tool ran since".
+#[test]
+fn cached_read_is_dropped_when_the_file_actually_changes() {
+    let (_dir, workspace, caveats) = read_memo_fixture("src/lib.rs", "file contents");
+    let file = serde_json::json!({"path": "src/lib.rs"});
+    let mut g = RepeatCallGuard::default();
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    assert!(g
+        .cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_some());
+
+    // An out-of-band edit — no tool this guard observes ran.
+    std::fs::write(
+        std::path::Path::new(&workspace).join("src/lib.rs"),
+        "edited",
+    )
+    .unwrap();
+
+    assert!(
+        g.cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_none(),
+        "changed content must never be served as if unchanged"
+    );
+    // Still never a refusal — the caller falls through to a real read.
+    assert!(
+        g.repeat_steer("read_file", &file).is_none(),
+        "a stale memo is dropped, not turned into a refusal"
+    );
+}
+
+/// #2637 review P1 regression: the memo's identity must describe exactly the
+/// bytes SERVED (`result`), never a separate reread of the path taken at
+/// record time. Before the fix, `classify_repeat_memo` called
+/// `read_scope.content_id_of(path)` — an independent disk read — to mint the
+/// id. That opens a window: the real tool call reads A and returns
+/// `result = A`, then (before `record` runs) an out-of-band edit lands B on
+/// disk, and the old code stored `(hash(B), A)`. A LATER read, with the file
+/// still holding B unchanged, would match `hash(B)` and serve stale `A`.
+/// This drives exactly that race and asserts the memo is never confused: the
+/// id is bound to `result` (`A`), so it can only ever match a disk read that
+/// still shows `A`, and B on disk is correctly seen as a mismatch, not a hit.
+#[test]
+fn content_id_binds_to_the_served_result_not_a_reread_at_record_time() {
+    let (_dir, workspace, caveats) = read_memo_fixture("race.rs", "A");
+    let file = serde_json::json!({"path": "race.rs"});
+    let mut g = RepeatCallGuard::default();
+    // The tool's real read already happened and returned "A" as `result`.
+    // Simulate the out-of-band edit landing BEFORE `record` classifies it —
+    // the exact window the old reread-based id minting raced.
+    std::fs::write(std::path::Path::new(&workspace).join("race.rs"), "B").unwrap();
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "A",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    // Disk still holds "B" (untouched since the edit above) — this is NOT
+    // "unchanged since A", so it must never be served from the memo.
+    assert!(
+        g.cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_none(),
+        "the memo's id must bind to the served result (\"A\"), not a reread \
+         taken at record time — serving \"A\" for the current \"B\" would be \
+         exactly the stale-content bug this regression guards"
+    );
+}
+
+/// #2637 review P1: a cache HIT must go through the same disclosure fence a
+/// real tool result takes, not `push_tool_resolution` unfiltered — the exact
+/// gap the review named (`newt-core/src/agentic/mod.rs:4062/:4474`, pre-fix).
+/// The fix passes the cached content through `maybe_offload_tool_result` (the
+/// same chokepoint `smart_harness::tool_result` uses) before `push_tool_resolution`;
+/// this pins that a session secret embedded in the memoized content is redacted.
+#[test]
+fn cache_hit_content_passes_through_the_disclosure_fence() {
+    let secret = "CANARY-cachehit-4d1e9a02";
+    let mut filter = crate::ocap::DisclosureFilter::new();
+    filter.register(secret);
+    let _guard = crate::ocap::scoped_session_disclosure(filter.clone());
+
+    let secret_content = format!("content with {secret} inside");
+    let (_dir, workspace, caveats) = read_memo_fixture("secret_file.txt", &secret_content);
+    let file = serde_json::json!({"path": "secret_file.txt"});
+    let mut g = RepeatCallGuard::default();
+    g.record(
+        "read_file",
+        &file,
+        true,
+        &secret_content,
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    let content = g
+        .cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
+        )
+        .expect("unchanged content serves from cache");
+    assert!(
+        content.contains(secret),
+        "sanity: the raw cached content names the secret before filtering: {content}"
+    );
+    let filtered = maybe_offload_tool_result("read_file", content, false, None, Some(&filter));
+    assert!(
+        !filtered.contains(secret),
+        "a cache hit must pass the live disclosure fence, exactly like \
+         a real tool result: {filtered}"
+    );
+}
+
+/// #2555: ANY workspace change releases the memo (not only an edit of the
+/// SAME file) — the model's next read is asking about the tree it just
+/// changed, so "nothing has changed since" no longer holds.
+#[test]
+fn bare_read_file_memo_is_released_by_any_workspace_change() {
+    let (_dir, workspace, caveats) = read_memo_fixture("a.rs", "file contents");
+    let file = serde_json::json!({"path": "a.rs"});
+    let mut g = RepeatCallGuard::default();
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    assert!(g
+        .cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_some());
+    g.record(
+        "write_file",
+        &serde_json::json!({"path": "b.rs", "content": "x"}),
+        true,
+        "wrote b.rs",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    assert!(
+        g.cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_none(),
+        "a workspace write to a DIFFERENT file still releases the memo"
+    );
+}
+
+/// #2555: the compaction release hook — `release_read_memos` drops every
+/// `ReadRange` memo (what `record_compaction_artifact` and the Responses
+/// loop's `Compacted` outcome call once a compaction actually commits) but
+/// leaves failure/no-result/evidence memos untouched, since those describe
+/// an outcome compaction does not invalidate.
+#[test]
+fn release_read_memos_drops_only_read_range_memos() {
+    let (_dir, workspace, caveats) = read_memo_fixture("a.rs", "file contents");
+    let mut g = RepeatCallGuard::default();
+    let file = serde_json::json!({"path": "a.rs"});
+    g.record(
+        "read_file",
+        &file,
+        true,
+        "file contents",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    let failing = serde_json::json!({"command": "cargo check"});
+    g.record(
+        "run_command",
+        &failing,
+        false,
+        "error: boom",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
+    assert!(g
+        .cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_some());
+    assert!(g.repeat_steer("run_command", &failing).is_some());
+
+    g.release_read_memos();
+
+    assert!(
+        g.cached_read(
+            "read_file",
+            &file,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats
+            }
+        )
+        .is_none(),
+        "compaction releases the read-range memo — a post-compaction re-read \
+         is legitimate because the working-set card no longer holds the page"
+    );
+    assert!(
+        g.repeat_steer("run_command", &failing).is_some(),
+        "compaction must not release an unrelated failure memo"
     );
 }
 
@@ -528,9 +1026,20 @@ fn no_result_reason_classifies_and_routes() {
 
     // A recall ERROR (ok=false) goes through the FAILURE path, not no-result
     // classification: it lands in repeat_memos as escalation-eligible.
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let q = serde_json::json!({"query": "x"});
-    g.record("recall", &q, false, "error: index unavailable", None);
+    g.record(
+        "recall",
+        &q,
+        false,
+        "error: index unavailable",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(matches!(
         g.repeat_memos.get(&RepeatCallGuard::key("recall", &q)),
         Some(RepeatMemo::Failure { first_line, .. }) if first_line == "error: index unavailable"
@@ -555,6 +1064,7 @@ fn first_line_caps_and_takes_first() {
 /// truth about the outcome.
 #[test]
 fn a_failing_build_now_memoizes_and_steers_the_repeat() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({"command": "cargo check -p thing", "cwd": "/w"});
     // What the shell path renders for a failing compile since #1969.
@@ -566,7 +1076,17 @@ fn a_failing_build_now_memoizes_and_steers_the_repeat() {
     );
 
     assert!(g.repeat_steer("run_command", &args).is_none());
-    g.record("run_command", &args, ok, result, None);
+    g.record(
+        "run_command",
+        &args,
+        ok,
+        result,
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     let steer = g
         .repeat_steer("run_command", &args)
         .expect("a repeated failing build is not steered");
@@ -577,12 +1097,23 @@ fn a_failing_build_now_memoizes_and_steers_the_repeat() {
 /// and for good reason, so the repair must not memoize success.
 #[test]
 fn a_passing_build_stays_repeatable() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut g = RepeatCallGuard::default();
     let args = serde_json::json!({"command": "cargo check -p thing", "cwd": "/w"});
     let result = "    Finished dev [unoptimized] target(s) in 0.04s\n";
     let ok = crate::agentic::tools::tool_result_ok(result);
     assert!(ok, "a successful build is being read as a failure");
-    g.record("run_command", &args, ok, result, None);
+    g.record(
+        "run_command",
+        &args,
+        ok,
+        result,
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(
         g.repeat_steer("run_command", &args).is_none(),
         "a passing build was memoized; re-running a build is legitimate"
@@ -625,9 +1156,20 @@ fn an_os_permission_denial_requires_a_failed_probe() {
 
 #[test]
 fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let mut guard = RepeatCallGuard::default();
     let args = serde_json::json!({});
-    guard.record("plan_get", &args, true, "no active plan", None);
+    guard.record(
+        "plan_get",
+        &args,
+        true,
+        "no active plan",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     assert!(guard.repeat_steer("plan_get", &args).is_some());
     guard.record(
         "update_plan",
@@ -635,6 +1177,10 @@ fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
         true,
         "<plan>inspect</plan>",
         None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     assert!(
         guard.repeat_steer("plan_get", &args).is_none(),
@@ -726,6 +1272,7 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
     ]
     .into_iter()
     .filter_map(|(name, args, clears)| {
+        let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
         let mut guard = RepeatCallGuard::default();
         guard.record(
             "run_command",
@@ -733,8 +1280,22 @@ fn result_aware_mode_clears_a_failure_memo_only_on_a_workspace_change() {
             false,
             "error: command exited 101",
             None,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
         );
-        guard.record(name, &args, true, "ok", None);
+        guard.record(
+            name,
+            &args,
+            true,
+            "ok",
+            None,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
+        );
         (guard.repeat_steer("run_command", &check).is_none() != clears)
             .then(|| format!("{name} {args}: clears={}", !clears))
     })
@@ -1442,8 +2003,19 @@ fn identical_failed_call_reruns_after_a_workspace_edit() {
         ("lifecycle", serde_json::json!({"phase": "check"})),
     ];
     for (name, args) in &calls {
+        let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
         let mut guard = RepeatCallGuard::default();
-        guard.record(name, args, false, "error: exited 101", None);
+        guard.record(
+            name,
+            args,
+            false,
+            "error: exited 101",
+            None,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
+        );
         assert!(
             guard.repeat_steer(name, args).is_some(),
             "{name}: true repeat"
@@ -1454,6 +2026,10 @@ fn identical_failed_call_reruns_after_a_workspace_edit() {
             true,
             "ok",
             None,
+            ReadScope {
+                workspace: &workspace,
+                caveats: &caveats,
+            },
         );
         assert!(
             guard.repeat_steer(name, args).is_none(),
@@ -1465,15 +2041,37 @@ fn identical_failed_call_reruns_after_a_workspace_edit() {
 /// F37: without a change in between, an identical read-only probe stays refused.
 #[test]
 fn identical_read_only_probe_is_still_refused_without_a_change() {
+    let (_dir, workspace, caveats) = read_memo_fixture("unused.txt", "");
     let args = serde_json::json!({"command": "grep x a.txt"});
     let mut guard = RepeatCallGuard::default();
-    guard.record("run_command", &args, true, "hello", None);
+    guard.record(
+        "run_command",
+        &args,
+        true,
+        "hello",
+        None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
+    );
     guard.record(
         "read_file",
         &serde_json::json!({"path": "a"}),
         true,
         "x",
         None,
+        ReadScope {
+            workspace: &workspace,
+            caveats: &caveats,
+        },
     );
     assert!(guard.repeat_steer("run_command", &args).is_some());
 }
+
+// #2637 / #2555: the real behavioral regression for the compaction release
+// hook (committed compaction → next read is fresh; a round where compaction
+// did not fire → the memo survives) lives in
+// `compression_loop_tests::compaction_release_forces_fresh_read_over_long_haul`,
+// driven through the actual chat loop instead of calling
+// `RepeatCallGuard` methods directly — see that test's docstring for why.

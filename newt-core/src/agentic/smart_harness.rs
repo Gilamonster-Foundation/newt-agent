@@ -209,6 +209,10 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
         let decision = self.inner.ask_with_caveats(baseline, requests);
         self.validate_decision(decision)
     }
+
+    fn consume_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
+        self.inner.consume_pending_once(kind, target);
+    }
 }
 
 /// Transport-free session plus a bounded, tool-less inference callback.
