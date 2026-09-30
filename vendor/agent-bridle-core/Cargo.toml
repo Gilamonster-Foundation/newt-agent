@@ -95,7 +95,7 @@ name = "unix_socket_grants"
 path = "tests/unix_socket_grants.rs"
 
 [dependencies.agent-mesh-protocol]
-version = "0.6.4"
+version = "0.7.0"
 
 [dependencies.anyhow]
 version = "1"
