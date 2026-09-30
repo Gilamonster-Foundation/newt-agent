@@ -1409,9 +1409,10 @@ pub fn resolve_alternates_chain(
             ));
         }
         chain.push(canonical.clone());
-        // Full no-symlink traversal anchored at canonical so every component
-        // of "info/alternates" is protected, not only the final one.
-        let contents = match read_beneath_no_symlinks(&canonical, Path::new("info/alternates"), fs_read, bound) {
+        // Full no-symlink traversal anchored at the ORIGINAL dir (not canonical) so
+        // that the dual-path permission check inside read_beneath_no_symlinks can
+        // match a non-canonical scope root (e.g. /var on macOS where /var → /private/var).
+        let contents = match read_beneath_no_symlinks(&dir, Path::new("info/alternates"), fs_read, bound) {
             Ok(Some(c)) => c,
             Ok(None) => continue,
             Err(e) => return Err(e),
