@@ -373,7 +373,14 @@ fn read_beneath_no_symlinks(
     let canon = std::fs::canonicalize(anchor).map_err(|e| {
         format!("refused: cannot canonicalize anchor '{}' ({e})", anchor.display())
     })?;
-    if !permits_path_with_bound_roots(fs_read, bound, &canon) {
+    // Check both canonical and original path: when the scope contains
+    // non-canonical roots (e.g. /var vs /private/var on macOS in tests),
+    // the original anchor string may still match the scope even though the
+    // canonical form does not.  Production use goes through bind_canonical_roots
+    // which pre-canonicalizes the roots, so both checks agree there.
+    if !permits_path_with_bound_roots(fs_read, bound, &canon)
+        && !permits_path_with_bound_roots(fs_read, bound, anchor)
+    {
         return Err(format!(
             "refused: '{}' is outside this session's filesystem read authority",
             anchor.display()
