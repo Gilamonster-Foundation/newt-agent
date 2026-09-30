@@ -1404,21 +1404,6 @@ mod tests {
         assert!(err.contains("not installed"), "{err}");
     }
 
-    /// F1 positive control: a real, root-owned helper in the REAL trusted
-    /// git's exec-path resolves and passes.
-    #[test]
-    fn validate_helper_value_accepts_a_trusted_helper_in_the_real_exec_path() {
-        let fs_write = scope(&["/some/other/root"]);
-        let tools = TrustedTools::authenticate(&fs_write).expect("real git authenticates");
-        let Ok(HelperForm::BareName(helper)) = validate_helper_value("store", &tools, &fs_write)
-        else {
-            panic!("git-credential-store must resolve in {:?}", tools.exec_path);
-        };
-        assert!(helper.starts_with(&tools.exec_path), "{helper:?}");
-    }
-
-    /// The operator's real shape: URL-scoped helper keys, an empty reset
-    /// before the gh form, and a valueless key — all kept, in order.
     #[test]
     fn parse_listing_keeps_resets_scoped_keys_and_order() {
         let listing = b"file:/h/.gitconfig\0credential.https://github.com.helper\n\0\
@@ -1749,6 +1734,22 @@ mod real_process_tests {
             .collect()
     }
 
+    /// F1 positive control: a real, root-owned helper in the REAL trusted
+    /// git's exec-path resolves and passes.
+    #[test]
+    fn validate_helper_value_accepts_a_trusted_helper_in_the_real_exec_path() {
+        let _env = TestEnv::new(None); // a private HOME: no host gh config
+        let fs_write = scope(&["/some/other/root"]);
+        let tools = TrustedTools::authenticate(&fs_write).expect("real git authenticates");
+        let Ok(HelperForm::BareName(helper)) = validate_helper_value("store", &tools, &fs_write)
+        else {
+            panic!("git-credential-store must resolve in {:?}", tools.exec_path);
+        };
+        assert!(helper.starts_with(&tools.exec_path), "{helper:?}");
+    }
+
+    /// The operator's real shape: URL-scoped helper keys, an empty reset
+    /// before the gh form, and a valueless key — all kept, in order.
     #[test]
     fn credential_import_reads_a_real_trusted_global_config() {
         let env = TestEnv::new(None);
