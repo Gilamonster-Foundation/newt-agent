@@ -352,3 +352,40 @@ fn branch_list_ref_inputs_reject_pathlike_symbolic_targets() {
         );
     }
 }
+
+/// Strict catalogs send an explicit JSON null for the optional scope. That
+/// must match an omitted scope (bounded "all") against a real repository,
+/// using only the session's filesystem read grant — not ambient authority.
+#[test]
+fn confined_act_branch_list_null_scope_matches_omitted_bounded_all() {
+    let repo = repo_with_commit();
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    let session = read_scope(&[repo.path()]);
+    let omitted = tool(repo.path())
+        .dispatch(
+            "branch-list",
+            &serde_json::json!({}),
+            &GitCaveats::read_only(),
+            &session,
+        )
+        .unwrap();
+    let null_scope = tool(repo.path())
+        .dispatch(
+            "branch-list",
+            &serde_json::json!({"scope": null}),
+            &GitCaveats::read_only(),
+            &session,
+        )
+        .unwrap();
+    assert_eq!(omitted, null_scope);
+    assert!(
+        omitted.contains("local branches: 1")
+            && omitted.contains("cached remote-tracking branches: 1")
+            && omitted.contains("refs/heads/main")
+            && omitted.contains("refs/remotes/origin/main"),
+        "{omitted}"
+    );
+}
