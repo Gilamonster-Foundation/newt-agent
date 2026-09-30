@@ -143,7 +143,7 @@ fn declined_permissions_report_defaults_without_refreshing_authority() {
                 "/parent/child",
                 None,
             )
-            .1;
+            .2;
             // The tool trims requested targets; diagnostics must reflect the
             // actual target asked of the gate and escape it as data.
             assert!(
@@ -331,7 +331,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         "/workspace",
         None,
     )
-    .1;
+    .2;
     assert!(out.starts_with("granted:"), "got: {out}");
     assert!(out.contains("Retry the original operation"), "got: {out}");
     assert_eq!(gate.asks.len(), 1);
@@ -350,7 +350,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         "/workspace",
         None,
     )
-    .1;
+    .2;
     assert!(out.starts_with("denied:"), "got: {out}");
     assert!(out.contains("different approach"), "got: {out}");
 
@@ -364,7 +364,7 @@ fn request_permissions_grant_deny_and_no_gate() {
         "/workspace",
         None,
     )
-    .1;
+    .2;
     assert!(out.contains("no operator available"), "got: {out}");
 }
 
@@ -418,7 +418,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
             "/workspace",
             None,
         )
-        .1;
+        .2;
         for (name, request, result) in [
             (
                 "request_permissions",
@@ -431,12 +431,12 @@ fn permission_grant_releases_only_cached_authority_failures() {
                     "/workspace",
                     None,
                 )
-                .1,
+                .2,
             ),
             (
                 "request_permissions",
                 permission.clone(),
-                execute_request_permissions(&permission, None, false, 20, "/workspace", None).1,
+                execute_request_permissions(&permission, None, false, 20, "/workspace", None).2,
             ),
             (
                 "request_permissions",
@@ -449,7 +449,7 @@ fn permission_grant_releases_only_cached_authority_failures() {
                     "/workspace",
                     None,
                 )
-                .1,
+                .2,
             ),
             ("read_file", args.clone(), granted.clone()),
             (
@@ -543,7 +543,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                 );
                 assert!(guard.repeat_steer(name, &command).is_some());
                 let declined =
-                    execute_request_permissions(&permission, None, false, 20, "/workspace", None).1;
+                    execute_request_permissions(&permission, None, false, 20, "/workspace", None).2;
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -562,7 +562,7 @@ fn permission_grant_releases_native_command_failure_for_recheck() {
                     "/workspace",
                     None,
                 )
-                .1;
+                .2;
                 guard.record(
                     "request_permissions",
                     &permission,
@@ -616,7 +616,7 @@ async fn permission_grant_retry_reaches_the_real_file_error() {
     let mut gate = MockGate::new(true, &base);
     let permission = serde_json::json!({"capability": "fs_read", "target": file});
     let granted =
-        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace", None).1;
+        execute_request_permissions(&permission, Some(&mut gate), false, 20, "/workspace", None).2;
     assert!(granted.starts_with("granted:"), "{granted}");
     guard.record(
         "request_permissions",
@@ -671,7 +671,7 @@ fn request_permissions_headless_answer_is_forward_guidance_not_a_dead_end() {
         "/workspace",
         None,
     )
-    .1;
+    .2;
     // Preserves the recoverable "no operator" signal.
     assert!(out.contains("no operator available"), "got: {out}");
     // Tells the model to proceed within its existing authority (forward
@@ -707,7 +707,7 @@ fn request_permissions_coaches_bad_inputs() {
         "/workspace",
         None,
     )
-    .1;
+    .2;
     assert!(out.contains("unknown capability"), "got: {out}");
     assert!(out.contains("fs_read"), "got: {out}");
     // Missing target → coach.
@@ -719,7 +719,7 @@ fn request_permissions_coaches_bad_inputs() {
         "/workspace",
         None,
     )
-    .1;
+    .2;
     assert!(out.contains("'target' is required"), "got: {out}");
 }
 
@@ -1147,7 +1147,7 @@ fn native_once_filesystem_schema_and_acknowledgement_explain_the_retry() {
                     "/workspace",
                     None,
                 )
-                .1;
+                .2;
                 assert!(permission_grant_succeeded(
                     "request_permissions",
                     &args,
@@ -2220,12 +2220,13 @@ async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set()
     );
 }
 
-/// #2636 round3 blocker 1: the "IMMEDIATELY re-runs" bound wording — and the
-/// actual replay — must only fire when the requested grant covers the
-/// COMPLETE `missing` set a pending command was denied on. Drives the real
-/// gate (`execute_tool_with_collaborators` → `execute_request_permissions`)
-/// and inspects both the prompt the operator would see (via a capturing
-/// spy) and whether the next matching `run_command` still gets gated fresh.
+/// #2636 round3 blocker 1: the "IMMEDIATELY re-runs" bound wording must only
+/// fire when the requested grant covers the COMPLETE `missing` set a pending
+/// command was denied on. Drives `execute_tool_with_collaborators` through a
+/// capturing spy gate and inspects the `PermissionRequest` the operator would
+/// see (`harness_bound`, wording). Does not check command execution or
+/// once-grant lifetime — those are covered by
+/// `stateful_gate_proves_ineligible_no_replay_and_eligible_once()` (round4).
 #[cfg(unix)]
 #[tokio::test]
 async fn bound_wording_and_replay_require_complete_missing_coverage() {
@@ -2457,5 +2458,211 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
         !request.harness_bound,
         "#2636 round3: a model-forged harness_bound argument must not reach the \
          dispatched PermissionRequest: {request:?}"
+    );
+}
+
+/// #2636 round4 [P2]: stateful gate proves ineligible approval never replays
+/// and eligible approval fires exactly once, then requires a fresh approval.
+///
+/// The gate returns `Caveats::top()` on every Allow so widened caveats always
+/// cover `pending.missing` — making this the worst-case for the old code (an
+/// ineligible request whose approval happens to cover the missing set).
+///
+/// Three assertions:
+/// 1. Ineligible (wrong axis: FsRead, but missing requires FsWrite) whose
+///    Allow DOES cover missing → no command side effect, `consume_pending_once`
+///    not called.
+/// 2. Eligible (FsWrite on the denied path) → command executed exactly once
+///    (file created), `consume_pending_once` called once.
+/// 3. Second identical eligible invocation with a fresh pending slot → gate
+///    consulted again (once-grant spent; a fresh approval is required).
+#[cfg(unix)]
+#[tokio::test]
+async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct StatefulGate {
+        ask_count: Rc<Cell<usize>>,
+        consume_count: Rc<Cell<usize>>,
+    }
+    impl PermissionGate for StatefulGate {
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            self.ask_count.set(self.ask_count.get() + 1);
+            // Always approve with top authority so widened caveats cover everything.
+            PermissionDecision::Allow(Caveats::top())
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+        fn consume_pending_once(&mut self, _: DenialKind, _: &str) {
+            self.consume_count.set(self.consume_count.get() + 1);
+        }
+    }
+
+    let ws = tempfile::tempdir().unwrap();
+    let path_a = ws.path().join("a.txt").to_string_lossy().into_owned();
+    let workspace_str = ws.path().to_string_lossy().into_owned();
+    let base = Caveats {
+        fs_write: crate::caveats::Scope::none(),
+        fs_read: crate::caveats::Scope::none(),
+        ..Caveats::top()
+    };
+    let missing = vec![PermissionRequest {
+        tool: "run_command".to_string(),
+        kind: DenialKind::FsWrite,
+        target: path_a.clone(),
+        reason: "test".to_string(),
+        harness_bound: false,
+    }];
+    let ask_count = Rc::new(Cell::new(0usize));
+    let consume_count = Rc::new(Cell::new(0usize));
+
+    // ── CASE 1: ineligible request (FsRead axis, missing is FsWrite) ──────────
+    // The gate returns top() which covers FsWrite(path_a), but the pre-prompt
+    // eligibility check fails (axis mismatch) → replay_auth=None → no replay.
+    {
+        let mut gate = StatefulGate {
+            ask_count: ask_count.clone(),
+            consume_count: consume_count.clone(),
+        };
+        let mut pending_slot: Option<super::super::PendingRerun> =
+            Some(super::super::PendingRerun {
+                cmd: format!("/bin/touch {path_a}"),
+                cwd: workspace_str.clone(),
+                declared: missing.clone(),
+                missing: missing.clone(),
+            });
+        execute_tool_with_collaborators(
+            "request_permissions",
+            &serde_json::json!({"capability": "fs_read", "target": &path_a, "reason": "test"}),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+                pending_rerun: Some(&mut pending_slot),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    assert!(
+        !std::path::Path::new(&path_a).exists(),
+        "#2636 round4: ineligible approval (wrong axis) must not execute the command"
+    );
+    assert_eq!(
+        ask_count.get(),
+        1,
+        "#2636 round4: gate.ask must be consulted even for an ineligible request"
+    );
+    assert_eq!(
+        consume_count.get(),
+        0,
+        "#2636 round4: consume_pending_once must not fire when the request is ineligible"
+    );
+
+    // ── CASE 2a: eligible approval → exactly one execution ────────────────────
+    ask_count.set(0);
+    consume_count.set(0);
+    {
+        let mut gate = StatefulGate {
+            ask_count: ask_count.clone(),
+            consume_count: consume_count.clone(),
+        };
+        let mut pending_slot: Option<super::super::PendingRerun> =
+            Some(super::super::PendingRerun {
+                cmd: format!("/bin/touch {path_a}"),
+                cwd: workspace_str.clone(),
+                declared: missing.clone(),
+                missing: missing.clone(),
+            });
+        execute_tool_with_collaborators(
+            "request_permissions",
+            &serde_json::json!({"capability": "fs_write", "target": &path_a, "reason": "test"}),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+                pending_rerun: Some(&mut pending_slot),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    assert!(
+        std::path::Path::new(&path_a).exists(),
+        "#2636 round4: eligible approval must execute the command (side effect: file created)"
+    );
+    assert_eq!(
+        consume_count.get(),
+        1,
+        "#2636 round4: consume_pending_once must fire exactly once for an eligible approval"
+    );
+
+    // ── CASE 2b: second identical invocation → gate consulted again ───────────
+    // The once-grant was signalled spent in case 2a (consume_pending_once fired).
+    // A second request_permissions with a fresh pending slot must still consult
+    // the gate — no auto-approval from a cached grant.
+    ask_count.set(0);
+    consume_count.set(0);
+    std::fs::remove_file(&path_a).unwrap();
+    {
+        let mut gate = StatefulGate {
+            ask_count: ask_count.clone(),
+            consume_count: consume_count.clone(),
+        };
+        let mut pending_slot: Option<super::super::PendingRerun> =
+            Some(super::super::PendingRerun {
+                cmd: format!("/bin/touch {path_a}"),
+                cwd: workspace_str.clone(),
+                declared: missing.clone(),
+                missing: missing.clone(),
+            });
+        execute_tool_with_collaborators(
+            "request_permissions",
+            &serde_json::json!({"capability": "fs_write", "target": &path_a, "reason": "test"}),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+                pending_rerun: Some(&mut pending_slot),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    assert_eq!(
+        ask_count.get(),
+        1,
+        "#2636 round4: second eligible invocation must consult gate for a fresh approval \
+         (once-grant spent after case 2a)"
     );
 }

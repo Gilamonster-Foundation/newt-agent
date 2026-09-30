@@ -1833,6 +1833,14 @@ pub(super) struct PendingRerun {
     missing: Vec<PermissionRequest>,
 }
 
+/// #2636 round4: typed token returned by `execute_request_permissions` only
+/// when the request was eligible for replay pre-prompt (i.e. a single grant
+/// of the requested `kind/target` would cover every entry in `pending.missing`
+/// before the operator was shown a prompt). The caller may replay solely when
+/// it holds this token AND the returned caveats actually cover `pending.missing`
+/// — making an ineligible approval unrepresentable as a replay authorization.
+pub(super) struct EligibleReplay;
+
 /// #2636 round3 blocker 1: does a single grant of `kind` for `target` cover
 /// EVERY request in `missing`? Checked BEFORE asking the operator, using only
 /// the requested capability/target — never the widened caveats the gate
@@ -1896,12 +1904,17 @@ fn execute_request_permissions(
     _tool_output_lines: usize,
     workspace: &str,
     bound: Option<&PendingRerun>,
-) -> (Option<crate::caveats::Caveats>, String) {
+) -> (
+    Option<crate::caveats::Caveats>,
+    Option<EligibleReplay>,
+    String,
+) {
     let capability = args["capability"].as_str().unwrap_or("").trim();
     let target = args["target"].as_str().unwrap_or("").trim();
     let reason = args["reason"].as_str().unwrap_or("").trim();
     let Some(kind) = parse_capability(capability) else {
         return (
+            None,
             None,
             format!(
                 "request_permissions: unknown capability '{capability}'. Use one of: \
@@ -1911,6 +1924,7 @@ fn execute_request_permissions(
     };
     if target.is_empty() {
         return (
+            None,
             None,
             "request_permissions: 'target' is required — the executable path or command name (exec), \
                    the path (fs_read/fs_write), or the host (net)."
@@ -1957,17 +1971,22 @@ fn execute_request_permissions(
         // exactly as a denial-driven prompt does.
         Some(g) => match g.ask(std::slice::from_ref(&request)) {
             PermissionDecision::Allow(widened) => {
-                if eligible.is_some_and(|pending| {
-                    pending
-                        .missing
-                        .iter()
-                        .all(|request| permits_filesystem_request(&widened, request))
-                }) {
+                // #2636 round4: `consume_pending_once` fires when the request was
+                // eligible pre-prompt — we told the operator the command would replay,
+                // so the gate's proactive once-grant for the model's own retry must be
+                // dropped. Whether `widened` actually covers `pending.missing` is
+                // checked by the caller via the `EligibleReplay` token; here we only
+                // need eligibility.
+                let replay_auth = if eligible.is_some() {
                     g.consume_pending_once(kind, target);
-                }
-                return (Some(widened), permission_granted_result(capability, target));
+                    Some(EligibleReplay)
+                } else {
+                    None
+                };
+                return (Some(widened), replay_auth, permission_granted_result(capability, target));
             }
             PermissionDecision::Deny => (
+                None,
                 None,
                 format!(
                     "denied: the operator declined {capability} for {quoted_target}. \
@@ -1986,6 +2005,7 @@ fn execute_request_permissions(
         // target is genuinely essential and out of scope.
         None => (
             None,
+            None,
             format!(
                 "no operator available to grant {capability} for {quoted_target} — this session \
                  has no interactive permission gate (headless / eval / piped), so authority \
@@ -1997,10 +2017,10 @@ fn execute_request_permissions(
         ),
     };
     if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
-        out.1.push('\n');
+        out.2.push('\n');
         // A declined question supplies no fresh authority snapshot. In
         // particular, do not remint capabilities just to render diagnostics.
-        out.1.push_str(&denial_context(workspace, None, None));
+        out.2.push_str(&denial_context(workspace, None, None));
     }
     out
 }
@@ -3791,7 +3811,7 @@ async fn execute_authorized_tool(
         // call) is unaffected either way.
         "request_permissions" => {
             let rerun = pending_rerun.and_then(|slot| slot.take());
-            let (granted, msg) = execute_request_permissions(
+            let (granted, replay_auth, msg) = execute_request_permissions(
                 args,
                 permission_gate,
                 color,
@@ -3799,8 +3819,14 @@ async fn execute_authorized_tool(
                 workspace,
                 rerun.as_ref(),
             );
-            match (granted, rerun) {
-                (Some(widened), Some(pending))
+            // #2636 round4: replay requires BOTH the pre-prompt eligibility
+            // token (the request was eligible before the operator was shown a
+            // prompt) AND that the returned caveats actually cover the denied
+            // set.  An ineligible approval whose widened authority happens to
+            // cover `pending.missing` cannot replay — the unsafe state is
+            // unrepresentable without the token.
+            match (granted, replay_auth, rerun) {
+                (Some(widened), Some(_auth), Some(pending))
                     if pending
                         .missing
                         .iter()
@@ -3825,10 +3851,10 @@ async fn execute_authorized_tool(
                         .await,
                     )
                 }
-                // No pending rerun, denied/headless, or the grant just given
-                // does not cover what this specific denial needed: fall back
-                // to the grant/denial message.
-                (_, _) => msg,
+                // No pending rerun, denied/headless, ineligible approval, or
+                // the grant just given does not cover what this specific denial
+                // needed: fall back to the grant/denial message.
+                (_, _, _) => msg,
             }
         }
 
