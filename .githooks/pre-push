@@ -1,102 +1,69 @@
 #!/bin/bash
 #
-# Pre-push hook for newt-agent
+# Pre-push hook for newt-agent (#1098: fast pre-flight on the CHANGED scope)
 #
-# Runs the same lint + test + coverage gates that CI runs, locally,
-# before any push reaches origin. If this passes, CI should pass too
-# — and if it doesn't, fix the issue here instead of burning a CI run.
+# CRAFT-14 ("Hooks pre-flight what changed", Craft Register v3.0): this hook
+# runs the pipeline's *kinds* of check -- format, lint, test -- on the files
+# in the push, the crates that own them, and their reverse dependents. CI
+# stays the authoritative FULL gate; nothing merges without it green.
 #
 # Install: `just install-hooks` (or `git config core.hooksPath .githooks`)
 #
-# PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
-#   - `just check` exercises this hook's privacy/range handling through
-#     scripts/test_pre_push.py, matching the CI lint job's regression step.
-#   - `just check` runs `npm --prefix npm test` (Node 22), matching test-npm;
-#     other OS executions are CI-only. release.yml reuses this suite before
-#     tag-only artifact assembly/publication, which this hook does not perform.
-#   - .github/workflows/harness-python.yml is a declared real-resource lane (uv + CPython), deliberately outside hook parity; `just harness-python` mirrors it.
-#   - .github/workflows/newt-tui-pty.yml is a declared real-resource lane (real PTYs and subprocesses; its cockpit steps run the `#[ignore]`d PTY tests with `--include-ignored`), deliberately outside hook parity; nothing here mirrors it.
-#   - .github/workflows/mcp-import-real.yml is a declared real-resource lane
-#     (weekly + release-gate + workflow_dispatch, not per-push), deliberately
-#     outside hook parity. Its two #2596 net-scope steps
-#     (`stdio_spawn_under_net_none_does_not_l3_bound_refuse` and
-#     `stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused`,
-#     both `newt-mcp-client --lib`, Linux-only, real confined stdio subprocess)
-#     ground the `caveats::spawn_net_scope` mock-free — run them locally with
-#     `cargo test -p newt-mcp-client --lib stdio_spawn_under -- --ignored
-#     --test-threads=1` before relying on this hook alone for that change.
-#   - The feature list passed to clippy and to cargo test must MATCH:
-#     `--features newt-data/kernel,newt-interaction/schema`. Linting without
-#     a feature the tests enable hides feature-gated lint regressions, which
-#     is the same class of gap as a pipeline step with no hook behind it.
-#   - `just check` matches the lint + test + lean-build jobs (fmt + clippy +
-#     cargo test, plus the `--no-default-features` lean build for issue #416 —
-#     rich-tui is a default feature now, so the main jobs already cover it —
-#     plus the #1409 lean TEST firewall: `cargo test -p newt-agent
-#     --no-default-features`, `cargo test -p newt-tui`, and (#1828) `cargo
-#     test -p newt-interaction --no-default-features` for the inward protocol
-#     layer. The newt-tui line is the
-#     lean surface's own suite: newt-tui declares no `default` features, so
-#     testing it package-alone strips rich-tui + live-spill, which the
-#     workspace build always unifies back on.)
-#   - `just check` also runs `scripts/docs_check.py --self-test` and the
-#     check itself, plus the `--deleted-refs origin/main` retirement sweep,
-#     matching the "documentation references resolve (docs-check)" and
-#     "deleted documents are not still referenced" steps in the lint job: every relative markdown link (repo
-#     root + docs/**) resolves, and every `docs/....md` cited from a Rust
-#     comment exists. Cheap (~0.1s); the self-test guards the scanner itself.
-#   - `just check` runs `just eval-selftest` (bench ingestion fixtures, #2316, and
-#     the container adapter's lane tests against a test-only `harbor` stub),
-#     matching the "eval self-tests (eval-selftest)" step in the lint job.
-#   - `just check-vendor-crossterm` (Unix) matches the "vendor crossterm
-#     regression gate (newt #2644)" step in ci.yml: runs the regression test
-#     for the `[patch.crates-io]` vendored crossterm directly, since the crate
-#     is excluded from the workspace and its tests are never reached by
-#     `just check` / `cargo test --workspace`. Run locally after any edit to
-#     vendor/crossterm-0.28.1-patched/src/cursor/sys/unix.rs.
-#   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
-#   - `just audit` matches the "Security audit" job (cargo audit against the
-#     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit
-#     is absent — CI is the hard gate)
-#   - `just msrv` matches the MSRV job (cargo +<declared rust-version> check
-#     --all-targets, so dev-deps count too — #2161; local best-effort, needs
-#     rustup + the declared toolchain — CI is the hard gate)
-# PARITY EXCEPTION (#1098), deliberate and one-directional: on a push whose
-# every path is documentation, this hook runs `just docs-check` ALONE and skips
-# the cargo gates. CI still runs everything on every push, so the authoritative
-# gate is unchanged and the hook can only be MORE permissive, never less. This
-# is the direction #1098 asks for -- hook = fast pre-flight on changed code,
-# pipeline = authoritative gate -- not a hole in parity. The classification
-# fails closed; see the gate itself.
+# SCOPED HERE (every push, on the changed crates only):
+#   - the network-leak guard (privacy; file-scoped to the pushed diff)
+#   - scripts/changed-scope.sh classification (NONE / ALL / <crates>)
+#   - `cargo fmt --all -- --check` (whole tree; fast enough that scoping
+#     buys nothing)
+#   - `cargo clippy -D warnings --all-targets` on the changed crates plus
+#     reverse dependents (`--workspace` when classification says ALL)
+#   - `cargo nextest run -E 'rdeps(<crate>) + ...'` on the same crate set
+#     (falls back to `cargo test -p <crate>` if nextest is missing)
+#   - `python3 scripts/spawn_inventory.py` (~0.2s, whole tree -- matches
+#     CI's spawn-inventory step; cheap enough to run unscoped every push)
+#   - `just docs-check` (~0.5s, whole tree -- matches the lint job's
+#     docs-check steps; cheap enough to run unscoped every push)
+#   - a documentation-only push (or one that resolves to no crates) skips
+#     the cargo gates and runs `just docs-check` alone
+#
+# CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
+# lacks; each of these is named so CRAFT-14's "scoped in the hook or named
+# as CI-only" rule holds for every check the pipeline runs):
+#   - `just cov-ci` (coverage floor, cargo-llvm-cov instrumented whole-workspace)
+#   - the `--no-default-features` lean build/test config (issue #416, #1409, #1828)
+#   - `just msrv` (MSRV toolchain check)
+#   - `just audit` (cargo-audit against .cargo/audit.toml)
+#   - `just eval-selftest` (bench/harbor fixture suite)
+#   - `just harness-python` (uv + CPython real-resource lane)
+#   - the PTY (newt-tui-pty.yml) and mcp-import-real.yml real-resource lanes
+#   - the npm installer matrix (test-npm) beyond the local OS
+#
+# PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml -- see that
+# file's HOOK PARITY comment for the job-by-job mapping. Editing either one
+# triggers an audit of the other (CRAFT-14 rule 3, Push Hook Governance
+# rule 3).
 #
 # When editing this hook, update the workflow to match.
 # When editing the workflow, update this hook to match.
 #
 # Do NOT skip this hook with `--no-verify`. If a check fails, fix the
-# issue. The hook is the local equivalent of CI; bypassing it just
-# moves the failure to the remote.
+# issue. CI is the authoritative full gate; this hook is the fast
+# pre-flight that keeps you from burning a CI run on an easy miss.
 #
-# TRANSPORT (#276): this gate takes ~10 minutes, and that is INCOMPATIBLE
-# with pushing over SSH. For SSH remotes git opens the connection and
-# reads the advertised refs BEFORE running this hook (the hook's stdin
-# carries the remote SHAs), then sends the pack over that SAME connection
-# afterwards — by which time GitHub has dropped the idle session, and git
-# exits 141 (SIGPIPE) after the gate passed. Over HTTPS the pack upload
-# is a fresh request after the hook, so gate duration is irrelevant.
-# `just install-hooks` therefore sets a repo-local
-#   url."https://github.com/".pushInsteadOf "git@github.com:"
-# so pushes transport over HTTPS while fetches keep their configured URL.
-# HTTPS push auth comes from a git credential helper; if pushes prompt
-# for a password, run `gh auth setup-git` once.
+# TRANSPORT (#276): a slow gate is incompatible with pushing over SSH (git
+# opens the connection and reads advertised refs BEFORE running this hook,
+# then sends the pack over that SAME connection afterwards -- by which time
+# GitHub may have dropped the idle session). `just install-hooks` sets a
+# repo-local `url."https://github.com/".pushInsteadOf "git@github.com:"` so
+# pushes transport over HTTPS while fetches keep their configured URL.
+# HTTPS push auth comes from a git credential helper; if pushes prompt for
+# a password, run `gh auth setup-git` once.
 
 set -e
 
 # Capture the ref list git writes to the hook's stdin (one
-# "<local-ref> <local-sha> <remote-ref> <remote-sha>" line per ref). The
-# network-leak guard below scans the pushed range; the cargo/coverage gates
-# ignore it (they gate the whole workspace). Consuming stdin here is also
-# standard hook hygiene: git must never take SIGPIPE writing refs to a hook
-# that exited without reading, and the gate commands must not inherit it.
+# "<local-ref> <local-sha> <remote-ref> <remote-sha>" line per ref). Both the
+# network-leak guard and scripts/changed-scope.sh need this, and git must
+# never take SIGPIPE writing refs to a hook that exited without reading.
 REFS="$(cat)"
 
 cd "$(git rev-parse --show-toplevel)"
@@ -106,7 +73,7 @@ cd "$(git rev-parse --show-toplevel)"
 # `cargo test`: integration tests that drive `git` inside temp repos
 # (newt-core/tests/workspace_key.rs) then operate on THIS repo instead of
 # their temp repo and fail. CI never runs under hook env, so parity is
-# unaffected — drop the leak so the gates see the same world CI does.
+# unaffected -- drop the leak so the gates see the same world CI does.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 
 # ── Network-leak guard (privacy/security) ─────────────────────────────────────
@@ -217,7 +184,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # 127.0.0.1:9000 inherited from a process older than the endpoint move.
 #
 # Drop the overrides so the config file is the single source of truth.
-# Credentials (AWS_*) and RUSTC_WRAPPER are deliberately untouched.
+# Credentials (AWS_*) and RUSTC_WRAPPER are deliberately untouched — honour
+# whatever wrapper/incremental settings the caller has (the gnuc sccache
+# trap above is about a STALE endpoint override, not the wrapper itself).
 unset SCCACHE_ENDPOINT SCCACHE_S3_USE_SSL SCCACHE_BUCKET SCCACHE_REGION
 
 if ! command -v just >/dev/null 2>&1; then
@@ -226,90 +195,99 @@ if ! command -v just >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-    echo "pre-push: 'cargo-llvm-cov' not found in PATH"
-    echo "          install via: cargo install cargo-llvm-cov"
-    exit 1
-fi
+# ── Changed-scope classification (#1098) ───────────────────────────────────────
+# scripts/changed-scope.sh reads the same ref list and prints:
+#   (nothing) -- deletion, tag push, or docs-only: skip the cargo gates
+#   ALL       -- a workspace-wide file changed: gate everything
+#   <crates>  -- only these crates (and their reverse dependents) changed
+SCOPE="$(printf '%s\n' "$REFS" | bash scripts/changed-scope.sh)"
 
-if ! command -v npm >/dev/null 2>&1; then
-    echo "pre-push: 'npm' not found in PATH"
-    echo "          'just check' runs the npm shim tests (Node 22) — see npm/README.md"
-    exit 1
-fi
-
-# Coverage gate: only runs when rustup llvm-tools-preview is available.
-# Homebrew Rust ships with a different LLVM version that reports ~6% lower
-# line coverage for this codebase than the CI's rustup toolchain, causing
-# spurious floor failures on macOS Homebrew installs. In that case, CI
-# (GitHub Actions, which uses rustup) remains the authoritative gate.
-SKIP_COV=0
-if command -v rustup >/dev/null 2>&1; then
-    # rustup available — ensure llvm-tools-preview is installed.
-    if ! cargo llvm-cov --version >/dev/null 2>&1; then
-        echo "pre-push: rustup is present but llvm-tools-preview is not installed."
-        echo "          install via: rustup component add llvm-tools-preview"
-        exit 1
-    fi
-else
-    # No rustup (e.g. Homebrew Rust). Warn and skip coverage locally.
-    echo "[pre-push] WARNING: rustup not found (Homebrew Rust detected)."
-    echo "           Coverage gate skipped locally — CI is the authoritative gate."
-    echo "           To run coverage locally: install Rust via rustup and run:"
-    echo "             rustup component add llvm-tools-preview"
-    SKIP_COV=1
-fi
-
-# Guard: never push a build patched onto the real brush shell (agent-bridle
-# `main`) — it reintroduces the brush git dep and breaks crates.io publish.
-
-# ── Documentation-only fast path (#1098) ──────────────────────────────────────
-# A push that cannot change a single byte of compiled output has no business
-# spending ten minutes proving the workspace still builds. Classify the pushed
-# range; if nothing in it can reach a Rust build, run the documentation gate
-# (which is the part that CAN fail on a .md change) and stop.
-#
-# FAILS CLOSED, deliberately. The fast path is taken only when the range was
-# read AND every path in it is inert. An empty list means "I could not
-# determine what changed" -- not "nothing changed" -- and falls through to the
-# full gate. An absence-check that cannot tell those apart is how this class of
-# guard dies; see the anti-vacuous note in .github/workflows/formal.yml.
-#
-# The allowlist is closed: anything unrecognised (a justfile, a workflow, a
-# .toml, a hook) is treated as build-affecting and runs everything.
-_needs_build=0
-_docs_changed=""
-while IFS= read -r _f; do
-    [ -z "$_f" ] && continue
-    case "$_f" in
-        *.md|docs/*|LICENSE|LICENSE-*|*.txt) _docs_changed="$_docs_changed $_f" ;;
-        *) _needs_build=1 ;;
-    esac
-done <<EOF
-$_changed
-EOF
-
-if [ "$_needs_build" -eq 0 ] && [ -n "$_docs_changed" ]; then
-    echo "[pre-push] documentation-only push — the cargo gates cannot observe this change."
-    for _f in $_docs_changed; do echo "             $_f"; done
-    echo "[pre-push] running just docs-check..."
+if [ -z "$SCOPE" ]; then
+    echo "[pre-push] no code-affecting change in this push — running just docs-check..."
     just docs-check
-    echo "[pre-push] OK (documentation-only; fmt/clippy/test/audit/msrv/coverage skipped)"
+    echo "[pre-push] OK (docs-only or no-op push; cargo gates skipped)"
     exit 0
 fi
 
-echo "[pre-push] running just check..."
-just check
+echo "[pre-push] running python3 scripts/spawn_inventory.py..."
+python3 scripts/spawn_inventory.py
 
-echo "[pre-push] running just audit..."
-just audit
+echo "[pre-push] running just docs-check..."
+just docs-check
 
-echo "[pre-push] running just msrv..."
-just msrv
+echo "[pre-push] running cargo fmt --all -- --check..."
+cargo fmt --all -- --check
 
-if [ "$SKIP_COV" -eq 0 ]; then
-    echo "[pre-push] running just cov-ci..."
-    just cov-ci
+# nextest's discovery model calls EVERY test binary with `--list [--format
+# terse] [--ignored]` to enumerate tests before running any of them. `cargo
+# test` never does this -- it invokes a harness=false binary directly and
+# lets its own main() decide what to do. This repo has six `harness = false`
+# custom-main test binaries (`grep -rn "harness = false" --include=Cargo.toml`),
+# and #1098 is the first thing to ever run nextest against them. Two are
+# confirmed broken by this real push (2026-09-30): newt-git::native_git_commit
+# treats the mere PRESENCE of "--ignored" in argv as "run the real confined
+# git test" (tests/native_git_commit.rs:11) instead of gating on an exact
+# match, so nextest's discovery pass runs it for real outside a sandboxed CI
+# runner; agent-harness::writer_inheritance ignores argv entirely and always
+# runs its fork-based test (tests/writer_inheritance.rs:149), which then hits
+# a broken pipe when nextest closes the child's stdout after the list request
+# it never asked for. newt-core::brush_build_pipeline is excluded alongside
+# them as a precaution -- same shape of custom main, not yet proven safe under
+# nextest's discovery pass either, and cheap to exclude versus expensive to
+# prove. The three vendored agent-bridle-tool-shell real-shell binaries
+# (brush_real, carried_coreutils, named_host_root_real) need `required-features
+# = ["brush"]` / `["carried-coreutils"]` this hook never enables, so they are
+# never compiled here and must NOT be named in this filter -- nextest's
+# `binary_id()` predicate hard-errors ("no binary IDs matched") on a name with
+# zero matches in the discovered set, unlike `package()`. Fixing the three
+# excluded binaries' arg handling is tracked separately; out of scope for
+# #1098's hook-only change. `cargo test --workspace` in CI is unaffected and
+# still covers all six normally.
+NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
+    and not binary_id(agent-harness::writer_inheritance)
+    and not binary_id(newt-git::native_git_commit)'
+
+if [ "$SCOPE" = "ALL" ]; then
+    echo "[pre-push] changed scope: ALL (workspace-wide file changed)"
+    echo "[pre-push] running cargo clippy --workspace --all-targets -- -D warnings..."
+    cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        echo "[pre-push] running cargo nextest run --workspace..."
+        cargo nextest run -E "$NEXTEST_EXCLUDE" --features newt-data/kernel,newt-interaction/schema
+    else
+        echo "[pre-push] cargo-nextest not found; falling back to cargo test --workspace"
+        cargo test --workspace --features newt-data/kernel,newt-interaction/schema
+    fi
+else
+    echo "[pre-push] changed scope: $SCOPE"
+    # -p accepts multiple package flags; build the arg list once for both
+    # clippy and the nextest expression's `rdeps(...)` terms.
+    _pkg_args=()
+    _rdeps_expr=""
+    for _crate in $SCOPE; do
+        _pkg_args+=(-p "$_crate")
+        if [ -z "$_rdeps_expr" ]; then
+            _rdeps_expr="rdeps($_crate)"
+        else
+            _rdeps_expr="$_rdeps_expr + rdeps($_crate)"
+        fi
+    done
+
+    # No --features here: `newt-data/kernel,newt-interaction/schema` is a
+    # workspace-level feature unification CI enables for the FULL build (see
+    # the ALL branch above), and `-p <crate>` rejects a feature path whose
+    # crate isn't in the selected package set. The scoped pre-flight trades
+    # that one axis of coverage for speed; CI still gates it on every PR.
+    echo "[pre-push] running cargo clippy -- -D warnings for: $SCOPE (and reverse dependents)..."
+    cargo clippy "${_pkg_args[@]}" --all-targets -- -D warnings
+
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
+        cargo nextest run -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+    else
+        echo "[pre-push] cargo-nextest not found; falling back to cargo test -p <crate> per crate"
+        cargo test "${_pkg_args[@]}"
+    fi
 fi
 
 echo "[pre-push] OK"

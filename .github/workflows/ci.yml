@@ -1,10 +1,17 @@
 name: CI
 
-# HOOK PARITY: The lint/test/lean-build/coverage/security/msrv jobs are mirrored
-# by .githooks/pre-push (via `just shell-check` + `just check` + `just cov-ci` +
-# `just audit` + `just msrv`).
-# When editing those, update the push hook to match.
-# npm tests also run in `just check`; macOS/Windows executions require CI hosts.
+# HOOK PARITY (#1098, CRAFT-14 v3.0): .githooks/pre-push is a fast pre-flight
+# on the CHANGED scope, not a full mirror of this pipeline. It classifies the
+# pushed ref range via scripts/changed-scope.sh (NONE / ALL / a crate list),
+# then runs `cargo fmt --all -- --check` + `cargo clippy -D warnings` +
+# `cargo nextest run -E 'rdeps(<crate>)'` scoped to that classification (or
+# `--workspace` on ALL), plus scripts/spawn_inventory.py and `just docs-check`.
+# This CI workflow is the authoritative FULL gate: coverage (cov-ci), MSRV,
+# security audit, the `--no-default-features` lean config, npm's
+# macOS/Windows legs, and the eval/harness/PTY/mcp-import-real real-resource
+# lanes are CI-ONLY and never run in the hook — the hook's own header comment
+# names each one. Editing a job here means auditing the hook (and vice versa)
+# per CRAFT-14 rule 3 / Push Hook Governance rule 3.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
 # Windows dev box), so it is deliberately outside hook parity. Same for the
 # `musl` job: it needs the musl cross target + `musl-tools` installed, which

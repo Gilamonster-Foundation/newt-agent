@@ -287,19 +287,17 @@ green before opening any PR.
 - **Never push to `main`.** Open a PR from `step-NN.M-…` or
   `feat/…` / `fix/…`. CI runs on PRs to main and pushes to those
   branches.
-- The pre-push hook runs `just check` + `just cov-ci`. **TEMPORARY EXCEPTION
-  (until #1098):** that hook is ~50 min (full-workspace clippy + test + a second
-  `--no-default-features` config + an instrumented whole-workspace `cov-ci`),
-  which is inhumane on every push — so **`--no-verify` is permitted for now.**
-  The real gate is CI on the PR plus the standing "no merge to `main` without a
-  green PR." Use `--no-verify` only to skip the slow gate, never to hide a
-  failure you could fix quickly (run `just check` locally when you can). When
-  #1098 lands a fast, changed-code-only hook, delete this exception —
-  `--no-verify` is forbidden again. If a check fails, fix the issue.
-  **The hook fires on every ref update, not just on pushing code** — including
-  `git push origin --delete <branch>`, which will sit in a full workspace build
-  to delete a merged branch, with no output to say why. `--no-verify` belongs on
-  those too.
+- **The pre-push hook is a fast pre-flight on the CHANGED scope (#1098,
+  CRAFT-14 v3.0).** `scripts/changed-scope.sh` classifies the pushed ref
+  range into NONE / ALL / a crate list; the hook then runs `cargo fmt
+  --all -- --check` (whole tree, cheap), `cargo clippy -D warnings` and
+  `cargo nextest run -E 'rdeps(<crate>)'` scoped to the changed crates (or
+  `--workspace` on ALL), plus `scripts/spawn_inventory.py` and `just
+  docs-check` (both sub-second). Coverage, MSRV, audit, the
+  `--no-default-features` lean config, and the eval/harness real-resource
+  lanes are CI-only — see the hook's own header comment for the full list.
+  `--no-verify` is forbidden again: fix the issue instead. A deletion or
+  tag-only ref update is classified NONE and the hook exits immediately.
 - One step per PR. Don't bundle "Step 0.2 + 0.3 because they're
   related" unless the bundle is itself explicitly authorized.
 - The PR body must include "What this PR does", "Test plan", and
