@@ -914,10 +914,11 @@ pub fn run_confined_git(
     // network is used — so Scope::All for net causes no real exposure.
     // Exec is a different story: Seatbelt does NOT kernel-enforce a restricted
     // exec scope for the copy (it is advisory, unlike Landlock on Linux).
-    // TODO(#ISSUE): bind the exec axis to the trusted git binary + exec-path
+    // TODO(#2661): bind the exec axis to the trusted git binary + exec-path
     // via a Landlock EXECUTE rule or an equivalent macOS mechanism; until
     // that issue lands, the confined copy on macOS has unrestricted exec.
     // Linux keeps net: none() (enforced by Landlock + seccomp via net-guard).
+    // macOS net=Scope::All follow-up: TODO(#2662) — enforce net:none on macOS.
     // See docs/security/ocap-deviations.md §mach-xpc-ambient-deputy.
     #[cfg(target_os = "macos")]
     let net_scope = Scope::All;

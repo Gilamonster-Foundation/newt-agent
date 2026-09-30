@@ -216,7 +216,10 @@ fn network_confinement_is_the_basic_floor_not_the_credential_floor() {
     // Landlock egress floor is enforceable, while the credential-bearing b1
     // floor stays Absent (so credential-seeding gates keep failing closed).
     let net = verify_network_confinement();
-    if crate::confined_exec::kernel_fs_fence_available() {
+    // On Linux: Landlock fs fence + seccomp egress floor → network Verified.
+    // On macOS: Seatbelt fs fence is available (kernel_fs_fence_available returns
+    // true), but network confinement is advisory-only (#2662), so Absent.
+    if crate::confined_exec::kernel_fs_fence_available() && cfg!(target_os = "linux") {
         assert!(
             net.is_verified(),
             "basic network confinement should be enforced here"
