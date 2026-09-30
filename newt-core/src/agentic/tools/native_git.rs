@@ -2346,7 +2346,10 @@ mod governed_push_tests {
         assert!(err.contains("does not cover"), "{err}");
     }
 
-    /// F3 type check: a branch ref naming a BLOB is refused at plan time.
+    /// F3 type check: a branch ref naming a BLOB is refused at run time.
+    /// verify_commit was moved from plan phase to run phase (item 3, round 5)
+    /// so the type check happens in verify_commit_in_staging after the confined
+    /// fetch, not at planning.
     #[test]
     fn a_branch_pointing_at_a_non_commit_is_refused() {
         if !fence() {
@@ -2360,8 +2363,12 @@ mod governed_push_tests {
             format!("{blob}\n"),
         )
         .unwrap();
-        let err =
-            plan_governed_push("git push", repo.path(), &scoped_caveats(), &mut None).unwrap_err();
+        // Plan phase now succeeds — type check moved to run phase (item 3).
+        let plan =
+            plan_governed_push("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        assert_eq!(plan.oid, blob, "plan pins the blob oid");
+        // Run phase refuses at verify_commit_in_staging.
+        let err = run_staged_push(&plan, &scoped_caveats()).unwrap_err();
         assert!(err.contains("not a commit"), "{err}");
     }
 
