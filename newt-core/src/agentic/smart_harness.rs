@@ -326,7 +326,7 @@ impl SmartHarness {
             .settings
             .initial_tool_bytes
             .min(s.session.config().max_slice_bytes);
-        let slice = s.session.re_read(&cid.to_string(), 0, max_bytes)?;
+        let slice = s.session.preview(&cid.to_string(), max_bytes)?;
         Ok(serde_json::json!({"source_cid":cid,"slice":slice}))
     }
 

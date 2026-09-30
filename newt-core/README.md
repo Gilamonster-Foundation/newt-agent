@@ -41,6 +41,10 @@ project-validation route from per-binary direct execution grants, which do not
 grant compiler descendants or their filesystem access. This guidance never
 retries or grants authority itself.
 
+Smart Harness initial tool previews preserve a complete UTF-8 prefix when a
+byte cap splits the final character, with exact continuation offsets. Explicit
+byte-addressed retrieval and binary data keep their existing semantics.
+
 Smart Harness also retains native execution outcomes in Agent Frame's existing
 verified occurrence journal, before display and independently of optional turn
 telemetry. Classification and recovery nudges receive bounded current-turn

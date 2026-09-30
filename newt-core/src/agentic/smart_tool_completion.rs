@@ -416,6 +416,23 @@ mod tests {
     }
 
     #[test]
+    fn initial_tool_preview_preserves_text_at_utf8_boundary() {
+        let harness = SmartHarness::new(
+            agent_harness::Session::new(Default::default()).unwrap(),
+            std::sync::Arc::new(|_| panic!("no inference")),
+            Default::default(),
+        )
+        .unwrap();
+        let batch = harness.fixture_tool_batch("read_file", serde_json::json!({"path":"fixture"}));
+        let invocation = batch.start(0, None).unwrap();
+        let text = format!("{}—tail", "a".repeat(511));
+        invocation.observe(&text, None, None).unwrap();
+        let output: Value = serde_json::from_str(&invocation.model_text().unwrap()).unwrap();
+        assert_eq!(output["sources"][0]["slice"]["text"], "a".repeat(511));
+        assert_eq!(output["sources"][0]["slice"]["next_offset"], 511);
+    }
+
+    #[test]
     fn long_host_return_is_delivered_without_deriving_another_generation() {
         let harness = SmartHarness::new(
             agent_harness::Session::new(Default::default()).unwrap(),

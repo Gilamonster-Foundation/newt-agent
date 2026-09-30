@@ -2044,6 +2044,23 @@ automatic adoption of other conversations, changing backend selection, and
 guaranteeing that the resumed model completes its task.
 
 
+## Step 27.10 — Preserve UTF-8 in initial tool previews (#2461)
+
+**Branch:** `step-27.10-frame-utf8-preview`
+
+Adapt the existing Frame retrieval path for initial source-event previews. If a
+byte cap cuts a trailing UTF-8 character, retain the complete prefix and derive
+its existing retrieval receipt from that exact interval. Preserve full source
+read accounting and the precise continuation offset.
+
+**Acceptance:** a 512-byte split of an em dash keeps readable text; cold restore
+verifies the receipt, and continuation reconstructs the original bytes. Explicit
+byte-addressed reads, binary data, and budgets smaller than the first character
+retain their existing exact-byte behavior.
+
+**Out of scope:** changing explicit retrieval spans, lossy decoding, new record
+formats, inference protocol changes, and general model progress heuristics.
+
 ### Status correction (2026-09-07) — measurement against the premise
 
 Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool

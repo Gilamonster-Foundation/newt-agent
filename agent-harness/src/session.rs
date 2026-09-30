@@ -1518,10 +1518,18 @@ impl Session {
         Ok(projected)
     }
 
+    /// Initial source-event preview, shortened to a complete UTF-8 prefix when
+    /// the byte cap splits a trailing character. Binary data and budgets too
+    /// small for the first character remain exact byte slices, with null text.
+    /// Explicit `re_read` requests always retain their requested byte interval.
+    pub fn preview(&mut self, cid: &str, max_bytes: usize) -> Result<Value> {
+        self.navigation_work(|session| session.re_read_inner(cid, 0, max_bytes, true))
+    }
+
     /// Retrieve only an admitted object from this session. The result names its
     /// actual byte interval and continuation; no truncated slice claims completion.
     pub fn re_read(&mut self, cid: &str, offset: usize, max_bytes: usize) -> Result<Value> {
-        self.navigation_work(|session| session.re_read_inner(cid, offset, max_bytes))
+        self.navigation_work(|session| session.re_read_inner(cid, offset, max_bytes, false))
     }
 
     /// Charge separately executed relevance work, including cancelled calls.
@@ -1544,7 +1552,13 @@ impl Session {
         result
     }
 
-    fn re_read_inner(&mut self, cid: &str, offset: usize, max_bytes: usize) -> Result<Value> {
+    fn re_read_inner(
+        &mut self,
+        cid: &str,
+        offset: usize,
+        max_bytes: usize,
+        preview: bool,
+    ) -> Result<Value> {
         if max_bytes == 0
             || max_bytes > self.config.max_slice_bytes
             || self.dereferences >= self.config.max_dereferences
@@ -1552,7 +1566,12 @@ impl Session {
             return Err(Error::Budget("retrieval bounds".into()));
         }
         let id: ContentId = cid.parse().map_err(integrity)?;
-        let retrieved = self.retrieve_bytes(
+        if preview && !self.events.contains_key(&id) {
+            return Err(Error::Access(
+                "initial preview requires a source event".into(),
+            ));
+        }
+        let mut retrieved = self.retrieve_bytes(
             id,
             offset,
             max_bytes,
@@ -1565,6 +1584,19 @@ impl Session {
                 .checked_sub(self.dereferences)
                 .ok_or_else(|| Error::Budget("retrieval dereferences".into()))?,
         )?;
+        // A preview is a single source event, so its receipt and retained part
+        // share this interval. Charge the full read even when the prefix shrinks.
+        if preview && retrieved.bytes.len() < retrieved.total {
+            if let Err(error) = std::str::from_utf8(&retrieved.bytes) {
+                if error.error_len().is_none() && error.valid_up_to() > 0 {
+                    let end = error.valid_up_to();
+                    retrieved.bytes.truncate(end);
+                    let (_, span, bytes) = &mut retrieved.parts[0];
+                    span.end = span.start + end as u64;
+                    bytes.truncate(end);
+                }
+            }
+        }
         self.fetched += retrieved.read_bytes;
         self.dereferences += retrieved.parts.len().max(1);
         let mut parts = Vec::new();

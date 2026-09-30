@@ -938,3 +938,68 @@ fn native_execution_classification_tampering_is_rejected_on_restore() {
         Some(agent_harness::ExecOutcome::Denied)
     );
 }
+
+/// Grounds the model preview in a real store: a split UTF-8 character must not
+/// erase readable text or falsify the addressed retrieval interval after restart.
+#[test]
+fn initial_preview_preserves_utf8_and_exact_continuation_after_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    let text = format!("{}—tail", "a".repeat(511));
+    let source = session
+        .retain_tool_output("read_file", text.as_bytes())
+        .unwrap();
+    let preview = session.preview(&source.to_string(), 512).unwrap();
+    assert_eq!(
+        preview["text"],
+        "a".repeat(511),
+        "initial preview must retain readable complete characters"
+    );
+    assert_eq!(preview["end"], 511);
+    assert_eq!(preview["next_offset"], 511);
+    assert_eq!(preview["complete"], false);
+    assert_eq!(preview["total_bytes"], text.len());
+    let mut bytes: Vec<u8> = serde_json::from_value(preview["bytes"].clone()).unwrap();
+    assert_eq!(bytes, text.as_bytes()[..511]);
+    let head = session.head();
+    drop(session);
+    let mut session = Session::restore(dir.path(), head, "local-session").unwrap();
+    let rest = session.re_read(&source.to_string(), 511, 512).unwrap();
+    bytes.extend(serde_json::from_value::<Vec<u8>>(rest["bytes"].clone()).unwrap());
+    assert_eq!(bytes, text.as_bytes());
+    assert_eq!(rest["text"], "—tail");
+    assert_eq!(rest["complete"], true);
+    let exact = session.re_read(&source.to_string(), 0, 512).unwrap();
+    assert!(
+        exact["text"].is_null(),
+        "explicit byte-addressed reads remain exact"
+    );
+    assert_eq!(exact["end"], 512);
+}
+
+#[test]
+fn initial_preview_preserves_binary_and_too_small_prefixes() {
+    let mut session = Session::new(SessionConfig::default()).unwrap();
+    for (bytes, limit) in [
+        (vec![0xff, b'a', b'b'], 2),
+        ("—tail".as_bytes().to_vec(), 1),
+    ] {
+        let source = session.retain_tool_output("read_file", &bytes).unwrap();
+        let preview = session.preview(&source.to_string(), limit).unwrap();
+        assert!(preview["text"].is_null());
+        assert_eq!(preview["bytes"], json!(bytes[..limit]));
+        assert_eq!(preview["next_offset"], limit);
+    }
+}
+
+#[test]
+fn initial_preview_preserves_complete_non_utf8_source() {
+    let mut session = Session::new(SessionConfig::default()).unwrap();
+    let bytes = b"abc\xe2";
+    let source = session.retain_tool_output("read_file", bytes).unwrap();
+    let preview = session.preview(&source.to_string(), 512).unwrap();
+    assert_eq!(preview["bytes"], json!(bytes));
+    assert!(preview["text"].is_null());
+    assert_eq!(preview["complete"], true);
+    assert!(preview["next_offset"].is_null());
+}

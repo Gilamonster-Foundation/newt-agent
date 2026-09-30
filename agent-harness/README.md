@@ -4,6 +4,11 @@ Host-controlled context projection, bounded navigation, and recorded agent
 sessions over `agent-frame`. Models propose relevance and classifications;
 the host validates them before changing a projection or delivering a reply.
 
+`Session::preview` provides an initial source-event slice that ends on a UTF-8
+boundary when possible. Its bytes, receipt interval, and continuation stay exact;
+explicit `re_read` spans remain byte-addressed. Binary prefixes and budgets too
+small for the first character retain exact bytes with no text representation.
+
 This library has no inference, HTTP, terminal, or async runtime dependency.
 Consumers supply model calls and authorization. `agent-harness-py` exposes
 the same operations through PyO3 for other Python hosts.
