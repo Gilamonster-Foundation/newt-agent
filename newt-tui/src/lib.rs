@@ -4021,8 +4021,8 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
 }
 
 /// PR #2626 review residual finding 3: the model-picker's result is explicit
-/// operator intent, honored against the roster the picker ITSELF fetched
-/// fresh right before returning — never a snapshot taken before the picker
+/// operator intent, honored against the roster displayed by the picker in
+/// the selection iteration — never a snapshot taken before the picker
 /// opened (roster can change while the picker is open: refresh, load/unload,
 /// or simply time passing). `None` (cancel, or a picked model that isn't in
 /// that fresh roster) is the only case that falls through to refusal. Pure
@@ -4031,14 +4031,54 @@ fn resolve_modal_choice(picked: Option<(String, Vec<String>)>) -> Option<String>
     picked.and_then(|(m, served)| served.contains(&m).then_some(m))
 }
 
+/// PR #2626 review round 4 ("smallest repair"): the ambiguous-default picker,
+/// as a seam `finish_adoption` calls rather than inlines. Production passes
+/// this real, terminal-driving implementation; tests pass a scripted
+/// stand-in so the picker-then-resolve decision inside `finish_adoption` runs
+/// for real without a PTY, a terminal, or a live probe.
+#[cfg_attr(not(feature = "rich-tui"), allow(unused_variables))]
+fn pick_ambiguous_default(choice: &BackendChoice) -> Option<(String, Vec<String>)> {
+    #[cfg(feature = "rich-tui")]
+    {
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+            .then(|| models_panel::choose(choice, None).ok().flatten())
+            .flatten()
+    }
+    #[cfg(not(feature = "rich-tui"))]
+    {
+        None
+    }
+}
+
 /// The shared adopt tail: probe results (live or pre-warmed) → the choice's
 /// model/serving/window/api, with the honest status lines.
 fn finish_adoption(
+    choice: &mut BackendChoice,
+    lines: Vec<String>,
+    models: Vec<String>,
+    warm: Vec<String>,
+    detected_kind: Option<newt_core::BackendKind>,
+) -> Vec<String> {
+    finish_adoption_with_picker(
+        choice,
+        lines,
+        models,
+        warm,
+        detected_kind,
+        pick_ambiguous_default,
+    )
+}
+
+/// Test seam: same as [`finish_adoption`] with the picker injectable. Kept
+/// as a thin wrapper rather than duplicating the tail so production and
+/// tests run the identical decision logic.
+fn finish_adoption_with_picker(
     choice: &mut BackendChoice,
     mut lines: Vec<String>,
     models: Vec<String>,
     warm: Vec<String>,
     detected_kind: Option<newt_core::BackendKind>,
+    picker: impl FnOnce(&BackendChoice) -> Option<(String, Vec<String>)>,
 ) -> Vec<String> {
     use newt_core::backend_probe::{self, Served};
     let secs = probe_timeout_secs(&choice.url);
@@ -4144,19 +4184,16 @@ fn finish_adoption(
                         // surface `/models` opens) rather than a bare notice;
                         // its choice — or a cancel — decides. Anywhere else
                         // (lean build, piped/non-tty) fall through to the
-                        // refusal-with-list below.
-                        #[cfg(feature = "rich-tui")]
-                        let picked = std::io::IsTerminal::is_terminal(&std::io::stdout())
-                            .then(|| models_panel::choose(choice, None).ok().flatten())
-                            .flatten();
-                        #[cfg(not(feature = "rich-tui"))]
-                        let picked: Option<(String, Vec<String>)> = None;
+                        // refusal-with-list below. `picker` is
+                        // `pick_ambiguous_default` in production and a
+                        // scripted stand-in under test (round 4 seam).
+                        let picked = picker(choice);
                         // PR #2626 review residual finding 3: the picker
                         // offers every served model (including ones not warm
                         // at probe time, and its own load/refresh controls),
                         // and the roster can change again while the picker
-                        // is open. Validate against the roster the picker
-                        // ITSELF fetched fresh right before returning — not
+                        // is open. Validate against the roster displayed by
+                        // the picker in the selection iteration — not
                         // `models_at_probe`, which is the OUTER probe from
                         // before the picker ever opened and can no longer
                         // speak for what the backend serves now.
