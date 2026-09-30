@@ -649,6 +649,20 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, Plan) {
         let temporary = tempfile::tempdir().unwrap();
+        // `tempfile::tempdir()` creates the directory with the process umask
+        // applied to 0o777, not a fixed private mode. Under a group-friendly
+        // umask (e.g. 0o002, common on dev boxes; CI uses 0o022) that leaves
+        // the fixture group-writable with no sticky bit, tripping the very
+        // check this module exists to enforce against a fixture that is, in
+        // fact, exclusively test-owned. Pin it to owner-only so the fixture
+        // models the private directory it is meant to be, independent of the
+        // host's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         let plan = Plan::new(temporary.path().canonicalize().unwrap());
         (temporary, plan)
     }
@@ -891,5 +905,32 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    /// Reproduces #2658: under a group-friendly umask (0o002, this host's
+    /// default; CI uses 0o022) `tempfile::tempdir()` alone yields a
+    /// group-writable, non-sticky directory, which the fixture's own
+    /// sticky-bit check then (wrongly) rejects. `fixture()` above pins the
+    /// permissions explicitly to guard against exactly this. umask is
+    /// process-global, so this test restores it immediately and does not
+    /// leave it changed for any sibling test.
+    #[cfg(unix)]
+    #[test]
+    fn managed_scratch_fixture_tolerates_a_group_friendly_umask() {
+        // SAFETY: umask(2) is async-signal-safe and merely reads/writes the
+        // calling process's umask; no memory safety concern, only the
+        // documented process-global-state concern handled by saving/
+        // restoring it immediately below.
+        let previous = unsafe { libc::umask(0o002) };
+        let (_temporary, plan) = fixture();
+        // SAFETY: see above; restores the umask this test changed.
+        unsafe {
+            libc::umask(previous);
+        }
+        assert!(
+            plan.acquire().is_ok(),
+            "a fixture the test itself owns must not be rejected merely because \
+             the host umask made tempfile::tempdir() group-writable"
+        );
     }
 }
