@@ -238,6 +238,9 @@ impl Respond for GauntletResponder {
             }));
         }
         if body.get("tools").is_some() {
+            // #2637: a bare `read_file` repeat is NEVER refused — every
+            // repeat gets the full content back (cached or fresh), so this
+            // fixture's pre-compaction growth is unaffected by the guard.
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": { "content": "", "tool_calls": [{
                     "function": { "name": "read_file", "arguments": { "path": "big.txt" } }
@@ -771,9 +774,12 @@ async fn openai_loop_compresses_with_the_same_pipeline() {
 // let the self-poisoning boundary bug through.
 // -----------------------------------------------------------------------
 
-/// Per-request long-haul observations: `(dispatched message count,
-/// length of the last tool-role message — the freshest result)`.
-type HaulLog = Arc<Mutex<Vec<(usize, Option<usize>)>>>;
+/// Per-request long-haul observations: `(dispatched message count, the
+/// last tool-role message's content — the freshest result)`. #2555: the
+/// FULL content (not just its length) is kept so assertions can tell a
+/// steered repeat-read (short, names the tool) apart from a corrupted or
+/// truncated fresh result, which a bare length could not.
+type HaulLog = Arc<Mutex<Vec<(usize, Option<String>)>>>;
 
 /// Endless-work responder: each round calls a (hallucinated) write-ish
 /// tool and then `read_file` of `path` while tools are offered (the loop
@@ -795,13 +801,16 @@ impl Respond for LongHaulResponder {
         if body.get("tools").is_some() {
             let empty = Vec::new();
             let msgs = body["messages"].as_array().unwrap_or(&empty);
-            let last_tool_len = msgs
+            let last_tool_content = msgs
                 .iter()
                 .rev()
                 .find(|m| m["role"].as_str() == Some("tool"))
                 .and_then(|m| m["content"].as_str())
-                .map(|c| c.chars().count());
-            self.log.lock().unwrap().push((msgs.len(), last_tool_len));
+                .map(str::to_string);
+            self.log
+                .lock()
+                .unwrap()
+                .push((msgs.len(), last_tool_content));
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "message": { "content": "", "tool_calls": [
                     { "function": { "name": "apply_patch", "arguments": {} } },
@@ -813,6 +822,19 @@ impl Respond for LongHaulResponder {
                 .set_body_json(serde_json::json!({ "message": { "content": "long haul done" } }))
         }
     }
+}
+
+/// #2637: a bare `read_file` repeat is NEVER refused any more (the doctrine
+/// fix) — every round's freshest tool-role message must be the exact, full
+/// file content, whether served from the cache or from a real re-read.
+/// There is no "steered" shape left to classify; anything that is not the
+/// expected content is a bug (truncation, corruption, or a stray refusal).
+fn assert_haul_round_is_full_content(round: usize, expected: &str, content: &str) {
+    assert_eq!(
+        content, expected,
+        "round {round}: a bare read_file repeat must return the exact file content \
+         (cached or fresh) — #2637 doctrine forbids ever refusing it"
+    );
 }
 
 /// Three prior turns, then the active task — the reviewer's multi-turn
@@ -869,7 +891,7 @@ async fn run_long_haul(
     threshold: usize,
     file: &'static str,
     content: &str,
-) -> (Vec<(usize, Option<usize>)>, usize, String, bool) {
+) -> (Vec<(usize, Option<String>)>, usize, String, bool) {
     // Repeated identical reads are intentional compression pressure here.
     // Exercise the configured round cap, independently of the stagnation
     // policy (covered by the progress and no-progress loop fixtures).
@@ -929,20 +951,32 @@ async fn forty_rounds_single_turn_stay_bounded_with_fresh_results_intact() {
     assert_eq!(reply, "long haul done");
     assert!(!latched, "count-only pressure must never latch anti-thrash");
     assert_eq!(log.len(), 40, "all 40 tool rounds dispatched");
+    // #2637: `read_file{"path":"big.txt"}` repeats byte-for-byte every
+    // round. It is NEVER refused — every round from the 2nd on carries a
+    // prior tool result, and it is always the exact file content, whether
+    // served from the cache or by a real re-read (a compaction released the
+    // memo). Round 0's request has no prior tool result yet (nothing has
+    // run), so its `last_tool` is legitimately `None`.
+    let mut fresh_rounds = 0;
     for (round, (len, last_tool)) in log.iter().enumerate() {
         assert!(
             *len <= threshold + 6,
             "round {round}: dispatched {len} messages — the count must stay \
                  bounded after every compression (threshold {threshold} + slack)"
         );
-        if let Some(n) = last_tool {
-            assert!(
-                *n > 1_000,
-                "round {round}: the fresh tool result was destroyed before \
-                     dispatch ({n} chars — a one-liner)"
-            );
+        match last_tool {
+            Some(content) => {
+                assert_haul_round_is_full_content(round, &line.repeat(64), content);
+                fresh_rounds += 1;
+            }
+            None => assert_eq!(round, 0, "only round 0 may lack a prior tool result"),
         }
     }
+    assert_eq!(
+        fresh_rounds,
+        log.len() - 1,
+        "every round but the first must carry the full read_file content — #2637: never refused"
+    );
     assert!(summarizer_calls >= 2, "the long haul compresses repeatedly");
     assert!(
         summarizer_calls <= 16,
@@ -977,18 +1011,28 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
     assert_eq!(reply, "long haul done");
     assert!(!latched, "count-only pressure must never latch anti-thrash");
     assert_eq!(log.len(), 30, "all 30 tool rounds dispatched");
+    // #2637: see the sibling forty-round test — an identical `read_file` is
+    // NEVER refused, so every round but the first (no prior tool result yet)
+    // carries the full, exact content.
+    let mut fresh_rounds = 0;
     for (round, (len, last_tool)) in log.iter().enumerate() {
         assert!(
             *len <= threshold + 6,
             "round {round}: dispatched {len} messages — bounded"
         );
-        if let Some(n) = last_tool {
-            assert!(
-                *n > 1_000,
-                "round {round}: fresh tool result destroyed pre-dispatch ({n} chars)"
-            );
+        match last_tool {
+            Some(content) => {
+                assert_haul_round_is_full_content(round, &line.repeat(64), content);
+                fresh_rounds += 1;
+            }
+            None => assert_eq!(round, 0, "only round 0 may lack a prior tool result"),
         }
     }
+    assert_eq!(
+        fresh_rounds,
+        log.len() - 1,
+        "every round but the first must carry the full read_file content — #2637: never refused"
+    );
     assert!(summarizer_calls >= 2);
     assert!(
         summarizer_calls <= 14,
@@ -1000,6 +1044,127 @@ async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
         "thirty-round multi-turn trace: max dispatched len {max_len}, \
              summarizer calls {summarizer_calls}"
     );
+}
+
+/// #2637 / #2555: exercises the REAL production release hook
+/// (`record_compaction_artifact` → `RepeatCallGuard::release_read_memos`,
+/// mod.rs ~5349) through the actual chat loop, instead of calling
+/// `RepeatCallGuard` methods by hand (that version was tautological — see
+/// the removed `repeat_call_guard_tests::
+/// compaction_committed_forces_fresh_read_rejected_preserves_memo`).
+///
+/// A bare repeated `read_file` of an UNCHANGED file is never refused
+/// (#2637) and serves byte-identical content whether from the memo or a
+/// genuine re-read (`ReadScope::content_id_of` re-verifies the memoized
+/// content id against the file's actual current bytes on every cache
+/// lookup, so a content mismatch would already force a real read
+/// independent of this hook — that path can't observe the release call at
+/// all). The signal that DOES distinguish them is `ToolEvent::from_cache`:
+/// the `cached_read` call site stamps it `true` and a real execution never
+/// sets it — deterministic, unlike the `duration_ms == Some(0)` shape this
+/// test used to key on (a real sub-millisecond read also records zero).
+/// Immediately after a COMMITTED compaction (the summarizer having just
+/// fired), the guard must have dropped the memo, so that round's
+/// `read_file` must NOT be `from_cache`; every other round (content held
+/// constant throughout) must be, checked per round rather than in
+/// aggregate.
+#[tokio::test]
+async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
+    let line = "the quick brown newt compresses context without discarding it\n";
+    let threshold = 15usize;
+    let file = "big.txt";
+    let rounds = 40;
+
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 0,
+        },
+        ..Default::default()
+    });
+    let server = MockServer::start().await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let summarizer = canned_summarizer(prompts.clone());
+    let ws = tempfile::TempDir::new().unwrap();
+    std::fs::write(ws.path().join(file), line.repeat(64)).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(LongHaulResponder {
+            path: file,
+            log: log.clone(),
+        })
+        .mount(&server)
+        .await;
+    let workspace = ws.path().to_string_lossy().to_string();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mem_messages = msgs();
+    let mut compress_state = CompressState::new();
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut c = ctx(&uri, &mem_messages, &caveats, &workspace);
+    c.max_tool_rounds = rounds;
+    c.mid_loop_trim_threshold = threshold;
+    c.mid_loop_trim_tokens = None;
+    c.summarizer = Some(&*summarizer);
+    c.compress_state = Some(&mut compress_state);
+    c.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the long haul must complete");
+    assert_eq!(reply, "long haul done");
+
+    // Every dispatched round's `read_file` produces exactly one ToolEvent
+    // (interleaved with the hallucinated `apply_patch`'s "unknown tool"
+    // event, which is not `read_file`). `summarizer_calls` (the number of
+    // prompts the canned summarizer recorded) is the number of committed
+    // compactions this run.
+    let summarizer_calls = prompts.lock().unwrap().len();
+    assert!(
+        summarizer_calls >= 2,
+        "the long haul must trigger at least one committed compaction \
+         (got {summarizer_calls} summarizer calls)"
+    );
+    let read_events: Vec<&crate::ToolEvent> =
+        events.iter().filter(|e| e.tool == "read_file").collect();
+    // `log` (one entry per dispatched tool-offering round) and `read_events`
+    // (one `read_file` ToolEvent per round, per the doc comment above) are
+    // index-aligned — required so the per-round pairing below lines up.
+    assert_eq!(
+        read_events.len(),
+        log.lock().unwrap().len(),
+        "one read_file ToolEvent must exist per dispatched round"
+    );
+    // `log[r].0` is the dispatched message COUNT for round r's request — a
+    // drop from round r-1 to r means a compaction committed between them
+    // (mid-loop compression shrinks the dispatched history; nothing else in
+    // this fixture ever shrinks it). That is the per-round commit signal,
+    // independent of `tool_events` entirely. Round 0 is excluded (nothing
+    // memoized yet, so it proves nothing about the release hook).
+    let log = log.lock().unwrap();
+    let commits: usize = (1..log.len()).filter(|&r| log[r].0 < log[r - 1].0).count();
+    assert_eq!(
+        commits, summarizer_calls,
+        "the dispatched-length-drop signal must count exactly one commit per \
+         summarizer call (got {commits} drops for {summarizer_calls} calls)"
+    );
+    for round in 1..log.len() {
+        let just_committed = log[round].0 < log[round - 1].0;
+        let served_from_cache = read_events[round].from_cache;
+        assert_eq!(
+            served_from_cache,
+            !just_committed,
+            "round {round}: {}, so its read_file must be {} \
+             (from_cache={served_from_cache})",
+            if just_committed {
+                "a compaction just committed"
+            } else {
+                "no compaction committed since the previous round"
+            },
+            if just_committed { "real" } else { "cached" }
+        );
+    }
 }
 
 /// F2 regression — the reviewer's 600-char-results multi-turn shape:
