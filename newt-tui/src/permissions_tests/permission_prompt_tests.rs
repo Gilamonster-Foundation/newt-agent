@@ -3880,7 +3880,7 @@ async fn headless_and_piped_sessions_never_construct_a_prompt_window() {
             .env(CHILD, "1")
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        let output = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, command.output())
             .await
             .expect("headless counter watchdog expired; child is killed on drop")
             .unwrap();

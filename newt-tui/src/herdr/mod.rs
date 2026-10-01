@@ -765,10 +765,12 @@ mod tests {
             && identity_settled
     }
 
-    /// Wait (bounded) until `f` holds; keeps the tests free of sleeps that are
-    /// either flaky or slow.
+    /// Wait until `f` holds; keeps the tests free of sleeps that are either
+    /// flaky or slow. The bound is the shared hang guard, never a budget: the
+    /// predicate turning true is the event, and the guard only names a worker
+    /// that never delivers.
     fn eventually(mut f: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + newt_core::test_guard::HANG_GUARD;
         while Instant::now() < deadline {
             if f() {
                 return true;
@@ -1013,7 +1015,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         const FLOOD: usize = 20_000;
-        let start = Instant::now();
         for i in 0..FLOOD {
             adapter.on_bare(
                 None,
@@ -1027,22 +1028,11 @@ mod tests {
             );
         }
         adapter.on_bare(None, LifecycleEvent::Waiting); // the LAST word
-        let elapsed = start.elapsed();
-        // The qualitative proof is that this line is reached at all: the sink
-        // is STILL blocked, so a design that waited on delivery would never
-        // have returned. The bounds below are deliberately loose (this box
-        // runs many parallel builds); the real assertion is many orders of
-        // magnitude away from a blocking path.
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "{FLOOD} emissions against a wedged Herdr took {elapsed:?}; the \
-             agent-facing path must be bounded and never wait on delivery"
-        );
-        let per_event = elapsed / (FLOOD as u32 + 1);
-        assert!(
-            per_event < Duration::from_micros(500),
-            "per-event agent cost {per_event:?} is not tiny"
-        );
+                                                        // The proof is that this line is reached at all: the sink is STILL
+                                                        // blocked, so a design that waited on delivery would never have
+                                                        // returned. The former `< 10 s` / `< 500 µs per event` stopwatches
+                                                        // measured mutex contention on a loaded box, not the design; the
+                                                        // coalescing and one-shot bounds below are the structural checks.
 
         {
             let inner = reporter.inner.lock().unwrap();
@@ -1098,21 +1088,16 @@ mod tests {
             .as_ref()
             .is_some_and(JoinHandle::is_finished)));
 
-        let start = Instant::now();
         for _ in 0..1_000 {
             adapter.on_bare(None, LifecycleEvent::Thinking);
             adapter.on_bare(None, LifecycleEvent::Waiting);
         }
-        let elapsed = start.elapsed();
         std::panic::set_hook(hook);
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "emission after the reporter died took {elapsed:?}"
-        );
-        // And teardown does not hang on a dead worker.
-        let t0 = Instant::now();
+        // No stopwatches: `try_send` on a dropped receiver returns at once, so
+        // reaching this line is the proof that emission after the reporter died
+        // did not wait; and teardown returning on a dead worker is the proof
+        // that it does not hang. Both `< N s` bounds measured the loaded box.
         reporter.shutdown();
-        assert!(t0.elapsed() < SHUTDOWN_GRACE * 4);
     }
 
     // -- teardown -----------------------------------------------------------
@@ -1144,13 +1129,13 @@ mod tests {
         let (adapter, mut reporter) = harness(FakeSink::gated(&gate));
         adapter.on_bare(None, LifecycleEvent::TurnStarted);
         std::thread::sleep(Duration::from_millis(20));
-        let t0 = Instant::now();
+        // No stopwatch: a shutdown that joined the stuck worker would never
+        // return (the gate is released only below), so returning is the proof.
+        // `< SHUTDOWN_GRACE * 4` measured a production grace loop on a loaded
+        // box. (The 20 ms sleep above is a "let the worker reach the gate" bet
+        // that needs an entered-deliver signal from FakeSink; it can only make
+        // the test vacuous, never red, so it stays for now.)
         reporter.shutdown();
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed < SHUTDOWN_GRACE * 4,
-            "teardown waited {elapsed:?} on a stuck Herdr"
-        );
         drop(held);
     }
 

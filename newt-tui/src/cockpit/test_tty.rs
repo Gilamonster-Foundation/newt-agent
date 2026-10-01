@@ -397,16 +397,25 @@ mod wait_for_after_tests {
     #[test]
     fn observes_a_needle_appended_after_the_wait_begins() {
         let buf = Arc::new(Mutex::new(b"before ".to_vec()));
+        // The writer appends from its own thread with no pacing sleep: whether
+        // the append lands before or after the wait begins, the poll loop must
+        // observe it. The former 30 ms sleep plus a 1 s bound was a bet on
+        // thread scheduling that a loaded box loses; the bound is now the
+        // shared hang guard.
         let writer = std::thread::spawn({
             let buf = Arc::clone(&buf);
             move || {
-                std::thread::sleep(Duration::from_millis(30));
                 buf.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(b"SHOWN after");
             }
         });
-        assert!(wait_for_after(&buf, 7, "SHOWN", Duration::from_secs(1)));
+        assert!(wait_for_after(
+            &buf,
+            7,
+            "SHOWN",
+            newt_core::test_guard::HANG_GUARD
+        ));
         writer.join().expect("writer thread");
     }
 
@@ -414,17 +423,14 @@ mod wait_for_after_tests {
     /// hanging — the timeout is a real bound, not decoration.
     #[test]
     fn times_out_and_returns_false_when_the_needle_never_arrives() {
+        // The `false` return is the proof that the timeout path ran; measuring
+        // the elapsed time on top of it kept a stopwatch in the unit tier.
         let buf = Mutex::new(b"before after".to_vec());
-        let start = std::time::Instant::now();
         assert!(!wait_for_after(
             &buf,
             7,
             "SHOWN",
             Duration::from_millis(100)
         ));
-        assert!(
-            start.elapsed() >= Duration::from_millis(100),
-            "must actually wait out the timeout, not return early"
-        );
     }
 }

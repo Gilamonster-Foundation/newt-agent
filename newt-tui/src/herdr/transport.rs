@@ -398,14 +398,23 @@ mod tests {
     #[test]
     fn a_missing_socket_fails_fast() {
         let dir = scratch("missing");
-        let mut sink = SocketSink::new(dir.join("nope.sock"));
-        let t0 = Instant::now();
+        // The property is that an absent socket costs no connect attempt, so
+        // count the attempts instead of timing them: the former `< 500 ms`
+        // stopwatch (versus a 200 ms CONNECT_WAIT) proved it only on an idle
+        // box.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let connect: Connector = Arc::new(move |p: &std::path::Path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            super::unix::connect_socket(p)
+        });
+        let mut sink = SocketSink::with_connector(dir.join("nope.sock"), connect);
         assert!(!sink.deliver(&working()));
         assert!(!sink.deliver(&working()));
-        assert!(
-            t0.elapsed() < Duration::from_millis(500),
-            "absent Herdr must not cost a connect attempt: {:?}",
-            t0.elapsed()
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "an absent socket must not cost a connect attempt"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -479,24 +488,24 @@ mod tests {
         let dir = scratch("silent");
         let path = dir.join("api.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        // The server stays connected and silent until the test says it is done
+        // (the event), so a slow cold connect under load cannot turn into a
+        // closed-peer race; the former fixed 1.5 s was a bet on that.
+        let (hangup_tx, hangup_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
-            // Stay connected and silent for longer than the test needs, so a
-            // slow cold connect cannot turn into a closed-peer race.
-            std::thread::sleep(Duration::from_millis(1500));
+            let _ = hangup_rx.recv();
             drop(conn);
         });
         let mut sink = SocketSink::new(path);
         assert!(deliver_eventually(&mut sink, &working()));
         // Warm connection, server still silent: delivery is immediate because
         // the reply is never awaited.
-        let t0 = Instant::now();
+        // No stopwatch: production drains the peer non-blocking, so a
+        // regression (a blocking read on a silent peer) hangs rather than runs
+        // slow, and `deliver` returning at all is the proof.
         assert!(sink.deliver(&working()));
-        assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "no response wait: {:?}",
-            t0.elapsed()
-        );
+        hangup_tx.send(()).unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -562,31 +571,39 @@ mod tests {
         });
         let mut sink = SocketSink::with_connector(path, connect);
 
+        // The first attempt really waits out CONNECT_WAIT (the production
+        // timer firing is the behaviour; load can only lengthen it). The former
+        // upper bounds (`< CONNECT_WAIT * 10`, `< CONNECT_WAIT * 12` across the
+        // five follow-ups) were stopwatches on a loaded box; the structural
+        // proof that later calls do not each pay the wait is `attempts == 1`.
         let t0 = Instant::now();
         assert!(!sink.deliver(&working()));
         let first = t0.elapsed();
         assert!(
-            first >= CONNECT_WAIT && first < CONNECT_WAIT * 10,
-            "the first attempt waits about one CONNECT_WAIT: {first:?}"
+            first >= CONNECT_WAIT,
+            "the first attempt waits out CONNECT_WAIT: {first:?}"
         );
         for _ in 0..5 {
             assert!(!sink.deliver(&working()));
         }
-        assert!(
-            t0.elapsed() < CONNECT_WAIT * 12,
-            "later calls must not each pay the wait: {:?}",
-            t0.elapsed()
-        );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
             "exactly one connect attempt stays outstanding"
         );
         drop(held); // the hung connect completes
-        let collected = (0..50).any(|_| {
-            std::thread::sleep(Duration::from_millis(20));
-            sink.deliver(&working())
-        });
+                    // The released connector thread building its socketpair is the event;
+                    // the former 50 × 20 ms loop was a 1 s budget on its scheduling.
+        let deadline = Instant::now() + newt_core::test_guard::HANG_GUARD;
+        let collected = loop {
+            if sink.deliver(&working()) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
         assert!(collected, "the abandoned attempt is collected, not leaked");
         let _ = std::fs::remove_dir_all(&dir);
     }

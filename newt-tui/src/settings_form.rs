@@ -1639,7 +1639,7 @@ mod tests {
                 .env(CHILD, "1")
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true);
-            let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+            let output = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, command.output())
                 .await
                 .expect("settings fixture watchdog expired; child is killed on drop")
                 .unwrap();

@@ -16,8 +16,6 @@ use newt_core::{DenialKind, PermissionGate as _, PermissionRequest};
 
 const CHILD_TEST: &str = "prompt_visibility_test::prompt_scenario_child";
 
-const HUMAN_THINKING_TIME: Duration = Duration::from_millis(600);
-
 // `pub(crate)`: shared with `transcript_pager_pty_test` (#1677) — the reuse
 // discipline says one child-reaper for the real-PTY tier, not a copy per test.
 pub(crate) fn wait_for_child(
@@ -231,7 +229,7 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
     // peeks instead, so the marker is matched whole however the bytes arrive,
     // and stays on the buffer for the reads below.
     assert!(
-        pty.wait_for_screen("example.com", Duration::from_secs(8)),
+        pty.wait_for_screen("example.com", newt_core::test_guard::HANG_GUARD),
         "child never presented its prompt; screen={:?}",
         pty.screen()
     );
@@ -242,10 +240,13 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
     // Ctrl-D can still be eaten. So re-type the key each second until the
     // child exits: a swallowed key is re-sent once the reader is armed (typed
     // bytes are kernel-buffered across the raw-mode switch, never flushed),
-    // and an extra byte after resolution is simply never read. The 10s cap
-    // stays comfortably above the web-decision timeout so a genuinely
-    // non-immediate control still loses to it and fails the screen assertion.
-    let status = wait_for_child_nudging(&mut child, Duration::from_secs(10), || pty.type_in(key));
+    // and an extra byte after resolution is simply never read. The cap is the
+    // shared hang guard, far above the web-decision timeout, so a genuinely
+    // non-immediate control still loses to that timeout and fails the screen
+    // assertion; the cap itself only names a hung child.
+    let status = wait_for_child_nudging(&mut child, newt_core::test_guard::HANG_GUARD, || {
+        pty.type_in(key);
+    });
     // #2075: exact once the child has exited, instead of whatever a 20 ms
     // sleep had collected.
     let screen = pty.screen_when_finished(status.is_some());
@@ -330,10 +331,19 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     .spawn()
     .expect("spawn the pty child");
 
-    std::thread::sleep(HUMAN_THINKING_TIME);
+    // Type only once the prompt is ON the screen: the glyph arriving is the
+    // event. The former 600 ms "human thinking time" bet that the child (which
+    // itself dwells 250 ms before rendering) was at its prompt by then; under
+    // load the keystroke's echo landed before the prompt and the pre-push hook
+    // rejected unrelated pushes (measured 2026-10-01).
+    assert!(
+        pty.wait_for_screen("⊘", newt_core::test_guard::HANG_GUARD),
+        "the prompt never rendered; screen={:?}",
+        pty.screen()
+    );
     pty.type_in("d\r");
 
-    let status = wait_for_child(&mut child, Duration::from_secs(2));
+    let status = wait_for_child(&mut child, newt_core::test_guard::HANG_GUARD);
 
     let screen = pty.screen_when_finished(status.is_some());
     assert!(
