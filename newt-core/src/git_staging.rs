@@ -204,8 +204,13 @@ fn path_has_user_symlink(path: &Path) -> bool {
                     Some("/etc") => Some("/private/etc"),
                     _ => None,
                 };
+                // The aliases are RELATIVE links (`/var -> private/var`), so
+                // resolve the target against the link's parent before comparing.
                 expected_target.is_some_and(|expected| {
-                    std::fs::read_link(&current).ok().as_deref() == Some(Path::new(expected))
+                    let parent = current.parent().unwrap_or(Path::new("/"));
+                    std::fs::read_link(&current)
+                        .ok()
+                        .is_some_and(|t| parent.join(t) == Path::new(expected))
                 })
             }
             #[cfg(not(target_os = "macos"))]
