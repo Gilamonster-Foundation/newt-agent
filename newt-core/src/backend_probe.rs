@@ -1650,11 +1650,11 @@ pub fn parse_openai_models_window(json: &serde_json::Value, model: &str) -> Opti
     if let Some(w) = data
         .iter()
         .find(|e| e["id"].as_str() == Some(model))
-        .and_then(&window_of)
+        .and_then(window_of)
     {
         return Some(w);
     }
-    data.iter().find_map(&window_of)
+    data.iter().find_map(window_of)
 }
 
 /// What an endpoint reported it serves. Produced by the fetchers below (or a
