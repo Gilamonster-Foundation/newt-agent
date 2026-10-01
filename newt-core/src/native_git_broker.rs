@@ -840,27 +840,28 @@ fn run_helper(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::forward_original_hook_input;
+    use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
 
     #[test]
     fn original_hook_closing_stdin_does_not_refuse_successful_hook() {
-        let directory = tempfile::tempdir().unwrap();
-        let closed = directory.path().join("stdin-closed");
+        // The hook says "ready" on its stdout once its stdin is closed, and the
+        // blocking read of that byte is the event; the former 1 s deadline poll
+        // on a marker file measured fork+exec latency on a loaded box instead.
         let mut child = Command::new("/bin/sh")
-            .args(["-c", "exec 0<&-\nprintf ready > \"$1\"", "sh"])
-            .arg(&closed)
+            .args(["-c", "exec 0<&-\nprintf ready"])
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !closed.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "test hook did not close its stdin"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let mut ready = [0_u8; 5];
+        child
+            .stdout
+            .take()
+            .expect("test hook stdout missing")
+            .read_exact(&mut ready)
+            .expect("the hook reports that its stdin is closed");
+        assert_eq!(&ready, b"ready");
         let stdin = child.stdin.take().expect("test hook stdin missing");
         forward_original_hook_input(
             stdin,

@@ -486,8 +486,21 @@ fn try_native_exclusive_lock(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 fn reclaimable_lock(lock_path: &Path) -> bool {
+    reclaimable_lock_at(lock_path, SystemTime::now())
+}
+
+/// [`reclaimable_lock`] with the clock injected: the age comparisons read
+/// `now`, so a test states the lock's age outright instead of racing the
+/// grace against scheduler latency. Production passes `SystemTime::now()`.
+fn reclaimable_lock_at(lock_path: &Path, now: SystemTime) -> bool {
     let Ok(body) = std::fs::read_to_string(lock_path) else {
         return false;
+    };
+    let age = || {
+        std::fs::metadata(lock_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
     };
     match LockOwner::decode(&body) {
         Some(owner) => !crate::store::pid_is_alive(owner.pid),
@@ -500,16 +513,8 @@ fn reclaimable_lock(lock_path: &Path) -> bool {
         // live writer gets before calling it dead. A non-empty but
         // undecodable body has unknown provenance and keeps the
         // conservative 30s legacy age fallback.
-        None if body.is_empty() => std::fs::metadata(lock_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > EMPTY_LOCK_GRACE),
-        None => std::fs::metadata(lock_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > LEGACY_LOCK_STALE),
+        None if body.is_empty() => age().is_some_and(|age| age > EMPTY_LOCK_GRACE),
+        None => age().is_some_and(|age| age > LEGACY_LOCK_STALE),
     }
 }
 
@@ -934,10 +939,20 @@ mod tests {
     fn fresh_empty_lock_is_not_reclaimed_within_the_grace() {
         let dir = TempDir::new().unwrap();
         let lock = lock_path_for(&dir.path().join("config.toml"));
-        std::fs::File::create(&lock).unwrap();
+        let file = std::fs::File::create(&lock).unwrap();
+        // The age is stated, not measured: the lock's mtime is pinned and the
+        // reader's clock is one tick inside the grace. The former form ("created
+        // the statement before") was a bet that fewer than 200 ms passed between
+        // two adjacent statements, which a loaded box does not honour.
+        let created = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        file.set_modified(created).unwrap();
         assert!(
-            !reclaimable_lock(&lock),
+            !reclaimable_lock_at(&lock, created + EMPTY_LOCK_GRACE - Duration::from_millis(1)),
             "a fresh empty lock must not read as a dead owner yet"
+        );
+        assert!(
+            reclaimable_lock_at(&lock, created + EMPTY_LOCK_GRACE + Duration::from_millis(1)),
+            "one tick past the grace, the same empty lock is a crash artifact"
         );
     }
 

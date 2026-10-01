@@ -486,7 +486,7 @@ fn protocol_mode_emits_no_prompt_bytes_and_does_not_wait() {
     let (screen, exited) = run_scenario_bounded(
         "protocol",
         "tty::pty_notice_test::protocol_mode_prompt_child",
-        Duration::from_secs(20),
+        crate::test_guard::HANG_GUARD,
     );
 
     assert!(

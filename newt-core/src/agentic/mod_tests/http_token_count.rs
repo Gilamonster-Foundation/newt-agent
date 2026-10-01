@@ -429,7 +429,13 @@ async fn exact_count_smart_admission_keeps_raw_response_evidence_and_request_rep
         agent_harness::Session::open(
             directory.path(),
             agent_harness::SessionConfig {
-                max_elapsed_ms: 300_000,
+                // Unreachable on purpose (see `test_guard::unbudgeted_session_config`):
+                // at 300 s this budget still fired under load — measured in the
+                // pre-push hook on 2026-10-01, where this test ran 548 s and the
+                // kernel refused the projection as "navigation elapsed time",
+                // which surfaced as a context-size error. The budget is not
+                // what this test is about.
+                max_elapsed_ms: u64::MAX,
                 ..Default::default()
             },
         )

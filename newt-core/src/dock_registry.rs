@@ -1560,7 +1560,7 @@ mod tests {
                     // Generous, and it bounds a hang rather than a race: the
                     // loop only continues while the registry is actively
                     // telling us someone else holds the lock.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let deadline = std::time::Instant::now() + crate::test_guard::HANG_GUARD;
                     loop {
                         match approve_dock_with_identity(
                             &config,
@@ -1575,7 +1575,7 @@ mod tests {
                             Err(error) if crate::atomic_fs::is_lock_contended(&error) => {
                                 assert!(
                                     std::time::Instant::now() < deadline,
-                                    "peer-{s} never acquired the lock in 60s — \
+                                    "peer-{s} never acquired the lock within the hang guard — \
                                      that is a stuck lock, not contention: {error:#}"
                                 );
                                 std::thread::yield_now();
