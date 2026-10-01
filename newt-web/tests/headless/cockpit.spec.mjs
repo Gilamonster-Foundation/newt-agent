@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { waitUntilReady } from "./readiness.mjs";
 
 const webRoot = fileURLToPath(new URL("../..", import.meta.url));
 const repoRoot = path.resolve(webRoot, "..");
@@ -33,24 +34,12 @@ async function reservePort() {
   return port;
 }
 
-async function waitUntilReady(url) {
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    if (appProcess.exitCode !== null) {
-      throw new Error(`newt-web exited before readiness (${appProcess.exitCode})\n${appLog}`);
-    }
-    try {
-      const response = await fetch(`${url}/healthz`);
-      if (response.ok) return;
-    } catch (_error) {
-      // The listener is still starting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`newt-web did not become ready\n${appLog}`);
-}
-
-test.beforeAll(async () => {
+test.beforeAll(async ({}, testInfo) => {
+  // The default 60s hook timeout was sized for waitUntilReady alone. A cold
+  // build (buildFirst) can take minutes on a loaded box; give the hook room
+  // for build + readiness rather than let the *hook* time out uninformatively
+  // before waitUntilReady's own, more detailed error gets a chance to fire.
+  testInfo.setTimeout(5 * 60_000);
   const reply = [
     "# Portable result",
     "",
@@ -79,26 +68,119 @@ test.beforeAll(async () => {
   const appPort = await reservePort();
   baseURL = `http://127.0.0.1:${appPort}`;
   stateDir = await mkdtemp(path.join(tmpdir(), "newt-web-acceptance-"));
-  appProcess = spawn(
-    "cargo",
-    ["run", "--quiet", "--manifest-path", path.join(webRoot, "Cargo.toml")],
-    {
-      cwd: repoRoot,
-      env: {
-        ...process.env,
-        NEWT_WEB_BIND: `127.0.0.1:${appPort}`,
-        NEWT_WEB_AUTH_HEADER: "",
-        NEWT_WEB_STATE_DIR: stateDir,
-        NEWT_WEB_WORKSPACE: repoRoot,
-      },
-      stdio: ["ignore", "ignore", "pipe"],
+
+  // Build BEFORE timing readiness, and launch the resulting BINARY directly
+  // rather than `cargo run`: `cargo run` re-invokes Cargo (lock + fingerprint
+  // recheck) even against a warm target/, so readiness was still timing
+  // Cargo's overhead, not just newt-web's startup. `--message-format
+  // json-render-diagnostics` reports the exact `executable` path Cargo
+  // produced for THIS manifest/profile/features — no guessing the target dir.
+  const buildStart = Date.now();
+  const executable = await buildFirst();
+  console.log(`[cockpit.spec] build done in ${Date.now() - buildStart}ms: ${executable}`);
+
+  const spawnStart = Date.now();
+  appProcess = spawn(executable, [], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      NEWT_WEB_BIND: `127.0.0.1:${appPort}`,
+      NEWT_WEB_AUTH_HEADER: "",
+      NEWT_WEB_STATE_DIR: stateDir,
+      NEWT_WEB_WORKSPACE: repoRoot,
     },
-  );
+    // Capture BOTH streams: an empty appLog on a live, unresponsive
+    // process used to be indistinguishable between "logged nothing" and
+    // "logged to the stream we ignored".
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  appProcess.once("error", (error) => {
+    console.log(`[cockpit.spec] spawn error after ${Date.now() - spawnStart}ms: ${error.message}`);
+  });
+  appProcess.once("exit", (code, signal) => {
+    console.log(`[cockpit.spec] app exited (code=${code} signal=${signal}) after ${Date.now() - spawnStart}ms`);
+  });
+  appProcess.stdout.on("data", (chunk) => {
+    appLog += chunk.toString();
+  });
   appProcess.stderr.on("data", (chunk) => {
     appLog += chunk.toString();
   });
-  await waitUntilReady(baseURL);
+  const readyStart = Date.now();
+  await waitUntilReady(baseURL, {
+    isExited: () => appProcess.exitCode,
+    getLog: () => appLog,
+  });
+  console.log(`[cockpit.spec] spawn ok, ready after ${Date.now() - readyStart}ms`);
 });
+
+/// Compile newt-web on its own deadline, separate from `waitUntilReady`'s,
+/// and return the `executable` path Cargo's own build output names for the
+/// `newt-web` bin — never a guessed `target/…` path. `--message-format
+/// json-render-diagnostics` still renders human diagnostics on stderr while
+/// emitting one JSON object per line on stdout.
+async function buildFirst() {
+  const BUILD_TIMEOUT_MS = 180_000;
+  return new Promise((resolve, reject) => {
+    const build = spawn(
+      "cargo",
+      [
+        "build",
+        "--message-format=json-render-diagnostics",
+        "--manifest-path",
+        path.join(webRoot, "Cargo.toml"),
+      ],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderrLog = "";
+    build.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+    build.stderr.on("data", (chunk) => (stderrLog += chunk.toString()));
+    const timer = setTimeout(() => {
+      build.kill("SIGKILL");
+      reject(new Error(`newt-web build did not finish within ${BUILD_TIMEOUT_MS}ms\n${stderrLog}`));
+    }, BUILD_TIMEOUT_MS);
+    // 'error' (e.g. `cargo` not found) never fires 'close', so it needs its
+    // own handler or a bad spawn hangs until the timeout instead of failing
+    // fast with the real reason.
+    build.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new Error(`newt-web build failed to start: ${error.message}\n${stderrLog}`));
+    });
+    // 'close', not 'exit': 'exit' can fire before the stdio pipes have
+    // flushed their last chunks, so `stdout` could still be missing the
+    // trailing compiler-artifact line at the moment this reads it.
+    build.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`newt-web build failed (${code})\n${stderrLog}`));
+        return;
+      }
+      const executable = stdout
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .find(
+          (message) =>
+            message?.reason === "compiler-artifact" &&
+            message.target?.name === "newt-web" &&
+            message.target?.kind?.includes("bin") &&
+            message.executable,
+        )?.executable;
+      if (!executable) {
+        reject(new Error(`newt-web build reported no bin executable\n${stderrLog}`));
+        return;
+      }
+      resolve(executable);
+    });
+  });
+}
 
 test.afterAll(async () => {
   if (appProcess && appProcess.exitCode === null) {
