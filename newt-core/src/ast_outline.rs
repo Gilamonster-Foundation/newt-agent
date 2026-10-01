@@ -6,6 +6,7 @@
 //! back to the one-liner otherwise — never to a regex approximation.
 
 use std::sync::OnceLock;
+use tree_sitter::{Node, Parser};
 use tree_sitter_tags::{TagsConfiguration, TagsContext};
 
 fn config() -> &'static TagsConfiguration {
@@ -36,37 +37,14 @@ pub struct OutlineEntry {
     pub open_ended: bool,
 }
 
-/// Item-start keywords a top-level Rust definition can begin with, once any
-/// `pub`/`async`/`unsafe` modifier prefix is stripped — config, not logic,
-/// so a new item kind is one array entry (#2638).
+/// Item-start keywords a top-level Rust definition can begin with — matched
+/// against the REAL parse tree's own token kinds (#2638 review round 8),
+/// never against raw text. Config, not logic: a new item kind is one array
+/// entry.
 const ITEM_KEYWORDS: &[&str] = &[
     "fn", "struct", "enum", "impl", "trait", "mod", "type", "static", "const",
 ];
 const VISIBILITY_PREFIXES: &[&str] = &["pub(crate)", "pub(super)", "pub(self)", "pub"];
-const MODIFIER_PREFIXES: &[&str] = &["async", "unsafe"];
-
-/// Does `line` (a single source line, already trimmed of leading fragment
-/// noise) look like the start of a top-level item, once its `pub`/`async`/
-/// `unsafe` modifiers are peeled off?
-fn looks_like_definition_start(line: &str) -> bool {
-    let mut rest = line.trim_start();
-    loop {
-        let before = rest;
-        for prefix in VISIBILITY_PREFIXES.iter().chain(MODIFIER_PREFIXES) {
-            if let Some(r) = rest.strip_prefix(prefix) {
-                rest = r.trim_start();
-                break;
-            }
-        }
-        if rest == before {
-            break;
-        }
-    }
-    ITEM_KEYWORDS.iter().any(|kw| {
-        rest.strip_prefix(kw)
-            .is_some_and(|after| after.starts_with([' ', '(', '!', '<']))
-    })
-}
 
 /// The mod name in `header` (e.g. `"pub(crate) mod foo"` -> `"foo"`), or
 /// `None` when `header` isn't a `mod` declaration — used to collapse runs
@@ -88,156 +66,98 @@ fn mod_name(header: &str) -> Option<&str> {
     rest.strip_prefix("mod ").map(str::trim)
 }
 
-/// Byte ranges of every line comment, block comment (nestable), string, and
-/// raw string in `source`, found by a dedicated lexical scan — #2638 fix
-/// item 2. This deliberately does NOT reuse the tree-sitter parse: an
-/// unparseable tail (a page cut mid-body) folds into one un-tokenized
-/// `ERROR` node that drops the comment/string token's identity entirely
-/// (confirmed by inspecting the tree directly — a `let _ = r#"..` fragment
-/// with no valid enclosing item produces `(ERROR (ERROR (identifier))
-/// (identifier))`, no `raw_string_literal` node at all), so the parse tree
-/// cannot be trusted to report every comment/string span under exactly the
-/// truncated input this exists to guard. An unterminated block comment or
-/// raw string extends to EOF, matching the real scanner's own behavior.
-fn comment_or_string_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
-    let b = source.as_bytes();
-    let mut ranges = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                let start = i;
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                ranges.push(start..i);
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let start = i;
-                i += 2;
-                let mut depth = 1usize;
-                while i < b.len() && depth > 0 {
-                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                ranges.push(start..i);
-            }
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < b.len() && b[i] != b'"' {
-                    i += if b[i] == b'\\' && i + 1 < b.len() {
-                        2
-                    } else {
-                        1
-                    };
-                }
-                i = (i + 1).min(b.len());
-                ranges.push(start..i);
-            }
-            b'r' if matches!(b.get(i + 1), Some(b'"') | Some(b'#')) => {
-                let start = i;
-                let mut j = i + 1;
-                let mut hashes = 0usize;
-                while b.get(j) == Some(&b'#') {
-                    hashes += 1;
-                    j += 1;
-                }
-                if b.get(j) != Some(&b'"') {
-                    i += 1; // an identifier starting with `r`, not a raw string
-                    continue;
-                }
-                j += 1;
-                loop {
-                    if j >= b.len() {
-                        break;
-                    }
-                    if b[j] == b'"' {
-                        let mut k = j + 1;
-                        let mut closing = 0usize;
-                        while closing < hashes && b.get(k) == Some(&b'#') {
-                            closing += 1;
-                            k += 1;
-                        }
-                        if closing == hashes {
-                            j = k;
-                            break;
-                        }
-                    }
-                    j += 1;
-                }
-                ranges.push(start..j.min(b.len()));
-                i = j.min(b.len());
-            }
-            _ => i += 1,
+/// The outermost node covering the parse's unrecovered tail: `source_file`'s
+/// own last top-level child, when it reports an error, or the root itself
+/// when the WHOLE file collapsed into one `ERROR` node (a deep-enough page
+/// cut makes tree-sitter give up on recovering any earlier structure at
+/// all and fold complete siblings the tags query already found into it
+/// too — #2638 fix item 1).
+fn final_incomplete_node(root: Node<'_>) -> Option<Node<'_>> {
+    let candidate = if root.kind() == "source_file" {
+        let mut cursor = root.walk();
+        root.children(&mut cursor).last()?
+    } else {
+        root
+    };
+    candidate.has_error().then_some(candidate)
+}
+
+/// Every byte offset within `node` (searched recursively) where an unnamed
+/// keyword token (`fn`, `struct`, …) is IMMEDIATELY followed by a sibling
+/// `identifier` node, exactly as tree-sitter itself parsed it — the only
+/// evidence #2638 review round 8 accepts for a recovered (open-ended)
+/// definition. A hand-rolled text scanner can't tell a real keyword from
+/// one embedded in a string/char literal (`let marker = '"'; let _ =
+/// r#"\nfn imaginary(`); the real parser can, because that text never
+/// becomes separate `fn`/`identifier` tokens in the first place — it stays
+/// inside whatever comment/string/char-literal token swallowed it (verified
+/// by walking the actual tree: the raw-string case above never produces an
+/// unnamed `fn` node at all, only an `identifier` node whose *text* happens
+/// to read "fn").
+fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
+    let mut hits = Vec::new();
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i) else {
+            continue;
+        };
+        if !child.is_named()
+            && ITEM_KEYWORDS.contains(&child.kind())
+            && node.child(i + 1).is_some_and(|next| next.kind() == "identifier")
+        {
+            hits.push(child.start_byte());
         }
+        hits.extend(keyword_identifier_starts(child));
     }
-    ranges
+    hits
 }
 
 /// The page-cut counterpart of tags-based recovery (#2638 fix item 1): a
-/// definition whose CLOSE never arrives inside this fragment (page cut
-/// mid-body) leaves an unbalanced brace count that, once deep enough, makes
-/// tree-sitter give up on recovering ANY valid structure and fold the WHOLE
-/// parse (including earlier, complete siblings the tags query already
-/// found) into one `ERROR` — so walking the raw tree for a trailing `ERROR`
-/// node can't tell "the cut definition" from "everything before it" apart.
-/// Scanning `source`'s own lines instead sidesteps the tree entirely: any
-/// line that looks like a definition start but isn't already one of
-/// `entries`' own start lines is one tags recovery lost, and the last such
-/// line in the fragment is the one the page actually cut — UNLESS that line
-/// sits inside a comment or string, per an actual parse (#2638 fix item 2):
-/// text there was never a definition, tagged or not.
+/// definition whose CLOSE never arrives inside this fragment leaves an
+/// unbalanced brace count with no `is_definition` tag of its own. Recovery
+/// is granted ONLY on parser evidence — a keyword token immediately
+/// followed by an identifier node inside the parse's final incomplete
+/// region — never on text that merely looks like one; no such evidence
+/// means no recovered entry, and the caller declines to the existing
+/// generic fallback.
 fn trailing_truncated_definition(
     source: &str,
     first_line: usize,
     entries: &[OutlineEntry],
 ) -> Option<OutlineEntry> {
-    // Only the FIRST untagged, non-lexical definition-start after the last
-    // real entry is the one the page cut — a local `const`/`static` inside
-    // that cut definition's own body can also match
-    // `looks_like_definition_start` (it's the same grammar shape at
-    // statement position), and one of those sitting later in the fragment
-    // must not shadow the real gap.
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("tree-sitter-rust's grammar must load");
+    let tree = parser.parse(source, None)?;
+    let target = final_incomplete_node(tree.root_node())?;
     let tagged: std::collections::HashSet<usize> = entries.iter().map(|e| e.start_line).collect();
-    let excluded = comment_or_string_ranges(source);
+    let line_of = |byte: usize| source[..byte.min(source.len())].matches('\n').count();
+    // The FIRST untagged evidence is the one the page cut: anything already
+    // tagged parses as a real, complete item; an untagged keyword+identifier
+    // pair AFTER that one is typically a local item inside the cut
+    // definition's own (unparsed) body — e.g. a local `const` — and must not
+    // shadow the actual cut point.
+    let start_byte = keyword_identifier_starts(target)
+        .into_iter()
+        .filter(|&b| !tagged.contains(&(first_line + line_of(b))))
+        .min()?;
     let total_lines = source.lines().count();
     let last_line = first_line + total_lines.saturating_sub(1);
-    let after = entries.last().map_or(first_line, |e| e.end_line + 1);
-    let mut byte = 0;
-    for (i, line) in source.split_inclusive('\n').enumerate() {
-        let abs_line = first_line + i;
-        let start_byte = byte;
-        byte += line.len();
-        if abs_line < after || tagged.contains(&abs_line) {
-            continue;
-        }
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if !looks_like_definition_start(trimmed) {
-            continue;
-        }
-        if excluded.iter().any(|r| r.contains(&start_byte)) {
-            continue;
-        }
-        return Some(OutlineEntry {
-            start_line: abs_line,
-            end_line: last_line,
-            header: trimmed
-                .trim()
-                .trim_end_matches(['{', ';'])
-                .trim()
-                .to_string(),
-            open_ended: true,
-        });
-    }
-    None
+    let line_start = source[..start_byte].rfind('\n').map_or(0, |p| p + 1);
+    let header = source[line_start..]
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(['{', ';'])
+        .trim()
+        .to_string();
+    Some(OutlineEntry {
+        start_line: first_line + line_of(start_byte),
+        end_line: last_line,
+        header,
+        open_ended: true,
+    })
 }
 
 /// Outline the definitions in `source`, a Rust source fragment whose first
@@ -292,16 +212,21 @@ const MOD_NAME_CAP: usize = 6;
 /// b, …)` line (#2638 fix item 3) so ~60 boilerplate `mod x;` lines don't
 /// drown out the page's real definitions — an `open_ended` mod (the page cut
 /// it) never joins a run, so its incomplete-extent marker is never hidden
-/// behind a closed-looking collapsed span.
+/// behind a closed-looking collapsed span. Only SINGLE-LINE declarations
+/// (`mod x;`) collapse; a multi-line inline module (`mod x { ... }` spanning
+/// more than one line) always keeps its own entry and real extent, since a
+/// collapsed run's rendered end is its LAST member's `start_line`, which
+/// would truncate an inline module's body (#2638 review round 8, item 2).
 pub fn render_outline(entries: &[OutlineEntry]) -> String {
+    let is_collapsible = |e: &OutlineEntry| !e.open_ended && e.start_line == e.end_line;
     let mut lines = Vec::new();
     let mut i = 0;
     while i < entries.len() {
-        if !entries[i].open_ended {
+        if is_collapsible(&entries[i]) {
             if let Some(first_name) = mod_name(&entries[i].header) {
                 let mut names = vec![first_name];
                 let mut j = i + 1;
-                while j < entries.len() && !entries[j].open_ended {
+                while j < entries.len() && is_collapsible(&entries[j]) {
                     let Some(name) = mod_name(&entries[j].header) else {
                         break;
                     };
@@ -557,6 +482,30 @@ pub(crate) enum ResponsesCompaction {
         );
     }
 
+    /// #2638 review round 8, P2 negative control: the review's counter-
+    /// example — a real `fn`, then a char literal containing `"`, then an
+    /// unterminated raw string whose body merely LOOKS like a `fn` header.
+    /// A hand-rolled scanner mistakes the char literal's `"` for a string
+    /// opener and the raw string's opening `"` for its closer, exposing
+    /// `imaginary` outside its own exclusion. The real parser never
+    /// tokenizes `fn`/`imaginary` as a keyword+identifier pair here at all
+    /// (confirmed by inspecting the tree: that region parses as an
+    /// `identifier` node whose *text* happens to read "fn", not an unnamed
+    /// `fn` keyword token), so no recovered entry should ever appear.
+    #[test]
+    fn a_definition_inside_an_unterminated_raw_string_after_a_char_literal_is_not_invented() {
+        let src = "fn real() {}\nlet marker = '\"';\nlet _ = r#\"\nfn imaginary(\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        assert!(
+            !entries.iter().any(|e| e.header.contains("imaginary")),
+            "no parser evidence exists for `imaginary`: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.header.contains("real")),
+            "the real fn must still appear: {entries:?}"
+        );
+    }
+
     /// #2638 review round 7, P2 negative control (page-cut positive):
     /// unrelated to comments/strings, a genuine page-cut mid-function must
     /// still surface open-ended — the exclusion added for comments/strings
@@ -625,6 +574,33 @@ pub(crate) enum ResponsesCompaction {
         assert!(
             rendered.contains("3-…\tmod c"),
             "the cut mod keeps its own open-ended marker: {rendered}"
+        );
+    }
+
+    /// #2638 review round 8, P2: a run of MULTI-LINE inline modules must
+    /// never collapse — the collapsed span's end is its last member's
+    /// `start_line`, which would truncate an inline module's own body.
+    /// Only single-line `mod x;` declarations collapse.
+    #[test]
+    fn a_multiline_mod_run_never_collapses() {
+        let entries = vec![
+            OutlineEntry {
+                start_line: 1,
+                end_line: 3,
+                header: "mod a".to_string(),
+                open_ended: false,
+            },
+            OutlineEntry {
+                start_line: 4,
+                end_line: 6,
+                header: "mod b".to_string(),
+                open_ended: false,
+            },
+        ];
+        let rendered = render_outline(&entries);
+        assert_eq!(
+            rendered, "    1-3\tmod a\n    4-6\tmod b",
+            "multi-line mods keep their own extents, never collapsed: {rendered}"
         );
     }
 }
