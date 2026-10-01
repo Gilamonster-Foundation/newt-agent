@@ -1110,6 +1110,16 @@ resolved in a later release:
   root, and its immediate child is owned by root or by the current user.
   Negative controls: non-sticky world-writable directories are refused, and
   sticky directories not owned by root are refused.
+- A5 named widening (operator-accepted 2026-09-30, the same decision as
+  agent-bridle #409): on macOS the trust walk exempts EXACTLY the root-owned,
+  admin-group-writable Apple developer directories — `/Applications` and
+  `/Applications/Xcode.app/…` only en route to a file under Xcode.app, and
+  `/Library/Developer/CommandLineTools` only when the SELECTED git resolves
+  there (read from the authenticated git's binary path or reported exec-path
+  and carried in the trust context for the whole call, never inferred from
+  the file under check). The root-owned symlink exception is limited to the
+  system aliases `/tmp`, `/var` and `/etc` → `/private/*`. Everything else
+  group- or other-writable is refused.
 - The confined copy's exec axis is unrestricted (operator-accepted 2026-09-30):
   Landlock/Seatbelt deliver exec restriction only at the interceptor level, so
   a `Kernel` floor refuses a restricted exec scope; neither Landlock nor
