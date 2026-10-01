@@ -116,13 +116,25 @@ pub const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Await `fut`, panicking (naming `what`) if it is still pending after
 /// [`HANG_GUARD`]. The assertion is the awaited event; this only names a hang.
-pub async fn hang_guarded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
-    match tokio::time::timeout(HANG_GUARD, fut).await {
-        Ok(out) => out,
-        Err(_) => panic!(
-            "hung: {what} produced no result within the {}s hang guard",
-            HANG_GUARD.as_secs()
-        ),
+///
+/// `fut` is boxed here, synchronously, before any future of this function's
+/// own exists: the guarded future is often a whole agentic turn, and holding
+/// one inline in a wrapper's state overflowed a test thread's 2 MiB stack
+/// (`ollama_completed_call_survives_cancelled_sibling`, 2026-10-01).
+pub fn hang_guarded<F: std::future::Future>(
+    what: &str,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let what = what.to_owned();
+    let guarded = tokio::time::timeout(HANG_GUARD, Box::pin(fut));
+    async move {
+        match guarded.await {
+            Ok(out) => out,
+            Err(_) => panic!(
+                "hung: {what} produced no result within the {}s hang guard",
+                HANG_GUARD.as_secs()
+            ),
+        }
     }
 }
 
@@ -135,6 +147,25 @@ pub fn recv_guarded<T>(rx: &std::sync::mpsc::Receiver<T>, what: &str) -> T {
             "hung: {what} produced no result within the {}s hang guard ({error})",
             HANG_GUARD.as_secs()
         ),
+    }
+}
+
+/// A kernel session config for the unit tier, with the navigation elapsed-time
+/// budget out of reach.
+///
+/// The kernel charges REAL elapsed time — its own `Instant` around every
+/// catalog, projection and re-read, plus the harness's auxiliary timers —
+/// against `max_elapsed_ms`, 30 s by default, and refuses navigation past it.
+/// That budget bounds a slow auxiliary model in production; in a unit test the
+/// auxiliary is an instant closure and the elapsed time is the loaded test
+/// box. Measured on 2026-10-01 under a 32-thread nextest run beside a build:
+/// five `smart_harness` navigation tests failed at 36–100 s with the budget
+/// error, none of them about the budget. The budget's own behaviour is tested
+/// in agent-harness against its injected clock, where it belongs.
+pub fn unbudgeted_session_config() -> agent_harness::SessionConfig {
+    agent_harness::SessionConfig {
+        max_elapsed_ms: u64::MAX,
+        ..Default::default()
     }
 }
 

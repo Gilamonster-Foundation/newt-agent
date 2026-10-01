@@ -263,7 +263,8 @@ async fn exact_count_preserves_the_latest_observed_tool_result_when_refusing() {
     mount_counter(&server, &trace, Some(|_| INPUT_BOUND + 1)).await;
     mount_generation(&server, &trace, true, false).await;
     let result_text = "latest observed tool result must remain exact";
-    let mut session = agent_harness::Session::new(Default::default()).unwrap();
+    let mut session =
+        agent_harness::Session::new(crate::test_guard::unbudgeted_session_config()).unwrap();
     session.record_messages(&[
         serde_json::json!({"role":"user","content":TASK}),
         serde_json::json!({"role":"assistant","content":"","tool_calls":[{
@@ -488,8 +489,13 @@ async fn exact_count_smart_persistence_failure_prevents_generation() {
     let server = MockServer::start().await;
     let trace = Trace::default();
     let directory = tempfile::tempdir().unwrap();
-    let harness =
-        smart(agent_harness::Session::open(directory.path(), Default::default()).unwrap());
+    let harness = smart(
+        agent_harness::Session::open(
+            directory.path(),
+            crate::test_guard::unbudgeted_session_config(),
+        )
+        .unwrap(),
+    );
     let counter_trace = trace.clone();
     let directory_path = directory.path().to_path_buf();
     let broken = AtomicBool::new(false);

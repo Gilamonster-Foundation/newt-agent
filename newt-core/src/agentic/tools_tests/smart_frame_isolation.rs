@@ -4,7 +4,9 @@ use crate::caveats::Caveats;
 use std::{path::Path, sync::Arc};
 
 fn harness(directory: &Path) -> (SmartHarness, content_addressable::ContentId) {
-    let mut session = agent_harness::Session::open(directory, Default::default()).unwrap();
+    let mut session =
+        agent_harness::Session::open(directory, crate::test_guard::unbudgeted_session_config())
+            .unwrap();
     let source = session
         .retain_tool_output("fixture", b"retained original source")
         .unwrap();

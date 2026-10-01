@@ -1355,7 +1355,7 @@ mod tests {
                 .collect::<std::collections::VecDeque<_>>(),
         ));
         SmartHarness::new(
-            Session::new(Default::default()).unwrap(),
+            Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(move |_| {
                 let reply = replies.lock().unwrap().pop_front().unwrap();
                 Box::pin(async move { Ok((reply, None)) })
@@ -1630,7 +1630,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let raw = "\"answer\"";
             let h = SmartHarness::new(
-                Session::open(dir.path(), Default::default()).unwrap(),
+                Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap(),
                 Arc::new(move |_| Box::pin(async move { Ok((raw.to_string(), None)) })),
                 AdjudicationSettings {
                     max_output_bytes: 4,
@@ -1699,7 +1699,7 @@ mod tests {
             ..Default::default()
         };
         let h = SmartHarness::new(
-            Session::new(Default::default()).unwrap(),
+            Session::new(crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|_| Box::pin(std::future::pending())),
             settings,
         )
@@ -1734,7 +1734,7 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let callback_started = Arc::clone(&started);
         let h = SmartHarness::new(
-            Session::open(dir.path(), Default::default()).unwrap(),
+            Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(move |_| {
                 callback_started.notify_one();
                 Box::pin(std::future::pending())
@@ -1807,7 +1807,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let callback_cancel = Arc::clone(&cancel);
         let h = SmartHarness::new(
-            Session::open(dir.path(), Default::default()).unwrap(),
+            Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(move |_| {
                 std::fs::rename(directory.join("heads"), directory.join("retained-heads")).unwrap();
                 std::fs::write(directory.join("heads"), b"blocked checkpoint directory").unwrap();
@@ -1881,7 +1881,8 @@ mod tests {
             "over_budget",
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let session = Session::open(dir.path(), Default::default()).unwrap();
+            let session =
+                Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap();
             let unrelated = session.head().to_string();
             let recorded = Arc::new(std::sync::Mutex::new(String::new()));
             let capture = recorded.clone();
@@ -1978,7 +1979,7 @@ mod tests {
     async fn accepted_navigation_keeps_pins_and_retains_retrievable_source_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let h = SmartHarness::new(
-            Session::open(dir.path(), Default::default()).unwrap(),
+            Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|prompt| {
                 let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
                 let mut selected = catalog["candidates"]
@@ -2067,7 +2068,7 @@ mod tests {
     fn offloaded_tool_source_survives_restart_without_a_live_spill_store() {
         let dir = tempfile::tempdir().unwrap();
         let h = SmartHarness::new(
-            Session::open(dir.path(), Default::default()).unwrap(),
+            Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|_| panic!("no inference")),
             Default::default(),
         )
@@ -2131,7 +2132,7 @@ mod tests {
     async fn navigation_retains_generated_companions_of_selected_source_calls() {
         let dir = tempfile::tempdir().unwrap();
         let h = SmartHarness::new(
-            Session::open(dir.path(), Default::default()).unwrap(),
+            Session::open(dir.path(), crate::test_guard::unbudgeted_session_config()).unwrap(),
             Arc::new(|prompt| {
                 let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
                 let cards = catalog["candidates"].as_array().unwrap();

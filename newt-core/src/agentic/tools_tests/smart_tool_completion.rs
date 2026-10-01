@@ -24,7 +24,11 @@ impl McpTools for BreakCheckpoint {
 async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W) {
     let workspace = tempfile::tempdir().unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let session = agent_harness::Session::open(directory.path(), Default::default()).unwrap();
+    let session = agent_harness::Session::open(
+        directory.path(),
+        crate::test_guard::unbudgeted_session_config(),
+    )
+    .unwrap();
     let mut mcp = BreakCheckpoint(session.checkpoint_path().unwrap());
     let harness = SmartHarness::new(
         session,
@@ -92,7 +96,11 @@ async fn posture_and_permission_refusals_retain_host_origin() {
     for name in ["write_file", "fixture__read"] {
         let workspace = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let session = agent_harness::Session::open(directory.path(), Default::default()).unwrap();
+        let session = agent_harness::Session::open(
+            directory.path(),
+            crate::test_guard::unbudgeted_session_config(),
+        )
+        .unwrap();
         let mut mcp = BreakCheckpoint(session.checkpoint_path().unwrap());
         let harness = SmartHarness::new(
             session,

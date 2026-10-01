@@ -105,7 +105,7 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
         .await;
     let workspace = tempfile::tempdir().unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let config = agent_harness::SessionConfig::default();
+    let config = crate::test_guard::unbudgeted_session_config();
     let harness = SmartHarness::new(
         agent_harness::Session::open(directory.path(), config.clone()).unwrap(),
         Arc::new(|_| panic!("an interrupted tool batch must not invoke adjudication")),
@@ -479,7 +479,11 @@ async fn all_four_completed_batches_preserve_observed_errors_and_large_sources()
         let workspace = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let harness = SmartHarness::new(
-            agent_harness::Session::open(directory.path(), Default::default()).unwrap(),
+            agent_harness::Session::open(
+                directory.path(),
+                crate::test_guard::unbudgeted_session_config(),
+            )
+            .unwrap(),
             Arc::new(|_| Box::pin(async { Ok(("\"answer\"".into(), None)) })),
             Default::default(),
         )
@@ -577,7 +581,11 @@ async fn all_four_persistence_failures_preserve_return_and_stop_before_next_tool
             .await;
         let workspace = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let session = agent_harness::Session::open(directory.path(), Default::default()).unwrap();
+        let session = agent_harness::Session::open(
+            directory.path(),
+            crate::test_guard::unbudgeted_session_config(),
+        )
+        .unwrap();
         let checkpoint = session.checkpoint_path().unwrap();
         let harness = SmartHarness::new(
             session,
@@ -806,7 +814,11 @@ async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
         crate::agentic::content_spill::tool_output_retrieval_hint(&handle)
     );
     let harness = SmartHarness::new(
-        agent_harness::Session::open(directory.path(), Default::default()).unwrap(),
+        agent_harness::Session::open(
+            directory.path(),
+            crate::test_guard::unbudgeted_session_config(),
+        )
+        .unwrap(),
         Arc::new(|_| panic!("source error must stop")),
         Default::default(),
     )
@@ -1021,8 +1033,11 @@ async fn brake_under_smart_harness(
     let workspace = tempfile::tempdir().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let harness = SmartHarness::new(
-        agent_harness::Session::open(directory.path(), agent_harness::SessionConfig::default())
-            .unwrap(),
+        agent_harness::Session::open(
+            directory.path(),
+            crate::test_guard::unbudgeted_session_config(),
+        )
+        .unwrap(),
         Arc::new(|_| panic!("no adjudication is expected")),
         AdjudicationSettings::default(),
     )
