@@ -82,7 +82,17 @@ fn final_incomplete_node(root: Node<'_>) -> Option<Node<'_>> {
     candidate.has_error().then_some(candidate)
 }
 
-/// Every byte offset within `node` (searched recursively) where an unnamed
+/// A node tree-sitter could not parse completely: an `ERROR` node, a
+/// `MISSING` placeholder, or any node containing one. Everything else is a
+/// COMPLETE item (a `function_item`, a `const_item`, …) whatever the tags
+/// query says about it — tree-sitter-rust's bundled `tags.scm` tags no
+/// `const`/`static` at all, so "untagged" never means "incomplete" (#2638
+/// review round 9).
+fn is_incomplete(node: Node<'_>) -> bool {
+    node.is_error() || node.is_missing() || node.has_error()
+}
+
+/// Every byte offset within `node`'s INCOMPLETE regions where an unnamed
 /// keyword token (`fn`, `struct`, …) is IMMEDIATELY followed by a sibling
 /// `identifier` node, exactly as tree-sitter itself parsed it — the only
 /// evidence #2638 review round 8 accepts for a recovered (open-ended)
@@ -94,6 +104,12 @@ fn final_incomplete_node(root: Node<'_>) -> Option<Node<'_>> {
 /// by walking the actual tree: the raw-string case above never produces an
 /// unnamed `fn` node at all, only an `identifier` node whose *text* happens
 /// to read "fn").
+///
+/// A complete subtree is never descended into (round 9): a deep enough page
+/// cut folds the fragment's complete earlier siblings — and the cut body's
+/// own complete local items — into the same `ERROR` node as the cut
+/// definition's loose tokens, and a complete `const_item` there is a
+/// complete item, not evidence of a cut.
 fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
     let mut hits = Vec::new();
     for i in 0..node.child_count() {
@@ -108,7 +124,9 @@ fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
         {
             hits.push(child.start_byte());
         }
-        hits.extend(keyword_identifier_starts(child));
+        if is_incomplete(child) {
+            hits.extend(keyword_identifier_starts(child));
+        }
     }
     hits
 }
@@ -118,9 +136,11 @@ fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
 /// unbalanced brace count with no `is_definition` tag of its own. Recovery
 /// is granted ONLY on parser evidence — a keyword token immediately
 /// followed by an identifier node inside the parse's final incomplete
-/// region — never on text that merely looks like one; no such evidence
-/// means no recovered entry, and the caller declines to the existing
-/// generic fallback.
+/// region, AFTER the last tagged entry's end line, and exactly ONE such
+/// pair — never on text that merely looks like one. No evidence, or more
+/// than one incomplete definition the tree can't rank, means no recovered
+/// entry: the caller declines to the existing generic fallback rather than
+/// guess (review round 9).
 fn trailing_truncated_definition(
     source: &str,
     first_line: usize,
@@ -132,17 +152,20 @@ fn trailing_truncated_definition(
         .expect("tree-sitter-rust's grammar must load");
     let tree = parser.parse(source, None)?;
     let target = final_incomplete_node(tree.root_node())?;
-    let tagged: std::collections::HashSet<usize> = entries.iter().map(|e| e.start_line).collect();
     let line_of = |byte: usize| source[..byte.min(source.len())].matches('\n').count();
-    // The FIRST untagged evidence is the one the page cut: anything already
-    // tagged parses as a real, complete item; an untagged keyword+identifier
-    // pair AFTER that one is typically a local item inside the cut
-    // definition's own (unparsed) body — e.g. a local `const` — and must not
-    // shadow the actual cut point.
-    let start_byte = keyword_identifier_starts(target)
+    // Recovery boundary: the cut item starts AFTER the last tagged entry
+    // ENDS. Everything up to there parsed as complete items, tagged or not.
+    let last_tagged_end = entries.iter().map(|e| e.end_line).max().unwrap_or(0);
+    let candidates: Vec<usize> = keyword_identifier_starts(target)
         .into_iter()
-        .filter(|&b| !tagged.contains(&(first_line + line_of(b))))
-        .min()?;
+        .filter(|&b| first_line + line_of(b) > last_tagged_end)
+        .collect();
+    // Two incomplete definitions in one region (a cut `mod tests {` whose
+    // cut `fn` is also incomplete) are flat siblings under the same `ERROR`;
+    // the tree doesn't say which one the page cut, so neither is reported.
+    let &[start_byte] = candidates.as_slice() else {
+        return None;
+    };
     let total_lines = source.lines().count();
     let last_line = first_line + total_lines.saturating_sub(1);
     let line_start = source[..start_byte].rfind('\n').map_or(0, |p| p + 1);
@@ -576,6 +599,109 @@ pub(crate) enum ResponsesCompaction {
         assert!(
             rendered.contains("3-…\tmod c"),
             "the cut mod keeps its own open-ended marker: {rendered}"
+        );
+    }
+
+    /// #2638 review round 9, P2 control (measured red): a COMPLETE but
+    /// untagged `const` and `static` (tree-sitter-rust's bundled `tags.scm`
+    /// tags neither) sit before the genuine page-cut `fn` in the SAME error
+    /// region — a cut this deep collapses the whole fragment into one root
+    /// `ERROR` node whose children are the complete `const_item` /
+    /// `static_item` and then the cut fn's loose `fn`/`identifier` tokens
+    /// (shape confirmed by dumping the real tree). "Untagged" is not
+    /// "incomplete": the recovered entry must be the fn, never the const.
+    #[test]
+    fn a_complete_untagged_const_and_static_before_the_cut_fn_are_not_recovered() {
+        let src = "fn real() {}\nconst X: u32 = 1;\nstatic Y: u32 = 2;\nfn cut() {\n    if a {\n        if b {\n            do_thing();\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        let open: Vec<&OutlineEntry> = entries.iter().filter(|e| e.open_ended).collect();
+        assert_eq!(
+            open.len(),
+            1,
+            "exactly one recovered entry, the cut fn: {entries:?}"
+        );
+        assert!(
+            open[0].header.contains("fn cut") && open[0].start_line == 4,
+            "the recovered entry is the cut fn at line 4, not a complete earlier item: {entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.header.contains("const X") || e.header.contains("static Y")),
+            "a complete untagged const/static is never a recovered entry: {entries:?}"
+        );
+        let real = entries
+            .iter()
+            .find(|e| e.header.contains("fn real"))
+            .expect("the complete tagged fn still appears");
+        assert!(!real.open_ended);
+    }
+
+    /// #2638 review round 9 positive (the local-constant-after-cut case the
+    /// real `agentic/mod.rs` offset-6000 page exercises at scale): a cut
+    /// fn's own unparsed body can contain a complete local `const` — a
+    /// complete subtree inside the error region. It is never recovery
+    /// evidence and never shadows the cut fn, which is still reported.
+    #[test]
+    fn a_local_const_inside_the_cut_body_does_not_shadow_the_cut_fn() {
+        let src = "fn real() {}\n\nfn cut() {\n    const CAP: usize = 3;\n    let x = CAP;\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        let entry = entries
+            .iter()
+            .find(|e| e.open_ended)
+            .expect("the cut fn must still be recovered");
+        assert!(entry.header.contains("fn cut"), "got: {entries:?}");
+        assert_eq!(entry.start_line, 3);
+        assert!(
+            !entries.iter().any(|e| e.header.contains("const CAP")),
+            "a local const inside the cut body is not an entry: {entries:?}"
+        );
+    }
+
+    /// #2638 review round 9 (measured red): two INCOMPLETE definitions in
+    /// one error region — a page cut inside an inline `mod tests {` block,
+    /// mid-way through its first fn — leave the tree unable to say which
+    /// one the page cut (both are loose `mod`/`fn` + `identifier` token
+    /// pairs, flat under the same `ERROR`, and both lie after the last
+    /// tagged entry). Recovery declines rather than guessing; the caller's
+    /// generic fallback takes the page.
+    #[test]
+    fn two_incomplete_definitions_in_one_error_region_decline_recovery() {
+        let src = "fn real() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    fn cut() {\n        if a {\n            do_thing();\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        assert!(
+            !entries.iter().any(|e| e.open_ended),
+            "ambiguous recovery must decline, not guess an entry: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.header.contains("fn real")),
+            "the complete tagged fn still appears: {entries:?}"
+        );
+    }
+
+    /// #2638 review round 9 (measured red): the same cut `mod tests {`, but
+    /// with a COMPLETE fn between the module header and the cut fn. That fn
+    /// is tagged, so the recovery boundary (after the last tagged entry's
+    /// end) moves past the `mod` token pair, and the cut fn after it is the
+    /// single remaining candidate — recovered, while the `mod` is not
+    /// reported (the old `.min()` guessed `mod tests` here).
+    #[test]
+    fn a_complete_tagged_fn_inside_the_cut_mod_moves_the_boundary_past_the_mod() {
+        let src = "fn real() {}\n\n#[cfg(test)]\nmod tests {\n    fn done() {}\n    fn cut() {\n        if a {\n            do_thing();\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        let open: Vec<&OutlineEntry> = entries.iter().filter(|e| e.open_ended).collect();
+        assert_eq!(open.len(), 1, "exactly one recovered entry: {entries:?}");
+        assert!(
+            open[0].header.contains("fn cut") && open[0].start_line == 6,
+            "the cut fn after the boundary is recovered: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.header.contains("mod tests")),
+            "the mod before the boundary is not guessed: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.header.contains("fn done")),
+            "complete fns inside the region stay tagged: {entries:?}"
         );
     }
 
