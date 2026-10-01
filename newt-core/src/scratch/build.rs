@@ -911,26 +911,51 @@ mod tests {
     /// default; CI uses 0o022) `tempfile::tempdir()` alone yields a
     /// group-writable, non-sticky directory, which the fixture's own
     /// sticky-bit check then (wrongly) rejects. `fixture()` above pins the
-    /// permissions explicitly to guard against exactly this. umask is
-    /// process-global, so this test restores it immediately and does not
-    /// leave it changed for any sibling test.
+    /// permissions explicitly to guard against exactly this.
+    ///
+    /// umask(2) is process-global. Setting it in-process — even saving and
+    /// restoring around the call — races every other test and thread in this
+    /// same `cargo test` binary: a sibling creating a file between the set
+    /// and the restore observes the wrong umask, and a panic between them
+    /// skips the restore entirely. So the actual umask change happens in a
+    /// disposable child process (a re-exec of this same test binary, filtered
+    /// to just this test via `NEWT_SCRATCH_UMASK_CHILD`): the child sets
+    /// umask 0o002, runs `fixture()` plus `acquire()`, and exits 0 or 1. This
+    /// (parent) process asserts on the child's exit status and never touches
+    /// its own umask.
     #[cfg(unix)]
     #[test]
     fn managed_scratch_fixture_tolerates_a_group_friendly_umask() {
-        // SAFETY: umask(2) is async-signal-safe and merely reads/writes the
-        // calling process's umask; no memory safety concern, only the
-        // documented process-global-state concern handled by saving/
-        // restoring it immediately below.
-        let previous = unsafe { libc::umask(0o002) };
-        let (_temporary, plan) = fixture();
-        // SAFETY: see above; restores the umask this test changed.
-        unsafe {
-            libc::umask(previous);
+        const CHILD_ENV: &str = "NEWT_SCRATCH_UMASK_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: umask(2) is async-signal-safe and merely reads/writes
+            // this (disposable, single-test) child process's umask; no other
+            // thread or test shares it.
+            unsafe {
+                libc::umask(0o002);
+            }
+            let (_temporary, plan) = fixture();
+            if plan.acquire().is_ok() {
+                std::process::exit(0);
+            } else {
+                eprintln!(
+                    "a fixture the test itself owns must not be rejected merely because \
+                     the host umask made tempfile::tempdir() group-writable"
+                );
+                std::process::exit(1);
+            }
         }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("scratch::build::tests::managed_scratch_fixture_tolerates_a_group_friendly_umask")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn umask-isolation child");
         assert!(
-            plan.acquire().is_ok(),
-            "a fixture the test itself owns must not be rejected merely because \
-             the host umask made tempfile::tempdir() group-writable"
+            status.success(),
+            "child process (umask 0o002) rejected its own fixture: {status:?}"
         );
     }
 }
