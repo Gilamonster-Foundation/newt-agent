@@ -91,6 +91,75 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
     );
 }
 
+/// #2630 — a `git`-only exec grant must let the confined shell run git
+/// porcelain that re-executes git under an internal alias: `git worktree
+/// add` spawns `<exec-path>/git branch` / `… update-ref`, which the kernel
+/// `Execute` allow-list denied because only the granted `git` binary itself
+/// was on it. Fixed upstream in agent-bridle#407 (`landlock_impl::
+/// resolve_exec_paths` folds in `<exec-path>/git` when it is the same image
+/// as a root-owned, trusted-dir `git`), backported into the vendored core.
+///
+/// Confirmed red on the pre-backport vendored copy: exit 128,
+/// `fatal: cannot exec 'branch': Permission denied`.
+///
+/// Real-resource proof (real `/usr/bin/git`, real Landlock), placed beside
+/// the existing kernel-confined `git add` proof above rather than in the
+/// weekly tier: like it, this skips (never fails) without Landlock or
+/// `/usr/bin/git`, and it is the ground truth for the vendored
+/// `git_exec_path_tests`, which only check the in-process allow-list and
+/// never ask the kernel. `/etc/gitconfig` is granted read explicitly for the
+/// same reason `dispatch_caveats_for_git_shell` grants it: real git always
+/// opens the system config, and this fixture's cwd is the main repository
+/// on its default branch, where that widening does not fire.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    if !crate::confined_exec::kernel_fs_fence_available()
+        || !std::path::Path::new("/usr/bin/git").exists()
+    {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    real_git(&main, &["init", "-q"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    real_git(&main, &["add", "seed"]);
+    real_git(&main, &["commit", "-q", "-m", "init"]);
+    let wt = root.path().join("wt");
+
+    let root_s = root.path().to_string_lossy().into_owned();
+    let session = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::only([root_s.clone(), "/etc/gitconfig".to_string()]),
+        fs_write: crate::caveats::Scope::only([root_s]),
+        exec: crate::caveats::Scope::only(["git".to_string()]),
+        net: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+    let cmd = format!("git worktree add -q {} -b task", wt.display());
+    let envelope = super::shell::dispatch_bridled_shell(
+        serde_json::json!({"cmd": cmd, "cwd": main.to_string_lossy()}),
+        &session,
+        None,
+    )
+    .await
+    .expect("dispatch");
+    assert_eq!(
+        envelope["sandbox_kind"], "landlock",
+        "must be kernel-confined: {envelope}"
+    );
+    assert_eq!(
+        envelope["exit_code"], 0,
+        "git worktree add must succeed under a git-only exec grant: {envelope}"
+    );
+    assert!(
+        wt.join("seed").exists(),
+        "the new worktree must actually be checked out"
+    );
+}
+
 /// Item 2(b): the widening is scoped to the ONE dispatch — the SESSION
 /// `fs_write` scope itself still does not permit the common dir's
 /// `objects/`, so a file tool (`write_file`/`delete_file`) stays refused.
