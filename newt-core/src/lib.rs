@@ -9,6 +9,8 @@ pub mod agentic;
 pub mod agents;
 pub mod api_surface;
 pub mod artifact;
+#[cfg(feature = "ast")]
+pub mod ast_outline;
 pub mod atomic_fs;
 pub mod attempts;
 pub mod attribution;

@@ -166,6 +166,12 @@ rusqlite.workspace = true
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
 pyo3 = { workspace = true, optional = true }
+# `ast` feature (#2557): compiled-in tree-sitter + tags, Rust grammar only.
+# Vendors C (tree-sitter's runtime + tree-sitter-rust's grammar, both built
+# via `cc`) — opt-in so the default build stays C-free.
+tree-sitter = { version = "0.27", optional = true }
+tree-sitter-tags = { version = "0.27", optional = true }
+tree-sitter-rust = { version = "0.24.2", optional = true }
 
 [target."cfg(windows)".dependencies]
 # Held directory identity for managed build scratch; already used by ignore.
@@ -216,6 +222,11 @@ test-util = []
 #   cargo test -p newt-core --features macos-seatbelt --test macos_seatbelt_adversarial -- --ignored --test-threads=1
 # Forwarding to agent-bridle's own feature keeps the two names in lock-step.
 macos-seatbelt = ["agent-bridle/macos-seatbelt"]
+# Tree-sitter outlines for aged `read_file` results (#2557). Off by default:
+# tree-sitter + tree-sitter-rust vendor C, compiled via `cc`, which adds
+# build cost the default build doesn't pay. Rust-only grammar for now; a
+# non-Rust file falls back to no outline rather than a regex approximation.
+ast = ["dep:tree-sitter", "dep:tree-sitter-tags", "dep:tree-sitter-rust"]
 
 # The shared pty harness for the real-resource tier (#1410) — replaces the
 # byte-identical copy `tty::pty_notice_test` used to carry. It is libc-only ON
