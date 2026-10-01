@@ -131,17 +131,23 @@ async fn blocked_live_sink_cannot_delay_host_timeout() {
         )
         .await
     });
-    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(1)))
-        .await
-        .unwrap()
-        .expect("renderer entered its blocking write");
+    tokio::task::spawn_blocking(move || {
+        crate::test_guard::recv_guarded(&entered_rx, "the renderer entering its blocking write");
+    })
+    .await
+    .unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), run).await;
-    if outcome.is_err() {
-        let _ = release_tx.send(());
-        panic!("blocked presentation defeated the host timeout");
-    }
-    let run = outcome.unwrap().unwrap().unwrap();
+    // The 100 ms host timeout firing is the event under test; a presentation
+    // that defeated it would hold `run` until `release_tx`, i.e. forever,
+    // which is what the shared hang guard names. The former 1 s budget also
+    // covered spawning `sh` under load, and failed on that alone.
+    let run = crate::test_guard::hang_guarded(
+        "the host timeout firing while the sink is blocked (a blocked presentation must not defeat it)",
+        run,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(run.timed_out);
     assert_eq!(run.exit_code, 124);
 
@@ -179,27 +185,30 @@ async fn blocked_live_sink_cannot_backpressure_host_pipe_capture() {
     });
     let mut session = LiveOutputSession::start(Some(sink)).unwrap();
     let relay = session.relay();
+    // The host timeout is the only hang guard here, so it is the shared one:
+    // the regression (a drain blocked behind the sink stalls the child on a
+    // full pipe) reads as `timed_out`, and nothing shorter is needed to see
+    // it. A 5 s ceiling plus a 2 s outer budget read a loaded box as the bug.
     let run = tokio::spawn(async move {
         host_shell_output_with_timeout(
             "head -c 262144 /dev/zero",
             ".",
             Some(relay),
-            std::time::Duration::from_secs(5),
+            crate::test_guard::HANG_GUARD,
         )
         .await
     });
-    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(1)))
-        .await
-        .unwrap()
-        .expect("renderer entered its blocking write");
+    tokio::task::spawn_blocking(move || {
+        crate::test_guard::recv_guarded(&entered_rx, "the renderer entering its blocking write");
+    })
+    .await
+    .unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
-    if outcome.is_err() {
-        let _ = release_tx.send(());
-        panic!("blocked presentation backpressured host pipe capture");
-    }
-    let run = outcome.unwrap().unwrap().unwrap();
-    assert!(!run.timed_out);
+    let run = run.await.unwrap().unwrap();
+    assert!(
+        !run.timed_out,
+        "blocked presentation backpressured host pipe capture"
+    );
     assert_eq!(run.exit_code, 0);
     assert_eq!(run.stdout.len(), 262_144);
 
@@ -222,25 +231,39 @@ async fn host_bypass_publishes_output_before_command_completion() {
         fn abandon(&self, _generation: u64) {}
     }
 
+    // The command blocks on a FIFO until this test releases it, so "the live
+    // chunk arrived before the command completed" is an ordering the test
+    // controls, not a 200 ms `sleep` window it hopes to win under load.
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let gate_c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the path is NUL-terminated; mkfifo does not retain it.
+    assert_eq!(unsafe { libc::mkfifo(gate_c.as_ptr(), 0o600) }, 0);
+    let command = format!("printf ready; cat {}; printf done", gate.display());
+
     let (tx, rx) = std::sync::mpsc::channel();
     let sink = std::sync::Arc::new(ChannelOutput(tx));
     let session = LiveOutputSession::start(Some(sink)).unwrap();
     let relay = session.relay();
-    let handle = tokio::spawn(async move {
-        host_shell_output("printf ready; sleep 0.2; printf done", ".", Some(relay)).await
-    });
+    let handle = tokio::spawn(async move { host_shell_output(&command, ".", Some(relay)).await });
 
-    let first =
-        tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(2)))
-            .await
-            .unwrap()
-            .expect("first live host-shell chunk");
+    let first = tokio::task::spawn_blocking(move || {
+        crate::test_guard::recv_guarded(&rx, "the first live host-shell chunk")
+    })
+    .await
+    .unwrap();
     assert_eq!(first, b"ready");
     assert!(
         !handle.is_finished(),
         "command completed before its live chunk"
     );
 
+    // Release the gate: the writer's open completes once `cat` holds the read
+    // end, and the close is `cat`'s EOF.
+    tokio::task::spawn_blocking(move || std::fs::write(gate, b""))
+        .await
+        .unwrap()
+        .unwrap();
     let run = handle.await.unwrap().unwrap();
     assert_eq!(run.stdout, b"readydone");
     assert_eq!(run.exit_code, 0);

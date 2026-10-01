@@ -61,21 +61,21 @@ async fn assert_pending_summary_is_cancelled(
         }
     };
     tokio::pin!(future);
-    // First prove the actual compressor called the pending summarizer, then
-    // time only cancellation acknowledgement, not unrelated fixture startup.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // First prove the actual compressor called the pending summarizer (the
+    // `Notify` is the event; the select's other arm turns the wrong path into
+    // a panic), then that cancellation drops it. No clock decides either.
+    crate::test_guard::hang_guarded("the summary starting", async {
         tokio::select! {
             _ = started.notified() => {}
             result = &mut future => panic!("loop exited before summary readiness: {result:?}"),
         }
     })
-    .await
-    .expect("summary must start");
+    .await;
     cancel.store(true, Ordering::SeqCst);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut future)
-        .await
-        .expect("interrupt must drop the pending summarizer")
-        .expect("interrupt is a normal turn exit");
+    let result =
+        crate::test_guard::hang_guarded("the interrupt dropping the summarizer", &mut future)
+            .await
+            .expect("interrupt is a normal turn exit");
     assert!(result.0.is_empty());
     assert!(
         dropped.load(Ordering::SeqCst),

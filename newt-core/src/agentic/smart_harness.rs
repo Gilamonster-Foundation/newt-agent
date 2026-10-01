@@ -1,7 +1,11 @@
 //! The inference adapter for the reusable, content-addressed harness policy.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// tokio's `Instant`, not std's: identical in production, but it follows the
+// paused test clock (`tokio::time::pause`), so the auxiliary and navigation
+// timers below are exercised without a test waiting on real time.
+use tokio::time::Instant;
 
 use agent_harness::{Session, Verdict};
 use content_addressable::ContentId;
@@ -1519,19 +1523,17 @@ mod tests {
                 decode_openai_response,
             ),
         ));
-        tokio::time::timeout(Duration::from_secs(30), async {
+        crate::test_guard::hang_guarded("the partial response reaching the reader", async {
             tokio::select! {
                 _ = delivered_rx => {},
                 result = &mut completion => panic!("unfinished response resolved: {result:?}"),
             }
         })
-        .await
-        .expect("the partial response must reach the reader");
+        .await;
         cancel.store(true, Ordering::Relaxed);
         assert!(completion.await.is_none());
-        tokio::time::timeout(Duration::from_secs(30), server)
+        crate::test_guard::hang_guarded("the server observing cancellation", server)
             .await
-            .expect("the server must observe cancellation")
             .unwrap();
 
         {
@@ -1687,7 +1689,10 @@ mod tests {
             .is_empty());
     }
 
-    #[tokio::test]
+    /// Paused clock: the 1 ms auxiliary timeout fires because tokio advances
+    /// its own clock to the deadline the moment the never-resolving completer
+    /// leaves the runtime idle, not because a millisecond of real time passed.
+    #[tokio::test(start_paused = true)]
     async fn auxiliary_timeout_and_cancellation_are_bounded_and_recorded() {
         let settings = AdjudicationSettings {
             timeout_ms: 1,

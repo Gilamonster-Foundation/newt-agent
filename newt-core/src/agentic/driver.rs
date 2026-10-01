@@ -580,22 +580,38 @@ impl TurnDriver {
             return TurnStatus::Idle;
         };
         match in_flight.rx.try_recv() {
-            Ok(Ok(outcome)) => {
+            Ok(result) => self.settle(Some(result)),
+            Err(oneshot::error::TryRecvError::Empty) => TurnStatus::Running,
+            Err(oneshot::error::TryRecvError::Closed) => self.settle(None),
+        }
+    }
+
+    /// Await the in-flight turn's completion, then settle it exactly as
+    /// [`poll`](Self::poll) would. For a consumer with nothing to draw between
+    /// frames (headless runs, tests) this replaces a `poll` + sleep loop: the
+    /// worker's result wakes this future, so no interval and no deadline is
+    /// involved. [`TurnStatus::Idle`] when nothing is in flight; never
+    /// [`TurnStatus::Running`].
+    pub async fn wait(&mut self) -> TurnStatus {
+        let Some(in_flight) = self.in_flight.as_mut() else {
+            return TurnStatus::Idle;
+        };
+        let result = (&mut in_flight.rx).await.ok();
+        self.settle(result)
+    }
+
+    /// Record the worker's final word. `None` means the worker ended without
+    /// sending (it was aborted, or panicked).
+    fn settle(&mut self, result: Option<Result<TurnOutcome, String>>) -> TurnStatus {
+        self.in_flight = None;
+        match result {
+            Some(Ok(outcome)) => {
                 self.transcript
                     .push(MemMessage::assistant(outcome.reply.clone()));
-                self.in_flight = None;
                 TurnStatus::Completed(Box::new(outcome))
             }
-            Ok(Err(err)) => {
-                self.in_flight = None;
-                TurnStatus::Failed(err)
-            }
-            Err(oneshot::error::TryRecvError::Empty) => TurnStatus::Running,
-            Err(oneshot::error::TryRecvError::Closed) => {
-                // The task ended without sending (it was aborted, or panicked).
-                self.in_flight = None;
-                TurnStatus::Failed("turn task ended without a result".to_string())
-            }
+            Some(Err(err)) => TurnStatus::Failed(err),
+            None => TurnStatus::Failed("turn task ended without a result".to_string()),
         }
     }
 
@@ -989,27 +1005,52 @@ mod tests {
         assert_eq!(seeded.runtime.initiative, Initiative::Patient);
     }
 
-    /// Pump the driver to completion the way a crossterm loop would: poll on an
-    /// interval until the turn resolves, never blocking the "frame".
+    /// Pump the driver to completion: one non-blocking `poll()` (the frame a
+    /// crossterm loop would draw), then await the worker's result itself.
     ///
-    /// The budget is a WALL-CLOCK deadline, not a poll count. It used to be 600
-    /// polls at 10 ms, which reads like six seconds but is really "600 polls
-    /// plus however long 600 `poll()` calls take" — and under `cargo llvm-cov`
-    /// instrumentation the turns that do a real mock-server round trip, take a
-    /// 400, compact, and retry ran past it. That made the test fail by machine
-    /// speed rather than by behaviour.
-    ///
-    /// A deadline says what is meant: no turn here should take 30 s, and one
-    /// that does is hung, which is what this guard exists to catch.
+    /// No clock decides this. It used to be 600 polls at 10 ms, then a 30 s
+    /// wall-clock deadline, and each failed by machine speed rather than by
+    /// behaviour: the deadline panicked here under a 32-thread nextest run
+    /// beside a build, where a turn that takes a second at idle took over a
+    /// minute. The worker's oneshot is the event; the only time left is the
+    /// shared hang guard, which a completing turn cannot reach.
     async fn pump_to_done(driver: &mut TurnDriver) -> TurnStatus {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while std::time::Instant::now() < deadline {
-            match driver.poll() {
-                TurnStatus::Running => tokio::time::sleep(Duration::from_millis(10)).await,
-                other => return other,
-            }
+        match driver.poll() {
+            TurnStatus::Running => {}
+            settled => return settled,
         }
-        panic!("turn did not complete within the 30s pump budget");
+        crate::test_guard::hang_guarded("the driven turn", driver.wait()).await
+    }
+
+    /// `poll` settles whatever the worker's oneshot carries, exactly once, and
+    /// with no worker thread in the picture: the channel is the whole seam.
+    /// A dropped sender (the worker died without a word) is a failure too.
+    #[tokio::test]
+    async fn poll_settles_the_oneshot_once() {
+        let mut driver = TurnDriver::new(cfg("http://placeholder"));
+        let (tx, rx) = oneshot::channel();
+        driver.in_flight = Some(InFlight {
+            handle: std::thread::spawn(|| {}),
+            rx,
+            cancel_tx: None,
+        });
+        assert!(matches!(driver.poll(), TurnStatus::Running));
+        tx.send(Err("boom".to_string())).unwrap();
+        assert!(matches!(driver.poll(), TurnStatus::Failed(e) if e == "boom"));
+        assert!(matches!(driver.poll(), TurnStatus::Idle));
+
+        let (tx, rx) = oneshot::channel::<Result<TurnOutcome, String>>();
+        driver.in_flight = Some(InFlight {
+            handle: std::thread::spawn(|| {}),
+            rx,
+            cancel_tx: None,
+        });
+        drop(tx);
+        assert!(matches!(
+            driver.wait().await,
+            TurnStatus::Failed(e) if e == "turn task ended without a result"
+        ));
+        assert!(matches!(driver.wait().await, TurnStatus::Idle));
     }
 
     #[tokio::test]
@@ -1780,12 +1821,13 @@ mod tests {
     #[tokio::test]
     async fn second_submit_while_running_is_busy() {
         let server = MockServer::start().await;
+        // No delay is needed: `submit` marks the turn in flight before it
+        // returns, so the second submit below is rejected regardless of how
+        // fast the server answers.
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            // Delay so the first turn is reliably still in flight.
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(200))
                     .set_body_json(serde_json::json!({ "message": { "content": "slow" } })),
             )
             .mount(&server)

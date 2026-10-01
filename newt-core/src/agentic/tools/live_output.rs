@@ -465,6 +465,7 @@ pub(super) fn mark_live_output_complete(completion: &LiveOutputCompletion) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_guard::{recv_guarded, HANG_GUARD};
 
     // The shared fake sink stays in the parent's test mod (the `find`
     // live-stream tests use it too); a child module may reach it.
@@ -744,17 +745,15 @@ mod tests {
             let session = LiveOutputSession::start(Some(creator_sink)).expect("live session");
             let _ = created_tx.send(session);
         });
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("presentation worker entered start");
-        let session = match created_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(session) => session,
-            Err(error) => {
-                let _ = release_tx.send(());
-                creator.join().unwrap();
-                panic!("arbitrary sink startup blocked tool execution: {error}");
-            }
-        };
+        recv_guarded(&entered_rx, "the presentation worker entering start");
+        // The sink's `start` is held until `release_tx` fires below, so the
+        // session arriving at all proves startup did not block tool execution;
+        // a session that waited on the sink would never arrive.
+        let session = recv_guarded(
+            &created_rx,
+            "LiveOutputSession::start returning while the sink's start is held \
+             (arbitrary sink startup must not block tool execution)",
+        );
         creator.join().unwrap();
         let relay = session.relay();
         relay.write(crate::agentic::ToolOutputStream::Stdout, b"queued");
@@ -765,7 +764,7 @@ mod tests {
 
         release_tx.send(()).unwrap();
         assert!(
-            relay.wait_finished(std::time::Duration::from_secs(1)),
+            relay.wait_finished(HANG_GUARD),
             "worker did not close after blocked startup returned"
         );
         assert_eq!(sink.writes.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -811,9 +810,10 @@ mod tests {
             .write(crate::agentic::ToolOutputStream::Stdout, b"ignored");
         session.finish();
 
-        abandoned_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("startup panic invalidated its generation");
+        recv_guarded(
+            &abandoned_rx,
+            "the startup panic invalidating its generation",
+        );
     }
 
     #[test]
@@ -855,8 +855,9 @@ mod tests {
         });
         let mut session = LiveOutputSession::start(Some(sink)).unwrap();
         let relay = session.relay();
+        let writer_relay = relay.clone();
         let writer = std::thread::spawn(move || {
-            relay.write(crate::agentic::ToolOutputStream::Stdout, b"held");
+            writer_relay.write(crate::agentic::ToolOutputStream::Stdout, b"held");
         });
         entered_rx.recv().unwrap();
         let (returned_tx, returned_rx) = std::sync::mpsc::channel();
@@ -865,12 +866,17 @@ mod tests {
             let _ = returned_tx.send(());
         });
 
-        returned_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("session finish must not wait forever on an arbitrary observer callback");
-        abandoned_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("timed-out teardown invalidates the generation before returning");
+        // `finish` returning while the write is still held is the property;
+        // it does so after its own bounded wait, which is production's clock,
+        // not this test's.
+        recv_guarded(
+            &returned_rx,
+            "session finish returning while an observer callback is held",
+        );
+        recv_guarded(
+            &abandoned_rx,
+            "timed-out teardown invalidating the generation before returning",
+        );
         assert!(
             finished_rx.try_recv().is_err(),
             "timed-out teardown must not queue a late terminal erase"
@@ -878,10 +884,11 @@ mod tests {
         release_tx.send(()).unwrap();
         writer.join().unwrap();
         finisher.join().unwrap();
+        // The worker's exit is the event; only then is "it never finished" a
+        // proof rather than a hope that it ran within some window.
+        assert!(relay.wait_finished(HANG_GUARD), "worker did not exit");
         assert!(
-            finished_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
+            finished_rx.try_recv().is_err(),
             "worker erased the generation after canonical rendering could resume"
         );
     }
@@ -940,12 +947,11 @@ mod tests {
             let _ = returned_tx.send(());
         });
 
-        finish_entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("worker entered finish");
-        returned_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("bounded teardown returned after invalidating the generation");
+        recv_guarded(&finish_entered_rx, "the worker entering finish");
+        recv_guarded(
+            &returned_rx,
+            "bounded teardown returning after invalidating the generation",
+        );
         assert!(
             !sink
                 .generation_valid
@@ -954,7 +960,7 @@ mod tests {
         );
 
         release_finish_tx.send(()).unwrap();
-        assert!(relay.wait_finished(std::time::Duration::from_secs(1)));
+        assert!(relay.wait_finished(HANG_GUARD));
         finisher.join().unwrap();
         assert!(
             !sink.erased.load(std::sync::atomic::Ordering::Acquire),
@@ -1031,18 +1037,17 @@ mod tests {
             std::thread::yield_now();
         }
         release_first_tx.send(()).unwrap();
-        held_entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("finishing worker drained the next queued write");
-        returned_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("finish cancels after its bounded wait");
+        recv_guarded(
+            &held_entered_rx,
+            "the finishing worker draining the next queued write",
+        );
+        recv_guarded(&returned_rx, "finish cancelling after its bounded wait");
         release_held_tx.send(()).unwrap();
         finisher.join().unwrap();
+        // Await the worker's exit, then the absence of `finish` is a fact.
+        assert!(relay.wait_finished(HANG_GUARD), "worker did not exit");
         assert!(
-            finished_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
+            finished_rx.try_recv().is_err(),
             "cancelled queue drain must not finish after the bounded handoff"
         );
 
@@ -1082,8 +1087,9 @@ mod tests {
             .write(crate::agentic::ToolOutputStream::Stdout, b"panic");
         session.finish();
 
-        abandoned_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("panic teardown abandoned the live generation");
+        recv_guarded(
+            &abandoned_rx,
+            "the panic teardown abandoning the live generation",
+        );
     }
 }

@@ -98,6 +98,46 @@ const ENV_KEYS: &[&str] = &[
     crate::event_journal::JOURNAL_PATH_ENV,
 ];
 
+/// How long a test may wait on an event before the test is declared hung.
+///
+/// This is a HANG GUARD, not a budget, and the distinction is the whole rule
+/// (the operator's, 2026-10-01: wall-clock decides nothing diagnostic). A test
+/// completes when the event it awaits arrives — a oneshot, a channel, a socket
+/// closing — never when a clock says so. The guard exists so a broken arm that
+/// never produces its event fails instead of wedging the suite, and it is set
+/// where no machine, however loaded, reaches it: measured on 2026-10-01, a
+/// 32-thread nextest run beside a build stretched one-second tests past a
+/// minute and broke every 30 s "budget" in the unit tier.
+///
+/// Never combine it with `tokio::time::pause()` while the awaited event comes
+/// from another OS thread or a socket: a paused clock auto-advances when the
+/// runtime idles and would fire the guard at once.
+pub const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Await `fut`, panicking (naming `what`) if it is still pending after
+/// [`HANG_GUARD`]. The assertion is the awaited event; this only names a hang.
+pub async fn hang_guarded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    match tokio::time::timeout(HANG_GUARD, fut).await {
+        Ok(out) => out,
+        Err(_) => panic!(
+            "hung: {what} produced no result within the {}s hang guard",
+            HANG_GUARD.as_secs()
+        ),
+    }
+}
+
+/// The blocking twin of [`hang_guarded`] for a `std::sync::mpsc` receiver: the
+/// sent value is the event, and only a hang is named.
+pub fn recv_guarded<T>(rx: &std::sync::mpsc::Receiver<T>, what: &str) -> T {
+    match rx.recv_timeout(HANG_GUARD) {
+        Ok(value) => value,
+        Err(error) => panic!(
+            "hung: {what} produced no result within the {}s hang guard ({error})",
+            HANG_GUARD.as_secs()
+        ),
+    }
+}
+
 /// Exclusive access to the process-global operator settings for the duration of a
 /// test. Snapshots cognition + tenacity + initiative + the relevant env on `acquire`, restores
 /// them on `drop` — even through a panic or assertion failure.

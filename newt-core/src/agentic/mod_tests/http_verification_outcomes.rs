@@ -489,24 +489,45 @@ async fn a_pass_goes_stale_on_a_write_but_not_on_a_read_only_command() {
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
 async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
+    // The check reports that it is running: `sh` opens the FIFO for writing,
+    // which blocks until this test opens it for reading, so the read returning
+    // is a happens-before for "the interrupt lands while the check runs". The
+    // former 300 ms sleep bet that round 1 and the spawn were done by then,
+    // and lost under load. The FIFO lives in the workspace so the shell's
+    // fence lets the check open it.
+    let ws = tempfile::TempDir::new().unwrap();
+    let fifo = ws.path().join("running");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the path is NUL-terminated; mkfifo does not retain it.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let slow: &'static str =
+        Box::leak(format!("sh -c 'echo > {}; sleep 5'", fifo.display()).into_boxed_str());
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let setter = flag.clone();
-    let interrupt = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let interrupt = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::read(&fifo);
         setter.store(true, Ordering::SeqCst);
     });
-    const SLOW: &str = "sh -c 'sleep 5'";
-    let run = run_script(
-        "openai",
-        true,
-        true,
-        SLOW,
-        &[Step::Run(SLOW)],
-        Some(&flag),
-        8,
+    let task = instruction(slow);
+    let run = crate::test_guard::hang_guarded(
+        "the interrupted turn",
+        run_turn(Turn {
+            wire: "openai",
+            smart: true,
+            outcomes: true,
+            check: slow,
+            script: &[Step::Run(slow)],
+            cancel: Some(&flag),
+            max_tool_rounds: 8,
+            caveats: Caveats::top(),
+            env: &[],
+            workspace_task: Some((ws.path(), &task)),
+        }),
     )
     .await;
-    interrupt.await.unwrap();
+    crate::test_guard::hang_guarded("the check reporting that it ran", interrupt)
+        .await
+        .unwrap();
     assert_eq!(run.reason, "cancelled");
     assert_eq!(
         run.bodies.len(),
@@ -844,12 +865,14 @@ async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget
         },
         ..Default::default()
     });
-    let run = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+    // A deadlock in the nested settings scope is a hang, which the shared
+    // guard names; five wiremock rounds plus four shell spawns under load are
+    // not a deadlock, and a 30 s budget called them one.
+    let run = crate::test_guard::hang_guarded(
+        "the nested settings scope (a deadlock would hang here)",
         run("openai", false, true, FAILING_CHECK),
     )
-    .await
-    .expect("the current-thread nested settings scope must not deadlock");
+    .await;
     assert_eq!(crate::initiative::installed_no_progress().stop_after, 2);
     assert_eq!(run.reason, "repair_exhausted");
     let signals = run

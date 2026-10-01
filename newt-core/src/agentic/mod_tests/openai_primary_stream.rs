@@ -1,6 +1,7 @@
 //! Primary streaming dispatch, distinct from the final display reissue.
 use super::*;
 use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
+use crate::test_guard::hang_guarded;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -364,20 +365,18 @@ async fn cancelled_stream_with_a_complete_tool_call_dispatches_nothing() {
     context.permission_gate = Some(&mut permission);
     let mut tools = FixtureTools::default();
     let mut completion = Box::pin(chat_complete(context, &mut tools));
-    let request = tokio::time::timeout(Duration::from_secs(30), async {
+    let request = hang_guarded("the complete tool-call frame reaching the client", async {
         tokio::select! {
             request = delivered_rx => request.unwrap(),
             result = &mut completion => panic!("unfinished response resolved: {result:?}"),
         }
     })
-    .await
-    .expect("the complete tool-call frame must reach the client");
+    .await;
     assert_eq!(request["stream"], true);
 
     cancel.store(true, Ordering::Relaxed);
-    let (reply, _, _, _) = tokio::time::timeout(Duration::from_secs(30), &mut completion)
+    let (reply, _, _, _) = hang_guarded("cancellation dropping the response body", &mut completion)
         .await
-        .expect("cancellation must drop the response body")
         .expect("cancellation is a clean turn outcome");
     assert!(reply.is_empty());
     drop(completion);
@@ -527,20 +526,18 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         crate::retry::RESPONSE_BYTES_READ
             .scope(consumed.clone(), chat_complete(context, &mut tools)),
     );
-    let request = tokio::time::timeout(Duration::from_secs(5), async {
+    let request = hang_guarded("the generation beginning", async {
         tokio::select! {
             request = started_rx => request.unwrap(),
             result = &mut completion => panic!("stream ended before its first frame: {result:?}"),
         }
     })
-    .await
-    .expect("the generation must begin");
+    .await;
     assert_eq!(request["stream"], true);
 
     tokio::time::pause();
     let mut expected = 0;
     let mut completed = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     for (index, frame) in FRAMES.iter().enumerate() {
         if index > 0 {
             tokio::time::advance(Duration::from_millis(400)).await;
@@ -552,10 +549,6 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         // time again. Yield stays runnable, preventing paused-time auto-advance
         // while the real socket's readiness notification catches up.
         while consumed.load(Ordering::SeqCst) < expected || index == FRAMES.len() - 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "client did not consume stream frame {index}"
-            );
             tokio::select! {
                 biased;
                 result = &mut completion => {
@@ -706,30 +699,26 @@ async fn cancellation_case(set_flag: bool, cap_summary: bool, measured: bool) {
     }
     let mut tools = NoMcp;
     let mut completion = Box::pin(chat_complete(context, &mut tools));
-    let request = tokio::time::timeout(Duration::from_secs(5), async {
+    let request = hang_guarded("the generation reaching the server", async {
         tokio::select! {
             request = reading => request.unwrap(),
             result = &mut completion => panic!("unfinished response resolved: {result:?}"),
         }
     })
-    .await
-    .expect("the generation must reach the server");
+    .await;
     let result = if set_flag {
         cancel.store(true, Ordering::Relaxed);
-        Some(tokio::time::timeout(Duration::from_secs(5), &mut completion).await)
+        Some(hang_guarded("the cancel flag interrupting the read", &mut completion).await)
     } else {
         None
     };
     drop(completion);
-    let measurement = tokio::time::timeout(Duration::from_secs(5), server)
+    let measurement = hang_guarded("the server observing socket closure", server)
         .await
-        .expect("server must observe socket closure")
         .unwrap();
     // Clean up before asserting on either streaming generation path.
     if let Some(result) = result {
-        let (reply, _, _, _) = result
-            .expect("cancel flag must interrupt send and body read")
-            .unwrap();
+        let (reply, _, _, _) = result.unwrap();
         assert!(reply.is_empty());
     }
     assert_eq!(request["stream"], true);
@@ -785,7 +774,7 @@ async fn provider_http_status_survives_a_truncated_response_body() {
             socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 128\r\nConnection: close\r\n\r\nfixture provider failure").as_bytes()).await.unwrap();
             socket.shutdown().await.unwrap();
         });
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let result = hang_guarded("the truncated body ending the read", async {
             let response = reqwest::Client::new()
                 .post(uri)
                 .json(&json!({}))
@@ -794,8 +783,7 @@ async fn provider_http_status_survives_a_truncated_response_body() {
                 .unwrap();
             crate::agentic::smart_harness::response(response, None, "inference endpoint").await
         })
-        .await
-        .unwrap();
+        .await;
         server.await.unwrap();
         let error = result.unwrap_err();
         assert_eq!(crate::retry::classify(&error), expected, "{error}");
@@ -896,9 +884,8 @@ async fn successful_stream_idle_timeout_is_retryable_and_typed_timeout() {
     )
     .await
     .unwrap_err();
-    tokio::time::timeout(Duration::from_secs(5), server)
+    hang_guarded("the server observing the idle timeout", server)
         .await
-        .expect("the server must observe the idle timeout")
         .unwrap();
     assert_eq!(
         crate::retry::classify(&error),
@@ -986,17 +973,17 @@ async fn observed_context_error_survives_core_idle_timeout(cap_summary: bool) {
     if cap_summary {
         context.max_tool_rounds = 0;
     }
-    let result =
-        tokio::time::timeout(Duration::from_secs(10), chat_complete(context, &mut NoMcp)).await;
-    let socket_closed = tokio::time::timeout(Duration::from_secs(5), closure).await;
+    let result = hang_guarded(
+        "the retained rejection ending the phase",
+        chat_complete(context, &mut NoMcp),
+    )
+    .await;
+    let socket_closed = hang_guarded("the idle timeout closing the socket", closure).await;
     server.abort();
     if let Err(error) = server.await {
         assert!(error.is_cancelled(), "fixture server failed: {error}");
     }
-    socket_closed
-        .expect("the generation idle timeout must close the socket")
-        .expect("the peer must observe the close");
-    let result = result.expect("the retained rejection must end the optional/irreducible phase");
+    socket_closed.expect("the peer must observe the close");
     if cap_summary {
         let (reply, _, _, _) = result.expect("a failed optional summary retains the cap fallback");
         assert!(reply.contains("tool-round limit (0"), "{reply}");
