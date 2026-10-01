@@ -76,12 +76,25 @@ impl LiveOutputRelay {
 
     pub(super) fn cancel(&self) {
         use std::sync::atomic::Ordering;
-        let changed = self
-            .phase
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| {
-                (phase != LIVE_OUTPUT_CLOSED).then_some(LIVE_OUTPUT_CANCELLED)
-            })
-            .is_ok();
+        // `AtomicU8::fetch_update` is deprecated since Rust 1.99 in favour of
+        // `try_update`, which exists only from 1.95; the declared MSRV is 1.90,
+        // so this is `fetch_update`'s own compare-exchange loop, spelled out:
+        // move to CANCELLED from any phase but CLOSED.
+        let mut phase = self.phase.load(Ordering::Acquire);
+        let changed = loop {
+            if phase == LIVE_OUTPUT_CLOSED {
+                break false;
+            }
+            match self.phase.compare_exchange_weak(
+                phase,
+                LIVE_OUTPUT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => phase = actual,
+            }
+        };
         if changed {
             let _ = self.sender.try_send(LiveOutputDispatch::Wake);
         }

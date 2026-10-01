@@ -51,12 +51,22 @@ impl RunAllowance {
     /// the same shared budget without needing the ledger machinery a primary
     /// attempt's audit trail requires.
     pub fn try_reserve(&self) -> Result<(), RunAllowanceExhausted> {
-        self.remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .map(|_| ())
-            .map_err(|_| RunAllowanceExhausted)
+        // `AtomicU32::fetch_update` is deprecated since Rust 1.99 in favour of
+        // `try_update`, which exists only from 1.95; the declared MSRV is 1.90,
+        // so this is `fetch_update`'s own compare-exchange loop, spelled out.
+        let mut remaining = self.remaining.load(Ordering::Relaxed);
+        loop {
+            let next = remaining.checked_sub(1).ok_or(RunAllowanceExhausted)?;
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => remaining = actual,
+            }
+        }
     }
 }
 
@@ -87,10 +97,11 @@ mod tests {
 
     #[test]
     fn two_racing_reservations_on_a_budget_of_one_give_exactly_one_success() {
-        // Deterministic stand-in for concurrency: fetch_update is the atomic
-        // primitive that would make this true under real concurrent access
-        // too, since it retries on a concurrent modification rather than
-        // reading remaining() and deciding non-atomically.
+        // Deterministic stand-in for concurrency: the compare-exchange loop in
+        // try_reserve is the atomic primitive that would make this true under
+        // real concurrent access too, since it retries on a concurrent
+        // modification rather than reading remaining() and deciding
+        // non-atomically.
         let allowance = RunAllowance::new(1);
         let first = allowance.try_reserve();
         let second = allowance.try_reserve();
