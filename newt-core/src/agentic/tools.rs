@@ -61,9 +61,9 @@ mod shell;
 #[cfg(all(test, unix))]
 mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
-pub use shell::venv_cmd_prefix;
 #[cfg(test)]
-pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
+pub(crate) use shell::absent_binary_refusal;
+pub use shell::venv_cmd_prefix;
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,

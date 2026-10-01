@@ -1405,12 +1405,12 @@ pub(super) fn confined_result(
     // `rg … | head` exits 0 and a live run showed only brush's bare
     // `command not found: rg`. Keep the output, and name the absence too.
     let absent = absent_program_note(envelope, &caveats.exec);
-    // #2273: a 126 with no structured denial whose program sits
-    // outside the fs-read grant is the KERNEL refusing, not a
-    // chmod the model forgot. Same structured test, one more state.
-    if let Some(refusal) = kernel_refused_binary(cmd, envelope, caveats) {
-        return (refusal, ExecOutcome::Denied);
-    }
+    // #2273 → #2629 round 2: a 126 with no structured denial gets a note that
+    // a refusal MAY have happened and that the target and axis are unknown.
+    // It is not classified as a denial and names no grant; see
+    // [`unstructured_exit_126_note`] for why the renderer it replaces could
+    // not be trusted to.
+    let unstructured_126 = unstructured_exit_126_note(envelope);
     // #2629 (revised): a child exec the sandbox refused (e.g. git's own
     // `fatal: cannot exec 'branch': Permission denied`) is neither 126 nor 127
     // at the TOP level — the parent ran fine, only its internal spawn of a
@@ -1430,6 +1430,9 @@ pub(super) fn confined_result(
     if let Some(note) = absent {
         text.push('\n');
         text.push_str(&note);
+    }
+    if let Some(note) = unstructured_126 {
+        text.push_str(note);
     }
     if outcome == ExecOutcome::TimedOut {
         text.push_str(&timed_out_note(dispatch_wall(cmd)));
@@ -2088,11 +2091,15 @@ pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<
 /// (resolved {canon}) is not within the granted fs_{op} scope"`, or `"{op} of
 /// {path:?} denied: cannot canonicalize (…)"` when no ancestor resolves; `op`
 /// is `read` or `write`. This is the leash's structured `reason` field, not
-/// child stderr. The VERB decides, because it precedes the model's own path
-/// text; the suffix, when present, must agree (a path spelled `…/fs_write…`
-/// in a read refusal must not steer the axis). Anything else (`/dev/fd`
+/// child stderr — but it IS text matching on a library-generated string, not
+/// a typed field: bridle's `Denial` is `{kind, target, reason}` and carries no
+/// axis for `open` (vendored `envelope.rs`). Kept as narrow as that string
+/// allows: the VERB decides, because it precedes the model's own path text;
+/// the suffix, when present, must agree (a path spelled `…/fs_write…` in a
+/// read refusal must not steer the axis). Anything else (`/dev/fd`
 /// reservations, the fail-closed no-caveats default, a cancelled run) names
-/// no axis and stays ungrantable.
+/// no axis and stays ungrantable. If bridle ever exposes the axis as a field,
+/// read that and delete this.
 fn open_denial_axis(reason: &str) -> Option<&'static str> {
     let reason = reason.strip_prefix("denied: ").unwrap_or(reason);
     let reason = reason.trim_end_matches('.');
@@ -2165,12 +2172,7 @@ fn absent_program_note(
 ) -> Option<String> {
     // A structured refusal is a DENIAL, not an absence. Relabelling one as the
     // other would send the model to the wrong remedy.
-    if envelope_denied(envelope)
-        || envelope
-            .get("denials")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|d| !d.is_empty())
-    {
+    if structured_denials_present(envelope) {
         return None;
     }
 
@@ -2208,95 +2210,80 @@ pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried use
 /// same renderer/classifier drift reason as [`ABSENT_BINARY_MARKER`] (#2304).
 pub(crate) const NOT_ON_HOST_MARKER: &str = "not installed on this host";
 
-/// #2273 — the fourth state: the binary exists and no grant refused it, yet
-/// the KERNEL did, because the program lives outside the fs-read grant
-/// (`~/.cargo/bin` outside the sandbox's read scope is the issue's own
-/// transcript). brush reports it as exit 126 with `Permission denied`, which
-/// is indistinguishable from a script the model forgot to `chmod +x` — a
-/// repairable failure. The gate is STRUCTURED and reads no stderr: exit 126,
-/// no `denials`, and the resolved host path is NOT permitted by the read
-/// scope. Stderr only chooses WHICH program that path check examines — brush's
-/// own error names it first, the leading token is the fallback (see
-/// [`failed_program`]). Only then is it rendered in newt's own denial vocabulary
-/// so the guidance stops asking for an edit; an ordinary 126 inside the grant
-/// falls through untouched.
-///
-/// #2629: which ONE grant unblocks it depends on the exec axis. Under a scoped
-/// `exec` the Landlock fence handles EXECUTE and grants it only to the
-/// resolved exec roots (vendored `sandbox.rs` `exec_roots`); read roots carry
-/// read rights alone, so a kernel refusal of an interceptor-admitted program
-/// means the path was not anchored, and only the exact-path exec grant anchors
-/// it (an absolute entry lands in both the read and the execute roots). Under
-/// `exec: All` EXECUTE is ambient and the missing right is the read one, so the
-/// grant is the binary's directory on `fs_read`. The program itself is still
-/// stderr-named / argv-selected and host-verified, as #2273 chose; the hint
-/// confers no authority the model lacks.
-pub(crate) fn kernel_refused_binary(
-    cmd: &str,
-    envelope: &serde_json::Value,
-    caveats: &crate::caveats::Caveats,
-) -> Option<String> {
-    let fs_read = &caveats.fs_read;
-    if envelope
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        != Some(126)
-    {
-        return None;
-    }
-    if envelope_denied(envelope)
+/// Whether the envelope carries a structured refusal: the leash's `denied`
+/// flag or a non-empty `denials` array. Every "is this an absence / an
+/// unstructured failure?" classifier runs this first, so none of them can
+/// relabel a refusal the interceptor actually made.
+fn structured_denials_present(envelope: &serde_json::Value) -> bool {
+    envelope_denied(envelope)
         || envelope
             .get("denials")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|d| !d.is_empty())
-    {
-        return None;
-    }
-    let prog = named_program(envelope, "failed to execute command '")
-        .or_else(|| leading_program(cmd))?
-        .to_string();
-    let abs = host_path_lookup(&prog)?;
-    if crate::caveats::permits_path(fs_read, &abs) {
-        return None;
-    }
-    let dir = std::path::Path::new(&abs)
-        .parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| abs.clone());
-    // #2629: name the grant as the one `request_permissions` call that covers
-    // it, not as prose the model has no tool for ("ask the operator for …").
-    let (why, hint) = if matches!(caveats.exec, crate::caveats::Scope::Only(_)) {
-        (
-            "the kernel's execute rule does not cover this path",
-            denial_recovery_hint("exec", &abs),
-        )
-    } else {
-        (
-            "it is outside the fs-read grant",
-            denial_recovery_hint("fs_read", &dir),
-        )
-    };
-    Some(format!(
-        "capability denied: exec of {prog} at {abs} was refused by the kernel \
-         (exit 126): {why}.\n  {hint}"
-    ))
 }
 
-/// Which program brush failed on, as brush names it in its own error —
-/// `command not found: X` for 127, `failed to execute command 'X': ...` for
-/// 126. That is the authoritative answer for a compound command, where the
-/// leading token (`cd newt-core && cargo test`) is not the one that failed
-/// (#2304). The LAST occurrence wins: the exit status belongs to the command
-/// that ran last. `None` when brush named nothing: the 126 caller falls back
-/// to the leading token for its message; the 127 caller does not, because an
-/// unnamed 127 is not an absence (#2315).
+/// #2273 → #2629 round 2: exit 126 with no structured denial stays an
+/// UNSTRUCTURED failure.
+///
+/// brush exits 126 when it found a program but could not execute it. Behind
+/// the fence that is either the KERNEL refusing an exec the interceptor had
+/// admitted (`~/.cargo/bin` outside the read roots is #2273's own transcript)
+/// or an ordinary shell failure (a missing execute bit, a script without a
+/// shebang) — and the envelope cannot tell the two apart, because a kernel
+/// refusal is never recorded in `denials` (that seam is #2421). The renderer
+/// this replaces tried to tell them apart anyway: it took the program from
+/// brush's `failed to execute command '<x>'` stderr line (else the leading
+/// argv token), resolved it on the host, and when the path lay outside the
+/// read grant asserted `capability denied` and named the grant to ask for.
+/// Every one of those inputs is child-controlled — a permitted script can
+/// print that exact line and `exit 126` — so the denial and its target came
+/// from text the model, or whatever it ran, had chosen. That is the trust
+/// boundary [`envelope_denied`] holds (#2633), and a host existence or mode
+/// check authenticates neither the failed invocation nor a refusal.
+///
+/// So the note says only what the envelope proves: a refusal MAY have
+/// happened, the target and axis are unknown, and no grant is named. The
+/// child's own output stays in front of it, and the outcome is the envelope's
+/// own (`Failed`), not `Denied`. The one thing that mints a target is the
+/// leash's structured `denials`, which [`denied_run_command_result`] renders
+/// before this is reached.
+pub(super) fn unstructured_exit_126_note(envelope: &serde_json::Value) -> Option<&'static str> {
+    (envelope
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        == Some(126)
+        && !structured_denials_present(envelope))
+    .then_some(UNSTRUCTURED_EXIT_126_NOTE)
+}
+
+/// Appended to an exit-126 result that carries no structured denial. Spells
+/// out none of newt's denial vocabulary (`capability denied`, `does not
+/// permit`, `not within the granted authority`), none of the OS's
+/// (`permission denied`), and never the name of the grant tool, so
+/// `run_command_result_is_denial` grounds a denial claim only on what the
+/// CHILD printed and no consumer can read a grant request out of this note.
+pub(crate) const UNSTRUCTURED_EXIT_126_NOTE: &str = "\n(exit 126: the shell found a command but \
+    could not execute it. No structured denial was recorded, so whether the sandbox refused it is \
+    unknown, and so are the path and the axis it would have refused on; a missing execute bit or \
+    a script without a shebang exits 126 as well. Nothing here names a grant to ask for: do not \
+    infer one from the text above. Check the file's mode and interpreter line first; if both are \
+    right, report exactly what was run to the operator rather than guessing a grant.)";
+
+/// Which program brush failed on, as brush names it in its own error:
+/// `command not found: X` for 127. That is the authoritative answer for a
+/// compound command, where the leading token (`cd newt-core && cargo test`)
+/// is not the one that failed (#2304). The LAST occurrence wins: the exit
+/// status belongs to the command that ran last. `None` when brush named
+/// nothing, because an unnamed 127 is not an absence (#2315).
 ///
 /// Reading stderr is acceptable HERE and not in [`envelope_denied`] because
-/// both callers are already fenced behind the structured exit-code-and-no-
-/// denials test, and the model controls `cmd` just as fully: stderr adds no
-/// authority the leading token did not already give it. `envelope_denied`
-/// decides whether authority was refused; this only picks which program the
-/// advisory message is about.
+/// the one caller is already fenced behind the structured exit-127-and-no-
+/// denials test and the text it picks is an ABSENCE advisory, not a refusal:
+/// `envelope_denied` decides whether authority was refused; this only picks
+/// which program the advisory is about. The exit-126 path stopped reading it
+/// (#2629 round 2): there the name would have chosen a grant TARGET, and a
+/// target comes only from the leash's structured `denials`, never from text
+/// the child controls.
 fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'a str> {
     envelope
         .get("stderr")

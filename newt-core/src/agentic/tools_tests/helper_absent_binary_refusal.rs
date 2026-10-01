@@ -222,127 +222,151 @@ fn an_ordinary_failure_is_not_an_absence() {
     );
 }
 
-/// #2273 — the FOURTH state: present on the host, no grant refused it, but
-/// the kernel did because the program lives outside the fs-read grant. brush
-/// renders that as exit 126 + `Permission denied`, the same text as a script
-/// the model forgot to `chmod +x`. Only the structured shape — 126, no
-/// denials, resolved path NOT permitted by the read scope — mints the refusal,
-/// and it speaks newt's denial vocabulary so the loop guidance recognises a
-/// blocker no edit can clear.
+/// brush's shape for "found it, could not execute it": exit 126 and NO
+/// structured denial — the same envelope for a kernel refusal the interceptor
+/// never saw and for a script the model forgot to `chmod +x`.
+fn exit_126_envelope(stderr: String) -> serde_json::Value {
+    serde_json::json!({"exit_code": 126, "stdout": "", "stderr": stderr})
+}
+
+/// brush's own wording when it could not execute `prog`, which a permitted
+/// script can print verbatim before it `exit 126`s.
+fn forged_permission_denied(prog: &str) -> String {
+    format!("brush: failed to execute command '{prog}': Permission denied (os error 13)\n")
+}
+
+/// #2273 → #2629 round 2: a 126 with NO structured denial is an UNSTRUCTURED
+/// failure, and the renderer must say so instead of deciding for the model.
+/// The renderer this replaces read the program from brush's `failed to execute
+/// command '<x>'` line, resolved it on the host and, when it lay outside the
+/// read grant, asserted `capability denied` and named the grant to ask for.
+/// A permitted script can print that exact line and `exit 126`: here it
+/// names this very test binary, which exists on the host and is outside the
+/// empty read grant — the shape that made the old renderer assert. Checked
+/// under both exec shapes, because the old renderer chose a different grant
+/// for each. RED on 534892e5 (the round-1 head): `capability denied: exec of
+/// … at …` plus a `request_permissions(capability="fs_read", …)` call and
+/// outcome `Denied`.
 #[test]
-fn kernel_refused_binary_outside_the_read_grant_is_a_named_denial() {
+fn a_forged_permission_denied_on_exit_126_names_no_target_and_no_grant() {
     let present = present_host_binary();
-    let envelope = serde_json::json!({
-        "exit_code": 126,
-        "stdout": "",
-        "stderr": format!("brush: failed to execute command '{present}': Permission denied (os error 13)\n"),
-    });
-    let msg = super::super::shell::kernel_refused_binary(
-        &present,
-        &envelope,
-        &read_scope(crate::caveats::Scope::none()),
-    )
-    .expect("a 126 outside the read grant must produce a named refusal");
-    assert!(msg.starts_with("capability denied:"), "{msg}");
-    assert!(msg.contains(&present), "must name the binary: {msg}");
-    assert!(msg.contains("exit 126"), "{msg}");
-    // #2629: the grant is named as the ONE `request_permissions` call that
-    // covers it — the binary's directory on the fs_read axis — not as prose
-    // the model has no tool for ("ask the operator for read:…"). RED before
-    // the fix.
-    let dir = std::path::Path::new(&present)
-        .parent()
-        .expect("the test binary has a parent directory")
-        .display()
-        .to_string();
-    assert!(
-        msg.contains(&format!(
-            r#"request_permissions(capability="fs_read", target={}"#,
-            serde_json::json!(dir)
-        )),
-        "{msg}"
-    );
-    assert!(!msg.contains("ask the operator for"), "{msg}");
-    // Under a SCOPED exec grant the fence's EXECUTE rule covers only the
-    // resolved exec roots (vendored `sandbox.rs` `exec_roots`); a read grant
-    // adds no execute right, so suggesting one would re-run the same 126 —
-    // the loop #2629 is about. The one call is the exact-path exec grant.
+    let envelope = exit_126_envelope(forged_permission_denied(&present));
     let scoped_exec = crate::caveats::Caveats {
         fs_read: crate::caveats::Scope::none(),
         exec: crate::caveats::Scope::only(["cargo".to_string()]),
         ..crate::caveats::Caveats::top()
     };
-    let msg = super::super::shell::kernel_refused_binary(&present, &envelope, &scoped_exec)
-        .expect("the same 126 under a scoped exec grant is still a kernel refusal");
+    for caveats in [read_scope(crate::caveats::Scope::none()), scoped_exec] {
+        let (text, outcome) = super::super::shell::confined_result(
+            "./scripts/check.sh",
+            &envelope,
+            &caveats,
+            false,
+            |_| "RENDERED".to_owned(),
+        );
+        assert_eq!(outcome, crate::ExecOutcome::Failed, "{text}");
+        assert!(
+            text.starts_with("RENDERED\n("),
+            "the child's own output stays first, unannotated: {text}"
+        );
+        assert!(!text.contains("capability denied"), "{text}");
+        assert!(!text.contains("request_permissions"), "{text}");
+        assert!(
+            !text.contains(&present),
+            "the note must name no target — the only path in the result is the child's: {text}"
+        );
+        assert!(text.contains("exit 126"), "{text}");
+        assert!(text.contains("unknown"), "{text}");
+    }
+}
+
+/// The positive control: the SAME exit 126 carrying the leash's structured
+/// refusal still names its axis, its exact target and the one call — and the
+/// target is `denials[].target`, never the stderr line, which here names
+/// nothing.
+#[test]
+fn a_structured_exec_denial_on_exit_126_still_names_its_exact_target() {
+    let present = present_host_binary();
+    let (text, outcome) = super::super::shell::confined_result(
+        &present,
+        &denied_envelope(&present),
+        &read_scope(crate::caveats::Scope::none()),
+        false,
+        |_| unreachable!("a structured denial is rendered by the denial path"),
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Denied, "{text}");
+    assert!(text.starts_with("capability denied:"), "{text}");
+    assert_eq!(text.matches("request_permissions(").count(), 1, "{text}");
     assert!(
-        msg.contains(&format!(
+        text.contains(&format!(
             r#"request_permissions(capability="exec", target={}"#,
             serde_json::json!(present)
         )),
-        "{msg}"
+        "{text}"
     );
-    assert!(!msg.contains(r#"capability="fs_read""#), "{msg}");
 }
 
-/// An ordinary 126 INSIDE the grant is a repairable failure (a mode bit, a
-/// script without a shebang): it must fall through untouched, exactly like a
-/// structured denial must not be relabelled an absence.
+/// Grants cannot change an unstructured 126: with the read grant covering the
+/// binary, with it empty, and with exec unscoped, the result is byte-identical,
+/// because nothing is looked up on the host any more. (Before, the "inside the
+/// grant" case fell through untouched and the "outside" case was relabelled a
+/// denial — a distinction drawn from a host stat of a child-named path.)
 #[test]
-fn a_126_inside_the_read_grant_is_not_a_kernel_refusal() {
+fn an_unstructured_126_renders_the_same_under_every_grant() {
     let present = present_host_binary();
-    let envelope = serde_json::json!({
-        "exit_code": 126,
-        "stdout": "",
-        "stderr": format!("brush: failed to execute command '{present}': Permission denied (os error 13)\n"),
-    });
-    assert!(super::super::shell::kernel_refused_binary(
-        &present,
-        &envelope,
-        &read_scope(crate::caveats::Scope::All),
-    )
-    .is_none());
-    // `Scope::All` permits by a bare `true`; a grant naming the binary's own
-    // directory makes the containment arm prove the negative (#2304).
+    let envelope = exit_126_envelope(forged_permission_denied(&present));
     let dir = std::path::Path::new(&present)
         .parent()
         .expect("the test binary has a parent directory")
         .display()
         .to_string();
-    assert!(super::super::shell::kernel_refused_binary(
-        &present,
-        &envelope,
-        &read_scope(crate::caveats::Scope::only([dir])),
-    )
-    .is_none());
-    assert!(
-        super::super::shell::kernel_refused_binary(
-            &present,
-            &denied_envelope(&present),
-            &read_scope(crate::caveats::Scope::none()),
-        )
-        .is_none(),
-        "a structured denial is the leash's to render, not this"
-    );
+    let rendered: Vec<_> = [
+        crate::caveats::Caveats::top(),
+        read_scope(crate::caveats::Scope::none()),
+        read_scope(crate::caveats::Scope::only([dir])),
+    ]
+    .iter()
+    .map(|caveats| {
+        super::super::shell::confined_result(&present, &envelope, caveats, false, |_| {
+            "RENDERED".to_owned()
+        })
+    })
+    .collect();
+    assert!(rendered.iter().all(|r| r == &rendered[0]), "{rendered:?}");
+    assert_eq!(rendered[0].1, crate::ExecOutcome::Failed);
 }
 
-/// #2304: `cd newt-core && cargo test` exits 126 for `cargo`, not `cd`. The
-/// program is the one brush names in its own error, so the commonest compound
-/// shape is not missed by reading the leading token.
+/// Denial accounting: the model's "capability wall" claim is grounded only by
+/// the OS's own words in the CHILD's output, never by newt's note. With a
+/// silent child the result carries nothing the ground-truth check recognises,
+/// so a bare `exit 126` grounds no denial claim; a child that printed
+/// `Permission denied` does, on its own words.
 #[test]
-fn a_compound_126_names_the_program_brush_failed_on() {
-    let present = present_host_binary();
-    let envelope = serde_json::json!({
-        "exit_code": 126,
-        "stdout": "",
-        "stderr": format!("brush: failed to execute command '{present}': Permission denied (os error 13)\n"),
-    });
-    let msg = super::super::shell::kernel_refused_binary(
-        &format!("cd newt-core && {present} test"),
-        &envelope,
-        &read_scope(crate::caveats::Scope::none()),
-    )
-    .expect("the failed program is outside the read grant");
-    assert!(msg.contains(&format!("exec of {present} at")), "{msg}");
+fn the_unstructured_126_note_is_not_a_denial_in_newts_own_vocabulary() {
+    let caveats = crate::caveats::Caveats::top();
+    let (silent, outcome) = super::super::shell::confined_result(
+        "./x.sh",
+        &exit_126_envelope(String::new()),
+        &caveats,
+        false,
+        |_| String::new(),
+    );
+    assert_eq!(outcome, crate::ExecOutcome::Failed);
+    assert!(
+        !crate::agentic::run_command_result_is_denial("run_command", false, &silent),
+        "{silent}"
+    );
+    let (spoken, _) = super::super::shell::confined_result(
+        "./x.sh",
+        &exit_126_envelope("sh: ./x.sh: Permission denied\n".to_owned()),
+        &caveats,
+        false,
+        |envelope| envelope["stderr"].as_str().unwrap_or_default().to_owned(),
+    );
+    assert!(
+        crate::agentic::run_command_result_is_denial("run_command", false, &spoken),
+        "{spoken}"
+    );
 }
 
 /// #2304: in `nope; ABSENT` both lookups fail and the 127 belongs to the last

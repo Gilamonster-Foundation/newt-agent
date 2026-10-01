@@ -306,43 +306,102 @@ fn run_command_ungrantable_denials_do_not_invent_permission_requests() {
     assert!(!out.contains("request_permissions"), "{out}");
 }
 
+/// One structured leash denial, in the envelope shape the interceptor records
+/// (`denied: true` + one `denials[]` row).
+fn one_denial(kind: &str, target: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "denied": true,
+        "denials": [{"kind": kind, "target": target, "reason": reason}],
+    })
+}
+
+/// The #2629 contract for a grantable denial: exactly one `request_permissions`
+/// call, naming this axis and this exact target, and no "take a different
+/// approach" fallback beside it.
+fn assert_one_precise_request(out: &str, axis: &str, target: &str) {
+    assert_eq!(out.matches("request_permissions(").count(), 1, "{out}");
+    assert!(
+        out.contains(&format!(
+            r#"request_permissions(capability="{axis}", target={}"#,
+            serde_json::json!(target)
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("No actionable capability grant"), "{out}");
+}
+
+/// The leash's recorded reason for a refused `open`: `ToolError`'s Display
+/// prefix + the `check_path` message (vendored `context.rs`; a live capture is
+/// in docs/findings/2026-08-exec-mcp-interrupt-audit.md). `op` is the verb the
+/// leash writes — `read` or `write` — which is the only place the axis lives.
+fn open_reason(op: &str, target: &str) -> String {
+    format!("denied: {op} of {target} (resolved {target}) is not within the granted fs_{op} scope")
+}
+
 /// #2629: agent-bridle's structured denial kinds are `exec` / `open` / `net`
 /// (vendored `envelope.rs`), so a refused shell write — the `echo x > path`
 /// probe a model uses to discover what is writable — arrives as kind `open`
 /// and used to be dropped as "No actionable capability grant is identified".
 /// That is what sent the lab model probing with touch/mkdir. The LEASH's own
-/// reason names the axis (`… is not within the granted fs_write scope`) and
-/// brush hands the interceptor the ABSOLUTE path, so the denial can name axis,
-/// exact target and the one `request_permissions` call. Nothing here reads
-/// child output: `reason` is written by the leash (#2633). RED before the fix:
-/// no `request_permissions` at all for an `open` kind.
+/// reason names the axis (`write of …`; bridle carries no typed axis, so this
+/// is the leading verb of a library-generated string) and brush hands the
+/// interceptor the ABSOLUTE path, so the denial can name axis, exact target
+/// and the one `request_permissions` call. Nothing here reads child output:
+/// `reason` is written by the leash (#2633). RED on origin/main 71719b35: no
+/// `request_permissions` at all for an `open` kind. The five structured kinds
+/// are each measured in a test of their own (this one and the four below), so
+/// one failing case cannot hide another.
 #[test]
-fn a_shell_open_denial_names_the_fs_axis_and_exact_target() {
-    for (op, axis) in [("write", "fs_write"), ("read", "fs_read")] {
-        let target = "/outside/wt/probe";
-        let envelope = serde_json::json!({
-            "denied": true,
-            "denials": [{
-                "kind": "open",
-                "target": target,
-                // The wire shape: `ToolError`'s Display prefix + the leash's
-                // check_path message (a live capture is in
-                // docs/findings/2026-08-exec-mcp-interrupt-audit.md).
-                "reason": format!(
-                    "denied: {op} of {target} (resolved {target}) is not within the granted fs_{op} scope"
-                ),
-            }]
-        });
-        let out = denied_run_command_result(&envelope, false);
-        assert_eq!(out.matches("request_permissions(").count(), 1, "{out}");
-        assert!(
-            out.contains(&format!(
-                r#"request_permissions(capability="{axis}", target="{target}""#
-            )),
-            "{out}"
-        );
-        assert!(!out.contains("No actionable capability grant"), "{out}");
-    }
+fn a_shell_open_write_denial_names_fs_write_and_the_exact_target() {
+    let target = "/outside/wt/probe";
+    let out = denied_run_command_result(
+        &one_denial("open", target, &open_reason("write", target)),
+        false,
+    );
+    assert_one_precise_request(&out, "fs_write", target);
+}
+
+/// The read twin (`source`, `< path`), measured on its own. RED on origin/main
+/// 71719b35 for the same reason as the write case.
+#[test]
+fn a_shell_open_read_denial_names_fs_read_and_the_exact_target() {
+    let target = "/outside/wt/notes";
+    let out = denied_run_command_result(
+        &one_denial("open", target, &open_reason("read", target)),
+        false,
+    );
+    assert_one_precise_request(&out, "fs_read", target);
+}
+
+/// `exec` named its axis and exact target before #2629 (`denial_recovery_hints`
+/// always took the kind as the axis); pinned per kind so it is measured
+/// independently of `open`. Green on origin/main by construction.
+#[test]
+fn a_shell_exec_denial_names_exec_and_the_exact_target() {
+    let out = denied_run_command_result(
+        &one_denial(
+            "exec",
+            "/usr/bin/git",
+            "denied: exec of \"/usr/bin/git\" is not within the granted authority",
+        ),
+        false,
+    );
+    assert_one_precise_request(&out, "exec", "/usr/bin/git");
+}
+
+/// `net` likewise: the target is the CONNECT host the egress proxy refused
+/// (#196), and the one call names it. Green on origin/main by construction.
+#[test]
+fn a_shell_net_denial_names_net_and_the_exact_host() {
+    let out = denied_run_command_result(
+        &one_denial(
+            "net",
+            "github.com",
+            "denied: network access to \"github.com\" is not within the granted authority",
+        ),
+        false,
+    );
+    assert_one_precise_request(&out, "net", "github.com");
 }
 
 /// A write whose parent directory does not exist yet is refused with the
@@ -460,38 +519,51 @@ fn a_denied_worktree_write_probe_yields_one_precise_request_not_a_loop() {
     );
 }
 
+/// Caveats under which every native fs tool is denied, in a workspace at `ws`.
+fn no_fs_caveats(ws: &std::path::Path) -> Caveats {
+    Caveats {
+        fs_read: Scope::none(),
+        fs_write: Scope::none(),
+        ..caveats_rw(ws)
+    }
+}
+
 /// #2629: a native fs tool's denial suggests the EXACT path the #263 gate
 /// would be asked for — the workspace-joined absolute path — not the model's
 /// relative spelling. `caveats::permits_path` is a lexical prefix test, so a
 /// relative root granted via `request_permissions` never covers the absolute
 /// retry: the model would ask, be told "granted", retry and be denied again.
-/// RED before the fix: the hint said `target="a.txt"`.
+/// RED on origin/main 71719b35: the hint said `target="a.txt"`.
 #[tokio::test]
-async fn a_native_fs_denial_suggests_the_absolute_target_the_gate_would_grant() {
+async fn a_native_write_denial_suggests_the_absolute_target_the_gate_would_grant() {
     let ws = tempfile::TempDir::new().unwrap();
-    let denied = Caveats {
-        fs_read: Scope::none(),
-        fs_write: Scope::none(),
-        ..caveats_rw(ws.path())
-    };
     let full = ws.path().join("a.txt").to_string_lossy().into_owned();
-    for (tool, args, axis) in [
-        (
-            "write_file",
-            serde_json::json!({"path": "a.txt", "content": "c"}),
-            "fs_write",
-        ),
-        ("read_file", serde_json::json!({"path": "a.txt"}), "fs_read"),
-    ] {
-        let out = run_tool(tool, args, ws.path(), &denied, None).await;
-        assert!(
-            out.contains(&format!(
-                r#"request_permissions(capability="{axis}", target={}"#,
-                serde_json::json!(full)
-            )),
-            "{tool}: {out}"
-        );
-    }
+    let out = run_tool(
+        "write_file",
+        serde_json::json!({"path": "a.txt", "content": "c"}),
+        ws.path(),
+        &no_fs_caveats(ws.path()),
+        None,
+    )
+    .await;
+    assert_one_precise_request(&out, "fs_write", &full);
+}
+
+/// The read twin, measured on its own. RED on origin/main 71719b35 for the
+/// same reason as the write case.
+#[tokio::test]
+async fn a_native_read_denial_suggests_the_absolute_target_the_gate_would_grant() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let full = ws.path().join("a.txt").to_string_lossy().into_owned();
+    let out = run_tool(
+        "read_file",
+        serde_json::json!({"path": "a.txt"}),
+        ws.path(),
+        &no_fs_caveats(ws.path()),
+        None,
+    )
+    .await;
+    assert_one_precise_request(&out, "fs_read", &full);
 }
 
 #[test]
