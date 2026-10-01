@@ -1662,6 +1662,17 @@ pub(crate) mod landlock_impl {
     /// for the `Execute` allow-list: a path-bearing entry is taken as-is (if it
     /// exists); a bare name is resolved against the exec search dirs. Canonicalized
     /// so the rule anchors the real inode. `All` => empty (exec stays ambient).
+    ///
+    /// **Git's own exec-path is folded in (#2630).** A grant that resolves to a
+    /// trusted `git` binary lets git run `git worktree add` / `git commit` / …
+    /// only because those porcelain commands themselves `execve` git's
+    /// *internal* helpers (`git-branch`, `git-update-ref`, …) from `git
+    /// --exec-path` — binaries the caller never named. A grant of `["git"]`
+    /// alone therefore kernel-denies the helper exec and git fails with
+    /// "cannot exec 'branch'". [`git_exec_path_binaries`] resolves that
+    /// directory WITHOUT EVER EXECUTING the granted binary (round 2, #2630) —
+    /// see its doc comment for why running `<git> --exec-path` in the
+    /// resolving process was refused.
     fn resolve_exec_paths(scope: &Scope<String>) -> Vec<String> {
         let set = match scope {
             Scope::All => return Vec::new(),
@@ -1680,11 +1691,200 @@ pub(crate) mod landlock_impl {
             };
             if let Some(p) = candidate {
                 if let Ok(canon) = p.canonicalize() {
+                    out.extend(git_exec_path_binaries(&canon));
                     out.push(canon.to_string_lossy().into_owned());
                 }
             }
         }
         out
+    }
+
+    /// Fixed, root-owned system directories a granted `git` binary must
+    /// resolve into before its own exec-path helpers are folded in. A `git`
+    /// living anywhere else — a repo-local `./tools/git`, a user's
+    /// `~/bin/git`, anything found only via `$PATH` shadowing — gets no extra
+    /// helpers, and (see [`git_exec_path_binaries`]) is never even opened,
+    /// let alone executed, to make that determination.
+    const GIT_TRUSTED_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+    /// Where a git installed under one of [`GIT_TRUSTED_DIRS`] keeps its own
+    /// helper binaries, relative to that directory's parent prefix
+    /// (`/usr/bin/git` → prefix `/usr`). Covers the two conventional
+    /// packaging layouts; a git installed anywhere else yields no candidate
+    /// (fail closed — no helper, `git worktree add` fails exactly as before
+    /// this fix, never wrongly permissive).
+    const GIT_EXEC_PATH_CANDIDATES: &[&str] = &["lib/git-core", "libexec/git-core"];
+
+    /// If `canon_git_bin` is a `git` binary that lives directly inside one of
+    /// [`GIT_TRUSTED_DIRS`], return the single absolute, canonical path of
+    /// `<exec-path>/git` — git re-executing *itself* under a different name
+    /// (`fatal: cannot exec 'branch'` is `<exec-path>/git branch`) — PROVIDED
+    /// that file is the same image as `canon_git_bin`. Empty otherwise.
+    ///
+    /// #2630 round 3 (bridle PR #407, finding P1-1): round 2 admitted every
+    /// direct child of the exec-path directory — `git-remote-https`,
+    /// `git-shell`, `git-daemon`, scripts — because they sit in a root-owned
+    /// package directory. A root-owned directory is not operator authority
+    /// for each file inside it; the operator granted execution of ONE binary
+    /// (`git`), and the only reason it needs help at all is that it re-execs
+    /// itself under an internal alias. So admit exactly that alias and
+    /// nothing else. A worktree op that later needs an independent helper
+    /// (`git-remote-https`, …) is a separate, explicit authority decision,
+    /// not an automatic one.
+    ///
+    /// **Never executes `canon_git_bin` or anything else (#2630 round 2).**
+    /// The only filesystem operations are `canonicalize`, `symlink_metadata`
+    /// (via [`ancestry_is_root_owned_and_unwritable`]) and reading the two
+    /// files' bytes to compare them ([`same_image`]) — no `exec`.
+    ///
+    /// Narrowing, on purpose:
+    /// - `canon_git_bin` AND its full ancestor chain up to `/` must each be
+    ///   root-owned and not group/other-writable
+    ///   ([`ancestry_is_root_owned_and_unwritable`]) — not just its immediate
+    ///   parent directory (P1-2): a writable *grandparent* could otherwise
+    ///   let an attacker replace a trusted leaf without touching the leaf
+    ///   itself.
+    /// - `canon_git_bin`'s parent must canonicalize to EXACTLY one of
+    ///   [`GIT_TRUSTED_DIRS`].
+    /// - The candidate `<exec-path>/git` is independently subjected to the
+    ///   same full-ancestry check, so a symlink or an intermediate writable
+    ///   directory anywhere in ITS chain also fails closed.
+    /// - The candidate must be [`same_image`] as `canon_git_bin` (same
+    ///   inode, or identical content by `content_addressable::RawContentId`)
+    ///   — proving it really is the same git, not merely another root-owned
+    ///   file that happens to be named `git`.
+    fn git_exec_path_binaries(canon_git_bin: &std::path::Path) -> Vec<String> {
+        if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
+            return Vec::new();
+        }
+        if !ancestry_is_root_owned_and_unwritable(canon_git_bin) {
+            return Vec::new();
+        }
+        let Some(bin_dir) = canon_git_bin.parent() else {
+            return Vec::new();
+        };
+        let is_trusted_dir = GIT_TRUSTED_DIRS.iter().any(|trusted| {
+            std::fs::canonicalize(trusted).is_ok_and(|canon_trusted| canon_trusted == bin_dir)
+        });
+        if !is_trusted_dir {
+            return Vec::new();
+        }
+        let Some(prefix) = bin_dir.parent() else {
+            return Vec::new();
+        };
+
+        for candidate in GIT_EXEC_PATH_CANDIDATES {
+            let Ok(exec_path_git) = prefix.join(candidate).join("git").canonicalize() else {
+                continue;
+            };
+            if exec_path_git == *canon_git_bin {
+                continue; // same path as the granted binary — nothing extra to add.
+            }
+            if !ancestry_is_root_owned_and_unwritable(&exec_path_git) {
+                continue;
+            }
+            if same_image(canon_git_bin, &exec_path_git) {
+                return vec![exec_path_git.to_string_lossy().into_owned()];
+            }
+        }
+        Vec::new()
+    }
+
+    /// The subset of a filesystem object's identity the ancestry walk
+    /// needs: owning uid and permission mode. Broken out as plain data so
+    /// the walk itself ([`ancestry_passes`]) can be driven by either live
+    /// `symlink_metadata` (production, via
+    /// [`ancestry_is_root_owned_and_unwritable`]) or a synthetic lookup
+    /// (tests) — bridle PR #407 review, round 3 finding 1: without this
+    /// seam, the round-3 adversarial "writable grandparent" tests could
+    /// pass with the RECURSIVE ancestor walk deleted outright, because they
+    /// never constructed a real root-owned leaf and so never got past the
+    /// leaf's own ownership check to exercise a grandparent at all.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct OwnerMode {
+        uid: u32,
+        mode: u32,
+    }
+
+    /// The actual ancestry walk: `path` and every ancestor up to and
+    /// including `/` must each pass `lookup` as root-owned (`uid == 0`) and
+    /// not group/other-writable (`mode & 0o022 == 0`). `lookup` returning
+    /// `None` (object doesn't exist / can't be inspected) fails closed.
+    /// Both production ([`ancestry_is_root_owned_and_unwritable`], backed
+    /// by live `symlink_metadata`) and the adversarial unit tests (backed
+    /// by a synthetic `HashMap`) call this SAME function, so a test that
+    /// passes is a claim about this exact traversal, not a parallel
+    /// reimplementation of it that could drift from what production runs.
+    #[cfg(unix)]
+    fn ancestry_passes(
+        path: &std::path::Path,
+        lookup: &dyn Fn(&std::path::Path) -> Option<OwnerMode>,
+    ) -> bool {
+        let Some(meta) = lookup(path) else {
+            return false;
+        };
+        if meta.uid != 0 || (meta.mode & 0o022) != 0 {
+            return false;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => ancestry_passes(parent, lookup),
+            _ => true,
+        }
+    }
+
+    /// `true` iff `path` itself AND every ancestor directory up to and
+    /// including `/` is owned by root (uid 0) and carries no group- or
+    /// other-write bit. Unlike a single-directory check, this rejects a
+    /// trusted-looking leaf sitting under a writable grandparent (P1-2):
+    /// an attacker who can write `/usr` but not `/usr/bin` could otherwise
+    /// replace `/usr/bin` itself with a symlink to attacker-controlled
+    /// content, or (more directly) install a new sibling that later
+    /// canonicalizes into the trusted set. `path` must already be
+    /// canonicalized by the caller — this checks the object at that path,
+    /// not what a symlink there might point to (`symlink_metadata`, not
+    /// `metadata`, via [`ancestry_passes`]'s `lookup`), so a still-symlinked
+    /// path fails closed.
+    #[cfg(unix)]
+    fn ancestry_is_root_owned_and_unwritable(path: &std::path::Path) -> bool {
+        ancestry_passes(path, &|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).ok().map(|m| OwnerMode {
+                uid: m.uid(),
+                mode: m.mode(),
+            })
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn ancestry_is_root_owned_and_unwritable(_path: &std::path::Path) -> bool {
+        false
+    }
+
+    /// `true` iff `a` and `b` are the same file (same device+inode), or —
+    /// when they are distinct filesystem objects (e.g. a hardlink is not in
+    /// use) — carry identical content, proven by comparing
+    /// `content_addressable::RawContentId` over each file's bytes rather
+    /// than a hand-rolled hash (repo doctrine: content identity goes through
+    /// `content-addressable`, never bespoke). Never executes either file.
+    #[cfg(unix)]
+    fn same_image(a: &std::path::Path, b: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+        let (Ok(ba), Ok(bb)) = (std::fs::read(a), std::fs::read(b)) else {
+            return false;
+        };
+        content_addressable::RawContentId::from_content(&ba)
+            == content_addressable::RawContentId::from_content(&bb)
+    }
+
+    #[cfg(not(unix))]
+    fn same_image(_a: &std::path::Path, _b: &std::path::Path) -> bool {
+        false
     }
 
     /// The directories a bare program name is resolved against: `$PATH` if set,
@@ -1731,6 +1931,354 @@ pub(crate) mod landlock_impl {
 
     fn landlock_denied(e: impl std::fmt::Display) -> ToolError {
         ToolError::denied(format!("landlock: {e}"))
+    }
+
+    /// #2630 round 2 — `resolve_exec_paths`/`git_exec_path_binaries` never
+    /// executes a grant-selected binary while computing the exec-path
+    /// allow-list, and only trusts a directory whose live permissions it has
+    /// checked.
+    #[cfg(test)]
+    mod git_exec_path_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn unique_dir(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let mut d = std::env::temp_dir();
+            d.push(format!(
+                "ab-2630-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn write_executable_marker_script(path: &std::path::Path, marker: &std::path::Path) {
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch \"{}\"\necho /nonexistent/hostile-exec-path\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        /// The real system `git` (if present) resolves into its own
+        /// `--exec-path`-equivalent directory purely from the fixed
+        /// trusted-dir/candidate-suffix convention, with every admitted path
+        /// actually living inside that one resolved directory.
+        #[test]
+        fn a_real_trusted_git_grant_admits_its_own_exec_path_helpers() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                resolved.iter().any(|p| p == git),
+                "the git binary itself must still be admitted: {resolved:?}"
+            );
+            assert!(
+                resolved.len() > 1,
+                "git's own exec-path helpers must be folded in, not just the binary: {resolved:?}"
+            );
+        }
+
+        /// A `git`-named binary OUTSIDE [`GIT_TRUSTED_DIRS`] — a repo-local
+        /// `./tools/git`-style plant — gets NO extra helpers, and (the load-
+        /// bearing assertion) is never executed while resolution decides
+        /// that: a marker-writing stand-in script proves it was never run.
+        #[test]
+        fn a_git_outside_trusted_dirs_gets_no_helpers_and_is_never_executed() {
+            let dir = unique_dir("outside-trusted");
+            let marker = dir.join("was-executed");
+            let fake_git = dir.join("git");
+            write_executable_marker_script(&fake_git, &marker);
+
+            let resolved =
+                resolve_exec_paths(&Scope::only([fake_git.to_string_lossy().into_owned()]));
+
+            assert!(
+                !marker.exists(),
+                "a git outside the trusted dirs must NEVER be executed during resolution"
+            );
+            let canon_fake_git = fake_git.canonicalize().unwrap();
+            assert_eq!(
+                resolved,
+                vec![canon_fake_git.to_string_lossy().into_owned()],
+                "an untrusted git must admit only itself, no helpers: {resolved:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // An ambient, attacker-controlled `GIT_EXEC_PATH` is irrelevant by
+        // construction: neither `resolve_exec_paths` nor
+        // `git_exec_path_binaries` calls `std::env::var`/`var_os` anywhere —
+        // there is nothing in either function body that reads it. Round 2
+        // kept a behavioral test here that mutated process-global
+        // `GIT_EXEC_PATH`, which raced every other test in this binary with
+        // no synchronization (bridle PR #407 review, finding 4); dropped
+        // per the round-3 brief rather than moved to a child process, since
+        // the static fact above is already the whole proof. `PATH` itself
+        // is still read, for bare-name entries in the caller's own grant
+        // set — pre-existing, unrelated to `GIT_EXEC_PATH`, and exercised by
+        // `a_non_git_binary_elsewhere_is_not_admitted` below.
+
+        /// A binary sitting in a sibling directory to git's real exec-path
+        /// directory — never one of the fixed candidate suffixes — is not
+        /// admitted just because a `git` grant is present.
+        #[test]
+        fn a_non_git_binary_elsewhere_is_not_admitted() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                !resolved
+                    .iter()
+                    .any(|p| p.contains("/elsewhere/") || p.contains("not-git-at-all")),
+                "only the fixed exec-path candidate directories may be admitted: {resolved:?}"
+            );
+        }
+
+        /// A directory that LOOKS like a git exec-path (matches a candidate
+        /// suffix under a trusted git's prefix) but is writable by non-root
+        /// must not be trusted — an attacker who can write there could plant
+        /// a helper the kernel would then be told to allow.
+        #[test]
+        fn a_group_writable_candidate_directory_is_not_trusted() {
+            let dir = unique_dir("writable-exec-dir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&dir),
+                "a world-writable directory must never be trusted, regardless of owner"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2630 round 3 (P1-1): even the real trusted system git admits
+        /// ONLY `<exec-path>/git` — never a sibling helper such as
+        /// `git-shell`, `git-daemon`, a `git-remote-*`, or a packaging
+        /// script — despite all of them sitting in the same root-owned
+        /// exec-path directory. A root-owned directory authorizes the ONE
+        /// file the operator granted (git re-executing itself), not every
+        /// file that happens to live beside it.
+        #[test]
+        fn a_trusted_git_grant_admits_only_its_own_exec_path_alias_not_sibling_helpers() {
+            let Some(git) = ["/usr/bin/git", "/bin/git"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let resolved = resolve_exec_paths(&Scope::only([git.to_string()]));
+            assert!(
+                resolved.iter().all(|p| std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some("git")),
+                "every admitted path must be a `git`-named alias of the granted binary, \
+                 never an independent helper: {resolved:?}"
+            );
+            assert!(
+                resolved.len() <= 2,
+                "at most the granted binary plus its one same-image exec-path alias: {resolved:?}"
+            );
+        }
+
+        /// P1-2: a `git`-named file sitting in an OTHERWISE trusted exec-path
+        /// directory, but reached only via a symlink whose target escapes
+        /// that directory, must not be admitted — canonicalization alone
+        /// (which resolves the symlink) is not the same as authenticating
+        /// the ancestry of what it resolves to.
+        #[test]
+        fn an_exec_path_git_reached_via_an_escaping_symlink_is_not_trusted() {
+            let dir = unique_dir("escaping-symlink");
+            let outside = dir.join("outside.txt");
+            std::fs::write(&outside, b"not really git\n").unwrap();
+            let link = dir.join("git");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            // The escape is in what the ancestry check must catch even once
+            // canonicalized: `outside` itself is not root-owned (it lives in
+            // a plain tmp dir owned by the test's own uid), so the resolved
+            // target fails the ancestry check regardless of the symlink.
+            let canon = link.canonicalize().unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&canon),
+                "a symlink resolving outside a root-owned, unwritable ancestry must not be trusted: {canon:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// P1-2: `ancestry_is_root_owned_and_unwritable` walks the FULL
+        /// ancestor chain, not just the immediate parent — a file can sit in
+        /// a root-owned, unwritable leaf directory while a GRANDPARENT is
+        /// attacker-writable, which round 2's single-directory check missed.
+        #[test]
+        fn a_writable_grandparent_defeats_trust_even_with_a_locked_down_leaf() {
+            let base = unique_dir("writable-grandparent");
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let leaf = base.join("locked-leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            // The leaf itself may be arbitrarily locked down; it is still
+            // reachable through a writable ancestor, so the whole chain must
+            // fail closed. (uid checks are skipped when not running as an
+            // owner able to chown; the writable-ancestor bit alone already
+            // fails this on any uid.)
+            let file = leaf.join("git");
+            std::fs::write(&file, b"stand-in\n").unwrap();
+            assert!(
+                !ancestry_is_root_owned_and_unwritable(&file),
+                "a writable grandparent must defeat trust even when the leaf directory is locked down"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// [`same_image`] must reject two DIFFERENT `git`-named files even
+        /// when both would independently pass the ancestry check — content
+        /// equality is what proves "the same git re-executing itself", not
+        /// merely "also named git, also root-owned".
+        #[test]
+        fn same_image_rejects_distinct_content() {
+            let dir = unique_dir("distinct-content");
+            let a = dir.join("git-a");
+            let b = dir.join("git-b");
+            std::fs::write(&a, b"binary one\n").unwrap();
+            std::fs::write(&b, b"binary two, totally different\n").unwrap();
+            assert!(
+                !same_image(&a, &b),
+                "distinct content must never be treated as the same image"
+            );
+            std::fs::write(&b, b"binary one\n").unwrap();
+            assert!(
+                same_image(&a, &b),
+                "identical content (different inode) must be recognized as the same image"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #2630 round 4 (bridle PR #407 review, round 3 finding 1): drives
+    /// [`ancestry_passes`] — the SAME traversal `ancestry_is_root_owned_and_
+    /// unwritable` runs in production — through a synthetic ownership map
+    /// instead of the real filesystem. Round 3's adversarial ancestry tests
+    /// built their fixtures from plain, user-owned tmp files/dirs, so the
+    /// leaf itself already failed the uid check before the walk ever
+    /// reached a parent; deleting the recursive call entirely left those
+    /// tests green. These tests hold every level but ONE constant between
+    /// the positive and negative cases, so only the traversal itself can
+    /// account for the difference.
+    #[cfg(test)]
+    mod ancestry_walk_tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn root_owned_unwritable() -> OwnerMode {
+            OwnerMode {
+                uid: 0,
+                mode: 0o755,
+            }
+        }
+
+        /// `/`, `/a`, `/a/b`, `/a/b/git` — every level root-owned and
+        /// unwritable. The baseline every negative test below perturbs at
+        /// exactly one level.
+        fn all_protected_chain() -> HashMap<PathBuf, OwnerMode> {
+            [
+                PathBuf::from("/"),
+                PathBuf::from("/a"),
+                PathBuf::from("/a/b"),
+                PathBuf::from("/a/b/git"),
+            ]
+            .into_iter()
+            .map(|p| (p, root_owned_unwritable()))
+            .collect()
+        }
+
+        fn lookup_in(
+            map: &HashMap<PathBuf, OwnerMode>,
+        ) -> impl Fn(&std::path::Path) -> Option<OwnerMode> + '_ {
+            move |p: &std::path::Path| map.get(p).copied()
+        }
+
+        const LEAF: &str = "/a/b/git";
+
+        /// Positive control: an entirely root-owned, unwritable synthetic
+        /// chain from the leaf to `/` passes.
+        #[test]
+        fn an_all_protected_synthetic_chain_passes() {
+            let map = all_protected_chain();
+            assert!(ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// The leaf and its immediate parent (`/a/b`) are UNCHANGED from the
+        /// positive case; only the GRANDPARENT's owner differs. This can
+        /// only fail if the walk actually recurses past the immediate
+        /// parent — deleting the recursive call (round 3's gap) would leave
+        /// this green.
+        #[test]
+        fn a_grandparent_owned_by_a_non_root_uid_fails_the_walk() {
+            let mut map = all_protected_chain();
+            map.insert(
+                PathBuf::from("/a"),
+                OwnerMode {
+                    uid: 1000,
+                    ..root_owned_unwritable()
+                },
+            );
+            assert!(!ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// Same shape, but the grandparent differs ONLY in its write mode
+        /// (still uid 0) — isolates the mode half of the check from the uid
+        /// half, and again only fails if the walk reaches it.
+        #[test]
+        fn a_group_writable_grandparent_fails_the_walk() {
+            let mut map = all_protected_chain();
+            map.insert(
+                PathBuf::from("/a"),
+                OwnerMode {
+                    mode: 0o775,
+                    ..root_owned_unwritable()
+                },
+            );
+            assert!(!ancestry_passes(
+                std::path::Path::new(LEAF),
+                &lookup_in(&map)
+            ));
+        }
+
+        /// A path with no entry in the lookup at all (object doesn't exist)
+        /// fails closed rather than defaulting to trusted.
+        #[test]
+        fn an_unresolvable_path_fails_closed() {
+            let map = all_protected_chain();
+            assert!(!ancestry_passes(
+                std::path::Path::new("/a/b/does-not-exist"),
+                &lookup_in(&map)
+            ));
+        }
     }
 
     #[cfg(test)]
@@ -3267,6 +3815,7 @@ mod landlock_kernel_tests {
     use crate::Scope;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
 
     fn unique_dir(tag: &str) -> PathBuf {
         // No rand dep: derive a unique path from pid + a per-call atomic counter.
@@ -3281,6 +3830,39 @@ mod landlock_kernel_tests {
         ));
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A hermetically-configured `git` `Command`: no inherited environment
+    /// beyond what's explicitly set here, and every ambient
+    /// config/hooks/template source disabled. Used for BOTH the plain
+    /// (unconfined) fixture setup and the Landlock-confined proof command
+    /// below, per bridle PR #407 review (P1-3/P2-4) — one constructor means
+    /// "isolated enough not to touch the real repository" and "isolated
+    /// enough to be a fair confinement proof" can't drift apart.
+    ///
+    /// `env_clear()` (not a denylist of individually-removed vars) is what
+    /// closes the whole class the review named: `GIT_DIR`, `GIT_WORK_TREE`,
+    /// `GIT_CEILING_DIRECTORIES` (the leak that once left a stray commit on
+    /// this very branch), plus `GIT_INDEX_FILE`, `GIT_COMMON_DIR`,
+    /// `GIT_OBJECT_DIRECTORY` (named in review finding 3) and anything else
+    /// ambient — none of them can leak in if nothing is inherited.
+    /// `GIT_CONFIG_NOSYSTEM=1` + `GIT_CONFIG_GLOBAL=/dev/null` +
+    /// `GIT_TEMPLATE_DIR=/dev/null` additionally close config/template
+    /// sources that live outside the process environment entirely (system
+    /// `/etc/gitconfig`, the operator's own `~/.gitconfig`).
+    fn hermetic_git_command(git: &str, dir: &std::path::Path, home: &std::path::Path) -> Command {
+        let mut cmd = Command::new(git);
+        cmd.current_dir(dir);
+        cmd.env_clear();
+        cmd.env("HOME", home);
+        cmd.env("GIT_AUTHOR_NAME", "t");
+        cmd.env("GIT_AUTHOR_EMAIL", "t@example.invalid");
+        cmd.env("GIT_COMMITTER_NAME", "t");
+        cmd.env("GIT_COMMITTER_EMAIL", "t@example.invalid");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        cmd.env("GIT_TEMPLATE_DIR", "/dev/null");
+        cmd
     }
 
     /// Whether a kernel-enforcement proof should run, skip, or hard-**FAIL** — a
@@ -3302,15 +3884,53 @@ mod landlock_kernel_tests {
         }
     }
 
+    /// `true` iff `BRIDLE_REQUIRE_LANDLOCK` is set (non-empty, not `"0"`) —
+    /// the same flag [`skip_proof_unless_landlock`] gates on, factored out
+    /// so [`require_trusted_git_or_fail`] can apply the identical
+    /// require-not-skip posture to a DIFFERENT missing prerequisite (the
+    /// fixture `git` binary, not the kernel feature).
+    fn landlock_is_required() -> bool {
+        std::env::var("BRIDLE_REQUIRE_LANDLOCK")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    }
+
+    /// `true` iff `git` exists on this host. **Panics** when Landlock is
+    /// *required* (`BRIDLE_REQUIRE_LANDLOCK=1`, as CI sets) but the fixture
+    /// `git` is absent — bridle PR #407 review, round 3 finding 2: a
+    /// required run that silently `eprintln!`+`return`ed on a missing
+    /// `/usr/bin/git` could go green in CI without ever exercising the
+    /// #2630 fence, exactly the failure mode [`skip_proof_unless_landlock`]
+    /// already closes for a missing KERNEL feature. A local, non-required
+    /// run still legitimately skips.
+    fn require_trusted_git_or_fail(git: &str) -> bool {
+        require_git_gated(git, landlock_is_required())
+    }
+
+    /// The pure decision [`require_trusted_git_or_fail`] wraps: separated so
+    /// the require-vs-skip posture is testable directly against an explicit
+    /// `required` flag, with no process-global `BRIDLE_REQUIRE_LANDLOCK`
+    /// mutation needed to exercise the `true` branch.
+    fn require_git_gated(git: &str, required: bool) -> bool {
+        if std::path::Path::new(git).exists() {
+            return true;
+        }
+        if required {
+            panic!(
+                "BRIDLE_REQUIRE_LANDLOCK is set but {git} is absent — the #2630 \
+                 git-exec-path proof cannot be verified"
+            );
+        }
+        eprintln!("skipping: no {git} on this host");
+        false
+    }
+
     /// `true` if the caller should `return` (skip the proof). **Panics** when
     /// Landlock is *required* (`BRIDLE_REQUIRE_LANDLOCK` set, as CI does) but the
     /// kernel lacks it — so a flagged run cannot pass without actually exercising
     /// the boundary. A local run without the flag legitimately skips (#74).
     fn skip_proof_unless_landlock() -> bool {
-        let required = std::env::var("BRIDLE_REQUIRE_LANDLOCK")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
-        match proof_gate(landlock_is_supported(), required) {
+        match proof_gate(landlock_is_supported(), landlock_is_required()) {
             ProofGate::Run => false,
             ProofGate::Skip => {
                 eprintln!(
@@ -3334,6 +3954,26 @@ mod landlock_kernel_tests {
         // The crux (#74): required + unsupported must FAIL, never silently skip,
         // so CI cannot pass without exercising the kernel boundary.
         assert_eq!(proof_gate(false, true), ProofGate::Fail);
+    }
+
+    /// #2630 round 4, finding 2's require-not-skip half: a missing fixture
+    /// `git` with `required = false` legitimately skips (no panic).
+    #[test]
+    fn require_git_gated_skips_a_missing_git_when_not_required() {
+        assert!(!require_git_gated(
+            "/definitely/does/not/exist/git-2630",
+            false
+        ));
+    }
+
+    /// The crux: the SAME missing `git`, with `required = true`, must FAIL
+    /// rather than silently return `false` — mirroring `proof_gate`'s own
+    /// required-but-unsupported posture (#74), applied to a different
+    /// missing prerequisite.
+    #[test]
+    #[should_panic(expected = "is absent")]
+    fn require_git_gated_panics_on_a_missing_git_when_required() {
+        require_git_gated("/definitely/does/not/exist/git-2630", true);
     }
 
     #[test]
@@ -3890,6 +4530,261 @@ mod landlock_kernel_tests {
             udp_created,
             "DenyDirect must be inert when net is granted (caller asked for egress)"
         );
+    }
+
+    /// #2630 — a `git`-only exec grant, naming the SYSTEM `/usr/bin/git`, must
+    /// admit its own internal helpers so `git worktree add` (which `execve`s
+    /// `git-branch`/`git-update-ref`) succeeds under a REAL kernel-enforced
+    /// Landlock fence, not merely the in-process admission check. Confirmed
+    /// red on the pre-fix code (`resolve_exec_paths` admitted only the
+    /// resolved `git` binary itself): `fatal: cannot exec 'branch':
+    /// Permission denied`, git exit 128.
+    ///
+    /// Both the unconfined fixture setup AND the confined proof command go
+    /// through [`hermetic_git_command`] (bridle PR #407 review, P1-3/P2-4):
+    /// one constructor, `env_clear()`-based, so this test cannot silently
+    /// touch the real repository the way a partial `env_remove()` denylist
+    /// once did (see its doc comment).
+    #[test]
+    fn git_only_exec_grant_admits_worktree_add_under_real_landlock() {
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let git = "/usr/bin/git";
+        if !require_trusted_git_or_fail(git) {
+            return;
+        }
+        let root = unique_dir("git-exec-2630");
+        let main = root.join("main");
+        std::fs::create_dir(&main).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir(&home).unwrap();
+
+        let real_git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = hermetic_git_command(git, dir, &home)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        real_git(&main, &["init", "-q"]);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        real_git(&main, &["add", "seed"]);
+        real_git(&main, &["commit", "-q", "-m", "init"]);
+
+        let root_t = root.clone();
+        let main_t = main.clone();
+        let home_t = home.clone();
+        // Absolute, not `../wt`: the destination must not depend on the
+        // child's resolved cwd matching this exact relative hop — keeps the
+        // test deterministic under heavy parallel-test-suite load.
+        let wt_t = root.join("wt");
+        let output = std::thread::spawn(move || {
+            let cav = Caveats {
+                // No `/etc/gitconfig` grant needed: `hermetic_git_command`
+                // sets `GIT_CONFIG_NOSYSTEM=1`, so a confined git never
+                // tries to open it in the first place.
+                fs_read: Scope::only([root_t.to_string_lossy().into_owned()]),
+                fs_write: Scope::only([root_t.to_string_lossy().into_owned()]),
+                exec: Scope::only([git.to_string()]),
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            LandlockSandbox::new().apply(&cav).expect("apply landlock");
+            hermetic_git_command(git, &main_t, &home_t)
+                .arg("worktree")
+                .arg("add")
+                .arg("-q")
+                .arg(&wt_t)
+                .arg("-b")
+                .arg("task")
+                .output()
+        })
+        .join()
+        .unwrap()
+        .expect("spawn confined git worktree add");
+
+        assert!(
+            output.status.success(),
+            "git worktree add must succeed under a git-only exec grant: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            root.join("wt").join("seed").exists(),
+            "the new worktree must actually be checked out"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Env var this test binary's own re-exec checks for: its presence
+    /// (any value) means "run as the dedicated hostile-env subprocess for
+    /// [`hostile_inherited_git_env_is_stripped_by_hermetic_env_clear`]"
+    /// instead of the normal top-level test. **Never set via
+    /// `std::env::set_var` on the shared test-binary process** (bridle PR
+    /// #407 review, round 3 finding 4/round 2's own P2: process-global env
+    /// mutation races every other test in this binary) — set ONLY on the
+    /// `Command` that spawns that one dedicated child process, below.
+    const HOSTILE_ENV_SUBPROCESS_MARKER: &str = "BRIDLE_2630_HOSTILE_ENV_SUBPROCESS_ROOT";
+
+    /// Runs (as the dedicated subprocess) the exact fixture the isolation
+    /// claim is about: [`hermetic_git_command`] for BOTH the unconfined
+    /// setup (`init`/`add`/`commit`) AND the Landlock-confined `worktree
+    /// add`. This subprocess's OWN environment carries hostile
+    /// `GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` (set by the
+    /// parent only on the `Command` that launched this process — never
+    /// globally). If `hermetic_git_command`'s `env_clear()` is doing its
+    /// job, none of the three reach the spawned `git` processes, so every
+    /// step below succeeds exactly as the non-hostile case; if it were
+    /// disabled, git would redirect into the sentinel paths this same
+    /// subprocess inherited and either corrupt them or fail confusingly.
+    fn run_hostile_env_subprocess_fixture(git: &str, root: &std::path::Path) {
+        let main = root.join("main");
+        fs::create_dir(&main).unwrap();
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+
+        let real_git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = hermetic_git_command(git, dir, &home)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed under hostile inherited env");
+        };
+        real_git(&main, &["init", "-q"]);
+        fs::write(main.join("seed"), "x").unwrap();
+        real_git(&main, &["add", "seed"]);
+        real_git(&main, &["commit", "-q", "-m", "init"]);
+
+        let git = git.to_string();
+        let wt = root.join("wt");
+        let confined_ok = {
+            let git = git.clone();
+            let main = main.clone();
+            let home = home.clone();
+            let root = root.to_path_buf();
+            let wt = wt.clone();
+            std::thread::spawn(move || {
+                let cav = Caveats {
+                    fs_read: Scope::only([root.to_string_lossy().into_owned()]),
+                    fs_write: Scope::only([root.to_string_lossy().into_owned()]),
+                    exec: Scope::only([git.clone()]),
+                    net: Scope::none(),
+                    ..Caveats::top()
+                };
+                LandlockSandbox::new().apply(&cav).expect("apply landlock");
+                hermetic_git_command(&git, &main, &home)
+                    .arg("worktree")
+                    .arg("add")
+                    .arg("-q")
+                    .arg(&wt)
+                    .arg("-b")
+                    .arg("task")
+                    .status()
+                    .unwrap()
+                    .success()
+            })
+            .join()
+            .unwrap()
+        };
+        assert!(
+            confined_ok,
+            "confined git worktree add failed under hostile inherited env"
+        );
+        assert!(
+            wt.join("seed").exists(),
+            "confined worktree add must actually check out its seed file"
+        );
+    }
+
+    /// #2630 round 4 (bridle PR #407 review, round 3 finding 2): the
+    /// hostile-`GIT_EXEC_PATH`-style claim needs a real adversary, not
+    /// sentinel files nothing ever pointed at (round 3's version). This
+    /// spawns a DEDICATED subprocess — re-executing this very test binary
+    /// with `--exact` against only this one test — whose `Command`
+    /// environment (not this process's own) carries hostile
+    /// `GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` pointed at
+    /// disposable sentinels. Inside that subprocess,
+    /// [`run_hostile_env_subprocess_fixture`] runs the real fixture (setup
+    /// AND the confined `worktree add`) through [`hermetic_git_command`];
+    /// this parent process then inspects the sentinels afterward. No
+    /// process-global env mutation anywhere in this process.
+    #[test]
+    fn hostile_inherited_git_env_is_stripped_by_hermetic_env_clear() {
+        // Re-entry: this same test, run again as the dedicated subprocess.
+        if let Ok(root) = std::env::var(HOSTILE_ENV_SUBPROCESS_MARKER) {
+            let git = std::env::var("BRIDLE_2630_SUBPROCESS_GIT")
+                .expect("parent must pass the git path to the subprocess");
+            run_hostile_env_subprocess_fixture(&git, std::path::Path::new(&root));
+            return;
+        }
+
+        if skip_proof_unless_landlock() {
+            return;
+        }
+        let git = "/usr/bin/git";
+        if !require_trusted_git_or_fail(git) {
+            return;
+        }
+
+        let root = unique_dir("hostile-env-2630");
+        let sentinel_index = unique_dir("hostile-sentinel-index").join("index");
+        let sentinel_common = unique_dir("hostile-sentinel-common");
+        let sentinel_objects = unique_dir("hostile-sentinel-objects");
+        fs::write(&sentinel_index, b"untouched\n").unwrap();
+        let sentinel_index_before = fs::read(&sentinel_index).unwrap();
+
+        let exe = std::env::current_exe().expect("current_exe must resolve for the re-exec proof");
+        let output = Command::new(&exe)
+            .arg("--exact")
+            .arg("sandbox::landlock_kernel_tests::hostile_inherited_git_env_is_stripped_by_hermetic_env_clear")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            // Explicit, minimal env: this Command's env is what the
+            // subprocess inherits, NOT this test's own process env (which
+            // is never mutated). PATH is needed for the re-executed test
+            // binary's own machinery; HOME/TMPDIR are left unset — the
+            // subprocess only ever touches paths this parent hands it.
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("BRIDLE_REQUIRE_LANDLOCK", "1")
+            .env(HOSTILE_ENV_SUBPROCESS_MARKER, root.to_string_lossy().as_ref())
+            .env("BRIDLE_2630_SUBPROCESS_GIT", git)
+            // The hostile ambient redirection targets: if hermetic_git_command
+            // ever inherited these instead of clearing them, git would
+            // redirect its index/object-store operations straight into them.
+            .env("GIT_INDEX_FILE", &sentinel_index)
+            .env("GIT_COMMON_DIR", &sentinel_common)
+            .env("GIT_OBJECT_DIRECTORY", &sentinel_objects)
+            .output()
+            .expect("spawn hostile-env subprocess");
+
+        assert!(
+            output.status.success(),
+            "hostile-env subprocess fixture failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&sentinel_index).unwrap(),
+            sentinel_index_before,
+            "a hostile inherited GIT_INDEX_FILE must never be honored: \
+             hermetic_git_command's env_clear() must have stripped it"
+        );
+        assert!(
+            fs::read_dir(&sentinel_common).unwrap().next().is_none(),
+            "a hostile inherited GIT_COMMON_DIR must never be honored"
+        );
+        assert!(
+            fs::read_dir(&sentinel_objects).unwrap().next().is_none(),
+            "a hostile inherited GIT_OBJECT_DIRECTORY must never be honored"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(sentinel_index.parent().unwrap());
+        let _ = fs::remove_dir_all(&sentinel_common);
+        let _ = fs::remove_dir_all(&sentinel_objects);
     }
 }
 
