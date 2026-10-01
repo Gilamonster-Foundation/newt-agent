@@ -9,15 +9,19 @@
 mod unix {
     use agent_harness::{Error, Session, SessionConfig};
     use std::{
+        ffi::c_void,
         io::{Read, Write},
         os::unix::{io::AsRawFd, net::UnixStream},
         time::Duration,
     };
 
+    // Signatures match libc's exactly (`*c_void` buffers): rustc 1.99's
+    // `suspicious_runtime_symbol_definitions` rejects a redeclaration of a
+    // symbol the standard library itself calls when the types differ.
     unsafe extern "C" {
         fn fork() -> i32;
-        fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
-        fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
+        fn read(fd: i32, buffer: *mut c_void, count: usize) -> isize;
+        fn write(fd: i32, buffer: *const c_void, count: usize) -> isize;
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         fn _exit(status: i32) -> !;
     }
@@ -47,11 +51,12 @@ mod unix {
                 // SAFETY: buffers remain valid for each one-byte syscall; fd
                 // is owned by child. _exit avoids running inherited test state.
                 unsafe {
-                    if write(fd, &ready, 1) != 1 {
+                    if write(fd, std::ptr::from_ref(&ready).cast(), 1) != 1 {
                         _exit(2);
                     }
-                    let mut command = 0;
-                    let valid = read(fd, &mut command, 1) == 1 && command == b'X';
+                    let mut command = 0u8;
+                    let valid = read(fd, std::ptr::from_mut(&mut command).cast(), 1) == 1
+                        && command == b'X';
                     _exit(if valid { 0 } else { 3 });
                 }
             }
