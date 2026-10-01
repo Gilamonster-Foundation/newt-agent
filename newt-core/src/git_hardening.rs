@@ -191,7 +191,7 @@ fn path_to_string(path: &Path) -> String {
 
 /// `(git-common-dir, absolute-git-dir)`, both made absolute against
 /// `workspace` (`--git-common-dir` prints relative for a normal checkout).
-fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
     let output = hardened_git(
         workspace,
         &["rev-parse", "--git-common-dir", "--absolute-git-dir"],
@@ -216,7 +216,7 @@ fn git_dirs(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
 
 /// The checked-out branch name (`refs/heads/<name>` stripped), or `None` for
 /// detached HEAD / an unresolvable symbolic ref.
-fn own_branch(workspace: &Path) -> Option<String> {
+pub(crate) fn own_branch(workspace: &Path) -> Option<String> {
     let output = hardened_git(workspace, &["symbolic-ref", "-q", "HEAD"])
         .ok()?
         .output()
@@ -233,7 +233,7 @@ fn own_branch(workspace: &Path) -> Option<String> {
 /// Is `branch` the repo's default branch — `main`, `master`, or whatever the
 /// remote's `HEAD` points at? The remote lookup is best-effort: an offline or
 /// remote-less repo just falls back to the hardcoded names.
-fn is_default_branch(workspace: &Path, branch: &str) -> bool {
+pub(crate) fn is_default_branch(workspace: &Path, branch: &str) -> bool {
     if branch == "main" || branch == "master" {
         return true;
     }
@@ -252,6 +252,28 @@ fn is_default_branch(workspace: &Path, branch: &str) -> bool {
         .trim()
         .strip_prefix("refs/remotes/origin/")
         .is_some_and(|default| default == branch)
+}
+
+/// The remote `origin`'s default branch name (`refs/remotes/origin/HEAD`),
+/// or `None` when it cannot be resolved (offline/remote-less repo) — the
+/// governed PR broker (issue-1188 amendment A4) falls back to `"main"` in
+/// that case, same as [`is_default_branch`]'s hardcoded-name fallback.
+#[must_use]
+pub fn origin_default_branch_name(workspace: &Path) -> Option<String> {
+    let output = hardened_git(
+        workspace,
+        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+    )
+    .ok()?
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_owned)
 }
 
 /// Git config keys/values forced via `-c` so a hostile repo `.git/config` cannot
@@ -492,34 +514,215 @@ pub fn hardened_git(cwd: &Path, args: &[&str]) -> io::Result<Command> {
     Ok(c)
 }
 
-fn git_program(cwd: &Path, path: Option<&OsStr>) -> io::Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let cwd = std::path::absolute(cwd)?;
-        // Relative/empty PATH entries retain their child-working-directory
-        // semantics. Do not canonicalize symlinks or substitute a system Git
-        // for the operator's selected executable. An absent PATH fails closed.
-        path.into_iter()
-            .flat_map(std::env::split_paths)
-            .map(|entry| cwd.join(entry).join("git"))
-            .find(|program| {
-                program.metadata().is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            })
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "git executable not found in PATH")
-            })
+/// `git config --local --list` (plus `--worktree`, when active) for
+/// `workspace`'s repository, via [`hardened_git`] (so this read itself cannot
+/// be redirected by the same hostile config it is inspecting). A repository
+/// with no local config section at all is a clean, empty listing, not an
+/// error.
+///
+/// With `extensions.worktreeConfig` enabled, Git additionally reads
+/// `$GIT_DIR/config.worktree` as its OWN scope, distinct from `--local` — a
+/// repo-local gadget key set only there would otherwise pass A1's scan
+/// clean while still being read by the credentialed push (issue-1188 review
+/// #2641, finding 3). `--worktree` is read only when that extension is
+/// actually enabled (checked from the `--local` listing itself): asking for
+/// it unconditionally errors on the vast majority of repositories that never
+/// opted in, which is not a hostility signal.
+///
+/// # Errors
+/// When git cannot be located/spawned, or a scope this reads exits with
+/// anything other than "no matches" (`1`) — fails closed rather than
+/// silently treating an unreadable/malformed config as clean.
+/// `git remote get-url <remote>` for `workspace`, via [`hardened_git`].
+/// Returns the URL git would resolve for a READ-ONLY purpose (deriving the
+/// `owner/name` shown to the operator and passed to `gh --repo`). The
+/// governed PUSH path does NOT use this — it reads
+/// [`crate::git_staging::literal_remote_url`] instead, since staging's actual
+/// dial never goes through a resolver that could apply `insteadOf` at all.
+///
+/// # Errors
+/// A message naming the remote when git reports no such remote, or on I/O
+/// failure launching git.
+pub fn resolve_remote_url(workspace: &Path, remote: &str) -> Result<String, String> {
+    let output = hardened_git(workspace, &["remote", "get-url", remote])
+        .map_err(|e| e.to_string())?
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "no such remote '{remote}': {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (cwd, path);
-        Ok(PathBuf::from("git"))
-    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg(all(test, target_os = "macos"))]
+/// Validate a resolved remote URL against issue-1188's amendment A2: only
+/// `https://` and `ssh://` (including the scp-like `user@host:path` shorthand,
+/// which IS an ssh URL to git) are pushable by the broker. `file://`, `ext::`,
+/// bare local paths, and anything else are refused — `file://` can point
+/// anywhere on the host filesystem and `ext::` runs an arbitrary program AS
+/// the transport, exactly the class of gadget the rest of this module exists
+/// to keep out of a host-side git invocation.
+///
+/// Returns the URL's host on success.
+pub fn push_url_host(url: &str) -> Result<String, String> {
+    let unsupported = || {
+        format!(
+        "unsupported remote URL scheme for a governed push: {url} (only https:// and ssh:// are pushable)"
+    )
+    };
+    let valid_host = |host: &str| {
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    };
+
+    if let Some(rest) = url.strip_prefix("https://") {
+        // Reject embedded userinfo outright: `https://github.com@evil.example/…`
+        // makes `github.com` LOOK like the host while Git actually connects to
+        // `evil.example`, and a password/token embedded this way must never
+        // reach a prompt/result/log either. A2 refuses the whole class.
+        if rest.contains('@') {
+            return Err(format!(
+                "refused: an https push URL must not embed credentials or a username: {url}"
+            ));
+        }
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = authority.split(':').next().unwrap_or(authority);
+        return if valid_host(host) {
+            Ok(host.to_ascii_lowercase())
+        } else {
+            Err(unsupported())
+        };
+    }
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        // ssh://[user@]host[:port][/path] — an authority segment must exist
+        // before the first `/`.
+        let authority = rest.split('/').next().unwrap_or("");
+        let host_part = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host_part.split(':').next().unwrap_or(host_part);
+        return if valid_host(host) {
+            Ok(host.to_ascii_lowercase())
+        } else {
+            Err(unsupported())
+        };
+    }
+    // Any other explicit scheme (`file://`, `ext::`, `git://`, a credential
+    // helper's own `scheme::` syntax) is refused outright, never treated as
+    // scp-like shorthand.
+    if url.contains("://") || url.contains("::") {
+        return Err(unsupported());
+    }
+    // scp-like shorthand: `user@host:path`. Git recognizes this ONLY when no
+    // `/` precedes the first `:` — `/tmp/repo@github.com:target` is a LOCAL
+    // path to Git (the leading `/` rules out scp syntax) even though naive
+    // string splitting on `@`/`:` would find `github.com` inside it.
+    if let Some(colon) = url.find(':') {
+        if url[..colon].contains('/') {
+            return Err(unsupported()); // a local path, not a pushable URL
+        }
+        let authority = &url[..colon];
+        let Some(host) = authority.rsplit_once('@').map(|(_, host)| host) else {
+            return Err(unsupported()); // no `user@` — not scp syntax
+        };
+        return if valid_host(host) {
+            Ok(host.to_ascii_lowercase())
+        } else {
+            Err(unsupported())
+        };
+    }
+    Err(unsupported())
+}
+
+/// `(owner, name)` from a GitHub `https://github.com/…` or scp-like
+/// `git@github.com:…` URL — amendment A4's `--repo owner/name` for `gh pr
+/// create`. `None` for anything not shaped like a GitHub remote (the caller
+/// refuses the PR broker in that case rather than guessing).
+#[must_use]
+pub fn github_owner_repo(url: &str) -> Option<(String, String)> {
+    let host = push_url_host(url).ok()?;
+    if host != "github.com" {
+        return None;
+    }
+    let path = if let Some(rest) = url.strip_prefix("https://") {
+        rest.split_once('/')?.1
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        rest.split_once('/')?.1
+    } else {
+        url.split_once(':')?.1
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
+}
+
+fn git_program(cwd: &Path, path: Option<&OsStr>) -> io::Result<PathBuf> {
+    resolve_trusted_program(cwd, path, "git")
+}
+
+/// [`resolve_trusted_program`] for `git`, with no `cwd` bias — used by
+/// [`crate::git_staging`], which never trusts a model-chosen `cwd` for
+/// executable resolution at all (every trusted binary it spawns runs from a
+/// harness-controlled staging directory).
+///
+/// # Errors
+/// Same as [`resolve_trusted_program`].
+pub fn trusted_git_program(path: Option<&OsStr>) -> io::Result<PathBuf> {
+    resolve_trusted_program(Path::new("."), path, "git")
+}
+
+/// [`trusted_git_program`]'s sibling for `gh`.
+///
+/// # Errors
+/// Same as [`resolve_trusted_program`].
+pub fn trusted_gh_program(path: Option<&OsStr>) -> io::Result<PathBuf> {
+    resolve_trusted_program(Path::new("."), path, "gh")
+}
+
+/// Resolve `name` from `path` the same trusted way on every Unix target, not
+/// only macOS: only ABSOLUTE PATH entries are considered, so a relative or
+/// empty entry can never resolve against the model-chosen `cwd` this process
+/// is about to `chdir` into (`execvp`'s own relative-PATH-entry semantics are
+/// exactly that "search relative to the current working directory" gadget —
+/// issue-1188 review #2641 finding 5). This is stricter than plain `execvp`,
+/// not merely a copy of it: previously only macOS resolved before scrubbing
+/// PATH at all, and even that macOS lookup accepted relative entries.
+///
+/// Windows keeps the pre-existing bare-name behavior: `CreateProcess`'s
+/// executable search does not repeat Unix's cwd-relative-PATH-entry gadget
+/// the same way, and the Windows AppContainer refusal already covers the
+/// dominant native-Git host-execution risk on that platform
+/// (`windows_appcontainer_native_git_refusal`).
+#[cfg(unix)]
+fn resolve_trusted_program(cwd: &Path, path: Option<&OsStr>, name: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = cwd;
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|entry| entry.is_absolute())
+        .map(|entry| entry.join(name))
+        .find(|program| {
+            program.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{name} executable not found in an absolute PATH entry"),
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn resolve_trusted_program(cwd: &Path, path: Option<&OsStr>, name: &str) -> io::Result<PathBuf> {
+    let _ = (cwd, path);
+    Ok(PathBuf::from(name))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -539,7 +742,7 @@ mod tests {
     /// Real files ground the lookup predicate's ordering and execute-bit checks;
     /// the structural regression above alone cannot verify filesystem behavior.
     #[test]
-    fn executable_lookup_preserves_path_order_and_child_relative_entries() {
+    fn executable_lookup_preserves_path_order_among_absolute_entries() {
         let fixture = tempfile::tempdir().unwrap();
         let cwd = std::path::absolute(fixture.path()).unwrap();
         for (name, mode) in [
@@ -554,10 +757,10 @@ mod tests {
             std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
         }
         let path = std::env::join_paths([
-            Path::new("missing"),
-            Path::new("not-executable"),
-            Path::new("first"),
-            Path::new("second"),
+            cwd.join("missing"),
+            cwd.join("not-executable"),
+            cwd.join("first"),
+            cwd.join("second"),
         ])
         .unwrap();
         assert_eq!(
@@ -571,19 +774,26 @@ mod tests {
         );
     }
 
-    /// Real symlinks ground the predicate's promise to retain the selected path.
+    /// issue-1188 review #2641, finding 5: a relative or empty PATH entry
+    /// must NEVER resolve against `cwd` — that is exactly the
+    /// `execvp`-inherited gadget that let a repo-planted `git`/`gh` run with
+    /// the host's credentials via a hostile (or merely inherited-relative)
+    /// PATH. Would have failed before the fix: the prior macOS-only lookup
+    /// joined a relative entry onto `cwd` and found `selected-git` here.
     #[test]
-    fn empty_path_entry_searches_child_cwd_and_symlink_is_not_rewritten() {
+    fn relative_and_empty_path_entries_are_never_resolved_against_cwd() {
         let fixture = tempfile::tempdir().unwrap();
         let cwd = std::path::absolute(fixture.path()).unwrap();
-        let target = cwd.join("selected-git");
-        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::os::unix::fs::symlink(&target, cwd.join("git")).unwrap();
-        assert_eq!(
-            git_program(&cwd, Some(OsStr::new(""))).unwrap(),
-            cwd.join("git")
-        );
+        let planted = cwd.join("git");
+        std::fs::write(&planted, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for path in [OsStr::new(""), OsStr::new("."), OsStr::new("sub")] {
+            assert_eq!(
+                git_program(&cwd, Some(path)).unwrap_err().kind(),
+                io::ErrorKind::NotFound,
+                "a repo-writable relative/empty PATH entry must never be searched: {path:?}"
+            );
+        }
     }
 
     /// An empty real directory grounds the lookup's fail-closed missing-path case.
@@ -885,5 +1095,130 @@ mod own_gitdir_grant_tests {
             "detached HEAD must not get write roots"
         );
         assert!(!grant.read.is_empty(), "detached HEAD still gets read");
+    }
+}
+
+/// Pure parsing/validation for the URL/owner-repo helpers the governed
+/// brokers use, exercised without a real git process. The former
+/// `hostile_push_config_key` denylist tests that lived here were deleted with
+/// that function: the staging-repo broker (`crate::git_staging`) makes the
+/// whole class of repo-local config gadget unrepresentable by never reading
+/// the workspace's `.git/config` for the actual dial at all, rather than
+/// enumerating known-hostile keys in it.
+#[cfg(test)]
+mod governed_push_config_tests {
+    use super::*;
+
+    #[test]
+    fn https_ssh_and_scp_like_urls_resolve_the_right_host() {
+        assert_eq!(
+            push_url_host("https://github.com/o/r.git").as_deref(),
+            Ok("github.com")
+        );
+        assert_eq!(
+            push_url_host("ssh://git@github.com:22/o/r.git").as_deref(),
+            Ok("github.com")
+        );
+        assert_eq!(
+            push_url_host("git@github.com:o/r.git").as_deref(),
+            Ok("github.com")
+        );
+    }
+
+    /// Would have failed before A2: `file://` and `ext::` are not screened by
+    /// any existing host allowlist check, so nothing else in the broker would
+    /// have refused them.
+    #[test]
+    fn file_and_ext_transports_are_refused() {
+        assert!(push_url_host("file:///home/op/other-repo").is_err());
+        assert!(push_url_host("ext::sh -c evil").is_err());
+        assert!(push_url_host("git://github.com/o/r.git").is_err());
+    }
+
+    /// Finding 1 (issue-1188 review #2641): embedded userinfo makes the
+    /// checked host and the host Git actually dials DIFFERENT strings. Would
+    /// have failed before the fix: naive `split(['/', '@'])` found
+    /// `github.com` as the first token and returned it, while Git connects
+    /// to `evil.example`.
+    #[test]
+    fn https_userinfo_host_confusion_is_refused() {
+        assert!(push_url_host("https://github.com@evil.example/o/r.git").is_err());
+        assert!(push_url_host("https://user:token@github.com/o/r.git").is_err());
+    }
+
+    /// Finding 1: a slash before the first `:` makes this a LOCAL path to
+    /// Git, not scp-like shorthand — even though naive parsing would find an
+    /// `@host:` pattern inside it. Would have failed before the fix.
+    #[test]
+    fn local_path_containing_at_and_colon_is_not_scp_syntax() {
+        assert!(push_url_host("/tmp/repo@github.com:target").is_err());
+        assert!(push_url_host("./relative/repo@host:target").is_err());
+    }
+
+    /// Finding 1: helper-like `scheme::` syntax must never fall through to
+    /// the scp-shorthand branch.
+    #[test]
+    fn double_colon_helper_syntax_is_refused() {
+        assert!(push_url_host("ext::sh -c 'evil'@host:path").is_err());
+    }
+
+    #[test]
+    fn github_owner_repo_parses_https_and_scp_like() {
+        assert_eq!(
+            github_owner_repo("https://github.com/Org/Repo.git"),
+            Some(("Org".to_string(), "Repo".to_string()))
+        );
+        assert_eq!(
+            github_owner_repo("git@github.com:Org/Repo.git"),
+            Some(("Org".to_string(), "Repo".to_string()))
+        );
+        assert_eq!(
+            github_owner_repo("https://gitlab.example.com/Org/Repo.git"),
+            None,
+            "non-github hosts refuse the gh broker rather than guessing --repo"
+        );
+    }
+}
+
+/// Real git + a real tempdir repo: grounds [`resolve_remote_url`] against
+/// actual `git remote` behavior, per the workspace's expensive/real-resource
+/// testing tier (small and self-contained enough to run inline, same posture
+/// as `own_gitdir_grant_tests` above).
+#[cfg(all(test, unix))]
+mod governed_push_process_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git invocation");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn resolve_remote_url_matches_what_git_would_actually_push_to() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        assert_eq!(
+            resolve_remote_url(repo.path(), "origin").unwrap(),
+            "https://github.com/o/r.git"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_url_errors_on_missing_remote() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        assert!(resolve_remote_url(repo.path(), "origin").is_err());
     }
 }

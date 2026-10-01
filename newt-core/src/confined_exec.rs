@@ -325,13 +325,20 @@ fn mint_context(origin: ExecOrigin, caveats: &Caveats) -> Result<ToolContext, Ex
 /// FAILS CLOSED ([`ExecRefused::ConfinementUnenforceable`]) rather than running
 /// unconfined — the honest signal a caller (or a test) uses to know whether the
 /// executor will confine or refuse on this host.
+///
+/// Linux uses Landlock; macOS uses Seatbelt (A3, operator-accepted 2026-09-30,
+/// verified on a remote macOS test runner — see `docs/security/ocap-deviations.md`).
 #[must_use]
 pub fn kernel_fs_fence_available() -> bool {
     #[cfg(target_os = "linux")]
     {
         agent_bridle::landlock_is_supported()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        agent_bridle::seatbelt_is_supported()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         false
     }
