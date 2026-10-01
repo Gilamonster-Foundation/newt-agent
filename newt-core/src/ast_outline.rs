@@ -102,7 +102,9 @@ fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
         };
         if !child.is_named()
             && ITEM_KEYWORDS.contains(&child.kind())
-            && node.child(i + 1).is_some_and(|next| next.kind() == "identifier")
+            && node
+                .child(i + 1)
+                .is_some_and(|next| next.kind() == "identifier")
         {
             hits.push(child.start_byte());
         }
