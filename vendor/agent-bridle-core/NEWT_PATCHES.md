@@ -83,3 +83,16 @@ this change, Cargo resolves the two ranges to two separate crates, and every
 the version requirement changed: protocol 0.7 adds `AgentKey::issue_derived`
 and removes nothing this crate uses. Upstream agent-bridle needs the same bump
 before this vendored copy can be retired.
+
+## Descriptor-bound read roots
+
+`HeldReadRoot`, `Sandbox::apply_with_held_roots` and
+`ConfinedCommand::held_read_roots`: a caller that already holds a read root as
+a directory descriptor (and has verified its identity) hands a duplicate to the
+spawn. The Landlock ruleset adds `PathBeneath` on that descriptor and drops the
+path-opened rule for the same root, so a swap at the pathname after the
+caller's check cannot re-point the fence. Admission is unchanged — the root is
+still spelled in `fs_read` — only how the rule is built changes. A wrapper
+backend (Seatbelt) refuses a non-empty set rather than fall back to the path.
+Newt's governed push uses this for the confined object copy. Filed upstream as
+a patch; retire this section when it lands.

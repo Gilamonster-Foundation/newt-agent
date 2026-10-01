@@ -445,6 +445,9 @@ pub struct ConfinedCommand {
     new_process_group: bool,
     /// Validated fixed-worker alias roots; only SandboxedWorker can set these.
     worker_read_resources: BTreeSet<String>,
+    /// Read roots the caller holds as directory descriptors; the Landlock
+    /// ruleset anchors on them instead of re-opening the root by path.
+    held_read_roots: Vec<crate::sandbox::HeldReadRoot>,
     /// The sandbox mechanism config (read/exec allow-lists). Rides the builder —
     /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
     /// D2). Defaults to today's built-in allow-lists.
@@ -471,8 +474,24 @@ impl ConfinedCommand {
             stderr: None,
             new_process_group: false,
             worker_read_resources: BTreeSet::new(),
+            held_read_roots: Vec::new(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
+    }
+
+    /// Bind read roots the caller already holds as directory descriptors
+    /// ([`crate::HeldReadRoot`]): the Landlock ruleset anchors on each
+    /// descriptor instead of re-opening that root by path. The roots must
+    /// also be spelled in the context's `fs_read` grant — this changes how
+    /// the fence is BUILT, never what is admitted. A backend that cannot
+    /// anchor on a descriptor refuses the spawn.
+    #[must_use]
+    pub fn held_read_roots(
+        mut self,
+        roots: impl IntoIterator<Item = crate::sandbox::HeldReadRoot>,
+    ) -> Self {
+        self.held_read_roots.extend(roots);
+        self
     }
 
     /// Set the sandbox mechanism policy (read/exec allow-lists, ABI floors) the
@@ -734,6 +753,14 @@ impl ConfinedCommand {
         // error aborts *before* we spawn the thread. Built from the ADMITTED
         // caveats — the same object `apply` consumes on the spawn thread.
         let prefix = sandbox.command_prefix(&mechanism_effective)?;
+        // A wrapper-based backend confines by profile text, which names paths:
+        // it cannot honor a descriptor-bound root, so it refuses rather than
+        // silently re-open that root by name.
+        if !prefix.is_empty() && !self.held_read_roots.is_empty() {
+            return Err(ToolError::denied(
+                "a wrapper-based sandbox cannot anchor a read root on a held descriptor",
+            ));
+        }
 
         // (3) Apply the sandbox on a throwaway thread, then spawn on it so the
         //     child inherits the OS confinement — the per-thread, fork/exec-
@@ -751,6 +778,7 @@ impl ConfinedCommand {
             // Already consumed above into `sandbox` via `best_available_sandbox`.
             sandbox_policy: _,
             worker_read_resources: _,
+            held_read_roots,
             // Consulted only on the `spawn_tokio` path, not this sync `spawn`.
             #[cfg(all(unix, feature = "spawn-tokio"))]
                 private_hosts: _,
@@ -824,9 +852,9 @@ impl ConfinedCommand {
             // achieved by the `command_prefix` wrapper — no per-thread state is
             // involved, and calling `apply` would be wrong (AppContainer fails
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
-            // non-empty.
+            // non-empty. The held roots stay alive here, past `restrict_self`.
             if prefix.is_empty() {
-                sandbox.apply(&mechanism_effective)?;
+                sandbox.apply_with_held_roots(&mechanism_effective, &held_read_roots)?;
             }
 
             cmd.spawn().map_err(ToolError::from)
