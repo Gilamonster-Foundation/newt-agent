@@ -1,11 +1,59 @@
+/// The fixture git, by absolute path: an inherited `PATH` cannot substitute
+/// another binary, and it is the same root-owned `/usr/bin/git` the #2630
+/// exec-path alias is proven against. The kernel-fence tests skip without
+/// it; the rest fail loudly ([`hermetic_git`]).
+const FIXTURE_GIT: &str = "/usr/bin/git";
+
+/// The explicit, minimal environment every fixture git runs under, for BOTH
+/// the unconfined setup ([`hermetic_git`]) and the confined dispatch (the
+/// `"env"` seam of `dispatch_bridled_shell`): one definition, so "isolated
+/// enough not to touch a real repository" and "isolated enough to be a fair
+/// confinement proof" cannot drift apart. A private `HOME` plus
+/// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`/`GIT_TEMPLATE_DIR` close the
+/// config and template sources that live outside the process environment
+/// (`/etc/gitconfig`, the operator's `~/.gitconfig`, `~/.config/git`).
+fn hermetic_git_env(home: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let home = home.to_string_lossy();
+    [
+        ("HOME", home.as_ref()),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@example.invalid"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@example.invalid"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_TEMPLATE_DIR", "/dev/null"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// Mirror of the vendored core's test-private `hermetic_git_command`
+/// (`vendor/agent-bridle-core/src/sandbox.rs`, bridle PR #407): `env_clear()`
+/// rather than a denylist, so an inherited `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_CEILING_DIRECTORIES`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`,
+/// `GIT_OBJECT_DIRECTORY` or any other ambient git knob cannot leak in,
+/// because nothing is inherited. Proven by
+/// [`hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture`].
+fn hermetic_git(dir: &std::path::Path, home: &std::path::Path) -> std::process::Command {
+    assert!(
+        std::path::Path::new(FIXTURE_GIT).exists(),
+        "the fixture git {FIXTURE_GIT} is absent"
+    );
+    let mut cmd = std::process::Command::new(FIXTURE_GIT);
+    cmd.current_dir(dir)
+        .env_clear()
+        .envs(hermetic_git_env(home));
+    cmd
+}
+
+/// Unconfined fixture setup (`init`/`add`/`commit`/`worktree add`) under a
+/// throwaway private `HOME` that lives only for the one command.
 fn real_git(dir: &std::path::Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
+    let home = tempfile::tempdir().unwrap();
+    let ok = hermetic_git(dir, home.path())
         .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
         .status()
         .unwrap()
         .success();
@@ -26,7 +74,7 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     if !crate::confined_exec::kernel_fs_fence_available()
-        || !std::path::Path::new("/usr/bin/git").exists()
+        || !std::path::Path::new(FIXTURE_GIT).exists()
     {
         return;
     }
@@ -79,9 +127,9 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
         "git add must succeed under the widened fence: {envelope}"
     );
 
-    let status = std::process::Command::new("git")
+    let home = tempfile::tempdir().unwrap();
+    let status = hermetic_git(&wt, home.path())
         .args(["status", "--porcelain"])
-        .current_dir(&wt)
         .output()
         .unwrap();
     assert!(
@@ -99,7 +147,7 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
 /// resolve_exec_paths` folds in `<exec-path>/git` when it is the same image
 /// as a root-owned, trusted-dir `git`), backported into the vendored core.
 ///
-/// Confirmed red on the pre-backport vendored copy: exit 128,
+/// Confirmed red on the pre-backport vendored copy: exit 255,
 /// `fatal: cannot exec 'branch': Permission denied`.
 ///
 /// Real-resource proof (real `/usr/bin/git`, real Landlock), placed beside
@@ -107,32 +155,56 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
 /// weekly tier: like it, this skips (never fails) without Landlock or
 /// `/usr/bin/git`, and it is the ground truth for the vendored
 /// `git_exec_path_tests`, which only check the in-process allow-list and
-/// never ask the kernel. `/etc/gitconfig` is granted read explicitly for the
-/// same reason `dispatch_caveats_for_git_shell` grants it: real git always
-/// opens the system config, and this fixture's cwd is the main repository
-/// on its default branch, where that widening does not fire.
+/// never ask the kernel. No `/etc/gitconfig` read grant is needed: the
+/// confined dispatch carries [`hermetic_git_env`], whose
+/// `GIT_CONFIG_NOSYSTEM=1` means git never opens the system config.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() {
-    let _env = super::disable_ocap_tests::env_lock().await;
-    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     if !crate::confined_exec::kernel_fs_fence_available()
-        || !std::path::Path::new("/usr/bin/git").exists()
+        || !std::path::Path::new(FIXTURE_GIT).exists()
     {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let main = root.path().join("main");
-    std::fs::create_dir(&main).unwrap();
-    real_git(&main, &["init", "-q"]);
-    std::fs::write(main.join("seed"), "x").unwrap();
-    real_git(&main, &["add", "seed"]);
-    real_git(&main, &["commit", "-q", "-m", "init"]);
-    let wt = root.path().join("wt");
+    worktree_add_under_git_only_exec_grant(root.path()).await;
+}
 
-    let root_s = root.path().to_string_lossy().into_owned();
+/// The #2630 fixture proper, built under `root`: an unconfined `init`/`add`/
+/// `commit` of `<root>/main`, then the Landlock-confined `git worktree add`
+/// under a `git`-only exec grant. Both halves run under [`hermetic_git_env`]
+/// with a private `HOME` inside `root`: the setup through [`hermetic_git`],
+/// the confined command through the dispatch's `"env"` seam (the engine
+/// `env_clear`s the child and applies only that map, so nothing of this
+/// process's environment reaches either git). Shared by the test above and
+/// by the hostile-environment subprocess of
+/// [`hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture`],
+/// so the isolation claim is made about exactly the fixture that runs.
+#[cfg(target_os = "linux")]
+async fn worktree_add_under_git_only_exec_grant(root: &std::path::Path) {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let main = root.join("main");
+    std::fs::create_dir(&main).unwrap();
+    let home = root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    let setup = |args: &[&str]| {
+        let ok = hermetic_git(&main, &home)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    setup(&["init", "-q"]);
+    std::fs::write(main.join("seed"), "x").unwrap();
+    setup(&["add", "seed"]);
+    setup(&["commit", "-q", "-m", "init"]);
+    let wt = root.join("wt");
+
+    let root_s = root.to_string_lossy().into_owned();
     let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([root_s.clone(), "/etc/gitconfig".to_string()]),
+        fs_read: crate::caveats::Scope::only([root_s.clone()]),
         fs_write: crate::caveats::Scope::only([root_s]),
         exec: crate::caveats::Scope::only(["git".to_string()]),
         net: crate::caveats::Scope::none(),
@@ -140,7 +212,11 @@ async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() 
     };
     let cmd = format!("git worktree add -q {} -b task", wt.display());
     let envelope = super::shell::dispatch_bridled_shell(
-        serde_json::json!({"cmd": cmd, "cwd": main.to_string_lossy()}),
+        serde_json::json!({
+            "cmd": cmd,
+            "cwd": main.to_string_lossy(),
+            "env": hermetic_git_env(&home),
+        }),
         &session,
         None,
     )
@@ -157,6 +233,137 @@ async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() 
     assert!(
         wt.join("seed").exists(),
         "the new worktree must actually be checked out"
+    );
+}
+
+/// Env var whose presence makes a re-execution of this test binary run as
+/// the dedicated hostile-environment subprocess of
+/// [`hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture`]
+/// (its value is the fixture root). Set ONLY on the `Command` that spawns
+/// that one child, never on this process: a process-global `set_var` races
+/// every other test in the binary.
+#[cfg(target_os = "linux")]
+const HOSTILE_ENV_SUBPROCESS_ROOT: &str = "NEWT_2630_HOSTILE_ENV_SUBPROCESS_ROOT";
+
+/// PR #2670 fix-first, P1: the fixture's unconfined `git init`/`add`/`commit`
+/// must not be redirectable by the environment the test process inherited.
+/// A developer shell that exports `GIT_DIR`/`GIT_WORK_TREE` (the dotfiles
+/// idiom: `GIT_DIR=~/.dotfiles GIT_WORK_TREE=~`) or carries a `~/.gitconfig`
+/// naming `core.hooksPath` would otherwise have the setup commit INTO that
+/// external repository and run its hooks, which is code execution outside
+/// the fixture.
+///
+/// The adversary is real, not sentinels nothing points at: this test
+/// re-executes its own binary with `--exact` against only itself, and that
+/// child's `Command` environment (this process's own is never mutated)
+/// carries `GIT_DIR` = an external sentinel repository's gitdir,
+/// `GIT_WORK_TREE` = the fixture root (so the fixture's files lie INSIDE the
+/// hostile work tree, exactly as a tempdir under `~` does under the dotfiles
+/// idiom), and `HOME` = a hostile home whose `.gitconfig` sets
+/// `core.hooksPath` to a `pre-commit` hook that leaves a mark. The child
+/// runs the real fixture through [`worktree_add_under_git_only_exec_grant`];
+/// this parent then checks the sentinels are byte-identical, the hook never
+/// ran, and the fixture actually completed (`<root>/wt/seed` exists, so a
+/// child that matched no test cannot pass vacuously).
+///
+/// Confirmed red with the pre-fix `real_git` (bare `git`, inherited
+/// environment): the setup's `add`/`commit` landed in the sentinel
+/// repository and its hook ran. The sentinel repository is this test's own
+/// disposable fixture, never an operator repository.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture() {
+    // Re-entry: the same test, running as the dedicated hostile subprocess.
+    if let Ok(root) = std::env::var(HOSTILE_ENV_SUBPROCESS_ROOT) {
+        assert!(
+            crate::confined_exec::kernel_fs_fence_available(),
+            "the parent re-executes only on a Landlock host"
+        );
+        worktree_add_under_git_only_exec_grant(std::path::Path::new(&root)).await;
+        return;
+    }
+    if !crate::confined_exec::kernel_fs_fence_available()
+        || !std::path::Path::new(FIXTURE_GIT).exists()
+    {
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let hostile = tempfile::tempdir().unwrap();
+
+    // The external sentinel repository: a real repo with one commit, whose
+    // gitdir the hostile `GIT_DIR` names.
+    let sentinel = hostile.path().join("sentinel");
+    std::fs::create_dir(&sentinel).unwrap();
+    real_git(&sentinel, &["init", "-q", "-b", "main"]);
+    std::fs::write(sentinel.join("seed"), "sentinel").unwrap();
+    real_git(&sentinel, &["add", "seed"]);
+    real_git(&sentinel, &["commit", "-q", "-m", "sentinel"]);
+    let sentinel_gitdir = sentinel.join(".git");
+    let index_before = std::fs::read(sentinel_gitdir.join("index")).unwrap();
+    let head_before = std::fs::read(sentinel_gitdir.join("refs/heads/main")).unwrap();
+
+    // A hostile HOME whose global config routes hooks to a directory whose
+    // `pre-commit` leaves a mark.
+    let hostile_home = hostile.path().join("home");
+    let hooks = hostile_home.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook_mark = hostile.path().join("hook-ran");
+    let hook = hooks.join("pre-commit");
+    std::fs::write(&hook, format!("#!/bin/sh\n: > '{}'\n", hook_mark.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        hostile_home.join(".gitconfig"),
+        format!("[core]\n\thooksPath = {}\n", hooks.display()),
+    )
+    .unwrap();
+
+    // libtest names a test by its module path without the crate prefix.
+    let this_test = format!(
+        "{}::hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
+    let exe = std::env::current_exe().expect("current_exe must resolve for the re-exec proof");
+    let output = std::process::Command::new(&exe)
+        .args(["--exact", &this_test, "--nocapture", "--test-threads=1"])
+        // Explicit, minimal: this Command's env is what the child inherits.
+        // PATH is for the re-executed test binary's own machinery.
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env(HOSTILE_ENV_SUBPROCESS_ROOT, root.path())
+        .env("HOME", &hostile_home)
+        .env("GIT_DIR", &sentinel_gitdir)
+        .env("GIT_WORK_TREE", root.path())
+        .output()
+        .expect("spawn hostile-env subprocess");
+
+    // Sentinels first, so a red names the mutation rather than its fallout.
+    assert!(
+        !hook_mark.exists(),
+        "a hook from the inherited HOME's config must never run"
+    );
+    assert_eq!(
+        std::fs::read(sentinel_gitdir.join("index")).unwrap(),
+        index_before,
+        "an inherited GIT_DIR/GIT_WORK_TREE must never redirect the fixture's `git add`"
+    );
+    assert_eq!(
+        std::fs::read(sentinel_gitdir.join("refs/heads/main")).unwrap(),
+        head_before,
+        "an inherited GIT_DIR/GIT_WORK_TREE must never redirect the fixture's `git commit`"
+    );
+    assert!(
+        output.status.success(),
+        "hostile-env subprocess fixture failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        root.path().join("wt").join("seed").exists(),
+        "the subprocess must have run the fixture to completion, not matched no test"
     );
 }
 
