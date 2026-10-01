@@ -1,5 +1,27 @@
 use super::{is_ctrl_c, is_lone_esc, watch_for_interrupt_fd, SpillInput, TurnKey, TurnKeyDecoder};
 
+/// Wait until the pipe's read end has been fully drained (the watcher
+/// thread's `read()` consumed everything written so far) — the event that
+/// makes "this byte arrived in its own read()" provable instead of hoped for
+/// by a fixed sleep between writes. `FIONREAD` only queries the kernel's
+/// buffered byte count; it never consumes, so it is safe to poll from the
+/// writer's thread while the reader thread independently reads the fd.
+fn wait_drained(read_fd: libc::c_int) {
+    let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
+    loop {
+        let mut pending: libc::c_int = 0;
+        let rc = unsafe { libc::ioctl(read_fd, libc::FIONREAD, &mut pending) };
+        if rc == 0 && pending == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never drained the pipe"
+        );
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn lone_esc_interrupts_but_sequences_and_chords_do_not() {
     assert!(is_lone_esc(&[0x1b]), "a bare Esc press interrupts");
@@ -61,7 +83,6 @@ fn arrow_decoder_preserves_fragmented_csi_and_ss3_sequences() {
 #[test]
 fn per_keystroke_reads_preserve_spaces_in_type_ahead() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     let _ = crate::type_ahead::take();
     let mut pipe = [0; 2];
@@ -82,12 +103,17 @@ fn per_keystroke_reads_preserve_spaces_in_type_ahead() {
             );
         });
         // One byte per write = one byte per read, the human typing shape.
+        // Each byte is drained (the event) before the next is written, so
+        // bytes cannot coalesce into one read() regardless of scheduling —
+        // the former 20 ms sleep only hoped the watcher ran in time, and a
+        // starved watcher made this pass vacuously instead of testing the
+        // per-keystroke shape at all.
         for byte in *b"hi !" {
             assert_eq!(
                 unsafe { libc::write(pipe[1], [byte].as_ptr().cast(), 1) },
                 1
             );
-            std::thread::sleep(Duration::from_millis(20));
+            wait_drained(pipe[0]);
         }
         // No wake byte: the 10 ms poll timeout notices `stop` on its own,
         // so nothing can race into the decoder after this store.
@@ -336,7 +362,11 @@ fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
                 newt_core::EditMode::Nano,
                 false, // mode_nav: base keys (arrow + space) only
                 10,
-                100,
+                // Large on purpose: this test's continuation always arrives,
+                // so nothing ever waits out the grace — the former 100 ms
+                // raced the test's own write pacing under load (see below)
+                // and could misclassify the arrow as a lone Esc.
+                60_000,
             );
         });
         let write = |bytes: &[u8]| {
@@ -345,10 +375,14 @@ fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
                 bytes.len() as isize
             );
         };
+        // Each fragment is drained (the watcher's read of it) before the next
+        // is written, so the split arrives exactly where the test intends
+        // regardless of scheduling — the former 10 ms sleeps only hoped the
+        // watcher ran between writes.
         write(&[0x1b]);
-        std::thread::sleep(Duration::from_millis(10));
+        wait_drained(pipe[0]);
         write(b"[");
-        std::thread::sleep(Duration::from_millis(10));
+        wait_drained(pipe[0]);
         write(b"A ");
 
         let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
