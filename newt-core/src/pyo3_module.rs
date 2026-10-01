@@ -41,7 +41,11 @@ fn newt_err_to_py(e: NewtError) -> PyErr {
     frozen,
     from_py_object
 )]
-#[derive(Clone, Copy, PartialEq, Eq)]
+// `Clone` but deliberately not `Copy`: `from_py_object` expands to a
+// `FromPyObject` impl that extracts by `Clone::clone`, which clippy (1.99+)
+// reports as `clone_on_copy` when the type is also `Copy`. Nothing here needs
+// the implicit copy.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PyTier {
     Fast,
     Standard,
@@ -59,7 +63,7 @@ impl PyTier {
         }
     }
 
-    fn to_inner(self) -> Tier {
+    fn into_inner(self) -> Tier {
         match self {
             Self::Fast => Tier::Fast,
             Self::Standard => Tier::Standard,
@@ -165,7 +169,7 @@ impl PyRouter {
     #[classmethod]
     fn with_override(_cls: &Bound<'_, PyType>, tier: PyTier) -> Self {
         Self {
-            inner: Router::with_override(tier.to_inner()),
+            inner: Router::with_override(tier.into_inner()),
         }
     }
 
@@ -307,7 +311,7 @@ impl PyBackendConfig {
                 name,
                 endpoint,
                 model: Some(model),
-                tiers: tiers.into_iter().map(PyTier::to_inner).collect(),
+                tiers: tiers.into_iter().map(PyTier::into_inner).collect(),
                 ..Default::default()
             },
         }
@@ -370,7 +374,7 @@ impl PyProviderConfig {
                 command,
                 model,
                 env_pass: env_pass.unwrap_or_default(),
-                tiers: tiers.into_iter().map(PyTier::to_inner).collect(),
+                tiers: tiers.into_iter().map(PyTier::into_inner).collect(),
             },
         }
     }
