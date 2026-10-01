@@ -1369,12 +1369,12 @@ struct OversizedRoundResponder {
 impl Respond for OversizedRoundResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body = body_json(req);
-        let a_onelined = messages_contain(&body, "[read_file] read 'a.txt'");
+        let a_onelined = messages_contain(&body, "[read_file] a.txt lines");
         if !body["stream"].as_bool().unwrap_or(false) {
             self.log.lock().unwrap().push((
                 body_request_tokens(&body),
                 a_onelined,
-                messages_contain(&body, "[read_file] read 'b.txt'"),
+                messages_contain(&body, "[read_file] b.txt lines"),
                 messages_contain(&body, "NEWEST-PAYLOAD-C-INTACT"),
                 messages_contain(&body, TASK),
             ));

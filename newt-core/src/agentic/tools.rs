@@ -53,7 +53,7 @@ pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
 mod live_output;
 mod native_git;
-mod output_budget;
+pub(crate) mod output_budget;
 mod shell;
 /// Real-resource (PTY) proof of the tool-call liveness contract (#1727): a
 /// silent tool is never a blank row, and the first live byte takes the row
@@ -1824,7 +1824,7 @@ pub(super) fn permission_grant_succeeded(
 /// `request_permissions` that consumes it (see `execute_authorized_tool`),
 /// so an unrelated intervening command — successful, failed, or a
 /// replacement for this one — invalidates a stale rerun.
-pub(super) struct PendingRerun {
+pub(crate) struct PendingRerun {
     cmd: String,
     cwd: String,
     declared: Vec<PermissionRequest>,
@@ -4608,6 +4608,7 @@ async fn execute_authorized_tool(
             match memory_source {
                 Some(source) => match super::memory_fetch::resolve_memory_address(address, source) {
                     Ok(body) => paginate_unspillable(
+                        address,
                         &body,
                         args["offset"].as_u64().map(|n| n as usize),
                         args["limit"].as_u64().map(|n| n as usize),
@@ -4636,7 +4637,7 @@ async fn execute_authorized_tool(
                     // held under the spill cap when offload is on, so a big
                     // file pages with `offset=` instead of becoming a handle.
                     let char_offset = args["char_offset"].as_u64().map(|n| n as usize);
-                    read_file_page(&contents, offset, limit, char_offset, tool_offload)
+                    read_file_page(path, &contents, offset, limit, char_offset, tool_offload)
                 }
                 Err(tool_output) => tool_output,
             }

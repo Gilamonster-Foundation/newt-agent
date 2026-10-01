@@ -182,7 +182,7 @@ mod routing;
 // of fabricating a foreign name (the structural complement to the #716 alias
 // seam + #717 phantom telemetry).
 mod tool_search;
-mod tools;
+pub(crate) mod tools;
 mod transcript;
 mod trim;
 // Scoped FR-14 (#1042): wrap a remote MCP tool's result as explicitly

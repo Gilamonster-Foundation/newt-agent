@@ -106,6 +106,39 @@ class ChangedScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "ALL")
 
+    def test_unmapped_path_after_mapped_path_forces_all(self):
+        # Fix-first review on #2658, finding P2 #2: an unmapped file used to
+        # print an empty line, and capturing all lines in command
+        # substitution strips a TRAILING empty line -- so when the unmapped
+        # path sorted last, it silently vanished instead of forcing ALL.
+        # "scripts/x.sh" sorts after "crate-a/..." alphabetically.
+        self.commit("crate-a/src/lib.rs", "pub fn f() { 5; }\n")
+        local = self.commit("scripts/unmapped.sh", "echo hi\n")
+        result = self.run_script(local, self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ALL")
+
+    def test_unmapped_path_before_mapped_path_forces_all(self):
+        # Same bug, opposite order: "0-unmapped.sh" sorts BEFORE crate-a's
+        # path, so this direction already worked before the fix -- kept as
+        # a regression guard against a fix that only handles one order.
+        self.git("checkout", "-qb", "mixed-order", self.base)
+        local = self.commit("0-unmapped.sh", "echo hi\n")
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { 6; }\n")
+        result = self.run_script(local, self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ALL")
+
+    def test_failed_diff_fails_closed_to_all_not_silent_noop(self):
+        # Fix-first review on #2658, finding P2 #2: a failed `git diff`
+        # (unreachable object) must never resolve to an empty, silently
+        # skipped scope -- that is indistinguishable from a genuine no-op
+        # push. "f" * 40 is a well-formed but unreachable sha.
+        local = self.commit("crate-a/src/lib.rs", "pub fn f() { 7; }\n")
+        result = self.run_script(local, "f" * 40)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ALL")
+
     def test_new_branch_uses_merge_base(self):
         # Diverge crate-a on main after the branch forked, so the branch's
         # OWN new commit (crate-b) is the only thing a merge-base diff sees.
