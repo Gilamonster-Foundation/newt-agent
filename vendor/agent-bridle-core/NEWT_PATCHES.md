@@ -59,6 +59,21 @@ SandboxPolicy option or a complete SBPL ruleset. This patch does not promote
 that partial projection to a ruleset-level filesystem proof. Inherited terminal
 descriptors and `/dev/tty` remain separate surfaces.
 
+## Backport of agent-bridle#407, pending rc.6
+
+Upstream commit `c6268667f4d1f7bf05253a20686217fabb460dd4` (merged
+2026-09-29, "fix(landlock): a git-only exec grant admits git's own exec-path
+helpers, execution-free"), applied verbatim to `src/sandbox.rs` plus its
+`content-addressable` pin bump (`0.1.0` → `0.1.2`, for `RawContentId`). On
+Linux, `landlock_impl::resolve_exec_paths` now also admits `<exec-path>/git`
+for a granted `git` whose canonical parent is one of `/usr/bin`, `/bin`,
+`/usr/sbin`, `/sbin`, provided both files and their whole ancestry are
+root-owned and not group/other-writable and the alias is the same image as
+the granted binary. Nothing is executed to decide that, and nothing outside
+that one alias is admitted. Closes newt-agent#2630 (`git worktree add` under a
+`git`-only exec grant failed with `cannot exec 'branch'`). Remove this section
+when the vendored base moves to a release that contains the commit.
+
 ## agent-mesh-protocol 0.7
 
 The published 0.8.0-rc.5 manifest requires `agent-mesh-protocol` 0.6.4. This

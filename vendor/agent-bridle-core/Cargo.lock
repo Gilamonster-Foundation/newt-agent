@@ -35,9 +35,9 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-protocol"
-version = "0.6.4"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f48aad8c7dc96b395393270a5fecefb8321ca9b13bfd519b56000852c9ef54d"
+checksum = "7584e2c151f48bbaafcb637920957e96e24327c9a299aec1fa36ccb255e29a9c"
 dependencies = [
  "blake3",
  "content-addressable",
@@ -225,9 +225,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "content-addressable"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8957229022f9bc41238340101b0b9c061b0e5881359139d35ae59f49133d8e9"
+checksum = "56f67d2c6abc332e3ce3121527028af12a71794cc059308d344aa0b88b9ac204"
 dependencies = [
  "blake3",
  "ipld-core",
