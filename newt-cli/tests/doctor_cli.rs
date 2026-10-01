@@ -6,6 +6,8 @@
 //! working directory are redirected to tempdirs so MCP discovery never reads
 //! the developer's real `~/.claude.json` / `./.mcp.json`.
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
@@ -21,21 +23,16 @@ fn write_config(contents: &str) -> tempfile::NamedTempFile {
     f
 }
 
-/// `newt doctor --config <f>` isolated from the developer's environment:
-/// fake `$HOME`, tempdir cwd (no `./.mcp.json`), no DGX env overrides, and
-/// an unreachable `OLLAMA_HOST` for the discovery step.
+/// `newt doctor --config <f>` under the hermetic setup (fake `$HOME`, tempdir
+/// cwd so no `./.mcp.json`, no DGX env overrides) plus an unreachable
+/// loopback `OLLAMA_HOST` for the discovery step, which doctor reports.
 fn doctor(config: &tempfile::NamedTempFile, home: &tempfile::TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("newt").unwrap();
-    cmd.env("HOME", home.path())
-        .env("OLLAMA_HOST", "http://127.0.0.1:1")
-        .env_remove("NEWT_DGX_OLLAMA_URL")
-        .env_remove("NEWT_DGX_OLLAMA_LB_URL")
-        .env_remove("NEWT_DGX_IN_CLUSTER_URL")
-        .env_remove("NEWT_DGX_VLLM_URL")
-        .env_remove("NEWT_DGX_HOST")
-        .env_remove("NEWT_DGX_MODEL")
-        .current_dir(home.path())
-        .args(["--config", config.path().to_str().unwrap(), "doctor"]);
+    let mut cmd = common::newt_at(home.path());
+    cmd.env("OLLAMA_HOST", "http://127.0.0.1:1").args([
+        "--config",
+        config.path().to_str().unwrap(),
+        "doctor",
+    ]);
     cmd
 }
 
@@ -165,7 +162,7 @@ tiers = ["FAST"]
         present_command = present_command,
         broken_command = broken_command,
     ));
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
 
     let mut cmd = doctor(&config, &home);
     cmd.env("PATH", path_with_front(provider_dir.path()));
@@ -243,7 +240,7 @@ name = "bare"
 "#,
         uri = server.uri(),
     ));
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
 
     doctor(&config, &home)
         .assert()
@@ -284,7 +281,7 @@ default_tier_order = ["FAST"]
 [dgx]
 "#,
     );
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
 
     let mut cmd = doctor(&config, &home);
     cmd.env("NEWT_DGX_OLLAMA_URL", "http://127.0.0.1:9999");
@@ -313,7 +310,7 @@ default_tier_order = ["FAST"]
 [dgx]
 "#,
     );
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
 
     doctor(&config, &home)
         .assert()
@@ -362,7 +359,7 @@ url = "http://127.0.0.1:1/mcp"
 "#,
         newt = newt_bin.display(),
     ));
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
 
     doctor(&config, &home)
         .assert()
@@ -397,7 +394,7 @@ args = ["mcp"]
 "#,
         newt = newt_bin.display(),
     ));
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
 
     doctor(&config, &home)
         .assert()

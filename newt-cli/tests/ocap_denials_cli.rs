@@ -1,6 +1,7 @@
 //! Process-level acceptance for the denial repair journal presentation.
 
-use assert_cmd::Command;
+mod common;
+
 use predicates::prelude::*;
 use std::path::Path;
 
@@ -18,15 +19,15 @@ fn record(command: &str) -> newt_core::denial_journal::DenialRecord {
     }
 }
 
-fn denials(journal: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("newt").unwrap();
+fn denials(journal: &Path) -> common::Newt {
+    let mut cmd = common::newt();
     cmd.args(["ocap", "denials", "--journal", journal.to_str().unwrap()]);
     cmd
 }
 
 #[test]
 fn ocap_denials_classifies_a_failed_grant_and_shows_its_fixture() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     let journal = dir.path().join("denials.jsonl");
     newt_core::denial_journal::append_record(&journal, record("wc -l src/lib.rs")).unwrap();
 
@@ -48,7 +49,7 @@ fn ocap_denials_classifies_a_failed_grant_and_shows_its_fixture() {
 /// untrustworthy rather than presented as a clean repair summary.
 #[test]
 fn ocap_denials_reports_a_journal_with_a_record_deleted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     let journal = dir.path().join("denials.jsonl");
     for name in ["a.rs", "b.rs", "c.rs"] {
         newt_core::denial_journal::append_record(&journal, record(&format!("wc -l {name}")))
@@ -76,7 +77,7 @@ fn ocap_denials_reports_a_journal_with_a_record_deleted() {
 /// looks: the command that reads the journal.
 #[test]
 fn ocap_denials_points_at_the_rotated_pre_chain_journal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     let journal = dir.path().join("denials.jsonl");
     std::fs::write(
         &journal,

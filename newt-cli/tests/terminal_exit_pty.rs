@@ -272,24 +272,10 @@ net = []
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_newt")));
     let mut cmd = Command::new(binary);
+    // The hermetic setup (#2665) starts from a cleared environment: no
+    // ambient helper/reporting connection, proxy, permission bypass or input
+    // mode reaches the child. Child-only; sibling tests keep their environment.
     common::isolate(&mut cmd, root.path());
-    // No ambient helper/reporting connection, permission bypass or input mode.
-    // These are child-only env changes; sibling tests keep their environment.
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|key| key.starts_with("HERDR_")) {
-            cmd.env_remove(key);
-        }
-    }
-    for key in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
-        cmd.env_remove(key);
-    }
     cmd.args(["--no-splash", "--ephemeral", "--no-prompt-for-permissions"])
         .arg("--config")
         .arg(&config)
@@ -299,10 +285,6 @@ net = []
         .env("NEWT_NO_MODEL_PULL", "1")
         .env("NEWT_PROMPT", LEAN_READY)
         .env("TERM", "xterm-256color")
-        .env_remove("NEWT_METRICS_PORT")
-        .env_remove("NEWT_DEBUG")
-        .env_remove("NEWT_TRACE")
-        .env_remove("NEWT_GUTTER")
         .stdin(pty.slave_stdio())
         .stdout(pty.slave_stdio())
         .stderr(pty.slave_stdio())

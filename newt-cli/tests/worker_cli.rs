@@ -53,7 +53,7 @@ fn blocked_key_path(home: &tempfile::TempDir) -> std::path::PathBuf {
 
 #[test]
 fn worker_refuses_to_start_when_key_unavailable() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let key = blocked_key_path(&home);
 
     worker(&home)
@@ -67,7 +67,7 @@ fn worker_refuses_to_start_when_key_unavailable() {
 
 #[test]
 fn worker_generates_key_and_answers_initialize() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let key = home.path().join("keys").join("identity.pem");
     assert!(!key.exists());
 
@@ -88,7 +88,7 @@ fn worker_generates_key_and_answers_initialize() {
 #[cfg(feature = "allow-no-key")]
 #[test]
 fn worker_allow_no_key_falls_back_to_debug_identity() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let key = blocked_key_path(&home);
 
     worker(&home)
@@ -109,7 +109,7 @@ fn worker_allow_no_key_falls_back_to_debug_identity() {
 #[cfg(not(feature = "allow-no-key"))]
 #[test]
 fn worker_allow_no_key_is_inert_in_production_build() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let key = blocked_key_path(&home);
 
     worker(&home)
@@ -125,7 +125,7 @@ fn worker_allow_no_key_is_inert_in_production_build() {
 
 #[test]
 fn worker_ignores_invalid_metrics_port() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let key = home.path().join("identity.pem");
 
     // Port 0 fails the `p > 0` filter — the worker must start without a
@@ -179,7 +179,7 @@ fn http_get_retry(port: u16, path: &str, secs: u64) -> std::io::Result<String> {
 
 #[test]
 fn worker_metrics_server_serves_healthz_and_metrics() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::isolated_root();
     let key = home.path().join("identity.pem");
 
     // Reserve a free port, then release it for the worker to bind.

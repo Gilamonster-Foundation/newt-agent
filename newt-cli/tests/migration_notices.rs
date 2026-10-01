@@ -56,7 +56,7 @@ fn migration_lock_failure_is_one_plain_diagnostic_with_parseable_stdout() {
 /// stderr stays redirected; forced color cannot contaminate the TOML stdout.
 #[test]
 fn migration_redirected_stderr_survives_plain_and_forced_color_pipes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     let path = dir.path().join("legacy.toml");
     let old = "[tenacity]\ndefault = \"standard\"\n";
     std::fs::write(&path, old).unwrap();
@@ -145,7 +145,6 @@ async fn migration_headless_keeps_answer_and_receipt_clean() {
         }))).mount(&server).await;
     let mut command = common::newt();
     let home = command.home().to_path_buf();
-    common::isolate_loopback_chat(&mut *command, &home);
     let config = home.join("legacy.toml");
     std::fs::write(&config, "[tenacity]\ndefault = \"standard\"\n").unwrap();
     let instruction = home.join("task.md");
@@ -194,7 +193,7 @@ async fn migration_headless_keeps_answer_and_receipt_clean() {
 #[test]
 fn migration_mcp_host_reports_persona_before_decode_and_keeps_wire_clean() {
     for invalid in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::isolated_root();
         let config_root = dir.path().join("config-root");
         let personas = config_root.join("personas");
         std::fs::create_dir_all(&personas).unwrap();

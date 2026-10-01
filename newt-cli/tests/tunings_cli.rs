@@ -6,12 +6,14 @@
 //! and because each test spawns its own `newt` process, there is no shared
 //! mutable env state between parallel tests.
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 /// A fresh fake `$HOME` with an empty `.newt/` directory.
 fn fake_home() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     std::fs::create_dir_all(dir.path().join(".newt")).unwrap();
     dir
 }
@@ -41,11 +43,9 @@ fn write_community(home: &tempfile::TempDir, toml_text: &str) {
     .unwrap();
 }
 
-/// `newt` with `HOME` pointed at the fake home.
+/// `newt` under the hermetic setup, rooted at the fake home.
 fn newt(home: &tempfile::TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("newt").unwrap();
-    cmd.env("HOME", home.path());
-    cmd
+    common::newt_at(home.path())
 }
 
 /// A capabilities document with two tuned models.

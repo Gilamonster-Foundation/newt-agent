@@ -25,6 +25,33 @@ fn backendless_config_deserializes_empty_but_default_keeps_fallback() {
     assert_eq!(inline.backends[0].name, "x");
 }
 
+/// #2665 regression: an explicit `$OLLAMA_HOST` names the bare install's
+/// Ollama. Before the fix the fallback backend pinned `127.0.0.1:11434`
+/// regardless, so a chat session started with `OLLAMA_HOST` pointing at a
+/// closed port still probed the developer's live Ollama (observed with
+/// `strace` in the purity tests). The fallback is one function, shared by
+/// `Config::default()` and the backendless-file branch of `resolve`, so the
+/// no-file and empty-file paths are both covered here.
+#[serial_test::serial(real_fs)] // reads a process-global environment variable
+#[test]
+fn ollama_host_names_the_fallback_backend() {
+    // The guard snapshots `OLLAMA_HOST` and restores it on drop, so a
+    // developer's own export survives the test, pass or fail.
+    let _env = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::process_env::set_var("OLLAMA_HOST", "http://127.0.0.1:65535");
+    let cfg = Config::default();
+    assert_eq!(cfg.backends.len(), 1);
+    assert_eq!(cfg.backends[0].endpoint, "http://127.0.0.1:65535");
+    assert_eq!(cfg.backends[0].kind, Some(BackendKind::Ollama));
+    // Unset (or empty, which `ollama serve` itself treats as unset) keeps the
+    // compiled-in localhost default.
+    crate::process_env::set_var("OLLAMA_HOST", "");
+    assert_eq!(
+        Config::default().backends[0].endpoint,
+        "http://127.0.0.1:11434"
+    );
+}
+
 #[test]
 fn defaults_are_sensible() {
     let cfg = Config::default();
