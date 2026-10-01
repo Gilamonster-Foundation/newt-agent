@@ -2385,6 +2385,21 @@ file:/h/.gitconfig\0credential.interactive\0";
         );
     }
 
+    /// The three macOS aliases are RELATIVE symlinks (`/var -> private/var`),
+    /// so verifying them against the absolute `/private/var` flagged every
+    /// tempdir path as a user-planted symlink and refused every staging repo
+    /// on macOS. Grounds the alias check against the real root filesystem.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_has_user_symlink_accepts_relative_macos_aliases() {
+        for alias in ["/var/folders", "/tmp", "/etc"] {
+            assert!(
+                !path_has_user_symlink(Path::new(alias)),
+                "{alias} is a system alias and must not be flagged"
+            );
+        }
+    }
+
     // --- Item 5 (Round-5): bind_canonical_roots snapshot stability -------------
 
     /// After calling `bind_canonical_roots`, retargeting the root symlink to a
@@ -2415,8 +2430,11 @@ file:/h/.gitconfig\0credential.interactive\0";
         std::os::unix::fs::symlink(&real_b, &root_link).unwrap();
 
         // The bound snapshot still points to real_a, so real_b is outside it.
+        // Candidates are canonicalized as every production caller does
+        // (macOS tempdirs live under /var -> /private/var).
         let real_b_file = real_b.join("secret");
         std::fs::write(&real_b_file, b"secret").unwrap();
+        let real_b_file = std::fs::canonicalize(&real_b_file).unwrap();
         assert!(
             !permits_path_with_bound_roots(&fs_read, bound.as_slice(), &real_b_file),
             "retargeted root must not widen the bound grant"
@@ -2424,6 +2442,7 @@ file:/h/.gitconfig\0credential.interactive\0";
         // real_a is still in scope.
         let real_a_file = real_a.join("ok");
         std::fs::write(&real_a_file, b"ok").unwrap();
+        let real_a_file = std::fs::canonicalize(&real_a_file).unwrap();
         assert!(
             permits_path_with_bound_roots(&fs_read, bound.as_slice(), &real_a_file),
             "original target must still be in scope"
@@ -2535,8 +2554,11 @@ file:/h/.gitconfig\0credential.interactive\0";
         std::os::unix::fs::symlink(&real_b, &root_link).unwrap();
 
         // real_b is NOT in the canonical bound (bound still points to real_a).
+        // Candidates are canonicalized as every production caller does
+        // (macOS tempdirs live under /var -> /private/var).
         let real_b_file = real_b.join("outside_file");
         std::fs::write(&real_b_file, b"should not be reachable").unwrap();
+        let real_b_file = std::fs::canonicalize(&real_b_file).unwrap();
         assert!(
             !permits_path_with_bound_roots(&fs_read, bound.canonical.as_slice(), &real_b_file),
             "real_b must not be in the canonical bound after retarget"
@@ -2544,6 +2566,7 @@ file:/h/.gitconfig\0credential.interactive\0";
         // real_a IS still in the canonical bound.
         let real_a_file = real_a.join("authorized_file");
         std::fs::write(&real_a_file, b"authorized").unwrap();
+        let real_a_file = std::fs::canonicalize(&real_a_file).unwrap();
         assert!(
             permits_path_with_bound_roots(&fs_read, bound.canonical.as_slice(), &real_a_file),
             "real_a must still be in the canonical bound"
