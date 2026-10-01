@@ -596,7 +596,7 @@ fn object_bound_read(
     match object_bound_target(scope, full_str) {
         // The gate already permitted this read, so `None` here would be a logic
         // error (the two matchers disagreeing); fail closed rather than read.
-        None => Err(denied_fs_result(axis, path)),
+        None => Err(denied_fs_result(axis, full_str)),
         Some(None) => {
             std::fs::read_to_string(full).map_err(|e| format!("error: reading {path}: {e}"))
         }
@@ -613,7 +613,7 @@ fn object_bound_read(
             });
             match read {
                 Ok(s) => Ok(s),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, full_str)),
                 Err(e) => Err(format!("error: reading {path}: {e}")),
             }
         }
@@ -627,12 +627,11 @@ fn object_bound_read(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_list(
     scope: &crate::caveats::Scope<String>,
-    path: &str,
     full: &std::path::Path,
     full_str: &str,
 ) -> Result<Vec<String>, String> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_read", path)),
+        None => Err(denied_fs_result("fs_read", full_str)),
         Some(None) => std_list_dir(full),
         Some(Some((root, rel))) => {
             match crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))
@@ -642,7 +641,9 @@ fn object_bound_list(
                     .into_iter()
                     .map(|n| n.to_string_lossy().into_owned())
                     .collect()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_read", path)),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(denied_fs_result("fs_read", full_str))
+                }
                 Err(e) => Err(format!("error: {e}")),
             }
         }
@@ -666,7 +667,6 @@ fn object_bound_read(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_list(
     _scope: &crate::caveats::Scope<String>,
-    _path: &str,
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<Vec<String>, String> {
@@ -701,7 +701,7 @@ fn object_bound_write(
 ) -> Result<(), String> {
     use std::io::Write;
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result(axis, path)),
+        None => Err(denied_fs_result(axis, full_str)),
         Some(None) => std_write(full, path, content),
         Some(Some((root, rel))) => {
             let write =
@@ -712,7 +712,7 @@ fn object_bound_write(
                     });
             match write {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, path)),
+                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result(axis, full_str)),
                 Err(e) => Err(format!("error: writing {path}: {e}")),
             }
         }
@@ -744,7 +744,7 @@ fn object_bound_delete(
     full_str: &str,
 ) -> Result<(), String> {
     match object_bound_target(scope, full_str) {
-        None => Err(denied_fs_result("fs_write", path)),
+        None => Err(denied_fs_result("fs_write", full_str)),
         Some(None) => {
             std::fs::remove_file(full).map_err(|e| format!("error: deleting {path}: {e}"))
         }
@@ -753,7 +753,9 @@ fn object_bound_delete(
                 .and_then(|dir| dir.unlink(&rel))
             {
                 Ok(()) => Ok(()),
-                Err(e) if is_fs_containment_denied(&e) => Err(denied_fs_result("fs_write", path)),
+                Err(e) if is_fs_containment_denied(&e) => {
+                    Err(denied_fs_result("fs_write", full_str))
+                }
                 Err(e) => Err(format!("error: deleting {path}: {e}")),
             }
         }
@@ -1594,6 +1596,12 @@ fn crew_off_recovery_result(name: &str) -> String {
 /// [`denial_recovery_hint`]. One factored message + regression point shared by
 /// every fs denial (read_file / write_file / edit_file / delete_file / list_dir /
 /// find), so the recoverable wording can never drift between them.
+///
+/// `path` is the EXACT target: the workspace-joined absolute path the #263
+/// gate is asked for (`fs_gate_allows`), never the model's relative spelling
+/// (#2629). `caveats::permits_path` is a lexical prefix test, so a relative
+/// root granted through `request_permissions` would not cover the retry — the
+/// model would be told "granted" and denied again.
 fn denied_fs_result(kind: &str, path: &str) -> String {
     format!(
         "capability denied: {kind} does not permit '{path}'. {}",
@@ -1629,7 +1637,7 @@ pub(super) fn authorized_read(
             fs_gate_allows(gate, tool, DenialKind::FsRead, &full_str, |c| &c.fs_read)
         });
         if !allowed {
-            return Err(denied_fs_result("fs_read", path));
+            return Err(denied_fs_result("fs_read", &full_str));
         }
     }
     // #1176: shadow-OCAP — under --full-access the fs fence is top(), so this
@@ -4683,7 +4691,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_write", path);
+                    return denied_fs_result("fs_write", &full_str);
                 }
             }
             // #1176: shadow-OCAP — under --full-access the fs fence is top(), so
@@ -4863,7 +4871,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_write", path);
+                    return denied_fs_result("fs_write", &full_str);
                 }
             }
 
@@ -5008,7 +5016,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_write", path);
+                    return denied_fs_result("fs_write", &full_str);
                 }
             }
             // #1176: shadow-OCAP — edit is a write; record under --full-access.
@@ -5191,7 +5199,7 @@ async fn execute_authorized_tool(
                     })
                 });
                 if !allowed {
-                    return denied_fs_result("fs_read", path);
+                    return denied_fs_result("fs_read", &full_str);
                 }
             }
             // #1176: shadow-OCAP — record the listed dir under --full-access.
@@ -5206,7 +5214,7 @@ async fn execute_authorized_tool(
             // symlink-escape directory is refused by the kernel); a gate-approved
             // out-of-scope path lists as-is.
             let listing = if scope_permits {
-                object_bound_list(&caveats.fs_read, path, &full, &full_str)
+                object_bound_list(&caveats.fs_read, &full, &full_str)
             } else {
                 std_list_dir(&full)
             };
@@ -5244,7 +5252,7 @@ async fn execute_authorized_tool(
                     fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
                 });
                 if !allowed {
-                    return denied_fs_result("fs_read", path);
+                    return denied_fs_result("fs_read", &full_str);
                 }
             }
             // #1176: shadow-OCAP — record the search root under --full-access

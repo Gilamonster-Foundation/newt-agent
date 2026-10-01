@@ -306,6 +306,194 @@ fn run_command_ungrantable_denials_do_not_invent_permission_requests() {
     assert!(!out.contains("request_permissions"), "{out}");
 }
 
+/// #2629: agent-bridle's structured denial kinds are `exec` / `open` / `net`
+/// (vendored `envelope.rs`), so a refused shell write — the `echo x > path`
+/// probe a model uses to discover what is writable — arrives as kind `open`
+/// and used to be dropped as "No actionable capability grant is identified".
+/// That is what sent the lab model probing with touch/mkdir. The LEASH's own
+/// reason names the axis (`… is not within the granted fs_write scope`) and
+/// brush hands the interceptor the ABSOLUTE path, so the denial can name axis,
+/// exact target and the one `request_permissions` call. Nothing here reads
+/// child output: `reason` is written by the leash (#2633). RED before the fix:
+/// no `request_permissions` at all for an `open` kind.
+#[test]
+fn a_shell_open_denial_names_the_fs_axis_and_exact_target() {
+    for (op, axis) in [("write", "fs_write"), ("read", "fs_read")] {
+        let target = "/outside/wt/probe";
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [{
+                "kind": "open",
+                "target": target,
+                // The wire shape: `ToolError`'s Display prefix + the leash's
+                // check_path message (a live capture is in
+                // docs/findings/2026-08-exec-mcp-interrupt-audit.md).
+                "reason": format!(
+                    "denied: {op} of {target} (resolved {target}) is not within the granted fs_{op} scope"
+                ),
+            }]
+        });
+        let out = denied_run_command_result(&envelope, false);
+        assert_eq!(out.matches("request_permissions(").count(), 1, "{out}");
+        assert!(
+            out.contains(&format!(
+                r#"request_permissions(capability="{axis}", target="{target}""#
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("No actionable capability grant"), "{out}");
+    }
+}
+
+/// A write whose parent directory does not exist yet is refused with the
+/// leash's `cannot canonicalize` reason, which still names the operation
+/// (`write of …`). The axis comes from that verb, so a first write into a new
+/// directory is as grantable as one into an existing directory.
+#[test]
+fn an_open_denial_without_a_resolved_path_still_names_its_axis() {
+    let target = "/outside/new-dir/wt";
+    let envelope = serde_json::json!({
+        "denied": true,
+        "denials": [{
+            "kind": "open",
+            "target": target,
+            "reason": format!(
+                "denied: write of {target:?} denied: cannot canonicalize (No such file or directory (os error 2))"
+            ),
+        }]
+    });
+    let out = denied_run_command_result(&envelope, false);
+    assert!(
+        out.contains(&format!(
+            r#"request_permissions(capability="fs_write", target="{target}""#
+        )),
+        "{out}"
+    );
+}
+
+/// The axis is never guessed. The verb the leash writes BEFORE the model's
+/// path decides it; a path that spells the other axis cannot steer it, and a
+/// suffix that contradicts the verb yields no hint. A target the grant could
+/// not cover — relative (the safe-subset engine records the redirect literal
+/// as typed) or a glob pattern — falls back to the no-grant text rather than
+/// suggesting a grant that would be inserted verbatim and never match.
+#[test]
+fn an_open_denial_hint_is_anchored_and_absolute_only() {
+    let steer = "/outside/fs_write_notes";
+    let envelope = serde_json::json!({
+        "denied": true,
+        "denials": [{
+            "kind": "open",
+            "target": steer,
+            "reason": format!(
+                "denied: read of {steer} (resolved {steer}) is not within the granted fs_read scope"
+            ),
+        }]
+    });
+    let out = denied_run_command_result(&envelope, false);
+    assert!(out.contains(r#"capability="fs_read""#), "{out}");
+    assert!(!out.contains(r#"capability="fs_write""#), "{out}");
+    for (target, reason) in [
+        (
+            "wt/.probe",
+            "denied: write of wt/.probe (resolved /ws/wt/.probe) is not within the granted fs_write scope",
+        ),
+        (
+            "/outside/*.log",
+            "denied: read of /outside (resolved /outside) is not within the granted fs_read scope",
+        ),
+        (
+            "/outside/x",
+            "denied: write of /outside/x (resolved /outside/x) is not within the granted fs_read scope",
+        ),
+        ("/outside/x", "denied: run cancelled (timeout or interrupt)"),
+    ] {
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [{"kind": "open", "target": target, "reason": reason}]
+        });
+        let out = denied_run_command_result(&envelope, false);
+        assert!(!out.contains("request_permissions"), "{target}: {out}");
+    }
+}
+
+/// Replay of the v0.8.0 gate's first step (#2631, #2629): `git worktree add`
+/// outside the workspace. The two halves the harness CAN attribute each yield
+/// ONE precise request, never a probing loop: the shell-redirect write probe
+/// (the only write the brush interceptor itself sees; RED before the fix, no
+/// grant was offered) and `git` itself outside the exec grant (already one
+/// request; pinned so the pair stays symmetric). git's own helper exec and a
+/// kernel-fenced coreutils write carry no structured evidence (#2421) and are
+/// deliberately NOT represented here — see shell.rs `confined_result`.
+#[test]
+fn a_denied_worktree_write_probe_yields_one_precise_request_not_a_loop() {
+    let probe = "/outside/newt-wt/.probe";
+    let write = serde_json::json!({
+        "denied": true,
+        "denials": [{
+            "kind": "open",
+            "target": probe,
+            "reason": format!(
+                "denied: write of {probe} (resolved {probe}) is not within the granted fs_write scope"
+            ),
+        }]
+    });
+    let out = denied_run_command_result(&write, false);
+    assert_eq!(out.matches("request_permissions(").count(), 1, "{out}");
+    assert!(
+        out.contains(&format!(r#"capability="fs_write", target="{probe}""#)),
+        "{out}"
+    );
+    let exec = serde_json::json!({
+        "denied": true,
+        "denials": [{
+            "kind": "exec",
+            "target": "/usr/bin/git",
+            "reason": "denied: exec of \"/usr/bin/git\" is not within the granted authority",
+        }]
+    });
+    let out = denied_run_command_result(&exec, false);
+    assert_eq!(out.matches("request_permissions(").count(), 1, "{out}");
+    assert!(
+        out.contains(r#"capability="exec", target="/usr/bin/git""#),
+        "{out}"
+    );
+}
+
+/// #2629: a native fs tool's denial suggests the EXACT path the #263 gate
+/// would be asked for — the workspace-joined absolute path — not the model's
+/// relative spelling. `caveats::permits_path` is a lexical prefix test, so a
+/// relative root granted via `request_permissions` never covers the absolute
+/// retry: the model would ask, be told "granted", retry and be denied again.
+/// RED before the fix: the hint said `target="a.txt"`.
+#[tokio::test]
+async fn a_native_fs_denial_suggests_the_absolute_target_the_gate_would_grant() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let denied = Caveats {
+        fs_read: Scope::none(),
+        fs_write: Scope::none(),
+        ..caveats_rw(ws.path())
+    };
+    let full = ws.path().join("a.txt").to_string_lossy().into_owned();
+    for (tool, args, axis) in [
+        (
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "c"}),
+            "fs_write",
+        ),
+        ("read_file", serde_json::json!({"path": "a.txt"}), "fs_read"),
+    ] {
+        let out = run_tool(tool, args, ws.path(), &denied, None).await;
+        assert!(
+            out.contains(&format!(
+                r#"request_permissions(capability="{axis}", target={}"#,
+                serde_json::json!(full)
+            )),
+            "{tool}: {out}"
+        );
+    }
+}
+
 #[test]
 fn parse_capability_maps_synonyms_and_rejects_unknown() {
     assert_eq!(parse_capability("exec"), Some(DenialKind::Exec));
@@ -926,7 +1114,10 @@ async fn no_gate_denials_are_bit_for_bit_unchanged() {
         None,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_read", "secret.txt"));
+    assert_eq!(
+        out,
+        denied_fs_result("fs_read", &ws.path().join("secret.txt").to_string_lossy())
+    );
     let out = run_tool(
         "list_dir",
         serde_json::json!({"path": "."}),
@@ -935,7 +1126,10 @@ async fn no_gate_denials_are_bit_for_bit_unchanged() {
         None,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_read", "."));
+    assert_eq!(
+        out,
+        denied_fs_result("fs_read", &ws.path().join(".").to_string_lossy())
+    );
     let out = run_tool(
         "write_file",
         serde_json::json!({"path": "a.txt", "content": "c"}),
@@ -944,7 +1138,10 @@ async fn no_gate_denials_are_bit_for_bit_unchanged() {
         None,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_write", "a.txt"));
+    assert_eq!(
+        out,
+        denied_fs_result("fs_write", &ws.path().join("a.txt").to_string_lossy())
+    );
     let out = run_tool(
         "edit_file",
         serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
@@ -953,7 +1150,10 @@ async fn no_gate_denials_are_bit_for_bit_unchanged() {
         None,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_write", "a.txt"));
+    assert_eq!(
+        out,
+        denied_fs_result("fs_write", &ws.path().join("a.txt").to_string_lossy())
+    );
     let out = run_tool(
         "delete_file",
         serde_json::json!({"path": "secret.txt"}),
@@ -962,7 +1162,10 @@ async fn no_gate_denials_are_bit_for_bit_unchanged() {
         None,
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_write", "secret.txt"));
+    assert_eq!(
+        out,
+        denied_fs_result("fs_write", &ws.path().join("secret.txt").to_string_lossy())
+    );
     // #721: every fs denial now carries the model-actionable recovery path.
     assert!(out.contains("request_permissions"), "got: {out}");
 }
@@ -1709,7 +1912,10 @@ async fn gate_deny_keeps_the_standard_denial_bit_for_bit() {
     )
     .await;
     assert_eq!(gated, ungated);
-    assert_eq!(gated, denied_fs_result("fs_read", "secret.txt"));
+    assert_eq!(
+        gated,
+        denied_fs_result("fs_read", &ws.path().join("secret.txt").to_string_lossy())
+    );
     assert_eq!(gate.asks.len(), 1, "the human was asked exactly once");
 }
 
@@ -1842,7 +2048,10 @@ async fn gate_allow_without_real_coverage_is_still_denied() {
         None, // step_ledger
     )
     .await;
-    assert_eq!(out, denied_fs_result("fs_read", "secret.txt"));
+    assert_eq!(
+        out,
+        denied_fs_result("fs_read", &ws.path().join("secret.txt").to_string_lossy())
+    );
 }
 
 #[tokio::test]

@@ -82,6 +82,15 @@ fn empty_exec() -> crate::caveats::Scope<String> {
     crate::caveats::Scope::none()
 }
 
+/// Caveats with the given read scope and an unscoped exec axis — the shape
+/// under which a kernel refusal is a missing READ right (#2629).
+fn read_scope(fs_read: crate::caveats::Scope<String>) -> crate::caveats::Caveats {
+    crate::caveats::Caveats {
+        fs_read,
+        ..crate::caveats::Caveats::top()
+    }
+}
+
 /// NOT CARRIED, but the host has it: the refusal must name the state, and
 /// name the lane that can supply it — as an ABSOLUTE PATH grant, never a
 /// basename (#2274 grant shape).
@@ -231,12 +240,48 @@ fn kernel_refused_binary_outside_the_read_grant_is_a_named_denial() {
     let msg = super::super::shell::kernel_refused_binary(
         &present,
         &envelope,
-        &crate::caveats::Scope::none(),
+        &read_scope(crate::caveats::Scope::none()),
     )
     .expect("a 126 outside the read grant must produce a named refusal");
     assert!(msg.starts_with("capability denied:"), "{msg}");
     assert!(msg.contains(&present), "must name the binary: {msg}");
     assert!(msg.contains("exit 126"), "{msg}");
+    // #2629: the grant is named as the ONE `request_permissions` call that
+    // covers it — the binary's directory on the fs_read axis — not as prose
+    // the model has no tool for ("ask the operator for read:…"). RED before
+    // the fix.
+    let dir = std::path::Path::new(&present)
+        .parent()
+        .expect("the test binary has a parent directory")
+        .display()
+        .to_string();
+    assert!(
+        msg.contains(&format!(
+            r#"request_permissions(capability="fs_read", target={}"#,
+            serde_json::json!(dir)
+        )),
+        "{msg}"
+    );
+    assert!(!msg.contains("ask the operator for"), "{msg}");
+    // Under a SCOPED exec grant the fence's EXECUTE rule covers only the
+    // resolved exec roots (vendored `sandbox.rs` `exec_roots`); a read grant
+    // adds no execute right, so suggesting one would re-run the same 126 —
+    // the loop #2629 is about. The one call is the exact-path exec grant.
+    let scoped_exec = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::none(),
+        exec: crate::caveats::Scope::only(["cargo".to_string()]),
+        ..crate::caveats::Caveats::top()
+    };
+    let msg = super::super::shell::kernel_refused_binary(&present, &envelope, &scoped_exec)
+        .expect("the same 126 under a scoped exec grant is still a kernel refusal");
+    assert!(
+        msg.contains(&format!(
+            r#"request_permissions(capability="exec", target={}"#,
+            serde_json::json!(present)
+        )),
+        "{msg}"
+    );
+    assert!(!msg.contains(r#"capability="fs_read""#), "{msg}");
 }
 
 /// An ordinary 126 INSIDE the grant is a repairable failure (a mode bit, a
@@ -253,7 +298,7 @@ fn a_126_inside_the_read_grant_is_not_a_kernel_refusal() {
     assert!(super::super::shell::kernel_refused_binary(
         &present,
         &envelope,
-        &crate::caveats::Scope::All,
+        &read_scope(crate::caveats::Scope::All),
     )
     .is_none());
     // `Scope::All` permits by a bare `true`; a grant naming the binary's own
@@ -266,14 +311,14 @@ fn a_126_inside_the_read_grant_is_not_a_kernel_refusal() {
     assert!(super::super::shell::kernel_refused_binary(
         &present,
         &envelope,
-        &crate::caveats::Scope::only([dir]),
+        &read_scope(crate::caveats::Scope::only([dir])),
     )
     .is_none());
     assert!(
         super::super::shell::kernel_refused_binary(
             &present,
             &denied_envelope(&present),
-            &crate::caveats::Scope::none(),
+            &read_scope(crate::caveats::Scope::none()),
         )
         .is_none(),
         "a structured denial is the leash's to render, not this"
@@ -294,7 +339,7 @@ fn a_compound_126_names_the_program_brush_failed_on() {
     let msg = super::super::shell::kernel_refused_binary(
         &format!("cd newt-core && {present} test"),
         &envelope,
-        &crate::caveats::Scope::none(),
+        &read_scope(crate::caveats::Scope::none()),
     )
     .expect("the failed program is outside the read grant");
     assert!(msg.contains(&format!("exec of {present} at")), "{msg}");

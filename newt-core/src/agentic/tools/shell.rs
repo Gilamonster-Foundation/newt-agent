@@ -1408,7 +1408,7 @@ pub(super) fn confined_result(
     // #2273: a 126 with no structured denial whose program sits
     // outside the fs-read grant is the KERNEL refusing, not a
     // chmod the model forgot. Same structured test, one more state.
-    if let Some(refusal) = kernel_refused_binary(cmd, envelope, &caveats.fs_read) {
+    if let Some(refusal) = kernel_refused_binary(cmd, envelope, caveats) {
         return (refusal, ExecOutcome::Denied);
     }
     // #2629 (revised): a child exec the sandbox refused (e.g. git's own
@@ -2035,6 +2035,14 @@ pub(super) fn denied_run_command_result(envelope: &serde_json::Value, _color: bo
 
 /// Preserve each grantable denial's axis and target. A structural or opaque
 /// refusal makes the batch ungrantable; never guess an axis or join targets.
+///
+/// #2629: agent-bridle's structured kinds are `exec` / `open` / `net`
+/// (`DenialKind`, vendored `envelope.rs`) — there is no `fs_write` kind on the
+/// wire. A refused shell redirect or `source` arrives as `open`, and dropping
+/// it as ungrantable left the model with no target to ask for, so it probed
+/// (the touch/mkdir loops of #2631). The axis is read from the LEASH's own
+/// reason ([`open_denial_axis`]); the target brush hands the interceptor is
+/// already the absolute path. Neither comes from the child's output (#2633).
 pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<String>> {
     let denials = envelope
         .get("denials")?
@@ -2044,21 +2052,58 @@ pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<
         .iter()
         .map(|denial| {
             let kind = denial.get("kind")?.as_str()?;
-            if !matches!(kind, "exec" | "fs_read" | "fs_write" | "net")
-                || denial
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(is_structural_refusal)
-            {
+            let reason = denial.get("reason").and_then(serde_json::Value::as_str);
+            if reason.is_some_and(is_structural_refusal) {
                 return None;
             }
             let target = denial
                 .get("target")?
                 .as_str()
                 .filter(|target| !target.trim().is_empty())?;
-            Some(denial_recovery_hint(kind, target))
+            let axis = match kind {
+                "exec" | "fs_read" | "fs_write" | "net" => kind,
+                // Brush hands the interceptor the absolute path, but the
+                // safe-subset engine's pre-check records the redirect literal
+                // as typed (relative) or a glob pattern. A grant of either is
+                // inserted verbatim and never covers the retry — the loop
+                // change (#2629) exists to remove — so fail closed to the
+                // no-grant text. Same absolute-only rule as
+                // `declared_filesystem_requests`.
+                "open"
+                    if std::path::Path::new(target).is_absolute()
+                        && !target.contains(['*', '?', '[']) =>
+                {
+                    open_denial_axis(reason?)?
+                }
+                _ => return None,
+            };
+            Some(denial_recovery_hint(axis, target))
         })
         .collect()
+}
+
+/// The fs axis an `open` denial refused on, as the leash itself states it.
+/// The recorded reason is `ToolError`'s Display, `denied: ` + the message
+/// `ToolContext::check_path` (vendored `context.rs`) wrote: `"{op} of {path}
+/// (resolved {canon}) is not within the granted fs_{op} scope"`, or `"{op} of
+/// {path:?} denied: cannot canonicalize (…)"` when no ancestor resolves; `op`
+/// is `read` or `write`. This is the leash's structured `reason` field, not
+/// child stderr. The VERB decides, because it precedes the model's own path
+/// text; the suffix, when present, must agree (a path spelled `…/fs_write…`
+/// in a read refusal must not steer the axis). Anything else (`/dev/fd`
+/// reservations, the fail-closed no-caveats default, a cancelled run) names
+/// no axis and stays ungrantable.
+fn open_denial_axis(reason: &str) -> Option<&'static str> {
+    let reason = reason.strip_prefix("denied: ").unwrap_or(reason);
+    let reason = reason.trim_end_matches('.');
+    let (axis, other) = if reason.starts_with("write of ") {
+        ("fs_write", "fs_read")
+    } else if reason.starts_with("read of ") {
+        ("fs_read", "fs_write")
+    } else {
+        return None;
+    };
+    (!reason.ends_with(&format!("is not within the granted {other} scope"))).then_some(axis)
 }
 
 /// #2274 — absence must never be ambiguous.
@@ -2175,11 +2220,23 @@ pub(crate) const NOT_ON_HOST_MARKER: &str = "not installed on this host";
 /// [`failed_program`]). Only then is it rendered in newt's own denial vocabulary
 /// so the guidance stops asking for an edit; an ordinary 126 inside the grant
 /// falls through untouched.
+///
+/// #2629: which ONE grant unblocks it depends on the exec axis. Under a scoped
+/// `exec` the Landlock fence handles EXECUTE and grants it only to the
+/// resolved exec roots (vendored `sandbox.rs` `exec_roots`); read roots carry
+/// read rights alone, so a kernel refusal of an interceptor-admitted program
+/// means the path was not anchored, and only the exact-path exec grant anchors
+/// it (an absolute entry lands in both the read and the execute roots). Under
+/// `exec: All` EXECUTE is ambient and the missing right is the read one, so the
+/// grant is the binary's directory on `fs_read`. The program itself is still
+/// stderr-named / argv-selected and host-verified, as #2273 chose; the hint
+/// confers no authority the model lacks.
 pub(crate) fn kernel_refused_binary(
     cmd: &str,
     envelope: &serde_json::Value,
-    fs_read: &crate::caveats::Scope<String>,
+    caveats: &crate::caveats::Caveats,
 ) -> Option<String> {
+    let fs_read = &caveats.fs_read;
     if envelope
         .get("exit_code")
         .and_then(serde_json::Value::as_i64)
@@ -2206,10 +2263,22 @@ pub(crate) fn kernel_refused_binary(
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| abs.clone());
+    // #2629: name the grant as the one `request_permissions` call that covers
+    // it, not as prose the model has no tool for ("ask the operator for …").
+    let (why, hint) = if matches!(caveats.exec, crate::caveats::Scope::Only(_)) {
+        (
+            "the kernel's execute rule does not cover this path",
+            denial_recovery_hint("exec", &abs),
+        )
+    } else {
+        (
+            "it is outside the fs-read grant",
+            denial_recovery_hint("fs_read", &dir),
+        )
+    };
     Some(format!(
-        "capability denied: exec of {prog} at {abs} is outside the fs-read \
-         grant, so the kernel refused it (exit 126).\n  \
-         ask the operator for read:{dir} (and exec:{abs}), or run the host lane."
+        "capability denied: exec of {prog} at {abs} was refused by the kernel \
+         (exit 126): {why}.\n  {hint}"
     ))
 }
 
@@ -2621,8 +2690,10 @@ fn pr_next_step_hint(url: &str) -> String {
 /// Returns `Some` only when EVERY structured denial entry is an `exec` kind
 /// with a non-empty target — the case the human can meaningfully grant (the
 /// exact executable target). Any other kind
-/// (e.g. an `open` refused inside the shell) keeps the standard denial:
-/// guessing which fs axis an opaque `open` maps to would over-grant.
+/// (e.g. an `open` refused inside the shell) keeps the standard denial — which
+/// since #2629 names the fs axis and exact path to ask for (see
+/// [`open_denial_axis`]); prompting the operator for an `open` is a separate
+/// change.
 /// #1150: a STRUCTURAL refusal is a can't, not a may-not — the confined shell
 /// engine cannot interpret the construct (`$(...)`, backgrounding `&`, heredocs,
 /// fd duplication), so NO grant unlocks it. Offering "allow once / session /

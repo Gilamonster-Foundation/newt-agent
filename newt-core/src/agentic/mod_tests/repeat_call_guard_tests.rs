@@ -1218,7 +1218,11 @@ fn a_kernel_refused_binary_remains_a_denied_tool_result() {
         "stdout": "",
         "stderr": format!("brush: failed to execute command '{exe}': Permission denied (os error 13)\n"),
     });
-    let rendered = tools::kernel_refused_binary(&exe, &envelope, &crate::caveats::Scope::none())
+    let no_reads = crate::caveats::Caveats {
+        fs_read: crate::caveats::Scope::none(),
+        ..crate::caveats::Caveats::top()
+    };
+    let rendered = tools::kernel_refused_binary(&exe, &envelope, &no_reads)
         .expect("a 126 outside the read grant renders the refusal");
     assert!(!tools::tool_result_ok(&rendered));
     assert!(run_command_result_is_denial(
