@@ -43,8 +43,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         range="$remote_sha..$local_sha"
     fi
     saw_ref=1
+    # A failed diff (unreachable object, corrupt range) is NOT a genuine
+    # no-op push -- it must never resolve to an empty, silently-skipped
+    # scope. Fail closed to ALL with a message instead (fix-first review on
+    # #2658, finding P2 #2).
+    if ! _diff="$(git diff --name-only "$range" 2>&1)"; then
+        echo "changed-scope.sh: git diff failed for range '$range'; failing closed to ALL" >&2
+        echo ALL
+        exit 0
+    fi
     changed="$changed
-$(git diff --name-only "$range" 2>/dev/null || true)"
+$_diff"
 done
 
 [ "$saw_ref" -eq 0 ] && exit 0
@@ -92,10 +101,11 @@ if [ -z "$manifest_dirs" ]; then
 fi
 
 root="$PWD"
+UNMAPPED="__UNMAPPED__"
 crates="$(printf '%s\n' "$code_changed" | while IFS= read -r f; do
     abs="$root/$f"
     best_len=-1
-    best_name=""
+    best_name="$UNMAPPED"
     while IFS="$(printf '\t')" read -r dir name; do
         case "$abs" in
             "$dir"/*)
@@ -112,8 +122,12 @@ EOF2
 done)"
 
 # Any file that didn't map to a crate (a root-level script, a justfile, a
-# hook) is treated as build-affecting: fail closed to ALL.
-if printf '%s\n' "$crates" | grep -qx ''; then
+# hook) is treated as build-affecting: fail closed to ALL. An explicit
+# sentinel survives command substitution's trailing-newline trim even when
+# the unmapped file sorts last among the changed paths -- an empty line in
+# that position used to vanish silently, dropping ALL in favor of whatever
+# crate(s) sorted earlier (fix-first review on #2658, finding P2 #2).
+if printf '%s\n' "$crates" | grep -qx "$UNMAPPED"; then
     echo ALL
     exit 0
 fi
