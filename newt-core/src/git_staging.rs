@@ -608,6 +608,11 @@ impl HeldRoots {
     /// `fstat` on the handle against `stat` on the path. A root replaced,
     /// renamed away, or swapped for a symlink after binding refuses.
     ///
+    /// On Linux the fence itself is then built from the handles
+    /// ([`HeldRoots::held_read_roots`]), so this check is defence in depth
+    /// there; on macOS the Seatbelt profile is path-only and this check is
+    /// the admission guard (residual #8).
+    ///
     /// # Errors
     /// Names the root whose identity no longer matches.
     pub fn verify_identities(&self) -> Result<(), Refusal> {
@@ -632,6 +637,32 @@ impl HeldRoots {
             }
         }
         Ok(())
+    }
+
+    /// The held handles, duplicated, for a fence that anchors on descriptors
+    /// (Linux Landlock): the SAME directory objects [`Self::verify_identities`]
+    /// compared, so nothing after that check can re-point the fence by path.
+    ///
+    /// # Errors
+    /// When a handle cannot be duplicated.
+    #[cfg(target_os = "linux")]
+    fn held_read_roots(&self) -> Result<Vec<agent_bridle::HeldReadRoot>, Refusal> {
+        self.canonical
+            .iter()
+            .zip(&self.handles)
+            .map(|(root, handle)| {
+                let fd = handle.as_fd().try_clone_to_owned().map_err(|e| {
+                    format!(
+                        "refused: cannot duplicate the handle for read root '{}' ({e})",
+                        root.display()
+                    )
+                })?;
+                Ok(agent_bridle::HeldReadRoot::new(
+                    root.to_string_lossy().into_owned(),
+                    fd,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -1099,6 +1130,9 @@ pub fn literal_remote_url(
 /// `rev-list`, `/bin/sh`) can reach is bounded by the kernel-enforced fs and
 /// net axes, which are the fence F4 depends on.
 ///
+/// `held` are read roots (also spelled in `fs_read`) whose fence rules anchor
+/// on the caller's descriptors rather than a re-opened path.
+///
 /// # Errors
 /// When the executor refuses, or the applied sandbox was not a kernel fence.
 pub fn run_confined_git(
@@ -1108,6 +1142,7 @@ pub fn run_confined_git(
     session: &Caveats,
     fs_read: Scope<String>,
     fs_write: Scope<String>,
+    held: Vec<agent_bridle::HeldReadRoot>,
 ) -> Result<crate::confined_exec::ConfinedOutput, String> {
     // macOS Seatbelt is advisory for both net AND exec in this path: the
     // kernel profile it receives does not prevent the confined copy from
@@ -1140,7 +1175,8 @@ pub fn run_confined_git(
         cwd.to_path_buf(),
         caveats,
     )
-    .envs(tools.env.iter().cloned());
+    .envs(tools.env.iter().cloned())
+    .held_read_roots(held);
     let out = crate::confined_exec::ConstrainedExecutor::run(&req)
         .map_err(|e| format!("refused: confined git could not run — {e}"))?;
     require_kernel_fence(out.sandbox_kind)?;
@@ -1200,10 +1236,12 @@ pub fn verify_commit_in_staging(
 /// into staging with a confined `git fetch`: read = the held read roots
 /// plus staging, write = staging only.
 ///
-/// The fence is admitted by pathname, so the held roots' identities are
-/// verified against what their paths name NOW, immediately before the
-/// spawn ([`HeldRoots::verify_identities`]): a root replaced after binding
-/// refuses instead of admitting the replacement.
+/// The held roots' identities are verified against what their paths name
+/// NOW ([`HeldRoots::verify_identities`]); on Linux the fence is then built
+/// FROM the held descriptors ([`agent_bridle::HeldReadRoot`]), so a root
+/// swapped at its pathname after that check is outside the fence and the
+/// copy refuses. On macOS the Seatbelt profile admits paths only, so that
+/// window stays open there (residual #8, `docs/security/ocap-deviations.md`).
 ///
 /// # Errors
 /// When a held root no longer matches its path, or the confined fetch
@@ -1216,9 +1254,28 @@ pub fn confined_fetch(
     session: &Caveats,
     held: &HeldRoots,
 ) -> Result<(), Refusal> {
+    confined_fetch_with(tools, staging, source_repo, oid, session, held, || {})
+}
+
+/// [`confined_fetch`] with `after_verify` run between the identity check and
+/// the fence build — the test seam for that window. Production passes a no-op.
+pub(crate) fn confined_fetch_with(
+    tools: &TrustedTools,
+    staging: &StagingRepo,
+    source_repo: &Path,
+    oid: &str,
+    session: &Caveats,
+    held: &HeldRoots,
+    after_verify: impl FnOnce(),
+) -> Result<(), Refusal> {
     let staging_dir = staging.path().to_string_lossy().into_owned();
     let source = source_repo.to_string_lossy();
     held.verify_identities()?;
+    #[cfg(target_os = "linux")]
+    let held_fds = held.held_read_roots()?;
+    #[cfg(not(target_os = "linux"))]
+    let held_fds = Vec::new();
+    after_verify();
     let fs_read = match held.scope() {
         Scope::All => Scope::All,
         Scope::Only(_) => Scope::only(
@@ -1243,6 +1300,7 @@ pub fn confined_fetch(
         session,
         fs_read,
         Scope::only([staging_dir.clone()]),
+        held_fds,
     )?;
     if out.success {
         Ok(())
