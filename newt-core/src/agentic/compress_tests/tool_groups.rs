@@ -432,7 +432,7 @@ fn within_group_reclaim_fires_only_when_group_alone_exceeds() {
         .map(|m| m["content"].as_str().unwrap())
         .collect();
     assert!(
-        results[0].starts_with("[read_file] read 'f0.txt'"),
+        results[0].starts_with("[read_file] f0.txt lines"),
         "oldest one-lined with the re-read affordance: {}",
         results[0]
     );
@@ -449,8 +449,8 @@ fn within_group_reclaim_fires_only_when_group_alone_exceeds() {
         .filter(|m| m["role"].as_str() == Some("tool"))
         .map(|m| m["content"].as_str().unwrap())
         .collect();
-    assert!(results[0].starts_with("[read_file] read 'f0.txt'"));
-    assert!(results[1].starts_with("[read_file] read 'f1.txt'"));
+    assert!(results[0].starts_with("[read_file] f0.txt lines"));
+    assert!(results[1].starts_with("[read_file] f1.txt lines"));
     assert_eq!(results[2], big, "the newest member is never a candidate");
     assert!(
         estimate_tokens(&residual, EST) > 1_000,
@@ -489,12 +489,12 @@ async fn oversized_group_reclaims_within_keeping_newest_whole() {
         .collect();
     assert_eq!(results.len(), 3, "pairing intact — nothing dropped");
     assert!(
-        results[0].starts_with("[read_file] read 'a.txt'"),
+        results[0].starts_with("[read_file] a.txt lines"),
         "oldest one-lined, file named for re-read: {}",
         results[0]
     );
     assert!(
-        results[1].starts_with("[read_file] read 'b.txt'"),
+        results[1].starts_with("[read_file] b.txt lines"),
         "older one-lined in order: {}",
         results[1]
     );

@@ -503,7 +503,7 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
         .collect::<Vec<_>>()
         .join("\n");
     let cap = crate::agentic::content_spill::TOOL_RESULT_SPILL_CAP;
-    let on = read_file_page(&body, None, None, None, true);
+    let on = read_file_page("", &body, None, None, None, true);
     assert!(
         on.chars().count() <= cap,
         "{} chars would spill",
@@ -511,7 +511,7 @@ fn with_offload_on_a_read_file_page_stays_under_the_spill_cap() {
     );
     assert!(on.contains("offset="), "says how to continue");
     // Offload off: nothing would spill, so the ordinary (larger) cap applies.
-    let off = read_file_page(&body, None, None, None, false);
+    let off = read_file_page("", &body, None, None, None, false);
     assert!(
         off.chars().count() > cap,
         "offload off keeps the full budget"
