@@ -7,12 +7,15 @@ name: CI
 # `cargo nextest run -E 'rdeps(<crate>)'` scoped to that classification (or
 # `--workspace` on ALL), plus scripts/spawn_inventory.py and `just docs-check`.
 # This CI workflow is the authoritative FULL gate: coverage (cov-ci), MSRV,
-# security audit, the `--no-default-features` lean config, npm's
-# macOS/Windows legs, the eval/harness/PTY/mcp-import-real real-resource
-# lanes, OCAP register honesty, cross-language conformance, the vendored
-# crossterm regression, and this hook's own regression suites (they gate
-# under CI, not by running themselves from inside the hook) are CI-ONLY and
-# never run in the hook — the hook's own header comment names each one, plus
+# security audit, the `--no-default-features` lean config, the whole npm
+# installer matrix (the hook runs no npm check on any OS), the
+# eval/harness/PTY/mcp-import-real real-resource lanes, the real-`newt`-
+# session / real-PTY integration binaries the hook's nextest filter excludes
+# by name (this file's `test` job is their per-PR run), OCAP
+# register honesty, cross-language conformance, the vendored crossterm
+# regression, and this hook's own regression suites (they gate under CI, not
+# by running themselves from inside the hook) are CI-ONLY and never run in
+# the hook — the hook's own header comment names each one, plus
 # the separately-triggered newt-web/mesh/formal/behavior-registry workflows,
 # each of which documents its own exclusion in its own HOOK PARITY comment.
 # Editing a job here means auditing the hook (and vice versa) per CRAFT-14
@@ -53,7 +56,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # HOOK PARITY: identical test command in `just npm-test` / `just check`.
+      # HOOK PARITY: CI-only (#1098) -- .githooks/pre-push runs no npm check
+      # on any OS; this matrix is the only gate. `just npm-test` / `just
+      # check` are the by-hand local equivalents. Named in the hook's CI-ONLY
+      # header list.
       - run: npm --prefix npm test
 
   lint:
@@ -190,7 +196,11 @@ jobs:
         # `--features newt-data/kernel` runs the Phase 21.3 live-kernel tests
         # (the pure accumulator + the mock-websocket rest.rs suite), which are
         # off by default; mirrored in the justfile `test`/`check` recipes.
-        # HOOK PARITY: mirrored by `just check` / `just test`.
+        # HOOK PARITY: .githooks/pre-push runs `cargo nextest run` on the
+        # changed scope MINUS the real-`newt`-session / real-PTY integration
+        # binaries its header names (newt-agent::lean_surface_purity and
+        # friends -- the expensive tier). This whole-workspace `cargo test`
+        # is their only per-PR run and the authoritative one.
         # `newt-interaction/schema` is off by default so schemars stays out
         # of the inward layer's runtime closure (#1828); enabling it here is
         # what keeps the published JSON Schemas from going stale unnoticed.

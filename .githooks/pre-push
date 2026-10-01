@@ -19,9 +19,10 @@
 #     says ALL; otherwise scripts/reverse_deps.py computes the closure from
 #     `cargo metadata` once and both clippy and the no-nextest fallback
 #     below use that same expanded `-p` set)
-#   - `cargo nextest run -E 'rdeps(<crate>) + ...'` on the same crate set
-#     (falls back to `cargo test -p <crate>` per the expanded set above if
-#     nextest is missing)
+#   - `cargo nextest run -E 'rdeps(<crate>) + ...'` on the same crate set,
+#     minus the CI-only binaries named below (falls back to `cargo test -p
+#     <crate>` per the expanded set above if nextest is missing; that
+#     fallback has no per-binary exclusion and runs them)
 #   - `python3 scripts/spawn_inventory.py` (~0.2s, whole tree -- matches
 #     CI's spawn-inventory step; cheap enough to run unscoped every push)
 #   - `just docs-check` (~0.5s, whole tree -- matches the lint job's
@@ -39,7 +40,28 @@
 #   - `just eval-selftest` (bench/harbor fixture suite)
 #   - `just harness-python` (uv + CPython real-resource lane)
 #   - the PTY (newt-tui-pty.yml) and mcp-import-real.yml real-resource lanes
-#   - the npm installer matrix (test-npm) beyond the local OS
+#   - the real-`newt`-session and real-PTY integration binaries of the
+#     newt-agent package (newt-cli/tests/), filtered out of the nextest run
+#     by name (NEXTEST_EXCLUDE below). CLAUDE.md "Testing strategy" puts
+#     real-subprocess / real-PTY tests in the EXPENSIVE tier: CI and release
+#     gates, never per-push. Each one spawns the real debug `newt` for actual
+#     CLI startup (backend probe, herdr socket, git config -- ~6 s at idle)
+#     behind a fixed wall-clock bound, and under this hook's parallel nextest
+#     run on a loaded dev box they cross it and reject the push (measured:
+#     three rejections on 2026-09-30, all in this shape, every one green in
+#     CI on the same SHA). CI's `test` job runs all six on every PR via
+#     `cargo test --workspace` (the `windows` job runs the three that are
+#     not `#![cfg(unix)]`); terminal_exit_pty also runs in newt-tui-pty.yml.
+#       newt-agent::lean_surface_purity  lean-surface byte contract; six
+#                                         `newt` sessions per test, 30 s cap
+#       newt-agent::stdout_purity        real `newt worker` / `newt mcp`, 10 s
+#       newt-agent::posture_turn         real chat loop, 30 s
+#       newt-agent::personality_turn     real chat loop, 60 s
+#       newt-agent::migration_notices    real CLI startup, 20-30 s
+#       newt-agent::terminal_exit_pty    real PTY + CLI startup, 30 s budget
+#   - the npm installer matrix (test-npm, all three OS legs): this hook runs
+#     no npm check on any OS -- ci.yml's test-npm job is the only gate;
+#     `just npm-test` / `just check` are the by-hand local equivalents
 #   - this hook's OWN regression suites (scripts/test_pre_push.py,
 #     scripts/test_changed_scope.py, scripts/test_reverse_deps.py) --
 #     running a hook's self-test from inside itself proves nothing; CI's
@@ -282,15 +304,32 @@ cargo fmt --all -- --check
 # -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
 # `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
 # real-resource CI lane of their own (tracked separately; out of scope here).
+#
+# The six newt-agent binaries are the real-`newt`-session / real-PTY tier:
+# see the CI-ONLY list in the header for each one's reason and where CI runs
+# it. scripts/test_pre_push.py pins this list; change both together.
 NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
     and not binary_id(agent-harness::writer_inheritance)
-    and not binary_id(newt-git::native_git_commit)'
+    and not binary_id(newt-git::native_git_commit)
+    and not binary_id(newt-agent::lean_surface_purity)
+    and not binary_id(newt-agent::stdout_purity)
+    and not binary_id(newt-agent::posture_turn)
+    and not binary_id(newt-agent::personality_turn)
+    and not binary_id(newt-agent::migration_notices)
+    and not binary_id(newt-agent::terminal_exit_pty)'
+
+# nextest presence is probed the way cargo resolves subcommands (PATH plus
+# $CARGO_HOME/bin) rather than with `command -v cargo-nextest`, so the hook's
+# own regression suite can force the no-nextest fallback through its `cargo`
+# stub on a box that has nextest installed (scripts/test_pre_push.py).
+_have_nextest=0
+cargo nextest --version >/dev/null 2>&1 && _have_nextest=1
 
 if [ "$SCOPE" = "ALL" ]; then
     echo "[pre-push] changed scope: ALL (workspace-wide file changed)"
     echo "[pre-push] running cargo clippy --workspace --all-targets -- -D warnings..."
     cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
-    if command -v cargo-nextest >/dev/null 2>&1; then
+    if [ "$_have_nextest" = 1 ]; then
         echo "[pre-push] running cargo nextest run --workspace..."
         cargo nextest run -E "$NEXTEST_EXCLUDE" --features newt-data/kernel,newt-interaction/schema
     else
@@ -326,7 +365,7 @@ else
     echo "[pre-push] running cargo clippy -- -D warnings for: $SCOPE (and reverse dependents)..."
     cargo clippy "${_pkg_args[@]}" --all-targets -- -D warnings
 
-    if command -v cargo-nextest >/dev/null 2>&1; then
+    if [ "$_have_nextest" = 1 ]; then
         echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
         cargo nextest run -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
     else
