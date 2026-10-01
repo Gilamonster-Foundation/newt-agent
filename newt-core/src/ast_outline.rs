@@ -45,6 +45,9 @@ const ITEM_KEYWORDS: &[&str] = &[
     "fn", "struct", "enum", "impl", "trait", "mod", "type", "static", "const",
 ];
 const VISIBILITY_PREFIXES: &[&str] = &["pub(crate)", "pub(super)", "pub(self)", "pub"];
+/// tree-sitter-rust's node kind for the opaque token run inside a macro
+/// invocation's delimiters — never item evidence (#2638 round 10).
+const MACRO_TOKENS: &str = "token_tree";
 
 /// The mod name in `header` (e.g. `"pub(crate) mod foo"` -> `"foo"`), or
 /// `None` when `header` isn't a `mod` declaration — used to collapse runs
@@ -110,6 +113,16 @@ fn is_incomplete(node: Node<'_>) -> bool {
 /// own complete local items — into the same `ERROR` node as the cut
 /// definition's loose tokens, and a complete `const_item` there is a
 /// complete item, not evidence of a cut.
+///
+/// Macro input is never evidence either (round 10): tree-sitter parses no
+/// items inside a macro invocation, so a cut `proptest! {` body is a
+/// [`MACRO_TOKENS`] node of loose keyword/identifier tokens in which a
+/// brace-balanced `fn generated() {}` never becomes a `function_item` —
+/// the complete-subtree rule can't see it. The body is not descended into,
+/// and when tree-sitter gives up on the invocation and folds those tokens
+/// straight into an `ERROR`, the parser still lexed what follows the
+/// identifier as a `token_tree` rather than `parameters`; a real cut `fn`
+/// never has that.
 fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
     let mut hits = Vec::new();
     for i in 0..node.child_count() {
@@ -121,10 +134,13 @@ fn keyword_identifier_starts(node: Node<'_>) -> Vec<usize> {
             && node
                 .child(i + 1)
                 .is_some_and(|next| next.kind() == "identifier")
+            && !node
+                .child(i + 2)
+                .is_some_and(|after| after.kind() == MACRO_TOKENS)
         {
             hits.push(child.start_byte());
         }
-        if is_incomplete(child) {
+        if is_incomplete(child) && child.kind() != MACRO_TOKENS {
             hits.extend(keyword_identifier_starts(child));
         }
     }
@@ -702,6 +718,45 @@ pub(crate) enum ResponsesCompaction {
         assert!(
             entries.iter().any(|e| e.header.contains("fn done")),
             "complete fns inside the region stay tagged: {entries:?}"
+        );
+    }
+
+    /// #2638 round 10 (measured red): a page cut inside an item-generating
+    /// macro body (`proptest! {`, `thread_local! {`, …). Tree-sitter never
+    /// parses items inside a macro invocation: the body is a `token_tree`
+    /// whose children are loose keyword/identifier tokens, so a COMPLETE,
+    /// brace-balanced `fn generated() {}` in there is never wrapped in a
+    /// `function_item` and "skip complete subtrees" cannot see that it is
+    /// complete. Macro input is not recovery evidence: nothing is reported
+    /// open-ended, and the cut macro declines to the generic fallback.
+    #[test]
+    fn a_complete_fn_inside_a_cut_macro_body_is_not_recovered() {
+        let src = "fn real() {}\n\nmy_macro! {\n    fn generated() {}\n    let other = 1;\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        assert!(
+            !entries.iter().any(|e| e.open_ended),
+            "macro input is not recovery evidence: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.header.contains("fn real")),
+            "the complete tagged fn still appears: {entries:?}"
+        );
+    }
+
+    /// #2638 round 10 (measured red): the same hazard when tree-sitter gives
+    /// up on the macro invocation entirely and folds its tokens straight
+    /// into an `ERROR` node, with no `token_tree` wrapper to skip
+    /// (`cfg_if! { if #[cfg(unix)] { fn platform() -> u32 { 1 }`). The
+    /// parser still lexed what follows the identifier as a `token_tree`,
+    /// not a `parameters` node — the signature of macro input, and a real
+    /// cut `fn` never has it.
+    #[test]
+    fn a_fn_lexed_as_macro_tokens_inside_a_collapsed_error_is_not_recovered() {
+        let src = "fn real() {}\n\ncfg_if::cfg_if! {\n    if #[cfg(unix)] {\n        fn platform() -> u32 { 1 }\n        use std::os::unix::fs::MetadataExt;\n";
+        let entries = outline_rust(src, 1).expect("valid rust prefix");
+        assert!(
+            !entries.iter().any(|e| e.open_ended),
+            "macro input is not recovery evidence: {entries:?}"
         );
     }
 
