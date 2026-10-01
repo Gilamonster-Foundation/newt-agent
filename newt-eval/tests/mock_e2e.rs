@@ -465,7 +465,6 @@ mod golden {
     use serde_json::json;
     use std::path::PathBuf;
     use std::process::Stdio;
-    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
     use wiremock::matchers::{method, path};
@@ -588,10 +587,20 @@ mod golden {
             }
             // drop closes stdin → server loop exits.
         }
-        let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
-            .await
-            .expect("newt mcp timed out")
-            .expect("collect output");
+        // The child's exit is the event; the bound is the shared hang guard,
+        // not a budget. The former 20 s failed first-try in three consecutive
+        // pre-push hook runs on 2026-10-01. Measured cause (strace -tt on this
+        // box under build I/O): before `newt mcp` serves its first frame it
+        // acquires the config lock through `atomic_fs::publish_lock`, whose
+        // fsync of the lock's tmp file took 5.6 s on one run, plus the cold
+        // page-in of the 208 MB debug binary (2–9 s); the handshake itself
+        // takes ~10 ms. Both costs are disk contention, which is what a box
+        // running cargo beside this test has most of.
+        let output =
+            tokio::time::timeout(newt_core::test_guard::HANG_GUARD, child.wait_with_output())
+                .await
+                .expect("newt mcp timed out")
+                .expect("collect output");
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Re-serialize each frame with sorted keys (serde_json maps preserve
         // order; Value round-trip is stable) so the golden is layout-stable.
@@ -658,7 +667,8 @@ mod golden {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            let output = tokio::time::timeout(Duration::from_secs(20), async {
+            // Same guard as the MCP capture above: the child's exit is the event.
+            let output = tokio::time::timeout(newt_core::test_guard::HANG_GUARD, async {
                 cmd.spawn()
                     .expect("spawn newt help")
                     .wait_with_output()
