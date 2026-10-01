@@ -206,7 +206,11 @@ pub(super) fn execute_governed_push(
     if let Err(unavailable) = broker_available(caveats) {
         return unavailable.to_string();
     }
-    let result = plan_governed_push(source, cwd, caveats, gate)
+    // Bind canonical roots BEFORE planning so the GrantedRoot handles are held
+    // for the full push lifetime (planning + copy). The plan carries the canonical
+    // paths; the handles here anchor the inodes against retargeting.
+    let held = crate::git_staging::bind_canonical_roots(&caveats.fs_read);
+    let result = plan_governed_push(source, cwd, caveats, gate, held.as_slice())
         .and_then(|plan| run_staged_push(&plan, caveats));
     fixed_form_with_notice(result, std::io::stdout())
 }
@@ -233,14 +237,21 @@ fn fixed_form(result: Result<crate::git_staging::Outcome, String>) -> String {
 /// Item 8: routes operator-actionable hints (chmod fixes, paths) to the harness
 /// notice channel before normalising the model-facing result to F6 fixed form.
 /// The model result carries nothing from the detail; only the operator sees it.
+///
+/// Hints are identified by a NUL-byte (\x00) sentinel prefix injected by
+/// [`crate::git_staging::TrustHint::tagged_render`]. NUL cannot appear in
+/// filesystem paths or URLs, so repository-controlled content (e.g. a commit
+/// URL containing "chmod" or "Fix:") cannot forge a hint line.
 fn fixed_form_with_notice(
     result: Result<crate::git_staging::Outcome, String>,
     mut notice: impl std::io::Write,
 ) -> String {
     if let Err(ref detail) = result {
+        // Only NUL-prefixed lines are operator hints; skip the sentinel.
         let hint: String = detail
             .lines()
-            .filter(|l| l.contains("Fix:") || l.contains("chmod"))
+            .filter(|l| l.starts_with('\x00'))
+            .map(|l| &l[1..]) // strip the \x00 sentinel
             .collect::<Vec<_>>()
             .join("\n");
         if !hint.is_empty() {
@@ -262,6 +273,7 @@ fn plan_governed_push(
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
+    bound: &[PathBuf],
 ) -> Result<GovernedPushPlan, String> {
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
@@ -286,14 +298,13 @@ fn plan_governed_push(
 
     // F1/F2: authenticate git/gh/sh/exec-path BEFORE any planning subprocess.
     let tools = staging::TrustedTools::authenticate(&caveats.fs_write)?;
-    // Item 5: bind canonical roots once at plan time (snapshot; retargeting the
-    // root symlink after this point does not change the grant).
-    let bound = staging::bind_canonical_roots(&caveats.fs_read);
     // Administrative dirs by file reads, each read-authorized before use.
-    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read, &bound)?;
+    // `bound` was pre-computed in execute_governed_push (canonical roots held
+    // for the full push lifetime; no re-bind here).
+    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read, bound)?;
 
-    let branch = staging::read_head_branch(&git_dir, &caveats.fs_read, &bound)?;
-    if staging::is_default_branch(&common_dir, &branch, &caveats.fs_read, &bound) {
+    let branch = staging::read_head_branch(&git_dir, &caveats.fs_read, bound)?;
+    if staging::is_default_branch(&common_dir, &branch, &caveats.fs_read, bound) {
         return Err(format!(
             "refused: cannot push the default branch '{branch}' (open a feature branch instead)"
         ));
@@ -311,7 +322,13 @@ fn plan_governed_push(
 
     // The LITERAL `remote.<name>.url` (never `git remote get-url`, which
     // applies insteadOf): what the operator approves is what staging dials.
-    let url = staging::literal_remote_url(&tools, &common_dir, &request.remote, &caveats.fs_read, &bound)?;
+    let url = staging::literal_remote_url(
+        &tools,
+        &common_dir,
+        &request.remote,
+        &caveats.fs_read,
+        bound,
+    )?;
     let host = crate::git_hardening::push_url_host(&url)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
@@ -320,12 +337,11 @@ fn plan_governed_push(
     };
 
     // F3: pin the commit at PLAN time; it is carried to the dial unchanged.
-    let oid = staging::read_branch_oid(&git_dir, &branch, &caveats.fs_read, &bound)
-        .or_else(|_| staging::read_branch_oid(&common_dir, &branch, &caveats.fs_read, &bound))?;
-    staging::resolve_alternates_chain(&common_dir.join("objects"), &caveats.fs_read, &bound)?;
+    let oid = staging::read_branch_oid(&git_dir, &branch, &caveats.fs_read, bound)
+        .or_else(|_| staging::read_branch_oid(&common_dir, &branch, &caveats.fs_read, bound))?;
+    staging::resolve_alternates_chain(&common_dir.join("objects"), &caveats.fs_read, bound)?;
     // Item 3: verify_commit_in_staging runs AFTER the confined fetch (in
     // run_staged_push), not here against workspace objects.
-
 
     ensure_net_granted(
         caveats,
@@ -342,6 +358,7 @@ fn plan_governed_push(
         oid,
         source_repo: common_dir,
         tools,
+        bound: bound.to_vec(),
     })
 }
 
@@ -359,6 +376,10 @@ struct GovernedPushPlan {
     /// The workspace REPOSITORY (common dir) the confined copy reads from.
     source_repo: PathBuf,
     tools: crate::git_staging::TrustedTools,
+    /// Canonical roots snapshot from plan time (see [`bind_canonical_roots`]).
+    /// Passed to `confined_fetch` so the copy uses the originally-authorized
+    /// directories, not live symlink resolution.
+    bound: Vec<PathBuf>,
 }
 
 /// Phases 2-6 of the staging-repo broker (`crate::git_staging`) for a push
@@ -377,7 +398,16 @@ fn run_staged_push(
     git_staging::import_credentials(&staging, &plan.tools, &caveats.fs_write)?;
 
     // F4: the ONLY step that reads workspace objects, kernel-confined.
-    git_staging::confined_fetch(&plan.tools, &staging, &plan.source_repo, &plan.oid, caveats)?;
+    // Pass plan.bound (canonical roots from plan time) so the copy uses the
+    // originally-authorized directories even if root symlinks were retargeted.
+    git_staging::confined_fetch(
+        &plan.tools,
+        &staging,
+        &plan.source_repo,
+        &plan.oid,
+        caveats,
+        &plan.bound,
+    )?;
     git_staging::remove_alternates(&staging)?;
     // Item 3: verify after alternates are removed so the commit is checked in
     // self-contained staging, not against live workspace objects.
@@ -504,7 +534,9 @@ pub(super) fn execute_governed_pr_create(
     if let Err(unavailable) = broker_available(caveats) {
         return unavailable.to_string();
     }
-    let result = plan_governed_pr_create(source, cwd, caveats, gate)
+    // Bind canonical roots before planning (same rationale as execute_governed_push).
+    let held = crate::git_staging::bind_canonical_roots(&caveats.fs_read);
+    let result = plan_governed_pr_create(source, cwd, caveats, gate, held.as_slice())
         .and_then(|plan| run_staged_pr_create(&plan, caveats));
     fixed_form_with_notice(result, std::io::stdout())
 }
@@ -579,6 +611,7 @@ fn plan_governed_pr_create(
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
+    bound: &[PathBuf],
 ) -> Result<GovernedPrCreatePlan, String> {
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
@@ -604,13 +637,12 @@ fn plan_governed_pr_create(
     if tools.gh_path().is_none() {
         return Err("refused: no trusted gh executable is installed".to_string());
     }
-    // Item 5: bind canonical roots once at plan time.
-    let bound = staging::bind_canonical_roots(&caveats.fs_read);
-    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read, &bound)?;
+    // `bound` was pre-computed in execute_governed_pr_create; use it directly.
+    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &caveats.fs_read, bound)?;
 
     // The `gh` dial runs from a fresh staging directory (Phase 4), so a
     // repo-local config gadget has nothing to reach.
-    let url = staging::literal_remote_url(&tools, &common_dir, "origin", &caveats.fs_read, &bound)?;
+    let url = staging::literal_remote_url(&tools, &common_dir, "origin", &caveats.fs_read, bound)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
             "refused: gh pr create is only supported for a github.com 'origin' remote (got {url})"
@@ -618,9 +650,10 @@ fn plan_governed_pr_create(
     };
     let host = "github.com".to_string();
 
-    let head = staging::read_head_branch(&git_dir, &caveats.fs_read, &bound)
+    let head = staging::read_head_branch(&git_dir, &caveats.fs_read, bound)
         .map_err(|_| "refused: detached HEAD has no branch to open a PR from".to_string())?;
-    let base = staging::origin_default_branch(&common_dir, &caveats.fs_read, &bound).unwrap_or_else(|| "main".to_string());
+    let base = staging::origin_default_branch(&common_dir, &caveats.fs_read, bound)
+        .unwrap_or_else(|| "main".to_string());
     if head == base {
         return Err(format!(
             "refused: cannot open a PR from the default branch '{base}' to itself"
@@ -2073,6 +2106,30 @@ mod governed_push_tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// Test wrapper: bind canonical roots from caveats and call plan_governed_push.
+    /// Tests use this so they do not need to pre-bind; execute_governed_push still
+    /// holds the HeldRoots handles in its own scope for the full push duration.
+    fn plan_push_test(
+        source: &str,
+        cwd: &Path,
+        caveats: &Caveats,
+        gate: &mut Option<&mut dyn PermissionGate>,
+    ) -> Result<GovernedPushPlan, String> {
+        let bound = crate::git_staging::bind_canonical_roots(&caveats.fs_read);
+        plan_governed_push(source, cwd, caveats, gate, bound.as_slice())
+    }
+
+    /// Test wrapper for plan_governed_pr_create (same rationale as plan_push_test).
+    fn plan_pr_create_test(
+        source: &str,
+        cwd: &Path,
+        caveats: &Caveats,
+        gate: &mut Option<&mut dyn PermissionGate>,
+    ) -> Result<GovernedPrCreatePlan, String> {
+        let bound = crate::git_staging::bind_canonical_roots(&caveats.fs_read);
+        plan_governed_pr_create(source, cwd, caveats, gate, bound.as_slice())
+    }
+
     fn capture_log<T>(f: impl FnOnce() -> T) -> (T, String) {
         let sink = LogSink::default();
         let log = sink.0.clone();
@@ -2098,7 +2155,7 @@ mod governed_push_tests {
             repo.path(),
             &["remote", "add", "origin", "https://github.com/o/r.git"],
         );
-        let err = plan_governed_push(
+        let err = plan_push_test(
             "git push origin main:main",
             repo.path(),
             &scoped_caveats(),
@@ -2118,7 +2175,7 @@ mod governed_push_tests {
             "git push -f origin task:task",
         ] {
             let err =
-                plan_governed_push(source, repo.path(), &scoped_caveats(), &mut None).unwrap_err();
+                plan_push_test(source, repo.path(), &scoped_caveats(), &mut None).unwrap_err();
             assert!(err.contains("no flags"), "{source}: {err}");
         }
     }
@@ -2129,7 +2186,7 @@ mod governed_push_tests {
         for url in ["file:///home/op/other-repo", "ext::sh -c evil"] {
             let repo = repo_on_feature_branch();
             git(repo.path(), &["remote", "set-url", "origin", url]);
-            let err = plan_governed_push(
+            let err = plan_push_test(
                 "git push origin task:task",
                 repo.path(),
                 &scoped_caveats(),
@@ -2147,7 +2204,7 @@ mod governed_push_tests {
     fn refspec_operand_naming_a_different_branch_is_refused() {
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
-        let err = plan_governed_push(
+        let err = plan_push_test(
             "git push origin other:other",
             repo.path(),
             &scoped_caveats(),
@@ -2165,10 +2222,9 @@ mod governed_push_tests {
             exec: Scope::only([]),
             ..scoped_caveats()
         };
-        let err = plan_governed_push("git push", repo.path(), &no_exec, &mut None).unwrap_err();
+        let err = plan_push_test("git push", repo.path(), &no_exec, &mut None).unwrap_err();
         assert!(err.contains("exec authority"), "{err}");
-        let err =
-            plan_governed_push("git push", repo.path(), &read_only(&[]), &mut None).unwrap_err();
+        let err = plan_push_test("git push", repo.path(), &read_only(&[]), &mut None).unwrap_err();
         assert!(err.contains("read authority"), "{err}");
     }
 
@@ -2184,8 +2240,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let sub = repo.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
-        let plan =
-            plan_governed_push("git push", &sub, &read_only(&[repo.path()]), &mut None).unwrap();
+        let plan = plan_push_test("git push", &sub, &read_only(&[repo.path()]), &mut None).unwrap();
         assert_eq!(plan.branch, "task");
     }
 
@@ -2209,8 +2264,8 @@ mod governed_push_tests {
                 "wt-task",
             ],
         );
-        let err = plan_governed_push("git push", &wt, &read_only(&[outer.path()]), &mut None)
-            .unwrap_err();
+        let err =
+            plan_push_test("git push", &wt, &read_only(&[outer.path()]), &mut None).unwrap_err();
         assert!(err.contains("read authority"), "{err}");
     }
 
@@ -2241,7 +2296,7 @@ mod governed_push_tests {
             fs_write: Scope::only([planted.path().to_string_lossy().into_owned()]),
             ..scoped_caveats()
         };
-        let err = plan_governed_push("git push", repo.path(), &caveats, &mut None).unwrap_err();
+        let err = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap_err();
         assert!(err.contains("model-writable"), "{err}");
         assert!(!sentinel.exists(), "the planted git must never run");
     }
@@ -2270,7 +2325,7 @@ mod governed_push_tests {
             allow: true,
             requests: vec![],
         };
-        let plan = plan_governed_push(
+        let plan = plan_push_test(
             "git push origin task:task",
             repo.path(),
             &with_net(Scope::only([])),
@@ -2290,8 +2345,7 @@ mod governed_push_tests {
             gate.requests
         );
 
-        let bare =
-            plan_governed_push("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        let bare = plan_push_test("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
         assert_eq!(bare, plan);
     }
 
@@ -2306,7 +2360,7 @@ mod governed_push_tests {
             allow: false,
             requests: vec![],
         };
-        let err = plan_governed_push(
+        let err = plan_push_test(
             "git push",
             repo.path(),
             &with_net(Scope::only([])),
@@ -2336,7 +2390,7 @@ mod governed_push_tests {
                 crate::agentic::HumanQuestionOutcome::Unavailable
             }
         }
-        let err = plan_governed_push(
+        let err = plan_push_test(
             "git push",
             repo.path(),
             &with_net(Scope::only([])),
@@ -2364,8 +2418,7 @@ mod governed_push_tests {
         )
         .unwrap();
         // Plan phase now succeeds — type check moved to run phase (item 3).
-        let plan =
-            plan_governed_push("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        let plan = plan_push_test("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
         assert_eq!(plan.oid, blob, "plan pins the blob oid");
         // Run phase refuses at verify_commit_in_staging.
         let err = run_staged_push(&plan, &scoped_caveats()).unwrap_err();
@@ -2391,8 +2444,7 @@ mod governed_push_tests {
                 &format!("touch {}", sentinel.display()),
             ],
         );
-        let plan =
-            plan_governed_push("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        let plan = plan_push_test("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
         assert_eq!(plan.url, "https://github.com/o/r.git");
         assert!(!sentinel.exists());
     }
@@ -2402,7 +2454,7 @@ mod governed_push_tests {
     /// Plan against the github.com origin, then point the APPROVED plan at a
     /// local endpoint (the only field changed) so the real broker dials it.
     fn plan_for_endpoint(cwd: &Path, caveats: &Caveats, port: u16) -> GovernedPushPlan {
-        let mut plan = plan_governed_push("git push", cwd, caveats, &mut None).unwrap();
+        let mut plan = plan_push_test("git push", cwd, caveats, &mut None).unwrap();
         plan.url = format!("http://127.0.0.1:{port}/o/r.git");
         plan
     }
@@ -2740,7 +2792,7 @@ mod governed_push_tests {
             allow: true,
             requests: vec![],
         };
-        let plan = plan_governed_pr_create(
+        let plan = plan_pr_create_test(
             "gh pr create --title 't' --body 'b'",
             repo.path(),
             &with_net(Scope::only([])),
@@ -2764,7 +2816,7 @@ mod governed_push_tests {
     fn unsupported_pr_create_flags_are_refused() {
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
-        let err = plan_governed_pr_create(
+        let err = plan_pr_create_test(
             "gh pr create --title t --body b --base other",
             repo.path(),
             &scoped_caveats(),
@@ -2787,7 +2839,7 @@ mod governed_push_tests {
                 "https://gitlab.example.com/o/r.git",
             ],
         );
-        let err = plan_governed_pr_create(
+        let err = plan_pr_create_test(
             "gh pr create --title t --body b",
             repo.path(),
             &scoped_caveats(),
@@ -2810,7 +2862,7 @@ mod governed_push_tests {
                 "ssh -oProxyCommand=evil",
             ],
         );
-        let plan = plan_governed_pr_create(
+        let plan = plan_pr_create_test(
             "gh pr create --title t --body b",
             repo.path(),
             &scoped_caveats(),
@@ -2828,7 +2880,7 @@ mod governed_push_tests {
             exec: Scope::only([]),
             ..scoped_caveats()
         };
-        let err = plan_governed_pr_create(
+        let err = plan_pr_create_test(
             "gh pr create --title t --body b",
             repo.path(),
             &no_exec,
@@ -2836,7 +2888,7 @@ mod governed_push_tests {
         )
         .unwrap_err();
         assert!(err.contains("exec authority"), "{err}");
-        let err = plan_governed_pr_create(
+        let err = plan_pr_create_test(
             "gh pr create --title t --body b",
             repo.path(),
             &read_only(&[]),
@@ -2851,16 +2903,20 @@ mod governed_push_tests {
     /// `fixed_form_with_notice` routes chmod hints to the operator sink while
     /// keeping the model-facing result as the fixed-form string.
     ///
-    /// Measured red: before adding `fixed_form_with_notice`, the chmod hint in
-    /// the trust-check error was simply discarded by `fixed_form`; the notice
-    /// sink received nothing and the model result was the same fixed-form string,
-    /// but there was no way to surface the actionable hint to the operator.
+    /// Hints are identified by the NUL (\x00) sentinel prefix from
+    /// `TrustHint::tagged_render`.  A bare "Fix:" or "chmod" string without the
+    /// sentinel is NOT routed (repo-controlled content cannot forge a hint).
+    ///
+    /// Measured red: before adding the NUL sentinel, any line containing "Fix:"
+    /// or "chmod" was promoted — including repo-controlled commit messages or
+    /// URLs.  After the change, only \x00-prefixed lines reach the operator.
     #[test]
     fn operator_sink_gets_chmod_hint_model_result_stays_fixed_form() {
         use crate::git_staging::Outcome;
 
-        // A trust-check error that contains a "Fix: chmod g-w" hint.
-        let detail = "governed push refused: '~/some/gitconfig' is group- or other-writable (mode 0664)\nFix: chmod g-w ~/some/gitconfig";
+        // A trust-check error with a NUL-sentinel hint (as TrustHint::tagged_render produces).
+        // The \x00 prefix is stripped before display; bare "Fix:" lines are skipped.
+        let detail = "governed push refused: '~/some/gitconfig' is group- or other-writable\n\x00Fix: chmod g-w ~/some/gitconfig  (current mode 0664)";
         let result: Result<Outcome, String> = Err(detail.to_string());
 
         let mut sink = Vec::<u8>::new();
@@ -2868,12 +2924,24 @@ mod governed_push_tests {
 
         // Model result is the fixed form — no path, no chmod.
         assert_eq!(model_result, "failed(refused_by_harness)");
-        assert!(!model_result.contains("chmod"), "chmod must not reach model");
-        assert!(!model_result.contains("gitconfig"), "path must not reach model");
+        assert!(
+            !model_result.contains("chmod"),
+            "chmod must not reach model"
+        );
+        assert!(
+            !model_result.contains("gitconfig"),
+            "path must not reach model"
+        );
 
         // Operator sink got the hint.
         let notice = String::from_utf8_lossy(&sink);
-        assert!(notice.contains("chmod"), "chmod hint must reach operator: {notice}");
-        assert!(notice.contains("Fix:"), "Fix: label must reach operator: {notice}");
+        assert!(
+            notice.contains("chmod"),
+            "chmod hint must reach operator: {notice}"
+        );
+        assert!(
+            notice.contains("Fix:"),
+            "Fix: label must reach operator: {notice}"
+        );
     }
 }

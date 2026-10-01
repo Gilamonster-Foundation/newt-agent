@@ -65,10 +65,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 
 | id | invariant | residual | disabled while open |
 |---|---|---|---|
-| `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: Seatbelt cannot kernel-enforce net=none; confined fetch uses net=Scope::All; fs+exec still Seatbelt-kernel-enforced; follow-up: #2662) |
+| `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: Seatbelt cannot kernel-enforce net=none; confined fetch uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
-| `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability; exec-bound follow-up: #2661) |
+| `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
 | `windows-inheritable-handle-leak` | no ambient inherited OS object handles cross into an AppContainer child | 🟠 ACTIVE (Windows) | (a Windows confinement limitation on attacker-exec children — not a gated capability) |
 | `windows-shelltool-env-inheritance` | confined Windows `run_command` children start from an explicit env allow-list, not the Newt parent's ambient env | ✅ CLOSED (agent-bridle 0.8.0-rc.4) | — |
 | `windows-appcontainer-exec-allowlist` | a restricted exec grant (`exec = { only = [...] }`) is enforced on every platform | 🟡 FAIL-CLOSED (Windows) | allowlisted `newt-mcp-server` `shell_run` is refused on Windows |
