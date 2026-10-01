@@ -83,6 +83,13 @@
 #     Rust-source trigger is cheap but still a separate workflow, not a
 #     hook-shaped pre-flight)
 #
+# RETRIES: nextest runs with `--retries 2`. Several newt-core tests carry
+#   wall-clock budgets (driver pump, stream loops) that pass in well under a
+#   second alone but can exceed their budget when this hook's full parallel run
+#   shares a loaded dev box. A test that passes on retry is reported FLAKY in
+#   nextest's summary (visible, not hidden); one that fails every attempt still
+#   fails the hook. CI stays the authoritative full gate.
+#
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml -- see that
 # file's HOOK PARITY comment for the job-by-job mapping. Editing either one
 # triggers an audit of the other (CRAFT-14 rule 3, Push Hook Governance
@@ -331,7 +338,7 @@ if [ "$SCOPE" = "ALL" ]; then
     cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
     if [ "$_have_nextest" = 1 ]; then
         echo "[pre-push] running cargo nextest run --workspace..."
-        cargo nextest run -E "$NEXTEST_EXCLUDE" --features newt-data/kernel,newt-interaction/schema
+        cargo nextest run --retries 2 -E "$NEXTEST_EXCLUDE" --features newt-data/kernel,newt-interaction/schema
     else
         echo "[pre-push] cargo-nextest not found; falling back to cargo test --workspace"
         cargo test --workspace --features newt-data/kernel,newt-interaction/schema
@@ -367,7 +374,7 @@ else
 
     if [ "$_have_nextest" = 1 ]; then
         echo "[pre-push] running cargo nextest run -E '$_rdeps_expr'..."
-        cargo nextest run -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
+        cargo nextest run --retries 2 -E "($_rdeps_expr) and ($NEXTEST_EXCLUDE)"
     else
         echo "[pre-push] cargo-nextest not found; falling back to cargo test -p <crate> per crate"
         cargo test "${_pkg_args[@]}"
