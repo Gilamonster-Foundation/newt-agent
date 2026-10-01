@@ -10,7 +10,8 @@
 
 use std::path::Path;
 
-use assert_cmd::Command;
+mod common;
+
 use predicates::prelude::*;
 
 const SECRET: &str = "sk-boxcorp-XYZZY-secret";
@@ -105,15 +106,15 @@ fn tree_contains(dir: &Path, needle: &str) -> bool {
     false
 }
 
-fn newt() -> Command {
-    Command::cargo_bin("newt").unwrap()
+fn newt() -> common::Newt {
+    common::newt()
 }
 
 #[serial_test::serial(real_fs)]
 #[test]
 fn import_hermes_writes_presets_skips_honestly_and_never_stores_keys() {
-    let hermes = tempfile::tempdir().unwrap();
-    let config = tempfile::tempdir().unwrap();
+    let hermes = common::isolated_root();
+    let config = common::isolated_root();
     write_hermes_home(hermes.path());
 
     let assert = newt()
@@ -197,8 +198,8 @@ fn import_hermes_writes_presets_skips_honestly_and_never_stores_keys() {
 #[serial_test::serial(real_fs)]
 #[test]
 fn import_hermes_dry_run_writes_nothing() {
-    let hermes = tempfile::tempdir().unwrap();
-    let config = tempfile::tempdir().unwrap();
+    let hermes = common::isolated_root();
+    let config = common::isolated_root();
     write_hermes_home(hermes.path());
 
     newt()
@@ -222,7 +223,7 @@ fn import_hermes_dry_run_writes_nothing() {
 #[serial_test::serial(real_fs)]
 #[test]
 fn providers_list_smoke_contains_builtin_rows() {
-    let config = tempfile::tempdir().unwrap();
+    let config = common::isolated_root();
     newt()
         .env("NEWT_CONFIG_DIR", config.path())
         .args(["providers", "list"])

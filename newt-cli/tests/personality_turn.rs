@@ -161,7 +161,7 @@ scheduled = false
     .expect("isolated explicit config");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_newt"));
-    common::isolate_loopback_chat(&mut cmd, root.path());
+    common::isolate(&mut cmd, root.path());
     cmd.arg("--config-dir")
         .arg(&config_dir)
         .arg("--config")

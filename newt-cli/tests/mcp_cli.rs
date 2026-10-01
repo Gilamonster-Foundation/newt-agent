@@ -14,6 +14,8 @@
 
 use std::path::Path;
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -25,7 +27,7 @@ struct Sandbox {
 }
 
 fn sandbox() -> Sandbox {
-    let root = tempfile::tempdir().unwrap();
+    let root = common::isolated_root();
     let config_dir = root.path().join("cfg");
     let home = root.path().join("home");
     // The workspace MUST live UNDER the sandbox home (#1494). The project-config
@@ -48,15 +50,11 @@ fn sandbox() -> Sandbox {
     }
 }
 
-/// A `newt` invocation isolated from the developer's environment.
+/// A `newt` invocation under the hermetic setup, with the sandbox's own
+/// config dir and cwd on top.
 fn newt(sb: &Sandbox) -> Command {
-    let mut cmd = Command::cargo_bin("newt").unwrap();
+    let mut cmd = common::newt_at(&sb.home);
     cmd.env("NEWT_CONFIG_DIR", &sb.config_dir)
-        .env("HOME", &sb.home)
-        // `home_dir()` reads HOME then USERPROFILE; set both so home resolution is
-        // contained on Windows too, not just Unix (#1494).
-        .env("USERPROFILE", &sb.home)
-        .env_remove("NEWT_CONFIG")
         .current_dir(&sb.cwd);
     cmd
 }

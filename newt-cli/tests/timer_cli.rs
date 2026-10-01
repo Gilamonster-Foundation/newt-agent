@@ -17,7 +17,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use assert_cmd::Command;
+mod common;
+
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -84,9 +85,8 @@ bounded_reasoning_continuation = true
 /// nothing — `advance_repeat` would otherwise spin forever once the job is due.
 #[test]
 fn every_zero_is_rejected_cleanly() {
-    let fixture = tempfile::tempdir().expect("timer fixture");
-    Command::cargo_bin("newt")
-        .expect("newt binary")
+    let fixture = common::isolated_root();
+    common::newt()
         .args(["timer", "schedule", "5m", "watch the pipeline"])
         .arg("--every")
         .arg("0")
@@ -122,7 +122,7 @@ async fn fire_run_reaches_solve_entry_point() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("timer + headless fixture");
+    let fixture = common::isolated_root();
     let config_path = write_solve_config(fixture.path(), &server.uri());
 
     let prompt = "check PR #1747 CI is green";
@@ -136,9 +136,7 @@ async fn fire_run_reaches_solve_entry_point() {
     // X. Scheduling from the test process's cwd therefore pointed the headless at
     // this crate's own directory — the fixture isolation was incomplete, and
     // nothing noticed while the self-verify gate was dark (#1943).
-    Command::cargo_bin("newt")
-        .expect("newt binary")
-        .env_remove("NEWT_TEAM")
+    common::newt()
         .arg("--config")
         .arg(&config_path)
         .args(["timer", "schedule", "0s", prompt])
@@ -149,9 +147,7 @@ async fn fire_run_reaches_solve_entry_point() {
         .success();
 
     // Fire + run: the due prompt must drive a real headless against the mock.
-    Command::cargo_bin("newt")
-        .expect("newt binary")
-        .env_remove("NEWT_TEAM")
+    common::newt()
         .arg("--config")
         .arg(&config_path)
         .args(["timer", "fire", "--run"])
@@ -198,7 +194,7 @@ async fn fire_run_drains_all_due_timers() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("timer + headless fixture");
+    let fixture = common::isolated_root();
     let config_path = write_solve_config(fixture.path(), &server.uri());
 
     let prompts = ["check build A", "check build B", "check build C"];
@@ -206,9 +202,7 @@ async fn fire_run_drains_all_due_timers() {
         // `current_dir` on the SCHEDULE, per the note in
         // `fire_run_reaches_solve_entry_point`: the recorded workspace is what
         // the headless runs against.
-        Command::cargo_bin("newt")
-            .expect("newt binary")
-            .env_remove("NEWT_TEAM")
+        common::newt()
             .arg("--config")
             .arg(&config_path)
             .args(["timer", "schedule", "0s", p])
@@ -219,9 +213,7 @@ async fn fire_run_drains_all_due_timers() {
             .success();
     }
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
-        .env_remove("NEWT_TEAM")
+    common::newt()
         .arg("--config")
         .arg(&config_path)
         .args(["timer", "fire", "--run"])
@@ -297,7 +289,7 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
         .mount(&server)
         .await;
 
-    let fixture = tempfile::tempdir().expect("timer + headless fixture");
+    let fixture = common::isolated_root();
     let config_path = write_solve_config(fixture.path(), &server.uri());
     // This workspace ships the check the scheduled task explicitly requests.
     // An unchanged workspace alone no longer makes an unrelated task coding work.
@@ -307,9 +299,7 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
     )
     .expect("write a manifest the gate can detect");
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
-        .env_remove("NEWT_TEAM")
+    common::newt()
         .arg("--config")
         .arg(&config_path)
         .args([
@@ -324,9 +314,7 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
         .assert()
         .success();
 
-    Command::cargo_bin("newt")
-        .expect("newt binary")
-        .env_remove("NEWT_TEAM")
+    common::newt()
         .arg("--config")
         .arg(&config_path)
         .args(["timer", "fire", "--run"])

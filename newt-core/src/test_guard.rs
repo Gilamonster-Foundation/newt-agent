@@ -78,6 +78,8 @@ const ENV_KEYS: &[&str] = &[
     "NEWT_PROVIDER",
     "NEWT_DGX_MODEL",
     "NEWT_OPENAI_API",
+    // #2665: the bare-install fallback backend's endpoint.
+    "OLLAMA_HOST",
     // **Every env-backed `/settings` field.** The guard's own doc says it
     // snapshots "the relevant env", and these are the most relevant there is:
     // a test that flips a form field left the variable set for whatever ran

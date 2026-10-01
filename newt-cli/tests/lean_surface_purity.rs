@@ -23,13 +23,19 @@
 //!
 //! # Isolation
 //!
-//! Each case runs with its own `HOME` **and its own working directory**. The cwd
-//! matters: config resolution walks up from the cwd looking for
-//! `.newt/config.toml`, so a test run from the repo would silently pick up the
-//! developer's real backend and model. That is not hypothetical — it is how the
-//! output that motivated this file was first captured.
+//! Each case runs under the shared hermetic setup (`common::isolate`, #2665):
+//! its own `HOME` **and its own working directory**, a cleared environment,
+//! and a loopback inference peer named through `OLLAMA_HOST`. The cwd matters:
+//! config resolution walks up from the cwd looking for `.newt/config.toml`, so
+//! a test run from the repo would silently pick up the developer's real backend
+//! and model. That is not hypothetical — it is how the output that motivated
+//! this file was first captured. The peer matters too: this file's own
+//! `OLLAMA_HOST=http://127.0.0.1:1` was ignored by the chat path, and the
+//! startup probe went to the developer's live Ollama instead.
 
 #![cfg(unix)]
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -72,10 +78,13 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
+    // A real terminal type on a pipe: the configuration under which a surface
+    // that keyed on `TERM` rather than on the fd would leak. The hermetic
+    // environment carries no `TERM` of its own.
     Case {
-        name: "piped stdin, defaults",
+        name: "piped stdin, real TERM",
         args: &["--no-splash"],
-        env: &[],
+        env: &[("TERM", "xterm-256color")],
     },
     Case {
         name: "--plain",
@@ -209,29 +218,23 @@ fn the_forbidden_sequence_detector_actually_detects() {
 
 /// Run one case to EOF in full isolation and return its stdout.
 ///
-/// Isolation that matters:
-/// * a fresh `HOME` with a seeded empty config, so no first-run wizard;
-/// * a fresh **cwd**, so the `.newt/config.toml` walk-up cannot reach the repo's
-///   own config (which carries a real backend URL and model);
-/// * an unreachable backend on `127.0.0.1:1`, so startup probing fails fast and
-///   deterministically instead of contacting anything;
-/// * `NEWT_CONFIG`/`NEWT_CONFIG_DIR` cleared, so an operator's environment does
-///   not steer the run.
+/// Isolation that matters, on top of the shared setup:
+/// * a seeded empty config, so no first-run wizard — and so the run exercises
+///   the bare-install fallback backend, the configuration a developer's
+///   `~/.newt` would otherwise displace;
+/// * the fallback routed to the fixture's loopback peer through `OLLAMA_HOST`,
+///   so startup probing is answered deterministically instead of by whatever
+///   is listening on the developer's `127.0.0.1:11434`.
 async fn run_lean(bin: &Path, case: &Case) -> Vec<u8> {
-    let home = tempfile::tempdir().expect("tempdir for HOME");
-    std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
-    std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
-    let cwd = tempfile::tempdir().expect("tempdir for cwd");
+    let root = common::isolated_root();
+    std::fs::create_dir_all(root.path().join(".newt")).expect("mk .newt");
+    std::fs::write(root.path().join(".newt/config.toml"), "").expect("seed config");
+    let peer = common::inference_peer("llama3.1:8b").await;
 
     let mut cmd = Command::new(bin);
+    common::isolate(&mut cmd, root.path());
     cmd.args(case.args)
-        .current_dir(cwd.path())
-        .env("HOME", home.path())
-        .env("OLLAMA_HOST", "http://127.0.0.1:1")
-        .env_remove("NEWT_CONFIG")
-        .env_remove("NEWT_CONFIG_DIR")
-        .env_remove("NEWT_PROMPT")
-        .env_remove("NEWT_FOOTER")
+        .env("OLLAMA_HOST", peer.uri())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

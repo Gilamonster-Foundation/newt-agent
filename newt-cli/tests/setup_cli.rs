@@ -1,6 +1,7 @@
 //! Process-level coverage for `newt setup <host-or-url>`.
 
-use assert_cmd::Command;
+mod common;
+
 use predicates::prelude::*;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -32,10 +33,9 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
         .expect(1)
         .mount(&server)
         .await;
-    let config_dir = tempfile::tempdir().unwrap();
+    let config_dir = common::isolated_root();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("DGX_SETUP_TEST_TOKEN", "secret-value")
         .arg("--config-dir")
         .arg(config_dir.path())
@@ -71,8 +71,7 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
     assert_eq!(backend.api_key_env.as_deref(), Some("DGX_SETUP_TEST_TOKEN"));
     assert!(!text.contains("secret-value"));
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--config-dir")
         .arg(config_dir.path())
         .arg("config")
@@ -87,10 +86,9 @@ async fn setup_url_probes_with_token_reference_and_writes_backend_dropin() {
 #[tokio::test]
 async fn setup_url_failure_writes_nothing() {
     let server = MockServer::start().await;
-    let config_dir = tempfile::tempdir().unwrap();
+    let config_dir = common::isolated_root();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("NEWT_CONFIG", "")
         .arg("--config-dir")
         .arg(config_dir.path())
@@ -105,11 +103,10 @@ async fn setup_url_failure_writes_nothing() {
 
 #[test]
 fn setup_target_rejects_explicit_config_before_writing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     let config_path = dir.path().join("custom.toml");
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--config")
         .arg(&config_path)
         .args(["setup", "127.0.0.1:9", "--yes"])
@@ -123,12 +120,11 @@ fn setup_target_rejects_explicit_config_before_writing() {
 
 #[test]
 fn setup_target_rejects_newt_config_before_writing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::isolated_root();
     let explicit_config = dir.path().join("explicit.toml");
     let config_dir = dir.path().join("managed");
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("NEWT_CONFIG", &explicit_config)
         .arg("--config-dir")
         .arg(&config_dir)
@@ -145,10 +141,9 @@ fn setup_target_rejects_newt_config_before_writing() {
 
 #[test]
 fn setup_target_requires_yes_when_stdin_is_not_a_terminal() {
-    let config_dir = tempfile::tempdir().unwrap();
+    let config_dir = common::isolated_root();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--config-dir")
         .arg(config_dir.path())
         .args(["setup", "127.0.0.1:9"])
@@ -188,13 +183,12 @@ async fn setup_v1_url_requires_generation_and_persists_canonical_token_reference
         .expect(1)
         .mount(&server)
         .await;
-    let root = tempfile::tempdir().unwrap();
+    let root = common::isolated_root();
     let token_path = root.path().join("dgx.token");
     std::fs::write(&token_path, "secret-value\n").unwrap();
 
     let target = format!("{}/v1/", server.uri());
-    let assertion = Command::cargo_bin("newt")
-        .unwrap()
+    let assertion = common::newt()
         .current_dir(root.path())
         .args([
             "--config-dir",
@@ -260,14 +254,13 @@ async fn setup_public_models_but_unauthorized_generation_writes_nothing() {
         .mount(&server)
         .await;
 
-    let root = tempfile::tempdir().unwrap();
+    let root = common::isolated_root();
     let token_path = root.path().join("token");
     std::fs::write(&token_path, "rejected-secret\n").unwrap();
     let config_dir = root.path().join("config");
     let target = format!("{}/v1/", server.uri());
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--config-dir")
         .arg(&config_dir)
         .args(["setup", &target, "--token-file"])
@@ -317,7 +310,7 @@ async fn setup_bare_host_without_token_discovers_every_live_configured_port() {
         })))
         .mount(&second)
         .await;
-    let config_dir = tempfile::tempdir().unwrap();
+    let config_dir = common::isolated_root();
     std::fs::write(
         config_dir.path().join("config.toml"),
         format!(
@@ -328,8 +321,7 @@ async fn setup_bare_host_without_token_discovers_every_live_configured_port() {
     )
     .unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--config-dir")
         .arg(config_dir.path())
         .args(["setup", "127.0.0.1", "--yes"])
@@ -343,8 +335,7 @@ async fn setup_bare_host_without_token_discovers_every_live_configured_port() {
             .count(),
         2
     );
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--config-dir")
         .arg(config_dir.path())
         .arg("config")
@@ -356,8 +347,7 @@ async fn setup_bare_host_without_token_discovers_every_live_configured_port() {
 
 #[test]
 fn setup_help_explains_host_expansion_and_authenticated_target_scope() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["setup", "--help"])
         .assert()
         .success()

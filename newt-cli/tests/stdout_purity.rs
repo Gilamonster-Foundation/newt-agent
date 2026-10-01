@@ -53,16 +53,15 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
     // error rather than on any impurity. Its sibling `mouse_*` driver below
     // was already pinning HOME; this one never was.
     let root = common::isolated_root();
+    let peer = common::inference_peer("llama3.1:8b").await;
     let mut cmd = Command::new(bin);
     common::isolate(&mut cmd, root.path());
     cmd.args(args)
-        // OLLAMA_HOST is set to an unreachable address. With the
-        // verbatim contract, discover() doesn't probe — so the
-        // worker starts cleanly. `initialize` doesn't touch Ollama,
-        // so we get a clean response. (If the test sent a `prompt`
-        // we'd see an Ollama error on stderr; that's fine — we only
-        // assert stdout purity.)
-        .env("OLLAMA_HOST", "http://127.0.0.1:1")
+        // The worker's `discover()` takes OLLAMA_HOST verbatim, so it
+        // starts against the fixture's loopback peer without probing;
+        // `initialize` never touches it. (A `prompt` would reach the
+        // peer and get a 404; we only assert stdout purity.)
+        .env("OLLAMA_HOST", peer.uri())
         // Crank up tracing on purpose — we want to PROVE that tracing
         // output stays on stderr even when the dep tree is chatty.
         .env("RUST_LOG", "debug")
@@ -192,9 +191,12 @@ async fn chat_emits_no_mouse_capture_sequences_when_piped() {
 /// empty config skips first-run setup so the run is fast and deterministic.
 async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
     // Isolate config from the real `~/.newt`; seed it so no first-run wizard.
-    let home = tempfile::tempdir().expect("tempdir");
+    let home = common::isolated_root();
     std::fs::create_dir_all(home.path().join(".newt")).expect("mk .newt");
     std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
+    // The fallback backend's startup probe goes to the fixture's peer (#2665),
+    // not to whatever answers on the developer's 127.0.0.1:11434.
+    let peer = common::inference_peer("llama3.1:8b").await;
 
     let mut cmd = Command::new(bin);
     // Same policy as the driver above (#1852). This helper was already the
@@ -203,7 +205,7 @@ async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
     // lets the project walk climb into the real home.
     common::isolate(&mut cmd, home.path());
     cmd.arg("--no-splash")
-        .env("OLLAMA_HOST", "http://127.0.0.1:1")
+        .env("OLLAMA_HOST", peer.uri())
         // Force the mouse opt-in ON: the TTY gate must STILL refuse.
         .env("NEWT_MOUSE", "1")
         .env("TERM", term)

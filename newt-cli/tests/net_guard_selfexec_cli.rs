@@ -16,7 +16,7 @@
 //! `newt-core::confined_exec` against a real released-shape invocation.
 #![cfg(target_os = "linux")]
 
-use assert_cmd::Command;
+mod common;
 
 /// `newt __net-guard --probe-egress` installs `no_new_privs` + the seccomp
 /// socket()-family deny on the spawned `newt` process, then self-tests that
@@ -25,8 +25,7 @@ use assert_cmd::Command;
 /// installs the floor is the packaging guarantee: the guard rides in `newt`.
 #[test]
 fn newt_binary_carries_the_net_guard_and_the_floor_holds() {
-    let assert = Command::cargo_bin("newt")
-        .unwrap()
+    let assert = common::newt()
         .args(["__net-guard", "--probe-egress"])
         .assert();
     // Exit 0 = every off-box family denied with EACCES, AF_UNIX allowed. A
@@ -41,8 +40,7 @@ fn newt_binary_carries_the_net_guard_and_the_floor_holds() {
 /// usage error; crucially it is NOT 0 (which would mean it ran a program).
 #[test]
 fn net_guard_rejects_a_malformed_invocation() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["__net-guard", "not-a-flag"])
         .assert()
         .failure()
