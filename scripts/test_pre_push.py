@@ -48,6 +48,15 @@ NEXTEST_CI_ONLY = [
     "newt-agent::personality_turn",
     "newt-agent::migration_notices",
     "newt-agent::terminal_exit_pty",
+    "newt-eval::mock_e2e",
+]
+# Same tier, but these two live as individual tests inside newt-tui's lib
+# unit-test binary (not a standalone binary_id) alongside ~1,360 fast tests,
+# so the hook excludes them by exact test() match scoped to that binary_id
+# instead of excluding the whole binary.
+NEXTEST_TEST_CI_ONLY = [
+    "mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal",
+    "a_permission_prompt_is_visible_and_survives_a_live_spinner",
 ]
 # Generated synthetic addresses exercise the guard without embedding a host.
 PRIVATE_FIXTURE = str(ipaddress.IPv4Network("10.0.0.0/8")[7])
@@ -311,6 +320,11 @@ class PrePushTests(unittest.TestCase):
         self.assertIn("rdeps(crate-a)", nextest)
         for binary in NEXTEST_CI_ONLY:
             self.assertIn(f"not binary_id({binary})", nextest)
+        for test_name in NEXTEST_TEST_CI_ONLY:
+            self.assertIn(
+                f"not (binary_id(newt-tui) and test(=prompt_visibility_test::{test_name}))",
+                nextest,
+            )
 
     def test_no_nextest_fallback_gates_every_transitive_reverse_dependent(self):
         base = self.cargo_chain()
@@ -341,6 +355,11 @@ class PrePushTests(unittest.TestCase):
         nextest = self.gate_argv("nextest")
         for binary in NEXTEST_CI_ONLY:
             self.assertIn(f"not binary_id({binary})", nextest)
+        for test_name in NEXTEST_TEST_CI_ONLY:
+            self.assertIn(
+                f"not (binary_id(newt-tui) and test(=prompt_visibility_test::{test_name}))",
+                nextest,
+            )
 
 
 if __name__ == "__main__":
