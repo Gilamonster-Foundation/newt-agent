@@ -2625,6 +2625,99 @@ mod governed_push_tests {
         assert!(seen.requests.is_empty(), "{seen:?}");
     }
 
+    /// Review r8 P1, the check-to-use window: the read root is swapped for a
+    /// different real directory AFTER `verify_identities` passes and BEFORE
+    /// the fence is built (the seam is a callback, not timing). The fence
+    /// anchors on the HELD descriptor, so the swapped-in repository at the
+    /// old pathname is outside it: the copy refuses and staging never
+    /// receives the object. Positive control first: an unchanged root is
+    /// copied through the same descriptor-anchored rule.
+    ///
+    /// Measured red (mutation): with the held descriptors not handed to the
+    /// fence — `held_read_roots()` replaced by an empty set, i.e. the
+    /// path-built fence of d1e5a49b — the swapped-in repository IS copied:
+    /// the swap wins.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_root_swapped_after_verification_is_outside_the_fd_bound_fence() {
+        use crate::git_staging::{self as staging, HeldRoots, StagingRepo};
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let root = tempdir();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let oid = commit(&repo, "f.txt", "one\n");
+        let caveats = read_only(&[&repo]);
+        let tools = staging::TrustedTools::authenticate(
+            staging::TrustContext::bind(&caveats.fs_write).unwrap(),
+        )
+        .unwrap();
+        let state = tempdir();
+        // One confined copy of `oid` from `repo/.git` into a fresh staging
+        // repo, with `seam` run after the identity check: (outcome, whether
+        // staging holds the object afterwards).
+        let copy = |seam: Box<dyn FnOnce() + '_>| {
+            let held = HeldRoots::bind(&caveats.fs_read).unwrap();
+            let st = StagingRepo::create(&state.path().join("state"), tools.ctx()).unwrap();
+            let outcome = staging::confined_fetch_with(
+                &tools,
+                &st,
+                &repo.join(".git"),
+                &oid,
+                &caveats,
+                &held,
+                seam,
+            );
+            let copied = tools
+                .git(["-C", &st.path().to_string_lossy(), "cat-file", "-e", &oid])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            (outcome, copied)
+        };
+
+        let (ok, copied) = copy(Box::new(|| {}));
+        assert!(
+            ok.is_ok(),
+            "positive control: an unchanged root copies: {ok:?}"
+        );
+        assert!(
+            copied,
+            "positive control: staging holds the approved commit"
+        );
+
+        let aside = root.path().join("repo.aside");
+        let (refused, copied) = copy(Box::new(|| {
+            // The swap: the held directory goes aside and an identical
+            // repository — a clone, the same objects under a different
+            // directory — takes its pathname, which is what the fetch names.
+            std::fs::rename(&repo, &aside).unwrap();
+            git(
+                root.path(),
+                &[
+                    "clone",
+                    "-q",
+                    &aside.to_string_lossy(),
+                    &repo.to_string_lossy(),
+                ],
+            );
+        }));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("confined copy")),
+            "the swapped-in repository must be outside the fence: {refused:?}"
+        );
+        assert!(
+            !copied,
+            "staging must not receive the object from the swapped-in repository"
+        );
+    }
+
     /// F6 canary, push side: the credential helper (the gh form, a fake gh)
     /// prints an unregistered secret on stderr while authenticating a real
     /// push. The endpoint seeing credentials proves the helper ran; the
