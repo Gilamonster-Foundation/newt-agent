@@ -49,6 +49,38 @@ impl ExecBoundary {
     }
 }
 
+/// Whether a spawn's stdin/stdout/stderr are the shape ADR 0015 amendment E6's
+/// Seatbelt Mach-lookup deputy audit assumed: a pipe this process created, or
+/// `/dev/null` — never a connected endpoint, because Seatbelt's socket rules
+/// gate new syscalls, not a descriptor the child already holds (agent-bridle#416
+/// round-2 review, item 1: the ADR claimed the spawn mechanism "supplies only
+/// pipe/null stdio", but the builder defaulted to inherited stdio and accepted
+/// an arbitrary [`std::process::Stdio`]).
+///
+/// The conservative default is [`Self::Unaudited`]: a mechanism built without
+/// an explicit posture — every [`ConfinementMechanism::new`]/[`backend`](ConfinementMechanism::backend)
+/// call, and the bare [`SandboxKind`] conversion — never over-claims.
+/// [`crate::spawn::ConfinedCommand::spawn`] is the only production caller that
+/// can honestly assert [`Self::Audited`], because it is the only code with
+/// per-channel knowledge of what it actually configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdioPosture {
+    /// At least one of stdin/stdout/stderr is inherited, a redirected file, or
+    /// some other descriptor this builder cannot vouch for.
+    #[default]
+    Unaudited,
+    /// Every one of stdin/stdout/stderr is a pipe this process created or
+    /// `/dev/null` — the shape the audit covers.
+    Audited,
+}
+
+impl StdioPosture {
+    fn is_unaudited(&self) -> bool {
+        matches!(self, Self::Unaudited)
+    }
+}
+
 /// The confinement **mechanism** actually governing a spawn: the selected OS
 /// backend PLUS the mechanism configuration that changes what a given backend can
 /// truthfully enforce. These include the explicit [`ExecBoundary`] proof domain
@@ -68,6 +100,10 @@ pub struct ConfinementMechanism {
     // Omission preserves the existing default canonical body and fence CID.
     #[serde(default, skip_serializing_if = "ExecBoundary::is_process_tree")]
     exec_boundary: ExecBoundary,
+    // Omission preserves the existing default canonical body and fence CID —
+    // the common case stays `Unaudited` (agent-bridle#416 round 2, item 1).
+    #[serde(default, skip_serializing_if = "StdioPosture::is_unaudited")]
+    stdio: StdioPosture,
 }
 
 impl ConfinementMechanism {
@@ -78,6 +114,7 @@ impl ConfinementMechanism {
             kind,
             child_network,
             exec_boundary: ExecBoundary::ProcessTree,
+            stdio: StdioPosture::Unaudited,
         }
     }
 
@@ -88,6 +125,7 @@ impl ConfinementMechanism {
             kind,
             child_network,
             exec_boundary: ExecBoundary::NamedRoot,
+            stdio: StdioPosture::Unaudited,
         }
     }
 
@@ -95,6 +133,23 @@ impl ConfinementMechanism {
     #[must_use]
     pub fn exec_boundary(&self) -> ExecBoundary {
         self.exec_boundary
+    }
+
+    /// Declare that every one of this spawn's stdin/stdout/stderr is a pipe or
+    /// `/dev/null` — the shape ADR 0015 amendment E6's Seatbelt audit covers
+    /// (agent-bridle#416 round 2, item 1). Only a caller with actual,
+    /// per-channel knowledge of what it configured may assert this;
+    /// [`crate::spawn::ConfinedCommand::spawn`] is the only production caller.
+    #[must_use]
+    pub fn with_stdio_posture(mut self, posture: StdioPosture) -> Self {
+        self.stdio = posture;
+        self
+    }
+
+    /// This mechanism's declared stdio posture (see [`Self::with_stdio_posture`]).
+    #[must_use]
+    pub fn stdio_posture(&self) -> StdioPosture {
+        self.stdio
     }
 
     /// A backend with the **conservative** (weakest) child-network mechanism
@@ -255,6 +310,7 @@ pub fn enforcement_report(
         kind: active,
         child_network,
         exec_boundary,
+        stdio,
     } = mechanism.into();
     // Filesystem axes: kernel when an OS sandbox actually governs them, else the
     // in-process interceptor. Exhaustive over `SandboxKind` so a new backend
@@ -353,11 +409,45 @@ pub fn enforcement_report(
             {
                 AxisEnforcement::Kernel
             }
+            // Seatbelt deny-all (`net: none`, zero `mach:` grants): agent-bridle#405
+            // closes the direct-socket path AND the zero Mach-lookup floor (#406),
+            // and the amendment-E6 native evidence (AF_UNIX, `open(1)`/
+            // LaunchServices, Darwin notifications, pasteboard, unnamed mach
+            // lookups — ADR 0015 E6) closes every OTHER ambient IPC route this
+            // audit could reach. `net_fully_denied` alone already implies zero
+            // `mach:`/`unix:` grants (they are entries in the same non-empty
+            // scope set), and `seatbelt_mach_deputy_audit_complete` gates this on
+            // the SAME audit state `seatbelt_net_projection` (sandbox.rs) uses for
+            // the L3 scope bound — flipping `MACH_DEPUTY_AUDIT` promotes both
+            // together, never one without the other. A `mach:` grant, a loopback
+            // shape, or a remote-host allowlist all stay Advisory below: this
+            // audit proved only the deny-all, zero-grant shape.
+            // The deny-all, zero-grant shape additionally requires the launch
+            // shape and spawning privilege the audit actually measured
+            // (agent-bridle#416 round-2 review, items 1/2): every one of
+            // stdin/stdout/stderr must be a pipe or `/dev/null` (never an
+            // inherited or otherwise opaque descriptor that could already be a
+            // connected endpoint Seatbelt's socket rules never see), and the
+            // spawning process must not be root (the probes all ran
+            // unprivileged, so a root-owned bridle can reach kernel controls
+            // they never exercised).
+            SandboxKind::Seatbelt
+                if crate::sandbox::seatbelt_net_kernel_witness(
+                    effective,
+                    crate::sandbox::seatbelt_mach_deputy_audit_complete(),
+                    stdio == StdioPosture::Audited,
+                    crate::sandbox::seatbelt_caller_is_unprivileged(),
+                ) =>
+            {
+                AxisEnforcement::Kernel
+            }
             // Seatbelt has useful direct-socket SBPL rules for deny-all and
-            // loopback, but no faithful bound for every ambient Mach/XPC deputy;
-            // every restricted shape therefore stays Advisory and is refused by a
-            // Kernel net floor. The minimal-rootfs jail does not namespace the
-            // network this tier either, so it is advisory too (ADR 0013 D5).
+            // loopback, but no faithful bound for every ambient Mach/XPC deputy
+            // while the audit above is incomplete (or for any shape the audit
+            // didn't cover); every other restricted shape stays Advisory and is
+            // refused by a Kernel net floor. The minimal-rootfs jail does not
+            // namespace the network this tier either, so it is advisory too
+            // (ADR 0013 D5).
             SandboxKind::Landlock
             | SandboxKind::Seatbelt
             | SandboxKind::MinimalRootfs
@@ -831,7 +921,26 @@ mod tests {
         use AxisEnforcement::{Advisory, Kernel};
         use ChildNetworkPolicy::{DenyDirect, LandlockOnly};
         let sb = ConfinementMechanism::backend(SandboxKind::Seatbelt);
+        // agent-bridle#416 round-2 review, item 1: only a mechanism that
+        // explicitly asserts the audited pipe/null-only stdio shape is
+        // eligible for the Kernel net witness. `sb` (the bare conversion,
+        // `StdioPosture::Unaudited` by default) never is.
+        let sb_audited = sb.with_stdio_posture(StdioPosture::Audited);
         let noop = ConfinementMechanism::backend(SandboxKind::None);
+        // agent-bridle#405 / ADR 0015 amendment E6: the deny-all, zero-grant
+        // Seatbelt shape is now a complete witness (Kernel) wherever the
+        // deputy audit is Complete (macOS), the caller is unprivileged, AND
+        // the spawn's stdio is audited (agent-bridle#416 round 2) — Advisory
+        // everywhere else, since the audit only exists where Seatbelt does.
+        // Single source of truth, not a re-derived `cfg`, so this can never
+        // drift from production.
+        let seatbelt_net_none = if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
+            Kernel
+        } else {
+            Advisory
+        };
 
         let cases: &[(&str, Caveats, ConfinementMechanism, AxisEnforcement)] = &[
             (
@@ -841,20 +950,36 @@ mod tests {
                 Advisory,
             ),
             ("deny-direct + net:none", none(), ll(DenyDirect), Kernel),
-            ("seatbelt + net:none", none(), sb, Advisory),
+            (
+                "seatbelt + net:none, audited stdio",
+                none(),
+                sb_audited,
+                seatbelt_net_none,
+            ),
+            (
+                "seatbelt + net:none, unaudited stdio stays advisory",
+                none(),
+                sb,
+                Advisory,
+            ),
             (
                 "seatbelt + loopback full interface",
                 loopback_full(),
-                sb,
+                sb_audited,
                 Advisory,
             ),
             (
                 "seatbelt + loopback single addr (widens)",
                 loopback_v4_only(),
-                sb,
+                sb_audited,
                 Advisory,
             ),
-            ("seatbelt + remote allowlist", remote(), sb, Advisory),
+            (
+                "seatbelt + remote allowlist",
+                remote(),
+                sb_audited,
+                Advisory,
+            ),
             ("noop + net:none", none(), noop, Advisory),
             ("noop + remote allowlist", remote(), noop, Advisory),
         ];
@@ -878,6 +1003,148 @@ mod tests {
         assert_eq!(r.fs_write, Some(AxisEnforcement::Kernel));
         assert_eq!(r.exec, Some(AxisEnforcement::Kernel));
         assert_eq!(r.net, Some(AxisEnforcement::Advisory));
+    }
+
+    /// agent-bridle#405 / ADR 0015 amendment E6: a `net: none`, zero-`mach:`-
+    /// grant Seatbelt scope with audited stdio reports `Kernel` on this
+    /// SHIPPING build under an unprivileged test runner — `MACH_DEPUTY_AUDIT`
+    /// is `Complete` (the full channel sweep closed, AppleEvents included), so
+    /// `seatbelt_net_kernel_witness` fires for exactly this deny-all,
+    /// zero-grant shape. This is the end-to-end proof the mechanism's pure
+    /// unit test (below) promised: the real production constant, not a
+    /// parameterized stand-in. macOS-only: `seatbelt_mach_deputy_audit_complete`
+    /// is unconditionally `false` off macOS (the audit only exists where
+    /// Seatbelt does), so this assertion is platform-specific by
+    /// construction, not an oversight. The bare `SandboxKind::Seatbelt`
+    /// conversion (`StdioPosture::Unaudited`) must NOT reach Kernel
+    /// (agent-bridle#416 round-2 review, item 1).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_net_none_reports_kernel_now_the_audit_is_complete() {
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert!(crate::sandbox::seatbelt_mach_deputy_audit_complete());
+        assert!(
+            crate::sandbox::seatbelt_caller_is_unprivileged(),
+            "this suite is expected to run unprivileged; a root CI runner needs a different fixture",
+        );
+        let mechanism = ConfinementMechanism::backend(SandboxKind::Seatbelt)
+            .with_stdio_posture(StdioPosture::Audited);
+        assert_eq!(
+            enforcement_report(&none, mechanism).net,
+            Some(AxisEnforcement::Kernel),
+        );
+        assert_eq!(
+            enforcement_report(&none, SandboxKind::Seatbelt).net,
+            Some(AxisEnforcement::Advisory),
+            "the bare conversion is Unaudited by default and must not claim Kernel",
+        );
+    }
+
+    /// A `mach:` grant, a loopback scope, and a general remote-host allowlist
+    /// are unaffected by the flip above — they stay `Advisory`, same as
+    /// before, because `seatbelt_net_kernel_witness` only ever fires for the
+    /// deny-all, zero-grant shape this audit covered.
+    #[test]
+    fn seatbelt_net_grant_loopback_and_remote_host_stay_advisory() {
+        for net in [
+            Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+            Scope::only(["127.0.0.1".to_string()]),
+            Scope::only(["example.com".to_string()]),
+        ] {
+            let cav = Caveats {
+                net: net.clone(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                enforcement_report(&cav, SandboxKind::Seatbelt).net,
+                Some(AxisEnforcement::Advisory),
+                "{net:?} must stay Advisory"
+            );
+        }
+    }
+
+    /// The pure post-audit witness (agent-bridle#405 / ADR 0015 E6), pinned
+    /// directly against `audit_complete` rather than the production const — this
+    /// is the RED-FIRST proof that the Kernel arm's logic is correct, so it can
+    /// be trusted the moment `MACH_DEPUTY_AUDIT` is flipped (a later, separate
+    /// commit) without re-deriving the match arm. A `mach:` grant, a loopback
+    /// shape, and a remote-host allowlist all stay `false` even with a complete
+    /// audit — this lane's evidence covers ONLY the deny-all, zero-grant shape.
+    #[test]
+    fn seatbelt_net_kernel_witness_is_deny_all_zero_grant_and_audit_complete() {
+        use crate::sandbox::seatbelt_net_kernel_witness;
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let mach_grant = Caveats {
+            net: Scope::only(["mach:com.apple.system.opendirectoryd.libinfo".to_string()]),
+            ..Caveats::top()
+        };
+        let loopback = Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        let remote = Caveats {
+            net: Scope::only(["example.com".to_string()]),
+            ..Caveats::top()
+        };
+
+        assert!(seatbelt_net_kernel_witness(&none, true, true, true));
+        assert!(
+            !seatbelt_net_kernel_witness(&none, false, true, true),
+            "deny-all with an incomplete audit must not witness Kernel",
+        );
+        assert!(
+            !seatbelt_net_kernel_witness(&mach_grant, true, true, true),
+            "a named mach: grant is not deny-all and must stay short of Kernel",
+        );
+        assert!(!seatbelt_net_kernel_witness(&loopback, true, true, true));
+        assert!(!seatbelt_net_kernel_witness(&remote, true, true, true));
+    }
+
+    /// agent-bridle#416 round-2 review, item 1: the ADR claimed the spawn
+    /// mechanism "supplies only pipe/null stdio", but nothing enforced that
+    /// shape. The witness must refuse Kernel the moment stdio is NOT in the
+    /// audited shape, even with a complete audit and an unprivileged caller —
+    /// an inherited or otherwise opaque descriptor could already be a
+    /// connected endpoint Seatbelt's socket rules never see.
+    #[test]
+    fn seatbelt_net_kernel_witness_requires_audited_stdio() {
+        use crate::sandbox::seatbelt_net_kernel_witness;
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert!(
+            !seatbelt_net_kernel_witness(&none, true, false, true),
+            "unaudited stdio (inherited, or an arbitrary descriptor) must not witness Kernel \
+             even with a complete audit and an unprivileged caller",
+        );
+        assert!(seatbelt_net_kernel_witness(&none, true, true, true));
+    }
+
+    /// agent-bridle#416 round-2 review, item 2: the ADR's probes all ran
+    /// unprivileged. A root-owned spawning process must not inherit the
+    /// witness even with a complete audit and audited stdio — a root process
+    /// can reach kernel controls (privileged IOKit classes, sysctl writes,
+    /// privileged Mach services) the probes never exercised.
+    #[test]
+    fn seatbelt_net_kernel_witness_requires_unprivileged_caller() {
+        use crate::sandbox::seatbelt_net_kernel_witness;
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert!(
+            !seatbelt_net_kernel_witness(&none, true, true, false),
+            "a root-owned caller must not witness Kernel even with a complete audit \
+             and audited stdio",
+        );
+        assert!(seatbelt_net_kernel_witness(&none, true, true, true));
     }
 
     /// The macOS exec-axis honesty distinction from Landlock: a restricted `exec`
@@ -1040,10 +1307,14 @@ mod tests {
     }
 
     /// Seatbelt's direct SBPL socket rules remain scope-shaped, but none is a
-    /// complete authority witness while ambient Mach/XPC deputies are unbounded.
-    /// Every restricted net shape is therefore Advisory.
+    /// complete authority witness while ambient Mach/XPC deputies are
+    /// unbounded — EXCEPT the deny-all, zero-grant shape (`net:none`, no
+    /// `mach:` grants), which agent-bridle#405/ADR 0015 amendment E6 now
+    /// proves deputy-complete and is covered by its own, separate test
+    /// (`seatbelt_deny_all_net_is_a_complete_witness`, below). Every scope
+    /// this audit did NOT cover — loopback, remote, mixed — stays Advisory.
     #[test]
-    fn seatbelt_net_is_advisory_for_every_restricted_scope() {
+    fn seatbelt_net_is_advisory_for_every_restricted_scope_the_audit_does_not_cover() {
         let net_report = |net| {
             enforcement_report(
                 &Caveats {
@@ -1056,7 +1327,6 @@ mod tests {
         };
 
         for (label, scope) in [
-            ("deny-all", Scope::none()),
             ("loopback token", Scope::only(["localhost".to_string()])),
             (
                 "both loopback addresses",
@@ -1080,13 +1350,14 @@ mod tests {
         }
     }
 
-    /// Under CONFINED (`net: Kernel`), every restricted Seatbelt net scope is
-    /// refused before spawn because every such report is Advisory. Direct socket
-    /// denial is not enough to discharge the ambient-deputy authority obligation.
+    /// Under CONFINED (`net: Kernel`), every Seatbelt net scope this audit does
+    /// NOT cover is refused before spawn because every such report is Advisory.
+    /// Direct socket denial alone is not enough to discharge the ambient-deputy
+    /// authority obligation. The one shape the audit DOES cover (deny-all, zero
+    /// grants) now admits instead — see `seatbelt_deny_all_net_is_a_complete_witness`.
     #[test]
     fn restricted_seatbelt_net_cannot_be_admitted_under_confined() {
         for (label, net) in [
-            ("deny-all", Scope::none()),
             ("full loopback", Scope::only(["localhost".to_string()])),
             ("single loopback", Scope::only(["127.0.0.1".to_string()])),
             ("remote", Scope::only(["example.com".to_string()])),
@@ -1473,22 +1744,39 @@ mod tests {
         );
     }
 
-    /// A Seatbelt deny-all socket rule is not a complete network witness while
-    /// ambient deputies remain unbounded: report Advisory and refuse CONFINED.
+    /// agent-bridle#405 / ADR 0015 amendment E6: a Seatbelt deny-all, zero-
+    /// `mach:`-grant socket rule IS now a complete network witness, wherever
+    /// the deputy audit is `Complete` (macOS), the spawn declares audited
+    /// stdio, and the caller is unprivileged (agent-bridle#416 round 2) —
+    /// report Kernel and admit CONFINED. Elsewhere, the old behavior is
+    /// unchanged: Advisory, refused. Checked against the real
+    /// `seatbelt_mach_deputy_audit_complete()`, not a re-derived `cfg`.
     #[test]
-    fn seatbelt_deny_all_net_is_advisory_and_refused() {
+    fn seatbelt_deny_all_net_is_a_complete_witness_where_the_audit_is_complete() {
+        let expected = if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
+            AxisEnforcement::Kernel
+        } else {
+            AxisEnforcement::Advisory
+        };
+        let mechanism = ConfinementMechanism::backend(SandboxKind::Seatbelt)
+            .with_stdio_posture(StdioPosture::Audited);
+        assert_eq!(
+            enforcement_report(&only_net_deny_all(), mechanism).net,
+            Some(expected),
+        );
+        let unmet = unenforceable_axis(&only_net_deny_all(), mechanism, EnforcementFloor::CONFINED);
+        assert_eq!(
+            unmet.is_none(),
+            expected == AxisEnforcement::Kernel,
+            "Seatbelt deny-all must admit under CONFINED iff its witness is Kernel"
+        );
+        // The bare, Unaudited-by-default conversion must NOT claim Kernel even
+        // when the audit is complete (agent-bridle#416 round-2 review, item 1).
         assert_eq!(
             enforcement_report(&only_net_deny_all(), SandboxKind::Seatbelt).net,
             Some(AxisEnforcement::Advisory),
-        );
-        assert!(
-            unenforceable_axis(
-                &only_net_deny_all(),
-                SandboxKind::Seatbelt,
-                EnforcementFloor::CONFINED
-            )
-            .is_some(),
-            "Seatbelt restricted net cannot satisfy the CONFINED Kernel floor"
         );
     }
 
@@ -1514,48 +1802,60 @@ mod tests {
             AxisEnforcement::Interceptor,
             AxisEnforcement::Kernel,
         ];
-        // (caveats, kind, axis, actual enforcement produced by enforcement_report)
-        let cases: &[(Caveats, SandboxKind, ConfinedAxis, AxisEnforcement)] = &[
+        // agent-bridle#405 / ADR 0015 amendment E6: Seatbelt deny-all, zero
+        // grants is Kernel wherever the deputy audit is Complete (macOS), the
+        // spawn declares audited stdio, and the caller is unprivileged
+        // (agent-bridle#416 round 2) — Advisory elsewhere.
+        let seatbelt_net_none_actual = if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
+            AxisEnforcement::Kernel
+        } else {
+            AxisEnforcement::Advisory
+        };
+        // (caveats, mechanism, axis, actual enforcement produced by enforcement_report)
+        let cases: &[(Caveats, ConfinementMechanism, ConfinedAxis, AxisEnforcement)] = &[
             (
                 only_fs_write(),
-                SandboxKind::None,
+                SandboxKind::None.into(),
                 ConfinedAxis::FsWrite,
                 AxisEnforcement::Interceptor,
             ),
             (
                 only_fs_write(),
-                SandboxKind::Landlock,
+                SandboxKind::Landlock.into(),
                 ConfinedAxis::FsWrite,
                 AxisEnforcement::Kernel,
             ),
             (
                 only_net_host(),
-                SandboxKind::None,
+                SandboxKind::None.into(),
                 ConfinedAxis::Net,
                 AxisEnforcement::Advisory,
             ),
             (
                 only_net_deny_all(),
-                SandboxKind::Seatbelt,
+                ConfinementMechanism::backend(SandboxKind::Seatbelt)
+                    .with_stdio_posture(StdioPosture::Audited),
                 ConfinedAxis::Net,
-                AxisEnforcement::Advisory,
+                seatbelt_net_none_actual,
             ),
             (
                 only_exec(),
-                SandboxKind::None,
+                SandboxKind::None.into(),
                 ConfinedAxis::Exec,
                 AxisEnforcement::Interceptor,
             ),
             (
                 only_exec(),
-                SandboxKind::Seatbelt,
+                SandboxKind::Seatbelt.into(),
                 ConfinedAxis::Exec,
                 AxisEnforcement::Kernel,
             ),
         ];
-        for (caveats, kind, axis, actual) in cases {
+        for (caveats, mechanism, axis, actual) in cases {
             // Sanity: the actual enforcement really is what we claim.
-            let report = enforcement_report(caveats, *kind);
+            let report = enforcement_report(caveats, *mechanism);
             let reported = report
                 .fs_read
                 .or(report.fs_write)
@@ -1564,10 +1864,10 @@ mod tests {
             assert_eq!(
                 reported,
                 Some(*actual),
-                "actual mismatch for {axis:?} under {kind:?}"
+                "actual mismatch for {axis:?} under {mechanism:?}"
             );
             for &required in &strengths {
-                let unmet = unenforceable_axis(caveats, *kind, floor_on(*axis, required));
+                let unmet = unenforceable_axis(caveats, *mechanism, floor_on(*axis, required));
                 let should_refuse = *actual < required;
                 assert_eq!(
                     unmet.is_some(),
@@ -1707,12 +2007,30 @@ mod tests {
             "LandlockOnly net:none is incomplete (UDP/DNS/raw ambient) → refuse on net"
         );
 
-        // macOS: direct Seatbelt socket denial is not a complete ambient-authority
-        // witness, so the contract refuses on net before spawn.
-        assert!(refuses_on(
-            ConfinementMechanism::backend(SandboxKind::Seatbelt),
-            ConfinedAxis::Net
-        ));
+        // macOS (agent-bridle#405 / ADR 0015 amendment E6): the contract's
+        // `net: none` with zero `mach:` grants is now a complete witness
+        // wherever the deputy audit is Complete, the spawn declares audited
+        // stdio, and the caller is unprivileged (agent-bridle#416 round 2)
+        // — admits instead of refusing. Elsewhere, unchanged: refuses. The
+        // bare, Unaudited-by-default conversion must keep refusing even when
+        // the audit is complete (round-2 review item 1).
+        let seatbelt = ConfinementMechanism::backend(SandboxKind::Seatbelt);
+        let seatbelt_audited = seatbelt.with_stdio_posture(StdioPosture::Audited);
+        assert!(
+            refuses_on(seatbelt, ConfinedAxis::Net),
+            "the bare, Unaudited-by-default mechanism must never satisfy CONFINED net"
+        );
+        if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
+            assert!(
+                admits(seatbelt_audited),
+                "deny-all, zero-grant net with audited stdio now satisfies CONFINED \
+                 where the audit is complete and the caller is unprivileged"
+            );
+        } else {
+            assert!(refuses_on(seatbelt_audited, ConfinedAxis::Net));
+        }
 
         // Windows: AppContainer independently kernel-denies egress (no net SIDs)
         // and fences fs → admits (exec allowlist is Interceptor, meets the floor).
@@ -1873,13 +2191,38 @@ mod tests {
         let caveats = newt_confined_caveats();
         let floor = EnforcementFloor::CONFINED;
 
-        // Seatbelt: fs/exec meet their floors, but every restricted net shape is
-        // Advisory until ambient deputies are bounded ⇒ REFUSE on net.
+        // Seatbelt: fs/exec meet their floors. net is this contract's deny-all,
+        // zero-grant shape — agent-bridle#405/ADR 0015 amendment E6 now proves
+        // it deputy-complete wherever `MACH_DEPUTY_AUDIT` is `Complete` (macOS)
+        // AND the spawn declares audited stdio AND the caller is unprivileged
+        // (agent-bridle#416 round 2), so the contract ADMITS only under an
+        // explicitly audited mechanism there; elsewhere, or for the bare
+        // Unaudited-by-default conversion, it still refuses on net, unchanged.
+        let bare_unmet_axis =
+            unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).map(|u| u.axis);
         assert_eq!(
-            unenforceable_axis(&caveats, SandboxKind::Seatbelt, floor).map(|u| u.axis),
+            bare_unmet_axis,
             Some(ConfinedAxis::Net),
-            "Seatbelt restricted net must fail closed before spawn"
+            "the bare, Unaudited-by-default mechanism must never satisfy CONFINED net"
         );
+        let audited = ConfinementMechanism::backend(SandboxKind::Seatbelt)
+            .with_stdio_posture(StdioPosture::Audited);
+        let audited_unmet_axis = unenforceable_axis(&caveats, audited, floor).map(|u| u.axis);
+        if crate::sandbox::seatbelt_mach_deputy_audit_complete()
+            && crate::sandbox::seatbelt_caller_is_unprivileged()
+        {
+            assert_eq!(
+                audited_unmet_axis, None,
+                "the newt contract's deny-all net with audited stdio now satisfies CONFINED \
+                 where the audit is complete and the caller is unprivileged"
+            );
+        } else {
+            assert_eq!(
+                audited_unmet_axis,
+                Some(ConfinedAxis::Net),
+                "Seatbelt restricted net must fail closed before spawn"
+            );
+        }
 
         // Landlock: fs=Kernel, exec=Interceptor(meets floor). net(deny-all) is
         // Kernel only where the kernel mechanism supplies it; on a Landlock report

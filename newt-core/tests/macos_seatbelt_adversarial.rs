@@ -379,29 +379,40 @@ fn seatbelt_pathname_af_unix_deputy() {
 
 #[test]
 #[serial]
-#[ignore = "profile inspection: Mach/XPC ambient surface"]
+#[ignore = "profile inspection: Mach/XPC zero floor (agent-bridle#405/#406)"]
 fn seatbelt_mach_xpc_deputy_surface() {
-    // The generated SBPL starts from `(allow default)` and governs only
-    // file-read/write, network, and process-exec. Mach lookups (XPC service
-    // discovery) therefore stay AMBIENT — a confined child can `bootstrap_look_up`
-    // host XPC services that could act as fs/network deputies. This test PINS that
-    // surface as a known, tracked residual: the profile must NOT (yet) claim to
-    // deny mach-lookup, so we never over-report containment we do not have.
+    // UPDATED by newt-agent#2673 / agent-bridle#406+#405 (ADR 0015 amendments
+    // E5/E6): `workspace_confined_caveats` uses `net: none` (a `net_direct_denied`
+    // shape), and the vendored profile generator now installs the ZERO
+    // Mach-lookup floor for exactly that family of shapes (deny-all, `unix:`-
+    // only, `mach:`-only, or a mixture of only those) — `(deny mach-lookup)`
+    // with no ambient re-allow, backed by agent-bridle's own native evidence
+    // (docs/security/platform/macos-evidence.md in agent-bridle, ADR 0015 E4-E6:
+    // every reachable ambient IPC route this zero-floor shape could expose is
+    // shown closed or correctly placed out of the net-egress threat model).
+    // This test now PINS THE OPPOSITE of its old assertion: the register entry
+    // (docs/security/ocap-deviations.md, `mach-xpc-ambient-deputy`) is updated
+    // to match — narrowed to this shape, not fully closed (a loopback or
+    // network-granted caveat still installs NO Mach floor at all; see that
+    // entry for the residual that remains).
     if !seatbelt_is_supported() {
         return;
     }
     let ws = tempdir().unwrap();
     let profile = rendered_profile(ws.path());
     assert!(
-        !profile.contains("(deny mach"),
-        "the profile now denies mach-lookup — update the register: the mach-xpc-ambient-deputy \
-         macOS residual may be closable. profile:\n{profile}",
+        profile.contains("(deny mach-lookup)"),
+        "the zero Mach floor must be installed for this net:none shape — if this fails, either \
+         the vendored profile generator regressed or workspace_confined_caveats no longer uses a \
+         net_direct_denied shape; re-derive the register entry either way. profile:\n{profile}",
     );
-    // Positive pin: the surface really is ambient by way of the base allow.
+    // The floor is zero, not an ambient re-allow: no default compatibility
+    // list is baked in (an operator grant would show as an explicit
+    // `(allow mach-lookup (global-name …))` line, absent here).
     assert!(
-        profile.contains("(allow default)"),
-        "profile no longer starts from (allow default); the ambient-mach reasoning must be \
-         re-derived. profile:\n{profile}",
+        !profile.contains("(allow mach-lookup"),
+        "a build-tool request grants no mach: services; the floor must not ambiently re-open any. \
+         profile:\n{profile}",
     );
 }
 
@@ -788,23 +799,62 @@ fn seatbelt_operator_network_grant_keeps_build_filesystem_confined() {
 #[ignore = "real Seatbelt admission"]
 #[serial]
 fn seatbelt_build_without_unrestricted_network_grant_refuses_before_spawn() {
+    // A general remote-host allowlist is NOT `net_direct_denied` (agent-bridle
+    // ADR 0015: SBPL cannot name an arbitrary host, so this shape is left
+    // ambient and reported `Unknown`/`Advisory`, unaffected by agent-bridle#405's
+    // promotion) — it must still refuse before spawn. `Scope::none()` no longer
+    // belongs in this test; see `seatbelt_build_deny_all_net_now_runs` below.
     let ws = tempdir().unwrap();
-    for network in [Scope::none(), Scope::only(["example.test".into()])] {
-        let request = newt_core::confined_exec::build_tool_request(
-            ws.path(),
-            ws.path(),
-            "/bin/sh",
-            ["-c", "echo ran > forbidden-marker"],
-            &network,
-        );
-        let error = ConstrainedExecutor::run(&request).unwrap_err();
-        assert!(
-            matches!(&error, ExecRefused::ConfinementUnenforceable(_)),
-            "{error}"
-        );
-        assert!(error.to_string().contains("Net axis"), "{error}");
-        assert!(!ws.path().join("forbidden-marker").exists());
-    }
+    let network = Scope::only(["example.test".into()]);
+    let request = newt_core::confined_exec::build_tool_request(
+        ws.path(),
+        ws.path(),
+        "/bin/sh",
+        ["-c", "echo ran > forbidden-marker"],
+        &network,
+    );
+    let error = ConstrainedExecutor::run(&request).unwrap_err();
+    assert!(
+        matches!(&error, ExecRefused::ConfinementUnenforceable(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("Net axis"), "{error}");
+    assert!(!ws.path().join("forbidden-marker").exists());
+}
+
+/// newt-agent#2673 / agent-bridle#405 (ADR 0015 amendment E6): `net: none`
+/// (deny-all, zero `mach:` grants) is now a deputy-complete Kernel witness,
+/// so a build-tool request under it ADMITS instead of refusing "Net axis"
+/// before spawn — this used to be part of the test above, asserting the
+/// OPPOSITE, before the Mach-deputy audit this promotion backs existed. The
+/// real kernel still has no network: this is a pure admission proof, not a
+/// network-reachability one (that is `seatbelt_net_deny_all_runs_kernel_denied`,
+/// above).
+#[test]
+#[ignore = "real Seatbelt admission"]
+#[serial]
+fn seatbelt_build_deny_all_net_now_runs() {
+    let ws = tempdir().unwrap();
+    let marker = ws.path().join("ran-under-deny-all-net");
+    let request = newt_core::confined_exec::build_tool_request(
+        ws.path(),
+        ws.path(),
+        "/bin/sh",
+        ["-c", &format!("echo ran > {}", marker.display())],
+        &Scope::none(),
+    );
+    let out = ConstrainedExecutor::run(&request)
+        .expect("net:none with zero mach: grants must now be admitted (agent-bridle#405)");
+    assert_seatbelt(&out);
+    assert!(
+        out.success,
+        "stdout={:?} stderr={:?}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        marker.exists(),
+        "the admitted command must actually have run"
+    );
 }
 
 /// Grounds cancellation's pre-spawn unit check in a real started subprocess:

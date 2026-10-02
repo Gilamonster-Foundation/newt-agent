@@ -84,6 +84,73 @@ the version requirement changed: protocol 0.7 adds `AgentKey::issue_derived`
 and removes nothing this crate uses. Upstream agent-bridle needs the same bump
 before this vendored copy can be retired.
 
+## Backport of agent-bridle#406 + the #405 promotion/audit, pending both upstream merge and rc.6
+
+Two upstream pieces, backported together because the second depends on the
+first:
+
+1. **agent-bridle#406** (`adac41a`, merged 2026-09-29): the zero Mach-lookup
+   floor plus named `mach:<service>` grants. Replaces the old ambient
+   `MACH_LOOKUP_ALLOWLIST` ("ADR 0015 E4") with a default-deny floor: nothing
+   is ambient, and a service is reachable only via an explicit `mach:` grant
+   in the `net` scope, projected as the named class
+   `seatbelt-mach-service:<name>` (never `∅` while a grant exists). Ships
+   `MACH_DEPUTY_AUDIT = Incomplete`, so every restricted Seatbelt `net` shape
+   still resolves `Unknown` and is refused — this alone changes nothing about
+   what admits.
+2. **The #405 promotion** (agent-bridle branch `fix/405-macos-net-none-audit`,
+   head `97f031f` at backport time — **NOT YET MERGED to agent-bridle main,
+   no PR opened yet**): the completed native channel audit (ADR 0015
+   amendment E6 — unix-domain sockets, `open(1)`/LaunchServices, Darwin
+   notifications, pasteboard, `iokit-open`, `sysctl-write`, a write-class
+   `file-ioctl`, `process-info`/`signal`, XPC beyond `mach-lookup`, and
+   AppleEvents, each shown closed or correctly placed out of the net-egress
+   threat model) and the resulting flip: `MACH_DEPUTY_AUDIT = Complete`. This
+   is what actually changes behavior: a `net: none` (or `unix:`-only,
+   `mach:`-only, or a mixture of only those) Seatbelt scope now resolves
+   `Bounded(∅)` at the L3 scope bound (`resolved_authority`) AND reports
+   `Kernel` at the L4 strength floor (`report.rs`'s `enforcement_report`,
+   gated on the SAME audit-complete predicate) — together, not one without
+   the other. A named `mach:` grant resolves to its own class (never `∅`,
+   never `Unknown`); a loopback scope or a general remote-host allowlist are
+   unaffected and stay `Unknown`/`Advisory`.
+
+**Why newt needs this**: newt-agent#2673. On macOS, `ConstrainedExecutor`
+narrows every `run_command`/MCP-spawn's net scope to `net: none` before
+spawning (`NetGrant::DenyAll` → `deny_all_net`, `confined_exec.rs`) —
+independent of whatever the operator's config actually named. Before this
+backport, the vendored `SeatbeltSandbox::resolved_authority` mapped EVERY
+restricted `net` shape (`net: none` included) to `Unknown`, so
+`AdmittedFence::admit`'s L3 scope-bound check refused every confined macOS
+spawn with "not decidable against the delegated grant ∪ declared runtime
+closure (L3 BOUND)" — `run_command`, MCP servers, and git all failed. Linux
+was unaffected (a separate, independent `newt-net-guard` seccomp floor
+supplies its own Kernel witness there, outside this mechanism entirely).
+
+**What was backported, mechanically**: `src/sandbox.rs` and `src/report.rs`
+replaced with the upstream branch's content for these two files (verified:
+newt's one local addition in `sandbox.rs`, `net_unix_only` — a `unix:`-only
+predicate without `mach:` support — is strictly superseded by upstream's more
+general `net_direct_denied`, used at the exact same two call sites in the
+new code; nothing is lost). `src/spawn.rs` is a 3-way merge
+(`git merge-file`) against upstream's pre-#406 base
+(`9df604c08102175b3a2e03524b1b46b9f186ea4a`): clean, no conflicts, newt's
+trusted-worker-broker patch is untouched. `tests/unix_socket_grants.rs` is
+the straight upstream diff applied (bases were byte-identical). `src/lib.rs`
+gains the matching public re-exports (`mach_service_grants`,
+`seatbelt_mach_service_class`, `MachServiceDisclosure`,
+`mach_service_disclosure`, `MACH_GRANT_PREFIX`, `MACH_SERVICE_CANDIDATES`) —
+without them the standalone crate check flags all six as dead code, since
+the Seatbelt-only call sites that would otherwise use them are platform-gated
+out on Linux. No version bump: `content-addressable` and
+`agent-mesh-protocol` pins are unchanged.
+
+**Status**: both the agent-bridle PR for `fix/405-macos-net-none-audit` and
+this newt backport are unopened, per operator instruction, pending review.
+Remove this section (and fold the Mach-floor logic back into a plain `rc.6`
+bump) once agent-bridle's own release contains both #406 and the #405
+promotion.
+
 ## Descriptor-bound read roots
 
 `HeldReadRoot`, `Sandbox::apply_with_held_roots` and

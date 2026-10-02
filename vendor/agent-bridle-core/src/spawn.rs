@@ -402,6 +402,54 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
     serde_json::from_slice(body).map_err(|error| format!("invalid trusted-worker request: {error}"))
 }
 
+/// A child's stdio stream, named by WHICH descriptor produces it rather than
+/// an already-constructed [`Stdio`] whose actual shape would otherwise have
+/// to be taken on trust (agent-bridle#416 round-2 review, item 1: ADR 0015
+/// amendment E6 claimed the spawn mechanism "supplies only pipe/null stdio",
+/// but the builder defaulted to inherited stdio and accepted an arbitrary
+/// `Stdio`). [`Self::Piped`] and [`Self::Null`] are exactly the shape that
+/// audit covers — a descriptor this process just minted, which cannot already
+/// be a connected endpoint. [`Self::Other`] is everything else (inherited, a
+/// redirected file, an existing fd) and is a legitimate, supported shape (shell
+/// redirects, a trusted-worker control channel) — it just does not qualify a
+/// Seatbelt `net:none` spawn for the Kernel witness; see
+/// [`ConfinementMechanism::with_stdio_posture`].
+#[derive(Debug)]
+pub enum ConfinedStdio {
+    /// `Stdio::piped()` — a pipe this process owns the opposite end of.
+    Piped,
+    /// `Stdio::null()` — `/dev/null`.
+    Null,
+    /// Any other descriptor: inherited, a redirected file, a raw or dup'd fd.
+    Other(Stdio),
+}
+
+impl ConfinedStdio {
+    fn into_stdio(self) -> Stdio {
+        match self {
+            Self::Piped => Stdio::piped(),
+            Self::Null => Stdio::null(),
+            Self::Other(stdio) => stdio,
+        }
+    }
+
+    /// `true` for exactly [`Self::Piped`]/[`Self::Null`] — the shape ADR 0015
+    /// amendment E6's Seatbelt audit covers.
+    fn is_audited(&self) -> bool {
+        matches!(self, Self::Piped | Self::Null)
+    }
+}
+
+/// Any already-constructed [`Stdio`] converts in as [`ConfinedStdio::Other`] —
+/// deliberately conservative: a value built outside this type has no attached
+/// provenance, so a caller that wants [`ConfinedStdio::Piped`]/[`Null`] credit
+/// must say so by name, not by what the `Stdio` happens to contain.
+impl From<Stdio> for ConfinedStdio {
+    fn from(stdio: Stdio) -> Self {
+        Self::Other(stdio)
+    }
+}
+
 /// Builder for a subprocess confined by a [`ToolContext`].
 ///
 /// Like [`std::process::Command`], but: the environment starts **empty** (only
@@ -437,9 +485,9 @@ pub struct ConfinedCommand {
     args: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
-    stdin: Option<Stdio>,
-    stdout: Option<Stdio>,
-    stderr: Option<Stdio>,
+    stdin: Option<ConfinedStdio>,
+    stdout: Option<ConfinedStdio>,
+    stderr: Option<ConfinedStdio>,
     /// Put the child in a fresh process group so a supervising caller can
     /// terminate the complete descendant tree at a timeout boundary.
     new_process_group: bool,
@@ -537,24 +585,26 @@ impl ConfinedCommand {
         self
     }
 
-    /// Configure the child's stdin (e.g. [`Stdio::piped`] for an MCP server).
+    /// Configure the child's stdin (e.g. [`ConfinedStdio::Piped`] for an MCP
+    /// server). A plain [`Stdio`] also converts in, as [`ConfinedStdio::Other`]
+    /// (agent-bridle#416 round-2 review, item 1).
     #[must_use]
-    pub fn stdin(mut self, cfg: Stdio) -> Self {
-        self.stdin = Some(cfg);
+    pub fn stdin(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stdin = Some(cfg.into());
         self
     }
 
     /// Configure the child's stdout.
     #[must_use]
-    pub fn stdout(mut self, cfg: Stdio) -> Self {
-        self.stdout = Some(cfg);
+    pub fn stdout(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stdout = Some(cfg.into());
         self
     }
 
     /// Configure the child's stderr.
     #[must_use]
-    pub fn stderr(mut self, cfg: Stdio) -> Self {
-        self.stderr = Some(cfg);
+    pub fn stderr(mut self, cfg: impl Into<ConfinedStdio>) -> Self {
+        self.stderr = Some(cfg.into());
         self
     }
 
@@ -632,6 +682,20 @@ impl ConfinedCommand {
         // installs the seccomp `DenyDirect` leg at apply time. So the net witness
         // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
         // from the mechanism actually applied to the spawn.
+        // The stdio shape ADR 0015 amendment E6's Seatbelt audit assumed —
+        // every one of stdin/stdout/stderr a pipe or `/dev/null` — checked
+        // against what THIS spawn actually configured, not assumed
+        // (agent-bridle#416 round-2 review, item 1). Unset defaults to the
+        // same inherited-stdio behavior `std::process::Command` always had,
+        // which is NOT the audited shape.
+        let stdio_audited = [&self.stdin, &self.stdout, &self.stderr]
+            .into_iter()
+            .all(|cfg| cfg.as_ref().is_some_and(ConfinedStdio::is_audited));
+        let stdio_posture = if stdio_audited {
+            crate::StdioPosture::Audited
+        } else {
+            crate::StdioPosture::Unaudited
+        };
         let mechanism = match sandbox.exec_boundary() {
             crate::ExecBoundary::ProcessTree => {
                 ConfinementMechanism::new(reported_kind, self.sandbox_policy.child_network)
@@ -640,7 +704,8 @@ impl ConfinedCommand {
                 reported_kind,
                 self.sandbox_policy.child_network,
             ),
-        };
+        }
+        .with_stdio_posture(stdio_posture);
 
         // (2) The declared runtime closure — the ONLY door for authority beyond
         // the delegated grant. A fixed worker executable is an internal
@@ -670,7 +735,7 @@ impl ConfinedCommand {
                 mechanism,
                 cx.strength_floor(),
                 |caveats| BackendProjection {
-                    resolved: sandbox.resolved_authority(caveats),
+                    resolved: sandbox.resolved_authority(caveats, stdio_posture),
                     runtime_closure: sandbox.runtime_closure(caveats),
                 },
             )
@@ -700,7 +765,9 @@ impl ConfinedCommand {
                         let mut resolved = crate::ResolvedAuthority::from_delegated(&effective);
                         resolved.fs_read =
                             crate::ResolvedScope::from_scope(&mechanism_caveats.fs_read);
-                        resolved.net = sandbox.resolved_authority(mechanism_caveats).net;
+                        resolved.net = sandbox
+                            .resolved_authority(mechanism_caveats, stdio_posture)
+                            .net;
                         return BackendProjection {
                             resolved,
                             runtime_closure: crate::ResolvedAuthority {
@@ -725,7 +792,7 @@ impl ConfinedCommand {
                     // fails closed until the io_uring egress floor lands (PR-1). No
                     // caveats-grain net override: `resolved` is the honest projection.
                     BackendProjection {
-                        resolved: sandbox.resolved_authority(mechanism_caveats),
+                        resolved: sandbox.resolved_authority(mechanism_caveats, stdio_posture),
                         runtime_closure: sandbox.runtime_closure(mechanism_caveats),
                     }
                 },
@@ -827,13 +894,13 @@ impl ConfinedCommand {
                 cmd.current_dir(dir);
             }
             if let Some(cfg) = stdin {
-                cmd.stdin(cfg);
+                cmd.stdin(cfg.into_stdio());
             }
             if let Some(cfg) = stdout {
-                cmd.stdout(cfg);
+                cmd.stdout(cfg.into_stdio());
             }
             if let Some(cfg) = stderr {
-                cmd.stderr(cfg);
+                cmd.stderr(cfg.into_stdio());
             }
             #[cfg(unix)]
             if new_process_group {
@@ -861,7 +928,7 @@ impl ConfinedCommand {
                     &apply_policy.resolve_named_root_protected_roots()?,
                     mechanism,
                     BackendProjection {
-                        resolved: sandbox.resolved_authority(&mechanism_effective),
+                        resolved: sandbox.resolved_authority(&mechanism_effective, stdio_posture),
                         runtime_closure: sandbox.runtime_closure(&mechanism_effective),
                     },
                 )?;
@@ -2817,35 +2884,157 @@ mod seatbelt_child_tests {
         );
     }
 
-    /// Restricted Seatbelt network authority remains held: admission must refuse
-    /// before the program is spawned, regardless of the defense-in-depth profile.
+    /// A loopback listener answering one request, so an ALLOW assertion tests
+    /// a *reachable* socket (curl exit 0) rather than "connection refused"
+    /// (also exit 7, like a kernel deny) — mirrors
+    /// `seatbelt_kernel_tests::spawn_loopback_http` (sandbox.rs), duplicated
+    /// here rather than exposed across the module boundary for one helper.
+    fn one_shot_listener(bind: &str) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind(bind).expect("bind an owned listener");
+        let addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        addr
+    }
+
+    /// agent-bridle#416 round 3 (fix-first review): a `net:none` spawn whose
+    /// stdio was never declared — `ConfinedCommand`'s `stdin`/`stdout`/
+    /// `stderr` default to `None`, which `ConfinedCommand::spawn` turns into
+    /// `std::process::Command`'s own inherited-stdio default — is exactly the
+    /// shape ADR 0015 amendment E6's audit never measured (a connected
+    /// endpoint could already live on an inherited descriptor, invisible to
+    /// Seatbelt's socket rules). It must refuse admission under the DEFAULT
+    /// floor, not resolve a named `Bounded(∅)` on `MACH_DEPUTY_AUDIT` alone —
+    /// the regression this round's L3 fix (`SeatbeltSandbox::resolved_authority`
+    /// now takes the spawn's `StdioPosture`) closes. This is the test that, by
+    /// construction, exercises the production default every caller gets
+    /// unless it explicitly asks for `ConfinedStdio::Piped`/`Null` (see the
+    /// positive control below).
     #[test]
-    fn restricted_net_authority_is_denied_before_spawn() {
+    fn net_none_with_default_stdio_refuses_admission() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
         }
-        let dir = unique_dir("net-held");
-        let marker = dir.join("must-not-spawn");
         let cx = ctx(Caveats {
             net: Scope::none(),
             ..Caveats::top()
         });
-        match ConfinedCommand::new("/usr/bin/touch")
-            .arg(&marker)
-            .spawn(&cx)
-        {
-            Err(ToolError::Denied { .. }) => {}
-            Err(other) => panic!("expected a restricted-network authority denial, got {other}"),
-            Ok(mut spawned) => {
-                let _ = spawned.child.kill();
-                panic!("restricted network authority must be denied before spawn");
-            }
-        }
+        // No .stdin()/.stdout()/.stderr() calls at all — the production
+        // default every caller gets who doesn't explicitly ask for the
+        // audited shape.
+        let res = ConfinedCommand::new("/usr/bin/true").spawn(&cx);
         assert!(
-            !marker.exists(),
-            "the denied command must never have executed"
+            matches!(res, Err(ToolError::Denied { .. })),
+            "net:none with default (inherited, unaudited) stdio must refuse before spawn, got {res:?}"
         );
+    }
+
+    /// The sibling of the above for an EXPLICIT, non-audited `Stdio`: a
+    /// caller that converts a raw [`std::process::Stdio`] in (even one that is
+    /// itself a freshly-made pipe) gets [`ConfinedStdio::Other`], not credit
+    /// for [`ConfinedStdio::Piped`] — "a caller that wants Piped/Null credit
+    /// must say so by name, not by what the `Stdio` happens to contain" (the
+    /// type's own doc comment). Proves the gate keys on the NAMED variant, not
+    /// on what the underlying descriptor would look like if inspected.
+    #[test]
+    fn net_none_with_other_stdio_refuses_admission() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+        let res = ConfinedCommand::new("/usr/bin/true")
+            // A raw `Stdio::piped()` converts in as `Other`, same as the ADR's
+            // inherited/redirected-file cases — never `Piped` by inspection.
+            .stdin(std::process::Stdio::piped())
+            .stdout(ConfinedStdio::Null)
+            .stderr(ConfinedStdio::Null)
+            .spawn(&cx);
+        assert!(
+            matches!(res, Err(ToolError::Denied { .. })),
+            "an `Other` stdio channel must refuse net:none admission even though two of three channels are audited, got {res:?}"
+        );
+    }
+
+    /// agent-bridle#405 / ADR 0015 amendment E6 — the CI kernel proof the
+    /// promotion exists to back, now gated on the audited shape this round
+    /// added: with the deputy audit `Complete`, an unprivileged caller, AND
+    /// every one of stdin/stdout/stderr declared `Piped`/`Null` BY NAME, a
+    /// `net: none`, zero-`mach:`-grant scope ADMITS through the real
+    /// production path (`Gate::authorize` + `ConfinedCommand::spawn`;
+    /// `resolved.net` is the bottom element `∅`, trivially a subset of any
+    /// delegated grant). The real kernel still blocks the child's own egress:
+    /// an unconfined positive control proves the probe reaches an owned
+    /// loopback listener (curl exit 0); the SAME request through the confined
+    /// spawn must not (curl exit 7, the exact "couldn't connect" code — not a
+    /// timeout, not a malformed-profile exit 65).
+    #[test]
+    fn net_none_with_audited_stdio_admits_and_the_kernel_still_blocks_egress() {
+        if !seatbelt_is_supported() {
+            eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
+            return;
+        }
+        let dir = unique_dir("net-none-admits");
+        let marker = dir.join("ran");
+        let cx = ctx(Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        });
+
+        // The benign leg: admission no longer refuses net:none before spawn,
+        // once the spawn declares the audited stdio shape BY NAME.
+        let mut touch = ConfinedCommand::new("/usr/bin/touch")
+            .arg(&marker)
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
+            .spawn(&cx)
+            .expect("net:none with zero mach: grants and audited stdio must now be admitted");
+        assert!(touch.child.wait().expect("wait").success());
+        assert!(
+            marker.exists(),
+            "the admitted command must actually have run"
+        );
+
+        // Positive control: an UNCONFINED curl reaches an owned listener.
+        let addr = one_shot_listener("127.0.0.1:0");
+        let url = format!("http://{addr}/");
+        let control = std::process::Command::new("/usr/bin/curl")
+            .args(["-sS", "--max-time", "5", &url])
+            .status()
+            .expect("spawn unconfined curl control");
+        assert!(
+            control.success(),
+            "positive control: an unconfined curl must reach the owned listener"
+        );
+
+        // Confined: the SAME request through the real spawn path must be
+        // kernel-denied before it ever reaches the listener.
+        let addr2 = one_shot_listener("127.0.0.1:0");
+        let url2 = format!("http://{addr2}/");
+        let mut curl = ConfinedCommand::new("/usr/bin/curl")
+            .args(["-sS", "--max-time", "5", &url2])
+            .stdin(ConfinedStdio::Null)
+            .stdout(ConfinedStdio::Piped)
+            .stderr(ConfinedStdio::Piped)
+            .spawn(&cx)
+            .expect("spawn");
+        assert_eq!(
+            curl.child.wait().expect("wait").code(),
+            Some(7),
+            "the confined child's own network attempt must be kernel-denied, exact exit 7"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

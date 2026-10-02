@@ -109,3 +109,6 @@ target-cursor-tests/
 # Lean build artifacts + TLC state dumps (formal/)
 formal/.lake/
 formal/tla/states/
+
+# Build output from building a vendored crate standalone.
+vendor/*/target/

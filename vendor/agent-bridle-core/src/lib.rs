@@ -88,13 +88,15 @@ pub use provenance::{
 pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
-    EnforcementFloor, EnforcementReport, ExecBoundary, UnenforceableAxis,
+    EnforcementFloor, EnforcementReport, ExecBoundary, StdioPosture, UnenforceableAxis,
 };
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
 pub use sandbox::{
     best_available_sandbox, effective_sandbox_kind, egress_proxy_plan, loopback_fenced_caveats,
-    net_egress_proxy_hosts, HeldReadRoot, NoopSandbox, Sandbox, SandboxKind,
+    mach_service_disclosure, mach_service_grants, net_egress_proxy_hosts,
+    seatbelt_mach_service_class, HeldReadRoot, MachServiceDisclosure, NoopSandbox, Sandbox, SandboxKind,
+    MACH_GRANT_PREFIX, MACH_SERVICE_CANDIDATES,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
@@ -104,7 +106,8 @@ pub use spawn::{
     confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,
     spawn_confined_subprocess, trusted_worker_frame_digest, ConfinedChild, ConfinedCommand,
-    ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind, TrustedWorkerRequest,
+    ConfinedStdio, ManagedSpawn, SandboxedWorker, SandboxedWorkerChild, TrustedWorkerKind,
+    TrustedWorkerRequest,
     TRUSTED_WORKER_ACK, TRUSTED_WORKER_BOOTSTRAP, TRUSTED_WORKER_FRAME_HEADER_LEN,
     TRUSTED_WORKER_HELLO_LEN, TRUSTED_WORKER_MAX_BODY, TRUSTED_WORKER_PROTOCOL_VERSION,
 };
