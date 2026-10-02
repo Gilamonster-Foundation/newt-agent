@@ -211,12 +211,18 @@ impl ObservedPaths {
     }
 }
 
-/// #1214: the observed local branch inventory, handed to
-/// [`annotate_action_claims`] as pure data. This is not execution evidence
-/// for commits, pushes, pull requests, or tests.
+/// #1214/#2683: the observed local branch inventory and commit evidence,
+/// handed to [`annotate_action_claims`] as pure data. This is not execution
+/// evidence for pushes, pull requests, or tests.
 pub(crate) struct TurnGitEvidence {
     /// Local branch names that exist right now.
     pub branches: Vec<String>,
+    /// #2683: did HEAD move since the baseline captured at the start of this
+    /// turn? `None` means no baseline was captured (off-repo at turn start,
+    /// or the read scope refused the probe) — absence of a baseline must
+    /// never manufacture a false refutation, so it is distinct from
+    /// `Some(false)`.
+    pub head_moved: Option<bool>,
 }
 
 /// Repo-relative path → two-character `git status --porcelain` code.
@@ -548,11 +554,50 @@ pub(crate) fn claimed_branches(text: &str) -> Vec<String> {
     out
 }
 
-/// #1214: append a refutation for a claimed local branch absent from the
-/// observed inventory, preserving the model's prose as an exact prefix.
-/// Git state cannot establish whether tests passed, an existing commit was
-/// pushed, or a pull request was opened. Do not turn a keyword in prose or
-/// an unchanged HEAD into an accusation about those actions.
+/// #2683: does `text` claim, somewhere, that a commit was just made? The
+/// verb form "committed" is the trigger (never the noun "commit" — "one
+/// commit ahead", "the existing commit", "pushed the existing commit" are
+/// never claims of having just performed a commit). Conservative, like
+/// [`claimed_branches`]: a negation, a future-tense auxiliary, or a
+/// temporal-distancing word ("previously"/"already"/"earlier"/"before")
+/// within the preceding [`COMMIT_VOID_WINDOW`] tokens voids the match, and a
+/// quoted line (starts with `>`, markdown blockquote — someone else's words,
+/// not the model's own claim) is skipped entirely. Precision over recall:
+/// a spurious refutation of an honest "I have not committed" is worse than
+/// missing a real false claim.
+const COMMIT_VOID_WINDOW: usize = 4;
+const COMMIT_VOID_WORDS: [&str; 6] = ["not", "never", "will", "previously", "already", "earlier"];
+
+pub(crate) fn claims_committed(text: &str) -> bool {
+    let normalize = |t: &str| {
+        t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+            .to_ascii_lowercase()
+    };
+    text.lines().any(|line| {
+        if line.trim_start().starts_with('>') {
+            return false; // a quoted line is not the model's own claim
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        toks.iter().enumerate().any(|(i, tok)| {
+            if normalize(tok) != "committed" {
+                return false;
+            }
+            let start = i.saturating_sub(COMMIT_VOID_WINDOW);
+            !toks[start..i].iter().any(|t| {
+                let k = normalize(t);
+                COMMIT_VOID_WORDS.contains(&k.as_str()) || k.contains("n't")
+            })
+        })
+    })
+}
+
+/// #1214/#2683: append a refutation for a claimed local branch absent from
+/// the observed inventory, and for a "committed" claim when HEAD did not
+/// move this turn, preserving the model's prose as an exact prefix. Git
+/// state still cannot establish whether tests passed, an existing commit
+/// was pushed, or a pull request was opened — do not turn a keyword in
+/// prose, an unchanged HEAD, or a missing baseline into an accusation about
+/// those.
 pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvidence>) -> String {
     let Some(ev) = evidence else { return text };
     let mut notes: Vec<String> = Vec::new();
@@ -561,24 +606,38 @@ pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvid
             notes.push(format!("claimed branch `{b}` does not exist"));
         }
     }
-    if notes.is_empty() {
-        return text;
+    // Recognize the commit claim against the model's ORIGINAL prose, never
+    // against a block this function itself appended.
+    let commit_refuted = ev.head_moved == Some(false) && claims_committed(&text);
+    let mut text = text;
+    if !notes.is_empty() {
+        text = format!(
+            "{text}\n\n⚠ claim check (#1214): {} — verify the workspace state before \
+             trusting the summary above.",
+            notes.join("; ")
+        );
     }
-    format!(
-        "{text}\n\n⚠ claim check (#1214): {} — verify the workspace state before \
-         trusting the summary above.",
-        notes.join("; ")
-    )
+    if commit_refuted {
+        text = format!(
+            "{text}\n\n⚠ claim check (#2683): claimed a commit, but the branch HEAD did not \
+             move this turn — verify the workspace state before trusting the summary above."
+        );
+    }
+    text
 }
 
-/// Observe the branch inventory used by final-answer annotations. Preserve
-/// the existing no-evidence behavior for unborn HEADs and failed Git reads;
-/// no evidence means no refutation.
+/// Observe the branch and commit evidence used by final-answer annotations.
+/// Preserve the existing no-evidence behavior for unborn HEADs and failed
+/// Git reads; no evidence means no refutation. `head_before` is the HEAD sha
+/// captured once at the start of this turn ([`git_head`], before any of this
+/// turn's tool calls ran) — `None` when no baseline was captured, which
+/// leaves [`TurnGitEvidence::head_moved`] `None` too rather than guessing.
 pub(crate) fn collect_git_evidence(
     workspace: &str,
     read_scope: &crate::Scope<String>,
+    head_before: Option<&str>,
 ) -> Option<TurnGitEvidence> {
-    git_head(workspace, read_scope)?;
+    let head_now = git_head(workspace, read_scope)?;
     let branches = git_in(
         workspace,
         &["branch", "--format=%(refname:short)"],
@@ -588,7 +647,11 @@ pub(crate) fn collect_git_evidence(
     .map(|l| l.trim().to_string())
     .filter(|l| !l.is_empty())
     .collect();
-    Some(TurnGitEvidence { branches })
+    let head_moved = head_before.map(|before| before != head_now);
+    Some(TurnGitEvidence {
+        branches,
+        head_moved,
+    })
 }
 
 /// Current HEAD sha of `workspace`, or `None` off-repo / on failure.
@@ -730,6 +793,15 @@ mod tests {
     fn evidence(branches: &[&str]) -> TurnGitEvidence {
         TurnGitEvidence {
             branches: branches.iter().map(|s| s.to_string()).collect(),
+            head_moved: None,
+        }
+    }
+
+    /// Like [`evidence`], but with explicit #2683 commit (HEAD-moved) evidence.
+    fn evidence_with_commit(branches: &[&str], head_moved: Option<bool>) -> TurnGitEvidence {
+        TurnGitEvidence {
+            branches: branches.iter().map(|s| s.to_string()).collect(),
+            head_moved,
         }
     }
 
@@ -774,6 +846,12 @@ mod tests {
         assert_eq!(annotate_action_claims(claimy.clone(), None), claimy);
     }
 
+    /// The same fixtures that must never be refuted as a phantom branch must
+    /// ALSO never be refuted as a false commit claim — including when HEAD
+    /// genuinely did NOT move this turn (`Some(false)`), which is the one
+    /// evidence state where a careless recognizer would misfire on the
+    /// negated, future-tense, retrospective, or quoted "commit(ted)" mentions
+    /// below.
     #[test]
     fn git_state_does_not_refute_negated_or_unrelated_action_claims() {
         for text in [
@@ -794,15 +872,68 @@ mod tests {
                 text,
                 "Git metadata does not contradict this statement: {text}"
             );
+            let ev = evidence_with_commit(&["main"], Some(false));
+            assert_eq!(
+                annotate_action_claims(text.to_string(), Some(&ev)),
+                text,
+                "not a direct, present-tense commit claim, even with a false HEAD-moved \
+                 signal on hand: {text}"
+            );
         }
     }
 
-    /// A branch inventory cannot establish whether a commit was created.
+    /// A branch inventory ALONE (no commit/HEAD evidence collected this
+    /// turn) cannot establish whether a commit was created — absence of
+    /// evidence is not evidence of absence (#2683).
     #[test]
     fn branch_inventory_is_not_commit_execution_evidence() {
         let text = "I committed the change".to_string();
         let ev = evidence(&["main"]);
         assert_eq!(annotate_action_claims(text.clone(), Some(&ev)), text);
+    }
+
+    /// #2683, the measured retest bug (COMPARE.md, 2026-10-02): the model
+    /// reported "committed locally" when the change was only staged — HEAD
+    /// never moved. The commit claim is refuted, appended after the model's
+    /// prose, without disturbing the branch-claim (#1214) channel.
+    #[test]
+    fn refutes_a_false_committed_claim_when_head_did_not_move() {
+        let text = "I committed the change locally. cargo check passes.".to_string();
+        let ev = evidence_with_commit(&["main"], Some(false));
+        let out = annotate_action_claims(text.clone(), Some(&ev));
+        assert!(out.starts_with(&text), "prose is an exact prefix: {out}");
+        assert!(out.contains("⚠ claim check (#2683)"), "got: {out}");
+        assert!(out.contains("branch HEAD did not move"), "got: {out}");
+    }
+
+    /// A true commit claim, with evidence that HEAD actually moved, is left
+    /// untouched.
+    #[test]
+    fn a_true_committed_claim_is_not_refuted_when_head_moved() {
+        let text = "I committed the change locally.".to_string();
+        let ev = evidence_with_commit(&["main"], Some(true));
+        assert_eq!(annotate_action_claims(text.clone(), Some(&ev)), text);
+    }
+
+    /// Direct coverage of the recognizer: the trigger is the verb
+    /// "committed", never the noun "commit"; negation, future tense, a
+    /// temporal-distancing word, and a quoted line all void a match.
+    #[test]
+    fn claims_committed_recognizes_the_verb_but_not_voided_or_noun_forms() {
+        assert!(claims_committed(
+            "committed the fix on branch fix/x-1; tests pass"
+        ));
+        assert!(claims_committed("Committed the fix locally."));
+        assert!(!claims_committed("I have not committed these changes."));
+        assert!(!claims_committed(
+            "After approval, these files will be committed."
+        ));
+        assert!(!claims_committed("Previously, I committed the change."));
+        assert!(!claims_committed("> committed the change"));
+        assert!(!claims_committed("I pushed the existing commit to origin."));
+        assert!(!claims_committed(
+            "The existing branch is one commit ahead of origin/main."
+        ));
     }
 
     /// Prose after "branch" is not a ref; backticked refs unwrap.

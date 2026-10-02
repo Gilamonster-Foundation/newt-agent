@@ -226,11 +226,62 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
         &crate::Scope::All,
         &capability_check::Evidence::default(),
         None,
+        None,
     );
     assert!(
         text.contains("⚠ claim check (#867)"),
         "cap handoffs must use the same path grounding gate on every provider: {text}"
     );
+}
+
+/// #2683, through the REAL dispatch path (`finalize_final_text`, real `git`
+/// subprocess calls via `claim_check::git_in`), not just the pure
+/// `annotate_action_claims` unit tests: a real repo whose HEAD genuinely did
+/// not move since `head_before` was captured — the exact retest shape
+/// (COMPARE.md, 2026-10-02) where the model reported "committed locally" on
+/// a change that was only staged.
+#[test]
+fn cap_exit_finalizer_refutes_a_committed_claim_when_head_did_not_move_in_a_real_repo() {
+    let workspace = tempfile::TempDir::new().expect("temp workspace");
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .expect("git")
+                .status
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(workspace.path().join("a.txt"), "one\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let head_before =
+        claim_check::git_head(&workspace.path().to_string_lossy(), &crate::Scope::All)
+            .expect("HEAD exists after the initial commit");
+    // The turn only staged a further edit — exactly the measured bug — so
+    // HEAD at finalize time is IDENTICAL to `head_before`.
+    std::fs::write(workspace.path().join("a.txt"), "one\ntwo\n").unwrap();
+    git(&["add", "a.txt"]);
+
+    let text = finalize_final_text(
+        "I committed the change locally.".to_string(),
+        &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
+        &capability_check::Evidence::default(),
+        None,
+        Some(&head_before),
+    );
+    assert!(
+        text.contains("⚠ claim check (#2683)"),
+        "a staged-not-committed claim must be refuted through the real dispatch path: {text}"
+    );
+    assert!(text.contains("branch HEAD did not move"), "got: {text}");
 }
 
 #[test]
