@@ -2107,8 +2107,8 @@ fn audit_row(rec: &newt_core::PermissionRecord) -> String {
 /// reviewable `approve.toml` proposal (issue #2679). The capture is GLOBAL
 /// across sessions, so it is narrowed to this session via the `session:`
 /// argument thread through [`newt_core::ocap_propose::propose_for`]: only the
-/// caveats recorded under the current session id survive (plus session-less
-/// caveats from before scoping existed), so a shared capture file never
+/// caveats recorded under the current session id survive (session-less
+/// caveats from before scoping existed are excluded), so a shared capture file never
 /// mixes one session's observed authority with another's. The proposer itself
 /// is shared with the CLI, so the panel cannot drift from the headless
 /// command. `save` records the low-danger candidates UNSIGNED (they are

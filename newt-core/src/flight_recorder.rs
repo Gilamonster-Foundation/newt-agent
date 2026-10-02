@@ -87,8 +87,8 @@ impl FlightCapture {
     /// the session this observation belongs to so a shared capture file can be
     /// filtered back to one session at read time. Existing caveats keep their
     /// original `session` (they were inserted first); a caveat recorded with no
-    /// session id stays session-less and is treated as belonging to every
-    /// session at read time (see `read_capture_jsonl`).
+    /// session id stays session-less: an unscoped read keeps it, a
+    /// session-scoped read excludes it (see `read_capture_jsonl_sessioned`).
     pub fn observe(
         &mut self,
         axis: ShadowAxis,
@@ -271,12 +271,14 @@ pub fn read_capture_jsonl_sessioned(text: &str, session: Option<&str>) -> Flight
     let mut cap = FlightCapture::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         if let Ok(c) = serde_json::from_str::<ShadowCaveat>(line) {
-            // A caveat recorded without a session id is treated as belonging to
-            // every session, so it survives the filter; a caveat recorded under
-            // another session is excluded.
+            // Session-scoped reads keep ONLY this session's caveats. A caveat
+            // recorded without a session id predates session stamping and could
+            // be from any past run (the 2026-10-02 retest found crontab and
+            // `curl | sh` in the global capture), so it is excluded; an unscoped
+            // read (`session == None`, the CLI's `newt ocap propose`) keeps all.
             let belongs = match (&c.session, session) {
                 (_, None) => true,
-                (None, Some(_)) => true,
+                (None, Some(_)) => false,
                 (Some(s), Some(id)) => s == id,
             };
             if belongs {
@@ -449,7 +451,8 @@ mod tests {
     #[test]
     fn session_scope_excludes_caveats_recorded_under_other_sessions() {
         // Shared capture file with two sessions' worth of caveats: the current
-        // session ("s1") must see only its own, plus session-less caveats.
+        // session ("s1") must see only its own. Session-less caveats predate
+        // stamping and could be from any past run, so a scoped read drops them.
         let s1 = r#"{"axis":"exec","target":"a","command":"a","count":1,"session":"s1"}"#;
         let shared = r#"{"axis":"exec","target":"cargo","command":"bash -c x","count":1}"#;
         let other = r#"{"axis":"exec","target":"b","command":"b","count":1,"session":"s2"}"#;
@@ -461,10 +464,16 @@ mod tests {
             "current session sees its own caveat"
         );
         assert!(
-            scoped
+            !scoped
                 .caveats
                 .contains_key(&(ShadowAxis::Exec, "cargo".into())),
-            "session-less caveat belongs to every session"
+            "a session-less caveat is not this session's evidence: {scoped:?}"
+        );
+        assert!(
+            read_capture_jsonl_sessioned(&lines, None)
+                .caveats
+                .contains_key(&(ShadowAxis::Exec, "cargo".into())),
+            "an unscoped read (the CLI) still keeps it"
         );
         assert!(
             !scoped.caveats.contains_key(&(ShadowAxis::Exec, "b".into())),
