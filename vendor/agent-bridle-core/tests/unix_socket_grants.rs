@@ -2,12 +2,16 @@
 //! The child fixture only connects/listens on test-owned local endpoints.
 //!
 //! Forward-port of f28e585 + 1d16a7e(a) (#385) from the 0.7 maintenance line.
-//! Adapted: main's `report.rs` holds EVERY restricted Seatbelt `net` shape at
-//! `Advisory`/`Unknown` (README: "every restricted Seatbelt `net` scope ...
-//! resolves `Unknown` and is refused by admission"), not just deny-all/loopback
-//! as on 0.7 — so `enforcement_report`/`effective_sandbox_kind` fold Seatbelt
-//! into the same Advisory bucket as every other backend for a Unix grant,
-//! rather than promoting it to `Kernel` the way the 0.7 test asserted.
+//! Updated for agent-bridle#405 / ADR 0015 amendment E6 (2026-10-01): the
+//! deputy audit is now `Complete`, so the L3 scope bound
+//! (`resolved_authority`) admits a `unix:`-only grant (and `mach:`-only, and
+//! the fully-empty `net:none`) as the concrete class the profile actually
+//! permits — it no longer refuses "L3 BOUND" the way the 0.7-vs-main split
+//! this file's header used to describe. The L4 **strength report**
+//! (`enforcement_report`) is narrower: a `unix:` grant present is not the
+//! zero-grant shape this audit backs, so it still reports Advisory there
+//! (see `unix_socket_grants_stay_advisory_on_every_backend_including_seatbelt`,
+//! unchanged, below) — only the exact empty `net:none` reaches `Kernel`.
 
 use agent_bridle_core::{
     confinement_unenforceable, effective_sandbox_kind, enforcement_report, loopback_fenced_caveats,
@@ -93,7 +97,7 @@ fn unix_socket_grants_stay_advisory_on_every_backend_including_seatbelt() {
 mod seatbelt {
     use super::*;
     use agent_bridle_core::{
-        ConfinedCommand, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext, ToolError, ToolResult,
+        ConfinedCommand, Gate, Sandbox, SeatbeltSandbox, Tool, ToolContext, ToolResult,
     };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -293,8 +297,10 @@ mod seatbelt {
 
     /// Grounds the probe deadline and kill/reap cleanup in a real stalled child;
     /// the other real-child case independently grounds the mocked socket policy.
+    /// Re-enabled by agent-bridle#405 / ADR 0015 amendment E6: a `unix:` grant
+    /// now admits at L3 (it resolves to its own concrete class, not Unknown),
+    /// so this real spawn no longer refuses before it can even start.
     #[test]
-    #[ignore = "re-enable when Seatbelt net is promoted from Advisory (1ac8995 hold)"]
     fn unix_socket_probe_timeout_kills_and_reaps_the_child() {
         let ep = Endpoints::new();
         let cx = Gate::new(0)
@@ -317,31 +323,16 @@ mod seatbelt {
         );
     }
 
-    /// Pins the 0.8 posture positively: a `unix:` grant is refused at
-    /// admission, not silently downgraded. Every restricted Seatbelt `net`
-    /// scope resolves Advisory and is refused before spawn (L3 BOUND) — see
-    /// `agent-bridle-core/README.md` and the ignored real-child proofs above,
-    /// which re-enable the day this hold lifts.
-    #[test]
-    fn unix_socket_grant_is_refused_at_admission_under_seatbelt() {
-        let ep = Endpoints::new();
-        let cx = Gate::new(0)
-            .authorize(&Fixture, &scoped(&[&ep.grant()]))
-            .unwrap();
-        let err = probe_command("connect", &ep.first, "allowed")
-            .spawn(&cx)
-            .unwrap_err();
-        let ToolError::Denied { reason } = err else {
-            panic!("expected a Denied refusal, got {err:?}");
-        };
-        assert!(reason.contains("Net"), "{reason}");
-        assert!(reason.contains("L3 BOUND"), "{reason}");
-    }
-
     /// Real inherited kernel proof for the profile and proxy-partition tests:
     /// one granted live socket works; its live sibling and TCP stay denied.
+    /// Re-enabled by agent-bridle#405 / ADR 0015 amendment E6: a `unix:` grant
+    /// now admits at L3 and covers the admission case the removed
+    /// `unix_socket_grant_is_refused_at_admission_under_seatbelt` used to pin
+    /// the OPPOSITE of — the `probe(&scoped(&[]), ...)` call below is the
+    /// zero-grant deny-all admission proof, the `probe(&caveats, ...)` calls
+    /// are the one-grant case, both now admitted and both still kernel-correct
+    /// about what they can and can't reach.
     #[test]
-    #[ignore = "re-enable when Seatbelt net is promoted from Advisory (1ac8995 hold)"]
     fn unix_socket_real_child_obeys_exact_connect_scope_and_cannot_listen() {
         let ep = Endpoints::new();
         // Reachability controls avoid confusing a missing service with denial.
@@ -381,12 +372,29 @@ mod seatbelt {
             "denied",
             false,
         );
-        #[cfg(feature = "spawn-tokio")]
-        {
-            let mixed = scoped(&[&grant, "example.test"]);
-            probe(&mixed, "connect", &ep.first, "allowed", true);
-            probe(&mixed, "connect", &ep.second, "denied", true);
-        }
+    }
+
+    /// Split out of the test above (found while re-enabling it for
+    /// agent-bridle#405): a `unix:` grant MIXED with a plain remote host
+    /// ("example.test") is NOT `net_direct_denied` (every entry must be a
+    /// structural `unix:`/`mach:` token — ADR 0015 amendment E6 only ever
+    /// covers deny-all/unix-only/mach-only/mixtures of only those), so it
+    /// stays `Unknown` regardless of `MACH_DEPUTY_AUDIT` and still refuses at
+    /// `ConfinedCommand::spawn_tokio`'s own admission (`AdmittedFence::admit`,
+    /// L3 BOUND) — unrelated to and unaffected by this lane's promotion. A
+    /// mixed unix+host grant admitting via the egress proxy is its own,
+    /// separate gap; this is not the issue that re-enables it.
+    #[test]
+    #[cfg(feature = "spawn-tokio")]
+    #[ignore = "mixed unix:+host grants refuse at admission independent of the #405 Mach-deputy audit; a separate egress-proxy admission gap, not covered by this promotion"]
+    fn unix_socket_mixed_grant_via_egress_proxy() {
+        let ep = Endpoints::new();
+        UnixStream::connect(&ep.first).unwrap();
+        UnixStream::connect(&ep.second).unwrap();
+        let grant = ep.grant();
+        let mixed = scoped(&[&grant, "example.test"]);
+        probe(&mixed, "connect", &ep.first, "allowed", true);
+        probe(&mixed, "connect", &ep.second, "denied", true);
     }
 
     #[test]

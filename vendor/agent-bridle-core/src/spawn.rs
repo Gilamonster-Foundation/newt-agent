@@ -2707,35 +2707,87 @@ mod seatbelt_child_tests {
         );
     }
 
-    /// Restricted Seatbelt network authority remains held: admission must refuse
-    /// before the program is spawned, regardless of the defense-in-depth profile.
+    /// A loopback listener answering one request, so an ALLOW assertion tests
+    /// a *reachable* socket (curl exit 0) rather than "connection refused"
+    /// (also exit 7, like a kernel deny) — mirrors
+    /// `seatbelt_kernel_tests::spawn_loopback_http` (sandbox.rs), duplicated
+    /// here rather than exposed across the module boundary for one helper.
+    fn one_shot_listener(bind: &str) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind(bind).expect("bind an owned listener");
+        let addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        addr
+    }
+
+    /// agent-bridle#405 / ADR 0015 amendment E6 — the CI kernel proof the
+    /// promotion exists to back: with the deputy audit `Complete`, a `net:
+    /// none`, zero-`mach:`-grant scope now ADMITS through the real production
+    /// path (`Gate::authorize` + `ConfinedCommand::spawn`, the exact seam
+    /// `restricted_net_authority_is_denied_before_spawn` used to pin the
+    /// OPPOSITE of — `resolved.net` is now the bottom element `∅`, trivially a
+    /// subset of any delegated grant, where it used to be `Unknown`). The real
+    /// kernel still blocks the child's own egress: an unconfined positive
+    /// control proves the probe reaches an owned loopback listener (curl exit
+    /// 0); the SAME request through the confined spawn must not (curl exit 7,
+    /// the exact "couldn't connect" code — not a timeout, not a
+    /// malformed-profile exit 65).
     #[test]
-    fn restricted_net_authority_is_denied_before_spawn() {
+    fn net_none_now_admits_and_the_kernel_still_blocks_egress() {
         if !seatbelt_is_supported() {
             eprintln!("skipping: /usr/bin/sandbox-exec unavailable");
             return;
         }
-        let dir = unique_dir("net-held");
-        let marker = dir.join("must-not-spawn");
+        let dir = unique_dir("net-none-admits");
+        let marker = dir.join("ran");
         let cx = ctx(Caveats {
             net: Scope::none(),
             ..Caveats::top()
         });
-        match ConfinedCommand::new("/usr/bin/touch")
+
+        // The benign leg: admission no longer refuses net:none before spawn.
+        let mut touch = ConfinedCommand::new("/usr/bin/touch")
             .arg(&marker)
             .spawn(&cx)
-        {
-            Err(ToolError::Denied { .. }) => {}
-            Err(other) => panic!("expected a restricted-network authority denial, got {other}"),
-            Ok(mut spawned) => {
-                let _ = spawned.child.kill();
-                panic!("restricted network authority must be denied before spawn");
-            }
-        }
+            .expect("net:none with zero mach: grants must now be admitted");
+        assert!(touch.child.wait().expect("wait").success());
         assert!(
-            !marker.exists(),
-            "the denied command must never have executed"
+            marker.exists(),
+            "the admitted command must actually have run"
         );
+
+        // Positive control: an UNCONFINED curl reaches an owned listener.
+        let addr = one_shot_listener("127.0.0.1:0");
+        let url = format!("http://{addr}/");
+        let control = std::process::Command::new("/usr/bin/curl")
+            .args(["-sS", "--max-time", "5", &url])
+            .status()
+            .expect("spawn unconfined curl control");
+        assert!(
+            control.success(),
+            "positive control: an unconfined curl must reach the owned listener"
+        );
+
+        // Confined: the SAME request through the real spawn path must be
+        // kernel-denied before it ever reaches the listener.
+        let addr2 = one_shot_listener("127.0.0.1:0");
+        let url2 = format!("http://{addr2}/");
+        let mut curl = ConfinedCommand::new("/usr/bin/curl")
+            .args(["-sS", "--max-time", "5", &url2])
+            .spawn(&cx)
+            .expect("spawn");
+        assert_eq!(
+            curl.child.wait().expect("wait").code(),
+            Some(7),
+            "the confined child's own network attempt must be kernel-denied, exact exit 7"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

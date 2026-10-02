@@ -292,6 +292,42 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.is_empty())
 }
 
+/// `true` when the Seatbelt Mach-lookup deputy audit (agent-bridle#405) is
+/// complete on this build — i.e. [`seatbelt_impl::MACH_DEPUTY_AUDIT`] is
+/// `Complete`. A narrow, read-only crossing of the `seatbelt_impl` cfg
+/// boundary so `report.rs`'s cross-platform `enforcement_report` can gate a
+/// `net → Kernel` claim on the same audit state that already gates the L3
+/// `resolved_authority` projection ([`seatbelt_impl::seatbelt_net_projection`]),
+/// without making the enum or the constant itself public. On a non-macOS
+/// build (or without the `macos-seatbelt` feature) the audit cannot exist, so
+/// this is unconditionally `false` — never a claim this platform cannot back.
+#[must_use]
+pub(crate) fn seatbelt_mach_deputy_audit_complete() -> bool {
+    #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
+    {
+        seatbelt_impl::MACH_DEPUTY_AUDIT == seatbelt_impl::MachDeputyAudit::Complete
+    }
+    #[cfg(not(all(target_os = "macos", feature = "macos-seatbelt")))]
+    {
+        false
+    }
+}
+
+/// `true` when a Seatbelt `net` scope is a **Kernel** egress-deny witness: the
+/// deny-all shape (`net_fully_denied`, which already implies zero `mach:`/
+/// `unix:` grants — they are entries in the same non-empty scope set) AND a
+/// complete Mach-lookup deputy audit (agent-bridle#405/ADR 0015 E6). Pure —
+/// takes `audit_complete` as a parameter rather than reading
+/// [`seatbelt_mach_deputy_audit_complete`] itself, so `report.rs`'s test suite
+/// can pin this pure predicate directly, independent of whichever state the
+/// production constant ships (`Complete` as of agent-bridle#405/ADR 0015
+/// amendment E6, 2026-10-01; see [`seatbelt_impl::MACH_DEPUTY_AUDIT`]'s doc
+/// comment for the evidence).
+#[must_use]
+pub(crate) fn seatbelt_net_kernel_witness(effective: &Caveats, audit_complete: bool) -> bool {
+    audit_complete && net_fully_denied(effective)
+}
+
 /// An explicit `unix:<path>` token names a path-anchored Unix-domain socket
 /// endpoint, distinct from a DNS host. It participates in the ordinary net
 /// scope like any other grant, but filesystem grants never imply permission
@@ -300,6 +336,164 @@ pub(crate) fn net_fully_denied(caveats: &Caveats) -> bool {
 #[must_use]
 pub(crate) fn has_unix_socket_grants(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s) if s.iter().any(|h| h.starts_with("unix:")))
+}
+
+/// The `net`-scope token prefix that names one Mach service a network-denied
+/// macOS child may look up: `mach:<global-name>` (agent-bridle#405).
+///
+/// Under a network-denied Seatbelt profile the Mach-lookup floor is **zero**:
+/// every named service is kernel-denied unless the operator grants it by name
+/// with one of these tokens. Nothing is ambient. A grant is a scope entry like
+/// any other — it rides in the ordinary `net` axis, is narrowed by `meet`, and
+/// is projected as a named class (`seatbelt-mach-service:<name>`) so admission
+/// compares it honestly and the report shows it. Only Seatbelt can enforce it;
+/// every other backend refuses the token outright (never silently ambient).
+pub const MACH_GRANT_PREFIX: &str = "mach:";
+
+/// `true` if the `net` axis carries at least one `mach:<service>` grant.
+#[must_use]
+pub(crate) fn has_mach_service_grants(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if s.iter().any(|h| h.starts_with(MACH_GRANT_PREFIX)))
+}
+
+/// `true` iff `token` is a **structural** net-scope entry — a `unix:` endpoint
+/// or a `mach:` service grant — rather than an IP/DNS host name. Both are
+/// Seatbelt-only, and neither is an egress host the proxy could admit.
+#[must_use]
+pub(crate) fn is_structural_net_token(token: &str) -> bool {
+    token.starts_with("unix:") || token.starts_with(MACH_GRANT_PREFIX)
+}
+
+/// The validated, sorted, de-duplicated Mach service names granted by
+/// `mach:<global-name>` tokens in `caveats.net`. `Ok(empty)` when the axis is
+/// unrestricted or carries no such token.
+///
+/// A global name is a launchd/XPC service label such as
+/// `com.apple.system.opendirectoryd.libinfo`: non-empty, ASCII letters, digits,
+/// `.`, `_` and `-` only. Anything else — an empty name, whitespace, a quote,
+/// a wildcard — fails closed, so a crafted token can never reach the SBPL
+/// profile (which quotes the literal, but the validation keeps the grant
+/// vocabulary exact rather than relying on quoting alone).
+///
+/// # Errors
+/// [`ToolError::Denied`] when any `mach:` token is malformed.
+pub fn mach_service_grants(caveats: &Caveats) -> ToolResult<Vec<String>> {
+    let crate::Scope::Only(names) = &caveats.net else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<String> = names
+        .iter()
+        .filter_map(|token| token.strip_prefix(MACH_GRANT_PREFIX))
+        .map(|name| {
+            let valid = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            if valid {
+                Ok(name.to_owned())
+            } else {
+                Err(crate::ToolError::denied(format!(
+                    "mach: service grant must name a launchd global-name \
+                     (ASCII letters, digits, '.', '_', '-'); got {name:?}"
+                )))
+            }
+        })
+        .collect::<ToolResult<_>>()?;
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The named class under which one granted Mach service appears in the
+/// resolved-authority lattice (`ResolvedScope::classes`) — following the
+/// `appcontainer-loopback-exemption` precedent: a grant that is real authority
+/// the mechanism permits, revealed by name so it can never collapse to `∅`.
+#[must_use]
+pub fn seatbelt_mach_service_class(service: &str) -> String {
+    format!("seatbelt-mach-service:{service}")
+}
+
+/// The Mach services a network-denied child *commonly needs* to run ordinary
+/// tooling — the **candidate grant set** an operator (or a host prompt) may open
+/// by name with a `mach:<service>` token. Until agent-bridle#405 this list was
+/// re-allowed ambiently under `net:none`; it is now **withheld by default** and
+/// listed here only so a host can name what it withheld.
+///
+/// None of these services has native evidence that it cannot act as a network
+/// deputy for the child, so none is in the default floor (which is empty). The
+/// native breakage measurement recorded in ADR 0015 (2026-09-28 amendment)
+/// found: `opendirectoryd.libinfo` is needed for uid→name resolution (`id -un`,
+/// `git commit` without a configured identity); `SecurityServer` for
+/// keychain access (`security`); git, cargo, sh, python (incl. TLS default
+/// certs), curl and xcrun ran without any of them.
+pub const MACH_SERVICE_CANDIDATES: &[&str] = &[
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.system.DirectoryService.libinfo_v1",
+    "com.apple.system.notification_center",
+    "com.apple.CoreServices.coreservicesd",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.dyld.closured",
+    "com.apple.logd",
+    "com.apple.logd.events",
+    "com.apple.diagnosticd",
+    "com.apple.SecurityServer",
+    "com.apple.trustd.agent",
+];
+
+/// The structured Mach-service posture of one network-denied Seatbelt run —
+/// the "service X denied" result a host needs to offer an operator grant
+/// (agent-bridle#405). The kernel denies a Mach lookup **silently** (no
+/// per-lookup signal reaches the child or the harness), so this is derived
+/// from the policy actually installed, not observed after the fact: `granted`
+/// is exactly the set re-allowed in the profile, `withheld` is every known
+/// candidate the profile denies. Informational (a [`crate::Disclosure`]
+/// field): it never raises or lowers the enforcement claim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MachServiceDisclosure {
+    /// Services re-allowed by name (`mach:<service>` grants), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted: Vec<String>,
+    /// Known candidate services ([`MACH_SERVICE_CANDIDATES`]) the profile
+    /// denies because no grant named them, sorted. A child that fails on one
+    /// of these is a candidate for an operator grant; the host owns the prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<String>,
+}
+
+/// The [`MachServiceDisclosure`] for `caveats` under `kind`, or `None` when no
+/// Mach floor is installed: only a **Seatbelt** run whose direct network is
+/// fully denied (an empty scope, or `unix:`/`mach:` entries only) carries the
+/// zero floor. A loopback or remote-host shape leaves Mach lookup ambient (so
+/// nothing is withheld), and no other backend installs a Mach floor at all.
+///
+/// # Errors
+/// [`ToolError::Denied`] when a `mach:` token is malformed.
+pub fn mach_service_disclosure(
+    caveats: &Caveats,
+    kind: SandboxKind,
+) -> ToolResult<Option<MachServiceDisclosure>> {
+    if kind != SandboxKind::Seatbelt || !net_direct_denied(caveats) {
+        return Ok(None);
+    }
+    let granted = mach_service_grants(caveats)?;
+    let withheld = MACH_SERVICE_CANDIDATES
+        .iter()
+        .map(|s| (*s).to_string())
+        .filter(|s| !granted.contains(s))
+        .collect();
+    Ok(Some(MachServiceDisclosure { granted, withheld }))
+}
+
+/// `true` iff the `net` axis denies **every direct socket** of the child: it
+/// is `Only(set)` and every entry is structural (`unix:` endpoint or `mach:`
+/// service grant) — including the empty set. This is the shape under which
+/// Seatbelt emits `(deny network*)` plus the zero Mach floor. It generalizes
+/// [`net_fully_denied`] (empty set only), which the Landlock/AppContainer
+/// backends keep because they cannot express either structural entry.
+#[must_use]
+pub(crate) fn net_direct_denied(caveats: &Caveats) -> bool {
+    matches!(&caveats.net, crate::Scope::Only(s) if s.iter().all(|h| is_structural_net_token(h)))
 }
 
 /// `true` when the `exec` axis is a deny-all empty allow-list (`Scope::Only([])`).
@@ -371,7 +565,7 @@ pub(crate) const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 pub(crate) fn net_loopback_only(caveats: &Caveats) -> bool {
     matches!(&caveats.net, crate::Scope::Only(s)
         if s.iter().any(|h| LOOPBACK_HOSTS.contains(&h.as_str()))
-            && s.iter().all(|h| h.starts_with("unix:") || LOOPBACK_HOSTS.contains(&h.as_str())))
+            && s.iter().all(|h| is_structural_net_token(h) || LOOPBACK_HOSTS.contains(&h.as_str())))
 }
 
 /// `true` iff a loopback-only net scope denotes the **entire** kernel-enforced
@@ -394,7 +588,7 @@ pub(crate) fn net_loopback_full_interface(caveats: &Caveats) -> bool {
     // additional authority AppContainer cannot express or enforce at all (it
     // rejects such a grant outright, see `appcontainer_impl::command_prefix`)
     // — never let its presence read as "still exactly the loopback interface".
-    if has_unix_socket_grants(caveats) {
+    if has_unix_socket_grants(caveats) || has_mach_service_grants(caveats) {
         return false;
     }
     matches!(&caveats.net, crate::Scope::Only(s) if
@@ -424,11 +618,11 @@ pub fn net_egress_proxy_hosts(caveats: &Caveats) -> Option<Vec<String>> {
     match &caveats.net {
         crate::Scope::Only(s)
             if s.iter()
-                .any(|h| !h.starts_with("unix:") && !LOOPBACK_HOSTS.contains(&h.as_str())) =>
+                .any(|h| !is_structural_net_token(h) && !LOOPBACK_HOSTS.contains(&h.as_str())) =>
         {
             Some(
                 s.iter()
-                    .filter(|h| !h.starts_with("unix:"))
+                    .filter(|h| !is_structural_net_token(h))
                     .cloned()
                     .collect(),
             )
@@ -493,6 +687,15 @@ pub(crate) fn egress_proxy_plan_for(
     if has_unix_socket_grants(caveats) && available != SandboxKind::Seatbelt {
         // No other backend projects exact Unix endpoint authority; the proxy
         // would silently drop the Unix grant instead of confining it.
+        return None;
+    }
+    if has_mach_service_grants(caveats) {
+        // A `mach:` grant has meaning only under a Mach floor, and the proxy's
+        // loopback fence installs none (Mach stays ambient there). The fenced
+        // caveats would erase the grant rather than confine it, so a
+        // mach-bearing remote-host scope has no defined proxy semantics on ANY
+        // backend: refuse the plan outright instead of dropping the token
+        // (review of #406). Define and prove those semantics before enabling.
         return None;
     }
     let allow_hosts = net_egress_proxy_hosts(caveats)?;
@@ -564,6 +767,7 @@ pub fn effective_sandbox_kind(available: SandboxKind, caveats: &Caveats) -> Sand
                 || net_fully_denied(caveats)
                 || net_loopback_only(caveats)
                 || has_unix_socket_grants(caveats)
+                || has_mach_service_grants(caveats)
                 || restricts_exec(caveats) =>
         {
             SandboxKind::Seatbelt
@@ -825,6 +1029,11 @@ pub(crate) mod appcontainer_impl {
             if super::has_unix_socket_grants(effective) {
                 return Err(ToolError::denied(
                     "windows-appcontainer: exact Unix endpoint grants require Seatbelt",
+                ));
+            }
+            if super::has_mach_service_grants(effective) {
+                return Err(ToolError::denied(
+                    "windows-appcontainer: mach: service grants require Seatbelt",
                 ));
             }
             // The launcher engages when:
@@ -2494,14 +2703,64 @@ mod seatbelt_impl {
     use std::path::Path;
     use std::sync::Arc;
 
-    /// `true` iff every host in a non-empty `net` allow-list is a `unix:`
-    /// endpoint (no IP/DNS host at all) — the shape Seatbelt can kernel-deny
-    /// direct network entirely (`(deny network*)`) and then re-allow exactly
-    /// the named sockets. Seatbelt-only: no other backend projects exact Unix
-    /// endpoint authority, so this predicate has no cross-backend caller.
-    fn net_unix_only(caveats: &Caveats) -> bool {
-        matches!(&caveats.net, Scope::Only(s)
-            if !s.is_empty() && s.iter().all(|h| h.starts_with("unix:")))
+    /// Whether the Mach-service deputy audit for the zero floor is complete
+    /// (agent-bridle#405 D4). While `Incomplete`, every restricted Seatbelt net
+    /// shape projects `Unknown` and admission refuses it — the fail-closed
+    /// posture of ADR 0015's E4 ruling. Only a deputy-complete native proof
+    /// (every reachable ambient IPC route shown closed, positive controls
+    /// included) may flip [`MACH_DEPUTY_AUDIT`] to `Complete`. The constant
+    /// controls ONLY the resolved-authority projection (the L3 scope bound);
+    /// `report.rs`'s Seatbelt `net` arm reads it too (via
+    /// `seatbelt_mach_deputy_audit_complete`/`seatbelt_net_kernel_witness`) so
+    /// the L3 projection and the L4 strength report promote together, never
+    /// one without the other.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MachDeputyAudit {
+        Incomplete,
+        Complete,
+    }
+
+    /// The audit state this build ships. **Complete** (agent-bridle#405, ADR
+    /// 0015 amendment E6, 2026-10-01): the zero floor closes every *named*
+    /// Mach lookup, and the full channel sweep this audit required —
+    /// unix-domain sockets, `open(1)`/LaunchServices, Darwin notifications,
+    /// pasteboard, `iokit-open`, `sysctl-write`, a write-class `file-ioctl`,
+    /// `process-info`/`signal`, XPC beyond `mach-lookup`, and AppleEvents —
+    /// is each shown closed or correctly placed out of the net-egress threat
+    /// model (full evidence table: ADR 0015 amendment E6). This governs ONLY
+    /// the deny-all, zero-`mach:`-grant shape; a named grant, a loopback
+    /// scope, or a remote-host allowlist are unaffected and stay
+    /// `Unknown`/`Advisory`.
+    pub(super) const MACH_DEPUTY_AUDIT: MachDeputyAudit = MachDeputyAudit::Complete;
+
+    /// The conservative network projection for `effective` under `audit`.
+    /// Pure. `All` is ambient (`Unbounded`). Every restricted shape is
+    /// `Unknown` while the audit is incomplete. Under a complete audit the
+    /// direct-denied shapes (`net:none`, `unix:`-only, `mach:`-only, or mixed)
+    /// resolve to exactly what the profile permits: the `unix:` endpoints as
+    /// concrete entries and each `mach:` grant as its named class — never `∅`
+    /// while a grant is present, so admission compares the grant honestly.
+    /// Loopback and remote-host shapes stay `Unknown` under either state:
+    /// their Mach lookup is ambient (no floor), so nothing bounds a deputy.
+    pub(super) fn seatbelt_net_projection(
+        effective: &Caveats,
+        audit: MachDeputyAudit,
+    ) -> crate::ResolvedScope {
+        use crate::ResolvedScope as Rs;
+        match &effective.net {
+            Scope::All => Rs::Unbounded,
+            Scope::Only(_) if audit == MachDeputyAudit::Incomplete => Rs::Unknown,
+            Scope::Only(set) if super::net_direct_denied(effective) => {
+                let Ok(grants) = super::mach_service_grants(effective) else {
+                    return Rs::Unknown;
+                };
+                let concrete = Rs::concrete(set.iter().filter(|h| h.starts_with("unix:")).cloned());
+                grants.iter().fold(concrete, |acc, g| {
+                    acc.union(&Rs::class(super::seatbelt_mach_service_class(g)))
+                })
+            }
+            Scope::Only(_) => Rs::Unknown,
+        }
     }
 
     /// The macOS sandbox wrapper. We invoke it by **absolute path** (never via
@@ -2541,12 +2800,17 @@ mod seatbelt_impl {
     /// effective [`Caveats`] (see [`seatbelt_profile`]): writes are denied
     /// outside the granted `fs_write` roots, and — when `fs_read` is restricted —
     /// reads are denied outside the granted roots plus the loader/system base
-    /// list. When `net` is empty it kernel-denies the child's direct socket
-    /// operations and installs a conservative Mach-lookup floor as
-    /// defense-in-depth. That floor is not proof that every ambient deputy is
-    /// closed, so restricted network authority remains held at admission. A
-    /// non-empty `net` host allowlist is not expressible in SBPL (it filters by
-    /// socket, not hostname) and stays advisory.
+    /// list. When direct network is denied (`net:none`, or `unix:`/`mach:`
+    /// entries only) it kernel-denies the child's direct socket operations and
+    /// installs the **zero** Mach-lookup floor (agent-bridle#405): every named
+    /// Mach service is denied unless the operator granted it by name with a
+    /// `mach:<service>` token — nothing ambient. With no grant the floor
+    /// closes every named Mach lookup; a grant re-opens the named service,
+    /// deputy or not. Neither is a deputy-complete proof (other ambient IPC is
+    /// not certified), so restricted network authority remains held at admission
+    /// (`MACH_DEPUTY_AUDIT`). A non-empty `net` host allowlist is not
+    /// expressible in SBPL (it filters by socket, not hostname) and stays
+    /// advisory.
     ///
     /// **The `exec` axis** — when restricted, the profile emits
     /// `(deny process-exec*)` and re-allows exactly the granted programs (resolved
@@ -2619,8 +2883,8 @@ mod seatbelt_impl {
                     &self.policy.base_read_paths.resolve(),
                     &self.policy.device_sink_paths.resolve(),
                     &unix_socket_paths(effective)?,
+                    &super::mach_service_grants(effective)?,
                     mach_floor,
-                    self.policy.macos_private_ptys,
                 ),
             ])
         }
@@ -2655,17 +2919,36 @@ mod seatbelt_impl {
         /// Deliberately partial Seatbelt projection. The filesystem and exec axes
         /// retain the legacy caveats-grain/verbatim projection so this change does
         /// not claim ruleset-grain fidelity that has not been established. Network
-        /// is stricter: unrestricted authority is honestly ambient, while every
-        /// restricted network scope remains `Unknown` and is refused before spawn.
-        /// The Mach floor in the generated profile is defense-in-depth only and is
-        /// not used to promote restricted network authority to a bounded claim.
+        /// follows [`seatbelt_net_projection`] under the shipped
+        /// [`MACH_DEPUTY_AUDIT`]: unrestricted authority is honestly ambient, and
+        /// every restricted network scope remains `Unknown` (refused before spawn)
+        /// until the deputy audit is complete. The zero Mach floor and the named
+        /// `mach:` grants in the generated profile are real kernel rules, but they
+        /// are not used to promote restricted network authority to a bounded claim
+        /// (agent-bridle#405 D4: fail closed first).
         fn resolved_authority(&self, effective: &Caveats) -> crate::ResolvedAuthority {
             let mut resolved = crate::ResolvedAuthority::from_delegated(effective);
-            resolved.net = match &effective.net {
-                Scope::All => crate::ResolvedScope::Unbounded,
-                Scope::Only(_) => crate::ResolvedScope::Unknown,
-            };
+            resolved.net = seatbelt_net_projection(effective, MACH_DEPUTY_AUDIT);
             resolved
+        }
+
+        /// The Seatbelt closure declares, on the net axis, exactly the named
+        /// classes its profile re-allows for the operator's `mach:` grants — the
+        /// bridge that lets `resolved.net` (which names the grant as a class)
+        /// admit as a `Subset` of `delegated ∪ closure` once the projection is
+        /// bounded. It adds nothing the caveats did not name: each class is
+        /// derived from a grant token in `effective.net`, never from a built-in
+        /// list. Nothing on any other axis.
+        fn runtime_closure(&self, effective: &Caveats) -> crate::ResolvedAuthority {
+            let mut closure = crate::empty_closure();
+            if let Ok(grants) = super::mach_service_grants(effective) {
+                closure.net = grants.iter().fold(crate::ResolvedScope::empty(), |acc, g| {
+                    acc.union(&crate::ResolvedScope::class(
+                        super::seatbelt_mach_service_class(g),
+                    ))
+                });
+            }
+            closure
         }
 
         fn apply(&self, _effective: &Caveats) -> ToolResult<()> {
@@ -2677,28 +2960,40 @@ mod seatbelt_impl {
 
         fn command_prefix(&self, effective: &Caveats) -> ToolResult<Vec<String>> {
             let unix_sockets = unix_socket_paths(effective)?;
+            let mach_grants = super::mach_service_grants(effective)?;
             if !unix_sockets.is_empty()
-                && !net_unix_only(effective)
+                && !super::net_direct_denied(effective)
                 && !super::net_loopback_only(effective)
             {
                 return Err(ToolError::denied(
                     "Unix socket grants with remote hosts require the managed egress proxy",
                 ));
             }
+            // A `mach:` grant only has meaning where a Mach floor is installed —
+            // the direct-denied shapes. Under a loopback or remote-host shape the
+            // profile leaves Mach lookup ambient (no floor, so nothing to re-open);
+            // refuse rather than accept a grant the fence would not act on.
+            if !mach_grants.is_empty() && !super::net_direct_denied(effective) {
+                return Err(ToolError::denied(
+                    "mach: service grants apply only to a network-denied scope \
+                     (net:none or unix:/mach: entries only)",
+                ));
+            }
             // Nothing on a governed axis (fs, a direct-network floor, exact Unix
-            // endpoints, or a restricted exec allow-list) => nothing to confine;
-            // run unwrapped (coarse honesty falls to `None` upstream, and the
-            // per-axis report omits unrestricted axes).
+            // endpoints, Mach service grants, or a restricted exec allow-list) =>
+            // nothing to confine; run unwrapped (coarse honesty falls to `None`
+            // upstream, and the per-axis report omits unrestricted axes).
             if !super::restricts_fs(effective)
-                && !super::net_fully_denied(effective)
+                && !super::net_direct_denied(effective)
                 && !super::net_loopback_only(effective)
                 && unix_sockets.is_empty()
+                && mach_grants.is_empty()
                 && !super::restricts_exec(effective)
             {
                 return Ok(Vec::new());
             }
-            // Production always installs the closed Mach floor. The network
-            // projection remains Unknown for every restricted scope regardless.
+            // Production always installs the zero Mach floor plus the named
+            // grants. The network projection follows `MACH_DEPUTY_AUDIT`.
             self.wrapper_prefix(effective, NetNoneMachFloor::Closed)
         }
     }
@@ -2726,23 +3021,24 @@ mod seatbelt_impl {
             &policy.base_read_paths.resolve(),
             &policy.device_sink_paths.resolve(),
             &unix_socket_paths(effective).expect("valid Unix socket grants in profile fixture"),
+            &super::mach_service_grants(effective).expect("valid mach: grants in profile fixture"),
             NetNoneMachFloor::Closed,
-            policy.macos_private_ptys,
         )
     }
 
     /// SBPL profile builder, parameterized on the read base (`base_read`), the
-    /// always-writable device sinks (`sinks`, #1220), and the exact Unix
-    /// endpoint paths (`unix_sockets`) already validated by
-    /// [`unix_socket_paths`].
+    /// always-writable device sinks (`sinks`, #1220), the exact Unix endpoint
+    /// paths (`unix_sockets`) already validated by [`unix_socket_paths`], and
+    /// the Mach service names (`mach_grants`) already validated by
+    /// [`super::mach_service_grants`].
     #[must_use]
     fn seatbelt_profile_with(
         effective: &Caveats,
         base_read: &[String],
         sinks: &[String],
         unix_sockets: &[String],
+        mach_grants: &[String],
         mach_floor: NetNoneMachFloor,
-        private_ptys: bool,
     ) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n");
 
@@ -2785,58 +3081,45 @@ mod seatbelt_impl {
                     p.push_str(&format!(" (subpath {})", sbpl_string(&c)));
                 }
             }
+            for r in confined_roots(&effective.fs_read) {
+                p.push_str(&format!(" (subpath {})", sbpl_string(&r)));
+            }
             p.push_str(")\n");
-            if private_ptys {
-                // The default read base includes /dev. Override that ambient
-                // base for slave terminals, then reapply explicit user roots.
-                p.push_str("(deny file-read* (regex #\"^/dev/ttys[0-9]+$\"))\n");
-            }
-            let roots = confined_roots(&effective.fs_read);
-            if !roots.is_empty() {
-                p.push_str("(allow file-read*");
-                for r in roots {
-                    p.push_str(&format!(" (subpath {})", sbpl_string(&r)));
-                }
-                p.push_str(")\n");
-            }
-        }
-
-        if private_ptys {
-            // Fresh devices are a declared runtime exception. The kernel
-            // extension binds slave access to PTYs allocated in this sandbox;
-            // an unrelated host terminal receives no read/write grant here.
-            // Inherited descriptors and /dev/tty are separate existing surfaces.
-            p.push_str("(allow pseudo-tty)\n");
-            p.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n");
-            p.push_str("(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n");
         }
 
         // net: SBPL can name only `*`/`localhost` + ports as a remote (an
         // arbitrary IP is rejected: "host must be * or localhost"; ADR 0015), so a
         // general host allowlist is inexpressible and left ambient (reported
         // advisory, never silently dropped). The two policies it *can* enforce:
-        //   • empty scope  → `(deny network*)`: the child's direct socket
-        //     operations are kernel-denied. Production also installs the typed
-        //     Mach-lookup floor below as defense-in-depth; this is not an exhaustive
-        //     deputy proof and restricted network admission remains held.
+        //   • direct-denied scope (empty, or `unix:`/`mach:` entries only) →
+        //     `(deny network*)`: the child's direct socket operations are
+        //     kernel-denied. Production also installs the ZERO Mach-lookup floor
+        //     below (agent-bridle#405): every named Mach service is denied unless
+        //     the operator granted it by name. Nothing is ambient. With no grant
+        //     this closes every named Mach lookup; it is not a deputy-complete
+        //     proof, so restricted network admission remains held
+        //     (`MACH_DEPUTY_AUDIT`).
         //   • loopback-only allowlist → deny all, then re-allow the loopback
         //     interface (`localhost` = 127.0.0.1 + ::1). The process's own off-box
         //     socket egress stays kernel-denied; the exact loopback host is narrowed
         //     by admission. Last-match-wins, so the allow overrides.
-        if super::net_fully_denied(effective) || net_unix_only(effective) {
+        if super::net_direct_denied(effective) {
             p.push_str("(deny network*)\n");
             match mach_floor {
                 NetNoneMachFloor::Closed => {
-                    // Defense-in-depth: default-deny named Mach lookup, then restore
-                    // the compatibility floor below. This characterizes one known
-                    // incremental barrier; it does not prove that all Mach/XPC,
-                    // AppleEvent, or other ambient deputies are closed.
+                    // Zero floor: default-deny named Mach lookup, then re-allow
+                    // exactly the operator's `mach:` grants (sorted, deduped by
+                    // `mach_service_grants`). No grant ⇒ the deny stands alone.
+                    // The former ambient compatibility list is now
+                    // `MACH_SERVICE_CANDIDATES` — documented, never emitted.
                     p.push_str("(deny mach-lookup)\n");
-                    p.push_str("(allow mach-lookup");
-                    for name in MACH_LOOKUP_ALLOWLIST {
-                        p.push_str(&format!(" (global-name {})", sbpl_string(name)));
+                    if !mach_grants.is_empty() {
+                        p.push_str("(allow mach-lookup");
+                        for name in mach_grants {
+                            p.push_str(&format!(" (global-name {})", sbpl_string(name)));
+                        }
+                        p.push_str(")\n");
                     }
-                    p.push_str(")\n");
                 }
                 #[cfg(test)]
                 NetNoneMachFloor::AmbientCharacterization => {}
@@ -2844,6 +3127,11 @@ mod seatbelt_impl {
         } else if super::net_loopback_only(effective) {
             p.push_str("(deny network*)\n");
             p.push_str("(allow network* (remote ip \"localhost:*\"))\n");
+            // The server side of the same interface: bind, listen and accept
+            // on a loopback address (a test suite's mock server). `remote ip`
+            // governs only the peer, so without this `bind` is EPERM. Off-box
+            // stays denied: both rules name only `localhost`.
+            p.push_str("(allow network-bind network-inbound (local ip \"localhost:*\"))\n");
         }
         // Exact Unix endpoints (#385 upstream, forward-ported): each granted
         // socket path is an exact outbound exception, never an `(allow
@@ -2932,25 +3220,6 @@ mod seatbelt_impl {
         roots.dedup();
         roots
     }
-
-    /// Operational compatibility floor re-allowed after the production
-    /// `net:none` Mach-lookup deny. It has been exercised with common build tools,
-    /// but it is not an exhaustive deputy audit and does not justify bounded
-    /// network authority. Restricted network scopes remain `Unknown` at admission.
-    const MACH_LOOKUP_ALLOWLIST: &[&str] = &[
-        "com.apple.system.opendirectoryd.libinfo",
-        "com.apple.system.opendirectoryd.membership",
-        "com.apple.system.DirectoryService.libinfo_v1",
-        "com.apple.system.notification_center",
-        "com.apple.CoreServices.coreservicesd",
-        "com.apple.coreservices.launchservicesd",
-        "com.apple.dyld.closured",
-        "com.apple.logd",
-        "com.apple.logd.events",
-        "com.apple.diagnosticd",
-        "com.apple.SecurityServer",
-        "com.apple.trustd.agent",
-    ];
 
     /// System binary directories searched to resolve a **bare-name** `exec` grant
     /// (e.g. `["git"]`) to absolute path(s) for the `process-exec*` allow-list.
@@ -3060,11 +3329,11 @@ mod seatbelt_impl {
         use super::*;
         use crate::{ResolvedScope, Scope};
 
-        /// The production `net:none` profile carries the configured Mach-lookup
-        /// defense-in-depth floor. This pins the selected policy shape only; it is
-        /// not evidence that all ambient deputies are closed.
+        /// The production `net:none` profile installs the ZERO Mach-lookup floor
+        /// (agent-bridle#405): default-deny named lookup and re-allow NOTHING —
+        /// no candidate, no former compatibility service, no `nsurlsessiond`.
         #[test]
-        fn net_none_profile_installs_the_mach_defense_floor() {
+        fn net_none_profile_installs_the_zero_mach_floor() {
             let cav = Caveats {
                 net: Scope::none(),
                 ..Caveats::top()
@@ -3073,16 +3342,94 @@ mod seatbelt_impl {
             assert!(profile.contains("(deny network*)"), "{profile}");
             assert!(
                 profile.contains("(deny mach-lookup)"),
-                "net:none production profile must install the Mach defense floor: {profile}"
+                "net:none production profile must install the Mach floor: {profile}"
             );
             assert!(
-                profile.contains("com.apple.system.opendirectoryd.libinfo"),
-                "the compatibility allow-list must be re-allowed: {profile}"
+                !profile.contains("(allow mach-lookup"),
+                "zero floor: nothing is re-allowed without a grant: {profile}"
+            );
+            for candidate in super::super::MACH_SERVICE_CANDIDATES {
+                assert!(
+                    !profile.contains(candidate),
+                    "candidate {candidate} must be withheld by default: {profile}"
+                );
+            }
+            assert!(!profile.contains("nsurlsessiond"), "{profile}");
+        }
+
+        /// A `mach:` grant emits exactly one `global-name` literal per granted
+        /// service after the deny (last-match-wins) and no other re-allow.
+        #[test]
+        fn mach_grant_reopens_exactly_the_named_service() {
+            let cav = Caveats {
+                net: Scope::only([
+                    "mach:com.apple.SecurityServer".to_string(),
+                    "mach:com.apple.system.opendirectoryd.libinfo".to_string(),
+                ]),
+                ..Caveats::top()
+            };
+            let profile = seatbelt_profile(&cav);
+            assert!(profile.contains("(deny network*)"), "{profile}");
+            let deny = profile.find("(deny mach-lookup)").expect("floor present");
+            let allow = profile
+                .find("(allow mach-lookup (global-name \"com.apple.SecurityServer\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))")
+                .expect("exactly the two grants, sorted: {profile}");
+            assert!(allow > deny, "the re-allow must follow the deny: {profile}");
+            assert_eq!(
+                profile.matches("(allow mach-lookup").count(),
+                1,
+                "{profile}"
             );
             assert!(
-                !profile.contains("nsurlsessiond"),
-                "the selected background-session service is outside this compatibility floor: {profile}"
+                !profile.contains("trustd"),
+                "an ungranted candidate stays denied: {profile}"
             );
+            // A grant alongside a `unix:` endpoint is still a direct-denied shape.
+            let sock = std::env::temp_dir().join(format!("ab405-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&sock);
+            let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+            let canonical = std::fs::canonicalize(&sock)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let mixed = Caveats {
+                net: Scope::only([
+                    format!("unix:{canonical}"),
+                    "mach:com.apple.logd".to_string(),
+                ]),
+                ..Caveats::top()
+            };
+            let profile = seatbelt_profile(&mixed);
+            assert!(profile.contains("(deny mach-lookup)"), "{profile}");
+            assert!(
+                profile.contains("(global-name \"com.apple.logd\")"),
+                "{profile}"
+            );
+            assert!(
+                profile.contains("(allow network-outbound (literal"),
+                "{profile}"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+
+        /// A malformed grant refuses before any profile is built, and a grant
+        /// under a shape with no Mach floor (loopback) refuses rather than being
+        /// accepted as a no-op the fence would never act on.
+        #[test]
+        fn mach_grant_refuses_when_malformed_or_floorless() {
+            let bad = Caveats {
+                net: Scope::only(["mach:com.apple.*".to_string()]),
+                ..Caveats::top()
+            };
+            assert!(SeatbeltSandbox::new().command_prefix(&bad).is_err());
+            let floorless = Caveats {
+                net: Scope::only(["localhost".to_string(), "mach:com.apple.logd".to_string()]),
+                ..Caveats::top()
+            };
+            let err = SeatbeltSandbox::new()
+                .command_prefix(&floorless)
+                .expect_err("loopback leaves Mach ambient; a grant there is refused");
+            assert!(err.to_string().contains("network-denied"), "{err}");
         }
 
         /// A granted (non-empty) net axis, or an unrestricted one, does not add the
@@ -3093,27 +3440,153 @@ mod seatbelt_impl {
             assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
         }
 
-        /// Support remains held: every restricted network scope is Unknown even
-        /// when the profile installs direct-network and Mach defense-in-depth.
+        /// agent-bridle#405/ADR 0015 amendment E6: the deputy audit is now
+        /// `Complete` (the full channel sweep closed, AppleEvents included).
+        /// `net:none` zero grants resolves to the bottom element `∅` — the
+        /// promotion this whole audit exists to back.
         #[test]
-        fn every_restricted_network_scope_resolves_unknown() {
+        fn net_none_resolves_bounded_empty_now_the_audit_is_complete() {
+            assert_eq!(MACH_DEPUTY_AUDIT, MachDeputyAudit::Complete);
             let cav = Caveats {
                 net: Scope::none(),
                 ..Caveats::top()
             };
             assert_eq!(
                 SeatbeltSandbox::new().resolved_authority(&cav).net,
-                ResolvedScope::Unknown,
-                "net:none support must remain held at admission"
+                ResolvedScope::empty(),
+                "net:none zero grants must resolve to the bottom element now the audit is complete"
             );
+        }
+
+        /// A named `mach:` grant resolves to its own class, never to `∅` and
+        /// never to `Unknown` — the "never collapse to ∅" requirement from
+        /// #405's acceptance criteria, now exercised through the real
+        /// `resolved_authority`, not just the pure projection function.
+        #[test]
+        fn mach_grant_resolves_its_named_class_not_unknown_or_empty() {
             let cav = Caveats {
-                net: Scope::only(["127.0.0.1".to_string()]),
+                net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
                 ..Caveats::top()
             };
             assert_eq!(
                 SeatbeltSandbox::new().resolved_authority(&cav).net,
+                ResolvedScope::class(super::super::seatbelt_mach_service_class(
+                    "com.apple.SecurityServer"
+                )),
+                "a named grant must never collapse to ∅ nor remain Unknown"
+            );
+        }
+
+        /// Support remains held for shapes this audit never covered: loopback
+        /// and a general remote-host allowlist carry no Mach floor at all (no
+        /// `(deny mach-lookup)` is ever emitted for them — see
+        /// `seatbelt_profile_with`), so a complete deputy audit for the
+        /// deny-all shape says nothing about them. #405's acceptance criteria
+        /// ("named grants stay Unknown until each is audited" extends to
+        /// shapes with no floor to audit at all).
+        #[test]
+        fn loopback_and_remote_host_stay_unknown_even_with_a_complete_audit() {
+            for net in [
+                Scope::only(["127.0.0.1".to_string()]),
+                Scope::only(["example.com".to_string()]),
+            ] {
+                let cav = Caveats {
+                    net: net.clone(),
+                    ..Caveats::top()
+                };
+                assert_eq!(
+                    SeatbeltSandbox::new().resolved_authority(&cav).net,
+                    ResolvedScope::Unknown,
+                    "{net:?} has no Mach floor at all; the audit doesn't bound it"
+                );
+            }
+            assert_eq!(
+                SeatbeltSandbox::new()
+                    .resolved_authority(&Caveats::top())
+                    .net,
+                ResolvedScope::Unbounded
+            );
+        }
+
+        /// The PROJECTION a grant takes once the deputy audit is complete: a
+        /// named class per granted service (never `∅` while a grant exists),
+        /// `unix:` endpoints concrete, and the lattice-level scope comparison
+        /// honest — the class compares as `Subset` only because the Seatbelt
+        /// closure declares exactly that class for the grant; without the
+        /// declaration it is Incomparable and refuses. This exercises the pure
+        /// `admit` lattice law only: it is set bookkeeping for the L3 bound, not
+        /// `AdmittedFence::admit` (which also applies the L4 strength floor and
+        /// the Advisory net report) and not native deputy safety. Operational
+        /// admission under `Complete` is deferred to the promotion PR.
+        #[test]
+        fn complete_audit_projects_grants_as_named_classes() {
+            use crate::{admit, empty_closure, AdmissionDecision};
+            use std::collections::BTreeSet;
+            let cav = Caveats {
+                net: Scope::only([
+                    "mach:com.apple.SecurityServer".to_string(),
+                    "mach:com.apple.logd".to_string(),
+                ]),
+                ..Caveats::top()
+            };
+            let net = seatbelt_net_projection(&cav, MachDeputyAudit::Complete);
+            assert_eq!(
+                net,
+                ResolvedScope::Bounded {
+                    concrete: BTreeSet::new(),
+                    classes: BTreeSet::from([
+                        "seatbelt-mach-service:com.apple.SecurityServer".to_string(),
+                        "seatbelt-mach-service:com.apple.logd".to_string(),
+                    ]),
+                },
+                "a grant must appear by name and never collapse to ∅"
+            );
+            // net:none with no grants is exactly ∅ under a complete audit.
+            let none = Caveats {
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                seatbelt_net_projection(&none, MachDeputyAudit::Complete),
+                ResolvedScope::empty()
+            );
+            // Loopback keeps Mach ambient: no floor ⇒ still Unknown.
+            let lo = Caveats {
+                net: Scope::only(["localhost".to_string()]),
+                ..Caveats::top()
+            };
+            assert_eq!(
+                seatbelt_net_projection(&lo, MachDeputyAudit::Complete),
                 ResolvedScope::Unknown
             );
+            // Admission: the closure declares the class ⇒ Subset ⇒ admit;
+            // no declaration ⇒ Incomparable ⇒ refuse (the class is not in the
+            // delegated concrete set).
+            let sandbox = SeatbeltSandbox::new();
+            let mut resolved = crate::ResolvedAuthority::from_delegated(&cav);
+            resolved.net = net;
+            let closure = sandbox.runtime_closure(&cav);
+            assert_eq!(
+                closure.net,
+                ResolvedScope::Bounded {
+                    concrete: BTreeSet::new(),
+                    classes: BTreeSet::from([
+                        "seatbelt-mach-service:com.apple.SecurityServer".to_string(),
+                        "seatbelt-mach-service:com.apple.logd".to_string(),
+                    ]),
+                }
+            );
+            assert!(crate::admitted::closure_is_harness_disjoint(&closure));
+            assert!(matches!(
+                admit(&resolved, &cav, &closure),
+                AdmissionDecision::Admit
+            ));
+            assert!(matches!(
+                admit(&resolved, &cav, &empty_closure()),
+                AdmissionDecision::Reject(_)
+            ));
+            // The closure never invents a class the caveats did not name.
+            assert_eq!(sandbox.runtime_closure(&none).net, ResolvedScope::empty());
         }
 
         /// #1220: a write-confined profile must re-allow the device sinks as
@@ -3240,6 +3713,16 @@ mod seatbelt_impl {
                 assert!(
                     prof.contains("(allow network* (remote ip \"localhost:*\"))"),
                     "{host}: loopback re-allow missing: {prof}"
+                );
+                assert!(
+                    prof.contains(
+                        "(allow network-bind network-inbound (local ip \"localhost:*\"))"
+                    ),
+                    "{host}: loopback listener rule missing: {prof}"
+                );
+                assert!(
+                    !prof.contains("(local ip \"*:*\")") && !prof.contains("(remote ip \"*:*\")"),
+                    "{host}: no rule may name a non-loopback address: {prof}"
                 );
                 assert!(
                     !SeatbeltSandbox::new()
@@ -3519,6 +4002,167 @@ mod tests {
         let s = NoopSandbox;
         assert_eq!(s.kind(), SandboxKind::None);
         assert!(s.apply(&Caveats::top()).is_ok());
+    }
+
+    // ── agent-bridle#405: `mach:` service grants are structural net tokens ──
+
+    fn with_net<I: IntoIterator<Item = &'static str>>(names: I) -> Caveats {
+        Caveats {
+            net: Scope::only(names.into_iter().map(str::to_string)),
+            ..Caveats::top()
+        }
+    }
+
+    /// The grant vocabulary is exact: launchd global-names only. A malformed
+    /// token refuses (fail-closed) rather than reaching the profile.
+    #[test]
+    fn mach_service_grants_validate_sort_and_dedup() {
+        assert_eq!(
+            mach_service_grants(&Caveats::top()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            mach_service_grants(&with_net([
+                "mach:com.apple.trustd.agent",
+                "mach:com.apple.SecurityServer",
+                "mach:com.apple.SecurityServer",
+                "unix:/private/tmp/s.sock",
+            ]))
+            .unwrap(),
+            vec![
+                "com.apple.SecurityServer".to_string(),
+                "com.apple.trustd.agent".to_string()
+            ]
+        );
+        for bad in [
+            "mach:",
+            "mach:com.apple.*",
+            "mach:a b",
+            "mach:x\"y",
+            "mach:é",
+        ] {
+            assert!(
+                mach_service_grants(&with_net([bad])).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+    }
+
+    /// A `mach:` token is structural, like `unix:`: it never becomes an egress
+    /// proxy host, and it does not stop a set from being direct-denied.
+    #[test]
+    fn mach_grants_are_structural_not_hosts() {
+        let m = "mach:com.apple.system.opendirectoryd.libinfo";
+        assert!(net_direct_denied(&with_net([m])));
+        assert!(net_direct_denied(&with_net([
+            m,
+            "unix:/private/tmp/s.sock"
+        ])));
+        assert!(net_direct_denied(&Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        }));
+        assert!(!net_direct_denied(&with_net([m, "localhost"])));
+        assert!(!net_direct_denied(&with_net(["example.com"])));
+        assert!(!net_fully_denied(&with_net([m])), "not the EMPTY set");
+        assert_eq!(net_egress_proxy_hosts(&with_net([m])), None);
+        assert_eq!(
+            net_egress_proxy_hosts(&with_net([m, "example.com"])),
+            Some(vec!["example.com".to_string()]),
+            "the grant never enters the proxy host list"
+        );
+        assert!(net_loopback_only(&with_net([m, "localhost"])));
+        assert!(
+            !net_loopback_full_interface(&with_net([m, "localhost"])),
+            "a mach grant is authority beyond the loopback interface"
+        );
+        // A mach-bearing remote-host scope has no proxy semantics: the loopback
+        // fence would erase the grant, so the planner refuses on EVERY backend,
+        // Seatbelt included (never a plan with the token silently dropped).
+        let mixed = with_net([m, "example.com"]);
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Seatbelt, &mixed).is_none(),
+            "Seatbelt must not plan a proxy that drops the mach grant"
+        );
+        assert!(
+            !matches!(&loopback_fenced_caveats(&mixed).net, Scope::Only(set) if set.contains(m)),
+            "the fence does not carry the grant, which is why the plan is refused"
+        );
+        assert!(
+            egress_proxy_plan_for(SandboxKind::Landlock, &with_net([m, "example.com"])).is_none()
+        );
+        assert!(
+            egress_proxy_plan_for(SandboxKind::AppContainer, &with_net([m, "example.com"]))
+                .is_none()
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::Seatbelt, &with_net([m])),
+            SandboxKind::Seatbelt
+        );
+        assert_eq!(
+            effective_sandbox_kind(SandboxKind::AppContainer, &with_net([m])),
+            SandboxKind::None
+        );
+    }
+
+    /// The structured "service X denied" result: only a network-denied
+    /// Seatbelt run carries a Mach floor, so only it discloses; the grant is
+    /// listed by name and every other known candidate is listed as withheld.
+    #[test]
+    fn mach_service_disclosure_names_granted_and_withheld() {
+        let m = "mach:com.apple.SecurityServer";
+        let d = mach_service_disclosure(&with_net([m]), SandboxKind::Seatbelt)
+            .unwrap()
+            .expect("a network-denied Seatbelt run discloses");
+        assert_eq!(d.granted, vec!["com.apple.SecurityServer".to_string()]);
+        assert_eq!(d.withheld.len(), MACH_SERVICE_CANDIDATES.len() - 1);
+        assert!(!d.withheld.iter().any(|s| s == "com.apple.SecurityServer"));
+        assert!(d
+            .withheld
+            .iter()
+            .any(|s| s == "com.apple.system.opendirectoryd.libinfo"));
+
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let d = mach_service_disclosure(&none, SandboxKind::Seatbelt)
+            .unwrap()
+            .expect("net:none discloses");
+        assert!(d.granted.is_empty());
+        assert_eq!(
+            d.withheld.len(),
+            MACH_SERVICE_CANDIDATES.len(),
+            "zero floor: every candidate withheld"
+        );
+
+        // No floor ⇒ nothing to disclose: other backends, ambient net, loopback.
+        for kind in [
+            SandboxKind::Landlock,
+            SandboxKind::AppContainer,
+            SandboxKind::None,
+        ] {
+            assert_eq!(
+                mach_service_disclosure(&none, kind).unwrap(),
+                None,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            mach_service_disclosure(&Caveats::top(), SandboxKind::Seatbelt).unwrap(),
+            None
+        );
+        assert_eq!(
+            mach_service_disclosure(&with_net(["localhost"]), SandboxKind::Seatbelt).unwrap(),
+            None
+        );
+        assert!(
+            mach_service_disclosure(&with_net(["mach:bad name"]), SandboxKind::Seatbelt).is_err()
+        );
+        assert_eq!(
+            seatbelt_mach_service_class("com.apple.logd"),
+            "seatbelt-mach-service:com.apple.logd"
+        );
     }
 
     #[test]
@@ -5075,8 +5719,10 @@ mod seatbelt_kernel_tests {
         );
     }
 
-    /// The Mach-lookup compatibility floor keeps a representative build shell
-    /// runnable. This is operational evidence, not a bounded-authority claim.
+    /// The ZERO Mach-lookup floor still keeps a representative build shell
+    /// runnable — `/bin/sh` needs no named Mach service to start and exit
+    /// (agent-bridle#405 breakage measurement). Operational evidence, not a
+    /// bounded-authority claim.
     #[test]
     fn net_none_mach_deny_still_runs_a_build_tool() {
         if skip_proof_unless_seatbelt() {
@@ -5089,7 +5735,7 @@ mod seatbelt_kernel_tests {
         let sh = run_wrapped(&cav, "/bin/sh", &["-c", "exit 0"]);
         assert!(
             sh.success(),
-            "the net:none Mach-lookup allow-list must keep /bin/sh runnable"
+            "the net:none zero Mach floor must keep /bin/sh runnable"
         );
     }
 
@@ -5400,6 +6046,194 @@ print(d.value())
             }
         });
         Some(addr)
+    }
+
+    /// The numeric-uid control for the zero-floor differential, validated so it
+    /// can never be satisfied by a failed or empty child: `id -u` must exit
+    /// successfully and print exactly one non-empty ASCII-decimal token. The
+    /// denied legs of the proof compare against THIS value, so an `id` that
+    /// died with empty stdout cannot match an empty control (review of #406,
+    /// finding 1). Pure over the captured output; pinned by
+    /// `validated_uid_rejects_failed_or_non_numeric_controls`.
+    fn validated_uid(output: &std::process::Output) -> Result<String, String> {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() {
+            return Err(format!(
+                "`id -u` control did not exit successfully: status={:?} stdout={text:?}",
+                output.status.code()
+            ));
+        }
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "`id -u` control did not print a non-empty ASCII-decimal uid: {text:?}"
+            ));
+        }
+        Ok(text)
+    }
+
+    /// A failed, empty, or non-numeric uid control is refused — so the denied
+    /// legs of the differential below cannot pass against an empty string.
+    #[test]
+    fn validated_uid_rejects_failed_or_non_numeric_controls() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(validated_uid(&out(0, "501\n")).unwrap(), "501");
+        assert!(validated_uid(&out(1, "501\n")).is_err(), "failed status");
+        assert!(validated_uid(&out(0, "")).is_err(), "empty stdout");
+        assert!(validated_uid(&out(0, "\n")).is_err(), "whitespace only");
+        assert!(validated_uid(&out(0, "runner")).is_err(), "not numeric");
+        assert!(validated_uid(&out(0, "501 502")).is_err(), "not one token");
+    }
+
+    /// The Mach floor is ZERO and a `mach:` grant re-opens the ONE service it
+    /// names, kernel-enforced (agent-bridle#405). Measured differential with
+    /// positive controls, for `com.apple.system.opendirectoryd.libinfo`:
+    /// uid→name resolution (`id -un`) goes through that service; unconfined it
+    /// prints the user name (control: the host resolves it, and the name is
+    /// distinct from the validated numeric uid); under `net:none` the zero
+    /// floor denies the lookup and `id` falls back to the numeric uid; under
+    /// `net: {mach:…libinfo}` the name resolves again; under an UNRELATED grant
+    /// (`SecurityServer`) it does not. Under every confined profile a benign
+    /// command (`/bin/echo`) still runs, proving each profile parsed. This
+    /// characterizes the libinfo grant and the literal rule it emits; it does
+    /// not characterize any other service's transitive authority. Deterministic
+    /// and offline: no network, no compiler, no timing.
+    #[test]
+    fn net_none_mach_floor_is_zero_and_a_named_grant_reopens_that_service() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let id = "/usr/bin/id";
+        if !std::path::Path::new(id).exists() {
+            fail_required_or_skip("no id(1) on this host");
+            return;
+        }
+        let stdout =
+            |o: &std::process::Output| String::from_utf8_lossy(&o.stdout).trim().to_string();
+        // Control 1: a validated numeric uid (success + non-empty ASCII decimal).
+        let uid = match validated_uid(
+            &std::process::Command::new(id)
+                .arg("-u")
+                .output()
+                .expect("run id -u"),
+        ) {
+            Ok(uid) => uid,
+            Err(reason) => {
+                fail_required_or_skip(&format!("positive control: {reason}"));
+                return;
+            }
+        };
+        // Control 2: the host resolves a NAME distinct from that uid, or the
+        // differential is meaningless — refuse to pass vacuously.
+        let unconfined = std::process::Command::new(id)
+            .arg("-un")
+            .output()
+            .expect("run id unconfined");
+        let name = stdout(&unconfined);
+        if !unconfined.status.success() || name.is_empty() || name == uid {
+            fail_required_or_skip(&format!(
+                "positive control: unconfined `id -un` did not resolve a user name (got {name:?}, uid {uid:?})"
+            ));
+            return;
+        }
+
+        // Denied leg: the documented `id` fallback is the exact validated uid on
+        // stdout. Exit status is NOT assumed (a denied lookup may or may not
+        // fail the tool); the non-empty exact-uid match is the evidence.
+        let none = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        assert!(
+            run_wrapped(&none, "/bin/echo", &["ok"]).success(),
+            "net:none profile must still run non-network commands (must parse)"
+        );
+        let denied = run_wrapped_output(&none, id, &["-un"]);
+        assert_eq!(
+            stdout(&denied),
+            uid,
+            "zero floor: with libinfo denied `id -un` must fall back to the numeric uid \
+             (stderr: {})",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+
+        // Reopened leg: success status AND the expected name.
+        let granted = Caveats {
+            net: Scope::only(["mach:com.apple.system.opendirectoryd.libinfo".to_string()]),
+            ..Caveats::top()
+        };
+        assert!(
+            run_wrapped(&granted, "/bin/echo", &["ok"]).success(),
+            "mach-grant profile must still run non-network commands (must parse)"
+        );
+        let reopened = run_wrapped_output(&granted, id, &["-un"]);
+        assert!(
+            reopened.status.success(),
+            "under the libinfo grant `id -un` must exit successfully (stderr: {})",
+            String::from_utf8_lossy(&reopened.stderr)
+        );
+        assert_eq!(
+            stdout(&reopened),
+            name,
+            "the libinfo grant must re-open uid→name resolution (stderr: {})",
+            String::from_utf8_lossy(&reopened.stderr)
+        );
+
+        // Unrelated-grant leg: its own launch control, then the same exact-uid
+        // fallback — a grant of SecurityServer does not re-open libinfo.
+        let other = Caveats {
+            net: Scope::only(["mach:com.apple.SecurityServer".to_string()]),
+            ..Caveats::top()
+        };
+        assert!(
+            run_wrapped(&other, "/bin/echo", &["ok"]).success(),
+            "unrelated-grant profile must still run non-network commands (must parse)"
+        );
+        let unrelated = run_wrapped_output(&other, id, &["-un"]);
+        assert_eq!(
+            stdout(&unrelated),
+            uid,
+            "an unrelated grant must not re-open libinfo (stderr: {})",
+            String::from_utf8_lossy(&unrelated.stderr)
+        );
+    }
+
+    /// A loopback-only child can also SERVE on loopback: bind, listen and
+    /// accept (a test suite's mock HTTP server). The connect-side rule alone
+    /// (`remote ip "localhost:*"`) refused `bind` with EPERM, so newt's build
+    /// lane could not run any wiremock-based test under this fence.
+    #[test]
+    fn net_loopback_only_permits_a_loopback_listener() {
+        if skip_proof_unless_seatbelt() {
+            return;
+        }
+        let perl = "/usr/bin/perl";
+        if !std::path::Path::new(perl).exists() {
+            eprintln!("skipping: no perl(1) on this host");
+            return;
+        }
+        let cav = Caveats {
+            net: Scope::only(["localhost".to_string()]),
+            ..Caveats::top()
+        };
+        // Bind an ephemeral loopback port, connect to it, accept: a full
+        // local round trip, all inside the fence.
+        let script = "use IO::Socket::INET; \
+            my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0, Listen => 1) \
+                or die \"bind: $!\"; \
+            my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $s->sockport) \
+                or die \"connect: $!\"; \
+            $s->accept or die \"accept: $!\"; print \"served\\n\";";
+        let out = run_wrapped_output(&cav, perl, &["-e", script]);
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("served"),
+            "net:Only([localhost]) must permit a loopback listener; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A loopback-only `net` grant kernel-confines egress to the loopback

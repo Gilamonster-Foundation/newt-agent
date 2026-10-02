@@ -94,7 +94,9 @@ pub use report::{
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
 pub use sandbox::{
     best_available_sandbox, effective_sandbox_kind, egress_proxy_plan, loopback_fenced_caveats,
-    net_egress_proxy_hosts, NoopSandbox, Sandbox, SandboxKind,
+    mach_service_disclosure, mach_service_grants, net_egress_proxy_hosts,
+    seatbelt_mach_service_class, MachServiceDisclosure, NoopSandbox, Sandbox, SandboxKind,
+    MACH_GRANT_PREFIX, MACH_SERVICE_CANDIDATES,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
