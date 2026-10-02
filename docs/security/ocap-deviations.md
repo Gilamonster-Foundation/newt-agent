@@ -68,7 +68,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: Seatbelt cannot kernel-enforce net=none; confined fetch uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
-| `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟠 ACTIVE (macos) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
+| `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟡 NARROWED (macos: deny-all/direct-denied net closed) / 🟠 ACTIVE (macos: loopback/host-grant net) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
 | `windows-inheritable-handle-leak` | no ambient inherited OS object handles cross into an AppContainer child | 🟠 ACTIVE (Windows) | (a Windows confinement limitation on attacker-exec children — not a gated capability) |
 | `windows-shelltool-env-inheritance` | confined Windows `run_command` children start from an explicit env allow-list, not the Newt parent's ambient env | ✅ CLOSED (agent-bridle 0.8.0-rc.4) | — |
 | `windows-appcontainer-exec-allowlist` | a restricted exec grant (`exec = { only = [...] }`) is enforced on every platform | 🟡 FAIL-CLOSED (Windows) | allowlisted `newt-mcp-server` `shell_run` is refused on Windows |
@@ -220,30 +220,47 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 ### mach-xpc-ambient-deputy
 - **Invariant (ideal):** a confined child reaches NO ambient host service (Mach/XPC) that could act
   as a filesystem or network deputy on its behalf — the macOS analog of `local-deputy-egress`.
-- **Practical caveat (now):** the generated Seatbelt SBPL profile starts from `(allow default)` and
-  governs only `file-read*` / `file-write*` / `network*` / `process-exec*` (the axes Newt's `Caveats`
-  express). **Mach service lookup (`bootstrap_look_up`, XPC discovery) stays AMBIENT** — a confined
-  child can talk to host XPC/Mach services that a hostile deputy could expose (an XPC helper that
-  performs fs or network on the caller's behalf would bypass the fs/net fences). Pinned by
-  `macos_seatbelt_adversarial::seatbelt_mach_xpc_deputy_surface`, which asserts the profile does NOT
-  yet deny mach-lookup, so containment is never over-reported.
-- **Residual:** 🟠 REACHABLE (macOS only) — bounded in practice by what ambient XPC services exist on
-  the host, but not by any Newt-enforced kernel rule.
-- **Disabled while open:** nothing — a Seatbelt confinement LIMITATION on the always-reachable
+- **Practical caveat, NARROWED (newt-agent#2673, agent-bridle#406+#405, ADR 0015 amendments E5/E6,
+  vendored 2026-10-01):** for a `net_direct_denied` shape — `net: none` (deny-all, what
+  `workspace_confined_caveats`/`build_tool_request` use today), `unix:`-only, `mach:`-only, or a
+  mixture of only those — the generated Seatbelt SBPL profile now installs a **zero** Mach-lookup
+  floor: `(deny mach-lookup)` with NO ambient re-allow (the old ambient compatibility list is gone;
+  a named service is reachable only via an explicit `mach:<service>` grant, which is denied in a
+  `build_tool_request`/`run_command` call since none is ever granted today). Closed by agent-bridle's
+  own native evidence (not re-derived here): unix-domain sockets, `open(1)`/LaunchServices, Darwin
+  notifications, pasteboard, `iokit-open`, `sysctl-write`, a write-class `file-ioctl`,
+  `process-info`/`signal`, XPC beyond `mach-lookup`, and AppleEvents are each shown closed or
+  correctly placed out of the net-egress threat model (full table: agent-bridle
+  `docs/adr/0015-macos-seatbelt-net-loopback-and-remote-host-frontier.md` amendment E6 and
+  `docs/security/platform/macos-evidence.md`). **For every OTHER net shape — a loopback allowlist, or
+  any caveat carrying a real host grant — NOTHING CHANGED**: no Mach floor is installed at all
+  (`seatbelt_profile_with`'s net branch only touches mach-lookup for the direct-denied family), so
+  Mach service lookup stays fully AMBIENT there, same as before this backport.
+- **Residual:** 🟡 NARROWED (macOS, deny-all/`unix:`/`mach:`-only net) — closed by the zero floor,
+  backed by agent-bridle's native evidence. 🟠 STILL REACHABLE (macOS, loopback or host-granted net)
+  — bounded in practice by what ambient XPC services exist on the host, not by any Newt-enforced
+  kernel rule; unchanged.
+- **Disabled while open:** nothing — a Seatbelt confinement LIMITATION on the loopback/host-granted
   `run_command` / build_check / crew paths, not a gated capability (no fail-closed toggle; the child
-  runs with the incomplete confinement). Honestly ACTIVE — reachable, not bounded by any CLOSED
-  invariant (the fs/net fences do not govern mach-lookup).
-- **Compensating controls:** the fs, exec, and direct-egress (`(deny network*)`) fences all stand,
-  limiting what the child can DO with a deputy; a hardened host removes unnecessary ambient XPC
-  services (not a hard guarantee); Newt tasks are trusted-code-on-trusted-host today.
-- **Closure criterion:** the SBPL profile emits `(deny mach*)` (or an explicit mach-lookup
-  allowlist) for a confined request, and a real-resource test proves an ambient XPC lookup is denied
-  — mirroring the AF_UNIX closure on the network axis.
-- **Ratchet guard:** `macos_seatbelt_adversarial::seatbelt_mach_xpc_deputy_surface` PINS the current
-  ambient surface (`(allow default)`, no `(deny mach…)`), so a future profile that closes it trips
-  the test and forces this entry to widen honestly.
-- **Status:** OPEN — reachable + unbounded on macOS; Linux and Windows builds are unaffected (no Mach). This is a
-  macOS-scoped ACTIVE deviation discovered by #1632. owner: — · review-by: #1599 / epic #749.
+  runs with the incomplete confinement for those shapes). The deny-all shape used by
+  `build_tool_request`/`workspace_confined_caveats` today is no longer in this category.
+- **Compensating controls (for the still-reachable shapes):** the fs, exec, and direct-egress
+  (`(deny network*)`) fences all stand, limiting what the child can DO with a deputy; a hardened host
+  removes unnecessary ambient XPC services (not a hard guarantee); Newt tasks are
+  trusted-code-on-trusted-host today.
+- **Closure criterion (remaining residual, loopback/host-grant shapes):** the same zero-floor
+  mechanism extended to those shapes — which agent-bridle's own ADR explicitly does NOT claim (SBPL
+  cannot express a general host allowlist at all, and a loopback grant installs no Mach floor because
+  it has nothing to re-deny against) — or a separate mechanism altogether. Not expected soon; no
+  owner assigned.
+- **Ratchet guard:** `macos_seatbelt_adversarial::seatbelt_mach_xpc_deputy_surface` now PINS THE
+  OPPOSITE of its prior assertion — the zero floor (`(deny mach-lookup)`, no `(allow mach-lookup`)
+  for the `net: none` shape `workspace_confined_caveats` renders — so a future change that removes
+  the floor, or that starts ambiently re-allowing a service, trips the test and forces this entry to
+  be re-derived.
+- **Status:** NARROWED (macOS, deny-all/`unix:`/`mach:`-only net is now DENIED, not reachable);
+  OPEN (macOS, loopback/host-granted net, unaffected); Linux and Windows builds are unaffected (no
+  Mach). Originally discovered by #1632; narrowed by #2673. owner: — · review-by: #1599 / epic #749.
 
 ### windows-inheritable-handle-leak
 - **Invariant (ideal):** an attacker-exec child receives only explicitly granted capabilities; arbitrary
